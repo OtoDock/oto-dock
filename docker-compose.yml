@@ -1,0 +1,322 @@
+# OtoDock — self-host stack (fully containerised; deployment topology T2).
+#
+# Quick start — this file is all you need; images are pulled from GHCR:
+#
+#   1. Create a `.env` file next to this compose file (config.env.example in
+#      the repo documents every knob — only the password is required):
+#          POSTGRES_PASSWORD=<long random string>
+#          DASHBOARD_PUBLIC_URL=https://otodock.example.com  # URL users browse to
+#          TZ=Europe/Athens                                  # container timezone
+#      The proxy auto-generates its remaining secrets (PROXY_API_KEY /
+#      JWT_SECRET / VAPID_*) into that same file on first boot, via the
+#      bind-mount below.
+#   2. docker compose up -d
+#
+# Building from source instead (contributors / development):
+#
+#   scripts/compose.sh up -d --build
+#
+# (compose.sh stacks docker-compose.build.yml on top of this file — the build
+# contexts live there, with base images pinned from VERSIONS.md — so this base
+# file stays pull-only and works standalone when downloaded on its own.)
+#
+# This is the ONE-COMMAND self-host: the proxy itself runs as a container and
+# drives sibling MCP containers through a read-restricted docker-socket-proxy.
+# It is SEPARATE from (and does not touch) the bare-metal `docker-compose.t1.yml`
+# (which brings up only Postgres for a host-process proxy — topology T1, the
+# bare-metal dev install). Pick ONE: the T1 file for a host proxy, this
+# file for a fully Dockerised proxy.
+#
+# SECURITY NOTE (proxy service): the proxy runs as the NON-ROOT `oto` user (uid
+# 1000) — like the bare-metal install — so every bwrap'd agent is non-root with
+# ZERO Linux capabilities. Rootless bwrap inside a container needs three Docker
+# relaxations (seccomp / apparmor / systempaths unconfined — see the proxy
+# service) and NO cap_add: a net privilege reduction vs running root+CAP_SYS_ADMIN.
+# A one-shot root init sidecar chowns the data volume to uid 1000 at first boot.
+
+name: otodock
+
+# Cap every long-lived container's stdout log so the json-file driver can't fill
+# the disk on a long-running install. (The proxy + phone ALSO rotate their own
+# application logs via RotatingFileHandler; this bounds the CONTAINER logs Docker
+# collects — Postgres/Collabora/etc. stdout that has no app-level rotation.)
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  # --- PostgreSQL ---
+  otodock-postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: otodock
+      POSTGRES_USER: otodock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this compose file (the dev flow uses config.env via proxy/setup.sh) — refusing to init Postgres with a default password}
+    # The default 64MB /dev/shm makes Postgres throw "could not resize shared
+    # memory segment" under parallel queries / large sorts.
+    shm_size: 256mb
+    volumes:
+      - otodock-pgdata:/var/lib/postgresql/data
+    networks: [otodock]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U otodock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- Docker socket proxy (Tecnativa) ---
+  # The proxy reaches the host Docker daemon ONLY through this read-restricted
+  # tcp shim. Whitelist: CONTAINERS/IMAGES/NETWORKS/VOLUMES + POST
+  # (create/start/stop). VOLUMES is needed because a pulled community Docker MCP
+  # uses NAMED volumes (the install rewrite converts any host bind-mount to one —
+  # a host path is meaningless to a containerised proxy); `compose up` then has
+  # to create/inspect them. `build` is intentionally NOT whitelisted → community
+  # Docker MCPs must be PULLED (pre-built images), never built, in T2/cloud
+  # (verified). The host socket is mounted read-only; the shim is the only writer.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.4.2
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [otodock]
+
+  # --- The platform proxy (dashboard baked in) ---
+  otodock-proxy:
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.0.0}
+    restart: unless-stopped
+    logging: *default-logging
+    # Memory cap — DEFAULT 0 = unlimited (the proxy uses all host RAM for max
+    # session concurrency; the live-RAM admission gates self-protect via Gate-2's
+    # host MemAvailable read + LRU session eviction + swap). Operators sharing the
+    # host with other heavy containers can set OTODOCK_PROXY_MEM_LIMIT (e.g. "12g" =
+    # host RAM minus ~2GB sibling headroom) for HARD OOM containment — a capped
+    # proxy confines an over-commit kill to its own cgroup instead of risking a
+    # host-wide OOM (which could hit Postgres). Capping does NOT trade away the
+    # sidecar-leak veto: a capped Gate 2 reads min(cgroup headroom, host
+    # MemAvailable), so a leaky sibling container still blocks admission (with an
+    # honest "host memory" denial) either way.
+    mem_limit: ${OTODOCK_PROXY_MEM_LIMIT:-0}
+    # Non-root runtime user (matches the Dockerfile USER + file-tools' uid). The
+    # agent inherits this uid → it runs as uid 1000, capability-less.
+    user: "1000:1000"
+    environment:
+      # T2 deployment seam — resolves Docker-MCP hosts to service-DNS, points
+      # docker_manager at the socket-proxy, and the WOPI/callback host at this
+      # service. (RUNNING_IN_DOCKER is also auto-detected via /.dockerenv; set
+      # explicitly here per the design — see core/deployment.py.)
+      RUNNING_IN_DOCKER: "true"
+      PLATFORM_DATA_DIR: /opt/otodock
+      # Container timezone. On first install the proxy seeds the platform
+      # timezone from this (a bare-metal host reads /etc/localtime automatically;
+      # a container is UTC unless TZ is set). Set TZ in config.env to localise.
+      TZ: ${TZ:-UTC}
+      PROXY_SERVICE_NAME: otodock-proxy
+      DOCKER_SOCKET_PROXY_HOST: docker-socket-proxy
+      DOCKER_SOCKET_PROXY_PORT: "2375"
+      OTODOCK_NETWORK: otodock
+      # The proxy always binds 8400 INSIDE the container — PROXY_PORT in the
+      # operator env file only moves the published host port (see `ports:`).
+      # Without this pin, a PROXY_PORT line in the bind-mounted config.env would
+      # re-bind the server inside the container while the port mapping, image
+      # healthcheck and sibling services all still target 8400.
+      PROXY_PORT: "8400"
+      # Public URL of the dashboard. Drives document-preview wiring (COLLABORA_URL,
+      # service-root, frame-ancestors all auto-derive from this) and the session
+      # cookie's Secure flag (https → Secure). Set this in config.env to your real
+      # public URL (e.g. https://otodock.example.com); the localhost default works
+      # for a same-host test.
+      DASHBOARD_PUBLIC_URL: ${DASHBOARD_PUBLIC_URL:-http://localhost:${PROXY_PORT:-8400}}
+      # Where the proxy reaches Collabora internally to forward /collabora/* (the
+      # browser-facing COLLABORA_URL auto-derives from DASHBOARD_PUBLIC_URL).
+      COLLABORA_BACKEND_URL: http://collabora:9980
+      # Reach Postgres over the compose network (not the host's loopback).
+      DATABASE_URL: postgresql://otodock:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@otodock-postgres:5432/otodock
+    ports:
+      # Publish the API/dashboard port. Default 8400; set PROXY_PORT (in the env
+      # file / shell) to publish elsewhere, e.g. PROXY_PORT=8410 to run alongside
+      # a bare-metal proxy already on 8400 — it changes ONLY this host-side
+      # mapping (the container side is pinned to 8400 above). In production,
+      # prefer fronting this with a reverse proxy / tunnel instead of exposing
+      # it directly.
+      - "${PROXY_PORT:-8400}:8400"
+    volumes:
+      # The operator env file (`.env` next to this compose file; the source/dev
+      # flow points this at config.env via OTODOCK_ENV_FILE — see compose.sh)
+      # is mounted as the platform's config.env, writable so the proxy persists
+      # its auto-generated secrets (PROXY_API_KEY / JWT_SECRET / VAPID_*) across
+      # restarts — exactly like bare-metal. DATABASE_URL above (container env)
+      # overrides the file's.
+      - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
+      # Shared with file-tools (file-tools mounts the SAME volume at /agents).
+      - otodock-agents:/opt/otodock/agents
+      # Runtime-installed community MCPs (camoufox, github-mcp, ...) land in
+      # /opt/otodock/mcps/community — a named volume keeps them across a proxy
+      # image rebuild / recreate (the baked dir is empty; core/custom MCPs live
+      # elsewhere in the image and are untouched).
+      - otodock-mcps:/opt/otodock/mcps/community
+      # Admin-uploaded SSH private keys (ssh-hosts MCP). mcps/custom is baked
+      # into the image, so runtime-written keys need their own volume or a
+      # rebuild wipes them. Never mounted into any agent sandbox.
+      - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
+      # Per-session runtime state (session/security index, pending permissions) —
+      # a named volume keeps it across a proxy image rebuild / recreate.
+      - otodock-sessions:/opt/otodock/sessions
+    # Rootless bwrap inside the container needs these three relaxations — NOT
+    # cap_add, NOT --privileged. seccomp → create the agent's user namespace
+    # (Docker's default profile blocks clone(CLONE_NEWUSER) without CAP_SYS_ADMIN);
+    # apparmor → mount-propagation (MS_SLAVE); systempaths → mount a fresh isolated
+    # /proc over Docker's masked /proc. The agent ends up uid 1000, CapEff=0, with
+    # its own clean /proc. Low-risk for a non-root proxy (e.g. /proc/kcore still
+    # needs CAP_SYS_RAWIO it doesn't hold). See SANDBOX.md.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    # Sandbox network isolation (always on) wraps every agent in a pasta netns;
+    # pasta creates a tap via /dev/net/tun, which Docker does not expose by
+    # default. The host node is world-rw (10:200), so the non-root proxy can use
+    # it once the device is mapped in — no extra capability needed (pasta gets
+    # CAP_NET_ADMIN over its OWN userns/netns). Without this the proxy boots but
+    # every agent spawn fails ("Failed to open tun socket in namespace"). See
+    # docs/architecture/SANDBOX.md.
+    devices:
+      - /dev/net/tun
+    networks: [otodock]
+    # Reach services on the Docker host (e.g. a local Ollama / OpenAI-compatible
+    # LLM endpoint, or local STT/TTS) at host.docker.internal. The proxy is the
+    # trusted control plane and only dials admin-configured endpoints — agents
+    # run netns-isolated (see SANDBOX.md). Admins configure local endpoints with
+    # a LAN IP or host.docker.internal (NOT localhost — that's the container).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      otodock-postgres:
+        condition: service_healthy
+      # Named volumes are created root-owned; this one-shot sidecar chowns the
+      # agents volume + config.env to uid 1000 before the (non-root) proxy starts.
+      otodock-agents-init:
+        condition: service_completed_successfully
+
+  # --- One-shot init: own the data volume for the non-root proxy ---
+  # Docker creates named volumes root-owned, but the proxy + file-tools + agent
+  # all run as uid 1000 and can't chown them. This runs once as root, chowns the
+  # agents volume + the bind-mounted config.env to 1000, then exits. `-R` handles
+  # the upgrade case where the volume already holds root-owned agent trees;
+  # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
+  otodock-agents-init:
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.0.0}
+    user: "0:0"
+    # This one-shot only chowns volumes — it needs NO network. Without this,
+    # Compose creates a `<project>_default` bridge just for it, and on a host
+    # whose 172.x pools are exhausted that bridge can grab a 192.168.x range
+    # that overlaps the LAN and black-holes the host's own route. `none` keeps
+    # it off every bridge so no default network is ever created. (Also pin the
+    # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
+    network_mode: "none"
+    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys 2>/dev/null; true"]
+    volumes:
+      - otodock-agents:/opt/otodock/agents
+      - otodock-mcps:/opt/otodock/mcps/community
+      - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
+      - otodock-sessions:/opt/otodock/sessions
+      - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
+    restart: "no"
+
+  # --- Core MCP: file-tools (operator-managed compose sibling) ---
+  # Reached by the proxy at http://file-tools:8932 (service-DNS). NO host port.
+  # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
+  # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
+  file-tools:
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.0.0}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      PROXY_URL: http://otodock-proxy:8400
+      WOPI_BASE_URL: http://otodock-proxy:8400
+      MCP_PORT: "8932"
+    # file-tools runs as uid 1000 (its image's `mcp` user) — the SAME uid as the
+    # proxy and the agent, so the shared agents volume has one consistent owner
+    # (the numeric uid is the contract; the username differs and that's fine).
+    volumes:
+      - otodock-agents:/agents
+    networks: [otodock]
+    depends_on:
+      - otodock-proxy
+
+  # --- Collabora Online (document preview/editing for file-tools) ---
+  # Optional but recommended — file-tools' live document preview renders here.
+  # Reached internally by the proxy at http://collabora:9980; its WOPI callbacks
+  # reach the proxy at http://otodock-proxy:8400 (WOPI_BASE_URL on file-tools).
+  collabora:
+    image: collabora/code:25.04.9.4.1
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # Document preview auto-configures from the ONE setting you already provide.
+      # Collabora generates the in-browser editor URL (discovery `urlsrc`) AND
+      # enforces a strict WS-origin check from its `server_name` + `ssl.termination`
+      # — NOT from request/X-Forwarded headers — so they must equal the dashboard's
+      # public origin. The entrypoint below derives them from DASHBOARD_PUBLIC_URL:
+      # server_name + frame_ancestors = its host:port, ssl.termination = (scheme is
+      # https). So just set DASHBOARD_PUBLIC_URL to the URL users actually browse to
+      # (in config.env) and preview works — no Collabora-specific knobs.
+      # NOTE: this is sub-path mode (the proxy forwards /collabora/* to here). For a
+      # separate Collabora FQDN, run your own reverse proxy and set COLLABORA_URL.
+      - DASHBOARD_PUBLIC_URL=${DASHBOARD_PUBLIC_URL:-http://localhost:${PROXY_PORT:-8400}}
+      - aliasgroup1=http://otodock-proxy:8400
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        host="$${DASHBOARD_PUBLIC_URL#*://}"; host="$${host%%/*}";
+        case "$$DASHBOARD_PUBLIC_URL" in https://*) t=true ;; *) t=false ;; esac;
+        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true";
+        exec /start-collabora-online.sh
+    cap_add:
+      - MKNOD
+    networks: [otodock]
+    depends_on:
+      - otodock-proxy
+
+networks:
+  otodock:
+    # Named (not project-scoped) so docker_manager can attach community Docker
+    # MCP containers to the SAME network by name (OTODOCK_NETWORK).
+    name: otodock
+    # Pin the subnet so OtoDock owns its networking end-to-end. Without this,
+    # Docker auto-allocates this bridge from its default pool, and on a host whose
+    # 172.16/12 pools are exhausted that lands on 192.168.0.0/16 — overlapping a
+    # typical LAN and black-holing the host's route (the same lockout the per-MCP
+    # T1 pin avoids). 10.200.0.0/24 is an
+    # uncommon-on-LAN default (distinct from the 10.201/16 MCP pool); override
+    # OTODOCK_NETWORK_SUBNET in config.env if it overlaps yours (no private range
+    # is universally safe).
+    ipam:
+      config:
+        - subnet: ${OTODOCK_NETWORK_SUBNET:-10.200.0.0/24}
+
+# Explicit (project-independent) volume names, matching the named network above:
+# predictable for backup/restore tooling (`docker run -v otodock-agents:… tar`)
+# and stable however the compose project is named.
+volumes:
+  otodock-pgdata:
+    name: otodock-pgdata
+  otodock-agents:
+    name: otodock-agents
+  otodock-mcps:
+    name: otodock-mcps
+  otodock-ssh-keys:
+    name: otodock-ssh-keys
+  otodock-sessions:
+    name: otodock-sessions

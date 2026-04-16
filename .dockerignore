@@ -1,0 +1,61 @@
+# Docker build-context excludes for the platform image(s).
+# Build context is the REPO ROOT (the proxy Dockerfile is `proxy/Dockerfile`,
+# built with context `.`). This file is SECURITY-CRITICAL: it keeps secrets and
+# user data out of every image layer. Mirrors `.gitignore` plus build-only cruft.
+
+# ── Secrets — MUST never enter an image layer ──
+config.env
+**/.env
+proxy/config/fcm-service-account.json
+
+# ── User data — comes from named volumes at runtime, never baked ──
+agents/
+# recover-bin holds DELETED USER FILE CONTENTS — a hard no for image history.
+recover-bin/
+host-media-cache/
+
+# ── Runtime state / caches ──
+proxy/sessions/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.log.*
+
+# ── Per-component virtualenvs + node_modules (rebuilt in the image) ──
+**/venv/
+**/.venv/
+**/node_modules/
+dashboard/dist/
+
+# ── Community MCPs — installed at runtime from OtoDock/community-mcps ──
+mcps/community/*/
+!mcps/community/.gitkeep
+
+# ── Agent/CLI config dirs (parallel-memory paths) ──
+**/.claude/
+**/.codex/
+
+# ── Components COPYd into an image built from this same root context ──
+# NOTE: the component trees below are NOT excluded — each is needed by an
+# image built from this context (their venvs/__pycache__/logs are already
+# stripped by the global patterns above):
+#   audio/     — the lean `oto-audio` core (proxy: cloud STT/TTS; phone: +localmodels), venv-installed.
+scheduler/
+
+# ── VCS / IDE / OS ──
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Host-local compose override (live-box data-volume adoption — never shipped) ──
+docker-compose.override.yml

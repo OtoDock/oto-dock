@@ -1,0 +1,90 @@
+# ── Secrets ──
+config.env
+# Root .env = the container quick-start's own secrets file (docker-compose.yml)
+/.env
+.env.local
+proxy/.env
+dashboard/.env
+audio/.env
+phone/.env
+mcps/**/.env
+# Firebase config — project-specific; ships as google-services.json.example
+dashboard/android/app/google-services.json
+
+# ── Agent data (user-specific, not shipped) ──
+agents/
+# …but api/agents/ is SOURCE (route subpackage), not runtime agent data:
+!proxy/api/agents/
+# …and tests/agents/ is the agent-features test bucket, not runtime data:
+!proxy/tests/agents/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Per-MCP runtime-reconciliation marker (records the platform Python/Node the
+# venv/node_modules was last reconciled to). Local runtime state, like a venv —
+# never source. Written by mcp_venv_bootstrap / reconcile_mcp_runtimes.
+.oto-runtime.json
+
+# ── Node ──
+node_modules/
+dist/
+
+# ── Runtime data ──
+proxy/sessions/
+sessions/
+# …but api/sessions/ is SOURCE (route subpackage), not runtime session data:
+!proxy/api/sessions/
+scripts/migrate_*.json
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Testing ──
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Credentials / keys ──
+proxy/config/fcm-service-account.json
+# Admin-uploaded SSH private keys (ssh-hosts MCP) — operator data, never tracked
+mcps/custom/ssh-hosts/keys/
+
+# ── Community MCPs — catalog lives in OtoDock/community-mcps ──
+# The mcps/community/ tree is the runtime install dir, populated at install
+# time from https://github.com/OtoDock/community-mcps. Local files are kept
+# on disk for dev/testing but never tracked in this repo.
+mcps/community/*/
+!mcps/community/.gitkeep
+
+# ── Session state ──
+.claude/
+.codex/
+
+# Host-local compose override (live-box data-volume adoption — never shipped)
+docker-compose*.override.yml
+
+# ── Runtime data (never tracked) ──
+# recover-bin = per-agent recycle bin holding DELETED USER FILE CONTENTS.
+# Pure runtime state; must never enter git history (data leak + bloat).
+recover-bin/
+# Full DB dumps + media caches — user data, never source.
+backups/
+host-media-cache/
+media-cache/
+# Rotated logs (the live "*.log" rule above misses "proxy.log.1" etc.).
+*.log.*

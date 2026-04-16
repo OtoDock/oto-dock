@@ -1,0 +1,46 @@
+# OtoDock — build-from-source overlay (contributors / development).
+#
+# Stack this on top of the base file to build the images from this repo
+# instead of pulling the GHCR releases:
+#
+#   scripts/compose.sh up -d --build
+#   (= docker compose -f docker-compose.yml -f docker-compose.build.yml …,
+#    with PYTHON_IMAGE / NODE_IMAGE / POSTGRES_IMAGE sourced from VERSIONS.md
+#    by scripts/versions.sh so the build stays in lockstep with the pins.)
+#
+# The base docker-compose.yml stays pull-only so a downloaded copy works
+# standalone; every build context lives here. Build args left unset fall back
+# to the Dockerfile ARG defaults (a bare `docker compose -f docker-compose.yml
+# -f docker-compose.build.yml up -d --build` works on the baked pins).
+
+services:
+  otodock-proxy:
+    # Never pull the GHCR tag in the source flow — always build (a fresh
+    # machine has no local image and the GHCR release may not exist or may
+    # not match this tree).
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+      args:
+        - PYTHON_IMAGE
+        - NODE_IMAGE
+
+  # Reuses the proxy image. The base file gives this one-shot no build
+  # config, so without this block Compose tries to PULL the GHCR proxy tag
+  # for it — which fails on a machine that has never had the image (fresh
+  # source install). Declaring the same build resolves it to the image the
+  # proxy service just built (pure cache hit, built once).
+  otodock-agents-init:
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+      args:
+        - PYTHON_IMAGE
+        - NODE_IMAGE
+
+  file-tools:
+    pull_policy: build
+    build:
+      context: ./mcps/custom/file-tools-mcp

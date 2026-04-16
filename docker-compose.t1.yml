@@ -1,0 +1,49 @@
+# OtoDock — bare-metal DEV stack (deployment topology T1): PostgreSQL only, for
+# a host-process proxy run from the repo checkout (contributors / development).
+# Normal installs use the default docker-compose.yml (fully-containerised T2).
+#
+#   docker compose --env-file config.env -f docker-compose.t1.yml up -d
+#
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    container_name: otodock-postgres
+    restart: unless-stopped
+    # Secrets live in PLATFORM_ROOT/config.env (proxy/setup.sh auto-generates a
+    # strong POSTGRES_PASSWORD there on a fresh install). Bring this up with
+    # that env file so ${POSTGRES_PASSWORD} resolves:
+    #     docker compose --env-file config.env -f docker-compose.t1.yml up -d
+    # No weak default — compose fails loudly if POSTGRES_PASSWORD is unset, so a
+    # public deploy can never silently ship `otodock:otodock`.
+    environment:
+      POSTGRES_DB: otodock
+      POSTGRES_USER: otodock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in config.env (run proxy/setup.sh) — refusing to init Postgres with a default password}
+    ports:
+      # Loopback-only. A BARE-METAL proxy reaches Postgres at 127.0.0.1:5432 and
+      # it is never exposed on other interfaces. A fully-dockerized proxy instead
+      # reaches it over the compose network as `otodock-postgres:5432` and needs
+      # no host publish at all (drop this block in that deployment; keep it only
+      # if you want a local `psql`).
+      - "127.0.0.1:5432:5432"
+    # The default 64MB /dev/shm makes Postgres throw "could not resize shared
+    # memory segment" under parallel queries / large sorts.
+    shm_size: 256mb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Cap the container's stdout log so the json-file driver can't fill the disk
+    # on a long-running install.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U otodock"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+
+volumes:
+  pgdata:
