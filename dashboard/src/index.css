@@ -1,0 +1,245 @@
+/* Self-hosted webfonts (bundled by Vite) — no CDN requests, so page loads
+   disclose nothing to Google and the fonts work in air-gapped installs.
+   Comfortaa = brand font; JetBrains Mono = interactive-CLI terminal (xterm
+   falls back to the system mono stack if it ever fails to load). */
+@import "@fontsource/comfortaa/300.css";
+@import "@fontsource/comfortaa/400.css";
+@import "@fontsource/comfortaa/500.css";
+@import "@fontsource/comfortaa/600.css";
+@import "@fontsource/comfortaa/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/700.css";
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Dark mode is class-driven: `.dark` on <html> (set by ThemeContext). */
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: 0 0% 98.4%; /* #FAF9F9 */
+  --foreground: 0 0% 20%; /* #333 */
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 20%;
+  --primary: 207 79% 39%; /* #146bb5 */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 0 0% 20%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 0 0% 40%; /* #666 */
+  --border: 0 0% 82%; /* #d0d0d0 */
+  --radius: 0.75rem; /* 12px — OtoDock card radius */
+
+  /* OtoDock semantic tokens */
+  --p-bg: 30 11% 98%;            /* #FAF9F9 */
+  --p-text: 0 0% 20%;            /* #333333 */
+  --p-text-secondary: 0 0% 40%;  /* #666666 */
+  --p-text-light: 0 0% 60%;      /* #999999 */
+  --p-border: 0 0% 82%;          /* #d0d0d0 */
+  --p-border-light: 216 12% 91%; /* #e5e7eb */
+  --p-surface: 0 0% 94%;         /* #efefef */
+  --p-surface-hover: 0 0% 94%;   /* #f0f0f0 */
+  --p-header: 220 10% 24%;       /* #353B45 */
+
+  /* Brand tints */
+  --brand-surface: 204 86% 95%;  /* #e8f4fd */
+  --brand-50: 208 88% 97%;       /* #f0f7fd */
+  --brand-100: 208 90% 93%;      /* #dceefb */
+
+  /* Must MATCH the artifact/mini-app iframes' documents (ui-kit tokens set
+     color-scheme per theme): when the embedded document's used color-scheme
+     differs from the embedding element's, browsers force an OPAQUE canvas
+     behind the (deliberately transparent) artifact body — in dark mode that
+     painted the UA's grey-black instead of our navy bg. */
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 222 30% 8%;
+  --foreground: 210 20% 92%;
+  --card: 222 30% 8%;
+  --card-foreground: 210 20% 92%;
+  --primary: 207 79% 50%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 217 20% 16%;
+  --secondary-foreground: 210 20% 92%;
+  --muted: 217 20% 16%;
+  --muted-foreground: 215 15% 60%;
+  --border: 220 15% 20%;
+
+  /* OtoDock semantic tokens — dark */
+  --p-bg: 224 25% 9%;              /* ~#121620 */
+  --p-text: 210 20% 90%;           /* ~#dde3eb */
+  --p-text-secondary: 215 15% 65%; /* ~#94a3b5 */
+  --p-text-light: 215 10% 45%;     /* ~#67737f */
+  --p-border: 220 15% 20%;         /* ~#2a3040 */
+  --p-border-light: 220 15% 16%;   /* ~#222836 */
+  --p-surface: 222 18% 13%;        /* ~#1a1f2e */
+  --p-surface-hover: 222 18% 16%;  /* ~#21273a */
+  --p-header: 210 20% 85%;         /* ~#cdd5df */
+
+  /* Brand tints — dark */
+  --brand-surface: 215 40% 16%;    /* ~#162238 */
+  --brand-50: 220 35% 12%;         /* ~#111a28 */
+  --brand-100: 215 35% 17%;        /* ~#1a2838 */
+}
+
+/* Map the HSL-variable tokens onto Tailwind's color/radius theme. `inline` keeps
+   the utilities referencing the var() directly so light/dark switching is live.
+   Literal brand/accent hexes are constants (no dark variant). */
+@theme inline {
+  --color-border: hsl(var(--border));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-brand: #146bb5;
+  --color-brand-hover: #0f5a9a;
+  --color-brand-light: #1e7dd1;
+  --color-brand-surface: hsl(var(--brand-surface));
+  --color-brand-50: hsl(var(--brand-50));
+  --color-brand-100: hsl(var(--brand-100));
+
+  --color-p-header: hsl(var(--p-header));
+  --color-p-bg: hsl(var(--p-bg));
+  --color-p-text: hsl(var(--p-text));
+  --color-p-text-secondary: hsl(var(--p-text-secondary));
+  --color-p-text-light: hsl(var(--p-text-light));
+  --color-p-border: hsl(var(--p-border));
+  --color-p-border-light: hsl(var(--p-border-light));
+  --color-p-surface: hsl(var(--p-surface));
+  --color-p-surface-hover: hsl(var(--p-surface-hover));
+
+  --color-p-accent-yellow: #f4b206;
+  --color-p-accent-purple: #673a97;
+  --color-p-accent-red: #da3536;
+  --color-p-accent-teal: #0d9488;
+  --color-p-success: #4CAF50;
+  --color-p-error: #e20000;
+
+  /* Card radius scale — derived from --radius (matches the prior shadcn config).
+     sm/xs stay at Tailwind defaults; md/lg track --radius. */
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    font-family: 'Comfortaa', cursive, sans-serif;
+    @apply bg-p-bg text-p-text;
+  }
+  /* v4 resets interactive elements to cursor:default — restore the pointer. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  /* Mobile viewport fix: dvh accounts for browser URL bar */
+  .h-screen-safe {
+    height: 100vh;
+    height: 100dvh;
+  }
+}
+
+/* User message bubble — copy button uses white/semi-transparent colors */
+.bg-brand .copy-msg-btn,
+.bg-blue-600 .copy-msg-btn {
+  color: rgba(255, 255, 255, 0.5);
+}
+.bg-brand .copy-msg-btn:hover,
+.bg-blue-600 .copy-msg-btn:hover {
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Markdown content — prevent prose from overriding code block styles.
+   Use the vscDarkPlus background instead of transparent so the dark theme shows. */
+.markdown-content pre {
+  background: #1e1e1e !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: none !important;
+}
+
+/* Remove prose default table margins */
+.markdown-content table {
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+
+/* Ensure code blocks don't get prose code styling */
+.code-block-wrapper code {
+  color: inherit !important;
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: inherit !important;
+  border: none !important;
+}
+.code-block-wrapper code::before,
+.code-block-wrapper code::after {
+  content: none !important;
+}
+
+/* Dark mode scrollbar */
+.dark ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.dark ::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: hsl(215 10% 30%);
+  border-radius: 4px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: hsl(215 10% 40%);
+}
+
+/* Hide scrollbar for tight horizontal-scroll rows (chip pickers etc.)
+   where the scrollbar adds vertical noise and isn't needed because the
+   fade-gradient edges already signal scrollability. */
+.scrollbar-hide {
+  scrollbar-width: none;       /* Firefox */
+  -ms-overflow-style: none;    /* IE 10+ */
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;               /* Chrome / Safari / Edge */
+}
+
+/* Interactive-CLI artifact PiP windows + minimized dock icons — a quick
+   pop-in when a window opens or an icon docks. */
+@keyframes oto-pop-in {
+  from { opacity: 0; transform: scale(0.94); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.oto-pop-in { animation: oto-pop-in 0.15s ease-out; }
+
+/* Sidebar chat row while its turn is generating — pulses the row BACKGROUND
+   only (Tailwind's animate-pulse would pulse the title text too). Timing
+   mirrors animate-pulse; pair with motion-reduce:animate-none + a static
+   brand-surface background as the reduced-motion fallback. */
+@keyframes oto-row-live {
+  0%, 100% { background-color: color-mix(in oklab, var(--color-brand-surface) 45%, transparent); }
+  50% { background-color: var(--color-brand-surface); }
+}
+.oto-row-live { animation: oto-row-live 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+/* Purple twin for TASK rows (task list, Active-now strip): the animation
+   property wins over any static bg-* utility, so purple rows need their own
+   keyframes — riding .oto-row-live would pulse them brand blue. */
+@keyframes oto-row-live-purple {
+  0%, 100% { background-color: color-mix(in oklab, var(--color-p-accent-purple) 7%, transparent); }
+  50% { background-color: color-mix(in oklab, var(--color-p-accent-purple) 18%, transparent); }
+}
+.oto-row-live-purple { animation: oto-row-live-purple 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }

@@ -1,0 +1,217 @@
+/* OtoDock UI-kit design tokens — mirrors src/index.css so artifacts look
+   native to the platform in both themes. Loaded by the artifact wrapper.
+   Theme is class-driven: the runtime sets `.dark` on <html>.
+
+   Keep the palette values in sync with src/index.css (the hex comments there
+   are the source of truth). Fonts are declared here because the sandboxed
+   artifact iframe never loads the dashboard's bundled webfonts. */
+
+/* --- Fonts (woff2s copied to /ui-kit/fonts/ at build; latin + greek) --- */
+
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
+  src: url(/ui-kit/fonts/comfortaa-latin-400-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
+  src: url(/ui-kit/fonts/comfortaa-greek-400-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 500;
+  src: url(/ui-kit/fonts/comfortaa-latin-500-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 500;
+  src: url(/ui-kit/fonts/comfortaa-greek-500-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
+  src: url(/ui-kit/fonts/comfortaa-latin-600-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
+  src: url(/ui-kit/fonts/comfortaa-greek-600-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 700;
+  src: url(/ui-kit/fonts/comfortaa-latin-700-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 700;
+  src: url(/ui-kit/fonts/comfortaa-greek-700-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono'; font-style: normal; font-display: swap; font-weight: 400;
+  src: url(/ui-kit/fonts/jetbrains-mono-latin-400-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono'; font-style: normal; font-display: swap; font-weight: 400;
+  src: url(/ui-kit/fonts/jetbrains-mono-greek-400-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono'; font-style: normal; font-display: swap; font-weight: 700;
+  src: url(/ui-kit/fonts/jetbrains-mono-latin-700-normal.woff2) format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono'; font-style: normal; font-display: swap; font-weight: 700;
+  src: url(/ui-kit/fonts/jetbrains-mono-greek-700-normal.woff2) format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+
+/* --- Tokens --- */
+
+:root {
+  --p-bg: #FAF9F9;
+  --p-card: #ffffff;
+  --p-text: #333333;
+  --p-text-secondary: #666666;
+  --p-text-light: #999999;
+  --p-border: #d0d0d0;
+  --p-border-light: #e5e7eb;
+  --p-surface: #efefef;
+  --p-surface-hover: #f0f0f0;
+  --p-primary: #146bb5;
+  --p-primary-fg: #ffffff;
+  --p-brand-surface: #e8f4fd;
+  --p-accent-yellow: #f4b206;
+  --p-accent-purple: #673a97;
+  --p-accent-red: #da3536;
+  --p-accent-teal: #0d9488;
+  --p-success: #4CAF50;
+  --p-error: #e20000;
+  --p-radius: 12px;
+  --p-radius-sm: 8px;
+  --p-shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+  --p-font: 'Comfortaa', ui-rounded, system-ui, -apple-system, sans-serif;
+  --p-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  color-scheme: light;
+}
+
+.dark {
+  --p-bg: #121620;
+  --p-card: #161b26;
+  --p-text: #dde3eb;
+  --p-text-secondary: #94a3b5;
+  --p-text-light: #67737f;
+  --p-border: #2a3040;
+  --p-border-light: #222836;
+  --p-surface: #1a1f2e;
+  --p-surface-hover: #21273a;
+  --p-primary: #2a8de0;
+  --p-primary-fg: #ffffff;
+  --p-brand-surface: #162238;
+  --p-shadow: 0 1px 3px rgba(0,0,0,.4), 0 1px 2px rgba(0,0,0,.3);
+  color-scheme: dark;
+}
+
+/* --- Base --- */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: transparent;            /* seamless in the transcript */
+  color: var(--p-text);
+  font-family: var(--p-font);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  /* Kill the mobile double-tap-to-zoom heuristic inside artifact frames —
+     it makes browsers hold/swallow single taps on interactive controls
+     (buttons needing two presses on phones). Pan/pinch still work. */
+  touch-action: manipulation;
+}
+
+body { padding: 2px; }
+
+h1, h2, h3, h4 { color: var(--p-text); font-weight: 600; line-height: 1.25; margin: 0 0 .5em; }
+h1 { font-size: 1.5rem; } h2 { font-size: 1.25rem; } h3 { font-size: 1.05rem; }
+p { margin: 0 0 .75em; }
+a { color: var(--p-primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+small, .muted { color: var(--p-text-secondary); }
+
+code, pre {
+  font-family: var(--p-mono);
+  font-size: .88em;
+  background: var(--p-surface);
+  border-radius: 4px;
+}
+code { padding: .1em .35em; }
+pre { padding: .7rem .85rem; overflow-x: auto; }
+pre code { padding: 0; background: none; }
+
+/* --- Primitives --- */
+
+/* Card */
+.card {
+  background: var(--p-card);
+  border: 1px solid var(--p-border-light);
+  border-radius: var(--p-radius);
+  box-shadow: var(--p-shadow);
+  padding: 1rem 1.15rem;
+}
+
+/* Table — reads native to the dashboard */
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+thead th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--p-text-secondary);
+  border-bottom: 2px solid var(--p-border);
+  padding: .5rem .7rem;
+  white-space: nowrap;
+}
+tbody td { padding: .5rem .7rem; border-bottom: 1px solid var(--p-border-light); }
+tbody tr:hover { background: var(--p-surface); }
+tbody tr:last-child td { border-bottom: none; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Button */
+.btn {
+  font-family: inherit;
+  font-size: .92rem;
+  font-weight: 500;
+  color: var(--p-text);
+  background: var(--p-surface);
+  border: 1px solid var(--p-border-light);
+  border-radius: var(--p-radius-sm);
+  padding: .5rem .85rem;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, transform .05s;
+}
+.btn:hover { background: var(--p-surface-hover); border-color: var(--p-border); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: var(--p-primary); color: var(--p-primary-fg); border-color: transparent; }
+.btn.primary:hover { filter: brightness(1.06); }
+
+/* Stat block */
+.stat { display: flex; flex-direction: column; gap: .15rem; }
+.stat .value { font-size: 1.65rem; font-weight: 600; color: var(--p-text); font-variant-numeric: tabular-nums; }
+.stat .label { font-size: .78rem; color: var(--p-text-secondary); text-transform: uppercase; letter-spacing: .03em; }
+
+/* Layout helpers */
+.row { display: flex; gap: 1rem; flex-wrap: wrap; }
+.grid { display: grid; gap: 1rem; }
+
+/* Badge (+ status variants) */
+.badge {
+  display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+  font-size: .72rem; font-weight: 600; background: var(--p-brand-surface); color: var(--p-primary);
+}
+.badge.success { background: color-mix(in srgb, var(--p-success) 14%, transparent); color: var(--p-success); }
+.badge.warn { background: color-mix(in srgb, var(--p-accent-yellow) 16%, transparent); color: #a87903; }
+.dark .badge.warn { color: var(--p-accent-yellow); }
+.badge.error { background: color-mix(in srgb, var(--p-error) 12%, transparent); color: var(--p-error); }

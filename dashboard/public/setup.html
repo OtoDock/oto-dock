@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>Connect to Server</title>
+<link href="https://fonts.googleapis.com/css2?family=Comfortaa:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Comfortaa', system-ui, sans-serif;
+    background: #FAF9F9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    /* Safe area insets for notch/status bar/nav bar */
+    padding: calc(env(safe-area-inset-top, 0px) + 1.5rem)
+             calc(env(safe-area-inset-right, 0px) + 1.5rem)
+             calc(env(safe-area-inset-bottom, 0px) + 1.5rem)
+             calc(env(safe-area-inset-left, 0px) + 1.5rem);
+    color: #333;
+  }
+  .card {
+    width: 100%;
+    max-width: 380px;
+    text-align: center;
+  }
+  .logo {
+    width: 72px;
+    height: 72px;
+    margin: 0 auto 1.5rem;
+    border-radius: 16px;
+  }
+  h1 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #666;
+    margin-bottom: 1.5rem;
+    line-height: 1.4;
+  }
+  .error-banner {
+    display: none;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 12px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    font-size: 0.8rem;
+    color: #da3536;
+  }
+  .error-banner.visible { display: block; }
+  .input-group {
+    margin-bottom: 0.75rem;
+  }
+  input[type="url"], input[type="text"] {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-size: 0.9rem;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    background: white;
+    color: #333;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus {
+    border-color: #146bb5;
+    box-shadow: 0 0 0 3px rgba(20, 107, 181, 0.12);
+  }
+  input::placeholder { color: #999; }
+  .msg {
+    font-size: 0.78rem;
+    margin-top: 0.5rem;
+    min-height: 1.2em;
+    transition: color 0.15s;
+  }
+  .msg.error { color: #da3536; }
+  .msg.info { color: #666; }
+  .msg.success { color: #4CAF50; }
+  .btn {
+    width: 100%;
+    padding: 0.75rem;
+    margin-top: 1rem;
+    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: white;
+    background: #146bb5;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .btn:hover { background: #0f5a9a; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .btn-link {
+    width: 100%;
+    margin-top: 10px;
+    background: transparent;
+    color: rgba(255,255,255,0.75);
+    border: none;
+    padding: 10px;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .btn-link:hover { color: #fff; }
+  /* "Server unreachable" → switch to another installation */
+  .installs-picker { display: none; margin-bottom: 1rem; text-align: left; }
+  .installs-picker.visible { display: block; }
+  .picker-label {
+    font-size: 0.8rem; color: #666; margin-bottom: 0.5rem; text-align: center;
+  }
+  .picker-or { font-size: 0.72rem; color: #999; text-align: center; margin-top: 0.75rem; }
+  .inst-row {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: white; border: 1px solid #e5e7eb; border-radius: 12px;
+    padding: 0.6rem 0.75rem; margin-bottom: 0.5rem;
+  }
+  .inst-star {
+    background: transparent; border: none; font-size: 1.15rem; line-height: 1;
+    color: #c4c4c4; cursor: pointer; padding: 0 2px;
+  }
+  .inst-star.on { color: #e6b800; }
+  .inst-meta { flex: 1; min-width: 0; cursor: pointer; }
+  .inst-name {
+    font-size: 0.85rem; font-weight: 600; color: #333;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .inst-host {
+    font-size: 0.72rem; color: #888;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .inst-go {
+    background: #146bb5; color: white; border: none; border-radius: 8px;
+    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-size: 0.78rem; font-weight: 600; padding: 0.45rem 0.8rem; cursor: pointer;
+  }
+  .inst-go:hover { background: #0f5a9a; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <img src="logo.png" alt="Logo" class="logo" onerror="this.style.display='none'">
+    <h1>Connect to Server</h1>
+    <p class="subtitle">Enter the URL of your OtoDock server to get started.</p>
+
+    <div id="error-banner" class="error-banner">
+      Server is unreachable. Check the URL or try again.
+    </div>
+
+    <div id="installs-picker" class="installs-picker">
+      <div class="picker-label">Switch to another installation</div>
+      <div id="installs-list"></div>
+      <div class="picker-or">or enter a server URL</div>
+    </div>
+
+    <div class="input-group">
+      <input
+        id="url-input"
+        type="text"
+        inputmode="url"
+        placeholder="https://your-server.example.com"
+        autocapitalize="none"
+        autocorrect="off"
+        spellcheck="false"
+      >
+      <div id="msg" class="msg"></div>
+    </div>
+
+    <button id="connect-btn" class="btn" onclick="validateAndSave()">
+      Connect
+    </button>
+    <button id="cancel-btn" class="btn-link" onclick="cancelAdd()" style="display:none">
+      Cancel
+    </button>
+  </div>
+
+<script>
+  var urlInput = document.getElementById('url-input');
+  var msgEl = document.getElementById('msg');
+  var btn = document.getElementById('connect-btn');
+
+  // On load: check for error state, and for "add another server" mode (which
+  // is reached from App Settings over an active dashboard, so Cancel returns).
+  (function() {
+    var params = new URLSearchParams(window.location.search);
+    if (params.get('error') === 'unreachable') {
+      document.getElementById('error-banner').classList.add('visible');
+      var savedUrl = params.get('url');
+      if (savedUrl) urlInput.value = decodeURIComponent(savedUrl);
+      // If other installations exist, offer to switch to one instead of forcing
+      // the user to re-type a URL (the unreachable one may be the favorite).
+      renderUnreachablePicker();
+    }
+    if (params.get('mode') === 'add') {
+      document.querySelector('h1').textContent = 'Add a Server';
+      document.querySelector('.subtitle').textContent =
+        'Enter the URL of another OtoDock server to add it.';
+      document.getElementById('cancel-btn').style.display = 'block';
+    }
+  })();
+
+  function cancelAdd() {
+    try { Android.cancelAddInstallation(); } catch (e) { /* not native */ }
+  }
+
+  function hostOf(u) {
+    try { return new URL(u).host; } catch (e) { return u; }
+  }
+
+  // On the "server unreachable" screen, list the OTHER installations so the user
+  // can switch to a reachable one (and optionally re-favorite it) without typing a
+  // URL. No-op on plain web or with <2 installations (Android bridge absent / only
+  // the unreachable one) — the URL prompt stays the sole option.
+  function renderUnreachablePicker() {
+    var installs;
+    try { installs = JSON.parse(Android.getInstallations() || '[]'); }
+    catch (e) { return; }
+    var others = installs.filter(function (i) { return !i.active; });
+    if (others.length === 0) return;
+
+    var listEl = document.getElementById('installs-list');
+    listEl.innerHTML = '';
+    others.forEach(function (inst) {
+      var row = document.createElement('div');
+      row.className = 'inst-row';
+
+      var star = document.createElement('button');
+      star.className = 'inst-star' + (inst.favorite ? ' on' : '');
+      star.textContent = inst.favorite ? '★' : '☆';
+      star.title = inst.favorite ? 'Default installation' : 'Set as default';
+      star.onclick = function (e) {
+        e.stopPropagation();
+        try { Android.setFavorite(inst.id); } catch (err) { /* ignore */ }
+        listEl.querySelectorAll('.inst-star').forEach(function (s) {
+          s.classList.remove('on'); s.textContent = '☆'; s.title = 'Set as default';
+        });
+        star.classList.add('on'); star.textContent = '★';
+        star.title = 'Default installation';
+      };
+
+      var meta = document.createElement('div');
+      meta.className = 'inst-meta';
+      var name = document.createElement('div');
+      name.className = 'inst-name';
+      name.textContent = inst.label || hostOf(inst.url);
+      var host = document.createElement('div');
+      host.className = 'inst-host';
+      host.textContent = hostOf(inst.url);
+      meta.appendChild(name);
+      meta.appendChild(host);
+      meta.onclick = function () { switchTo(inst.id); };
+
+      var go = document.createElement('button');
+      go.className = 'inst-go';
+      go.textContent = 'Switch';
+      go.onclick = function () { switchTo(inst.id); };
+
+      row.appendChild(star);
+      row.appendChild(meta);
+      row.appendChild(go);
+      listEl.appendChild(row);
+    });
+    document.getElementById('installs-picker').classList.add('visible');
+  }
+
+  function switchTo(id) {
+    try { Android.switchFromSetup(id); } catch (e) { /* not native */ }
+  }
+
+  // Submit on Enter key
+  urlInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') validateAndSave();
+  });
+
+  // Callback from Java-side validation (called via evaluateJavascript)
+  window._onValidationResult = function(type, message) {
+    if (type === 'error') {
+      showMsg(message, 'error');
+      resetBtn();
+    }
+    // 'success' case is handled by Java recreate() — page reloads automatically
+  };
+
+  function validateAndSave() {
+    var raw = urlInput.value.trim();
+    if (!raw) {
+      showMsg('Please enter a server URL.', 'error');
+      return;
+    }
+
+    // Basic client-side normalization for display. A bare host defaults to https;
+    // an explicit http:// is allowed through and validated natively (permitted only
+    // for private/LAN addresses, rejected for public hosts).
+    var url = raw;
+    if (url.endsWith('/')) url = url.slice(0, -1);
+    if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
+
+    // Show loading state
+    showMsg('Validating server...', 'info');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Connecting...';
+
+    // Validate from Java (bypasses CORS and forward auth)
+    try {
+      Android.addInstallation(url);
+    } catch (e) {
+      showMsg('Native interface unavailable. Are you running in the app?', 'error');
+      resetBtn();
+    }
+  }
+
+  function showMsg(text, type) {
+    msgEl.textContent = text;
+    msgEl.className = 'msg ' + type;
+  }
+
+  function resetBtn() {
+    btn.disabled = false;
+    btn.textContent = 'Connect';
+  }
+</script>
+</body>
+</html>
