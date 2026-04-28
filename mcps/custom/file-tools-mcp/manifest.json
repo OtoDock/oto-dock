@@ -1,0 +1,54 @@
+{
+  "name": "file-tools",
+  "label": "File Tools",
+  "description": "Document reading, creation, editing, conversion, image manipulation, and live Collabora preview",
+  "version": "1.1.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "docker",
+    "transport": "http",
+    "docker_compose": "docker-compose.yml",
+    "port": 8932,
+    "health_endpoint": "/health",
+    "url_template": "http://${docker_mcp_host}:${port}",
+    "source": "docker:file-tools-mcp + collabora/code",
+    "proxy_callbacks": true
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {
+    "PROXY_URL": "${platform.proxy_url_for_docker}",
+    "HOST_AGENTS_DIR": "${platform.host_agents_dir}",
+    "WOPI_BASE_URL": "${platform.wopi_base_url}",
+    "COLLABORA_FRAME_ANCESTORS": "${platform.collabora_frame_ancestors}",
+    "COLLABORA_SERVICE_ROOT": "${platform.collabora_service_root}",
+    "MCP_PORT": "${platform.mcp_port}"
+  },
+  "agent_env": {},
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "file-tools-usage",
+      "file": "skills/file-tools.md",
+      "description": "Document and image tool descriptions, usage instructions, preview behavior",
+      "default_exclude_from": []
+    },
+    {
+      "id": "photo-editing-guide",
+      "file": "skills/photo-editing.md",
+      "description": "Professional Lightroom-style photo editing workflow and parameter guidelines",
+      "default_exclude_from": []
+    }
+  ],
+
+  "patched": false,
+  "patch_note": null
+}

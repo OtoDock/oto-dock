@@ -1,0 +1,51 @@
+services:
+  file-tools:
+    build: .
+    container_name: file-tools-mcp
+    restart: always
+    ports:
+      # Loopback-only: file-tools RW-mounts the whole agents tree, so its port
+      # must never be reachable off-host. The host-local proxy reaches it on
+      # localhost; nothing external should. (The Docker-compose sibling model
+      # finalizes this via the otodock network + service-DNS instead.)
+      - "127.0.0.1:8932:8932"
+    volumes:
+      # HOST_AGENTS_DIR is consumed at compose time only — the bind-mount source.
+      # Inside the container the mount is hardcoded at /agents (see shared.py).
+      - ${HOST_AGENTS_DIR:-../../../agents}:/agents:rw
+    env_file: .env
+    # MCP_PORT is delivered via .env (auto-generated from manifest by
+    # `services/docker_manager.py::_inject_mcp_env`).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  collabora:
+    image: collabora/code:25.04.9.4.1
+    container_name: collabora-agent
+    restart: always
+    ports:
+      - "9981:9980"
+    environment:
+      - aliasgroup1=${WOPI_BASE_URL:-http://host.docker.internal:8400}
+      # Collabora's start script unquotes `${extra_params}` and passes each
+      # space-separated token as a separate `coolwsd` arg, so each --o:KEY=VAL
+      # must be a single token (no spaces in the value). We pass two overrides:
+      #   --o:net.frame_ancestors=<host>   — single host that may embed the
+      #     iframe. Auto-derived from DASHBOARD_PUBLIC_URL host by the proxy.
+      #     Same-domain sub-path setups don't need this (browser auto-allows
+      #     same origin) but it's harmless when set.
+      #   --o:net.service_root=<path>      — the URL prefix Collabora is
+      #     mounted under (e.g. "/collabora") for same-domain sub-path setups.
+      #     The reverse proxy passes through the full path; Collabora generates
+      #     its WS / cool.html links with this prefix. Empty for subdomain
+      #     setups (e.g. https://collabora.example.com).
+      - "extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true"
+    # `host.docker.internal` resolves to the Linux host gateway so Collabora's
+    # WOPI callbacks can reach the proxy when the proxy runs on the bare-metal
+    # host (the bare-metal default — `WOPI_BASE_URL` auto-derives to
+    # `http://host.docker.internal:${PROXY_PORT}` in that mode). Without this,
+    # admins are forced to set a LAN IP override in `config.env`.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_add:
+      - MKNOD
