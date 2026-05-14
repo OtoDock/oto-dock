@@ -1,0 +1,40 @@
+{
+  "name": "triggers-mcp",
+  "label": "Triggers",
+  "description": "Webhook trigger creation and management. Lets agents configure event-driven webhooks (per-user or per-agent) that fire tasks and/or notifications when external systems (GitHub, Stripe, Linear, IoT, etc.) call the platform.",
+  "version": "1.0.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "TRIG_MCP_AGENT": "${agent_name}",
+    "PROXY_TASK_OWNER": "${session.task_owner}"
+  },
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "trigger-instructions",
+      "file": "docs/trigger-instructions.md",
+      "description": "When and how to use triggers, scope rules, the trigger ↔ task and trigger ↔ notification pairing patterns, webhook setup workflow",
+      "default_exclude_from": []
+    }
+  ],
+
+  "patched": false,
+  "patch_note": null
+}

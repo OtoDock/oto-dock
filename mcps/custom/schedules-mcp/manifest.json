@@ -1,0 +1,43 @@
+{
+  "name": "schedules-mcp",
+  "label": "Schedules",
+  "description": "Scheduled, one-time, and trigger-fired background tasks",
+  "version": "1.0.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "SCHEDULES_MCP_AGENT": "${agent_name}",
+    "SCHEDULES_MCP_ALLOW_ALL": "false",
+    "PROXY_TASK_OWNER": "${session.task_owner}",
+    "PROXY_TASK_USERNAME": "${session.task_username}",
+    "PROXY_TASK_SCOPE": "${session.task_scope}"
+  },
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "task-scheduling",
+      "file": "skills/task-scheduling.md",
+      "description": "When to use scheduled/one-time/trigger tasks vs in-session, scope, completion notifications, self-continuations",
+      "default_exclude_from": []
+    }
+  ],
+
+  "patched": false,
+  "patch_note": null
+}
