@@ -1,0 +1,40 @@
+{
+  "name": "notifications-mcp",
+  "label": "Notifications",
+  "description": "User notification creation and management",
+  "version": "1.0.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "NOTIF_MCP_AGENT": "${agent_name}",
+    "PROXY_TASK_OWNER": "${session.task_owner}"
+  },
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "notification-instructions",
+      "file": "docs/notification-instructions.md",
+      "description": "When and how to use notifications, severity guidelines, scope rules",
+      "default_exclude_from": []
+    }
+  ],
+
+  "patched": false,
+  "patch_note": null
+}

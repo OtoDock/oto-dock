@@ -1,0 +1,42 @@
+{
+  "name": "memory-mcp",
+  "label": "Memory",
+  "description": "Persistent agent memory — the `memory` tool saves, updates, and deletes markdown topic files (shared agent scope + private user scope); content auto-loads into the system prompt",
+  "version": "2.0.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "MEMORY_MCP_AGENT": "${agent_name}",
+    "PROXY_TASK_OWNER": "${session.task_owner}",
+    "PROXY_TASK_USERNAME": "${session.task_username}",
+    "PROXY_TASK_SCOPE": "${session.task_scope}"
+  },
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "memory-usage",
+      "file": "skills/memory.md",
+      "description": "Worked examples for the memory tool (save / revise / forget patterns)",
+      "default_exclude_from": []
+    }
+  ],
+
+  "patched": false,
+  "patch_note": null
+}
