@@ -56,7 +56,11 @@ logger = logging.getLogger("claude-proxy")
 
 # --- App ---
 
-app = FastAPI(title="OtoDock Proxy", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="OtoDock Proxy",
+    version=config.PINNED_OTODOCK_VERSION or "0.0.0",
+    lifespan=lifespan,
+)
 
 register_middlewares(app)
 
