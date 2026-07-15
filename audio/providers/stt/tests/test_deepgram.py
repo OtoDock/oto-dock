@@ -58,3 +58,12 @@ def test_to_deepgram_lang_normalizes_bcp47():
     assert _to_deepgram_lang("en-GB") == "en-GB"
     assert _to_deepgram_lang("el") == "el"         # already a base code (phone path)
     assert _to_deepgram_lang("") == "multi"        # empty → auto-detect
+
+
+async def test_on_error_surfaces_via_pop_fatal_error():
+    stt = DeepgramSTT(api_key="k")
+    assert stt.pop_fatal_error() is None
+    await stt._on_error(None, "invalid credentials")
+    err = stt.pop_fatal_error()
+    assert err is not None and "invalid credentials" in err
+    assert stt.pop_fatal_error() is None  # surfaced once, then cleared

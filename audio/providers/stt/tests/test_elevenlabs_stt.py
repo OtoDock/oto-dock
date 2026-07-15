@@ -168,7 +168,8 @@ async def test_transcribe_file_auth_error(monkeypatch):
 
 class FakeScribeWS:
     """Scripted Scribe realtime endpoint: records client frames, emits a
-    partial per audio chunk and a committed transcript on commit."""
+    partial per audio chunk and a committed transcript on commit. Can also
+    push an unsolicited committed frame (a server-side VAD commit)."""
 
     def __init__(self):
         self.paths: list[str] = []
@@ -177,6 +178,7 @@ class FakeScribeWS:
         self.committed_text = "Καλημέρα κόσμε"
         self.server = None
         self.port = 0
+        self.ws = None  # newest live connection
 
     async def start(self):
         self.server = await websockets.serve(self._handler, "127.0.0.1", 0)
@@ -187,8 +189,18 @@ class FakeScribeWS:
         self.server.close()
         await self.server.wait_closed()
 
+    async def push_committed(self, text: str):
+        await self.ws.send(json.dumps({"message_type": "committed_transcript", "text": text}))
+
+    async def push_error(self, mtype: str, detail: str):
+        await self.ws.send(json.dumps({"message_type": mtype, "error": detail}))
+
+    def commit_frames(self) -> list[dict]:
+        return [f for f in self.frames if f.get("commit")]
+
     async def _handler(self, ws):
         self.paths.append(ws.request.path)
+        self.ws = ws
         await ws.send(json.dumps({"message_type": "session_started", "session_id": "s1"}))
         async for raw in ws:
             msg = json.loads(raw)
@@ -256,7 +268,7 @@ async def test_streaming_lifecycle(fake_scribe):
 async def test_finish_commits_and_drains(fake_scribe):
     stt = ElevenLabsSTT(api_key="k")
     await stt.start(sample_rate=16000)
-    await stt.send_audio(b"\x00" * 320)
+    await stt.send_audio(b"\x00\x10" * 160)  # voiced (RMS 4096, above the gate)
     text = await stt.finish()
     assert text == "Καλημέρα κόσμε"
 
@@ -285,14 +297,99 @@ async def test_recover_after_opening_reconnects(fake_scribe):
 
 
 async def test_drain_and_clear_queue(fake_scribe):
+    voiced = b"\x00\x10" * 160
     stt = ElevenLabsSTT(api_key="k")
     await stt.start(sample_rate=16000)
+    await stt.send_audio(voiced)
     await stt.force_endpoint()
     await asyncio.sleep(0.2)
     assert stt.drain_transcript() == "Καλημέρα κόσμε"
     assert stt.drain_transcript() is None
+    await stt.send_audio(voiced)
     await stt.force_endpoint()
     await asyncio.sleep(0.2)
     stt.clear_queue()
     assert stt.drain_transcript() is None
+    await stt.close()
+
+
+# ── Hallucination guard: no commit / no text without voiced audio ──
+# Whisper-family Scribe invents text when transcribing silence, so a commit
+# covering only gated (zeroed) audio must never happen — and text the server
+# produces for such a span must never surface (live repro 2026-07-15:
+# trailing repeated Greek on mic-stop after a pause).
+
+
+async def test_finish_skips_commit_when_nothing_voiced(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    await stt.send_audio(b"\x00\x01" * 160)  # below-gate noise → zeroed
+    text = await stt.finish()
+    assert text is None
+    assert fake_scribe.commit_frames() == []  # the commit was never sent
+
+
+async def test_commit_resumes_after_new_voiced_audio(fake_scribe):
+    voiced = b"\x00\x10" * 160
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    await stt.send_audio(voiced)
+    await stt.force_endpoint()
+    assert await stt.wait_for_transcript(timeout=2.0) == "Καλημέρα κόσμε"
+    # Committed transcript consumed the buffer → silence-only follow-up commit
+    # is skipped…
+    await stt.send_audio(b"\x00\x01" * 160)
+    await stt.force_endpoint()
+    await asyncio.sleep(0.2)
+    assert len(fake_scribe.commit_frames()) == 1
+    # …but fresh voiced audio re-arms it.
+    await stt.send_audio(voiced)
+    await stt.force_endpoint()
+    assert await stt.wait_for_transcript(timeout=2.0) == "Καλημέρα κόσμε"
+    assert len(fake_scribe.commit_frames()) == 2
+    await stt.close()
+
+
+async def test_silence_only_committed_transcript_is_dropped(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    await stt.send_audio(b"\x00\x01" * 160)  # zeroed — nothing voiced
+    await asyncio.sleep(0.1)
+    # Server VAD commits the silence span anyway and hallucinates text.
+    await fake_scribe.push_committed("Πάει καλά; Πάει καλά.")
+    await asyncio.sleep(0.2)
+    assert stt.drain_transcript() is None
+    # Real speech afterwards still comes through.
+    await stt.send_audio(b"\x00\x10" * 160)
+    await fake_scribe.push_committed("Καλημέρα")
+    await asyncio.sleep(0.2)
+    assert stt.drain_transcript() == "Καλημέρα"
+    await stt.close()
+
+
+async def test_error_frames_surface_via_pop_fatal_error(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    assert stt.pop_fatal_error() is None
+    await fake_scribe.push_error("auth_error", "You must be authenticated to use this endpoint.")
+    await asyncio.sleep(0.2)
+    err = stt.pop_fatal_error()
+    assert err is not None and "auth error" in err and "authenticated" in err
+    assert stt.pop_fatal_error() is None  # surfaced once, then cleared
+    await stt.close()
+
+
+async def test_partials_suppressed_when_nothing_voiced(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000, interim_results=True)
+    # The fake emits a partial for every chunk — with only gated audio sent,
+    # it must not surface (the composer previews partials live).
+    await stt.send_audio(b"\x00\x01" * 160)
+    await asyncio.sleep(0.2)
+    assert stt.pop_interim() is None
+    assert stt.latest_interim == ""
+    # Voiced audio → partials flow again.
+    await stt.send_audio(b"\x00\x10" * 160)
+    await asyncio.sleep(0.2)
+    assert stt.pop_interim() == "kali"
     await stt.close()

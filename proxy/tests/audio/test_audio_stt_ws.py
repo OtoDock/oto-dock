@@ -19,12 +19,17 @@ from ws.audio import ws_audio_stt_handler
 class WsFakeSTT:
     def __init__(self):
         self.started_with: dict = {}
+        self.fatal: str | None = None
 
     async def start(self, language, sample_rate=None, interim_results=False, endpointing_ms=None):
         self.started_with = dict(
             language=language, sample_rate=sample_rate,
             interim_results=interim_results, endpointing_ms=endpointing_ms,
         )
+
+    def pop_fatal_error(self):
+        err, self.fatal = self.fatal, None
+        return err
 
     async def send_audio(self, b):
         pass
@@ -111,3 +116,34 @@ def test_cost_cap_closes(client):
         ws.send_bytes(b"\x00" * 3200)
         msg = ws.receive_json()
         assert msg["type"] == "error" and msg["code"] == "max_seconds"
+
+
+def test_provider_fatal_error_is_forwarded(client):
+    """A provider that dies AFTER connecting (auth/quota error frame) must
+    surface as an error frame — not a mic that silently hears nothing."""
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        assert ws.receive_json() == {"type": "ready"}
+        client.fakes[0].fatal = "ElevenLabs speech-to-text auth error: bad key"
+        ws.send_bytes(b"\x00" * 3200)
+        msg = ws.receive_json()
+        assert msg["type"] == "error" and msg["code"] == "provider"
+        assert "auth error" in msg["message"]
+
+
+def test_provider_start_failure_reports_error(client, monkeypatch):
+    """start() raising (Deepgram bad key fails at connect) sends an error
+    frame before closing instead of dropping the socket silently."""
+    class BoomSTT(WsFakeSTT):
+        async def start(self, *a, **k):
+            raise RuntimeError("Failed to start Deepgram connection")
+
+    def _build(ptype, *, provider_id=None):
+        return BoomSTT(), {"id": 1, "provider_name": "fake", "advanced": {}}
+
+    monkeypatch.setattr(audio_service, "build_chat_provider", _build)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "sample_rate": 16000})
+        msg = ws.receive_json()
+        assert msg["type"] == "error" and msg["code"] == "provider"
+        assert "could not start" in msg["message"]

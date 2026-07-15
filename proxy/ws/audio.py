@@ -80,10 +80,19 @@ async def ws_audio_stt_handler(websocket: WebSocket):
         # its own endpointing (advanced.chat_endpointing_ms) so low-latency call
         # tuning never tightens chat commits; unset → the provider's call value.
         chat_endpointing = (row.get("advanced") or {}).get("chat_endpointing_ms")
-        await provider.start(
-            language, sample_rate=sample_rate, interim_results=True,
-            endpointing_ms=int(chat_endpointing) if chat_endpointing else None,
-        )
+        try:
+            await provider.start(
+                language, sample_rate=sample_rate, interim_results=True,
+                endpointing_ms=int(chat_endpointing) if chat_endpointing else None,
+            )
+        except Exception as e:
+            # A dead mic with no feedback is the worst outcome — tell the client
+            # (bad credential / provider outage land here for Deepgram).
+            logger.warning("chat STT provider %s failed to start: %s", provider_name, e)
+            await websocket.send_json({"type": "error", "code": "provider",
+                                       "message": "Speech-to-text could not start — check the provider configuration"})
+            await websocket.close(code=_CLOSE_INTERNAL)
+            return
         await websocket.send_json({"type": "ready"})
 
         # 3. Stream loop: binary PCM in, transcripts out.
@@ -109,6 +118,15 @@ async def ws_audio_stt_handler(websocket: WebSocket):
                 interim = getattr(provider, "pop_interim", lambda: None)()
                 if interim:
                     await websocket.send_json({"type": "interim", "text": interim})
+                # A provider that died after connecting (auth/quota error frame)
+                # would otherwise look like a mic that hears nothing — forward
+                # the failure so the client can stop and show it.
+                fatal = getattr(provider, "pop_fatal_error", lambda: None)()
+                if fatal:
+                    await websocket.send_json({"type": "error", "code": "provider",
+                                               "message": fatal})
+                    await websocket.close(code=_CLOSE_INTERNAL)
+                    break
                 continue
 
             # Control frame: {"type":"stop"} flushes the final transcript.

@@ -92,6 +92,39 @@ function toEmbedUrl(src: string): string | null {
 const PIP_SUPPORTED =
   typeof document !== 'undefined' && !!(document as any).pictureInPictureEnabled
 
+/**
+ * Follow the PHYSICAL device orientation during web video fullscreen.
+ * The initial landscape lock is a cue, not a pin: devicemotion gravity tells
+ * us how the phone is actually held even while the screen orientation is
+ * locked, and we re-lock to match once the hold is steady. Re-locking (vs
+ * unlock()) keeps rotation working when the OS auto-rotate toggle is off,
+ * where unlock() would snap back to the default orientation instead.
+ * No-ops silently where motion sensors are unavailable (desktop, http).
+ */
+function startOrientationFollow(initial: 'landscape' | 'portrait'): () => void {
+  let current = initial
+  let pendingSince = 0
+  const onMotion = (e: DeviceMotionEvent) => {
+    const g = e.accelerationIncludingGravity
+    const gx = g?.x ?? 0
+    const gy = g?.y ?? 0
+    if (gx * gx + gy * gy < 25) return // flat on a table — no usable signal
+    // 0° = upright portrait, 90° = on its side (either way), 180° = upside down.
+    const angle = Math.abs(Math.atan2(gx, gy) * 180 / Math.PI)
+    const held: 'landscape' | 'portrait' | null =
+      angle > 55 && angle < 125 ? 'landscape' : angle < 35 ? 'portrait' : null
+    if (!held || held === current) { pendingSince = 0; return }
+    const now = Date.now()
+    if (!pendingSince) { pendingSince = now; return }
+    if (now - pendingSince < 500) return // debounce a transient tilt
+    pendingSince = 0
+    current = held
+    try { (screen.orientation as any).lock(held).catch(() => {}) } catch { /* unsupported */ }
+  }
+  window.addEventListener('devicemotion', onMotion)
+  return () => window.removeEventListener('devicemotion', onMotion)
+}
+
 export default function VideoPlayer({
   src, mime, poster, caption, title, downloadName, canDownload = true,
 }: Props) {
@@ -212,24 +245,35 @@ export default function VideoPlayer({
   }, [])
 
   // Fullscreen side-effects: native edge-to-edge + immersive (Android app),
-  // Android/web Back closes fullscreen (not the app), and landscape lock for
-  // wide videos on mobile. All guards no-op on desktop / plain web.
+  // Android/web Back closes fullscreen (not the app), and an initial landscape
+  // rotation for wide videos on mobile — a CUE, not a pin: the physical
+  // orientation is followed afterwards (natively in the app, via
+  // startOrientationFollow on the web) so the user can turn the phone back to
+  // portrait while staying fullscreen. All guards no-op on desktop / plain web.
   useEffect(() => {
     if (!fs) return
     const w = window as any
     const v = videoRef.current
-    const landscape = coarse && !!v && v.videoWidth >= v.videoHeight
+    // videoWidth is 0 until metadata loads — never treat that as "wide" (it
+    // used to rotate PORTRAIT videos to landscape when fullscreen came fast).
+    const landscape = coarse && !!v && v.videoWidth > 0 && v.videoWidth >= v.videoHeight
     const close = () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}) }
+    const native = !!w.Android?.enterVideoFullscreen
     try { w.Android?.enterVideoFullscreen?.(landscape) } catch { /* no native bridge */ }
     w.__otodockVideoFullscreenActive = true       // MainActivity.handleBackAction checks this
     w.__otodockVideoFullscreenClose = close
-    if (landscape) { try { (screen.orientation as any)?.lock?.('landscape') } catch { /* web: unsupported */ } }
+    let stopFollow: (() => void) | null = null
+    if (!native && coarse && (screen.orientation as any)?.lock) {
+      if (landscape) { try { (screen.orientation as any).lock('landscape').catch?.(() => {}) } catch { /* unsupported */ } }
+      stopFollow = startOrientationFollow(landscape ? 'landscape' : 'portrait')
+    }
     let pushed = false
     try { history.pushState({ otoVideoFs: true }, ''); pushed = true } catch { /* ignore */ }
     const onPop = () => close()                   // web Back button closes fullscreen
     window.addEventListener('popstate', onPop)
     return () => {
       window.removeEventListener('popstate', onPop)
+      stopFollow?.()
       try { w.Android?.exitVideoFullscreen?.() } catch { /* ignore */ }
       if (w.__otodockVideoFullscreenActive) {
         w.__otodockVideoFullscreenActive = false

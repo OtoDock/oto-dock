@@ -60,6 +60,14 @@ _PCM_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 # keeps the audio timeline intact for server-side VAD/endpointing while
 # removing the noise the model invents speech from. Normal speech RMS is
 # ~2000-8000; phone-mic ambience with AGC ~100-600.
+#
+# Zeroing alone is NOT enough: Whisper-family models hallucinate on pure
+# silence too, so committing a zeros-only buffer (the mic-stop force_endpoint
+# after a pause) still invents text conditioned on the prior context (observed
+# live 2026-07-15: trailing repeated Greek the user never said). Hence
+# ``_voiced_since_commit``: when nothing voiced was sent since the last
+# commit, commits are skipped and any partial/committed text the server
+# produces anyway is discarded.
 _SILENCE_GATE_RMS = 300
 
 # Real audio keeps flowing this long (audio-time) after the last voiced frame
@@ -105,6 +113,7 @@ class ElevenLabsSTT(STTProvider):
         self._vad_silence_offset_ms = vad_silence_offset_ms
         self._silence_gate_rms = silence_gate_rms
         self._gate_hangover_left = 0.0
+        self._voiced_since_commit = False
         self._ws: websockets.ClientConnection | None = None
         self._reader_task: asyncio.Task | None = None
         self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -112,6 +121,7 @@ class ElevenLabsSTT(STTProvider):
         self._is_open = False
         self._latest_interim = ""
         self._last_interim_sent = ""
+        self._fatal_error: str | None = None
         # Last start() parameters, kept for recover_after_opening reconnects.
         self._active_rate = sample_rate
         self._interim_results = False
@@ -250,6 +260,8 @@ class ElevenLabsSTT(STTProvider):
         self._latest_interim = ""
         self._last_interim_sent = ""
         self._gate_hangover_left = 0.0
+        self._voiced_since_commit = False
+        self._fatal_error = None
         self._transcript_queue = asyncio.Queue()
         self._transcript_ready.clear()
 
@@ -280,11 +292,19 @@ class ElevenLabsSTT(STTProvider):
                 mtype = msg.get("message_type", "")
                 if mtype == "partial_transcript":
                     text = (msg.get("text") or "").strip()
-                    if text:
+                    # Text produced with zero voiced audio in the buffer is
+                    # invented — never surface it (the chat composer previews
+                    # partials live and keeps the last one if no final follows).
+                    if text and self._voiced_since_commit:
                         self._latest_interim = text
                 elif mtype in ("committed_transcript", "committed_transcript_with_timestamps"):
                     text = (msg.get("text") or "").strip()
-                    if text:
+                    voiced = self._voiced_since_commit
+                    self._voiced_since_commit = False  # commit consumed the buffer
+                    if text and not voiced:
+                        logger.info("ElevenLabs STT dropped silence-only transcript "
+                                    f"(hallucination guard): {text[:80]!r}")
+                    elif text:
                         self._log_transcript("Scribe final", text)
                         self._latest_interim = ""
                         self._last_interim_sent = ""
@@ -295,7 +315,11 @@ class ElevenLabsSTT(STTProvider):
                 elif mtype:
                     # Error frames (auth_error, quota_exceeded, rate_limited, …)
                     if "error" in mtype or msg.get("error"):
-                        logger.error(f"ElevenLabs STT {mtype}: {str(msg.get('error') or msg)[:200]}")
+                        detail = str(msg.get("error") or msg)[:200]
+                        logger.error(f"ElevenLabs STT {mtype}: {detail}")
+                        self._fatal_error = (
+                            f"ElevenLabs speech-to-text {mtype.replace('_', ' ')}: {detail}"
+                        )
         except websockets.ConnectionClosed:
             pass
         except Exception as e:
@@ -325,14 +349,24 @@ class ElevenLabsSTT(STTProvider):
         byte's place in the timeline — server VAD still sees the silence gap
         and commits — but the model never hears the noise it hallucinates
         from. A hangover window passes real audio briefly after voiced frames
-        so soft trailing syllables survive."""
-        if self._silence_gate_rms <= 0 or not chunk or len(chunk) % 2:
+        so soft trailing syllables survive.
+
+        Also tracks ``_voiced_since_commit`` for the hallucination guard:
+        pass-through frames (gate disabled, non-pcm16) count as voiced so the
+        guard can never drop audio it didn't inspect; hangover frames don't
+        set it on their own — they only ever follow a voiced frame within the
+        same uncommitted segment."""
+        if not chunk:
+            return chunk
+        if self._silence_gate_rms <= 0 or len(chunk) % 2:
+            self._voiced_since_commit = True
             return chunk  # disabled / odd length (not clean pcm16) → pass through
         samples = array.array("h", chunk)  # native little-endian == pcm_s16le here
         duration_s = len(samples) / float(self._active_rate)
         rms = math.sqrt(sum(x * x for x in samples) / len(samples))
         if rms >= self._silence_gate_rms:
             self._gate_hangover_left = _GATE_HANGOVER_S
+            self._voiced_since_commit = True
             return chunk
         if self._gate_hangover_left > 0:
             self._gate_hangover_left -= duration_s
@@ -344,8 +378,12 @@ class ElevenLabsSTT(STTProvider):
 
     async def force_endpoint(self) -> None:
         """Commit whatever Scribe has buffered — one 20 ms silence frame with
-        ``commit: true`` (the schema requires audio bytes on every chunk)."""
-        if self._ws and self._is_open:
+        ``commit: true`` (the schema requires audio bytes on every chunk).
+
+        Skipped when nothing voiced was sent since the last commit: the
+        buffer is gated zeros, and committing it makes the model transcribe
+        silence — which Whisper-family models hallucinate on."""
+        if self._ws and self._is_open and self._voiced_since_commit:
             silence = b"\x00" * int(self._active_rate * 0.02) * 2
             await self._send_chunk(silence, commit=True)
 
@@ -377,6 +415,10 @@ class ElevenLabsSTT(STTProvider):
     def latest_interim(self) -> str:
         return self._latest_interim
 
+    def pop_fatal_error(self) -> str | None:
+        err, self._fatal_error = self._fatal_error, None
+        return err
+
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
         self._transcript_ready.clear()
         try:
@@ -398,8 +440,12 @@ class ElevenLabsSTT(STTProvider):
             logger.info(f"STT queue cleared ({discarded} items discarded)")
 
     async def finish(self) -> str | None:
-        """Commit pending audio, give the final a moment to arrive, close."""
-        if self._ws and self._is_open:
+        """Commit pending audio, give the final a moment to arrive, close.
+
+        With nothing voiced since the last commit there is nothing worth
+        finalizing — skip the commit AND the wait, so stopping the mic after
+        a pause is instant instead of a hallucination-prone silence commit."""
+        if self._ws and self._is_open and self._voiced_since_commit:
             try:
                 await self.force_endpoint()
                 await asyncio.wait_for(self._transcript_ready.wait(), timeout=1.5)

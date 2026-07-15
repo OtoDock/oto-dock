@@ -9,10 +9,10 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.0.2
+OTODOCK_VERSION=1.1.0
 ```
 
-The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v0.4.0`, `v0.4.1`, `v1.0.0`).
+The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
 
 `-dev` suffix indicates work in progress between releases. Stripped on release.
 
@@ -132,11 +132,11 @@ The platform runs against **exact** Claude Code / Codex CLI versions. `CLAUDE_CO
 ## Downstream community repos
 
 ```
-COMMUNITY_MCPS_VERSION=v0.4.0-dev
-COMMUNITY_AGENTS_VERSION=v0.4.0-dev
+COMMUNITY_MCPS_VERSION=v1.0.0
+COMMUNITY_AGENTS_VERSION=v1.0.0
 ```
 
-Tagged releases of the `OtoDock/community-mcps` and `OtoDock/community-agents` repos — recorded here as the catalog versions validated against this platform release.
+Tagged releases of the `OtoDock/community-mcps` and `OtoDock/community-agents` repos — recorded here as the catalog versions validated against this platform release. These are real tags on those repos, not placeholders: bump the value here only after tagging the catalog repo itself.
 
 
 ## Database schema version

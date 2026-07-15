@@ -12,6 +12,29 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-15
+
+### Added
+
+- Images opened full-screen from a gallery can now be zoomed: pinch on touch,
+  mouse wheel or double-click on desktop, with panning while zoomed. Long
+  captions are shown in full.
+
+### Fixed
+
+- Video fullscreen on mobile no longer pins the screen to landscape: wide
+  videos still rotate as a starting cue, but turning the phone upright rotates
+  the video back to portrait fullscreen. Vertical videos are no longer rotated
+  to landscape when fullscreen starts before the video dimensions are known.
+- ElevenLabs speech-to-text no longer invents trailing text after you stop the
+  chat mic. Stopping after a pause committed a silence-only buffer, which the
+  model would "transcribe" into words never spoken (most noticeable in
+  non-English dictation).
+- A speech-to-text provider that fails (bad API key, quota, connection) now
+  shows an error on the chat mic instead of a mic that hears nothing.
+- Audio settings: the provider API-key row (Save/Remove buttons) no longer
+  overflows the screen on mobile.
+
 ## [1.0.2] — 2026-07-14
 
 ### Added

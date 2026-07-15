@@ -119,7 +119,8 @@ export function ProviderPill({ provider, languages }: { provider: AudioProvider;
             ))}
           </div>
 
-          {/* Credential */}
+          {/* Credential — min-w-0 lets the input shrink below its intrinsic
+              width so the buttons never push past the viewport on mobile */}
           {provider.credential_key && (
             <div className="flex gap-2">
               <input
@@ -127,19 +128,19 @@ export function ProviderPill({ provider, languages }: { provider: AudioProvider;
                 value={credValue}
                 onChange={e => setCredValue(e.target.value)}
                 placeholder={provider.credential_configured ? '********' : 'Enter API key'}
-                className="flex-1 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                className="flex-1 min-w-0 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
               />
               <button
                 onClick={saveCredential}
                 disabled={!credValue.trim() || setCred.isPending}
-                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40"
+                className="shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40"
               >
                 Save
               </button>
               {provider.credential_configured && (
                 <button
                   onClick={() => { if (confirm(`Remove ${provider.label} API key?`)) delCred.mutate(provider.id) }}
-                  className="px-3 py-1.5 text-xs rounded-lg border border-red-200 text-red-500 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20"
+                  className="shrink-0 px-3 py-1.5 text-xs rounded-lg border border-red-200 text-red-500 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20"
                 >
                   Remove
                 </button>
@@ -161,7 +162,7 @@ export function ProviderPill({ provider, languages }: { provider: AudioProvider;
                   <input
                     defaultValue={provider.voices[lang] || ''}
                     onBlur={e => { if (e.target.value !== (provider.voices[lang] || '')) saveVoice(lang, e.target.value) }}
-                    className="flex-1 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                    className="flex-1 min-w-0 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
                     placeholder="Voice UUID"
                   />
                   <SavedBadge show={saved === `voice_${lang}`} />

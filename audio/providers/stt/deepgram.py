@@ -100,6 +100,7 @@ class DeepgramSTT(STTProvider):
         self._last_interim_sent = ""  # dedup guard for pop_interim()
         self._interim_results = False  # mode last requested in start() (kept on reconnect)
         self._endpointing_override: int | None = None  # per-connection override (kept on reconnect)
+        self._fatal_error: str | None = None  # last Error event, surfaced once via pop_fatal_error
 
     # ── Factory / metadata ─────────────────────────────────────────
 
@@ -220,6 +221,7 @@ class DeepgramSTT(STTProvider):
         language = _to_deepgram_lang(language)
         self._latest_interim = ""
         self._last_interim_sent = ""
+        self._fatal_error = None
         self._interim_results = interim_results
         self._endpointing_override = endpointing_ms
         self._transcript_queue = asyncio.Queue()
@@ -503,6 +505,11 @@ class DeepgramSTT(STTProvider):
     async def _on_error(self, _conn, error, **kwargs) -> None:
         """Handle errors from Deepgram."""
         logger.error(f"Deepgram error: {error}")
+        self._fatal_error = f"Deepgram speech-to-text error: {str(error)[:200]}"
+
+    def pop_fatal_error(self) -> str | None:
+        err, self._fatal_error = self._fatal_error, None
+        return err
 
     async def _on_close(self, _conn, close, _gen: int = 0, **kwargs) -> None:
         """Handle connection close.

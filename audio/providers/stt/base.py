@@ -175,6 +175,15 @@ class STTProvider(ABC):
         """
         return ""
 
+    def pop_fatal_error(self) -> str | None:
+        """Fatal stream failure (auth/quota/connection) to surface to the
+        client, returned ONCE then cleared; ``None`` while healthy. Consumers
+        (the chat STT WebSocket) poll this alongside ``drain_transcript`` —
+        without it a provider that dies after connecting looks like a mic
+        that hears nothing. Default: no fatal-error surface.
+        """
+        return None
+
     @abstractmethod
     async def close(self) -> None:
         """Close the connection without waiting for final transcript."""
