@@ -9,10 +9,15 @@ everyone who self-hosts it.
 
 ## Supported versions
 
+Security fixes ship for the latest minor release line. Upgrading is
+`docker compose pull && docker compose up -d` — see the
+[CHANGELOG](CHANGELOG.md) before you pull.
+
 | Version | Supported |
 | ------- | --------- |
-| 0.4.x   | ✅        |
-| < 0.4   | ❌        |
+| 1.1.x   | ✅        |
+| 1.0.x   | ✅        |
+| < 1.0   | ❌        |
 
 ## Reporting a vulnerability
 
