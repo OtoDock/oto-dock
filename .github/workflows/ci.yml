@@ -1,8 +1,10 @@
 name: ci
 
 # The public test gates: the proxy pytest suite against a disposable Postgres
-# service container, plus the dashboard typecheck / build / vitest. Same
-# commands as a local run — see proxy/tests/README.md ("CI" section).
+# service container, the audio package's own suite (NOT collected by the
+# proxy run — its testpaths live in audio/pyproject.toml), plus the dashboard
+# typecheck / build / vitest. Same commands as a local run — see
+# proxy/tests/README.md ("CI" section).
 
 on:
   workflow_dispatch: {}
@@ -12,6 +14,12 @@ on:
 
 permissions:
   contents: read
+
+# A force-push to a PR branch cancels the now-stale run; pushes to main
+# always run to completion (their results guard the release flow).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   proxy:
@@ -61,6 +69,12 @@ jobs:
         env:
           TEST_DATABASE_URL: postgresql://otodock:otodock@localhost:5432/otodock_test
         run: python -m pytest -n 8 -q
+
+      - name: pytest (audio package)
+        # Colocated per-subpackage tests (providers/*/tests, streaming/tests)
+        # discovered via audio/pyproject.toml testpaths.
+        working-directory: audio
+        run: python -m pytest -q
 
   dashboard:
     if: github.repository == 'OtoDock/oto-dock'

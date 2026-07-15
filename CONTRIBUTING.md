@@ -60,6 +60,14 @@ The suite needs a reachable PostgreSQL (the dev stack's container on
 `otodock_test` database; point `TEST_DATABASE_URL` elsewhere if your Postgres
 lives somewhere else.
 
+**Audio package** (shares the proxy's Python env; its tests are colocated
+with each subpackage and are *not* collected by the proxy run):
+
+```bash
+python -m pip install ./audio   # from the repo root, once
+cd audio && pytest
+```
+
 **Dashboard:**
 
 ```bash
@@ -83,13 +91,31 @@ npx vitest run                      # unit tests
 ## Pull requests
 
 - Keep PRs focused — one concern per PR reviews quickly.
-- CI must be green (proxy suite + dashboard type-check/build/tests).
+- CI runs automatically on every PR (proxy + audio suites against a
+  disposable Postgres, dashboard type-check/build/tests) and must be green —
+  merging is blocked until it is.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.
 - **AI-assisted contributions** are welcome — much of OtoDock is built that
   way. The bar is the same as for any PR: you understand and stand behind
   every line you submit, tests ride along, and CI is green. Please don't
   open large generated PRs you haven't reviewed yourself.
+
+## How your PR gets merged
+
+This repository is a curated export of OtoDock's internal development tree,
+and its history is release-sized on purpose (see the
+[CHANGELOG](CHANGELOG.md)). For pull requests that means one extra step you
+don't have to do anything for:
+
+1. CI validates your PR and a maintainer reviews it.
+2. Once accepted, your commits are applied to the internal tree first — with
+   **you as the commit author** — where they run through the full internal
+   gates alongside the components that aren't public yet.
+3. Your PR is then merged here, and the change ships (and is credited) in the
+   next release.
+
+A short gap between approval and merge is that porting step, not a stall.
 
 ## Licensing of contributions
 

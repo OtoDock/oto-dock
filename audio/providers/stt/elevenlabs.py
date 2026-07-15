@@ -302,8 +302,11 @@ class ElevenLabsSTT(STTProvider):
                     voiced = self._voiced_since_commit
                     self._voiced_since_commit = False  # commit consumed the buffer
                     if text and not voiced:
-                        logger.info("ElevenLabs STT dropped silence-only transcript "
-                                    f"(hallucination guard): {text[:80]!r}")
+                        # The dropped text is still a transcript (Rule #1) —
+                        # only the DEBUG-gated policy path may carry it.
+                        logger.info("ElevenLabs STT dropped a silence-only "
+                                    "transcript (hallucination guard)")
+                        self._log_transcript("Scribe dropped", text)
                     elif text:
                         self._log_transcript("Scribe final", text)
                         self._latest_interim = ""
