@@ -159,7 +159,7 @@ def test_stt_session_mint(client):
     r = client.post("/v1/audio/stt/session", json={"provider_id": 5})
     assert r.status_code == 200
     body = r.json()
-    assert "ws_token" in body and body["max_seconds"] == 60
+    assert "ws_token" in body and body["max_seconds"] == 180
 
 
 def test_stt_session_blocked_when_disabled(client):

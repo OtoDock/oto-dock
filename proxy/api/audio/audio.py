@@ -531,7 +531,7 @@ async def mint_stt_session(
             raise HTTPException(status_code=503, detail="No chat STT provider configured")
         provider_id = default["id"]
 
-    max_seconds = _int_setting("audio_chat_stt_max_seconds", 60)
+    max_seconds = _int_setting("audio_chat_stt_max_seconds", 180)
     return ws_audio_token.create_ws_audio_token(user.sub, max_seconds=max_seconds, provider_id=provider_id)
 
 

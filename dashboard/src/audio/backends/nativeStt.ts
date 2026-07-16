@@ -107,6 +107,10 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
   const h = { partial: (_: string) => {}, final: (_: string) => {}, error: (_: Error) => {}, end: () => {} }
   let last = ''
   let ended = false
+  // stop() during an in-flight start() (the permission/availability awaits):
+  // start() must abort at its next checkpoint or the recognizer opens as a
+  // background session the UI no longer shows.
+  let stopped = false
   let timer: ReturnType<typeof setTimeout> | null = null
 
   const finalize = async () => {
@@ -153,6 +157,7 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
           throw new Error('Microphone permission denied. Enable it in Settings → Apps → OtoDock → Permissions.')
         }
       }
+      if (stopped) return
       const avail = await sr.available().catch(() => ({ available: false }))
       if (!avail.available) {
         throw new Error('On-device speech recognition is unavailable here. Install/enable Google’s speech services, or set Dictation to “platform” in Audio settings.')
@@ -161,6 +166,7 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
       // streams partial results on modern Android (the legacy path does not on
       // Android 13+).
       const onDevice = await sr.isOnDeviceRecognitionAvailable({ language: opts.language }).catch(() => ({ available: false }))
+      if (stopped) return
 
       await sr.addListener('partialResults', (d) => {
         const m = d.matches?.[0] || d.accumulatedText
@@ -175,6 +181,10 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
         if (last) { void finalize() }
         else { h.error(new Error(d.message || `Speech recognition error${d.code ? ` (${d.code})` : ''}`)); void finalize() }
       })
+      if (stopped) { // stopped while connecting — never open the recognizer
+        await sr.removeAllListeners().catch(() => {})
+        return
+      }
       scheduleFinalize(30000) // safety net — never leave the mic stuck
       const res = await sr.start({
         language: opts.language, partialResults: true, popup: false,
@@ -185,6 +195,7 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
       if (typeof m === 'string' && m) { last = m; void finalize() }
     },
     async stop() {
+      stopped = true
       const sr = await loadSR()
       try { await sr.stop() } catch { /* ignore */ }
       scheduleFinalize(600) // catch the trailing final, then finalize

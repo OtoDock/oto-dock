@@ -80,20 +80,29 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
     return pairs
   }, [storeActive, seed.data, byChat])
 
-  // Re-seed (debounced) when an active id has no metadata — a foreign chat
-  // that went live after the last seed.
+  // Re-seed (debounced) when an active id has no SEED metadata — any chat
+  // that went live after the last seed. The store's WS slice carries the
+  // agent but never the TITLE, so gating this on "store knows the agent"
+  // (the old condition) left own-agent rows renderable but permanently
+  // titled "New chat" — visible in the sidebar's task mode, where own live
+  // chats stay in the strip (chat mode dedups them into the list below).
+  // Once per id: the seed enumerates currently-streaming ids server-side,
+  // so a single refetch after the id appears either supplies the metadata
+  // or never will (visibility-filtered) — retrying would be polling.
   const lastReseedRef = useRef(0)
+  const reseededIdsRef = useRef(new Set<string>())
   useEffect(() => {
     if (!enabled) return
-    const unknown = [...activePairs.keys()].some(
-      (id) => !metaById.has(id) && !byChat[id]?.agent,
+    const unknown = [...activePairs.keys()].filter(
+      (id) => !metaById.has(id) && !reseededIdsRef.current.has(id),
     )
-    if (!unknown) return
+    if (unknown.length === 0) return
     const now = Date.now()
     if (now - lastReseedRef.current < RESEED_MIN_INTERVAL_MS) return
     lastReseedRef.current = now
+    for (const id of unknown) reseededIdsRef.current.add(id)
     void seed.refetch()
-  }, [activePairs, metaById, byChat, seed, enabled])
+  }, [activePairs, metaById, seed, enabled])
 
   // Finished retention: ids that WERE shown and just left the active set stay
   // as phase 'finished' — for FINISHED_LINGER_MS always, and PAST the linger

@@ -12,6 +12,32 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-07-16
+
+### Changed
+
+- Chat dictation can now run up to 3 minutes per take (was 60 seconds, which
+  cut long dictations off mid-sentence). Admins can tune this with the
+  `audio_chat_stt_max_seconds` setting.
+
+### Fixed
+
+- Live voice mode no longer sends truncated turns. The auto-send fired the
+  moment the silence timer expired, racing the speech provider's own
+  end-of-utterance commit — long turns went out with the tail missing and
+  anything said after was lost. The mic now stops first, the provider flushes
+  everything it heard, and the full transcript is what gets sent. Stopping
+  dictation likewise waits briefly for that flush, so the last sentence is
+  never dropped.
+- Dictation no longer doubles your sentences. Two ways a hidden second
+  recording session could be left running — a slow microphone connect timing
+  out, and stopping the mic while it was still connecting — meant a retry had
+  multiple sessions transcribing the same microphone, so every sentence landed
+  in the input twice (or more, stacking with each retry).
+- The sidebar's "Active now" strip shows the real titles of live chats (it
+  showed "New chat" for chats that started after the page loaded — most
+  visible in the task-history view).
+
 ## [1.1.0] — 2026-07-15
 
 ### Added
@@ -92,7 +118,9 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/OtoDock/oto-dock/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/OtoDock/oto-dock/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/OtoDock/oto-dock/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/OtoDock/oto-dock/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/OtoDock/oto-dock/releases/tag/v1.0.0

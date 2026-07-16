@@ -93,7 +93,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.1}
     restart: unless-stopped
     logging: *default-logging
     # Memory cap — DEFAULT 0 = unlimited (the proxy uses all host RAM for max
@@ -215,7 +215,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.1}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -238,7 +238,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.1.0}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.1.1}
     restart: unless-stopped
     logging: *default-logging
     environment:

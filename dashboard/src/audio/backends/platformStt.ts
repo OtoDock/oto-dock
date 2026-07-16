@@ -41,6 +41,12 @@ export const platformStt: STTBackend = {
     let ctx: AudioContext | null = null
     let node: ScriptProcessorNode | null = null
     let source: MediaStreamAudioSourceNode | null = null
+    // stop() arrived while start() was still in flight. stop()'s teardown is a
+    // no-op at that point (nothing created yet), so start() must abort ITSELF
+    // at its next checkpoint — otherwise it opens the mic and reaches ready
+    // as a background session the UI no longer shows (the "invisible second
+    // recorder" that doubled every dictated sentence, live repro 2026-07-16).
+    let stopping = false
     const handlers = {
       partial: (_: string) => {},
       final: (_: string) => {},
@@ -63,15 +69,19 @@ export const platformStt: STTBackend = {
           method: 'POST',
           body: JSON.stringify({ provider_id: opts.providerId ?? null }),
         })
+        if (stopping) return // stopped during the mint — nothing was opened
         if (!sessRes.ok) throw new Error(`Could not start STT session (${sessRes.status})`)
         const { ws_token } = await sessRes.json()
+        if (stopping) return
 
         // 2. Mic.
         stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        if (stopping) { teardown(); return } // stopped while the mic opened
         ctx = new AudioContext()
         // Autoplay policy can leave a fresh AudioContext "suspended"; the mic tap
         // is a user gesture, so resume it so audioprocess actually fires.
         await ctx.resume().catch(() => {})
+        if (stopping) { teardown(); return }
         source = ctx.createMediaStreamSource(stream)
         node = ctx.createScriptProcessor(4096, 1, 1)
 
@@ -100,8 +110,15 @@ export const platformStt: STTBackend = {
               handlers.error(new Error(msg.message || 'STT error'))
             }
           }
-          sock.onclose = () => { teardown(); handlers.end() }
+          // Rejecting after resolve is inert — this also settles the await
+          // when a mid-connect stop() closes the socket, instead of hanging.
+          sock.onclose = () => { teardown(); handlers.end(); reject(new Error('STT socket closed')) }
         })
+        if (stopping) { // stopped while connecting — never start pumping
+          try { sock.close() } catch { /* ignore */ }
+          teardown()
+          return
+        }
 
         // 4. Pump PCM once the server is ready.
         node.onaudioprocess = (e) => {
@@ -114,12 +131,28 @@ export const platformStt: STTBackend = {
       },
 
       async stop() {
-        try {
-          if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'stop' }))
-        } catch { /* ignore */ }
-        teardown()
-        try { ws?.close() } catch { /* ignore */ }
+        stopping = true
+        const sock = ws
         ws = null
+        teardown() // release the mic immediately — the flush below is receive-only
+        if (sock && sock.readyState === WebSocket.OPEN) {
+          try { sock.send(JSON.stringify({ type: 'stop' })) } catch { /* ignore */ }
+          // The server flushes the buffered tail as one last {"final"} before
+          // closing. WAIT for it (bounded) instead of closing instantly —
+          // close() raced that frame, and whatever the user said since the
+          // last VAD commit was silently dropped (the truncated live-mode
+          // sends, 2026-07-16). The property onmessage handler still runs
+          // first, so the final reaches h.final before we proceed.
+          await new Promise<void>((resolve) => {
+            const done = () => { clearTimeout(timer); resolve() }
+            const timer = setTimeout(done, 1800)
+            sock.addEventListener('message', (ev) => {
+              try { if (JSON.parse((ev as MessageEvent).data).type === 'final') done() } catch { /* not JSON */ }
+            })
+            sock.addEventListener('close', done)
+          })
+        }
+        try { sock?.close() } catch { /* ignore */ }
       },
 
       onPartial(h) { handlers.partial = h },

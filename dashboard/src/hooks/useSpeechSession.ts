@@ -56,9 +56,6 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
   const [status, setStatus] = useState<SpeechStatus>('idle')
 
   const sessionRef = useRef<STTSession | null>(null)
-  const erroredRef = useRef(false)     // this session hit an error → suppress onCommit
-  const committedRef = useRef(false)   // onCommit fired once per session
-  const finalsRef = useRef('')         // accumulated finals for onCommit(text)
   // Handlers may change every render; keep a live ref so the once-set session
   // callbacks always call the latest (avoids stale closures).
   const hRef = useRef(handlers)
@@ -80,41 +77,90 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     if (!backend || !cap) { hRef.current.onError?.('Microphone unavailable.'); return }
 
     setStatus('connecting')
-    erroredRef.current = false
-    committedRef.current = false
-    finalsRef.current = ''
     hRef.current.onActive?.(true)
 
+    // PER-ATTEMPT state, deliberately closure-local: a stopped session's
+    // events land LATE (the server's stop flush takes ~1.5s before its socket
+    // closes), often while the NEXT session is already connecting. Hook-level
+    // accumulators let the stale session commit/poison the new one's state.
+    let finals = ''       // accumulated finals for onCommit(text)
+    let committed = false // onCommit fired once per attempt
+    let errored = false   // attempt hit an error → suppress onCommit
+
     const fireCommit = () => {
-      if (erroredRef.current || committedRef.current) return
-      committedRef.current = true
-      hRef.current.onCommit?.(finalsRef.current.trim())
+      if (errored || committed) return
+      committed = true
+      hRef.current.onCommit?.(finals.trim())
     }
 
     const runWith = async (b: STTBackend) => {
       const session = b.create({ language: prefs?.stt_language || browserSttLang(), providerId: cap.stt_provider_id })
-      session.onPartial((t) => { if (t) hRef.current.onInterim?.(t) })
+      // Set when start() fails or times out. withTimeout REJECTS but the
+      // underlying start keeps running — without this flag (and the stop()
+      // in the catch) a slow platform connect leaves a ZOMBIE session whose
+      // late 'ready' attaches the mic pump and keeps feeding these handlers.
+      // The user retries the mic, and two live sessions transcribe the same
+      // microphone: every finalized sentence lands in the composer twice
+      // (live repro 2026-07-16: paired 60s max_seconds usage records).
+      // Note: a session stopped by the USER stays undead on purpose — its
+      // tail final (the server's stop flush) must still be delivered.
+      let dead = false
+      session.onPartial((t) => { if (!dead && t) hRef.current.onInterim?.(t) })
       session.onFinal((t) => {
+        if (dead) return
         const v = t.trim()
         if (!v) return
-        finalsRef.current = finalsRef.current ? `${finalsRef.current} ${v}` : v
+        finals = finals ? `${finals} ${v}` : v
         hRef.current.onFinal?.(v)
       })
       session.onError((e) => {
-        erroredRef.current = true
+        if (dead) return // the connect failure was already surfaced
+        errored = true
         hRef.current.onError?.(e?.message || 'Microphone error.')
-        setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
+        // Only the CURRENT session may flip the hook's state — a stopped
+        // session's late error must not knock out its successor.
+        if (sessionRef.current === session) {
+          setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
+        }
       })
       // Clean end (silence or user-stop, never an error).
       session.onEnd(() => {
-        setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
+        if (dead) return
+        // Same stale-guard: a stopped session's close event lands LATE (the
+        // server stop-flush runs first) — often while the next session is
+        // CONNECTING. Without the guard it reset status to idle and cleared
+        // sessionRef, so the new session came up with a dead icon while
+        // recording in the background (live repro 2026-07-16, third window).
+        if (sessionRef.current === session) {
+          setStatus('idle'); hRef.current.onActive?.(false); sessionRef.current = null
+        }
         fireCommit()
       })
       sessionRef.current = session
       // Hold "connecting" until the recognizer is genuinely ready (session.start()
       // resolves on the real ready event for the platform WS) AND a minimum beat.
-      await Promise.all([withTimeout(session.start(), CONNECT_TIMEOUT_MS), sleep(MIN_CONNECTING_MS)])
-      if (sessionRef.current === session) setStatus('recording')  // unless stopped meanwhile
+      try {
+        await Promise.all([withTimeout(session.start(), CONNECT_TIMEOUT_MS), sleep(MIN_CONNECTING_MS)])
+      } catch (e) {
+        dead = true
+        session.stop().catch(() => {}) // release the mic/socket the failed start may still hold
+        if (sessionRef.current !== session) return // user already stopped it — nothing to report
+        sessionRef.current = null
+        throw e
+      }
+      if (sessionRef.current !== session) {
+        // Detached (stopped) while connecting: that early stop() may have run
+        // BEFORE start() had created the mic/socket, in which case its
+        // teardown was a no-op and the session just came up in the background
+        // — the second zombie window (live repro 2026-07-16: UI idle, mic
+        // recording, duplicates stacking per retry). Kill it now that its
+        // resources exist; the backend's own stopping-flag checkpoints make
+        // this belt-and-braces.
+        dead = true
+        session.stop().catch(() => {})
+        return
+      }
+      setStatus('recording')
     }
 
     try {

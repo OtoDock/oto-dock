@@ -82,4 +82,29 @@ describe('useActiveChats', () => {
       { timeout: FINISHED_LINGER_MS + 2_000 },
     )
   })
+
+  it('re-seeds for a store-known chat so its real title replaces New chat', async () => {
+    // Regression (2026-07-16): a chat that went live AFTER the seed has its
+    // agent in the store (WS events) but no seed metadata — the old re-seed
+    // condition was vetoed by the store agent, leaving the row permanently
+    // titled "New chat" in the sidebar's task mode.
+    seedSpy
+      .mockResolvedValueOnce([]) // initial seed predates the chat
+      .mockResolvedValue([
+        { id: 'h2', agent: 'alpha', title: 'Stripe Live Mode Migration', status: 'streaming' },
+      ])
+    const { result } = renderHook(() => useActiveChats(), { wrapper })
+    await waitFor(() => expect(seedSpy).toHaveBeenCalledTimes(1))
+    act(() => {
+      useChatStore.getState().beginWarmup('h2', { agent: 'alpha' })
+      useChatStore.getState().setStreaming('h2')
+    })
+    // Renderable immediately from the store (title still the placeholder)…
+    await waitFor(() => expect(result.current).toHaveLength(1))
+    // …and the re-seed supplies the real title.
+    await waitFor(() =>
+      expect(result.current[0]).toMatchObject({ id: 'h2', title: 'Stripe Live Mode Migration' }),
+    )
+    expect(seedSpy).toHaveBeenCalledTimes(2)
+  })
 })

@@ -2,14 +2,18 @@
 // (immediately left of Send). Default: just the mic (dictation). Tap or slide-left
 // to reveal/enable LIVE mode, a hands-free half-duplex conversation:
 //
-//   listen → (you stop talking) auto-send + CLOSE the mic → the reply is spoken
-//   (mic stays closed: no echo, no Deepgram max-seconds) → on TTS end OR a mic tap
-//   the mic re-opens (a fresh STT session) and listens again.
+//   listen → (you stop talking) the mic CLOSES and the provider flushes its
+//   tail → the FULL transcript auto-sends → the reply is spoken (mic stays
+//   closed: no echo, no provider max-seconds) → on TTS end OR a mic tap the
+//   mic re-opens (a fresh STT session) and listens again.
 //
-// End-of-turn is detected client-side: native Web Speech ends on its own silence,
-// and the platform (Deepgram) WS — which never ends on silence — is closed by a
-// silence timer. Either way the STT connection is torn down between turns, so it
-// can't accumulate audio or carry a transcript into the next message.
+// End-of-turn is detected client-side: native Web Speech ends on its own
+// silence; the platform WS — which never ends on silence — is stopped by a
+// silence timer. Either way the SEND happens from onCommit, AFTER the stop
+// flush delivered everything (sending at timer expiry raced the provider's
+// end-of-utterance commit and truncated long turns). The STT connection is
+// torn down between turns, so it can't carry a transcript into the next
+// message.
 //
 // The TTS side (speaking the reply) lives in useVoiceMode (parent); this owns the
 // mic + the loop and reacts to `speaking`.
@@ -38,7 +42,7 @@ export interface VoiceControlProps {
   disabled?: boolean
 }
 
-type Phase = 'off' | 'listen' | 'await' | 'paused'
+type Phase = 'off' | 'listen' | 'flush' | 'await' | 'paused'
 
 export function VoiceControl({
   ttsAvailable, live, onSetLive, speaking, onBargeIn, streaming,
@@ -51,7 +55,6 @@ export function VoiceControl({
   const didMountRef = useRef(false)
   const dragRef = useRef<{ x: number; slid: boolean } | null>(null)  // slide-to-enable gesture
   const interruptMounted = useRef(false)
-  const liveBufRef = useRef('')          // accumulated finals for this live turn
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const endRef = useRef<() => void>(() => {})  // end-of-turn (assigned after `speech`)
 
@@ -67,35 +70,42 @@ export function VoiceControl({
 
   const speech = useSpeechSession({
     onInterim: (t) => { onDictateInterim(t); if (live) armSilence(SILENCE_MS) },
-    onFinal: (t) => {
-      onDictateFinal(t)
-      if (live) { liveBufRef.current = liveBufRef.current ? `${liveBufRef.current} ${t}` : t; armSilence(SILENCE_MS) }
-    },
+    onFinal: (t) => { onDictateFinal(t); if (live) armSilence(SILENCE_MS) },
     onActive: (a) => {
       onDictateActive(a)
       if (live) { if (a) armSilence(NO_SPEECH_MS); else clearSilence() }
     },
-    onCommit: () => { if (live) endRef.current() },   // native silence-end path
+    // The turn's text is the session's FULL accumulated transcript, delivered
+    // AFTER the stop flush — never a locally-buffered subset. The old path
+    // sent a client-side finals buffer the moment the silence timer fired,
+    // which RACED the provider's end-of-utterance commit (client 1.7s vs
+    // server 1.5s + network): long turns went out with the whole tail
+    // missing (live repro 2026-07-16). 'flush' = we stopped on silence;
+    // 'listen' = a native recognizer ended on its own silence detection.
+    onCommit: (text) => {
+      if (!live) return
+      if (phaseRef.current !== 'flush' && phaseRef.current !== 'listen') return
+      clearSilence()
+      const t = text.trim()
+      if (t) {
+        phaseRef.current = 'await'
+        sawActivityRef.current = false
+        onSendText(t)
+        onClearInput()
+      } else {
+        phaseRef.current = 'paused'  // nothing said → wait for a tap
+      }
+    },
     onError: (msg) => { showError(msg); clearSilence(); if (live) phaseRef.current = 'paused' },
   })
 
-  // End the live turn: send what was heard + CLOSE the mic (or, if nothing was
-  // said, just close + pause). Idempotent via the phase guard.
+  // End the live turn: STOP the mic and let the flush deliver the transcript —
+  // onCommit above does the send. Idempotent via the phase guard.
   endRef.current = () => {
     if (phaseRef.current !== 'listen') return
     clearSilence()
-    const text = liveBufRef.current.trim()
-    liveBufRef.current = ''
-    if (text) {
-      phaseRef.current = 'await'
-      sawActivityRef.current = false
-      speech.stop()        // tear the STT down for the whole reply
-      onSendText(text)
-      onClearInput()
-    } else {
-      phaseRef.current = 'paused'
-      speech.stop()        // nothing said → close + wait for a tap
-    }
+    phaseRef.current = 'flush'
+    speech.stop()
   }
 
   // Live enable/disable (NOT on mount — a persisted "on" shouldn't open the mic on
@@ -107,7 +117,7 @@ export function VoiceControl({
       return
     }
     if (live) {
-      phaseRef.current = 'listen'; sawActivityRef.current = false; liveBufRef.current = ''
+      phaseRef.current = 'listen'; sawActivityRef.current = false
       void speech.start()
     } else {
       phaseRef.current = 'off'; clearSilence(); onBargeIn(); speech.stop()
@@ -121,7 +131,7 @@ export function VoiceControl({
     if (!live || phaseRef.current !== 'await') return
     if (streaming || speaking) sawActivityRef.current = true
     if (sawActivityRef.current && !streaming && !speaking) {
-      phaseRef.current = 'listen'; liveBufRef.current = ''
+      phaseRef.current = 'listen'
       void speech.start()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -153,7 +163,7 @@ export function VoiceControl({
     if (!live) { speech.toggle(); return }
     if (speaking) {                          // barge-in: stop TTS, listen now
       onBargeIn()
-      phaseRef.current = 'listen'; sawActivityRef.current = false; liveBufRef.current = ''
+      phaseRef.current = 'listen'; sawActivityRef.current = false
       void speech.start()
       return
     }
@@ -162,7 +172,7 @@ export function VoiceControl({
       phaseRef.current = 'paused'; speech.stop()
       return
     }
-    phaseRef.current = 'listen'; sawActivityRef.current = false; liveBufRef.current = ''  // (re)start
+    phaseRef.current = 'listen'; sawActivityRef.current = false  // (re)start
     void speech.start()
   }
 

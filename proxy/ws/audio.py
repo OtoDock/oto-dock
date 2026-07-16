@@ -53,7 +53,7 @@ async def ws_audio_stt_handler(websocket: WebSocket):
             return
 
         user_sub = claims["sub"]
-        max_seconds = int(claims.get("max_seconds", 60))
+        max_seconds = int(claims.get("max_seconds", 180))
         provider_id = claims.get("provider_id")
         sample_rate = int(init.get("sample_rate", 16000)) or 16000
         # The client-supplied rate feeds BOTH the max_seconds cost cap and the
