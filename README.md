@@ -104,14 +104,18 @@ box.
 
 ### Docker (recommended)
 
-The compose file is all you need — images are pulled from GHCR:
+Two lines — images are pulled from GHCR:
 
 ```bash
-mkdir otodock && cd otodock
-curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/docker-compose.yml
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
-docker compose up -d
+curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/install.sh
+bash install.sh
 ```
+
+The installer is a short, commented script built to be read: it checks
+Docker, creates `./otodock`, writes a `.env` with a generated database
+password, handles the one Ubuntu 24.04+ host-setup step, and starts the
+release-pinned stack. It performs fresh installs only — it never touches an
+existing one.
 
 Then open **http://localhost:8400** — the setup wizard creates your admin
 account, and you're chatting with your first agent minutes later. Set
@@ -120,10 +124,20 @@ account, and you're chatting with your first agent minutes later. Set
 documents every knob; the platform auto-generates its remaining secrets on
 first boot).
 
+Prefer to do it by hand? The same install is four commands:
+
+```bash
+mkdir otodock && cd otodock
+curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/docker-compose.yml
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+docker compose up -d
+```
+
 > **Ubuntu 24.04+ hosts** restrict the unprivileged user namespaces the agent
-> sandbox is built on, so add one step — a scoped AppArmor profile for the
-> OtoDock container. The system-wide hardening stays enabled; never disable
-> the `apparmor_restrict_unprivileged_userns` sysctl for this:
+> sandbox is built on, so the by-hand flow adds one step — a scoped AppArmor
+> profile for the OtoDock container (the installer above does this for you).
+> The system-wide hardening stays enabled; never disable the
+> `apparmor_restrict_unprivileged_userns` sysctl for this:
 >
 > ```bash
 > curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/setup-apparmor-userns.sh

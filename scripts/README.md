@@ -8,6 +8,7 @@ than inside any single service (`proxy/`, `dashboard/`, `audio/`). They live at 
 
 | Script | Purpose | Consumed by |
 |--------|---------|-------------|
+| `install.sh` | One-command bootstrap for the Docker quick start: preflights Docker/Compose, creates the install dir (`./otodock` / `OTODOCK_DIR`), writes `.env` with a generated Postgres password, handles the Ubuntu 24.04+ userns step (fetches + runs `setup-apparmor-userns.sh` under one sudo prompt), fetches the release-pinned `docker-compose.yml` and starts the stack. Fresh installs only — refuses to touch an existing one; idempotent on re-run after a stop. | self-host operators (fetched raw from GitHub, per the README quick start) |
 | `install-baseline-tools.sh` | Installs the baseline dev toolchain (git, gh, python+uv, node+pnpm, ripgrep, …) every agent sandbox expects. | the platform `proxy/Dockerfile` |
 | `install-baseline-tools.ps1` | Windows (winget) equivalent of the above. | Windows hosts |
 | `oto-git-credential-helper` | Git credential helper that feeds `GH_TOKEN` (from the github-mcp manifest's `env_injection`) to `git push`/`fetch` for `github.com` only. Installed into `/usr/local/bin` + wired into `/etc/gitconfig`. | installed by `install-baseline-tools.sh`; relied on by `proxy/core/sandbox/sandbox.py` |
