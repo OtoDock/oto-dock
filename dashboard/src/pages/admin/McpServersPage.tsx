@@ -12,12 +12,16 @@ const CATEGORY_LABEL: Record<string, string> = { core: 'Core', custom: 'Custom',
 // ---------------------------------------------------------------------------
 
 export default function McpServersPage() {
-  const { data: mcps, isLoading } = useAdminMcps()
+  const { data: allMcps, isLoading } = useAdminMcps()
   const [showInstall, setShowInstall] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
   const { data: updateData, refetch: checkUpdates, isFetching: checkingUpdates } = useCheckMcpUpdates()
   const updates = updateData?.updates || {}
+
+  // Standalone skill packages (category "skill") live on the admin Skills
+  // page — filtered out here so they don't double-list as servers.
+  const mcps = allMcps?.filter(m => m.category !== 'skill')
 
   if (isLoading) return <div className="text-sm text-p-text-light">Loading MCP servers...</div>
   if (!mcps || mcps.length === 0) return <div className="text-sm text-p-text-light">No MCP servers found.</div>
@@ -41,6 +45,8 @@ export default function McpServersPage() {
   const categories = Object.keys(grouped).sort((a, b) => (CATEGORY_ORDER[a] ?? 3) - (CATEGORY_ORDER[b] ?? 3))
 
   const enabled = mcps.filter(m => m.enabled).length
+  // Skill-package updates surface on the Skills page, not here.
+  const updateCount = mcps.filter(m => updates[m.name]).length
 
   return (
     <div>
@@ -50,9 +56,9 @@ export default function McpServersPage() {
           {enabled}/{mcps.length} enabled
         </span>
         <div className="flex-1 min-w-0" />
-        {Object.keys(updates).length > 0 && (
+        {updateCount > 0 && (
           <span className="text-xs px-2 py-0.5 rounded-lg bg-brand/10 dark:bg-brand/20 text-brand font-medium">
-            {Object.keys(updates).length} update{Object.keys(updates).length > 1 ? 's' : ''}
+            {updateCount} update{updateCount > 1 ? 's' : ''}
           </span>
         )}
         <button

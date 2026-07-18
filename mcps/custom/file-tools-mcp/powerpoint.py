@@ -8,7 +8,8 @@ formatting, transitions, connectors, hyperlinks, and slide management.
 import copy
 from pathlib import Path
 
-from shared import _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
+from equations import latex_to_png
+from shared import _dropped_note, _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
 
 # ---------------------------------------------------------------------------
 # Shape type mapping
@@ -234,7 +235,7 @@ async def handle_write_pptx(args: dict) -> str:
     from pptx.util import Inches, Pt
 
     path = _resolve_path(args["path"], writing=True)
-    ops = _normalize_operations(args.get("operations"))
+    ops, dropped = _normalize_operations(args.get("operations"))
     create_new = args.get("create_new", False)
 
     if Path(path).exists() and not create_new:
@@ -616,6 +617,31 @@ async def handle_write_pptx(args: dict) -> str:
                 height = Inches(float(op["height"])) if op.get("height") else None
                 slide.shapes.add_picture(img_path, left, top, width=width, height=height)
 
+            elif ot == "add_equation":
+                # LaTeX equation as a 4×-oversampled PNG picture (pptx has no
+                # reliable native-math write path — python-pptx renders
+                # appended OMML as nothing).
+                import os
+                import tempfile
+
+                slide = _get_slide(prs, op)
+                latex = op.get("latex") or op.get("equation") or ""
+                left = Inches(float(op.get("left", 1)))
+                top = Inches(float(op.get("top", 2)))
+                height_in = float(op.get("height", 0.8))
+                width = Inches(float(op["width"])) if op.get("width") else None
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                tmp.close()
+                try:
+                    latex_to_png(latex, tmp.name, display=True,
+                                 height_px=int(height_in * 96))
+                    slide.shapes.add_picture(
+                        tmp.name, left, top, width=width,
+                        height=None if width else Inches(height_in),
+                    )
+                finally:
+                    os.unlink(tmp.name)
+
             # =============================================================
             # TABLES
             # =============================================================
@@ -947,6 +973,7 @@ async def handle_write_pptx(args: dict) -> str:
     await _push_preview(path)
 
     msg = f"Presentation saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
+    msg += _dropped_note(dropped)
     if errors:
         msg += f"\n\nWarnings/Errors ({len(errors)}):\n" + "\n".join(f"  - {e}" for e in errors)
     return msg

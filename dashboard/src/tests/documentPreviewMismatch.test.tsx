@@ -6,7 +6,7 @@ import { render, screen } from '@testing-library/react'
 //     (DASHBOARD_PUBLIC_URL) instead of rendering a dead iframe. ─────────────
 
 vi.mock('@/hooks/useCollaboraLiveReload', () => ({
-  useCollaboraLiveReload: () => ({ iframeRef: { current: null }, reloadAvailable: false, doReload: () => {} }),
+  useCollaboraLiveReload: () => ({ iframeRef: { current: null }, reloadAvailable: false, doReload: () => {}, modifiedRef: { current: false } }),
 }))
 
 import DocumentPreview from '@/components/chat/media/DocumentPreview'

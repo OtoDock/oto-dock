@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } fr
 import { SoundIcon } from './SoundIcon'
 import { useSearch } from '../../contexts/SearchContext'
 import type { DisplayMessage, MessageBlock } from './types'
-import { pairBgCommandBlocks, supersededUiBlocks, uiTitlesByPath } from '../../lib/messageBlocks'
+import { pairBgCommandBlocks, previewChainModes, supersededUiBlocks, uiTitlesByPath } from '../../lib/messageBlocks'
 import BlockRenderer from './ChatBlockRenderer'
 import ErrorBoundary from '../ErrorBoundary'
 
@@ -19,7 +19,7 @@ interface Props {
   onQuestionAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
   onSendMessage?: (text: string) => void
   onPlanFetched?: (filename: string, content: string) => void
-  onDismissPreview?: (fileId: string, dbMessageId?: number) => void
+  onDismissPreview?: (fileId: string, key?: { snapshotId?: string; dbMessageId?: number }) => void
   onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }>
   streaming?: boolean
   queuedMessages?: string[]
@@ -160,6 +160,10 @@ export default function ChatMessages({
   // title known for its path.
   const supersededUi = useMemo(() => supersededUiBlocks(messages), [messages])
   const uiTitles = useMemo(() => uiTitlesByPath(messages), [messages])
+  // Document previews: render-time live → frozen ("previous version") → chip
+  // chain per fileId over the loaded block list (each block applies/defers
+  // its own transition — see DocumentPreview).
+  const previewModes = useMemo(() => previewChainModes(messages), [messages])
 
   // Auto-scroll during streaming: column-reverse handles initial load positioning,
   // but during streaming we need to keep the user at the bottom as new content arrives.
@@ -533,6 +537,7 @@ export default function ChatMessages({
                       bgPair={bgPairs.get(i)}
                       uiSuperseded={supersededUi.has(`${msgIdx}:${i}`)}
                       uiTitle={block.type === 'ui' && !block.title && block.path ? uiTitles.get(block.path) : undefined}
+                      previewMode={block.type === 'document_preview' ? previewModes.get(`${msgIdx}:${i}`) : undefined}
                     />
                   )
                 })}

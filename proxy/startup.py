@@ -112,6 +112,15 @@ async def lifespan(app: FastAPI):
         pg_schema.init_schema(_pg_conn)
         pg_schema.run_migrations(_pg_conn)
         _pg_conn.commit()
+        # Drift guard: one loud ERROR when the live DB is missing columns the
+        # code expects (a CREATE TABLE-only addition never reaches existing
+        # installs) instead of scattered UndefinedColumn 500s at query time.
+        pg_schema.check_schema_drift(_pg_conn)
+    # Credential-key canary: one loud ERROR when stored secrets can't be
+    # decrypted (JWT_SECRET changed / config.env recreated) instead of
+    # scattered use-time 500s and silently-empty credential reads.
+    from storage.credential_store import startup_key_canary
+    startup_key_canary()
     # First-install only: default the platform timezone to the server's local
     # wall clock (UTC otherwise). Guarded on the setting being absent → set once,
     # never overwritten by later updates or an admin's change.
@@ -344,6 +353,13 @@ async def lifespan(app: FastAPI):
                 _db.sweep_expired_media_tokens()  # reap expired workspace tokens
             except Exception:
                 logger.exception("media cache sweep failed")
+            try:
+                # Version-pinned preview snapshots: reap dirs of deleted chats
+                # (internally throttled to hourly).
+                from services.media import preview_snapshots as _psnap
+                _psnap.sweep_orphans()
+            except Exception:
+                logger.exception("preview snapshot sweep failed")
             try:
                 # Workspace Recover Bin: reap entries past their 7-day TTL
                 # (DB rows + on-disk bytes). Quick indexed delete, usually 0.

@@ -173,6 +173,47 @@ class SatelliteFileTransferMixin:
             chunk_idx += 1
         return True
 
+    async def stat_file(
+        self,
+        machine_id: str,
+        ref: "PathRef",
+        *,
+        agent_slug: str = "",
+        timeout: float = 10.0,
+    ) -> dict | None:
+        """Cheap file metadata probe on the satellite (0.5.95+).
+
+        Returns ``{"exists": bool, "size": int, "mtime_ns": int}`` — both
+        stat values are SATELLITE-clock/filesystem facts, so comparing two
+        probes (or a probe against a value recorded at pull time) never
+        involves cross-host clock skew. Returns ``None`` on timeout, policy
+        reject, disconnect, or an old satellite (callers must gate on
+        ``satellite_supports_file_stat`` — an ungated send to an old
+        satellite is silently dropped and burns the whole timeout).
+        ``None`` means "don't trust the cache": callers fall back to a full
+        pull, never to serving stale bytes.
+        """
+        try:
+            ack = await self.send_command(
+                machine_id,
+                {
+                    "type": "file_stat",
+                    "path_kind": ref.kind,
+                    "agent_slug": agent_slug,
+                    "path": ref.value,
+                },
+                timeout=timeout,
+            )
+        except RuntimeError:
+            return None
+        if not isinstance(ack, dict) or ack.get("status") != "ok":
+            return None
+        return {
+            "exists": bool(ack.get("exists")),
+            "size": int(ack.get("size", 0) or 0),
+            "mtime_ns": int(ack.get("mtime_ns", 0) or 0),
+        }
+
     async def pull_file_to_path(
         self,
         machine_id: str,

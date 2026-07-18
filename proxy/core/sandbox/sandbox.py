@@ -55,6 +55,21 @@ _SYSTEM_RO_FILES = [
     "/etc/gitconfig",
 ]
 
+# Ubuntu 24.04+ AppArmor gate on unprivileged user namespaces: when this
+# sysctl reads "1", only processes confined by a profile granting `userns`
+# (or holding CAP_SYS_ADMIN) may create them — the exact capability the agent
+# sandbox is built on. Module-level so tests can point it at a fixture.
+_APPARMOR_USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+
+
+def _apparmor_userns_restricted() -> bool:
+    """True when the host kernel restricts unprivileged userns via AppArmor."""
+    try:
+        return _APPARMOR_USERNS_SYSCTL.read_text().strip() == "1"
+    except OSError:
+        return False  # sysctl absent → not an Ubuntu-restricted kernel
+
+
 # ---------------------------------------------------------------------------
 # Network namespace isolation (always on)
 # ---------------------------------------------------------------------------
@@ -157,11 +172,31 @@ def netns_preflight() -> None:
             "allow unprivileged user+network namespaces."
         )
     if probe is not None and probe.returncode != 0:
+        detail = (probe.stderr or b"").decode(errors="replace").strip()
+        if _apparmor_userns_restricted():
+            # The Ubuntu 24.04+ default. Name the exact cause and the scoped
+            # remedy — the generic advice people find is "set the sysctl to
+            # 0", which disables the hardening for the whole host.
+            raise RuntimeError(
+                "Sandbox network isolation is mandatory but this host denies "
+                "unprivileged user namespaces via AppArmor "
+                "(kernel.apparmor_restrict_unprivileged_userns=1 — the "
+                f"Ubuntu 24.04+ default; `unshare -Urn` failed: {detail}). "
+                "Fix, containerised install: run "
+                "`sudo scripts/setup-apparmor-userns.sh` on the Docker HOST "
+                "(installs the scoped `otodock_userns` AppArmor profile), then "
+                "restart via scripts/compose.sh — it selects the profile "
+                "automatically (standalone `docker compose`: set "
+                "OTODOCK_APPARMOR_PROFILE=otodock_userns in .env). Bare-metal "
+                "install: the distro AppArmor profiles for bwrap/unshare/passt "
+                "must be present (Ubuntu's `apparmor` package ships them). Do "
+                "NOT set the sysctl to 0 — that disables the protection for "
+                "the entire host."
+            )
         raise RuntimeError(
             "Sandbox network isolation is mandatory but this host cannot create "
-            "an unprivileged user+network namespace (`unshare -Urn` failed: "
-            f"{(probe.stderr or b'').decode(errors='replace').strip()}). Enable "
-            "unprivileged user namespaces (and, in a container, relax the "
+            f"an unprivileged user+network namespace (`unshare -Urn` failed: {detail}). "
+            "Enable unprivileged user namespaces (and, in a container, relax the "
             "seccomp/userns profile)."
         )
 

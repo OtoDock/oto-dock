@@ -254,11 +254,24 @@ function Row({
 }) {
   const isPending = req.status === 'pending'
   const isFailed = req.status === 'install_failed'
+  // Which catalog the request targets — rows created before the skills
+  // feature have no `kind` and default to 'mcp'.
+  const kind = req.kind ?? 'mcp'
   return (
     <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface p-3">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded-sm font-medium ${
+                kind === 'skill'
+                  ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400'
+                  : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
+              }`}
+              title={kind === 'skill' ? 'Community skill package request' : 'Community MCP request'}
+            >
+              {kind === 'skill' ? 'Skill' : 'MCP'}
+            </span>
             <span className="text-sm font-medium text-p-text">{req.mcp_name}</span>
             <span className="text-xs text-p-text-light">for</span>
             <span className="text-sm font-medium text-brand">{req.agent_slug}</span>

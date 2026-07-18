@@ -88,6 +88,70 @@ export function useCommunityMcps(enabled: boolean = true, agentSlug?: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Community skills catalog (standalone skill packages)
+// ---------------------------------------------------------------------------
+
+/**
+ * A community-skills registry entry + the same local-state augmentation the
+ * MCP catalog gets (installed / update_available / enabled_for_agents /
+ * pending_request). Skill packages have no runtime — they are folders of
+ * SKILL.md skills installed under the MCPs dir with ``category: "skill"``.
+ */
+export interface CommunitySkillEntry {
+  name: string
+  label: string
+  description: string
+  version: string
+  manifest_url?: string
+  readme_url?: string
+  icon_url?: string | null
+  tags?: string[]
+  author?: string
+  author_url?: string | null
+  license?: string
+  platform_min_version?: string | null
+  size_bytes?: number
+  deprecated?: boolean
+  manifest_hash?: string
+  // Augmentation added by the proxy (local platform state).
+  installed: boolean
+  installed_version: string | null
+  update_available: boolean
+  enabled_for_agents: string[]
+  pending_request: number | null
+  pending_request_count: number
+}
+
+export interface CommunitySkillsResponse {
+  registry_version: string
+  updated_at: string
+  platform_min_version: string | null
+  fetched_from: string
+  /** True when the skills registry could not be fetched AND no cache exists —
+   *  the catalog degrades to an empty list instead of a 502. Render a banner. */
+  catalog_unreachable: boolean
+  skills: CommunitySkillEntry[]
+}
+
+/**
+ * Fetch the augmented community-skills catalog. Same polling behaviour as
+ * {@link useCommunityMcps}; pass ``agentSlug`` to scope ``pending_request``.
+ */
+export function useCommunitySkills(enabled: boolean = true, agentSlug?: string) {
+  const url = agentSlug
+    ? `/v1/community/skills?agent=${encodeURIComponent(agentSlug)}`
+    : '/v1/community/skills'
+  return useQuery<CommunitySkillsResponse>({
+    queryKey: ['community-skills', agentSlug ?? null],
+    queryFn: () => apiFetch(url).then(r => r.json()),
+    enabled,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Install / Update — admin only
 // ---------------------------------------------------------------------------
 
@@ -151,6 +215,33 @@ export function useInstallCommunityMcp() {
 }
 
 /**
+ * Start a background install (or update) of a community skill package.
+ * Admin-only; 202 + job semantics identical to {@link useInstallCommunityMcp} —
+ * skill installs share the same job registry, so progress is polled via
+ * {@link useCatalogInstallJobs} unchanged.
+ */
+export function useInstallCommunitySkill() {
+  const qc = useQueryClient()
+  return useMutation<InstallStartResponse, Error, string>({
+    mutationFn: (name: string) =>
+      apiFetch(`/v1/admin/community/skills/${name}/install`, { method: 'POST' })
+        .then(async r => {
+          if (!r.ok) {
+            const body = await r.text()
+            throw new Error(body || `Install failed (HTTP ${r.status})`)
+          }
+          return r.json()
+        }),
+    onSuccess: (data) => {
+      qc.setQueryData<CatalogInstallsResponse>(['catalog-installs'], old => {
+        const others = (old?.installs ?? []).filter(j => j.name !== data.job.name)
+        return { installs: [...others, data.job] }
+      })
+    },
+  })
+}
+
+/**
  * Poll in-flight + recently-completed catalog installs while the Browse drawer
  * is open. Drives the per-card progress bar. 1.5s cadence; no polling when
  * disabled (drawer closed). A completed install lingers briefly server-side so
@@ -182,6 +273,9 @@ export type RequestStatus =
 export interface McpRequest {
   id: number
   mcp_name: string
+  /** Which catalog the requested name lives in. Absent on rows created
+   *  before the skills feature — treat as 'mcp'. */
+  kind?: 'mcp' | 'skill'
   agent_slug: string
   requested_by: string
   requested_by_name: string | null
@@ -210,6 +304,9 @@ export interface McpRequest {
 export interface CreateMcpRequestBody {
   mcp_name: string
   reason?: string
+  /** Which catalog to validate the name against — 'mcp' (default) or
+   *  'skill' (community-skills catalog). */
+  kind?: 'mcp' | 'skill'
 }
 
 export interface AdminRequestsResponse {
@@ -227,6 +324,7 @@ export function useCreateMcpRequest(agentSlug: string) {
         body: JSON.stringify({
           mcp_name: body.mcp_name,
           reason: (body.reason ?? '').trim(),
+          kind: body.kind ?? 'mcp',
         }),
       }).then(async r => {
         if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
@@ -234,8 +332,12 @@ export function useCreateMcpRequest(agentSlug: string) {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
+      qc.invalidateQueries({ queryKey: ['community-skills'] })
       qc.invalidateQueries({ queryKey: ['agent-mcp-requests', agentSlug] })
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
+      // Admin auto-approve may have installed + enabled a skill package —
+      // refresh the agent's skills so the tab reflects it immediately.
+      qc.invalidateQueries({ queryKey: ['agent-skills', agentSlug] })
     },
   })
 }
@@ -253,6 +355,7 @@ export function useCancelMcpRequest(agentSlug: string) {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
+      qc.invalidateQueries({ queryKey: ['community-skills'] })
       qc.invalidateQueries({ queryKey: ['agent-mcp-requests', agentSlug] })
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
     },
@@ -285,6 +388,7 @@ export function useApproveMcpRequest() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
+      qc.invalidateQueries({ queryKey: ['community-skills'] })
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
     },
   })

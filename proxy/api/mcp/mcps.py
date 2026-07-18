@@ -541,6 +541,11 @@ async def get_agent_mcps(name: str, user: UserContext = Depends(get_current_user
     _require_manage(user, name)
 
     visible = await asyncio.to_thread(mcp_registry.get_visible_mcps_for_agent, name)
+    # Standalone skill packages never surface as MCPs: the Skills tab is
+    # their single control surface (GET/PATCH /v1/agents/{name}/skills).
+    # This endpoint also feeds mcps-mcp's list_enabled_mcps — a tool-less
+    # "MCP" row would confuse both humans and agents.
+    visible = [m for m in visible if m.category != "skill"]
     enabled_set = set(
         await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, name)
     )
@@ -587,6 +592,21 @@ async def set_agent_mcps(
     visible_manifests = await asyncio.to_thread(
         mcp_registry.get_visible_mcps_for_agent, name,
     )
+    # Skill packages are managed via the Skills tab, never through this
+    # replace-all endpoint: reject them in the payload (two control surfaces
+    # would fight), and PRESERVE any already-assigned ones — the MCPs tab
+    # and mcps-mcp's GET-then-PUT round-trip a skill-filtered list, so a
+    # plain replace would silently wipe standalone skill enablement.
+    skill_pkg_names = {m.name for m in visible_manifests if m.category == "skill"}
+    in_payload = [n for n in req.mcps if n in skill_pkg_names]
+    if in_payload:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Skill packages are managed via the Skills tab",
+                "skill_packages": in_payload,
+            },
+        )
     visible_names = {m.name for m in visible_manifests}
     not_visible = [n for n in req.mcps if n not in visible_names]
     if not_visible:
@@ -597,13 +617,13 @@ async def set_agent_mcps(
                 "not_visible": not_visible,
             },
         )
+    prior = set(await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, name))
+    preserved_skill_pkgs = sorted(prior & skill_pkg_names)
+    effective_mcps = list(req.mcps) + preserved_skill_pkgs
 
     # Audit log: managers enabling assigned_to_all-only instances. Helps admins
     # see who is consuming shared resources without a separate audit table.
-    prior_enabled = set(
-        await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, name)
-    )
-    newly_enabled = set(req.mcps) - prior_enabled
+    newly_enabled = set(effective_mcps) - prior
     if newly_enabled:
         for mcp_name in newly_enabled:
             m = mcp_registry.get_manifest(mcp_name)
@@ -619,11 +639,11 @@ async def set_agent_mcps(
                     user.sub, mcp_name, name,
                 )
 
-    await asyncio.to_thread(mcp_store.set_manager_enabled_mcps, name, req.mcps)
+    await asyncio.to_thread(mcp_store.set_manager_enabled_mcps, name, effective_mcps)
 
     # Auto-create skill rows for newly enabled MCPs (idempotent — preserves prior
     # state if a skill was customized then disabled then re-enabled).
-    for mcp_name in req.mcps:
+    for mcp_name in effective_mcps:
         m = mcp_registry.get_manifest(mcp_name)
         if m:
             for skill in m.skills:
@@ -632,7 +652,7 @@ async def set_agent_mcps(
                     name, skill.id, True, skill.default_exclude_from,
                 )
 
-    return {"status": "saved", "agent": name, "mcps": req.mcps}
+    return {"status": "saved", "agent": name, "mcps": effective_mcps}
 
 
 # ---------------------------------------------------------------------------
@@ -646,18 +666,32 @@ class SkillUpdateRequest(BaseModel):
 
 @router.get("/v1/agents/{name}/skills")
 async def get_agent_skills(name: str, user: UserContext = Depends(get_current_user)):
-    """List skills for an agent with their state."""
+    """List skills for an agent with their state — the Skills tab's data source.
+
+    Two sources, one list: skills bundled with ASSIGNED MCPs (configuration
+    view — a device-local MCP's skills must be configurable with no target in
+    context) plus skills from VISIBLE standalone skill packages
+    (``category: "skill"``), including unassigned ones so the tab can offer
+    enabling them (``assigned: false`` → PATCH enable auto-assigns the
+    package). ``standalone`` + ``loading`` drive the tab's source label and
+    loading-mode badge.
+    """
     u = _require_manage(user, name)
 
     db_skills = await asyncio.to_thread(mcp_store.get_agent_skills, name)
     skill_map = {s["skill_id"]: s for s in db_skills}
 
-    # Collect all skills from assigned MCPs. Configuration view: a device-local
-    # MCP's skills must be configurable in settings even with no target in
-    # context.
     assigned = mcp_registry.get_agent_mcps_all_placements(name)
+    assigned_names = {m.name for m in assigned}
+    visible_skill_pkgs = [
+        m for m in await asyncio.to_thread(
+            mcp_registry.get_visible_mcps_for_agent, name)
+        if m.category == "skill" and m.name not in assigned_names
+    ]
+
     result = []
-    for m in assigned:
+    for m in list(assigned) + visible_skill_pkgs:
+        pkg_assigned = m.name in assigned_names
         for skill_def in m.skills:
             db_entry = skill_map.get(skill_def.id)
             result.append({
@@ -665,7 +699,12 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
                 "mcp_name": m.name,
                 "mcp_label": m.label,
                 "description": skill_def.description,
-                "enabled": db_entry["enabled"] if db_entry else True,
+                "standalone": m.category == "skill",
+                "loading": skill_def.loading,
+                "assigned": pkg_assigned,
+                # An unassigned package's skills are OFF regardless of rows.
+                "enabled": (pkg_assigned
+                            and (db_entry["enabled"] if db_entry else True)),
                 "exclude_from": db_entry["exclude_from"] if db_entry else skill_def.default_exclude_from,
                 "default_exclude_from": skill_def.default_exclude_from,
             })
@@ -678,7 +717,34 @@ async def update_agent_skill(
     name: str, skill_id: str, req: SkillUpdateRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    """Toggle a skill / edit its context exclusions.
+
+    Manager-gated like MCP assignment (same trust tier — was admin-only when
+    no UI existed). Enabling a skill whose provider is an UNASSIGNED
+    standalone package auto-assigns the package (the Skills tab is the only
+    control surface for skill packages; the MCPs replace-all PUT rejects and
+    preserves them). Unknown skill ids 404 instead of writing blind rows.
+    """
+    _require_manage(user, name)
+
+    provider = mcp_registry.find_skill_provider(skill_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail=f"Unknown skill: {skill_id}")
+
+    if req.enabled and provider.category == "skill":
+        visible = await asyncio.to_thread(
+            mcp_registry.get_visible_mcps_for_agent, name)
+        if not any(m.name == provider.name for m in visible):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Skill package {provider.name} is not available to "
+                       f"this agent",
+            )
+        enabled_pkgs = set(await asyncio.to_thread(
+            mcp_store.get_manager_enabled_mcps, name))
+        if provider.name not in enabled_pkgs:
+            await asyncio.to_thread(mcp_store.add_agent_mcp, name, provider.name)
+
     await asyncio.to_thread(
         mcp_store.set_agent_skill, name, skill_id, req.enabled, req.exclude_from
     )
@@ -999,15 +1065,20 @@ async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
     if not manifest:
         raise HTTPException(404, f"MCP '{name}' not found")
 
-    if manifest.category != "community":
+    if manifest.category not in ("community", "skill"):
         raise HTTPException(
             400,
-            "Only community MCPs can be deleted. Core and custom MCPs ship "
-            "with the platform.",
+            "Only community MCPs and skill packages can be deleted. Core and "
+            "custom MCPs ship with the platform.",
         )
 
-    # Remove all DB data (state, agent assignments, skills, config values)
-    await asyncio.to_thread(mcp_store.delete_mcp_all_data, name)
+    # Remove all DB data (state, agent assignments, skills, config values).
+    # Skill ids are bare identifiers — pass the manifest's ids so the
+    # agent_skills rows go with the provider.
+    await asyncio.to_thread(
+        mcp_store.delete_mcp_all_data, name,
+        [s.id for s in (manifest.skills or [])],
+    )
 
     # Remove credentials (infra, service accounts, all user credentials)
     from storage import credential_store

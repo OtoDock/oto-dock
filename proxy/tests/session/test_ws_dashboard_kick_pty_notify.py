@@ -117,7 +117,7 @@ class TestPtyViewer:
             "plans": [], "total_cost": 0, "context_used": 0,
             "context_max": 0, "cache_read": 0, "cache_write": 0,
             "output_tokens": 0, "execution_path": "claude-code-cli",
-            "execution_mode": "", "model": TEST_MODEL,
+            "execution_mode": "", "model": TEST_MODEL, "mode": "default",
         })
         await ws.expect({
             "type": "warmup_ready", "session_id": sid, "chat_id": cid,
@@ -306,4 +306,90 @@ class TestNotificationDelivery:
                 assert _conn_state() == (True, False)
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+
+class TestInteractiveColdFirstPrompt:
+    """A cold send's text rides the warmup and the SERVER delivers it into the
+    fresh interactive session (stamped, tailer-noted) — the client holds no
+    stash, so the prompt survives switching chats / reloading mid-warmup
+    (the lost-prompt bug: warmup_ready for a non-viewed chat is dropped by the
+    frontend staleness guard, and the old stash died with resetSession)."""
+
+    def test_warmup_text_submits_server_side_stamped(self, temp_db, monkeypatch):
+        from core.session import interactive_session
+        from core.session import transcript_tool_events as tte
+        from storage.db_settings import set_platform_setting
+
+        registered: list[FakeInteractiveSession] = []
+
+        class _InteractiveSpawnLayer(FakeExecutionLayer):
+            """Registers the InteractiveSession the real CLI layer would
+            create for an interactive agent_cfg."""
+
+            async def start_session(self, sid, agent_cfg):
+                await super().start_session(sid, agent_cfg)
+                if getattr(agent_cfg, "interactive", False):
+                    isess = FakeInteractiveSession(sid, "")
+                    registered.append(isess)
+                    monkeypatch.setitem(
+                        interactive_session._sessions, sid, isess)
+
+        layer = _InteractiveSpawnLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        set_platform_setting("interactive_cli_enabled", "true")
+        monkeypatch.setattr(tte, "_sent_prompts", {})
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({
+                    "type": "warmup", "agent": slug,
+                    "text": "cold interactive prompt",
+                    "execution_mode": "interactive",
+                })
+                started = await ws.next_frame()
+                assert started["type"] == "warmup_started"
+                chat_id = started["chat_id"]
+                # Drain until the interactive warmup_ready lands (frame set
+                # varies on this path — not a golden-master pin).
+                for _ in range(10):
+                    frame = await ws.next_frame()
+                    if frame["type"] == "warmup_ready":
+                        break
+                else:
+                    raise AssertionError("no warmup_ready")
+                assert frame["chat_id"] == chat_id
+                assert frame["interactive"] is True
+
+                # The submit runs in the backgrounded spawn tail after
+                # warmup_ready — poll briefly.
+                for _ in range(50):
+                    if registered and registered[0].submitted:
+                        break
+                    await asyncio.sleep(0.02)
+                assert registered, "interactive session never spawned"
+                isess = registered[0]
+                assert len(isess.submitted) == 1
+                submitted = isess.submitted[0]
+                # Stamped at delivery, raw text intact.
+                assert submitted.startswith("[Current time: ")
+                assert submitted.endswith("\n\ncold interactive prompt")
+
+                # Send-time persistence: the DB row is the RAW prompt (the
+                # stamp is a delivery artifact) and the chat got its title.
+                msgs = temp_db.get_chat_messages(chat_id)
+                assert [(m["role"], m["content"]) for m in msgs] == [
+                    ("user", "cold interactive prompt"),
+                ]
+                assert temp_db.get_chat(chat_id)["title"] == "cold interactive prompt"
+
+                # Tailer dedup: the note now holds the STAMPED bytes — the
+                # CLI journals exactly what the PTY received, so the tailer's
+                # byte-for-byte consume must match or the user row lands twice.
+                assert tte.consume_sent_prompt(chat_id, submitted) is True
+
+                ws.client_send({"type": "close"})
         run_ws_scenario(scenario)

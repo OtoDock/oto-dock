@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, fetchAuthConfig } from '../../api/auth'
+import { useAuth } from '../../contexts/AuthContext'
 import { useSetPlatformAuth } from '../../api/executionLayers'
 
 interface UserRecord {
@@ -201,6 +202,7 @@ function LocalOnlyToggle({ user }: { user: UserRecord }) {
 export default function UsersPage() {
   const { data: users, isLoading } = useUsers()
   const { data: allAgents } = useAgentList()
+  const { user: authUser, refreshUser } = useAuth()
   const queryClient = useQueryClient()
   const [editingSub, setEditingSub] = useState<string | null>(null)
   const [editRole, setEditRole] = useState('')
@@ -347,6 +349,10 @@ export default function UsersPage() {
     )
     if (agentsChanged || rolesChanged) {
       await updateAgents.mutateAsync({ sub: editingSub, agents: editAgents, agent_roles: editAgentRoles })
+      // Editing YOUR OWN assignments must also refresh the auth snapshot —
+      // `user.agent_roles` is otherwise only fetched at app load, and it
+      // drives the Remote Machines settings tab and per-agent role gates.
+      if (editingSub === authUser?.sub) void refreshUser()
     }
     setEditingSub(null)
   }

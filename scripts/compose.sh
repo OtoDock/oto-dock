@@ -61,5 +61,45 @@ if [ -f "$_root/docker-compose.phone.yml" ] && [ "${OTODOCK_PHONE:-1}" != "0" ];
     _files+=(-f "$_root/docker-compose.phone.yml")
 fi
 
+# --- Ubuntu 24.04+ unprivileged-userns restriction --------------------------
+# When kernel.apparmor_restrict_unprivileged_userns=1 the proxy container
+# (unprivileged + apparmor=unconfined) cannot create the user namespaces the
+# agent sandbox is built on — the proxy hard-fails its boot preflight. The fix
+# is the SCOPED `otodock_userns` AppArmor profile (grants userns to this
+# workload only; the system-wide restriction stays on). Select it when the
+# host has it; install it (one-time, sudo — same trust level dev-setup.sh
+# already uses for apt) when it doesn't; print the manual command if sudo
+# isn't available. An explicit OTODOCK_APPARMOR_PROFILE (shell env or
+# config.env) always wins.
+_userns_sysctl="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+if [ -z "${OTODOCK_APPARMOR_PROFILE:-}" ] \
+   && ! grep -qE '^\s*OTODOCK_APPARMOR_PROFILE=' "$_root/config.env" \
+   && [ "$(cat "$_userns_sysctl" 2>/dev/null || echo 0)" = "1" ]; then
+    if [ -f /etc/apparmor.d/otodock-userns ]; then
+        export OTODOCK_APPARMOR_PROFILE=otodock_userns
+    else
+        echo "compose.sh: this host restricts unprivileged user namespaces"
+        echo "  (kernel.apparmor_restrict_unprivileged_userns=1 — the Ubuntu 24.04+ default),"
+        echo "  which blocks the agent sandbox inside the proxy container."
+        echo "  Installing the scoped AppArmor profile 'otodock_userns' (one-time; the"
+        echo "  system-wide hardening stays ON — this may prompt for your sudo password):"
+        _sudo=(sudo)
+        if [ "$(id -u)" -eq 0 ]; then _sudo=(); fi
+        # No tty → sudo can't prompt; try passwordless, else fall through to
+        # the manual instructions instead of hanging.
+        if [ ! -t 0 ] && [ "${#_sudo[@]}" -gt 0 ]; then _sudo=(sudo -n); fi
+        if "${_sudo[@]}" bash "$_here/setup-apparmor-userns.sh"; then
+            export OTODOCK_APPARMOR_PROFILE=otodock_userns
+        else
+            echo >&2
+            echo "compose.sh: could not install the profile automatically. Run once:" >&2
+            echo "      sudo $_here/setup-apparmor-userns.sh" >&2
+            echo "  then re-run this command." >&2
+            echo "  Do NOT disable the sysctl system-wide — the profile is the supported path." >&2
+            exit 1
+        fi
+    fi
+fi
+
 export OTODOCK_ENV_FILE="$_root/config.env"
 exec docker compose --env-file "$_root/config.env" "${_files[@]}" "$@"

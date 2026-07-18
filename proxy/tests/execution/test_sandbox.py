@@ -569,6 +569,10 @@ class TestDisallowedBuiltinsConstant:
             "WebFetch", "WebSearch", "AskUserQuestion", "NotebookEdit",
             # Core editor tools
             "Bash", "Read", "Edit", "Write", "Glob", "Grep",
+            # Skill: allowed since 2026-07 — the activation surface for
+            # platform-managed on-demand skills (skills_materializer);
+            # the no-parallel-memory guarantee moved to reconciliation.
+            "Skill",
         }
         denied = set(_DISALLOWED_BUILTIN_TOOLS)
         for t in kept:
@@ -578,6 +582,14 @@ class TestDisallowedBuiltinsConstant:
         from core.sandbox.sandbox import _build_sandbox_cli_settings, _DISALLOWED_BUILTIN_TOOLS
         settings = _build_sandbox_cli_settings("/users/test/.claude")
         assert set(settings["permissions"]["deny"]) == set(_DISALLOWED_BUILTIN_TOOLS)
+
+    def test_sandbox_cli_settings_disables_plugins(self):
+        """Platform is the only skill source: with the Skill tool allowed,
+        plugin skills must not activate outside install/approval — the
+        always-rewritten settings.json keeps every plugin off."""
+        from core.sandbox.sandbox import _build_sandbox_cli_settings
+        settings = _build_sandbox_cli_settings("/users/test/.claude")
+        assert settings["enabledPlugins"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +898,45 @@ class TestNetnsPreflight:
 
         resolv.write_text("nameserver 8.8.8.8\n")
         assert _sandbox_mod._host_resolv_has_loopback_ns(str(resolv)) is False
+
+    def _failing_probe(self, monkeypatch):
+        # All tools present; the `unshare -Urn true` capability probe fails.
+        real_which = _shutil.which
+        monkeypatch.setattr(_sandbox_mod.shutil, "which",
+                            lambda tool: real_which(tool) or f"/usr/bin/{tool}")
+        monkeypatch.setattr(_sandbox_mod.os, "access", lambda *a, **k: True)
+
+        class _Probe:
+            returncode = 1
+            stderr = b"unshare: unshare failed: Operation not permitted"
+        monkeypatch.setattr(_sandbox_mod.subprocess, "run",
+                            lambda *a, **k: _Probe())
+
+    def test_probe_failure_names_apparmor_restriction(self, monkeypatch, tmp_path):
+        # Ubuntu 24.04+ (sysctl = 1): the error must name the sysctl and the
+        # scoped-profile remedy, never suggest flipping the sysctl off.
+        self._failing_probe(monkeypatch)
+        sysctl = tmp_path / "apparmor_restrict_unprivileged_userns"
+        sysctl.write_text("1\n")
+        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL", sysctl)
+        with pytest.raises(RuntimeError) as exc:
+            _sandbox_mod.netns_preflight()
+        msg = str(exc.value)
+        assert "apparmor_restrict_unprivileged_userns" in msg
+        assert "setup-apparmor-userns.sh" in msg
+        assert "OTODOCK_APPARMOR_PROFILE" in msg
+        assert "NOT set the sysctl to 0" in msg
+
+    def test_probe_failure_generic_without_restriction(self, monkeypatch, tmp_path):
+        # Sysctl absent (non-Ubuntu kernel): the generic message, no AppArmor blame.
+        self._failing_probe(monkeypatch)
+        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL",
+                            tmp_path / "missing-sysctl")
+        with pytest.raises(RuntimeError) as exc:
+            _sandbox_mod.netns_preflight()
+        msg = str(exc.value)
+        assert "apparmor_restrict_unprivileged_userns" not in msg
+        assert "cannot create" in msg
 
 
 class TestResolveSandboxEgress:

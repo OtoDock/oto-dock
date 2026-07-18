@@ -3,6 +3,7 @@
 CRUD endpoints for chats and messages, authenticated via JWT session cookie.
 """
 
+import asyncio
 import logging
 import uuid
 
@@ -413,6 +414,8 @@ async def delete_chat(
     for cont in task_store.list_continuations_for_chat(chat_id):
         await scheduler.remove_dynamic_task(cont["id"])
     task_store.delete_chat(chat_id)
+    from services.media import preview_snapshots
+    await asyncio.to_thread(preview_snapshots.delete_chat_dir, chat_id)
     return {"status": "ok"}
 
 
@@ -420,14 +423,29 @@ async def delete_chat(
 async def dismiss_preview(
     chat_id: str,
     file_id: str,
+    snapshot_id: str | None = None,
+    message_id: int | None = None,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Dismiss ALL document_preview events for a file_id in a chat. Persisted to DB."""
+    """Dismiss document_preview events for a file_id in a chat. Persisted.
+
+    ``snapshot_id`` / ``message_id`` scope the dismissal to one preview
+    instance (a "previous version" block closing itself); with neither, every
+    instance for the file is dismissed (the live block's close)."""
     u = require_auth(user)
     chat = task_store.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     if not can_access_chat(u, chat):
         raise HTTPException(status_code=403, detail="Access denied")
-    count = task_store.dismiss_document_previews(chat_id, file_id)
+    count, freed = task_store.dismiss_document_previews(
+        chat_id, file_id, snapshot_id=snapshot_id, db_message_id=message_id,
+    )
+    if freed:
+        from services.media import preview_snapshots
+
+        def _drop() -> None:
+            for sid in freed:
+                preview_snapshots.delete_snapshot(chat_id, sid)
+        await asyncio.to_thread(_drop)
     return {"status": "ok", "dismissed": count}

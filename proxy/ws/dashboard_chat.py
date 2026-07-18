@@ -631,6 +631,7 @@ class ChatController:
                 "execution_path": resolve_execution_path(self.agent_name, chat.get("execution_path", "")),
                 "execution_mode": chat.get("execution_mode", ""),
                 "model": chat.get("model", ""),
+                "mode": chat.get("permission_mode", "default"),
             })
             for past_ev in list(inflight.event_history):
                 await self._send(past_ev)
@@ -842,7 +843,12 @@ class ChatController:
                      "output_tokens": output_tokens,
                      "execution_path": effective_exec_path,
                      "execution_mode": chat.get("execution_mode", ""),
-                     "model": chat.get("model", "")})
+                     "model": chat.get("model", ""),
+                     # The chat's stored permission mode. The frontend applies
+                     # it for task-run chats (the scheduler's 'auto' posture)
+                     # so the permission chip reflects the RUN's real mode,
+                     # not the viewer's sticky selection.
+                     "mode": chat.get("permission_mode", "default")})
 
         if view_only_external:
             # Read-only view of a live external session: history is sent, but we
@@ -2412,6 +2418,7 @@ class ChatController:
             "execution_path": resolve_execution_path(agent, chat.get("execution_path", "")),
             "execution_mode": new_mode,
             "model": chat.get("model", ""),
+            "mode": chat.get("permission_mode", "default"),
         })
 
         # Re-warm in the target mode — reuses the full warmup machinery; the now

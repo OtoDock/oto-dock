@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import contextmanager
 
 from storage import database as task_store
 from core.session.session_state import (
@@ -154,6 +155,30 @@ _bg_command_monitors_running: set[str] = set()  # session_ids with an active bg-
 def bg_command_monitor_running(session_id: str) -> bool:
     """True if a _bg_command_monitor is already watching this session's commands."""
     return session_id in _bg_command_monitors_running
+
+
+@contextmanager
+def hold_bg_monitors(session_id: str):
+    """Suppress BOTH post-turn monitors for a session while the caller owns
+    bg-completion handling itself. The task producer wraps its whole run in
+    this: it takes the session lock per send (not across the flow), so a
+    dashboard viewer detaching mid-run would otherwise arm a chat monitor on
+    the task session, race the producer's own drain, and double-nudge. Adds
+    to the monitors' idempotency sets so their guards no-op; releases only
+    what it added (a monitor already mid-flight keeps its own guard)."""
+    added_agent = session_id not in _bg_monitors_running
+    added_cmd = session_id not in _bg_command_monitors_running
+    if added_agent:
+        _bg_monitors_running.add(session_id)
+    if added_cmd:
+        _bg_command_monitors_running.add(session_id)
+    try:
+        yield
+    finally:
+        if added_agent:
+            _bg_monitors_running.discard(session_id)
+        if added_cmd:
+            _bg_command_monitors_running.discard(session_id)
 
 
 async def _bg_command_monitor(

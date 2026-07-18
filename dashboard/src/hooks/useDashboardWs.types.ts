@@ -63,7 +63,7 @@ export interface WsCallbacks {
   onAudio?: (data: { src_kind?: string; url?: string; media_url?: string; token?: string; mime?: string; caption?: string; title?: string }) => void
   onMediaProcessing?: (data: { media_kind?: string; caption?: string }) => void
   onMediaFailed?: (data: { error?: string }) => void
-  onDocumentPreview?: (data: { wopi_url: string; filename: string; file_id: string; download_url: string }) => void
+  onDocumentPreview?: (data: { wopi_url: string; filename: string; file_id: string; download_url: string; snapshot_id?: string; generation?: number }) => void
   // A shared workspace file changed on the server (a Collabora
   // save or an agent/disk write). Also fanned out to the lib/fileUpdates bus for
   // any open Collabora preview; this callback lets the host invalidate the

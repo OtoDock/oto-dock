@@ -100,6 +100,11 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
             "filename": perm_data["filename"],
             "file_id": perm_data["file_id"],
             "download_url": perm_data["download_url"],
+            # Version-pinned snapshot identity: the dashboard renders a
+            # superseded block from ITS OWN snapshot via
+            # /v1/documents/snapshot-wopi-url ("" = no snapshot → chip).
+            "snapshot_id": perm_data.get("snapshot_id", ""),
+            "generation": perm_data.get("generation", 0),
         }
     if et == "ui":
         # Every field rides along: this dict is json.dumps-persisted verbatim,

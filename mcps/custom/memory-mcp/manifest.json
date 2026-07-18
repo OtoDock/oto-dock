@@ -31,6 +31,7 @@
   "skills": [
     {
       "id": "memory-usage",
+      "loading": "always",
       "file": "skills/memory.md",
       "description": "Worked examples for the memory tool (save / revise / forget patterns)",
       "default_exclude_from": []

@@ -457,10 +457,89 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
             return True
         stderr = retry_err
 
+    # Name-conflict self-heal: a container holding OUR exact target name is
+    # by definition ours (the name embeds this install's id — see
+    # _project_name), left behind by a previous deployment generation that
+    # compose can no longer see (project labels changed). Remove it and retry
+    # once. Containers of a DIFFERENT install-id are never touched — a second
+    # OtoDock install on the same daemon legitimately owns those.
+    expected_name = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}".lower()
+    if "already in use" in stderr.lower() and expected_name in stderr.lower():
+        logger.warning(
+            "%s: container name %s is held by a previous deployment "
+            "generation — removing it and retrying",
+            manifest.name, expected_name,
+        )
+        try:
+            rm = subprocess.run(
+                ["docker", "rm", "-f", expected_name],
+                capture_output=True, text=True, timeout=60,
+                env=deployment.docker_subprocess_env(),
+            )
+        except Exception as e:
+            rm = None
+            logger.warning("%s: stale-container removal failed: %s", manifest.name, e)
+        if rm is not None and rm.returncode == 0:
+            rc, retry_err = _run_compose_streaming(
+                manifest, _compose_cmd(manifest, *args),
+                timeout=timeout, cwd=str(manifest.mcp_dir),
+            )
+            if rc == 0:
+                logger.info(
+                    "Started Docker MCP %s after removing the previous "
+                    "generation's container", manifest.name,
+                )
+                return True
+            stderr = retry_err
+        elif rm is not None:
+            logger.warning(
+                "%s: could not remove stale container %s: %s",
+                manifest.name, expected_name, (rm.stderr or "")[:200],
+            )
+
     if _is_docker_perm_denied(stderr):
         _log_docker_perm_denied(f"compose up for {manifest.name} failed")
     logger.error("Failed to start Docker MCP %s: %s", manifest.name, stderr[:500])
     return False
+
+
+def _warn_foreign_mcp_leftovers() -> None:
+    """Log MCP containers whose name carries a DIFFERENT install identity.
+
+    Container/project names embed the install-id (``otodock-<id>-mcp-<name>``,
+    see ``_project_name``). The id lives in config.env, so a recreated
+    config.env (install moved to a new folder) rotates it — the previous
+    generation's containers keep running with stale config, invisible to
+    every compose op here. They must NOT be auto-removed: a second OtoDock
+    install on the same daemon legitimately owns identically-shaped names.
+    Name them loudly with the removal command and let the operator decide.
+    Best-effort — any failure is silent (T3 has no daemon at all).
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+            env=deployment.docker_subprocess_env(),
+        )
+        if result.returncode != 0:
+            return
+        ours = f"otodock-{config.INSTALL_ID}-mcp-"
+        foreign = re.compile(r"^otodock-(?:[0-9a-f]+-)?mcp-")
+        stale = [
+            n for n in result.stdout.split()
+            if foreign.match(n) and not n.startswith(ours)
+        ]
+        if stale:
+            logger.warning(
+                "%d MCP container(s) carry another OtoDock install identity: "
+                "%s. If this daemon hosts ONLY this install, they are "
+                "leftovers from a previous config.env (rotated install-id) "
+                "still running with stale config — remove them with: "
+                "docker rm -f %s",
+                len(stale), ", ".join(stale), " ".join(stale),
+            )
+    except Exception as e:
+        logger.debug("foreign-MCP-leftover scan skipped: %s", e)
 
 
 def stop_container(manifest) -> bool:
@@ -592,6 +671,10 @@ def startup_docker_mcps() -> None:
     """
     from services.mcp import mcp_registry
     from storage import mcp_store
+
+    # Every topology with a local daemon: name (but never touch) MCP
+    # containers left behind by a previous install identity.
+    _warn_foreign_mcp_leftovers()
 
     # T2 (Docker-Compose): Docker MCPs are NOT started from their per-MCP
     # build-context compose files here. The core file-tools runs as an

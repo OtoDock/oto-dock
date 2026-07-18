@@ -29,6 +29,7 @@
   "skills": [
     {
       "id": "notification-instructions",
+      "loading": "always",
       "file": "docs/notification-instructions.md",
       "description": "When and how to use notifications, severity guidelines, scope rules",
       "default_exclude_from": []

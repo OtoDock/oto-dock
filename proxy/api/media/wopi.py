@@ -29,6 +29,12 @@ router = APIRouter(tags=["wopi"])
 
 _WOPI_TOKEN_TTL = 14400  # 4 hours
 
+# file_path namespace for version-pinned preview snapshots
+# (services/media/preview_snapshots.py): "<ns>/<chat_id>/<snapshot_id>".
+# The leading dot keeps it disjoint from every agent slug, so a snapshot
+# file_id can never collide with (or traverse into) an agent tree.
+_SNAPSHOT_NS = ".preview-snapshots"
+
 
 def encode_file_id(relative_path: str) -> str:
     """Base64url-encode a relative file path for use as WOPI file_id."""
@@ -41,14 +47,25 @@ def decode_file_id(file_id: str) -> str:
     return base64.urlsafe_b64decode(padded).decode()
 
 
+def snapshot_rel_path(chat_id: str, snapshot_id: str) -> str:
+    """The token file_path / file_id payload for a preview snapshot."""
+    return f"{_SNAPSHOT_NS}/{chat_id}/{snapshot_id}"
+
+
 def create_wopi_token(
     file_path: str,
     user_sub: str,
     user_name: str,
     permissions: str,
     agent: str,
+    display_name: str = "",
 ) -> tuple[str, int]:
-    """Create a JWT WOPI access token. Returns (token, expiry_ms)."""
+    """Create a JWT WOPI access token. Returns (token, expiry_ms).
+
+    ``display_name`` overrides CheckFileInfo's BaseFileName — snapshot files
+    are stored under opaque extension-less ids, and Collabora picks its
+    renderer from the BaseFileName extension, so snapshot tokens must carry
+    the original filename."""
     now = int(time.time())
     exp = now + _WOPI_TOKEN_TTL
     payload = {
@@ -65,6 +82,8 @@ def create_wopi_token(
         "iat": now,
         "exp": exp,
     }
+    if display_name:
+        payload["display_name"] = display_name
     token = jwt.encode(payload, config.WOPI_SECRET, algorithm="HS256")
     return token, exp * 1000  # expiry in milliseconds for Collabora
 
@@ -89,6 +108,20 @@ def _resolve_wopi_path(file_id: str, claims: dict) -> Path:
     # Verify token's file_path matches the file_id
     if claims.get("file_path") != rel_path:
         raise HTTPException(status_code=403, detail="Token/file mismatch")
+
+    # Preview-snapshot namespace: resolve under the proxy-private snapshot
+    # cache. The store validates both id segments against a strict charset
+    # (no separators, no dots), so the decoded path cannot traverse.
+    if rel_path.startswith(_SNAPSHOT_NS + "/"):
+        from services.media import preview_snapshots
+        parts = rel_path.split("/")
+        snap = (
+            preview_snapshots.snapshot_path(parts[1], parts[2])
+            if len(parts) == 3 else None
+        )
+        if snap is None:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return snap
 
     full_path = (config.AGENTS_DIR / rel_path).resolve()
 
@@ -174,7 +207,9 @@ async def wopi_check_file_info(
     can_write = claims.get("permissions") == "edit"
 
     return {
-        "BaseFileName": file_path.name,
+        # Snapshot tokens carry display_name (opaque on-disk id, no
+        # extension) — Collabora picks its renderer from this extension.
+        "BaseFileName": claims.get("display_name") or file_path.name,
         "Size": file_path.stat().st_size,
         "OwnerId": claims.get("user_sub", ""),
         "UserId": claims.get("user_sub", ""),
@@ -227,6 +262,10 @@ async def wopi_put_file(
 
     if claims.get("permissions") != "edit":
         raise HTTPException(status_code=403, detail="Write permission required")
+    # Snapshots are immutable history; tokens for them are minted view-only,
+    # but refuse writes on the namespace itself as defence in depth.
+    if (claims.get("file_path") or "").startswith(_SNAPSHOT_NS + "/"):
+        raise HTTPException(status_code=403, detail="Snapshots are read-only")
 
     # Check lock (if locked by someone else, reject)
     lock_header = request.headers.get("X-WOPI-Lock", "")
@@ -292,6 +331,12 @@ async def wopi_lock_operations(
     lock_id = request.headers.get("X-WOPI-Lock", "")
     old_lock = request.headers.get("X-WOPI-OldLock", "")
 
+    # Mutating lock ops require edit capability — a view-only session must
+    # not be able to place/steal a lock and 409 the real editor's saves.
+    # GET_LOCK stays readable with any valid token.
+    if override in ("LOCK", "UNLOCK", "REFRESH_LOCK") and claims.get("permissions") != "edit":
+        raise HTTPException(status_code=403, detail="Write permission required")
+
     current = _get_lock(file_id)
 
     if override == "LOCK":
@@ -331,6 +376,25 @@ async def wopi_lock_operations(
 # ---------------------------------------------------------------------------
 # Dashboard endpoint: generate Collabora WOPI URL
 # ---------------------------------------------------------------------------
+
+
+def build_cool_url(file_id: str, token: str, token_ttl: int) -> str:
+    """The Collabora iframe URL for a minted WOPI token (shared by the
+    dashboard endpoints and the document-preview hook)."""
+    wopi_src = urllib.parse.quote(
+        f"{config.WOPI_BASE_URL.rstrip('/')}/wopi/files/{file_id}",
+        safe="",
+    )
+    return (
+        f"{config.COLLABORA_URL}/browser/dist/cool.html"
+        f"?WOPISrc={wopi_src}"
+        f"&access_token={token}"
+        f"&access_token_ttl={token_ttl}"
+        f"&closebutton=0&homebutton=0"
+        f"&ui_defaults=UIMode%3Dcompact%3BTextSidebar%3Dfalse"
+        f"%3BSpreadsheetSidebar%3Dfalse%3BPresentationSidebar%3Dfalse"
+    )
+
 
 class WopiUrlRequest(BaseModel):
     file_path: str  # relative to agent dir, e.g. "users/alice/workspace/report.docx" or "workspace/report.docx"
@@ -413,18 +477,53 @@ async def generate_wopi_url(
         rel_path, user.sub, user.name, permissions, req.agent
     )
 
-    wopi_src = urllib.parse.quote(
-        f"{config.WOPI_BASE_URL.rstrip('/')}/wopi/files/{file_id}",
-        safe="",
-    )
-    wopi_url = (
-        f"{config.COLLABORA_URL}/browser/dist/cool.html"
-        f"?WOPISrc={wopi_src}"
-        f"&access_token={token}"
-        f"&access_token_ttl={token_ttl}"
-        f"&closebutton=0&homebutton=0"
-        f"&ui_defaults=UIMode%3Dcompact%3BTextSidebar%3Dfalse"
-        f"%3BSpreadsheetSidebar%3Dfalse%3BPresentationSidebar%3Dfalse"
-    )
+    wopi_url = build_cool_url(file_id, token, token_ttl)
 
     return {"wopi_url": wopi_url, "file_id": file_id, "permissions": permissions}
+
+
+@router.get("/v1/documents/snapshot-wopi-url")
+async def generate_snapshot_wopi_url(
+    chat_id: str = Query(...),
+    snapshot_id: str = Query(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """Mint a VIEW-only Collabora URL for a version-pinned preview snapshot.
+
+    Called by the dashboard at render/swap time — never persisted, so a
+    "previous version" block always gets a live token. Access is gated on the
+    requester's CHAT access (the snapshot belongs to the chat's preview
+    history, not to any workspace path), and the snapshot must still be
+    referenced by a non-dismissed preview event. 404 (pruned/unknown snapshot)
+    tells the dashboard to degrade that block to a chip."""
+    u = require_auth(user)
+
+    if not config.COLLABORA_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="Document preview is unavailable: COLLABORA_URL is not configured.",
+        )
+
+    from storage import database as task_store
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    from api.agents.chats import can_access_chat
+    if not can_access_chat(u, chat):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    event = task_store.get_preview_event_by_snapshot(chat_id, snapshot_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    from services.media import preview_snapshots
+    if preview_snapshots.snapshot_path(chat_id, snapshot_id) is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    rel_path = snapshot_rel_path(chat_id, snapshot_id)
+    token, token_ttl = create_wopi_token(
+        rel_path, u.sub, u.name, "view", chat.get("agent") or "",
+        display_name=event.get("filename") or "document",
+    )
+    file_id = encode_file_id(rel_path)
+    return {"wopi_url": build_cool_url(file_id, token, token_ttl)}

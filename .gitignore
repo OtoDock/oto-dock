@@ -71,6 +71,11 @@ mcps/custom/ssh-hosts/keys/
 mcps/community/*/
 !mcps/community/.gitkeep
 
+# ── Standalone skill packages — catalog lives in OtoDock/community-skills ──
+# Same pattern: runtime install dir, populated by the skills installer.
+mcps/skills/*/
+!mcps/skills/.gitkeep
+
 # ── Session state ──
 .claude/
 .codex/
@@ -82,6 +87,9 @@ docker-compose*.override.yml
 # recover-bin = per-agent recycle bin holding DELETED USER FILE CONTENTS.
 # Pure runtime state; must never enter git history (data leak + bloat).
 recover-bin/
+# preview-snapshots = version-pinned document-preview copies (user file
+# contents) — proxy-private runtime cache, never source.
+preview-snapshots/
 # Full DB dumps + media caches — user data, never source.
 backups/
 host-media-cache/

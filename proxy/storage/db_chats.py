@@ -758,10 +758,19 @@ def sweep_expired_media_tokens() -> int:
         return len(rows)
 
 
-def dismiss_document_previews(chat_id: str, file_id: str) -> int:
-    """Dismiss ALL document_preview events with the given file_id in a chat.
+def dismiss_document_previews(
+    chat_id: str, file_id: str,
+    snapshot_id: str | None = None, db_message_id: int | None = None,
+) -> tuple[int, list[str]]:
+    """Dismiss document_preview events with the given file_id in a chat.
 
-    Returns the number of rows updated.
+    Instance scoping: ``snapshot_id`` (or ``db_message_id`` for pre-snapshot
+    rows) narrows the dismissal to ONE preview instance — the dashboard's
+    "previous version" block dismisses only itself. With neither, every
+    instance for the file is dismissed (the live block's close).
+
+    Returns ``(rows updated, snapshot ids of those rows)`` so the caller can
+    delete exactly the newly-unreferenced snapshot files.
     """
     import json as _json
     with get_conn() as conn:
@@ -771,18 +780,70 @@ def dismiss_document_previews(chat_id: str, file_id: str) -> int:
             (chat_id,),
         ).fetchall()
         count = 0
+        freed_snapshots: list[str] = []
         for row in rows:
             data = _json.loads(row["event_data"] or "{}") if row["event_data"] else {}
-            if data.get("file_id") == file_id and not data.get("dismissed"):
-                data["dismissed"] = True
-                conn.execute(
-                    "UPDATE chat_messages SET event_data=%s WHERE id=%s",
-                    (_json.dumps(data), row["id"]),
-                )
-                count += 1
+            if data.get("file_id") != file_id or data.get("dismissed"):
+                continue
+            if snapshot_id is not None and data.get("snapshot_id") != snapshot_id:
+                continue
+            if db_message_id is not None and row["id"] != db_message_id:
+                continue
+            data["dismissed"] = True
+            conn.execute(
+                "UPDATE chat_messages SET event_data=%s WHERE id=%s",
+                (_json.dumps(data), row["id"]),
+            )
+            count += 1
+            if data.get("snapshot_id"):
+                freed_snapshots.append(data["snapshot_id"])
         if count:
             conn.commit()
-        return count
+        return count, freed_snapshots
+
+
+def get_preview_event_by_snapshot(chat_id: str, snapshot_id: str) -> dict | None:
+    """The non-dismissed document_preview event data referencing a snapshot,
+    or None. Serving a snapshot requires a live reference — a dismissed row's
+    snapshot is deleted and must not be re-mintable."""
+    import json as _json
+    if not snapshot_id:
+        return None
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages "
+            "WHERE chat_id=%s AND event_type='document_preview'",
+            (chat_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            data = _json.loads(row["event_data"] or "{}")
+        except ValueError:
+            continue
+        if data.get("snapshot_id") == snapshot_id and not data.get("dismissed"):
+            return data
+    return None
+
+
+def get_referenced_preview_snapshot_ids(chat_id: str) -> set[str]:
+    """Snapshot ids referenced by NON-dismissed document_preview events in a
+    chat — the keep-set for the reference-driven snapshot GC."""
+    import json as _json
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages "
+            "WHERE chat_id=%s AND event_type='document_preview'",
+            (chat_id,),
+        ).fetchall()
+    out: set[str] = set()
+    for row in rows:
+        try:
+            data = _json.loads(row["event_data"] or "{}")
+        except ValueError:
+            continue
+        if not data.get("dismissed") and data.get("snapshot_id"):
+            out.add(data["snapshot_id"])
+    return out
 
 
 def get_chat_message_count(chat_id: str) -> int:

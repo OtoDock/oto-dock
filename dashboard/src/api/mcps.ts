@@ -59,7 +59,9 @@ export interface McpServer {
   label: string
   description: string
   version: string
-  category: 'core' | 'custom' | 'community'
+  // 'skill' = standalone skill package (runtime none) — listed on the admin
+  // Skills page, filtered out of the MCP Servers page.
+  category: 'core' | 'custom' | 'community' | 'skill'
   runtime: 'python' | 'node' | 'docker'
   transport: 'stdio' | 'sse'
   source: string
@@ -571,6 +573,16 @@ export interface AgentSkill {
   mcp_name: string
   mcp_label: string
   description: string
+  /** True when the provider is a standalone skill package (category "skill")
+   *  rather than a skill bundled inside a regular MCP. */
+  standalone: boolean
+  /** 'always' (body inlined into the system prompt) or 'on_demand'
+   *  (progressive disclosure via the CLI's skills dir). */
+  loading: string
+  /** Whether the provider package/MCP is currently assigned to the agent.
+   *  Unassigned standalone packages still list (enabled=false) so the tab
+   *  can offer enabling them — the PATCH auto-assigns server-side. */
+  assigned: boolean
   enabled: boolean
   exclude_from: string[]
   default_exclude_from: string[]
@@ -586,6 +598,44 @@ export function useAgentSkills(agent: string) {
       return data.skills
     },
     enabled: !!agent,
+  })
+}
+
+/**
+ * Toggle a skill / edit its context exclusions for an agent.
+ * Manager-gated like MCP assignment. Enabling a skill whose provider is an
+ * unassigned standalone package auto-assigns the package server-side, so we
+ * also refresh the community-skills catalog augmentation (enabled_for_agents).
+ */
+export function useSetAgentSkill() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ agent, skillId, enabled, exclude_from }: {
+      agent: string
+      skillId: string
+      enabled: boolean
+      exclude_from: string[]
+    }) => {
+      const res = await apiFetch(
+        `/v1/agents/${agent}/skills/${encodeURIComponent(skillId)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled, exclude_from }),
+        },
+      )
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(
+          typeof data.detail === 'string' ? data.detail : 'Failed to save skill',
+        )
+      }
+      return res.json()
+    },
+    onSuccess: (_, { agent }) => {
+      qc.invalidateQueries({ queryKey: ['agent-skills', agent] })
+      qc.invalidateQueries({ queryKey: ['community-skills'] })
+    },
   })
 }
 

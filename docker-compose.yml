@@ -93,7 +93,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.2.0}
     restart: unless-stopped
     logging: *default-logging
     # Memory cap — DEFAULT 0 = unlimited (the proxy uses all host RAM for max
@@ -165,6 +165,9 @@ services:
       # image rebuild / recreate (the baked dir is empty; core/custom MCPs live
       # elsewhere in the image and are untouched).
       - otodock-mcps:/opt/otodock/mcps/community
+      # Runtime-installed skill packages (community-skills catalog) land in
+      # /opt/otodock/mcps/skills — same persistence story as community MCPs.
+      - otodock-skills:/opt/otodock/mcps/skills
       # Admin-uploaded SSH private keys (ssh-hosts MCP). mcps/custom is baked
       # into the image, so runtime-written keys need their own volume or a
       # rebuild wipes them. Never mounted into any agent sandbox.
@@ -179,9 +182,18 @@ services:
     # /proc over Docker's masked /proc. The agent ends up uid 1000, CapEff=0, with
     # its own clean /proc. Low-risk for a non-root proxy (e.g. /proc/kcore still
     # needs CAP_SYS_RAWIO it doesn't hold). See SANDBOX.md.
+    #
+    # Ubuntu 24.04+ hosts: the kernel denies unprivileged user-namespace
+    # creation to UNCONFINED processes (kernel.apparmor_restrict_unprivileged_userns=1),
+    # so `apparmor=unconfined` alone can't sandbox agents there. Run
+    # `sudo scripts/setup-apparmor-userns.sh` once and set
+    # OTODOCK_APPARMOR_PROFILE=otodock_userns in .env (scripts/compose.sh
+    # detects the restriction and does both steps itself). The scoped profile
+    # keeps the system-wide restriction enabled — never flip the sysctl to 0
+    # for this.
     security_opt:
       - seccomp=unconfined
-      - apparmor=unconfined
+      - apparmor=${OTODOCK_APPARMOR_PROFILE:-unconfined}
       - systempaths=unconfined
     # Sandbox network isolation (always on) wraps every agent in a pasta netns;
     # pasta creates a tap via /dev/net/tun, which Docker does not expose by
@@ -215,7 +227,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.1.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.2.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -224,10 +236,11 @@ services:
     # it off every bridge so no default network is ever created. (Also pin the
     # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
     network_mode: "none"
-    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys 2>/dev/null; true"]
+    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys 2>/dev/null; true"]
     volumes:
       - otodock-agents:/opt/otodock/agents
       - otodock-mcps:/opt/otodock/mcps/community
+      - otodock-skills:/opt/otodock/mcps/skills
       - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
       - otodock-sessions:/opt/otodock/sessions
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
@@ -238,7 +251,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.1.1}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.2.0}
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -262,6 +275,9 @@ services:
     image: collabora/code:25.04.9.4.1
     restart: unless-stopped
     logging: *default-logging
+    # Bound so a runaway document degrades (Collabora sheds its LRU doc)
+    # instead of pressuring the host; matches the T1 catalog deploy.
+    mem_limit: 2g
     environment:
       # Document preview auto-configures from the ONE setting you already provide.
       # Collabora generates the in-browser editor URL (discovery `urlsrc`) AND
@@ -281,7 +297,7 @@ services:
       - |
         host="$${DASHBOARD_PUBLIC_URL#*://}"; host="$${host%%/*}";
         case "$$DASHBOARD_PUBLIC_URL" in https://*) t=true ;; *) t=false ;; esac;
-        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true";
+        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200";
         exec /start-collabora-online.sh
     cap_add:
       - MKNOD
@@ -316,6 +332,8 @@ volumes:
     name: otodock-agents
   otodock-mcps:
     name: otodock-mcps
+  otodock-skills:
+    name: otodock-skills
   otodock-ssh-keys:
     name: otodock-ssh-keys
   otodock-sessions:

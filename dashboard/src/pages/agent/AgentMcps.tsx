@@ -1,10 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router-dom'
 import {
   useAgentMcps,
   useSetAgentMcps,
   useAgentSkills,
-  AgentSkill,
   AgentMcpsNotVisibleError,
 } from '../../api/mcps'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
@@ -95,15 +94,12 @@ export default function AgentMcps() {
         m.name.toLowerCase().includes(q),
       )
     : mcpData.mcps
-  // The search also narrows the Skills list — match a skill's id, its parent
-  // MCP label, or its description.
-  const filteredSkills = q && skills
-    ? skills.filter(s =>
-        s.id.toLowerCase().includes(q) ||
-        (s.mcp_label || '').toLowerCase().includes(q) ||
-        (s.description || '').toLowerCase().includes(q),
-      )
-    : (skills || [])
+  // Per-MCP bundled-skill counts — rendered as a "provides N skills →" chip
+  // linking to the Skills tab (the single skill-control surface).
+  const skillCounts = new Map<string, number>()
+  for (const s of skills ?? []) {
+    skillCounts.set(s.mcp_name, (skillCounts.get(s.mcp_name) ?? 0) + 1)
+  }
 
   return (
     <div>
@@ -189,6 +185,15 @@ export default function AgentMcps() {
                         via admin
                       </span>
                     )}
+                    {(skillCounts.get(mcp.name) ?? 0) > 0 && (
+                      <Link
+                        to={`/agents/${name}/skills`}
+                        className="text-[10px] px-1.5 py-0.5 rounded-sm bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors"
+                        title="This MCP bundles skills — manage them on the Skills tab"
+                      >
+                        provides {skillCounts.get(mcp.name)} skill{skillCounts.get(mcp.name) === 1 ? '' : 's'} →
+                      </Link>
+                    )}
                   </div>
                   {mcp.description && (
                     <p className="text-xs text-p-text-light mt-0.5 line-clamp-2">
@@ -215,38 +220,6 @@ export default function AgentMcps() {
           <p className="text-sm text-p-text-light py-4">No MCPs match your search.</p>
         )}
       </div>
-
-      {/* Skills (read-only — MCP skills are tied to their MCP) */}
-      {filteredSkills.length > 0 && (
-        <div>
-          <h2 className="text-base font-bold text-p-text mb-2">Skills</h2>
-          <p className="text-xs text-p-text-light mb-3">Skills are auto-activated when their MCP is assigned.</p>
-          <div className="space-y-2">
-            {filteredSkills.map((skill: AgentSkill) => (
-              <div
-                key={skill.id}
-                className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface"
-              >
-                <span className="w-2 h-2 rounded-full bg-green-500 shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-mono text-brand">{skill.id}</span>
-                    <span className="text-xs text-p-text-light">from {skill.mcp_label}</span>
-                  </div>
-                  {skill.description && (
-                    <p className="text-xs text-p-text-secondary mt-0.5">{skill.description}</p>
-                  )}
-                </div>
-                {skill.exclude_from.length > 0 && (
-                  <span className="text-[10px] text-p-text-light shrink-0">
-                    excl: {skill.exclude_from.join(', ')}
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       <CommunityMcpsBrowser
         open={showBrowse}

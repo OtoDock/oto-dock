@@ -201,6 +201,7 @@ export default function AgentChat() {
     setMeetingRound,
     meetingLeftParticipants,
     editText, setEditText,
+    dismissPreview,
     currentMsgRef, thinkingBufRef, abortedRef, discardingRef, sentWithBubbleRef, meetingSpeakerRef,
     handlePermissionRespond, handleQuestionAnswer, handleQuestionAnswerStructured, handleSendMessage,
     sendArtifactInteraction, sendAppAction,
@@ -224,16 +225,17 @@ export default function AgentChat() {
       setChatActiveLayer(data.execution_path || agentExecutionPath)  // Lock to chat's actual layer
       setWarmingUp(false)
       // Interactive CLI: a live PTY-backed session →
-      // render the terminal, NOT the pump UI. The hook flushes any text typed
-      // before the terminal was ready, or — if the backend declined interactive
-      // (kill-switch off / non-Claude / remote) — replays the stashed prompt as
-      // a normal turn. 'none' = not interactive: fall through to the server-kick.
+      // render the terminal, NOT the pump UI. Text-only cold sends ride the
+      // warmup and the backend delivers them (submit_prompt / server kick);
+      // the hook's flush + decline replay only remain for the attachments
+      // stash. 'none' = not interactive: fall through to the server-kick.
       const interactiveStatus = interactive.onWarmupReady(data, {
         onDecline: (t, cid) => { serverKickPendingRef.current = false; ws.sendMessage(t, cid) },
       })
+      const kick = serverKickPendingRef.current
       if (interactiveStatus !== 'none') {
         serverKickPendingRef.current = false
-      } else if (serverKickPendingRef.current) {
+      } else if (kick && (kick.chatId === null || kick.chatId === data.chat_id)) {
         // Adopt the server-kicked first turn into the streaming UI.
         // The backend runs the turn on warmup_ready, but the client sent `warmup`
         // (not sendMessage), so nothing flipped ws.streaming — do it here so the
@@ -501,8 +503,14 @@ export default function AgentChat() {
     const prefs = useAgentPrefsStore.getState()
     const stickyModel = prefs.lastModel[agentName]
     const stickyMode = prefs.lastMode[agentName]
-    if (!model) setModel(stickyModel || agentDefaultModel)
-    if (stickyMode && mode === 'default') setMode(stickyMode)
+    // Unconditional re-seed: navigating here from an EXISTING chat leaves its
+    // restored model/mode in state — for a task-run chat that's the run's
+    // model + 'auto', which must never carry into a new chat ('auto' would
+    // spawn it with Don't Ask). The sticky prefs hold the user's own last
+    // explicit picks (handleModeChange/handleModelChange save every change),
+    // so re-seeding never loses a real choice.
+    setModel(stickyModel || agentDefaultModel)
+    setMode(stickyMode || 'default')
     // Seed the interactive toggle from the agent's sticky preference too, so a
     // new chat (or a page refresh on /chat/<agent>) keeps the user's last
     // interactive on/off choice. No-op unless an explicit value was set.
@@ -581,8 +589,12 @@ export default function AgentChat() {
   // Set when we send a prompt WITH warmup (server-kicked first turn). On
   // warmup_ready we adopt the server-driven turn into the streaming UI so the
   // stop button + timer + live generation engage (the client sent `warmup`,
-  // not sendMessage, so nothing else flips ws.streaming).
-  const serverKickPendingRef = useRef(false)
+  // not sendMessage, so nothing else flips ws.streaming). CHAT-TAGGED (null =
+  // brand-new chat, matches the id the backend mints): adopt only the sending
+  // chat's warmup_ready — after send→switch-away the flag would otherwise
+  // survive (that chat's ready is dropped by the staleness guard) and flip a
+  // phantom "generating" UI on the NEXT chat's resume. Cleared on chat switch.
+  const serverKickPendingRef = useRef<false | { chatId: string | null }>(false)
 
   const { data: chats, refetch: refetchChats } = useChats(agentName)
 
@@ -785,6 +797,13 @@ export default function AgentChat() {
     setFindBarOpen(false)
     setFindInput('')
     setFindQuery('')
+    // Same sticky re-seed as handleSelectChat: a task chat's restored model +
+    // 'auto' mode must not leak into the chat this navigation opens.
+    if (agentName) {
+      const prefs = useAgentPrefsStore.getState()
+      setModel(prefs.lastModel[agentName] || agentDefaultModel)
+      setMode(prefs.lastMode[agentName] || 'default')
+    }
 
     ws.resumeChat(urlChatId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -962,7 +981,16 @@ export default function AgentChat() {
       const routed = interactive.routeSend(text, {
         chatId, sessionId, warmingUp,
         warmupParams: { agentName, chatId: chatId || undefined, mode, model, layer: chatActiveLayer ?? selectedLayer ?? undefined },
-        onColdStart: () => { addUserAndPlaceholder(text); sentWithBubbleRef.current = text; setWarmingUp(true) },
+        onColdStart: () => {
+          addUserAndPlaceholder(text)
+          sentWithBubbleRef.current = text
+          setWarmingUp(true)
+          // A cold interactive send carries its text with the warmup (Codex
+          // argv / Claude server submit) — if the backend DECLINES interactive
+          // it server-kicks that text as a -p turn, so arm the adoption like
+          // the -p cold path below.
+          serverKickPendingRef.current = { chatId: chatId || null }
+        },
         images: wsImages, files: wsFiles,
       })
       if (routed) {
@@ -983,7 +1011,7 @@ export default function AgentChat() {
       } else if (!warmingUp) {
         addUserAndPlaceholder(text)
         setWarmingUp(true)
-        serverKickPendingRef.current = true  // adopt the server-kicked turn on warmup_ready
+        serverKickPendingRef.current = { chatId: chatId || null }  // adopt the server-kicked turn on warmup_ready
         // Server-owned first turn: the prompt rides WITH warmup —
         // the backend persists it at send-time and kicks the turn on
         // warmup_ready, so it runs even if we navigate away / refresh during
@@ -1093,13 +1121,19 @@ export default function AgentChat() {
     // `model` non-empty so the seed effect's `if (!model)` guard skipped the
     // sticky model, and the layer followed the default model.
     setModel(prefs.lastModel[agentName] || agentDefaultModel)
+    // Sticky MODE from prefs — not the current state: coming from a task-run
+    // chat the state holds the run's 'auto', and the pre-warm below would
+    // spawn the new session with Don't Ask. prefs.lastMode holds the user's
+    // own last explicit pick, so New Chat stays sticky without the leak.
+    const nextMode = prefs.lastMode[agentName] || 'default'
+    setMode(nextMode)
     preWarmedRef.current = null
     navigate(`/chat/${agentName}`, { replace: true })
-    // Trigger eager pre-warmup for the new chat. Keep the current `mode` state
-    // (sticky across New Chat) so the pre-warmed session is spawned with the
-    // user's selected permission mode — otherwise the session's _session_modes
-    // entry is locked to "default" at start_session time and the user has to
-    // toggle the dropdown to re-apply.
+    // Trigger eager pre-warmup for the new chat with the just-seeded sticky
+    // mode so the pre-warmed session spawns with the user's selected
+    // permission mode — otherwise the session's _session_modes entry is
+    // locked to "default" at start_session time and the user has to toggle
+    // the dropdown to re-apply.
     // Skip the headless pre-warm when the new chat will be interactive — the
     // interactive send spawns its own PTY session (which would supersede a
     // headless pre-warm). Use the just-seeded sticky choice (state setters above
@@ -1108,9 +1142,9 @@ export default function AgentChat() {
       (stickyInteractive || (currentAgent?.default_execution_mode || '')) === 'interactive'
     // Eager only for the favorite — others warm lazily on first interaction.
     if (ws.connected && !willBeInteractive && isFavoriteAgent) {
-      ws.preWarmup(agentName, agentDefaultModel, mode, agentExecutionPath)
+      ws.preWarmup(agentName, agentDefaultModel, nextMode, agentExecutionPath)
     }
-  }, [agentName, agentDefaultModel, agentExecutionPath, mode, navigate, ws, workspace, currentAgent?.default_execution_mode, interactive.seedExecMode, interactive.resetSession, isFavoriteAgent])
+  }, [agentName, agentDefaultModel, agentExecutionPath, navigate, ws, workspace, currentAgent?.default_execution_mode, interactive.seedExecMode, interactive.resetSession, isFavoriteAgent])
 
   // Lazy pre-warm: a non-favorite agent's new-chat page warms the moment the
   // user genuinely engages the composer (first keydown/pointerdown). Deduped by
@@ -1141,6 +1175,17 @@ export default function AgentChat() {
       setSessionId(null)
       setWarmingUp(false)
       interactive.resetSession()  // cleared until the resumed chat's warmup_ready{interactive}
+      serverKickPendingRef.current = false  // the left chat's kick must not adopt a later ready
+      // Re-seed model/mode from the sticky prefs: a task-run chat restored
+      // its RUN's model + 'auto' permission into this state (chat_history
+      // mode), and neither may leak into the next chat — 'auto' would
+      // silently run a normal chat with Don't Ask. chat_history overrides
+      // for the opened chat (model always; mode for task chats).
+      if (agentName) {
+        const prefs = useAgentPrefsStore.getState()
+        setModel(prefs.lastModel[agentName] || agentDefaultModel)
+        setMode(prefs.lastMode[agentName] || 'default')
+      }
       preWarmedRef.current = null
       setTotalCost(0)
       setLimitReached(false)
@@ -1166,7 +1211,7 @@ export default function AgentChat() {
         ws.resumeChat(selectedChatId)
       }
     },
-    [agentName, chatId, ws, navigate, workspace, interactive.resetSession],
+    [agentName, agentDefaultModel, chatId, ws, navigate, workspace, interactive.resetSession],
   )
 
   // Mini-app send_prompt router — the host page decides the delivery rail:
@@ -1191,9 +1236,10 @@ export default function AgentChat() {
       }
       // No live terminal but interactive is the effective mode (agent default
       // or per-chat toggle) — front page or a dead interactive chat. Ride the
-      // composer's own cold-start rail: routeSend stashes the framed text and
-      // warmup_ready types it into the fresh terminal (a backend decline to
-      // headless falls back through the page's normal send via onDecline).
+      // composer's own cold-start rail: the framed text goes up WITH the
+      // warmup and the backend delivers it into the fresh terminal (or
+      // server-kicks it as a -p turn on a decline — arm the adoption ref so
+      // that turn engages the streaming UI, like the composer path).
       // Without this, the fresh terminal opened and the prompt never landed.
       if (interactive.interactiveMode && agentName) {
         const built = buildAppActionText(app.title || app.slug, action.label, substituted)
@@ -1201,7 +1247,11 @@ export default function AgentChat() {
         const routed = interactive.routeSend(built.framed, {
           chatId, sessionId, warmingUp,
           warmupParams: { agentName, chatId: chatId || undefined, mode, model, layer: chatActiveLayer ?? selectedLayer ?? undefined },
-          onColdStart: () => { setAppsOpen(false); setWarmingUp(true) },
+          onColdStart: () => {
+            setAppsOpen(false)
+            setWarmingUp(true)
+            serverKickPendingRef.current = { chatId: chatId || null }
+          },
         })
         if (routed) {
           interactive.setShowRichView(false)
@@ -1363,15 +1413,11 @@ export default function AgentChat() {
       onSendMessage={handleSendMessage}
       onArtifactInteraction={sendArtifactInteraction}
       onPlanFetched={handlePlanFetched}
-      onDismissPreview={(fileId, dbMessageId) => {
-        // Drop the preview block from local UI state. The DocumentPreview
-        // component already called the dismiss API before invoking this.
-        setMessages(prev => prev.map(m => ({
-          ...m,
-          blocks: m.blocks.filter(b =>
-            !(b.type === 'document_preview' && b.fileId === fileId)
-          ),
-        })))
+      onDismissPreview={(fileId, key) => {
+        // Drop the preview blocks from local UI state (ref-safe; `key` scopes
+        // to one frozen instance). The DocumentPreview component already
+        // called the dismiss API before invoking this.
+        dismissPreview(fileId, key)
       }}
       streaming={viewedStreaming}
       queuedMessages={queuedMessages}
@@ -1631,7 +1677,12 @@ export default function AgentChat() {
               onToggleRichView={handleToggleRichView}
               hidePermissions={interactive.interactiveMode || interactive.sessionInteractive}
               interactiveActive={interactive.interactiveMode || interactive.sessionInteractive}
-              modelLocked={interactive.sessionInteractive}
+              // A task run's model/permissions are the RUN's facts (agent
+              // default model, 'auto' posture) — display-only, never a
+              // viewer choice. The locked model row renders the raw id even
+              // when the catalog no longer lists that model.
+              modelLocked={interactive.sessionInteractive || isTaskChat}
+              modeLocked={isTaskChat}
               leftSlot={interactive.sessionInteractive && chatId
                 ? <TerminalControlBar className="flex-1 min-w-0" send={(seq) => ws.sendPtyInput(chatId, utf8ToB64(seq))} />
                 : undefined}

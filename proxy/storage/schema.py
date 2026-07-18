@@ -787,6 +787,10 @@ def init_community_requests(conn) -> None:
             admin_note TEXT NOT NULL DEFAULT '',
             install_log TEXT NOT NULL DEFAULT '',
             batch_id TEXT,
+            -- 'mcp' | 'skill' — which catalog/installer the request targets
+            -- (mcp_name then holds a skill-package slug). Pre-existing
+            -- installs get the column via run_migrations.
+            kind TEXT NOT NULL DEFAULT 'mcp',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             resolved_at TEXT,
@@ -1722,6 +1726,12 @@ def run_migrations(conn) -> None:
         "ALTER TABLE pinned_apps "
         "ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE"
     )
+    # 2026-07-17: skills adoption — approval requests carry which catalog
+    # they target ('mcp' | 'skill'); every pre-existing row is an MCP request.
+    conn.execute(
+        "ALTER TABLE mcp_assignment_requests "
+        "ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'mcp'"
+    )
     # 2026-07-11: chat/project-scoped pins (the Dock). The one-per-scope
     # partial unique indexes live HERE, not in init_pinned_apps: on a
     # pre-existing install the CREATE-IF-NOT-EXISTS no-ops before these
@@ -1787,3 +1797,72 @@ def run_migrations(conn) -> None:
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT cron_dow_std")
             logger.exception("cron dow migration failed — will retry next startup")
+
+
+# ---------------------------------------------------------------------------
+# Schema-drift guard (log-only)
+# ---------------------------------------------------------------------------
+
+_DRIFT_PROBE_SCHEMA = "otodock_drift_probe"
+
+
+def check_schema_drift(conn) -> list[tuple[str, str]]:
+    """Log-only boot guard: live tables missing columns the code expects.
+
+    ``init_schema``'s CREATE TABLE IF NOT EXISTS silently no-ops on existing
+    tables, so a column added to a CREATE TABLE without a matching
+    ``run_migrations`` ALTER never reaches a pre-existing install — its
+    endpoints then 500 at query time with UndefinedColumn and nothing points
+    at the cause. This builds the expected schema in a scratch pg schema
+    inside a rolled-back transaction and diffs information_schema against the
+    live one. Never raises; returns the (table, column) drift list after
+    logging it loudly.
+    """
+    drift: list[tuple[str, str]] = []
+    try:
+        live_schema = conn.execute(
+            "SELECT current_schema() AS cs"
+        ).fetchone()["cs"]
+        conn.execute(f"DROP SCHEMA IF EXISTS {_DRIFT_PROBE_SCHEMA} CASCADE")
+        conn.execute(f"CREATE SCHEMA {_DRIFT_PROBE_SCHEMA}")
+        # SET LOCAL: scoped to this (never-committed) transaction, so the
+        # probe DDL below lands in the scratch schema and every trace of it
+        # vanishes on the rollback in `finally`.
+        conn.execute(f"SET LOCAL search_path TO {_DRIFT_PROBE_SCHEMA}")
+        init_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT c1.table_name AS t, c1.column_name AS c
+            FROM information_schema.columns c1
+            WHERE c1.table_schema = %s
+              AND EXISTS (SELECT 1 FROM information_schema.tables tb
+                          WHERE tb.table_schema = %s
+                            AND tb.table_name = c1.table_name)
+              AND NOT EXISTS (SELECT 1 FROM information_schema.columns c2
+                              WHERE c2.table_schema = %s
+                                AND c2.table_name = c1.table_name
+                                AND c2.column_name = c1.column_name)
+            ORDER BY c1.table_name, c1.column_name
+            """,
+            (_DRIFT_PROBE_SCHEMA, live_schema, live_schema),
+        ).fetchall()
+        drift = [(r["t"], r["c"]) for r in rows]
+    except Exception as e:  # the guard must never take the boot down with it
+        logger.debug("schema drift probe skipped: %s", e)
+    finally:
+        try:
+            conn.rollback()  # discard the probe schema + reset search_path
+        except Exception:
+            pass
+    if drift:
+        logger.error(
+            "SCHEMA DRIFT: the live database is missing %d column(s) the "
+            "code expects: %s. This DB predates those columns and no forward "
+            "migration covers them (pre-release installs were hand-converged, "
+            "not migrated). Add the matching ALTER TABLE ... ADD COLUMN, or "
+            "file it in run_migrations(). Affected endpoints will return "
+            "HTTP 500 (UndefinedColumn) until fixed.",
+            len(drift),
+            ", ".join(f"{t}.{c}" for t, c in drift),
+        )
+    return drift

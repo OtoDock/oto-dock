@@ -99,6 +99,10 @@ RELAY_ERROR_MESSAGES = {
         "This OtoDock license is already active on another install — deactivate "
         "it there first, or use 'Move license'."
     ),
+    "invalid_grant": (
+        "The vendor revoked this account's authorization — reconnect the "
+        "account in Settings → Integrations."
+    ),
     "events_provider_unsupported": (
         "Hosted event delivery isn't available for this integration yet — "
         "vendor-console (manual) webhook setup still works."

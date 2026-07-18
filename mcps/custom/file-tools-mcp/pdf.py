@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 from shared import (
+    _dropped_note,
     _libreoffice_convert,
     _normalize_operations,
     _op_type,
@@ -213,6 +214,82 @@ def read_pdf(path: str, pages: str | None) -> str:
 # Write PDF (HTML/Markdown → PDF via WeasyPrint)
 # ---------------------------------------------------------------------------
 
+# Math delimiters. \( \) / \[ \] / $$ $$ are always math. Single-$ spans only
+# count under pandoc's adjacency rules — opening $ immediately followed by
+# non-space, closing $ immediately preceded by non-space and not followed by
+# a digit — so "$100 and $200" or "$5-$10" never parse as math.
+_MATH_PATTERNS = [
+    (re.compile(r"\\\[(.+?)\\\]", re.DOTALL), True),
+    (re.compile(r"\$\$(.+?)\$\$", re.DOTALL), True),
+    (re.compile(r"\\\((.+?)\\\)", re.DOTALL), False),
+]
+_SINGLE_DOLLAR_RE = re.compile(
+    r"(?<![\\$])\$(?![\s$])((?:[^$\n\\]|\\[^\n])+?)(?<![\s\\])\$(?![\d$])"
+)
+# Segments math must never touch: fenced code blocks and backtick spans
+# (markdown), <pre>/<code> blocks (raw HTML input).
+_MD_CODE_RE = re.compile(r"(```.*?```|~~~.*?~~~|`[^`\n]*`)", re.DOTALL)
+_HTML_CODE_RE = re.compile(r"(<pre\b.*?</pre>|<code\b.*?</code>)", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_math_spans(content: str, *, is_markdown: bool):
+    """Swap math spans for placeholder tokens that survive markdown conversion.
+
+    Returns (content_with_placeholders, spans) where each span is
+    (token, latex, display, original_text). Rendering happens after the HTML
+    pipeline so LaTeX backslashes never meet the markdown parser.
+    """
+    import uuid
+
+    spans: list[tuple[str, str, bool, str]] = []
+
+    def _sub_segment(segment: str) -> str:
+        def make_repl(display: bool):
+            def repl(m):
+                token = f"OTOMATH{uuid.uuid4().hex[:12]}X"
+                spans.append((token, m.group(1).strip(), display, m.group(0)))
+                return token
+            return repl
+
+        for pattern, display in _MATH_PATTERNS:
+            segment = pattern.sub(make_repl(display), segment)
+        if is_markdown:
+            segment = _SINGLE_DOLLAR_RE.sub(make_repl(False), segment)
+        return segment
+
+    protect = _MD_CODE_RE if is_markdown else _HTML_CODE_RE
+    parts = protect.split(content)
+    # protect.split alternates non-code / code segments; transform only non-code
+    return "".join(
+        _sub_segment(part) if i % 2 == 0 else part
+        for i, part in enumerate(parts)
+    ), spans
+
+
+def _render_math_spans(html_body: str, spans, errors: list[str]) -> str:
+    """Replace placeholder tokens with inline SVG (ziamath). A failed equation
+    restores its original text and reports — one bad formula must not sink
+    the whole document."""
+    from equations import EquationError, latex_to_svg
+
+    for token, latex, display, original in spans:
+        try:
+            svg, yofst = latex_to_svg(latex, display=display, size=18 if display else 16)
+            if display:
+                rendered = (
+                    '<span style="display:block;text-align:center;margin:0.8em 0">'
+                    f"{svg}</span>"
+                )
+            else:
+                rendered = svg.replace(
+                    "<svg ", f'<svg style="vertical-align:{yofst:.2f}px" ', 1
+                )
+        except EquationError as exc:
+            errors.append(str(exc))
+            rendered = original
+        html_body = html_body.replace(token, rendered)
+    return html_body
+
 
 async def handle_write_pdf(args: dict) -> str:
     import markdown as md
@@ -226,6 +303,10 @@ async def handle_write_pdf(args: dict) -> str:
     custom_css = args.get("css", "")
     page_size = args.get("page_size", "A4")
     margins = args.get("margins", {})
+
+    content, math_spans = _extract_math_spans(
+        content, is_markdown=content_type == "markdown"
+    )
 
     if content_type == "markdown":
         html_body = md.markdown(
@@ -243,6 +324,10 @@ async def handle_write_pdf(args: dict) -> str:
             return match.group(0)
 
     html_body = re.sub(r'src="([^"]+)"', resolve_img_src, html_body)
+
+    # After the src= rewriter — injected SVG markup must never meet it
+    math_errors: list[str] = []
+    html_body = _render_math_spans(html_body, math_spans, math_errors)
 
     m_top = margins.get("top", "2cm")
     m_bottom = margins.get("bottom", "2cm")
@@ -268,7 +353,16 @@ img {{ max-width: 100%; }}
 
     HTML(string=full_html).write_pdf(path)
     await _push_preview(path)
-    return f"PDF created: {_to_agents_relative(path)}"
+    msg = f"PDF created: {_to_agents_relative(path)}"
+    rendered_eqs = len(math_spans) - len(math_errors)
+    if rendered_eqs:
+        msg += f" ({rendered_eqs} equation(s) rendered)"
+    if math_errors:
+        msg += (
+            f"\n\nEquation warnings ({len(math_errors)}) — these spans were left "
+            "as plain text:\n" + "\n".join(f"  - {e}" for e in math_errors)
+        )
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +381,7 @@ async def handle_edit_pdf(args: dict) -> str:
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
-    ops = _normalize_operations(args.get("operations"))
+    ops, dropped = _normalize_operations(args.get("operations"))
     doc = fitz.open(path)
     errors = []
     notes = []
@@ -752,6 +846,7 @@ async def handle_edit_pdf(args: dict) -> str:
     await _push_preview(path)
 
     msg = f"PDF saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
+    msg += _dropped_note(dropped)
     if garbage:
         pct = (1 - size_after / max(size_before, 1)) * 100
         msg += f"\nCompression: {size_before / 1024:.0f}KB → {size_after / 1024:.0f}KB ({pct:.0f}% reduction)"

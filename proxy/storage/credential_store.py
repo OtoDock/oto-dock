@@ -92,7 +92,7 @@ def get_user_credentials(
                 result[r["credential_key"]] = _decrypt(r["credential_value_enc"])
             except Exception:
                 logger.warning(
-                    "Failed to decrypt user credential %s/%s/%s/%s",
+                    "Failed to decrypt user credential %s/%s/%s/%s (key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                     user_sub[:8], mcp_name, account_label, r["credential_key"],
                 )
         return result
@@ -191,7 +191,7 @@ def get_all_user_credentials(
                 result[mcp][r["credential_key"]] = _decrypt(r["credential_value_enc"])
             except Exception:
                 logger.warning(
-                    "Failed to decrypt %s/%s/%s/%s",
+                    "Failed to decrypt %s/%s/%s/%s (key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                     user_sub[:8], mcp, account_label, r["credential_key"],
                 )
         return result
@@ -351,6 +351,62 @@ def list_agent_account_bindings(user_sub: str, mcp_name: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def startup_key_canary() -> None:
+    """Boot-time probe: can the current key decrypt what's already stored?
+
+    The Fernet key derives from JWT_SECRET (or CREDENTIAL_ENCRYPTION_KEY), so
+    a recreated config.env silently orphans every encrypted row: 2FA 500s at
+    login, provider subscriptions report "no subscription", MCP/phone creds
+    read back empty. Sampling a few rows per store at boot turns that
+    multi-hour mystery into one log line. Diagnosis only — never raises,
+    never blocks boot.
+    """
+    probes = [
+        ("user MCP credentials",
+         "SELECT credential_value_enc AS v FROM user_credentials "
+         "WHERE credential_value_enc <> '' LIMIT 5"),
+        ("infrastructure credentials",
+         "SELECT credential_value_enc AS v FROM infra_credentials "
+         "WHERE credential_value_enc <> '' LIMIT 5"),
+        ("provider subscriptions",
+         "SELECT credential_data_enc AS v FROM execution_layer_subscriptions "
+         "WHERE credential_data_enc <> '' LIMIT 5"),
+        ("2FA/TOTP enrollments",
+         "SELECT totp_secret_enc AS v FROM users "
+         "WHERE totp_secret_enc IS NOT NULL AND totp_secret_enc <> '' LIMIT 5"),
+    ]
+    bad: list[str] = []
+    try:
+        with get_conn() as conn:
+            for store, sql in probes:
+                try:
+                    rows = conn.execute(sql).fetchall()
+                except Exception:
+                    continue  # table absent (partial install) — not this probe's job
+                for r in rows:
+                    try:
+                        _decrypt(r["v"])
+                    except Exception:
+                        bad.append(store)
+                        break
+    except Exception as e:  # canary must never take the boot down with it
+        logger.debug("credential key canary skipped: %s", e)
+        return
+    if bad:
+        logger.error(
+            "CREDENTIAL KEY MISMATCH: stored %s cannot be decrypted with the "
+            "current key. The encryption key derives from JWT_SECRET in "
+            "config.env — if config.env was recreated (e.g. the install moved "
+            "to a new folder), every previously saved secret is unreadable: "
+            "2FA login will fail with 500, provider subscriptions will report "
+            "'no subscription', MCP/phone credentials will read back empty. "
+            "Fix: restore the original JWT_SECRET in config.env and restart; "
+            "or re-enroll 2FA and re-connect the affected credentials under "
+            "the new key.",
+            " + ".join(bad),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Infrastructure credentials (shared, admin-only)
 # ---------------------------------------------------------------------------
@@ -368,7 +424,7 @@ def get_infra_credentials(mcp_name: str) -> dict[str, str]:
             try:
                 result[r["credential_key"]] = _decrypt(r["credential_value_enc"])
             except Exception:
-                logger.warning("Failed to decrypt infra credential %s/%s",
+                logger.warning("Failed to decrypt infra credential %s/%s (key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                                mcp_name, r["credential_key"])
         return result
 
@@ -428,7 +484,7 @@ def set_infra_credentials_if_absent(
             try:
                 result[r["credential_key"]] = _decrypt(r["credential_value_enc"])
             except Exception:
-                logger.warning("Failed to decrypt infra credential %s/%s",
+                logger.warning("Failed to decrypt infra credential %s/%s (key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                                mcp_name, r["credential_key"])
         return result
 
@@ -471,7 +527,7 @@ def get_all_infra_credentials() -> dict[str, dict[str, str]]:
             try:
                 result[mcp][r["credential_key"]] = _decrypt(r["credential_value_enc"])
             except Exception:
-                logger.warning("Failed to decrypt infra %s/%s",
+                logger.warning("Failed to decrypt infra %s/%s (key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
                                mcp, r["credential_key"])
         return result
 

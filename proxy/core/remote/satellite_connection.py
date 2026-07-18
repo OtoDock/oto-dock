@@ -80,6 +80,12 @@ _PTY_INJECT_MIN_VERSION = (0, 5, 83)
 # proxy keeps the hard abort (tree-kill + re-warm) for them.
 _SOFT_INTERRUPT_MIN_VERSION = (0, 5, 89)
 
+# Minimum SATELLITE_VERSION that handles `file_stat` (cheap pull-through cache
+# revalidation: size+mtime probe instead of a full re-transfer). Older
+# satellites would silently drop the frame — the proxy then skips the probe
+# and re-pulls unconditionally (today's behavior, no regression).
+_FILE_STAT_MIN_VERSION = (0, 5, 95)
+
 
 @dataclass
 class SatelliteConnection:
@@ -830,6 +836,13 @@ class SatelliteConnectionManager(
         keeps the hard abort path — the frame would be silently dropped and
         the turn would never close."""
         return self._satellite_at_least(machine_id, _SOFT_INTERRUPT_MIN_VERSION)
+
+    def satellite_supports_file_stat(self, machine_id: str) -> bool:
+        """True if the connected satellite handles ``file_stat`` (pull-through
+        cache revalidation, SATELLITE_VERSION 0.5.95). When False the proxy
+        skips the probe and re-pulls unconditionally — the frame would be
+        silently dropped and the probe would only burn its timeout."""
+        return self._satellite_at_least(machine_id, _FILE_STAT_MIN_VERSION)
 
     def _satellite_at_least(self, machine_id: str, version: tuple) -> bool:
         conn = self._connections.get(machine_id)

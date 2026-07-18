@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { useAuth } from '../contexts/AuthContext'
 
 export interface AgentSummary {
   name: string
@@ -384,6 +385,7 @@ export const useZipAgentPaths = () => {
 
 export function useCreateAgent() {
   const qc = useQueryClient()
+  const { refreshUser } = useAuth()
   return useMutation({
     mutationFn: async (data: {
       display_name: string
@@ -399,7 +401,15 @@ export function useCreateAgent() {
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to create agent') }
       return res.json()
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['agents'] }) },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents'] })
+      // Creating an agent assigns the creator as its manager server-side.
+      // That role lives in the auth user snapshot (`user.agent_roles`),
+      // which is only fetched at app load — refresh it so views driven off
+      // it (the Remote Machines settings tab, per-agent role gates) show
+      // the new agent without a page reload.
+      void refreshUser()
+    },
   })
 }
 
@@ -420,13 +430,20 @@ export function useUpdateAgent() {
 
 export function useDeleteAgent() {
   const qc = useQueryClient()
+  const { refreshUser } = useAuth()
   return useMutation({
     mutationFn: async ({ name, confirm_slug }: { name: string; confirm_slug: string }) => {
       const res = await apiFetch(`/v1/agents/${name}`, { method: 'DELETE', body: JSON.stringify({ confirm_slug }) })
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to delete') }
       return res.json()
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['agents'] }) },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agents'] })
+      // Mirror of useCreateAgent: the delete removes the agent's rows from
+      // `user_agents` server-side, so refresh the auth snapshot or the dead
+      // agent lingers in `user.agent_roles`-driven views until a reload.
+      void refreshUser()
+    },
   })
 }
 

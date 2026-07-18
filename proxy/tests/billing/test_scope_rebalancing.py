@@ -1,6 +1,6 @@
 """Scope-level rebalancing + sticky-pin liveness (subscription_pool).
 
-Covers the dev/plans/subscription-scope-rebalancing.md invariants:
+Covers the subscription_pool scope-rebalancing invariants:
 - drift trigger ($100 floor / 3× ratio on the 5h window) moves a whole scope
   onto the coldest eligible account over the fan-out rails, ack-gated;
 - reactive trigger: a REAL provider limit (full cooldown class) moves the

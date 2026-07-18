@@ -20,7 +20,7 @@ import QuestionDialog from './QuestionDialog'
 import SearchHighlight from './SearchHighlight'
 import { useSearch } from '../../contexts/SearchContext'
 import type { MessageBlock } from './types'
-import type { BgCommandPair } from '../../lib/messageBlocks'
+import type { BgCommandPair, PreviewChainMode } from '../../lib/messageBlocks'
 import PlanReviewCard from './PlanReviewCard'
 
 // URL regex for linkifying plain text (user messages)
@@ -118,6 +118,7 @@ export default function BlockRenderer({
   agentName,
   uiSuperseded,
   uiTitle,
+  previewMode,
 }: {
   block: MessageBlock
   blockId: string
@@ -134,7 +135,10 @@ export default function BlockRenderer({
   onQuestionAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
   onSendMessage?: (text: string) => void
   onPlanFetched?: (filename: string, content: string) => void
-  onDismissPreview?: (fileId: string, dbMessageId?: number) => void
+  /** document_preview blocks: `key` scopes the removal to ONE instance (a
+   * frozen "previous version" closing itself); undefined removes the file's
+   * whole preview trail (the live block's close). */
+  onDismissPreview?: (fileId: string, key?: { snapshotId?: string; dbMessageId?: number }) => void
   /** display_ui backchannel sender — absent on read-only surfaces (history,
       task runs), where the artifact acks `unavailable` instead. */
   onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }>
@@ -147,6 +151,9 @@ export default function BlockRenderer({
   /** ui blocks: fallback title inherited from an earlier display of the same
    * path (html-less re-displays carry none on the wire). */
   uiTitle?: string
+  /** document_preview blocks: render-time chain state (previewChainModes) —
+   * live / frozen previous version / chip. */
+  previewMode?: PreviewChainMode
 }) {
   const { query: searchQuery } = useSearch()
   switch (block.type) {
@@ -505,8 +512,15 @@ export default function BlockRenderer({
           fileId={block.fileId}
           downloadUrl={block.downloadUrl}
           dbMessageId={block.dbMessageId}
+          snapshotId={block.snapshotId}
           chatId={chatId}
-          onDismiss={() => onDismissPreview?.(block.fileId, block.dbMessageId)}
+          mode={previewMode}
+          onDismiss={(scope) => onDismissPreview?.(
+            block.fileId,
+            scope === 'instance'
+              ? { snapshotId: block.snapshotId, dbMessageId: block.dbMessageId }
+              : undefined,
+          )}
         />
       )
 

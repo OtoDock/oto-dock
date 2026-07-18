@@ -87,6 +87,14 @@ def _current_session() -> tuple[str, str]:
 # /v1/hooks/file*, which the hooks then translate per-target (local sandbox,
 # remote satellite, plain host). See `_to_agents_relative` below.
 
+# For satellite-homed sessions the resolve/file/file-written hooks perform a
+# FULL synchronous file transfer over the satellite's WebSocket (lazy pull in,
+# push-back out) before replying — over a WAN/tunnel link a few MB takes tens
+# of seconds. The read budget must cover that transfer (the proxy's own pull
+# budget is 180 s); connect stays short because the proxy itself is always
+# platform-local to this container.
+HOOK_TIMEOUT = httpx.Timeout(connect=5.0, read=150.0, write=30.0, pool=5.0)
+
 
 def _to_agents_relative(container_path: str) -> str:
     """Strip the `/agents/` mount prefix to produce an agents-relative path
@@ -128,7 +136,7 @@ def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, st
             f"{PROXY_URL}/v1/hooks/resolve-path",
             json={"session_id": session_id, "path": path, "writing": writing},
             headers={"Authorization": auth},
-            timeout=5.0,
+            timeout=HOOK_TIMEOUT,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -232,7 +240,7 @@ def _op_type(op: dict) -> str:
     return op.get("type") or op.get("op") or op.get("operation") or op.get("action") or ""
 
 
-def _normalize_operations(ops) -> list[dict]:
+def _normalize_operations(ops) -> tuple[list[dict], int]:
     """Normalize an operations argument to a list of dicts.
 
     Some LLMs double-encode array parameters as JSON strings. Accept any of:
@@ -242,29 +250,45 @@ def _normalize_operations(ops) -> list[dict]:
     - JSON-encoded string of a single op: "{\"type\":\"resize\"}"
     - single dict (wrap in list)
 
-    Malformed items are silently dropped so other operations still run.
+    Returns (operations, dropped): malformed items are dropped so other
+    operations still run, but the count is reported — a caller that silently
+    swallows them leaves the model believing everything was applied.
     """
     if ops is None:
-        return []
+        return [], 0
     if isinstance(ops, str):
         try:
             ops = json.loads(ops)
         except (json.JSONDecodeError, ValueError):
-            return []
+            return [], 1  # the whole blob was unparseable
     if isinstance(ops, dict):
         ops = [ops]
     if not isinstance(ops, list):
-        return []
+        return [], 1
     normalized: list[dict] = []
+    dropped = 0
     for op in ops:
         if isinstance(op, str):
             try:
                 op = json.loads(op)
             except (json.JSONDecodeError, ValueError):
+                dropped += 1
                 continue
         if isinstance(op, dict):
             normalized.append(op)
-    return normalized
+        else:
+            dropped += 1
+    return normalized, dropped
+
+
+def _dropped_note(dropped: int) -> str:
+    """Result-message suffix reporting operations lost in normalization."""
+    if not dropped:
+        return ""
+    return (
+        f"\nWARNING: {dropped} malformed operation item(s) could not be parsed "
+        "and were NOT applied (expected objects like {\"type\": \"...\", ...})."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +346,7 @@ async def _notify_file_written(file_path: str) -> bool:
         return False
     agents_rel = _to_agents_relative(file_path)
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
             resp = await client.post(
                 f"{PROXY_URL}/v1/hooks/file-written",
                 json={"session_id": session_id, "path": agents_rel},
@@ -351,7 +375,7 @@ async def _push_preview(file_path: str, filename: str | None = None):
     agents_rel = _to_agents_relative(file_path)
     fname = filename or Path(file_path).name
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
             await client.post(
                 f"{PROXY_URL}/v1/hooks/document-preview",
                 json={

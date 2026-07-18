@@ -67,8 +67,15 @@ interface Props {
   interactiveActive?: boolean
   /** A live interactive PTY's model can't be changed from here (use /model in
    * the TUI), so the Model dropdown shows only the active model read-only. The
-   * popup still opens for the interactive switch. */
+   * popup still opens for the interactive switch. Also set for task-run
+   * chats: a run's model is a fact of the run (the agent's configured
+   * default), not a viewer choice — and the locked row renders the raw model
+   * id even when the layer's current catalog no longer lists it. */
   modelLocked?: boolean
+  /** Task-run chats: the permission chip shows the RUN's stored mode (the
+   * scheduler's 'auto' → Don't Ask) read-only — the popup lists only the
+   * active mode and selection is a no-op. */
+  modeLocked?: boolean
   /** Optional content rendered on the LEFT of the status row, filling the space
    * that is otherwise the flex spacer (so the model control stays right-aligned).
    * Used by the interactive terminal control-key bar —
@@ -271,6 +278,7 @@ export default function ChatStatusBar({
   hidePermissions,
   interactiveActive,
   modelLocked,
+  modeLocked,
   leftSlot,
   onModeChange,
   onModelChange,
@@ -519,12 +527,15 @@ export default function ChatStatusBar({
             permission mode; our baseline + path enforcement still apply). */}
         {!hidePermissions && (() => {
           const mc = MODE_CONFIG[mode] || MODE_CONFIG.default
+          const modeOptions = modeLocked
+            ? [{ value: mode, label: mc.label }]
+            : (meetingActive || supportsPlanMode === false) ? MODE_OPTIONS.filter(o => o.value !== 'plan') : MODE_OPTIONS
           return (
             <IconDropdown
               label="Permissions"
               value={mode}
-              options={(meetingActive || supportsPlanMode === false) ? MODE_OPTIONS.filter(o => o.value !== 'plan') : MODE_OPTIONS}
-              onChange={onModeChange}
+              options={modeOptions}
+              onChange={modeLocked ? () => {} : onModeChange}
               trigger={
                 <span
                   className={`flex items-center justify-center w-7 h-7 rounded-lg border ${mc.bg} ${mc.border} ${mc.text} hover:brightness-95 transition-colors cursor-pointer`}

@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-Apache-2.0" src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.0-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
@@ -119,6 +119,22 @@ account, and you're chatting with your first agent minutes later. Set
 `PROXY_PORT` to move the published port ([`config.env.example`](config.env.example)
 documents every knob; the platform auto-generates its remaining secrets on
 first boot).
+
+> **Ubuntu 24.04+ hosts** restrict the unprivileged user namespaces the agent
+> sandbox is built on, so add one step — a scoped AppArmor profile for the
+> OtoDock container. The system-wide hardening stays enabled; never disable
+> the `apparmor_restrict_unprivileged_userns` sysctl for this:
+>
+> ```bash
+> curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/setup-apparmor-userns.sh
+> sudo bash setup-apparmor-userns.sh
+> echo "OTODOCK_APPARMOR_PROFILE=otodock_userns" >> .env
+> ```
+>
+> The script is short and readable — it installs one profile to
+> `/etc/apparmor.d/` and nothing else. Without it the proxy stops at boot
+> with an error pointing here. (The source flow below needs no extra step:
+> `scripts/compose.sh` detects the restriction and runs the setup itself.)
 
 Building from source instead (contributors):
 

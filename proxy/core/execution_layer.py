@@ -331,30 +331,6 @@ class ExecutionLayer(ABC):
             pass
         return n
 
-    async def wait_for_bg_commands(
-        self, session_id: str, *, timeout: float = 120.0,
-    ) -> int:
-        """Block until this session's background bash commands finish; return how
-        many were pending (0 if none).
-
-        The CLI analog of :meth:`wait_for_bg_subagents`, driven by the
-        ``BackgroundCommandRegistry`` (see core/events/bg_command_state.py). Unlike
-        subagents, a backgrounded command fires NO completion hook — its
-        completion is only observed while stdout is read, which for a task is the
-        ``settle`` loop (kept alive while commands are pending). On timeout it
-        returns the pending count rather than raising, so the task producer
-        nudges anyway (a lost terminal can't hang a task forever)."""
-        from core.events.bg_command_state import get_bg_command_registry
-        reg = get_bg_command_registry(session_id)
-        n = reg.pending_count
-        if n == 0:
-            return 0
-        try:
-            await asyncio.wait_for(reg.wait_all_done(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
-        return n
-
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
         """Read a session's stdout to resolve background-command completions
         between turns; return True if any were resolved. Default no-op — only the

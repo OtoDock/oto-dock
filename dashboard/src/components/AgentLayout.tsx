@@ -31,6 +31,7 @@ export default function AgentLayout() {
   const topNavItems = [
     { path: `/agents/${name}`, label: 'Overview', exact: true, visible: true },
     { path: `/agents/${name}/mcps`, label: 'MCPs', visible: canManage },
+    { path: `/agents/${name}/skills`, label: 'Skills', visible: canManage },
     { path: `/agents/${name}/config`, label: 'Configuration', visible: canManage },
   ]
 

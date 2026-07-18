@@ -16,6 +16,7 @@ from storage import database as task_store, agent_store, remote_store
 from core.session.session_state import (
     set_session_mode,
     get_session_mode,
+    get_session_user_tz,
     get_user_tz,
     set_session_user_tz,
     clear_session_liveness,
@@ -874,23 +875,42 @@ class WarmupController:
             if still_viewing:
                 await self._reapply_deferred_after_warmup()
             # Interactive: there is NO server-kicked pump turn — the human drives
-            # the PTY. The normal flow is the frontend sending pty_input after the
-            # terminal mounts; this only covers the edge case where text was typed
-            # before the session was ready (cold send) — write it as the first
-            # input (best-effort; the TUI may still be starting up).
+            # the PTY. A cold send's text rides the warmup and is delivered HERE,
+            # server-side (submit_prompt buffers until the TUI is ready and arms
+            # the deferred Enter), so the prompt survives the client switching
+            # chats / reloading mid-warmup. Codex fresh spawns delivered it via
+            # the launch argv instead (auto-runs) — skip those (double-send).
             if res.interactive:
-                # The cold first prompt edge case — Codex (fresh) delivered it via
-                # its launch argv (auto-runs), so skip it here (double-send). This
-                # only fires when text was typed BEFORE the session was ready; the
-                # normal Claude flow is the frontend's pty_input paste after
-                # warmup_ready. Any reseed digest rides the session's stashed
-                # seed (set_pending_seed above), prepended at the first submission —
-                # NOT here — so it works for both delivery paths.
                 first_text = msg.get("text", "")
                 if first_text and not res.first_prompt_in_argv:
                     isess = interactive_session.get(res.session_id)
                     if isess is not None and isess.alive:
-                        isess.submit_prompt(first_text)
+                        # Stamp browser time/zone at delivery (parity with the
+                        # -p pump's injection; the client sends the text RAW so
+                        # a declined-to-headless kick can't double-stamp).
+                        user_tz = (get_session_user_tz(res.session_id)
+                                   or get_user_tz(self.user_sub))
+                        stamped = (
+                            f"[Current time: "
+                            f"{config.format_current_time(user_tz)}]"
+                            f"\n\n{first_text}"
+                        )
+                        # Re-note the STAMPED bytes (replaces the raw note from
+                        # _persist_first_prompt): the tailer's duplicate-skip
+                        # matches the journaled user line byte-for-byte and the
+                        # CLI journals what the PTY received — without this the
+                        # first user row lands twice. Any reseed digest rides
+                        # the session's stashed seed (set_pending_seed above),
+                        # prepended at the first submission — NOT here.
+                        from core.session.transcript_tool_events import (
+                            note_sent_prompt,
+                        )
+                        note_sent_prompt(wcid, stamped)
+                        logger.info(
+                            f"WS dashboard: server-side first prompt submit "
+                            f"chat={wcid[:8]} session={res.session_id[:8]}"
+                        )
+                        isess.submit_prompt(stamped)
                 return
             # Server-owned first turn. If the WS is gone (refresh/navigate during
             # the spawn), there is no main loop to drive the kick — run it
@@ -1136,9 +1156,10 @@ class WarmupController:
         # Codex interactive cold first prompt: a FRESH spawn delivers it as the
         # `codex` launch arg → the TUI auto-runs it after MCP warm (deterministic
         # first-turn submit; the PTY type-then-Enter race is unreliable during
-        # Codex's warm). On RESUME the prompt instead rides the PTY flush in
-        # `_spawn_tail` (so `codex resume <tid>` continues the thread and any new
-        # turn still runs). Claude always uses the PTY flush.
+        # Codex's warm). On RESUME the prompt instead rides the server-side
+        # submit in `_spawn_tail` (so `codex resume <tid>` continues the thread
+        # and any new turn still runs). Claude — fresh and resume — always uses
+        # that server-side submit too.
         _first_prompt_in_argv = False
         if (agent_cfg.interactive and first_prompt and not agent_cfg.resume
                 and (agent_cfg.execution_path or "") == "codex-cli"):

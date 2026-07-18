@@ -286,3 +286,30 @@ def test_ws_admin_endpoint_rejected(app_with_router, subpath_mode, authed):
             with client.websocket_connect("/collabora/cool/adminws"):
                 pass
     assert exc_info.value.code == 1008
+
+
+# ---------------------------------------------------------------------------
+# Upstream websocket keepalive
+# ---------------------------------------------------------------------------
+
+
+def test_ws_upstream_keepalive_is_tolerant():
+    """The tunnel must outlast a Collabora stall (heavy XLSX recalculation):
+    explicit ping kwargs, never the library's ~20s default teardown."""
+    from api.media.collabora_proxy import _upstream_connect_kwargs
+
+    kwargs = _upstream_connect_kwargs(None, None, None)
+    assert kwargs["ping_interval"] == 25
+    assert kwargs["ping_timeout"] >= 60
+    assert kwargs["max_size"] is None
+    assert "origin" not in kwargs and "subprotocols" not in kwargs
+
+
+def test_ws_upstream_kwargs_carry_origin_and_subprotocol():
+    from api.media.collabora_proxy import _upstream_connect_kwargs
+
+    headers = [("Cookie", "a=b")]
+    kwargs = _upstream_connect_kwargs(headers, "https://example.com", "cool")
+    assert kwargs["additional_headers"] == headers
+    assert kwargs["origin"] == "https://example.com"
+    assert kwargs["subprotocols"] == ["cool"]

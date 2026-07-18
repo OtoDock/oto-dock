@@ -18,6 +18,7 @@ import UsersPage from './pages/admin/UsersPage'
 import UsagePage from './pages/admin/UsagePage'
 import McpServersPage from './pages/admin/McpServersPage'
 import McpRequestsPage from './pages/admin/McpRequestsPage'
+import SkillsPage from './pages/admin/SkillsPage'
 import PlatformPage from './pages/admin/PlatformPage'
 import NotificationsPage from './pages/admin/NotificationsPage'
 import MeetingsPage from './pages/admin/MeetingsPage'
@@ -32,6 +33,7 @@ import AgentMeetings from './pages/agent/AgentMeetings'
 import AgentConversations from './pages/agent/AgentConversations'
 import ConversationView from './pages/ConversationView'
 import AgentMcps from './pages/agent/AgentMcps'
+import AgentSkills from './pages/agent/AgentSkills'
 import AgentConfig from './pages/agent/AgentConfig'
 import ChangePassword from './pages/ChangePassword'
 import ResetPassword from './pages/ResetPassword'
@@ -120,6 +122,7 @@ export default function App() {
               <Route path="scheduled-tasks" element={<AgentSchedules />} />
               <Route path="config" element={<AgentConfig />} />
               <Route path="mcps" element={<AgentMcps />} />
+              <Route path="skills" element={<AgentSkills />} />
               <Route path="triggers" element={<AgentTriggers />} />
               <Route path="notifications" element={<AgentNotifications />} />
               <Route path="meetings" element={<AgentMeetings />} />
@@ -139,6 +142,7 @@ export default function App() {
               <Route path="users" element={<UsersPage />} />
               <Route path="usage" element={<UsagePage />} />
               <Route path="mcp-servers" element={<McpServersPage />} />
+              <Route path="skills" element={<SkillsPage />} />
               <Route path="mcp-requests" element={<McpRequestsPage />} />
               <Route path="remote-machines" element={<RemoteMachinesPage />} />
               <Route path="platform" element={<PlatformPage />} />

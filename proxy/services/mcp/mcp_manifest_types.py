@@ -27,12 +27,32 @@ class ConfigField:
     user_overridable: bool = False
 
 
+# Skill loading modes. "always" = full body inlined into the system prompt
+# (the pre-2026-07 behavior; right for behavior-shaping skills the agent must
+# know before deciding anything). "on_demand" = standard Agent Skills
+# progressive disclosure: the body is materialized into the session's CLI
+# skills dir and loaded only when a task matches the description. Absent
+# field defaults to on_demand (agentskills.io semantics); bundled manifests
+# stamp behavior-shaping skills "always" explicitly.
+VALID_SKILL_LOADING = {"always", "on_demand"}
+SKILL_LOADING_DEFAULT = "on_demand"
+
+# Skill ids become filesystem path components at materialization
+# (<config>/skills/<id>/) and folder names in skill packages, so they are
+# constrained to the agentskills.io ``name`` grammar: lowercase alnum runs
+# separated by single hyphens, max 64 chars. NEVER interpolate an id that
+# fails this into a path.
+SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SKILL_ID_MAX_LEN = 64
+
+
 @dataclass
 class SkillDef:
     id: str
     file: str  # relative to MCP folder
     description: str = ""
     default_exclude_from: list[str] = field(default_factory=list)
+    loading: str = SKILL_LOADING_DEFAULT  # "always" | "on_demand"
 
 
 @dataclass

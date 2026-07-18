@@ -142,6 +142,14 @@ class TestComputeManifest:
         # Hidden skills subdir — NOT synced (every hidden dir is pruned).
         (cx / "skills" / ".system").mkdir(parents=True)
         (cx / "skills" / ".system" / "sk.md").write_text("skill")
+        # Platform-materialized on-demand skills (skills_materializer) — the
+        # non-hidden folders MUST sync (that's how remote sessions get them);
+        # the .quarantine dir is hidden → stays platform-local.
+        (cl / "skills" / "voiceover").mkdir(parents=True)
+        (cl / "skills" / "voiceover" / "SKILL.md").write_text("skill body")
+        (cl / "skills" / "voiceover" / ".oto-skill.json").write_text("{}")
+        (cl / "skills" / ".quarantine" / "old-skill").mkdir(parents=True)
+        (cl / "skills" / ".quarantine" / "old-skill" / "SKILL.md").write_text("x")
 
         paths = {e.path for e in compute_manifest(agent_dir, target_role="manager")}
         # settings.json + mcp-config.json are HOST-LOCAL (carry sandbox-internal
@@ -162,8 +170,25 @@ class TestComputeManifest:
             "users/alice/.claude/.claude.json.backup.1775",
             "users/alice/.claude/.claude.json.corrupted.1779",
             "users/alice/.codex/skills/.system/sk.md",
+            "users/alice/.claude/skills/.quarantine/old-skill/SKILL.md",
         ):
             assert leaked not in paths, f"cruft leaked: {leaked}"
+        # Materialized skills DO sync — remote sessions depend on it.
+        assert "users/alice/.claude/skills/voiceover/SKILL.md" in paths
+
+    def test_satellite_authored_skills_never_write_back(self):
+        """A compromised satellite writing into .claude/skills/ must never
+        propagate back to the platform (and from there into other sessions):
+        skills paths sit under the engine-machinery push-only segments, so
+        write-back is denied for EVERY role and the next session-start scrub
+        reverts satellite-local tampering. Regression-pinned so a future
+        'owners curate skills on their machine' change can't silently open
+        the loop."""
+        from core.remote.file_sync import can_write_back, is_engine_machinery_path
+        for path in ("users/alice/.claude/skills/evil/SKILL.md",
+                     "workspace/.codex/skills/evil/SKILL.md"):
+            assert is_engine_machinery_path(path)
+            assert not can_write_back(path, "admin", "alice")
 
     def test_hash_format(self, agent_dir):
         entries = compute_manifest(agent_dir)

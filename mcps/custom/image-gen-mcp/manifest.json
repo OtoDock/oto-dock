@@ -57,6 +57,7 @@
   "skills": [
     {
       "id": "image-gen-usage",
+      "loading": "always",
       "file": "skills/image-gen.md",
       "description": "Image generation tool descriptions and model selection guidance",
       "default_exclude_from": ["task"]

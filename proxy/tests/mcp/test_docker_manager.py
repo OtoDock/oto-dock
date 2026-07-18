@@ -305,3 +305,54 @@ def test_container_status_perm_denied_logs_hint(
 
     assert docker_manager.get_container_status(file_tools_manifest) == "not_found"
     assert any("docker' group" in r.message for r in caplog.records)
+
+
+def test_compose_up_name_conflict_self_heal(file_tools_manifest, monkeypatch):
+    """A 'name already in use' collision on OUR exact container name (a
+    previous deployment generation's container) is removed and retried."""
+    import config as _config
+    expected = f"otodock-{_config.INSTALL_ID}-mcp-{file_tools_manifest.name}"
+    conflict = (
+        f'Error response from daemon: Conflict. The container name '
+        f'"/{expected}" is already in use by container "abc123".'
+    )
+    results = iter([(1, conflict), (0, "")])
+    monkeypatch.setattr(
+        docker_manager, "_run_compose_streaming",
+        lambda *a, **k: next(results),
+    )
+    removed = {}
+
+    def _fake_run(cmd, **kw):
+        removed["cmd"] = cmd
+        return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_manager.subprocess, "run", _fake_run)
+    assert docker_manager._compose_up(
+        file_tools_manifest, ["up", "-d"], timeout=10,
+    ) is True
+    assert removed["cmd"][:3] == ["docker", "rm", "-f"]
+    assert removed["cmd"][3] == expected
+
+
+def test_compose_up_no_removal_for_foreign_name(file_tools_manifest, monkeypatch):
+    """A collision on a DIFFERENT install-id's container name must never
+    trigger removal — that container may belong to another live install."""
+    conflict = (
+        'Error response from daemon: Conflict. The container name '
+        '"/otodock-deadbeef-mcp-file-tools" is already in use by container "x".'
+    )
+    monkeypatch.setattr(
+        docker_manager, "_run_compose_streaming", lambda *a, **k: (1, conflict),
+    )
+    ran = {"rm": False}
+
+    def _fake_run(cmd, **kw):
+        ran["rm"] = True
+        return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_manager.subprocess, "run", _fake_run)
+    assert docker_manager._compose_up(
+        file_tools_manifest, ["up", "-d"], timeout=10,
+    ) is False
+    assert ran["rm"] is False

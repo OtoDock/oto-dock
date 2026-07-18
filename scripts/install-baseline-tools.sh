@@ -136,8 +136,8 @@ install_linux_tier_1() {
         bubblewrap
 
     # Node.js — NodeSource repo pinned to the platform's major (NODE_VERSION,
-    # keep in sync with VERSIONS.md; apt floats within the major, matching the
-    # manual instructions in docs/INSTALL-SPEC.md). Ubuntu/Debian's own
+    # keep in sync with VERSIONS.md; apt floats within the major). Ubuntu/Debian's
+    # own
     # `nodejs` package is far too old for the CLIs (min Node 22). Without
     # this, a FRESH machine has no npm and every npm-dependent step below
     # (pnpm + the claude/codex CLI installs) falls over with "npm not
@@ -304,6 +304,47 @@ install_macos_all() {
 }
 
 # ──────────────────────────────────────────────────────────────────────
+# sympy — symbolic maths in the agents' python (the file-tools maths
+# workflow: transcribe LaTeX → compute → write equations back). The agent
+# sandbox binds the system python and its $HOME is a per-session tmpfs, so
+# an on-demand `pip install --user sympy` evaporates every session — bake
+# it into the environment instead. Keep SYMPY_VERSION in sync with
+# VERSIONS.md.
+# ──────────────────────────────────────────────────────────────────────
+
+install_sympy() {
+    local sympy_ver="${SYMPY_VERSION:-1.14.0}"
+    if ! command -v python3 &>/dev/null; then
+        warn "python3 not present — skipping sympy."
+        return 0
+    fi
+    if python3 -c "import sympy" &>/dev/null; then
+        ok "sympy already importable"
+        return 0
+    fi
+    info "Installing sympy ${sympy_ver}..."
+    # pip first, WITH $SUDO: lands in the system site of whatever `python3`
+    # resolves to (notably the Docker image's /usr/local python). Without
+    # sudo, pre-PEP-668 pips silently fall back to the installing user's
+    # ~/.local — invisible to the bwrap sandbox (HOME isn't mounted).
+    # Externally-managed pythons (PEP 668: Debian/Ubuntu apt python,
+    # Homebrew python) refuse even under sudo — fall back to the distro
+    # package there (its version floats with the distro; presence beats an
+    # exact pin for a maths library).
+    if $SUDO python3 -m pip install --quiet "sympy==${sympy_ver}" 2>/dev/null; then
+        ok "sympy ${sympy_ver} installed via pip"
+    elif [ "$OS_TYPE" = "linux" ] \
+        && $SUDO apt-get install -y --no-install-recommends python3-sympy; then
+        ok "sympy installed via apt (python3-sympy)"
+    elif [ "$OS_TYPE" = "macos" ] && brew install sympy; then
+        ok "sympy installed via brew"
+    else
+        warn "Could not install sympy — agents can still 'pip install sympy' per session."
+    fi
+}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # CLIs — claude + codex (via npm globals on both Linux and macOS)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -411,6 +452,7 @@ main() {
         install_macos_all
     fi
 
+    install_sympy
     install_clis
     install_credential_helper
 

@@ -29,6 +29,7 @@
   "skills": [
     {
       "id": "trigger-instructions",
+      "loading": "always",
       "file": "docs/trigger-instructions.md",
       "description": "When and how to use triggers, scope rules, the trigger ↔ task and trigger ↔ notification pairing patterns, webhook setup workflow",
       "default_exclude_from": []

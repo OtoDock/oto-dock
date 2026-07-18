@@ -2,11 +2,13 @@ FROM python:3.13-slim
 
 # LibreOffice (Writer/Calc/Impress only — not the full metapackage)
 # WeasyPrint system deps: libpango, libharfbuzz, libgdk-pixbuf
+# libcairo2: cairosvg (equation SVG → PNG for pptx/xlsx)
 # Fonts for consistent document rendering
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer libreoffice-calc libreoffice-impress \
     fonts-liberation fonts-dejavu-core fonts-comfortaa \
     libpango-1.0-0 libharfbuzz0b libffi-dev libgdk-pixbuf-2.0-0 \
+    libcairo2 \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-ell \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

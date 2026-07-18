@@ -34,7 +34,7 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
     case 'media_processing':
       return { type: 'media_processing', mediaKind: ib.media_kind === 'audio' ? 'audio' : 'video', caption: ib.caption || undefined }
     case 'document_preview':
-      return { type: 'document_preview', wopiUrl: ib.wopi_url, filename: ib.filename, fileId: ib.file_id, downloadUrl: ib.download_url }
+      return { type: 'document_preview', wopiUrl: ib.wopi_url, filename: ib.filename, fileId: ib.file_id, downloadUrl: ib.download_url, snapshotId: ib.snapshot_id || undefined, generation: ib.generation || undefined }
     case 'ui':
       return { type: 'ui', token: ib.token || '', uiUrl: ib.ui_url || '', title: ib.title || undefined, height: typeof ib.height === 'number' ? ib.height : undefined, path: ib.path || undefined }
     case 'artifact_interaction':
@@ -80,7 +80,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
     case 'audio':
       return { type: 'audio', srcKind: evt.src_kind === 'token' ? 'token' : 'url', url: evt.url || undefined, mediaUrl: evt.media_url || undefined, token: evt.token || undefined, mime: evt.mime || undefined, caption: evt.caption || undefined, title: evt.title || undefined }
     case 'document_preview':
-      return { type: 'document_preview', wopiUrl: evt.wopi_url, filename: evt.filename, fileId: evt.file_id, downloadUrl: evt.download_url, dbMessageId }
+      return { type: 'document_preview', wopiUrl: evt.wopi_url, filename: evt.filename, fileId: evt.file_id, downloadUrl: evt.download_url, dbMessageId, snapshotId: evt.snapshot_id || undefined, generation: evt.generation || undefined }
     case 'ui':
       return { type: 'ui', token: evt.token || '', uiUrl: evt.ui_url || '', title: evt.title || undefined, height: typeof evt.height === 'number' ? evt.height : undefined, path: evt.path || undefined }
     case 'artifact_interaction':
@@ -434,26 +434,63 @@ export function dbMessagesToDisplay(
       }
     }
   }
-  // Post-process: deduplicate document_preview blocks — keep only the LAST
-  // occurrence per fileId (across all messages) and remove earlier ones.
-  const lastPreviewMsg = new Map<string, { msgIdx: number; blockIdx: number }>()
-  for (let mi = 0; mi < displayMsgs.length; mi++) {
-    for (let bi = 0; bi < displayMsgs[mi].blocks.length; bi++) {
-      const b = displayMsgs[mi].blocks[bi]
-      if (b.type === 'document_preview') {
-        lastPreviewMsg.set(b.fileId, { msgIdx: mi, blockIdx: bi })
-      }
+  // Post-process: intra-message document_preview dedupe — within ONE message
+  // keep only the LAST block per fileId (interactive chats persist every
+  // intra-turn push; the pump path already dedupes per turn). Cross-message
+  // instances are KEPT: previewChainModes renders them as the live preview,
+  // the view-only "previous version", or a chip.
+  for (const dm of displayMsgs) {
+    const lastIdxByFile = new Map<string, number>()
+    dm.blocks.forEach((b, bi) => {
+      if (b.type === 'document_preview') lastIdxByFile.set(b.fileId, bi)
+    })
+    if (lastIdxByFile.size) {
+      dm.blocks = dm.blocks.filter((b, bi) =>
+        b.type !== 'document_preview' || lastIdxByFile.get(b.fileId) === bi,
+      )
     }
   }
-  // Remove all document_preview blocks that are NOT the last for their fileId
-  for (let mi = 0; mi < displayMsgs.length; mi++) {
-    displayMsgs[mi].blocks = displayMsgs[mi].blocks.filter((b, bi) => {
-      if (b.type !== 'document_preview') return true
-      const last = lastPreviewMsg.get(b.fileId)
-      return last?.msgIdx === mi && last?.blockIdx === bi
+  return displayMsgs
+}
+
+export type PreviewChainMode = 'live' | 'frozen' | 'chip'
+
+/**
+ * Render-time live → frozen → chip chain per fileId over the combined loaded
+ * block list: a file's LAST preview occurrence is the live block, the one
+ * before it the view-only "previous version" (frozen to its own push-time
+ * snapshot), anything older a chip. Keys are `${msgIdx}:${blockIdx}`.
+ *
+ * Computed at render (like supersededUiBlocks) so live streaming, history
+ * reload, and scroll-back pagination all agree — never positionally ("all but
+ * last message") and never only at rebuild. That is what fixes the deferred
+ * collapse landing on the live block after an interleaved text turn, and the
+ * loadOlder duplicate-live-block hole (an older page can only add frozen/chip
+ * entries — the true latest instance is always already loaded).
+ */
+export function previewChainModes(
+  messages: DisplayMessage[],
+): Map<string, PreviewChainMode> {
+  const perFile = new Map<string, string[]>()
+  messages.forEach((msg, mi) =>
+    msg.blocks.forEach((b, bi) => {
+      if (b.type === 'document_preview') {
+        const keys = perFile.get(b.fileId) ?? []
+        keys.push(`${mi}:${bi}`)
+        perFile.set(b.fileId, keys)
+      }
+    }),
+  )
+  const out = new Map<string, PreviewChainMode>()
+  for (const keys of perFile.values()) {
+    keys.forEach((key, i) => {
+      out.set(
+        key,
+        i === keys.length - 1 ? 'live' : i === keys.length - 2 ? 'frozen' : 'chip',
+      )
     })
   }
-  return displayMsgs
+  return out
 }
 
 /** Data a bgcommand pill borrows from the Bash tool block it spawned from. */

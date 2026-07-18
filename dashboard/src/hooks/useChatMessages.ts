@@ -90,6 +90,29 @@ export function useChatMessages(args: {
     }
   }, [agents])
 
+  // Drop document_preview blocks for a dismissed file. `key` scopes the
+  // removal to ONE instance (a frozen "previous version" closing itself);
+  // without it every instance goes (the live block's close nukes the trail).
+  // Touching the streaming message must rebind currentMsgRef, or every later
+  // appendBlock/appendToLastTextBlock for the turn is silently dropped.
+  const removePreviewBlocks = useCallback((
+    fileId: string, key?: { snapshotId?: string; dbMessageId?: number },
+  ) => {
+    setMessages((prev) => prev.map((m) => {
+      const blocks = m.blocks.filter((b) => {
+        if (b.type !== 'document_preview' || b.fileId !== fileId) return true
+        if (!key) return false
+        if (key.snapshotId) return b.snapshotId !== key.snapshotId
+        if (key.dbMessageId != null) return b.dbMessageId !== key.dbMessageId
+        return false
+      })
+      if (blocks.length === m.blocks.length) return m
+      const updated = { ...m, blocks }
+      if (m === currentMsgRef.current) currentMsgRef.current = updated
+      return updated
+    }))
+  }, [])
+
   // Drop the transient media_processing skeleton (transcode done/failed).
   const removeMediaProcessing = useCallback(() => {
     setMessages((prev) => {
@@ -284,5 +307,6 @@ export function useChatMessages(args: {
     appendBlock, removeMediaProcessing, appendToLastTextBlock,
     updateToolBlock, updateToolBlockByName, resolvePermission,
     updateSubagentActive, updateCommandActive, ensureAssistantMsg,
+    removePreviewBlocks,
   }
 }

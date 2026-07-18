@@ -54,10 +54,21 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendBlock, seedDbHistory, loadOlder, removeMediaProcessing,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
-    ensureAssistantMsg,
+    ensureAssistantMsg, removePreviewBlocks,
   } = useChatMessages({ agents, meetingSpeakerRef, chatIdRef })
   const [mode, setMode] = useState(options.defaultMode ?? 'default')
   const [model, setModel] = useState('')
+
+  // Dismiss (user X'd a preview block): drop the matching local blocks
+  // ref-safely. `key` scopes to one instance (a frozen "previous version");
+  // without it the file's whole preview trail goes (the live block's close).
+  // The live/frozen/chip states themselves are a render-time derivation
+  // (previewChainModes) — there is no collapse bookkeeping to update here.
+  const dismissPreview = useCallback((
+    fileId: string, key?: { snapshotId?: string; dbMessageId?: number },
+  ) => {
+    removePreviewBlocks(fileId, key)
+  }, [removePreviewBlocks])
 
   // Execution target for the active session (set by warmup_ready). When the
   // session falls back to local, fallbackReason is set so the header can render
@@ -1079,24 +1090,19 @@ export function useChatStream(options: UseChatStreamOptions) {
     onDocumentPreview: (data) => {
       if (discardingRef.current) return
       ensureAssistantMsg()
-      // Remove old document_preview blocks with this fileId from PREVIOUS messages
-      // (don't touch the current streaming message to avoid disconnecting refs)
-      setMessages(prev => prev.map((m, i) => {
-        if (i === prev.length - 1) return m // preserve current message refs
-        return {
-          ...m,
-          blocks: m.blocks.filter(b =>
-            !(b.type === 'document_preview' && b.fileId === data.file_id)
-          ),
-        }
-      }))
-      // Append new preview to current assistant message (same pattern as onImage/onFile)
+      // Append the new preview to the current assistant message (same pattern
+      // as onImage/onFile). The old block for this file transitions to a
+      // view-only "previous version" (and older ones to chips) at RENDER time
+      // via previewChainModes — each block defers its own transition while
+      // the user is engaged with it, so nothing here needs to collapse state.
       appendBlock({
         type: 'document_preview',
         wopiUrl: data.wopi_url,
         filename: data.filename,
         fileId: data.file_id,
         downloadUrl: data.download_url,
+        snapshotId: data.snapshot_id || undefined,
+        generation: data.generation || undefined,
       })
     },
 
@@ -2066,6 +2072,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     meetingMaxRounds,
     meetingLeftParticipants,
     editText, setEditText,
+    dismissPreview,
     // refs
     currentMsgRef,
     thinkingBufRef,

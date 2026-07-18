@@ -811,7 +811,10 @@ async def _handle_send_file(arguments: dict) -> list[TextContent]:
         }
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
+            # /v1/hooks/file does a FULL synchronous satellite pull for
+            # remote sessions — budget must cover a multi-MB WAN transfer
+            # (proxy pull budget is 180 s).
+            timeout=httpx.Timeout(connect=5.0, read=150.0, write=30.0, pool=5.0),
         ) as client:
             resp = await client.post(
                 f"{PROXY_URL}/v1/hooks/file",

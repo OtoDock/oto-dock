@@ -70,8 +70,9 @@
   "skills": [
     {
       "id": "image-search-usage",
-      "file": "skills/image-search.md",
-      "description": "How and when to call find_images, search_by_image, and save_image",
+      "loading": "on_demand",
+      "file": "skills/image-search-usage/SKILL.md",
+      "description": "Search the web for images with filters and download them. Use when you need stock photos, reference images, or product shots from the web.",
       "default_exclude_from": ["phone"]
     }
   ],

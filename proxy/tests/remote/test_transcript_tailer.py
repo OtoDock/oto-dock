@@ -103,6 +103,27 @@ def test_persists_user_and_assistant_text(tmp_path, _capture):
     assert _capture == [("user", "hello there"), ("assistant", "hi back")]
 
 
+def test_server_submitted_first_prompt_not_duplicated(tmp_path, _capture):
+    # An interactive cold send persists the RAW prompt at send-time and the
+    # server submits the STAMPED variant into the PTY; dashboard_warmup
+    # re-notes the STAMPED bytes because the tailer's duplicate-skip matches
+    # the journaled user line byte-for-byte (it does NOT strip the
+    # [Current time:] prelude before consume) — without the re-note the first
+    # user row would land twice.
+    from core.session.transcript_tool_events import note_sent_prompt
+    stamped = ("[Current time: Friday, July 17, 2026 02:00 (2:00 AM) "
+               "UTC (UTC+00:00)]\n\ncold prompt")
+    note_sent_prompt("c1", "cold prompt")  # _persist_first_prompt (raw)
+    note_sent_prompt("c1", stamped)        # dashboard_warmup re-note (stamped)
+    path = _write(
+        tmp_path,
+        _user(stamped),
+        _assistant([{"type": "text", "text": "hi back"}]),
+    )
+    T.tail_transcript("s1", "c1", path)
+    assert _capture == [("assistant", "hi back")]
+
+
 def test_skips_tool_result_user_messages(tmp_path, _capture):
     # A user message that is only a tool_result must NOT be persisted as user
     # text — it completes the pending tool block into ONE event row instead.

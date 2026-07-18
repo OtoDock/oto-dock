@@ -246,7 +246,8 @@ async def install_from_extracted_folder(
         raise HTTPException(
             400,
             "Only community MCPs can be installed via this path. Core and "
-            "custom MCPs ship with the platform.",
+            "custom MCPs ship with the platform. (Skill packages install via "
+            "the skills catalog.)",
         )
 
     target_parent = config.MCPS_DIR / category
@@ -254,6 +255,24 @@ async def install_from_extracted_folder(
 
     existing = mcp_registry.get_manifest(mcp_name)
     is_update = existing is not None
+    # Flat-namespace guards (mirrored in skills_installer): an MCP whose name
+    # is an installed SKILL PACKAGE, or whose skills[] ids collide with
+    # another provider's, is rejected up front — the registry scan would
+    # otherwise warn-and-shadow nondeterministically.
+    if existing is not None and existing.category == "skill":
+        raise HTTPException(
+            409,
+            f"Name {mcp_name!r} is already an installed skill package — "
+            "MCPs and skill packages share the flat registry namespace",
+        )
+    for _sk in manifest_data.get("skills") or []:
+        _provider = mcp_registry.find_skill_provider(_sk.get("id", ""))
+        if _provider is not None and _provider.name != mcp_name:
+            raise HTTPException(
+                409,
+                f"Skill id {_sk.get('id')!r} is already provided by "
+                f"{_provider.name!r}",
+            )
     old_version = existing.version if existing else None
     # Snapshot the prior enabled state. On update we'll restore it post-scan;
     # on new install we'll force enabled=True so the admin doesn't have to
@@ -542,8 +561,9 @@ def _is_safe_name(name: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name))
 
 
-async def _fetch_catalog_tarball() -> bytes:
-    """GET the catalog repo tarball as raw bytes."""
+async def _fetch_catalog_tarball(url: str = CATALOG_TARBALL_URL) -> bytes:
+    """GET a catalog repo tarball as raw bytes (community-mcps by default;
+    the skills installer passes its own catalog URL)."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "otodock-platform/community-installer",
@@ -553,7 +573,7 @@ async def _fetch_catalog_tarball() -> bytes:
             timeout=TARBALL_FETCH_TIMEOUT_SECONDS,
             follow_redirects=True,
         ) as client:
-            resp = await client.get(CATALOG_TARBALL_URL, headers=headers)
+            resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         return resp.content
     except httpx.HTTPError as exc:
@@ -692,6 +712,7 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
 
     mcp_name = req["mcp_name"]
     agent_slug = req["agent_slug"]
+    kind = req.get("kind") or "mcp"
 
     install_log = ""
     install_failed_msg: str | None = None
@@ -705,7 +726,13 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
         from core.credentials import catalog_install_registry
         async with catalog_install_registry.lock_for(mcp_name):
             if mcp_registry.get_manifest(mcp_name) is None:
-                install_result = await install_from_catalog(mcp_name)
+                if kind == "skill":
+                    from services.community import skills_installer
+                    install_result = await (
+                        skills_installer.install_skill_package_from_catalog(mcp_name)
+                    )
+                else:
+                    install_result = await install_from_catalog(mcp_name)
                 install_log = install_result.get("install_log", "")
             else:
                 install_log = "Already installed — skipping fetch + dependency install."
@@ -731,6 +758,16 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
     # Install OK → assign the MCP to the agent. ``add_agent_mcp`` is
     # idempotent so a re-request after a previous installed state is safe.
     await asyncio.to_thread(mcp_store.add_agent_mcp, agent_slug, mcp_name)
+
+    # Seed agent_skills rows for the assignment (idempotent), mirroring the
+    # manager-enable path — without this an approved MCP's/package's skills
+    # have no rows for the Skills tab to toggle until the next manual save.
+    _m = mcp_registry.get_manifest(mcp_name)
+    for _skill in getattr(_m, "skills", None) or []:
+        await asyncio.to_thread(
+            mcp_store.ensure_agent_skill,
+            agent_slug, _skill.id, True, _skill.default_exclude_from,
+        )
 
     # For explicit-mode MCPs (prometheus, ssh-server, unifi-network, etc.),
     # the manager-enabled flag alone isn't enough — the runtime only

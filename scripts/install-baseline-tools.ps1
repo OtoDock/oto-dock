@@ -272,6 +272,27 @@ if ($realPy) {
     $skipped += 'pipx'
 }
 
+# ---- sympy (via Python pip) --------------------------------------------
+#
+# Symbolic maths in the agents' python -- the file-tools maths workflow
+# (transcribe LaTeX -> compute -> write equations back). Keep the pin in
+# sync with VERSIONS.md (SYMPY_VERSION).
+
+Write-Host ""
+Write-Host "=== sympy ===" -ForegroundColor Yellow
+if ($realPy) {
+    if (Invoke-Native -Name 'sympy' -Cmd ({
+        & $realPy -m pip install --user --quiet sympy==1.14.0
+    }).GetNewClosure()) {
+        Write-Host "[baseline]   sympy OK" -ForegroundColor Green
+    } else {
+        $skipped += 'sympy'
+    }
+} else {
+    Write-Warning "[baseline]   sympy skipped -- no real Python found (Store alias only)."
+    $skipped += 'sympy'
+}
+
 # ---- pnpm + claude + codex (via npm) ----------------------------------
 
 if (Get-Command npm -ErrorAction SilentlyContinue) {

@@ -308,9 +308,34 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       repaintTimer = setTimeout(fullRepaint, 350)
     }
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') fullRepaint()
+      if (document.visibilityState !== 'visible') return
+      // Re-fit BEFORE repainting: writes while the tab was hidden ran against
+      // throttled rAF, and stale render dimensions leave the viewport's
+      // scroll area wrong (the "can't scroll until I type" flavor — a
+      // keypress healed it only because its echo forced a fresh
+      // write+render). syncSize() recomputes the geometry; the repaint then
+      // redraws against it.
+      syncSize()
+      fullRepaint()
     }
     document.addEventListener('visibilitychange', onVisibility)
+    // Idle stale-paint backstop (2026-07-17): every guard above fires on an
+    // EVENT — output settling (scheduleRepaint), tab visibility, font load,
+    // resize. A terminal that desyncs while VISIBLE and IDLE has no event
+    // coming, so the stale rows sat there until a selection/resize/keypress
+    // forced a re-render — the recurring "bottom separator vanished" report
+    // (opening DevTools healed it because the viewport resize re-rendered).
+    // While output is quiet, run the proven heal on a slow cadence: cheap
+    // (glyph re-rasterization of one viewport) and visually seamless. Skipped
+    // while hidden (tab in background / rich-view display:none) — those paths
+    // repaint on their own transition handlers.
+    let lastOutputAt = 0
+    const idleRepaintTimer = setInterval(() => {
+      if (document.visibilityState !== 'visible') return
+      if (!el.isConnected || el.clientWidth < 2 || el.clientHeight < 2) return
+      if (Date.now() - lastOutputAt < 5_000) return  // streaming — burst-settle guard owns it
+      fullRepaint()
+    }, 15_000)
     // Brand-tint the Claude TUI's truecolor diff rows (see lib/ptyBrandColors).
     // Both the xterm theme and the filter can be re-pointed by the session's
     // baked TUI theme (pty_status "attached" below).
@@ -334,6 +359,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         const following = buf.viewportY >= buf.baseY
         term.write(brand.push(b64ToBytes(m.data || '')))
         if (following || Date.now() < pinBottomUntil) term.scrollToBottom()
+        lastOutputAt = Date.now()
         scheduleRepaint()
       } catch { /* malformed frame */ }
     })
@@ -444,6 +470,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     pinBottomUntil = Date.now() + 1500  // keep the post-attach replay burst pinned to the bottom
 
     let raf = 0
+    let wasZeroSize = false
     const ro = new ResizeObserver(() => {
       // Debounce to a frame so a drag-resize doesn't spam SIGWINCH.
       cancelAnimationFrame(raf)
@@ -453,10 +480,17 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         // top — keep the latest output + input line visible. Codex's redraw
         // arrives ASYNC (pty_output) after the SIGWINCH, so also open a short
         // pin window so that redraw gets pinned too (see the pty_output handler).
+        const zeroNow = !el.isConnected || el.clientWidth < 2 || el.clientHeight < 2
         if (syncSize()) {
           try { term.scrollToBottom() } catch { /* noop */ }
           pinBottomUntil = Date.now() + 1000
+          // Re-shown from display:none (the rich-view toggle): writes kept
+          // landing while hidden and a SAME-SIZE return re-renders nothing on
+          // its own (fit dedupes) — repaint so the first visible frame isn't
+          // stale.
+          if (wasZeroSize) fullRepaint()
         }
+        wasZeroSize = zeroNow
       })
     })
     ro.observe(el)
@@ -567,6 +601,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       cancelAnimationFrame(raf)
       cancelAnimationFrame(fitRetryRaf)
       clearTimeout(postAttachRepaint)
+      clearInterval(idleRepaintTimer)
       try { document.fonts?.removeEventListener('loadingdone', onFontsLoaded) } catch { /* noop */ }
       stopRewarmPoll()
       if (repaintTimer) clearTimeout(repaintTimer)
@@ -579,6 +614,20 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       touchTarget.removeEventListener('touchend', onTouchEnd, { capture: true } as any)
       term.textarea?.removeEventListener('blur', onBlur)
       vv?.removeEventListener('resize', onVvResize)
+      // Release the GL context explicitly BEFORE disposing: term.dispose()
+      // drops the WebGL addon but never frees its context, so every chat
+      // switch leaked a zombie GL context until GC — and browsers cap live
+      // contexts per page, evicting the OLDEST under pressure (the natural
+      // context-loss source in the many-terminals workflow). getContext on
+      // the addon's canvas returns its live context; non-GL canvases return
+      // null and are skipped.
+      try {
+        for (const c of Array.from(el.querySelectorAll('canvas'))) {
+          const gl = (c as HTMLCanvasElement).getContext('webgl2')
+            || (c as HTMLCanvasElement).getContext('webgl')
+          gl?.getExtension('WEBGL_lose_context')?.loseContext()
+        }
+      } catch { /* noop */ }
       try { term.dispose() } catch { /* already disposed */ }
       termRef.current = null
     }

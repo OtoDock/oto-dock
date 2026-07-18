@@ -172,6 +172,10 @@ class ChatStreamPump:
         )
         self._active_tools: dict[str, dict] = {}
         self._pending_previews: dict[str, dict] = {}  # file_id -> latest preview (flushed at turn end)
+        # Armed by a preview flush; _save_turn_blocks then prunes this chat's
+        # unreferenced version-pinned snapshots (reference-driven GC — must run
+        # AFTER the flushed rows persist, or their snapshots look orphaned).
+        self._gc_snapshots_pending = False
         self._thinking_text = ""
         self._total_cost_delta = 0.0
         # LLM-only delta (METADATA events) — used to write the LLM usage_records
@@ -380,6 +384,8 @@ class ChatStreamPump:
 
     async def _flush_pending_previews(self):
         """Forward buffered document previews to dashboard (called at turn end)."""
+        if self._pending_previews:
+            self._gc_snapshots_pending = True
         for evt in self._pending_previews.values():
             await self._forward({"pump_type": "ws_event", "event": evt})
         self._pending_previews.clear()
@@ -426,6 +432,15 @@ class ChatStreamPump:
                 )
         self._turn_blocks.clear()
         self._todo_block = None
+        if self._gc_snapshots_pending:
+            # The flushed preview rows are persisted now — prune this chat's
+            # unreferenced version-pinned snapshots (dismissed history etc.).
+            self._gc_snapshots_pending = False
+            try:
+                from services.media import preview_snapshots
+                preview_snapshots.gc_chat(self.chat_id)
+            except Exception:
+                logger.debug("preview snapshot GC failed", exc_info=True)
         # Advance cutoff so incrementally saved content (completed meeting
         # turns) is included in chat_history on reconnect, not truncated.
         self._db_msg_cutoff_id = task_store.get_last_chat_message_id(self.chat_id)
@@ -1693,6 +1708,13 @@ class ChatStreamPump:
             for i, block in enumerate(self._turn_blocks):
                 if (block.get("type") == "document_preview"
                         and block.get("file_id") == evt["file_id"]):
+                    # Intra-turn supersede: the replaced push's snapshot was
+                    # never exposed to the dashboard (previews only forward at
+                    # flush) — drop its file now.
+                    old_snap = block.get("snapshot_id") or ""
+                    if old_snap and old_snap != evt.get("snapshot_id"):
+                        from services.media import preview_snapshots
+                        preview_snapshots.delete_snapshot(self.chat_id, old_snap)
                     self._turn_blocks[i] = evt
                     replaced = True
                     break

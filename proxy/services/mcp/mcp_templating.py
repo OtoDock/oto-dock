@@ -111,6 +111,7 @@ def _resolve_template(
         "${platform.wopi_base_url}":      config.WOPI_BASE_URL,
         "${platform.collabora_frame_ancestors}": config.COLLABORA_FRAME_ANCESTORS,
         "${platform.collabora_service_root}":    config.COLLABORA_SERVICE_ROOT,
+        "${platform.collabora_ssl_termination}": config.COLLABORA_SSL_TERMINATION,
         "${platform.host_agents_dir}":    str(config.AGENTS_DIR),
         "${platform.mcp_port}":           str(manifest.server.port),
         "${platform.oauth_insecure_transport}": "1" if config.DASHBOARD_PUBLIC_URL.startswith("http://") else "",

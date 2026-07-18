@@ -100,7 +100,7 @@ class TestResumeIdleChat:
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL,
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
                 })
                 assert [(m["role"], m["content"])
                         for m in history["messages"]] == [
@@ -142,7 +142,7 @@ class TestResumeIdleChat:
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL,
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
                 })
                 await ws.expect({
                     "type": "warmup_ready", "session_id": live_sid,
@@ -926,3 +926,40 @@ class TestDeterministicTitlePrelude:
                   '```text\nRefresh please\n```')
         assert _title_from_prompt(framed) == "Infra Dashboard — Refresh data"
         assert _title_from_prompt("plain words") == "plain words"
+
+
+class TestTaskChatModeRestore:
+    """A task-run chat's chat_history must carry the chat row's stored
+    permission mode — the scheduler runs tasks with 'auto' (Don't Ask), and
+    the frontend restores the chip from this field for task- chats. Before
+    the fix NO chat_history frame carried `mode`, so the viewer's sticky
+    selection (or a stale previous chat's mode) showed instead of the run's
+    real posture."""
+
+    def test_task_chat_history_carries_auto_mode(self, temp_db, monkeypatch):
+        import uuid as _uuid
+        from storage import database as task_store
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        run_id = _uuid.uuid4().hex[:12]
+        cid = f"task-run-{run_id}"
+        task_store.create_chat(cid, "user-admin", slug, "auto",
+                               model=TEST_MODEL,
+                               execution_path="claude-code-cli",
+                               source_type="task")
+        task_store.add_chat_message(cid, "user", "do the task",
+                                    author_sub="user-admin")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                history = await ws.next_frame()
+                assert history["type"] == "chat_history"
+                assert history["chat_id"] == cid
+                assert history["mode"] == "auto"
+                assert history["model"] == TEST_MODEL
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)

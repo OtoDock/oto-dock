@@ -40,6 +40,13 @@ REGISTRY_RAW_URL = (
 )
 MCP_RAW_BASE = "https://raw.githubusercontent.com/OtoDock/community-mcps/main"
 
+# Standalone skill packages live in their own catalog repo (same layout:
+# registry.json + one folder per package). Entries sit under a "skills" key.
+SKILLS_REGISTRY_RAW_URL = (
+    "https://raw.githubusercontent.com/OtoDock/community-skills/main/registry.json"
+)
+SKILLS_RAW_BASE = "https://raw.githubusercontent.com/OtoDock/community-skills/main"
+
 # Short TTL keeps the dashboard snappy on repeated opens but lets a registry
 # bump propagate within a minute. Long enough that an admin clicking around
 # doesn't hammer GitHub raw with serialized requests.
@@ -66,6 +73,9 @@ class _CacheEntry:
 _registry_cache: _CacheEntry = _CacheEntry(value=None)
 _manifest_cache: dict[str, _CacheEntry] = {}
 _readme_cache: dict[str, _CacheEntry] = {}
+_skills_registry_cache: _CacheEntry = _CacheEntry(value=None)
+_skills_manifest_cache: dict[str, _CacheEntry] = {}
+_skills_readme_cache: dict[str, _CacheEntry] = {}
 _lock = asyncio.Lock()
 
 
@@ -192,6 +202,98 @@ async def fetch_readme(name: str) -> str:
         return body or ""
 
 
+async def fetch_skills_registry() -> dict[str, Any]:
+    """Return the parsed ``registry.json`` from the community-skills repo.
+
+    Same caching/ETag/stale-fallback scheme as :func:`fetch_registry`, with
+    one deliberate difference: when the registry is unreachable AND uncached,
+    this returns an EMPTY catalog flagged ``catalog_unreachable`` instead of
+    raising — a fresh install (or a pre-repo-publish dev box) must show an
+    empty Skills catalog with a banner, never an erroring tab.
+    """
+    now = time.monotonic()
+    cached = _skills_registry_cache.value
+    if cached is not None and now - _skills_registry_cache.fetched_at < REGISTRY_CACHE_TTL_SECONDS:
+        return cached
+
+    async with _lock:
+        now = time.monotonic()
+        if _skills_registry_cache.value is not None and now - _skills_registry_cache.fetched_at < REGISTRY_CACHE_TTL_SECONDS:
+            return _skills_registry_cache.value
+
+        try:
+            body, etag, status = await _http_get_json(
+                SKILLS_REGISTRY_RAW_URL, _skills_registry_cache.etag,
+            )
+            if status == 304 and _skills_registry_cache.value is not None:
+                _skills_registry_cache.fetched_at = now
+                return _skills_registry_cache.value
+            if body is None:
+                raise RuntimeError("skills registry GET returned no body and no cache")
+            _skills_registry_cache.value = body
+            _skills_registry_cache.fetched_at = now
+            _skills_registry_cache.etag = etag
+            return body
+        except Exception as exc:
+            if _skills_registry_cache.value is not None:
+                logger.warning(
+                    "Failed to refresh community skills registry (%s) — "
+                    "serving stale cache", exc,
+                )
+                return _skills_registry_cache.value
+            logger.warning(
+                "Community skills registry unavailable and uncached (%s) — "
+                "serving empty catalog", exc,
+            )
+            return {"skills": [], "catalog_unreachable": True}
+
+
+async def fetch_skills_manifest(name: str) -> dict[str, Any]:
+    """Return the parsed ``manifest.json`` for one community skill package."""
+    url = f"{SKILLS_RAW_BASE}/{name}/manifest.json"
+    return await _fetch_cached_json(url, _skills_manifest_cache, name)
+
+
+async def fetch_skills_readme(name: str) -> str:
+    """Return the markdown ``README.md`` for one community skill package."""
+    url = f"{SKILLS_RAW_BASE}/{name}/README.md"
+    cached = _skills_readme_cache.get(name)
+    now = time.monotonic()
+    if cached is not None and cached.value is not None and now - cached.fetched_at < README_CACHE_TTL_SECONDS:
+        return cached.value
+    async with _lock:
+        cached = _skills_readme_cache.get(name)
+        now = time.monotonic()
+        if cached is not None and cached.value is not None and now - cached.fetched_at < README_CACHE_TTL_SECONDS:
+            return cached.value
+        body, etag, status = await _http_get_text(url, cached.etag if cached else None)
+        if status == 304 and cached is not None and cached.value is not None:
+            cached.fetched_at = now
+            return cached.value
+        _skills_readme_cache[name] = _CacheEntry(value=body, fetched_at=now, etag=etag)
+        return body or ""
+
+
+async def _fetch_cached_json(url: str, cache: dict[str, _CacheEntry],
+                             key: str) -> dict[str, Any]:
+    """Shared per-key JSON fetch with the manifest TTL + ETag scheme."""
+    cached = cache.get(key)
+    now = time.monotonic()
+    if cached is not None and cached.value is not None and now - cached.fetched_at < MANIFEST_CACHE_TTL_SECONDS:
+        return cached.value
+    async with _lock:
+        cached = cache.get(key)
+        now = time.monotonic()
+        if cached is not None and cached.value is not None and now - cached.fetched_at < MANIFEST_CACHE_TTL_SECONDS:
+            return cached.value
+        body, etag, status = await _http_get_json(url, cached.etag if cached else None)
+        if status == 304 and cached is not None and cached.value is not None:
+            cached.fetched_at = now
+            return cached.value
+        cache[key] = _CacheEntry(value=body, fetched_at=now, etag=etag)
+        return body
+
+
 # ---------------------------------------------------------------------------
 # Augmentation — adds local platform state to a registry entry
 # ---------------------------------------------------------------------------
@@ -275,13 +377,14 @@ def augment_entry(
     update_available = bool(installed and _catalog_is_newer(catalog_version, local_version))
     # node/python: catalog version is "" (unbounded), so the version compare never
     # fires — flag instead when the catalog integration manifest changed. Guarded:
-    # node/python only, both hashes present (a stale registry.json without
-    # ``manifest_hash`` must not false-flag).
+    # both hashes present (a stale registry.json without ``manifest_hash`` must
+    # not false-flag). runtime "none" = skill packages / context-only entries,
+    # whose only non-version update signal is the manifest hash.
     if (
         installed
         and not update_available
         and installed_manifest_hashes
-        and entry.get("runtime") in ("node", "python")
+        and entry.get("runtime") in ("node", "python", "none")
     ):
         catalog_hash = entry.get("manifest_hash")
         installed_hash = installed_manifest_hashes.get(name)
@@ -332,7 +435,7 @@ def _collect_installed_manifest_hashes() -> dict[str, str]:
 
     out: dict[str, str] = {}
     for name, m in mcp_registry.get_all_manifests().items():
-        if getattr(m.server, "runtime", "") not in ("node", "python"):
+        if getattr(m.server, "runtime", "") not in ("node", "python", "none"):
             continue
         try:
             data = json.loads((Path(m.mcp_dir) / "manifest.json").read_text())

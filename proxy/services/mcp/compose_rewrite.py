@@ -275,7 +275,39 @@ def ensure_pull_compose(manifest) -> bool:
     services = data.get("services") or {}
     has_build = any(isinstance(s, dict) and "build" in s for s in services.values())
     if not has_build:
-        return False  # already pull-form (or no build to replace) — idempotent
+        # Already pull-form — but verify the stamped container_name matches
+        # THIS install identity. The install-id lives in config.env, so a
+        # recreated config.env (install moved to a new folder) rotates it and
+        # a stale stamp makes every `up` collide with the previous
+        # generation's container ("name already in use" → opaque 500 on
+        # start, forever). Re-stamp instead of returning idempotent-False.
+        expected = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}"
+        try:
+            target = _pick_target_service(
+                services, deployment.mcp_service_name(manifest),
+            )
+        except ValueError:
+            return False  # unrecognizable shape — leave it alone
+        svc = services.get(target)
+        current = svc.get("container_name") if isinstance(svc, dict) else None
+        if (
+            isinstance(current, str)
+            and current.startswith("otodock-")
+            and "-mcp-" in current
+            and current != expected
+        ):
+            svc["container_name"] = expected
+            compose_path.write_text(
+                _HEADER
+                + yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+            )
+            logger.info(
+                "Re-stamped %s compose container_name %s → %s "
+                "(install identity changed)",
+                manifest.name, current, expected,
+            )
+            return True
+        return False  # already pull-form and correctly stamped — idempotent
 
     if not srv.image:
         raise ValueError(

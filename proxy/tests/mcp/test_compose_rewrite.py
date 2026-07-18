@@ -282,3 +282,47 @@ def test_sibling_service_also_gets_default_bounds(monkeypatch):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_ensure_restamps_stale_install_id(tmp_path, monkeypatch):
+    """A pull-form compose stamped by a PREVIOUS install identity (rotated
+    config.env → new INSTALL_ID) gets its container_name re-stamped instead
+    of colliding with the old generation's container forever."""
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)
+    pull_form = {
+        "services": {
+            "camoufox": {
+                "image": "ghcr.io/otodock/camoufox:0.0.55",
+                "container_name": "otodock-deadbeef-mcp-camoufox",
+                "networks": {"otodock": {"aliases": ["camoufox"]}},
+            }
+        },
+        "networks": {"otodock": {"external": True, "name": "otodock"}},
+    }
+    m = _manifest(tmp_path, compose=pull_form)
+
+    assert compose_rewrite.ensure_pull_compose(m) is True
+    written = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())
+    assert written["services"]["camoufox"]["container_name"] == (
+        f"otodock-{config.INSTALL_ID}-mcp-camoufox"
+    )
+    # second call: correctly stamped → idempotent no-op
+    assert compose_rewrite.ensure_pull_compose(m) is False
+
+
+def test_ensure_leaves_non_otodock_container_name(tmp_path, monkeypatch):
+    """A pull-form compose whose container_name is not otodock-shaped is not
+    ours to re-stamp — leave it untouched."""
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)
+    pull_form = {
+        "services": {
+            "camoufox": {
+                "image": "ghcr.io/otodock/camoufox:0.0.55",
+                "container_name": "camoufox-mcp",
+            }
+        },
+    }
+    m = _manifest(tmp_path, compose=pull_form)
+    original = (tmp_path / "docker-compose.yml").read_text()
+    assert compose_rewrite.ensure_pull_compose(m) is False
+    assert (tmp_path / "docker-compose.yml").read_text() == original

@@ -56,11 +56,18 @@ def test_media_processing_placeholder():
 
 def test_document_preview():
     item = {"event_type": "document_preview", "wopi_url": "w", "filename": "f.docx",
-            "file_id": "fid", "download_url": "/d"}
+            "file_id": "fid", "download_url": "/d",
+            "snapshot_id": "abc123", "generation": 1700000000000}
     assert artifact_event_from_perm_item(item) == {
         "type": "document_preview", "wopi_url": "w", "filename": "f.docx",
         "file_id": "fid", "download_url": "/d",
+        "snapshot_id": "abc123", "generation": 1700000000000,
     }
+    # Pre-snapshot pushes (no chat, copy failure) default to empty identity.
+    out = artifact_event_from_perm_item(
+        {"event_type": "document_preview", "wopi_url": "w", "filename": "f",
+         "file_id": "fid", "download_url": "/d"})
+    assert out["snapshot_id"] == "" and out["generation"] == 0
 
 
 def test_ui_carries_every_field():

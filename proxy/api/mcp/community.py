@@ -292,6 +292,165 @@ async def list_catalog_installs(
 
 
 # ---------------------------------------------------------------------------
+# Community skills catalog (standalone skill packages)
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/community/skills")
+async def list_community_skills(
+    agent: str | None = None,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """List the community-skills catalog with platform-state augmentation.
+
+    Mirrors ``GET /v1/community/mcps`` (same augmentation + ``?agent=``
+    scoping) with one deliberate difference: an unreachable, uncached
+    registry degrades to an EMPTY catalog with ``catalog_unreachable: true``
+    instead of a 502 — the Skills tab renders a banner, never an error.
+    """
+    _require_creator_or_admin(user)
+    if agent and not user.can_manage_agent(agent):
+        raise HTTPException(403, "Manager access required for this agent")
+
+    registry = await community_catalog.fetch_skills_registry()
+    installed_versions, enabled_for_agents, pending_requests, installed_manifest_hashes = (
+        await community_catalog.collect_local_state()
+    )
+    augmented = [
+        community_catalog.augment_entry(
+            entry, installed_versions, enabled_for_agents,
+            pending_requests=pending_requests,
+            agent_slug=agent,
+            installed_manifest_hashes=installed_manifest_hashes,
+        )
+        for entry in registry.get("skills", [])
+    ]
+    return {
+        "registry_version": registry.get("registry_version"),
+        "updated_at": registry.get("updated_at"),
+        "platform_min_version": registry.get("platform_min_version"),
+        "fetched_from": community_catalog.SKILLS_REGISTRY_RAW_URL,
+        "catalog_unreachable": bool(registry.get("catalog_unreachable")),
+        "skills": augmented,
+    }
+
+
+@router.get("/v1/community/skills/{name}")
+async def get_community_skill(
+    name: str,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Registry entry + manifest + README for one community skill package."""
+    _require_creator_or_admin(user)
+
+    registry = await community_catalog.fetch_skills_registry()
+    entry = next(
+        (s for s in registry.get("skills", []) if s.get("name") == name), None,
+    )
+    if entry is None:
+        raise HTTPException(404, f"Skill package '{name}' not found in skills catalog")
+
+    installed_versions, enabled_for_agents, pending_requests, installed_manifest_hashes = (
+        await community_catalog.collect_local_state()
+    )
+    augmented = community_catalog.augment_entry(
+        entry, installed_versions, enabled_for_agents,
+        pending_requests=pending_requests,
+        installed_manifest_hashes=installed_manifest_hashes,
+    )
+    try:
+        manifest = await community_catalog.fetch_skills_manifest(name)
+    except Exception:
+        manifest = None
+    try:
+        readme = await community_catalog.fetch_skills_readme(name)
+    except Exception:
+        readme = ""
+    return {"entry": augmented, "manifest": manifest, "readme": readme}
+
+
+async def _run_skill_catalog_install(name: str, admin_sub: str) -> None:
+    """Background worker for a skills-catalog install (mirrors the MCP twin;
+    shares the job registry — package/MCP names can't collide by install-time
+    guard, so job keys stay unique)."""
+    from core.credentials import catalog_install_registry
+    from services.community import skills_installer
+
+    async def _progress(ev: dict) -> None:
+        await catalog_install_registry.update(
+            name, phase=ev.get("phase"), pct=ev.get("pct"), message=ev.get("message"),
+        )
+
+    try:
+        async with catalog_install_registry.lock_for(name):
+            result = await skills_installer.install_skill_package_from_catalog(
+                name, progress_cb=_progress,
+            )
+        await catalog_install_registry.finish(name, result)
+        logger.info(
+            "Installed community skill package %s v%s (status=%s)",
+            result.get("name"), result.get("version"), result.get("status"),
+        )
+    except HTTPException as exc:
+        msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        await catalog_install_registry.fail(name, msg)
+        await _notify_install_failed(name, msg, admin_sub)
+    except Exception as exc:
+        logger.exception("Background skill install of %s failed", name)
+        msg = f"{type(exc).__name__}: {exc}"
+        await catalog_install_registry.fail(name, msg)
+        await _notify_install_failed(name, msg, admin_sub)
+
+
+@router.post("/v1/admin/community/skills/{name}/install")
+async def install_community_skill(
+    name: str,
+    user: UserContext = Depends(get_current_user),
+) -> JSONResponse:
+    """Start a background install (or update) of a skill package. Admin only.
+
+    Same 202 + job semantics as the MCP install endpoint; progress rides the
+    same job registry, polled via either installs listing.
+    """
+    _require_admin(user)
+    from core.credentials import catalog_install_registry
+
+    registry = await community_catalog.fetch_skills_registry()
+    entry = next(
+        (s for s in registry.get("skills", []) if s.get("name") == name), None,
+    )
+    if entry is None:
+        if registry.get("catalog_unreachable"):
+            raise HTTPException(502, "Skills catalog is unreachable")
+        raise HTTPException(404, f"Skill package '{name}' not found in skills catalog")
+
+    job, is_new = await catalog_install_registry.start(
+        name,
+        triggered_by=user.sub,
+        runtime="none",
+        label=entry.get("label") or name,
+    )
+    if is_new:
+        task = asyncio.create_task(_run_skill_catalog_install(name, user.sub))
+        _install_tasks.add(task)
+        task.add_done_callback(_install_tasks.discard)
+
+    return JSONResponse(
+        status_code=202, content={"job": job.to_dict(), "started": is_new},
+    )
+
+
+@router.get("/v1/admin/community/skills/installs")
+async def list_skill_catalog_installs(
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Alias of the shared install-jobs snapshot (jobs are keyed by name and
+    names are unique across both catalogs)."""
+    _require_admin(user)
+    from core.credentials import catalog_install_registry
+    return {"installs": [j.to_dict() for j in catalog_install_registry.snapshot()]}
+
+
+# ---------------------------------------------------------------------------
 # Manager request flow
 # ---------------------------------------------------------------------------
 
@@ -302,6 +461,10 @@ class CreateRequestBody(BaseModel):
     # this required (LLMs compose context-aware reasons cheaply); the UI
     # treats it as optional to keep the manager flow low-friction.
     reason: str = ""
+    # Which catalog the requested name lives in: 'mcp' (community-mcps,
+    # default) or 'skill' (community-skills). Drives validation here and the
+    # installer dispatch in approve_request.
+    kind: str = "mcp"
 
 
 class AdminResolveBody(BaseModel):
@@ -346,13 +509,26 @@ async def create_mcp_request(
     if not user.can_manage_agent(slug):
         raise HTTPException(403, "Manager access required for this agent")
 
-    # Confirm catalog entry exists (defense against drive-by POSTs).
-    try:
-        registry = await community_catalog.fetch_registry()
-    except Exception as exc:
-        raise HTTPException(502, f"Could not load community catalog: {exc}")
-    if not any(m.get("name") == body.mcp_name for m in registry.get("mcps", [])):
-        raise HTTPException(404, f"MCP '{body.mcp_name}' not found in community catalog")
+    if body.kind not in ("mcp", "skill"):
+        raise HTTPException(400, f"Invalid request kind: {body.kind!r}")
+
+    # Confirm catalog entry exists (defense against drive-by POSTs) — against
+    # the catalog matching the request kind.
+    if body.kind == "skill":
+        skills_registry = await community_catalog.fetch_skills_registry()
+        if not any(s.get("name") == body.mcp_name
+                   for s in skills_registry.get("skills", [])):
+            raise HTTPException(
+                404,
+                f"Skill package '{body.mcp_name}' not found in skills catalog",
+            )
+    else:
+        try:
+            registry = await community_catalog.fetch_registry()
+        except Exception as exc:
+            raise HTTPException(502, f"Could not load community catalog: {exc}")
+        if not any(m.get("name") == body.mcp_name for m in registry.get("mcps", [])):
+            raise HTTPException(404, f"MCP '{body.mcp_name}' not found in community catalog")
 
     # Short-circuit when the MCP is already enabled on the agent — no need to
     # bother the admin.
@@ -367,6 +543,8 @@ async def create_mcp_request(
             mcp_request_store.create_request,
             body.mcp_name, slug, user.sub,
             (body.reason or "").strip(),
+            None,
+            body.kind,
         )
     except ValueError as exc:
         raise HTTPException(409, str(exc))

@@ -32,7 +32,9 @@ def _get_mcp_info(name: str) -> tuple[int, list[str]]:
     """
     from services.mcp import mcp_registry
     manifests = mcp_registry.get_agent_mcps_all_placements(name)
-    names = sorted(m.name for m in manifests)
+    # Standalone skill packages aren't MCPs from the caller's perspective
+    # (discovery cards + delegation surfaces) — they carry no tools.
+    names = sorted(m.name for m in manifests if m.category != "skill")
     return len(names), names
 
 

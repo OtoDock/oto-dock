@@ -30,9 +30,11 @@ def reset_flow():
     from core.remote import remote_file_flow
     remote_file_flow._sessions.clear()
     remote_file_flow._global_path_locks.clear()
+    remote_file_flow._pull_stat_records.clear()
     yield
     remote_file_flow._sessions.clear()
     remote_file_flow._global_path_locks.clear()
+    remote_file_flow._pull_stat_records.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +527,198 @@ async def test_pull_through_via_fallback_after_restart(
         host = await remote_file_flow.pull_through("surv-2", "workspace/a.txt")
         assert host == (tmp_path / "agent-1" / "workspace" / "a.txt").resolve()
         assert host.read_bytes() == b"survivor"
+
+
+# ---------------------------------------------------------------------------
+# Pull-stat revalidation (file_stat, satellite >= 0.5.95)
+# ---------------------------------------------------------------------------
+
+
+def _mock_cm(*, supports_stat, stat=None, pulled=b"content-v1"):
+    """Connection-manager mock: gated stat probe + a pull that writes bytes."""
+    cm = MagicMock()
+    cm.satellite_supports_file_stat.return_value = supports_stat
+    cm.stat_file = AsyncMock(return_value=stat)
+
+    async def fake_pull(machine_id, ref, dest_path, *, agent_slug=""):
+        p = Path(dest_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(pulled)
+        return True
+
+    cm.pull_file_to_path = MagicMock(side_effect=fake_pull)
+    return cm
+
+
+_STAT_V1 = {"exists": True, "size": 10, "mtime_ns": 111}
+_STAT_V2 = {"exists": True, "size": 12, "mtime_ns": 222}
+
+
+@pytest.mark.asyncio
+async def test_pull_through_fast_path_skips_transfer(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """Second read of an unchanged file: stat matches the pull-time record →
+    the workspace copy is served with NO second transfer."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        first = await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert first is not None
+        assert cm.pull_file_to_path.call_count == 1
+
+        second = await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert second == first
+        assert cm.pull_file_to_path.call_count == 1  # served from workspace copy
+        assert cm.stat_file.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_through_repulls_on_stat_mismatch(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """A changed satellite file (different stat) always re-transfers."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        cm.stat_file = AsyncMock(return_value=_STAT_V2)  # file changed
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert cm.pull_file_to_path.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_through_old_satellite_never_probes(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """Pre-0.5.95 satellite: no stat frames sent (they would be silently
+    dropped), every read pulls — the pre-existing behavior."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=False)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert cm.pull_file_to_path.call_count == 2
+        assert cm.stat_file.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pull_through_probe_failure_falls_back_to_pull(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """stat_file returning None (timeout/policy/disconnect) must never serve
+    the cache — always fall through to a full pull."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        cm.stat_file = AsyncMock(return_value=None)  # probe broke
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert cm.pull_file_to_path.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_push_back_invalidates_stat_record(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """A write-back drops the pull-time record, so the next read re-pulls
+    instead of fast-pathing onto a pre-write comparison."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    cm.push_file = AsyncMock(return_value=True)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert remote_file_flow._pull_stat_records  # recorded
+
+        assert await remote_file_flow.push_back("s1", "workspace/a.txt") is True
+        assert not remote_file_flow._pull_stat_records  # invalidated
+
+        # Even though the satellite still reports the same stat, the record
+        # is gone → full pull.
+        await remote_file_flow.pull_through("s1", "workspace/a.txt")
+        assert cm.pull_file_to_path.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_host_path_fast_path_uses_sidecar_stat(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """satellite_host pulls persist the stat in the sidecar; a matching
+    probe on the next read serves the session cache without a transfer."""
+    import config
+    from core.remote import remote_file_flow
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        first = await remote_file_flow.pull_through_host_path(
+            "s1", "/home/user/Desktop/report.pdf",
+        )
+        assert first is not None and first.is_file()
+        assert cm.pull_file_to_path.call_count == 1
+
+        second = await remote_file_flow.pull_through_host_path(
+            "s1", "/home/user/Desktop/report.pdf",
+        )
+        assert second == first
+        assert cm.pull_file_to_path.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_stat_type_gates_non_dict_replies(reset_flow):
+    """Regression: an un-configured mock cm (`AsyncMock().stat_file(...)`
+    returns an AsyncMock) flowed straight through `_probe_stat`, and
+    `pull_through_host_path` then crashed JSON-serializing it into the cache
+    sidecar (`test_satellite_host_paths.py::test_writes_sidecar_with_metadata`).
+    The probe's contract is dict-or-None — anything else (malformed ack,
+    test double) must degrade to "no probe", never break the read."""
+    from core.remote import remote_file_flow
+
+    for bad in (AsyncMock(), "not-a-dict", 42, ["exists"]):
+        cm = MagicMock()
+        cm.satellite_supports_file_stat.return_value = True
+        cm.stat_file = AsyncMock(return_value=bad)
+        assert await remote_file_flow._probe_stat(cm, "m-1", object()) is None
+
+    # A genuine dict still passes through untouched.
+    cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
+    assert await remote_file_flow._probe_stat(cm, "m-1", object()) == _STAT_V1

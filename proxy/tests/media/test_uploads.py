@@ -12,6 +12,7 @@ resolution branches without DB/auth ceremony — same approach as
 `tests/media/test_collabora_proxy.py`.
 """
 
+import asyncio
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -266,3 +267,78 @@ def test_agent_scoped_upload_rejects_viewer(app_with_internal_agent, monkeypatch
     )
     assert resp.status_code == 403, resp.text
     assert "manager" in resp.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Behavior — satellite push is backgrounded, never awaited by the endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_upload_schedules_push_without_awaiting(app_with_router, monkeypatch):
+    """`/v1/upload` must return once the platform write lands: the satellite
+    push is handed to the turn-start barrier registry as a background task
+    (`core/remote/upload_inflight.track`) instead of being awaited in-request.
+    The push coroutine here would hang forever if the endpoint awaited it."""
+    app, agents_dir = app_with_router
+    from api.media import uploads
+    from core.remote import upload_inflight
+    from services.remote import workspace_fanout
+
+    monkeypatch.setattr(
+        workspace_fanout, "has_fanout_candidates", lambda *a, **kw: True,
+    )
+
+    async def hang_forever(*a, **kw):  # would deadlock a synchronous await
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        uploads, "_push_upload_to_active_remote_sessions", hang_forever,
+    )
+
+    tracked: list[str] = []
+
+    def fake_track(agent_slug, coro):
+        tracked.append(agent_slug)
+        coro.close()  # don't leave an un-awaited coroutine behind
+        return None
+
+    monkeypatch.setattr(upload_inflight, "track", fake_track)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("big.bin", BytesIO(b"x" * 4096), "application/octet-stream")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert tracked == ["test-agent"]
+    # The platform write landed before the response — that's what makes the
+    # background push safe (the workspace listing reads the platform dir).
+    saved = agents_dir / "test-agent" / resp.json()["path"]
+    assert saved.is_file()
+
+
+def test_upload_skips_push_scheduling_without_candidates(app_with_router, monkeypatch):
+    """Local-only installs (no connected satellite that could receive the
+    file) schedule nothing — no stray background task per upload."""
+    app, _ = app_with_router
+    from core.remote import upload_inflight
+    from services.remote import workspace_fanout
+
+    monkeypatch.setattr(
+        workspace_fanout, "has_fanout_candidates", lambda *a, **kw: False,
+    )
+    tracked: list[str] = []
+    monkeypatch.setattr(
+        upload_inflight, "track",
+        lambda slug, coro: (tracked.append(slug), coro.close()),
+    )
+
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("note.txt", BytesIO(b"hello"), "text/plain")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert tracked == []

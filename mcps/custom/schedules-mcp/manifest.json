@@ -32,6 +32,7 @@
   "skills": [
     {
       "id": "task-scheduling",
+      "loading": "always",
       "file": "skills/task-scheduling.md",
       "description": "When to use scheduled/one-time/trigger tasks vs in-session, scope, completion notifications, self-continuations",
       "default_exclude_from": []

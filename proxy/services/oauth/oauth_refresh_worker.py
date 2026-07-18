@@ -35,16 +35,23 @@ defensive cross-check; legacy ``workspace_mcp`` files fall back to the
 dir-name convention.
 
 Failure mode:
-  * Network error / vendor 5xx → log + skip this account, try again next tick.
-  * 4xx (invalid_grant — token was revoked at the vendor) → log + leave the
-    file in place; next session start will exclude the MCP with a clear
-    "not connected" reason.
+  * A failed refresh leaves ``expires_at`` in the past, so without damping the
+    file would be retried on EVERY tick — 1,440 vendor calls/day for a token
+    that can never succeed. Failures therefore back off exponentially
+    (``_BACKOFF_BASE_SECONDS`` doubling to ``_BACKOFF_CAP_SECONDS``), and an
+    identified ``invalid_grant`` (grant revoked at the vendor — permanent)
+    stops retrying entirely until the token file changes (a reconnect rewrites
+    it). Backoff state is in-memory only: a proxy restart costs at most one
+    extra attempt per failing token.
+  * The file stays in place either way; next session start will exclude the
+    MCP with a clear "not connected" reason.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +63,19 @@ logger = logging.getLogger("claude-proxy.oauth-refresh-worker")
 _INTERVAL_SECONDS = 60
 # Refresh threshold: tokens with less than this lifetime get refreshed.
 _REFRESH_THRESHOLD_SECONDS = 300
+# Failure backoff: first retry this long after a failure, doubling per
+# consecutive failure up to the cap (a permanently-broken token then costs
+# ≤24 attempts/day instead of 1,440).
+_BACKOFF_BASE_SECONDS = 120
+_BACKOFF_CAP_SECONDS = 3600
+
+# Per-token-file failure state: str(path) → {failures, next_attempt, mtime,
+# dead}. ``dead`` marks an invalid_grant token — never retried until the file's
+# mtime changes. Cleared on success / file rewrite / file removal.
+_failure_state: dict[str, dict] = {}
+
+# Seam for tests (patch this, not the global clock).
+_monotonic = time.monotonic
 
 # Module-level handle to the running task so app.py can cancel it cleanly.
 _worker_task: asyncio.Task | None = None
@@ -125,13 +145,70 @@ async def _refresh_tick() -> None:
                         provider_id=provider_id,
                     ):
                         refreshed += 1
-                except Exception:
+                except Exception as exc:
+                    _record_refresh_failure(token_file, exc)
                     logger.exception(
                         "OAuth refresh failed for %s/%s",
                         prov_dir.name, token_file.name,
                     )
+    # Drop failure state for files that no longer exist (account removed).
+    for key in [k for k in _failure_state if not Path(k).exists()]:
+        _failure_state.pop(key, None)
     if refreshed:
         logger.info("OAuth refresh worker refreshed %d token(s)", refreshed)
+
+
+def _in_backoff(token_file: Path) -> bool:
+    """True if ``token_file`` recently failed and its retry window hasn't
+    elapsed (or it's marked dead). A changed mtime — reconnect or writeback by
+    another path — clears the state: the old verdict no longer applies."""
+    state = _failure_state.get(str(token_file))
+    if state is None:
+        return False
+    try:
+        mtime = token_file.stat().st_mtime
+    except OSError:
+        _failure_state.pop(str(token_file), None)
+        return True
+    if mtime != state["mtime"]:
+        _failure_state.pop(str(token_file), None)
+        return False
+    return state["dead"] or _monotonic() < state["next_attempt"]
+
+
+def _is_permanent_refresh_error(exc: Exception) -> bool:
+    """invalid_grant means the grant was revoked/expired at the vendor —
+    no retry can ever succeed. Relay-brokered refreshes surface it as a
+    ``RelayError`` code; direct providers embed the vendor's OAuth error
+    code in the ``RuntimeError`` message."""
+    from services.billing.relay_client import RelayError
+
+    if isinstance(exc, RelayError):
+        return exc.code == "invalid_grant"
+    return isinstance(exc, RuntimeError) and "invalid_grant" in str(exc)
+
+
+def _record_refresh_failure(token_file: Path, exc: Exception) -> None:
+    key = str(token_file)
+    prev = _failure_state.get(key)
+    failures = (prev["failures"] if prev else 0) + 1
+    delay = min(_BACKOFF_CAP_SECONDS, _BACKOFF_BASE_SECONDS * 2 ** (failures - 1))
+    dead = _is_permanent_refresh_error(exc)
+    try:
+        mtime = token_file.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    _failure_state[key] = {
+        "failures": failures,
+        "next_attempt": _monotonic() + delay,
+        "mtime": mtime,
+        "dead": dead,
+    }
+    if dead:
+        logger.warning(
+            "OAuth refresh giving up on %s (%s) — will retry only after the "
+            "account is reconnected", token_file.name, exc,
+        )
 
 
 async def _maybe_refresh_token_file(
@@ -166,6 +243,9 @@ async def _maybe_refresh_token_file(
 
     remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
     if remaining > _REFRESH_THRESHOLD_SECONDS:
+        return False
+
+    if _in_backoff(token_file):
         return False
 
     # Four-arm dispatch:
@@ -313,4 +393,5 @@ async def _maybe_refresh_token_file(
             provider_id, (user_sub or "_service")[:8], account_label,
             "s2s" if is_s2s2 else "oauth", remaining,
         )
+        _failure_state.pop(str(token_file), None)
         return True

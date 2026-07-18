@@ -1,3 +1,8 @@
+---
+name: photo-editing-guide
+description: Professional Lightroom-style photo editing workflow and parameter recipes for edit_image. Use when editing, retouching, enhancing, or color-grading photos.
+---
+
 ## Photo Editing Guidelines
 
 When editing photos, **always call `analyze_image` first** to see the histogram, zone balance, and color data before choosing adjustment values. This prevents over-editing.

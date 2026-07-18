@@ -42,8 +42,16 @@
   "skills": [
     {
       "id": "display-tools",
+      "loading": "always",
       "file": "skills/display-tools.md",
-      "description": "Display MCP tool descriptions and usage instructions",
+      "description": "Display MCP routing judgment: which display tool for which content, media routing rules, when display_ui is worth it, artifact iteration",
+      "default_exclude_from": ["phone"]
+    },
+    {
+      "id": "miniapp-authoring",
+      "loading": "on_demand",
+      "file": "skills/miniapp-authoring/SKILL.md",
+      "description": "Authoring contracts for interactive artifacts, mini-app dashboards, and Dock panels: display_ui backchannel and theme events, pin_app action buttons, live data panels, feeds, scoped dashboards, file pins. Use whenever building or updating a display_ui artifact, mini-app, or dashboard.",
       "default_exclude_from": ["phone"]
     }
   ],

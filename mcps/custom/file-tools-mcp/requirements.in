@@ -13,3 +13,10 @@ matplotlib>=3.8
 rembg[cpu]>=2.0
 starlette
 uvicorn
+# Equation pipeline: LaTeX → MathML → OMML (docx) / SVG (pdf) / PNG (pptx, xlsx)
+lxml>=5.0
+latex2mathml>=3.78
+mathml2omml>=0.0.2
+ziamath>=0.13
+cairosvg>=2.7
+dwml>=0.3

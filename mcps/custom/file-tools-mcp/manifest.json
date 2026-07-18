@@ -28,6 +28,7 @@
     "WOPI_BASE_URL": "${platform.wopi_base_url}",
     "COLLABORA_FRAME_ANCESTORS": "${platform.collabora_frame_ancestors}",
     "COLLABORA_SERVICE_ROOT": "${platform.collabora_service_root}",
+    "COLLABORA_SSL_TERMINATION": "${platform.collabora_ssl_termination}",
     "MCP_PORT": "${platform.mcp_port}"
   },
   "agent_env": {},
@@ -37,14 +38,16 @@
   "skills": [
     {
       "id": "file-tools-usage",
+      "loading": "always",
       "file": "skills/file-tools.md",
       "description": "Document and image tool descriptions, usage instructions, preview behavior",
       "default_exclude_from": []
     },
     {
       "id": "photo-editing-guide",
-      "file": "skills/photo-editing.md",
-      "description": "Professional Lightroom-style photo editing workflow and parameter guidelines",
+      "loading": "on_demand",
+      "file": "skills/photo-editing-guide/SKILL.md",
+      "description": "Professional Lightroom-style photo editing workflow and parameter recipes for edit_image. Use when editing, retouching, enhancing, or color-grading photos.",
       "default_exclude_from": []
     }
   ],

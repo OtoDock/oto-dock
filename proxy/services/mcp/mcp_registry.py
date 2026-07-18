@@ -175,8 +175,21 @@ def scan_manifests() -> dict[str, McpManifest]:
             if not manifest_path.is_file():
                 continue
             manifest = _parse_manifest(manifest_path)
-            if manifest:
-                found[manifest.name] = manifest
+            if not manifest:
+                continue
+            # Flat name registry — FIRST seen wins, deterministically (scan
+            # order custom → community → skills). Last-wins would let a later
+            # dir (e.g. a skill package) silently shadow a custom MCP; the
+            # installers reject cross-catalog name collisions up front, so a
+            # hit here is a local/manual layout problem worth shouting about.
+            if manifest.name in found:
+                logger.warning(
+                    "MCP registry: manifest name collision on %r — keeping "
+                    "%s, ignoring %s",
+                    manifest.name, found[manifest.name].mcp_dir, child,
+                )
+                continue
+            found[manifest.name] = manifest
 
     _manifests = found
     logger.info(
@@ -1129,6 +1142,12 @@ def build_available_mcps_section(
     for m in manifests_sorted:
         if m.name in _SUPPRESS_FROM_CATALOG:
             continue
+        # Standalone skill packages are context-only carriers of skills —
+        # advertising them as "MCP servers ... tools you can call" would put
+        # a tool-less server in front of the agent. Their skills surface via
+        # the skills pipeline (inline or the CLI's own index) instead.
+        if m.category == "skill":
+            continue
         if context and context in (m.exclude_from or []):
             continue
         label = (m.label or m.name).strip()
@@ -1158,16 +1177,26 @@ def get_skills_for_agent(
     is_remote: bool = False,
     target_has_display: bool | None = None,
     target_device_grants: set[str] | None = None,
-) -> list[tuple[str, str]]:
-    """Return (skill_id, prompt_content) pairs for an agent filtered by context.
+) -> list[tuple[str, str, str]]:
+    """Return (skill_id, prompt_content, loading) for an agent, context-filtered.
 
-    Reads agent_skills DB table, checks exclude_from, loads .md files from disk.
-    Context is e.g. "dashboard", "phone", "task".
+    Reads agent_skills DB table, checks exclude_from, loads skill files from
+    disk with any SKILL.md frontmatter stripped (frontmatter is index
+    metadata for the CLI skills dir, never prompt text). Context is the
+    session's ``client_type`` — ``"dashboard"`` / ``"phone"`` / ``"task"`` /
+    ``"terminal"`` / … — matched against the skill's ``exclude_from``; ``""``
+    skips the exclusion filter.
+
+    ``loading`` is the manifest stamp (``"always"`` | ``"on_demand"``) — the
+    caller decides what to inline vs. hand to the CLI's own progressive
+    disclosure.
 
     ``is_remote`` / ``target_has_display`` / ``target_device_grants`` forward to
     ``get_agent_mcps`` so a device-local MCP's skill text is dropped on sessions
     that can't run it. Fail-closed defaults.
     """
+    from services.mcp.skill_format import strip_frontmatter
+
     db_skills = mcp_store.get_agent_skills(agent_name)
     skill_map: dict[str, dict] = {s["skill_id"]: s for s in db_skills}
 
@@ -1176,7 +1205,7 @@ def get_skills_for_agent(
         agent_name, is_remote=is_remote, target_has_display=target_has_display,
         target_device_grants=target_device_grants,
     )
-    result: list[tuple[str, str]] = []
+    result: list[tuple[str, str, str]] = []
 
     for manifest in assigned_mcps:
         for skill_def in manifest.skills:
@@ -1197,12 +1226,60 @@ def get_skills_for_agent(
             skill_path = manifest.mcp_dir / skill_def.file
             if skill_path.is_file():
                 try:
-                    content = skill_path.read_text()
-                    result.append((skill_def.id, content))
+                    content = strip_frontmatter(skill_path.read_text())
+                    result.append((skill_def.id, content, skill_def.loading))
                 except Exception as e:
                     logger.warning("Failed to read skill %s: %s", skill_path, e)
 
     return result
+
+
+def find_skill_provider(skill_id: str) -> McpManifest | None:
+    """The manifest that declares ``skill_id`` (first match in registry
+    order — collisions are rejected at install and warned at scan, so at
+    most one live provider exists)."""
+    for manifest in _manifests.values():
+        for skill_def in manifest.skills:
+            if skill_def.id == skill_id:
+                return manifest
+    return None
+
+
+def get_on_demand_skills_for_materialization(
+    agent_name: str,
+) -> list[tuple[str, Path, str, str, str]]:
+    """The on-demand skills to materialize into a session CLI skills dir.
+
+    Returns ``(skill_id, source_path, package_name, package_version,
+    description)`` for every ENABLED ``loading: on_demand`` skill of the
+    agent's base manifest set.
+
+    Deliberately **context-free and placement-free** (all-placements set, no
+    ``exclude_from`` filtering): the materialized ``skills/`` dir is shared
+    by every session context that uses the same config dir (chat + task +
+    phone on the workspace scope), and concurrent config-dir ensures MUST
+    compute the identical set or reconciliation ping-pongs — one session
+    start deleting the folders another just wrote (plan §2.1). Per-context
+    precision lives on the INLINE path, where the token cost is; an
+    on-demand skill's residual footprint is a one-line CLI index entry.
+    """
+    db_skills = {s["skill_id"]: s for s in mcp_store.get_agent_skills(agent_name)}
+    out: list[tuple[str, Path, str, str, str]] = []
+    for manifest in get_agent_mcps_all_placements(agent_name):
+        for skill_def in manifest.skills:
+            if skill_def.loading != "on_demand":
+                continue
+            row = db_skills.get(skill_def.id)
+            if row and not row["enabled"]:
+                continue
+            out.append((
+                skill_def.id,
+                manifest.mcp_dir / skill_def.file,
+                manifest.name,
+                manifest.version,
+                skill_def.description,
+            ))
+    return out
 
 
 # ---------------------------------------------------------------------------

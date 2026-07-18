@@ -11,6 +11,7 @@ interface AuthContextValue {
   login: () => void
   logout: () => void
   setUser: (u: User) => void
+  refreshUser: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -20,6 +21,7 @@ const AuthContext = createContext<AuthContextValue>({
   login: () => {},
   logout: () => {},
   setUser: () => {},
+  refreshUser: async () => {},
 })
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -55,6 +57,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     startLogin().catch(console.error)
   }, [])
 
+  // Re-fetch /auth/me and swap the snapshot in place. The user object is
+  // otherwise loaded ONCE at app mount, so any mutation that changes the
+  // CURRENT user's server-side profile must call this or the change is
+  // invisible until a page reload — e.g. creating an agent assigns the
+  // creator as its manager, and `user.agent_roles` drives the
+  // Remote Machines settings tab and the per-agent role gates.
+  // Keeps the existing snapshot on failure: never null out a logged-in
+  // user over a transient refetch error.
+  const refreshUser = useCallback(async () => {
+    const u = await fetchCurrentUser()
+    if (u) setUser(u)
+  }, [])
+
   const logout = useCallback(() => {
     // Clear persisted drafts + sticky prefs so the next user on a shared
     // machine doesn't inherit them. Theme stays (display preference).
@@ -64,7 +79,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, loading, authConfig, login, logout, setUser }}>
+    <AuthContext.Provider value={{ user, loading, authConfig, login, logout, setUser, refreshUser }}>
       {children}
     </AuthContext.Provider>
   )

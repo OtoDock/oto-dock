@@ -27,6 +27,7 @@ from core.layers.cli.settle import (
 )
 from core.layers.codex.layer import CodexEventTranslator
 from core.layers.codex.session import CodexEvent
+from core.remote import upload_inflight
 from core.remote.satellite_connection import SatelliteConnectionManager
 from core.session.session_state import (
     _record_session_use, set_session_security, set_session_mode,
@@ -800,6 +801,16 @@ class RemoteExecutionLayer(
             return
 
         info.last_activity = time.monotonic()
+
+        # Barrier on in-flight dashboard-upload pushes for this agent:
+        # ``/v1/upload`` returns before its satellite push completes
+        # (``api/media/uploads.py``), so a prompt referencing a just-attached
+        # file must wait for the bytes to land on the machine first. Bounded —
+        # a wedged push logs and the turn proceeds (the pre-existing
+        # best-effort failure mode). Returns immediately (no wait) when
+        # nothing is in flight, i.e. the vast majority of turns.
+        await upload_inflight.wait_settled(info.agent_name)
+
         inject_time = kwargs.get("inject_time", False)
         settle_after_result = kwargs.get("settle_after_result", 0)
 

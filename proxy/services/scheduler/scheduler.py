@@ -1353,7 +1353,8 @@ async def _deliver_via_oneshot(
     _os_has_display = remote_store.get_target_has_display(_os_kind, target)
     _os_grants = remote_store.get_target_device_grants(_os_kind, target)
     agent_prompt = config.build_agent_prompt(
-        agent, is_remote=_os_is_remote, target_has_display=_os_has_display,
+        agent, client_type="task",
+        is_remote=_os_is_remote, target_has_display=_os_has_display,
         target_device_grants=_os_grants,
     )
     mcp_config, _, _, _, _ = mcp_registry.build_session_mcp_config(

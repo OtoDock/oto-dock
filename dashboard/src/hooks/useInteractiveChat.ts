@@ -144,8 +144,11 @@ export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string =
   // sessionInteractive; reset whenever a (re)warm lands so a fresh terminal
   // always opens on the terminal, not a stale snapshot.
   const [showRichView, setShowRichView] = useState(false)
-  // Text typed before the terminal was ready; flushed as the first pty_input on
-  // warmup_ready (or replayed as a normal turn if the backend declines).
+  // ATTACHMENTS-ONLY stash: a cold send with photos/files keeps its text here
+  // and flushes on warmup_ready (or replays as a normal turn if the backend
+  // declines). Text-only cold sends do NOT stash — their prompt rides the
+  // warmup and the backend delivers it server-side, surviving a chat switch
+  // or reload mid-warmup (this ref dies with resetSession on switch).
   const pendingPtyTextRef = useRef<string | null>(null)
   // Photos/files attached on a cold-start send; flushed via
   // sendPtyAttachments on warmup_ready (the backend saves + types the paths).
@@ -266,11 +269,24 @@ export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string =
         ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, { text: withInteractiveTime(text) }, 'interactive', currentDashboardTheme())
         return 'cold'
       }
-      // Stash the RAW (un-stamped) prompt: if the backend ends up running HEADLESS
-      // (-p fallback below), that path injects time itself — stamping here would
-      // double it. The interactive flush in onWarmupReady stamps at delivery.
+      if (!hasAttachments) {
+        // Claude text-only cold start: the RAW prompt rides the warmup and the
+        // BACKEND delivers it — interactive via submit_prompt at spawn
+        // completion (the server stamps the time), declined-to-headless via
+        // the server kick (that path injects time itself, which is why the
+        // text must go up un-stamped). Server-owned delivery survives
+        // switching chats / reloading mid-warmup; the client-held stash below
+        // does not (resetSession nulls it on switch, and warmup_ready for a
+        // non-viewed chat is dropped by the staleness guard).
+        ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, { text }, 'interactive', currentDashboardTheme())
+        return 'cold'
+      }
+      // Attachments keep the stash + warmup_ready flush (the base64 photos
+      // ride a separate pty_attachments message the backend saves + types as
+      // Read paths) — mirroring Codex's attachment fallback above. Known
+      // residual: switching away mid-warmup still drops an attachments send.
       pendingPtyTextRef.current = text
-      pendingPtyAttachmentsRef.current = hasAttachments ? { images: ctx.images, files: ctx.files } : null
+      pendingPtyAttachmentsRef.current = { images: ctx.images, files: ctx.files }
       ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, undefined, 'interactive', currentDashboardTheme())
       return 'cold'
     }

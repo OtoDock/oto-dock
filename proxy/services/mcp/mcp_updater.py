@@ -378,7 +378,58 @@ async def detect_available_updates() -> dict:
                     name, m.version, latest, HOLD_MARKER,
                 )
 
-    return {"updates": results, "checked": len(checks) + docker_checked}
+    # Standalone skill packages (category "skill", runtime none) — the skills
+    # catalog is the version of record (docker-style `!=` converge) plus the
+    # manifest-hash axis. Registry fetch degrades to an empty catalog, so a
+    # transient outage simply reports no skill updates.
+    skills_checked = 0
+    try:
+        skills_doc = await community_catalog.fetch_skills_registry()
+        skills_catalog = {
+            e.get("name"): e for e in skills_doc.get("skills", [])
+            if isinstance(e, dict)
+        }
+    except Exception as e:
+        logger.warning("Skills registry fetch failed for update check: %s", e)
+        skills_catalog = {}
+    if skills_catalog:
+        def _skill_hashes() -> dict:
+            out: dict[str, str | None] = {}
+            for sname, sm in manifests.items():
+                if sm.category != "skill":
+                    continue
+                try:
+                    data = json.loads((Path(sm.mcp_dir) / "manifest.json").read_text())
+                    out[sname] = community_catalog.normalized_manifest_hash(data)
+                except Exception:
+                    out[sname] = None
+            return out
+        skill_hashes = await asyncio.to_thread(_skill_hashes)
+        for name, m in manifests.items():
+            if m.category != "skill":
+                continue
+            skills_checked += 1
+            entry = skills_catalog.get(name)
+            if entry is None:
+                continue
+            latest = entry.get("version")
+            pkg_newer = bool(latest) and latest != m.version
+            catalog_hash = entry.get("manifest_hash")
+            installed_hash = skill_hashes.get(name)
+            manifest_changed = (bool(catalog_hash) and bool(installed_hash)
+                                and installed_hash != catalog_hash)
+            if not pkg_newer and not manifest_changed:
+                continue
+            reason = ("both" if (pkg_newer and manifest_changed)
+                      else ("package" if pkg_newer else "manifest"))
+            results[name] = {
+                "current": m.version,
+                "latest": latest if pkg_newer else m.version,
+                "registry": "skills-catalog", "package": name, "reason": reason,
+            }
+
+    return {"updates": results,
+            "checked": len(checks) + docker_checked + skills_checked}
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +573,11 @@ async def update_one(name: str) -> dict:
     async with catalog_install_registry.lock_for(name):
         # Re-read inside the lock in case a concurrent update just changed it.
         manifest = mcp_registry.get_manifest(name) or manifest
+        if manifest.category == "skill":
+            # Converge to the skills catalog (idempotent reinstall — the
+            # generic runtime-none path below would 400 on "no source").
+            from services.community import skills_installer
+            return await skills_installer.install_skill_package_from_catalog(name)
         if manifest.server.runtime == "docker":
             return await _update_docker_mcp(name)
         return await _update_node_python_mcp(name, manifest)
@@ -544,6 +600,11 @@ def community_targets() -> list:
     cloud = deployment.current_mode() == deployment.EXTERNAL_POOL
     out = []
     for m in mcp_registry.get_all_manifests().values():
+        # Skill packages update from the skills catalog on every tier (pure
+        # file converge — no docker/pool concerns).
+        if m.category == "skill":
+            out.append(m)
+            continue
         if m.category != "community":
             continue
         if cloud and m.server.runtime == "docker":

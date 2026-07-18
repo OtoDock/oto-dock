@@ -117,6 +117,11 @@ AGENTS_DIR = PLATFORM_DATA_DIR / "agents"  # persistent — overridable via PLAT
 # up here so they stay recoverable. Reaped after 7 days. Sibling of agents/ so it
 # sits OUTSIDE any agent tree (never manifested/synced).
 RECOVER_BIN_DIR = PLATFORM_DATA_DIR / "recover-bin"
+# Version-pinned document-preview snapshots (services/media/preview_snapshots.py):
+# proxy-private copies of a file as it was when a preview was pushed, so the
+# dashboard's "previous version" block shows trustworthy history. Sibling of
+# agents/ so no agent or satellite sync can reach or tamper with it.
+PREVIEW_SNAPSHOT_DIR = PLATFORM_DATA_DIR / "preview-snapshots"
 # Files larger than this are NOT backed up to the recover-bin (the delete /
 # overwrite still proceeds) — a safety net shouldn't copy huge build artifacts.
 RECOVER_BIN_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
@@ -734,21 +739,30 @@ def build_agent_prompt(model: str, *,
     except Exception:
         pass  # mcp_registry not yet initialized (startup race)
 
-    # Load MCP skills for this agent (from manifest-driven skill system)
+    # Load MCP skills for this agent (from manifest-driven skill system).
+    # The real client_type threads through so skill-level exclude_from
+    # (e.g. voiceover's ["phone"]) is honored — it was dead at this call
+    # site until 2026-07 (hardcoded "system_prompt" matched nothing).
     try:
         from services.mcp import mcp_registry
         skills = mcp_registry.get_skills_for_agent(
-            model, context="system_prompt",
+            model, context=client_type or "",
             is_remote=is_remote, target_has_display=target_has_display,
             target_device_grants=target_device_grants,
         )
-        if skills:
+        # Only "always" skills inline; "on_demand" skills reach CLI sessions
+        # as materialized skill folders (core/sandbox/skills_materializer)
+        # where the CLI's own progressive disclosure indexes them, and are
+        # deliberately absent on direct-llm (no Read tool to follow a body).
+        inline = [(sid, body) for sid, body, loading in skills
+                  if loading == "always"]
+        if inline:
             parts.append(
                 "\n\n---\n\n"
                 "# MCP Tool Skills\n\n"
                 "The following tool instructions are auto-loaded from active MCP servers.\n"
             )
-            for skill_id, content in skills:
+            for skill_id, content in inline:
                 parts.append(f"\n{content}")
     except Exception:
         pass  # mcp_registry not yet initialized (startup race)
@@ -1940,19 +1954,35 @@ AUDIOSOCKET_PUBLIC_HOST_AUTODETECTED = not _cfg("OTO_AUDIOSOCKET_PUBLIC_HOST")
 
 # Hosts allowed to embed the Collabora iframe (CSP frame-ancestors). Without
 # this, Collabora defaults to allowing only the WOPI host, which blocks the
-# dashboard origin in subdomain deployments. For same-domain sub-path setups
-# this is a no-op (browser auto-allows same origin). Default: derive from
-# DASHBOARD_PUBLIC_URL host so a single-domain install needs no extra config.
+# dashboard origin. Collabora sends the value as an explicit CSP source list,
+# which REPLACES the browser's same-origin default — and a CSP host-source
+# without a port matches only the scheme's default port, so the PORT must be
+# preserved (the standard install serves on :8400; hostname-only blocked every
+# sub-path preview there with "refused to connect"). Also feeds Collabora's
+# `server_name` (self-URL building + WS origin check), which equally needs the
+# non-default port. Default: host[:port] of DASHBOARD_PUBLIC_URL.
 def _default_frame_ancestors() -> str:
     if not DASHBOARD_PUBLIC_URL:
         return ""
     try:
         from urllib.parse import urlparse
-        return urlparse(DASHBOARD_PUBLIC_URL).hostname or ""
+        u = urlparse(DASHBOARD_PUBLIC_URL)
+        host = u.hostname or ""
+        return f"{host}:{u.port}" if host and u.port else host
     except Exception:
         return ""
 
 COLLABORA_FRAME_ANCESTORS = _cfg("COLLABORA_FRAME_ANCESTORS", _default_frame_ancestors())
+
+# Whether TLS terminates in front of Collabora (drives the scheme of its
+# origin check and generated self-URLs). Plain-http installs (LAN T1 on
+# :8400) need false or the WS origin check expects https and rejects the
+# editor socket. Derived from the DASHBOARD_PUBLIC_URL scheme, same rule the
+# T2 compose entrypoint applies.
+COLLABORA_SSL_TERMINATION = _cfg(
+    "COLLABORA_SSL_TERMINATION",
+    "true" if (DASHBOARD_PUBLIC_URL or "").strip().lower().startswith("https://") else "false",
+)
 
 # Path prefix Collabora is mounted under on the dashboard's domain. Empty for
 # subdomain deployments (e.g. https://collabora.example.com); set to e.g.

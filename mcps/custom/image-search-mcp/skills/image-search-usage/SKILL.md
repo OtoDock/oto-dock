@@ -1,3 +1,8 @@
+---
+name: image-search-usage
+description: Search the web for images with filters and download them. Use when you need stock photos, reference images, or product shots from the web.
+---
+
 ## Image Search Tools
 
 You have three image-related tools alongside the `display_images` tool from display-mcp:

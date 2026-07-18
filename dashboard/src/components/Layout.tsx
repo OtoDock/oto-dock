@@ -18,6 +18,7 @@ const navItems = [
   { path: '/admin/users', label: 'Users' },
   { path: '/admin/usage', label: 'Usage' },
   { path: '/admin/mcp-servers', label: 'MCP Servers' },
+  { path: '/admin/skills', label: 'Skills' },
   { path: '/admin/mcp-requests', label: 'MCP Requests', badge: 'pendingMcpRequests' as const },
   { path: '/admin/remote-machines', label: 'Remote Machines' },
 ]

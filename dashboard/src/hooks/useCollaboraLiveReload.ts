@@ -29,7 +29,9 @@ interface Args {
  *       unsaved edits, surface a manual "Reload" affordance instead of clobbering.
  *
  * Returns an `iframeRef` to attach to the <iframe>, a `reloadAvailable` flag for
- * the manual affordance, and `doReload` for its button.
+ * the manual affordance, `doReload` for its button, and `modifiedRef` — the
+ * doc's live dirty state, which DocumentPreview reads to flush unsaved edits
+ * (Action_Save) before swapping a superseded block to its frozen snapshot.
  */
 export function useCollaboraLiveReload({ fileId, agentSlug, relPath, reload }: Args) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
@@ -106,5 +108,5 @@ export function useCollaboraLiveReload({ fileId, agentSlug, relPath, reload }: A
     reload()
   }, [reload])
 
-  return { iframeRef, reloadAvailable, doReload }
+  return { iframeRef, reloadAvailable, doReload, modifiedRef }
 }

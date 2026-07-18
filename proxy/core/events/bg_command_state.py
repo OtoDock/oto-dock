@@ -49,8 +49,8 @@ class BackgroundCommandRegistry:
     ``task_notification`` backup) → :meth:`mark_done`. There is no hook path
     (unlike subagents), so completion is only observed while stdout is read.
 
-    Mirrors ``SubagentRegistry``'s wait/gate API so the task producer
-    (``wait_for_bg_commands``), the CLI ``settle`` loop, and the post-turn
+    Mirrors ``SubagentRegistry``'s wait/gate API so the task producer's
+    bounded review phase, the CLI ``settle`` loop, and the post-turn
     ``_bg_command_monitor`` can all drive it the same way they drive the
     subagent registry.
     """

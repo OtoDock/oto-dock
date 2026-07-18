@@ -85,10 +85,15 @@ _DISALLOWED_BUILTIN_TOOLS = [
     "mcp__claude_ai_Google_Calendar__complete_authentication",
     "mcp__claude_ai_Google_Drive__authenticate",
     "mcp__claude_ai_Google_Drive__complete_authentication",
-    # Claude Code's Skill tool writes to .claude/skills/ — a parallel memory
-    # path we don't want. The platform's memory-mcp handles persistent
-    # learnings via remember/forget + offline consolidation.
-    "Skill",
+    # "Skill" was denied here until 2026-07 ("parallel memory path"). It is
+    # now ALLOWED: platform-managed on-demand skills are materialized into
+    # .claude/skills/ (skills_materializer) and the Skill tool is their
+    # activation surface. The no-parallel-memory guarantee moved from tool
+    # denial to reconciliation — agent-written skill content is reverted /
+    # quarantined at every session start. Unmanaged skill SOURCES stay
+    # closed elsewhere: bundled CLI skills via
+    # CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1 (env_builder + satellite spawn),
+    # plugin skills via "enabledPlugins": {} below.
 ]
 
 
@@ -133,6 +138,15 @@ def _build_sandbox_cli_settings(sandbox_claude_dir: str) -> dict:
         # satellite reconciles the pinned version). Belt-and-braces with env
         # DISABLE_AUTOUPDATER=1 (env_builder).
         "autoUpdates": False,
+        # The platform is the only skill SOURCE: with
+        # the Skill tool allowed, plugin skills must not activate outside
+        # install/approval/version-pinning. This settings.json is rewritten
+        # every session start, so plugin enablement is platform-owned state —
+        # an explicit empty map keeps every plugin off. Live installs carry
+        # auto-installed marketplace trees under .claude/plugins/; those stay
+        # on disk (inert). VERIFY at dogfood: no plugin skills in the CLI's
+        # skills index (pre-impl checklist item 1, plan §checklist).
+        "enabledPlugins": {},
         "permissions": {
             "deny": list(_DISALLOWED_BUILTIN_TOOLS),
         },
@@ -251,6 +265,12 @@ def ensure_persistent_claude_dir(
     # interceptor wrap that spawn-time config still points at.
     _copy_hook_lf(_INTERCEPTOR_SRC, claude_dir / _INTERCEPTOR_SRC.name)
 
+    # Reconcile the platform-managed on-demand skills dir (fail-soft — a
+    # skills problem must never block a session start). See
+    # skills_materializer for the full protocol.
+    from core.sandbox.skills_materializer import materialize_skills_for_sandbox
+    materialize_skills_for_sandbox(agent_name, claude_dir)
+
     os.chmod(claude_dir, 0o700)
 
     logger.debug(
@@ -304,6 +324,12 @@ def ensure_persistent_codex_dir(
     # reachable inside the bwrap sandbox for the credential-broker fetch.
     # Unconditional so a missing source raises instead of silently skipping.
     _copy_hook_lf(_INTERCEPTOR_SRC, codex_dir / _INTERCEPTOR_SRC.name)
+
+    # Reconcile the platform-managed on-demand skills dir ($CODEX_HOME/skills;
+    # Codex's vendored .system builtins are never touched — dot-prefixed).
+    # Fail-soft; see skills_materializer for the full protocol.
+    from core.sandbox.skills_materializer import materialize_skills_for_sandbox
+    materialize_skills_for_sandbox(agent_name, codex_dir)
 
     os.chmod(codex_dir, 0o700)
 

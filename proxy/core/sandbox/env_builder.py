@@ -91,6 +91,13 @@ def build_session_env(
     # (core/sandbox/sandbox.py). See VERSIONS.md.
     env["DISABLE_AUTOUPDATER"] = "1"
 
+    # The platform is the only skill SOURCE: keep
+    # Claude Code's own bundled skills/workflows out of platform sessions —
+    # they ship outside our install/approval/version-pinning. Platform skills
+    # arrive via .claude/skills/ (skills_materializer). Mirrored on satellite
+    # CLI spawns (cli_session/pty_session).
+    env["CLAUDE_CODE_DISABLE_BUNDLED_SKILLS"] = "1"
+
     # Standard OTO_* platform env vars (incl. OTO_SESSION_ID) — community MCPs
     # read these for scope-aware paths without per-manifest declarations.
     from core.sandbox.oto_env import build_oto_env, resolve_memory_and_scope

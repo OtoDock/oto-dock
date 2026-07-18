@@ -2203,6 +2203,22 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # Append a timestamp so the iframe reloads on file changes (same token, new URL key)
     wopi_url_with_ts = f"{wopi_url}&_t={int(time.time())}"
 
+    chat_id = await resolve_hook_chat_id(req.session_id) or None
+
+    # Version-pinned snapshot: copy the file AS DELIVERED — right here, at
+    # push time, before the agent can touch it again — into the proxy-private
+    # snapshot cache. When a later push supersedes this preview, the dashboard
+    # swaps the old block to a view-only render of this copy ("previous
+    # version"). Best-effort: with no snapshot the superseded block degrades
+    # to the "preview moved" chip.
+    snapshot_id = ""
+    generation = int(time.time() * 1000)
+    if chat_id:
+        from services.media import preview_snapshots
+        snapshot_id = await asyncio.to_thread(
+            preview_snapshots.create_snapshot, chat_id, file_path,
+        ) or ""
+
     # Download token: durable media_tokens row (media_kind "file" →
     # attachment-forced by /v1/media's inline allowlist), so the preview's
     # download button survives restarts like the rest of the chat history.
@@ -2211,7 +2227,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         download_token,
         str(file_path),
         media_kind="file",
-        chat_id=await resolve_hook_chat_id(req.session_id) or None,
+        chat_id=chat_id,
         session_id=req.session_id,
         cache_owned=False,
         expires_at="",  # durable until the chat is deleted
@@ -2229,6 +2245,8 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         "filename": filename,
         "file_id": file_id,
         "download_url": download_url,
+        "snapshot_id": snapshot_id,
+        "generation": generation,
     })
 
     logger.info(f"Hook document-preview: session={req.session_id}, file={filename}")

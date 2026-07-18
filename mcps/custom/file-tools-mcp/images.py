@@ -14,8 +14,10 @@ from pathlib import Path
 import httpx
 
 from shared import (
+    HOOK_TIMEOUT,
     PROXY_URL,
     _current_session,
+    _dropped_note,
     _normalize_operations,
     _op_type,
     _notify_file_written,
@@ -113,7 +115,7 @@ async def handle_edit_image(args: dict) -> str:
     else:
         out = path
 
-    ops = _normalize_operations(args.get("operations"))
+    ops, dropped = _normalize_operations(args.get("operations"))
     if args.get("operations") and not ops:
         # A non-empty operations arg that normalizes to nothing means the
         # caller's shape was unusable (double-encoded string, bare strings,
@@ -819,7 +821,7 @@ async def handle_edit_image(args: dict) -> str:
     if PROXY_URL and session_id and auth:
         agents_rel = _to_agents_relative(out)
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
                 await client.post(
                     f"{PROXY_URL}/v1/hooks/file",
                     json={
@@ -835,6 +837,7 @@ async def handle_edit_image(args: dict) -> str:
 
     result = (f"Image saved: {_to_agents_relative(out)} "
               f"({img.width}x{img.height}, {len(ops)} operations applied)")
+    result += _dropped_note(dropped)
     if before_stats is not None:
         result += "\n" + _tone_check_line(before_stats, _tone_stats(img))
     return result

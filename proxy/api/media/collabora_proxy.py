@@ -222,6 +222,32 @@ async def proxy_collabora_http(path: str, request: Request):
     )
 
 
+def _upstream_connect_kwargs(
+    additional_headers: list | None,
+    forwarded_origin: str | None,
+    chosen_subproto: str | None,
+) -> dict:
+    """kwargs for the upstream Collabora websocket connect.
+
+    Tolerant keepalive: the library default (~20s ping timeout) tears the
+    tunnel down when Collabora stalls on a CPU-heavy recalculation (large
+    spreadsheets), killing the user's live preview. The tunnel must be the
+    tolerant link; the cost is slower detection of a genuinely dead upstream
+    (~145s worst case).
+    """
+    kwargs: dict = {
+        "max_size": None,
+        "additional_headers": additional_headers or None,
+        "ping_interval": 25,
+        "ping_timeout": 120,
+    }
+    if forwarded_origin:
+        kwargs["origin"] = forwarded_origin
+    if chosen_subproto:
+        kwargs["subprotocols"] = [chosen_subproto]
+    return kwargs
+
+
 @router.websocket("/collabora/{path:path}")
 async def proxy_collabora_ws(websocket: WebSocket, path: str):
     if not _is_subpath_mode():
@@ -266,14 +292,9 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
         additional_headers.append((_k, _v))
 
     try:
-        connect_kwargs = {
-            "max_size": None,
-            "additional_headers": additional_headers or None,
-        }
-        if forwarded_origin:
-            connect_kwargs["origin"] = forwarded_origin
-        if chosen_subproto:
-            connect_kwargs["subprotocols"] = [chosen_subproto]
+        connect_kwargs = _upstream_connect_kwargs(
+            additional_headers, forwarded_origin, chosen_subproto
+        )
         async with websockets.connect(upstream_url, **connect_kwargs) as upstream:
             async def client_to_upstream():
                 try:
@@ -307,6 +328,14 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                 upstream_to_client(),
                 return_exceptions=True,
             )
+            # Field diagnosis for "preview died by itself": record WHY the
+            # upstream document socket ended (1000/1001 = orderly; 1006/None =
+            # dropped, e.g. missed pongs under load or a container restart).
+            if upstream.close_code not in (1000, 1001):
+                logger.warning(
+                    f"Collabora WS upstream closed abnormally ({path}): "
+                    f"code={upstream.close_code} reason={upstream.close_reason!r}"
+                )
     except websockets.WebSocketException as e:
         logger.warning(f"Collabora WS upstream error ({path}): {e}")
     except Exception:

@@ -35,6 +35,10 @@ from services.mcp.mcp_manifest_types import (
     OutputRelocationDef,
     PathEnvDecl,
     PathEnvValueRef,
+    SKILL_ID_MAX_LEN,
+    SKILL_ID_RE,
+    SKILL_LOADING_DEFAULT,
+    VALID_SKILL_LOADING,
     SandboxMountDef,
     ServerConfig,
     SkillDef,
@@ -706,14 +710,36 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
             user_overridable=cf.get("user_overridable", False),
         ))
 
-    # Skills
+    # Skills. Fail closed per-skill, not per-manifest: a bad skill entry is
+    # dropped with a warning (its id would become a filesystem path component
+    # at materialization) while the MCP's tools keep working. The community
+    # installers additionally hard-reject packages with invalid skill entries
+    # at install time, where a human sees the error.
     skills = []
     for sk in data.get("skills", []):
+        skill_id = sk["id"]
+        if not SKILL_ID_RE.fullmatch(skill_id) or len(skill_id) > SKILL_ID_MAX_LEN:
+            logger.warning(
+                "%s: skill id %r is not a valid skill name (lowercase alnum "
+                "+ single hyphens, max %d chars) — skill dropped",
+                data.get("name", mcp_dir.name), skill_id, SKILL_ID_MAX_LEN,
+            )
+            continue
+        loading = sk.get("loading", SKILL_LOADING_DEFAULT)
+        if loading not in VALID_SKILL_LOADING:
+            logger.warning(
+                "%s: skill %r has invalid loading %r (expected one of %s) — "
+                "using %r",
+                data.get("name", mcp_dir.name), skill_id, loading,
+                sorted(VALID_SKILL_LOADING), SKILL_LOADING_DEFAULT,
+            )
+            loading = SKILL_LOADING_DEFAULT
         skills.append(SkillDef(
-            id=sk["id"],
+            id=skill_id,
             file=sk["file"],
             description=sk.get("description", ""),
             default_exclude_from=sk.get("default_exclude_from", []),
+            loading=loading,
         ))
 
     # System-level package dependencies (optional). Used by the installer

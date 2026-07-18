@@ -33,6 +33,7 @@
   "skills": [
     {
       "id": "meetings",
+      "loading": "always",
       "file": "skills/meetings.md",
       "description": "When and how to use multi-agent meetings for collaborative problem-solving",
       "default_exclude_from": ["phone", "terminal"]

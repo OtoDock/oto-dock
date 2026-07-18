@@ -77,7 +77,7 @@ class TestMidTurnReattach:
                     "context_max": 0, "cache_read": 0, "cache_write": 0,
                     "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL,
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
                 })
                 assert [(m["role"], m["content"])
                         for m in history["messages"]] == [

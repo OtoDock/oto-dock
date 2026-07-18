@@ -230,19 +230,51 @@ async def upload_file(
     logger.info(f"File uploaded: {rel_path} ({total_bytes} bytes) by user={user.sub[:16]}...")
 
     # If any active session for this agent runs on a remote satellite, push
-    # the upload over so the agent CLI can see it. Best-effort — failure
-    # doesn't block the upload response (the file still exists on the
-    # platform side and end-of-turn manifest sync will catch it eventually).
-    try:
-        await _push_upload_to_active_remote_sessions(agent, rel_path, target)
-    except Exception:
-        logger.exception("Failed to push upload to remote sessions: %s", rel_path)
+    # the upload over so the agent CLI can see it — in the BACKGROUND, so
+    # the response (and the dashboard's workspace listing, which reads the
+    # platform dir) doesn't stall for the length of a WAN transfer. A prompt
+    # referencing the file can't outrun the push: the remote turn dispatch
+    # barriers on in-flight pushes (``core/remote/upload_inflight``).
+    # Best-effort like the old synchronous push — on failure the periodic
+    # fingerprint sweep / next session-start sync reconciles.
+    _schedule_upload_push(agent, rel_path, target)
 
     return {
         "path": rel_path,
         "filename": target.name,
         "size": total_bytes,
     }
+
+
+def _schedule_upload_push(agent_slug: str, rel_path: str, host_path: Path) -> None:
+    """Background ``_push_upload_to_active_remote_sessions`` for a fresh
+    upload, registered with the turn-start barrier
+    (``core/remote/upload_inflight``). Never raises, never blocks.
+
+    The cheap in-memory candidate gate runs HERE (synchronously) so
+    local-only installs — no connected satellite — schedule nothing at all.
+    """
+    try:
+        from services.remote import workspace_fanout
+        if not workspace_fanout.has_fanout_candidates(
+            agent_slug, rel_path, include_idle=True,
+        ):
+            return
+        from core.remote import upload_inflight
+
+        async def _push() -> None:
+            try:
+                await _push_upload_to_active_remote_sessions(
+                    agent_slug, rel_path, host_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to push upload to remote sessions: %s", rel_path,
+                )
+
+        upload_inflight.track(agent_slug, _push())
+    except Exception:
+        logger.exception("Failed to schedule upload push: %s", rel_path)
 
 
 async def _push_upload_to_active_remote_sessions(
@@ -254,9 +286,16 @@ async def _push_upload_to_active_remote_sessions(
     Routes through ``services/remote/workspace_fanout`` so per-user / per-role isolation
     applies: an upload under ``users/{alice}/`` only reaches machines whose active
     session may actually see it — not every machine running the agent (fixes the
-    historical "push to every machine" leak). This same helper is also called by
-    the ws/dashboard "Take Photo / Upload Photo" path, so both surfaces are fixed
-    here. No-op when no allowed remote session is active.
+    historical "push to every machine" leak). No-op when no allowed remote
+    session is active.
+
+    Callers split by how they wait:
+      * ``/v1/upload`` runs this in the BACKGROUND via ``_schedule_upload_push``
+        (the remote turn dispatch barriers on it — ``core/remote/upload_inflight``);
+      * the ws/dashboard "Take Photo / Upload Photo" path and the hook-side
+        artifact writes (``api/hooks/hooks.py``) AWAIT it — they run inside a
+        message send / agent turn where the file must be on the machine before
+        the very next step reads it.
     """
     from services.remote import workspace_fanout
     if not workspace_fanout.has_fanout_candidates(agent_slug, rel_path, include_idle=True):

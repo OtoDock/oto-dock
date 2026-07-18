@@ -69,11 +69,14 @@ def create_request(
     requested_by: str,
     reason: str = "",
     batch_id: str | None = None,
+    kind: str = "mcp",
 ) -> dict:
     """Create a new pending request. Caller must check no open request exists.
 
     Args:
-        mcp_name: catalog MCP slug.
+        mcp_name: catalog slug (an MCP or, with ``kind="skill"``, a skill
+            package — the endpoint validates against the matching catalog
+            and approval dispatches to the matching installer).
         agent_slug: target agent.
         requested_by: requester's user_sub.
         reason: optional human justification surfaced on the admin Requests
@@ -96,8 +99,8 @@ def create_request(
                 """WITH inserted AS (
                     INSERT INTO mcp_assignment_requests
                     (mcp_name, agent_slug, requested_by, reason, batch_id,
-                     status, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s)
+                     kind, status, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s)
                     RETURNING *
                 )
                 SELECT i.*,
@@ -108,7 +111,7 @@ def create_request(
                 FROM inserted i
                 LEFT JOIN users ru ON ru.sub = i.requested_by""",
                 (mcp_name, agent_slug, requested_by, reason or "", batch_id,
-                 now, now),
+                 kind, now, now),
             ).fetchone()
             return dict(row)
         except Exception as exc:

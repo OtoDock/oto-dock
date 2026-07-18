@@ -7,12 +7,39 @@ search & replace, table manipulation, and mixed-formatting paragraphs.
 
 from pathlib import Path
 
-from shared import _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
+from equations import OMML_NS, latex_to_omml_element, omml_to_latex
+from shared import _dropped_note, _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
 
 
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
+
+
+def _para_text_with_math(para) -> str:
+    """Paragraph text with embedded OMML equations rendered as LaTeX.
+
+    para.text silently drops math — an equation-bearing document would read
+    as if the equations didn't exist. Only used when the paragraph actually
+    contains math, so plain paragraphs keep python-docx's own extraction.
+    """
+    from docx.oxml.ns import qn
+
+    m = f"{{{OMML_NS}}}"
+    parts: list[str] = []
+    for child in para._p.iterchildren():
+        if child.tag == qn("w:r"):
+            parts.append("".join(t.text or "" for t in child.findall(qn("w:t"))))
+        elif child.tag == m + "oMath":
+            latex = omml_to_latex(child)
+            parts.append(f"${latex}$" if latex else "[equation]")
+        elif child.tag == m + "oMathPara":
+            for om in child.findall(m + "oMath"):
+                latex = omml_to_latex(om)
+                parts.append(f"$${latex}$$" if latex else "[equation]")
+        elif child.tag == qn("w:hyperlink"):
+            parts.append("".join(t.text or "" for t in child.findall(f".//{qn('w:t')}")))
+    return "".join(parts).strip()
 
 
 def read_docx(path: str) -> str:
@@ -108,13 +135,17 @@ def read_docx(path: str) -> str:
 
     # Body content
     result.append("**Body**:")
+    math_tag = f".//{{{OMML_NS}}}oMath"
     for para in doc.paragraphs:
         style = para.style.name if para.style else ""
         prefix = ""
         if "Heading" in style:
             level = style.replace("Heading", "").strip() or "1"
             prefix = "#" * int(level) + " "
-        text = para.text.strip()
+        if para._p.find(math_tag) is not None:
+            text = _para_text_with_math(para)
+        else:
+            text = para.text.strip()
         if text:
             result.append(f"{prefix}{text}")
 
@@ -356,7 +387,7 @@ async def handle_write_docx(args: dict) -> str:
     from docx.shared import Inches, Pt, RGBColor
 
     path = _resolve_path(args["path"], writing=True)
-    ops = _normalize_operations(args.get("operations"))
+    ops, dropped = _normalize_operations(args.get("operations"))
     create_new = args.get("create_new", False)
 
     if Path(path).exists() and not create_new:
@@ -385,14 +416,26 @@ async def handle_write_docx(args: dict) -> str:
                 doc.add_heading(op["text"], level=int(op.get("level", 1)))
 
             elif ot == "add_paragraph":
-                p = doc.add_paragraph()
-                # Support mixed-formatting runs array
+                # Support mixed-formatting runs array. Equations convert up
+                # front so a bad one fails the op before the paragraph exists
+                # (no half-built paragraph left in the doc).
                 runs_data = op.get("runs")
                 if runs_data and isinstance(runs_data, list):
-                    for rd in runs_data:
+                    converted = [
+                        latex_to_omml_element(rd["equation"], display=False)
+                        if rd.get("equation") else None
+                        for rd in runs_data
+                    ]
+                    p = doc.add_paragraph()
+                    for rd, omath in zip(runs_data, converted):
+                        if omath is not None:
+                            # Inline math run — native OMML among the text runs
+                            p._p.append(omath)
+                            continue
                         run = p.add_run(rd.get("text", ""))
                         _apply_run_format(run, rd)
                 else:
+                    p = doc.add_paragraph()
                     run = p.add_run(op.get("text", ""))
                     _apply_run_format(run, op)
 
@@ -400,6 +443,17 @@ async def handle_write_docx(args: dict) -> str:
                     p.alignment = align_map[op["alignment"]]
                 for _w in _apply_paragraph_spacing(p, op):
                     errors.append(f"Op #{idx} {ot}: {_w}")
+
+            elif ot == "add_equation":
+                latex = op.get("latex") or op.get("equation") or ""
+                omath = latex_to_omml_element(latex, display=True)
+                p = doc.add_paragraph()
+                omp = omath.makeelement(f"{{{OMML_NS}}}oMathPara", None, None)
+                omp.append(omath)
+                p._p.append(omp)
+                align = op.get("alignment", "center")
+                if align in align_map:
+                    p.alignment = align_map[align]
 
             elif ot == "insert_paragraph":
                 index = int(op.get("index", 0))
@@ -880,6 +934,7 @@ async def handle_write_docx(args: dict) -> str:
     await _push_preview(path)
 
     msg = f"Document saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
+    msg += _dropped_note(dropped)
     if errors:
         msg += f"\n\nWarnings/Errors ({len(errors)}):\n" + "\n".join(f"  - {e}" for e in errors)
     return msg

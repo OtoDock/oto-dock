@@ -91,12 +91,19 @@ def is_mcp_state_empty() -> bool:
         return row["cnt"] == 0
 
 
-def delete_mcp_all_data(mcp_name: str) -> None:
-    """Remove all DB data for an MCP: state, agent assignments, skills, config, instances."""
+def delete_mcp_all_data(mcp_name: str, skill_ids: list[str] | None = None) -> None:
+    """Remove all DB data for an MCP: state, agent assignments, skills, config, instances.
+
+    ``skill_ids`` are the manifest's declared skill ids — skill ids are BARE
+    identifiers (``voiceover``, ``frontend-design``), not namespaced by the
+    provider, so the caller must pass them for the ``agent_skills`` rows to
+    be cleaned up (the provider name never appears in ``skill_id``).
+    """
     with get_conn() as conn:
         conn.execute("DELETE FROM mcp_state WHERE name = %s", (mcp_name,))
         conn.execute("DELETE FROM agent_mcps WHERE mcp_name = %s", (mcp_name,))
-        conn.execute("DELETE FROM agent_skills WHERE skill_id LIKE %s", (f"{mcp_name}/%",))
+        for sid in skill_ids or []:
+            conn.execute("DELETE FROM agent_skills WHERE skill_id = %s", (sid,))
         conn.execute("DELETE FROM mcp_config_values WHERE mcp_name = %s", (mcp_name,))
         conn.execute("DELETE FROM mcp_instances WHERE mcp_name = %s", (mcp_name,))
         conn.commit()

@@ -36,7 +36,7 @@ export type MessageBlock =
   | { type: 'ui'; token: string; uiUrl: string; title?: string; height?: number; path?: string }
   | { type: 'artifact_interaction'; token: string; title?: string; payload?: unknown }
   | { type: 'app_action'; appId: string; slug?: string; title?: string; actionId: string; label?: string; prompt?: string }
-  | { type: 'document_preview'; wopiUrl: string; filename: string; fileId: string; downloadUrl: string; dbMessageId?: number }
+  | { type: 'document_preview'; wopiUrl: string; filename: string; fileId: string; downloadUrl: string; dbMessageId?: number; snapshotId?: string; generation?: number }
   | { type: 'metadata'; costUsd: number; durationMs: number }
 
 export interface DisplayMessage {

@@ -614,8 +614,11 @@ class _FakeEchoLayer:
     async def wait_for_bg_subagents(self, sid, timeout=120.0):
         return
 
-    async def wait_for_bg_commands(self, sid, timeout=120.0):
-        return
+    async def drain_bg_commands(self, sid, *, budget=2.0):
+        return False
+
+    async def is_session_alive(self, sid):
+        return True
 
     async def prepare_resume(self, sid):
         return

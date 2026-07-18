@@ -8,6 +8,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { useAuth } from '../contexts/AuthContext'
 
 export interface CommunityAgentRegistryEntry {
   slug: string
@@ -133,6 +134,7 @@ export interface InstallFromCommunityResult {
  */
 export function useInstallCommunityAgent() {
   const qc = useQueryClient()
+  const { refreshUser } = useAuth()
   return useMutation<
     InstallFromCommunityResult,
     Error,
@@ -166,6 +168,12 @@ export function useInstallCommunityAgent() {
       qc.invalidateQueries({ queryKey: ['community-agents'] })
       qc.invalidateQueries({ queryKey: ['agents'] })
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
+      // Installing a template assigns the installer as the new agent's
+      // manager server-side — refresh the auth snapshot so
+      // `user.agent_roles`-driven views (Remote Machines settings tab,
+      // role gates) show the new agent without a page reload. Mirrors
+      // `useCreateAgent` in `./agents.ts`.
+      void refreshUser()
     },
   })
 }

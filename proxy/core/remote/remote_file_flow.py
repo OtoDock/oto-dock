@@ -147,6 +147,76 @@ def _host_cache_paths(
     return cache_dir / basename, cache_dir / "_meta.json"
 
 
+# --- Pull-stat revalidation (satellite ≥ 0.5.95) ---------------------------
+#
+# Both pull paths historically re-transferred the FULL file on every call —
+# correct, but over a WAN/tunnel link every repeated read of the same
+# unchanged document costs seconds. With a new-enough satellite we probe
+# (size, mtime_ns) via the cheap `file_stat` RPC and serve the cached copy
+# when it matches the stat RECORDED AT PULL TIME. Both values come from the
+# satellite's own clock/filesystem, so no cross-host clock skew is involved.
+#
+# Fail-open to the transfer, never to staleness: any doubt — old satellite,
+# probe timeout, policy reject, no recorded stat, mismatch, missing cache
+# file — falls through to the full pull (the pre-existing behavior). The
+# recorded stat is the PRE-pull probe, so a file that changes mid-pull
+# mismatches on the next read and re-pulls (wasteful once, never wrong).
+# Writes invalidate: push_back drops the record, so a read after a write
+# re-pulls (phase 2 — stat-enriched push acks — can tighten that).
+
+# Agent-tree records: (machine_id, agent_slug, rel_path) → stat dict.
+# In-memory (lost on restart → first read re-pulls, correct); bounded.
+_pull_stat_records: dict[tuple[str, str, str], dict] = {}
+_PULL_STAT_RECORDS_MAX = 4096
+
+
+def _stats_match(recorded: dict | None, fresh: dict | None) -> bool:
+    """Exact-match gate for the cache fast path."""
+    return (
+        isinstance(recorded, dict)
+        and isinstance(fresh, dict)
+        and bool(fresh.get("exists"))
+        and recorded.get("size") == fresh.get("size")
+        and recorded.get("mtime_ns") == fresh.get("mtime_ns")
+        and recorded.get("size") is not None
+        and recorded.get("mtime_ns") is not None
+    )
+
+
+async def _probe_stat(cm, machine_id: str, ref, agent_slug: str = "") -> dict | None:
+    """Version-gated `file_stat` probe; None = don't trust the cache.
+
+    Strictly best-effort: ANY failure (old satellite, timeout, disconnect,
+    or a bug in the probe path itself) returns None and the caller does the
+    full pull — the probe must never be able to break a read."""
+    try:
+        if not cm.satellite_supports_file_stat(machine_id):
+            return None
+        res = await cm.stat_file(machine_id, ref, agent_slug=agent_slug)
+        # Type-gate the reply: callers `.get()` it, JSON-serialize it into
+        # the cache sidecar, and store it in `_pull_stat_records` — anything
+        # that isn't a plain dict (malformed ack, test double) must degrade
+        # to "no probe" instead of breaking the read downstream.
+        return res if isinstance(res, dict) else None
+    except Exception as e:
+        logger.debug("file_stat probe failed (%s) — falling back to pull", e)
+        return None
+
+
+def _record_agent_stat(key: tuple[str, str, str], stat: dict) -> None:
+    if len(_pull_stat_records) >= _PULL_STAT_RECORDS_MAX:
+        _pull_stat_records.pop(next(iter(_pull_stat_records)))
+    _pull_stat_records[key] = stat
+
+
+def _drop_agent_stat_all(agent_slug: str, rel_path: str) -> None:
+    """Invalidate records for this file on EVERY machine (push fan-out
+    rewrites the file on all satellites running the agent)."""
+    for k in [k for k in _pull_stat_records
+              if k[1] == agent_slug and k[2] == rel_path]:
+        _pull_stat_records.pop(k, None)
+
+
 def is_host_cache_path(host_path: str) -> bool:
     """Does ``host_path`` live in the satellite-host cache subtree?"""
     root = str(_host_cache_root())
@@ -174,20 +244,33 @@ async def pull_through_host_path(
         from core.remote.satellite_connection import get_connection_manager
         from services.path_policy_v2 import PathRef
         cm = get_connection_manager()
-        ok = await cm.pull_file_to_path(
-            info.machine_id, PathRef("satellite_host", abs_path), cache_path,
-        )
+        ref = PathRef("satellite_host", abs_path)
+
+        # Revalidation fast path: cached copy + recorded pull-time stat +
+        # matching fresh probe → skip the transfer entirely.
+        fresh = await _probe_stat(cm, info.machine_id, ref)
+        if fresh is not None and cache_path.is_file():
+            try:
+                recorded = json.loads(sidecar.read_text()).get("stat")
+            except (OSError, json.JSONDecodeError):
+                recorded = None
+            if _stats_match(recorded, fresh):
+                return cache_path
+
+        ok = await cm.pull_file_to_path(info.machine_id, ref, cache_path)
         if not ok:
             return None
         # The file itself was already committed atomically (.partial + fsync
         # + rename) by pull_file_to_path. Write the sidecar metadata so a
-        # later push-back targets the original abs_path. Sidecar still uses
+        # later push-back targets the original abs_path — plus the PRE-pull
+        # stat for the next read's revalidation (absent when the probe was
+        # unavailable → next read pulls, today's behavior). Sidecar still uses
         # explicit str+`.partial` (not with_suffix) for dot-file edge cases.
+        meta = {"machine_id": info.machine_id, "abs_path": abs_path}
+        if fresh is not None and fresh.get("exists"):
+            meta["stat"] = fresh
         sidecar_partial = Path(str(sidecar) + ".partial")
-        sidecar_partial.write_text(json.dumps({
-            "machine_id": info.machine_id,
-            "abs_path": abs_path,
-        }))
+        sidecar_partial.write_text(json.dumps(meta))
         sidecar_partial.replace(sidecar)
         return cache_path
 
@@ -224,9 +307,24 @@ async def push_back_host_path(session_id: str, cache_path: str) -> bool:
         from core.remote.satellite_connection import get_connection_manager
         from services.path_policy_v2 import PathRef
         cm = get_connection_manager()
-        return await cm.push_file(
+        ok = await cm.push_file(
             machine_id, PathRef("satellite_host", abs_path), content,
         )
+        if ok and "stat" in meta:
+            # The write changed the satellite file's mtime — the recorded
+            # pull-time stat is stale. Invalidate it so the next read
+            # re-pulls instead of fast-pathing onto a pre-write comparison.
+            meta.pop("stat", None)
+            try:
+                sp = Path(str(sidecar) + ".partial")
+                sp.write_text(json.dumps(meta))
+                sp.replace(sidecar)
+            except OSError as e:
+                logger.warning(
+                    "push_back_host_path: sidecar stat invalidation failed "
+                    "for %s: %s", cache_path, e,
+                )
+        return ok
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +526,35 @@ async def pull_through(session_id: str, rel_path: str) -> Path | None:
         from core.remote.satellite_connection import get_connection_manager
         cm = get_connection_manager()
         from services.path_policy_v2 import PathRef
+        ref = PathRef("agent_tree", rel_path)
+
+        # Revalidation fast path (satellite ≥ 0.5.95): the workspace copy +
+        # the stat recorded at the last pull + a matching fresh probe → the
+        # satellite file hasn't changed, serve the workspace copy without
+        # re-transferring it.
+        key = (info.machine_id, info.agent_name, rel_path)
+        fresh = await _probe_stat(cm, info.machine_id, ref,
+                                  agent_slug=info.agent_name)
+        if (fresh is not None and host_path.is_file()
+                and _stats_match(_pull_stat_records.get(key), fresh)):
+            return host_path
+
         ok = await cm.pull_file_to_path(
             info.machine_id,
-            PathRef("agent_tree", rel_path),
+            ref,
             host_path,
             agent_slug=info.agent_name,
         )
-        return host_path if ok else None
+        if not ok:
+            return None
+        # Record the PRE-pull probe for the next read's revalidation; a probe
+        # that was unavailable leaves no record (next read pulls — the
+        # pre-0.5.95 behavior).
+        if fresh is not None and fresh.get("exists"):
+            _record_agent_stat(key, fresh)
+        else:
+            _pull_stat_records.pop(key, None)
+        return host_path
 
 
 async def push_back(session_id: str, rel_path: str) -> bool:
@@ -492,6 +612,13 @@ async def push_back(session_id: str, rel_path: str) -> bool:
                 content,
                 agent_slug=info.agent_name,
             )
+            if ok:
+                # The write changed the file on the satellite (and the
+                # fan-out below rewrites it on every other machine) — the
+                # pull-time stats are stale on all of them. Invalidate so
+                # the next read re-pulls instead of fast-pathing onto a
+                # pre-write comparison.
+                _drop_agent_stat_all(info.agent_name, rel_path)
 
             # Cross-satellite fan-out. The push above reaches
             # the session's OWN satellite; propagate the same bytes to every

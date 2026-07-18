@@ -39,7 +39,12 @@ services:
       #     The reverse proxy passes through the full path; Collabora generates
       #     its WS / cool.html links with this prefix. Empty for subdomain
       #     setups (e.g. https://collabora.example.com).
-      - "extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true"
+      #   --o:ssl.termination=${COLLABORA_SSL_TERMINATION} — scheme of the WS
+      #     origin check + self-URLs; auto-derived by the proxy from the
+      #     DASHBOARD_PUBLIC_URL scheme (plain-http installs need false).
+      #   --o:per_document.idle_timeout_secs=7200 — viewing a document sends no
+      #     traffic; the stock 3600 unloads it mid-read and the preview dies.
+      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-true} --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200"
     # `host.docker.internal` resolves to the Linux host gateway so Collabora's
     # WOPI callbacks can reach the proxy when the proxy runs on the bare-metal
     # host (the bare-metal default — `WOPI_BASE_URL` auto-derives to
