@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 OtoDock uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each
 release's entry is also published as its [GitHub Release](https://github.com/OtoDock/oto-dock/releases).
 
-Upgrading is `docker compose pull && docker compose up -d`. Anything that
+Upgrading is `git pull`, then `docker compose pull && docker compose up -d` —
+the compose file pins each release's image version, so pulling the repo is what
+moves an install to the new release. Anything that
 changes the behaviour of a running install — a config key, a schema migration, a
 changed default — is called out explicitly under its version.
 
