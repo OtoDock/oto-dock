@@ -109,6 +109,18 @@ def test_reaper_leash_pending_subagents(temp_db):
     assert _idle_session_has_pending_work(sid, now, 900.0) is False
 
 
+def test_reaper_leash_fresh_boot_no_hook_activity(temp_db):
+    """The 0 that get_hook_activity returns for a hook-less session must not
+    read as 'active at boot': with now < idle_timeout (a host up less than
+    the timeout — every fresh CI VM and freshly booted server),
+    `now - 0 <= idle_timeout` held the leash and suppressed reaping."""
+    from core.remote.remote_execution import _idle_session_has_pending_work
+    from core.session.session_state import reset_subagent_registry
+    sid = "leash-sess-fresh-boot"
+    reset_subagent_registry(sid)
+    assert _idle_session_has_pending_work(sid, 300.0, 900.0) is False
+
+
 def test_reaper_leash_recent_hook_activity(temp_db, monkeypatch):
     from core.remote import remote_execution as rex
     from core.session import session_state

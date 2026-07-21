@@ -2365,7 +2365,12 @@ def _idle_session_has_pending_work(
         get_hook_activity, get_subagent_registry,
     )
     last_hook = get_hook_activity(sid)
-    if last_hook is not None and now - last_hook <= idle_timeout:
+    # Truthiness, not `is not None`: get_hook_activity returns 0 for a
+    # session that never fired a hook, and `now - 0 <= idle_timeout` is
+    # true for the first idle_timeout seconds after HOST boot (monotonic
+    # starts near 0) — which suppressed reaping on freshly booted servers.
+    # The local reaper (cli/session.py) guards the same way.
+    if last_hook and now - last_hook <= idle_timeout:
         return True
     return get_subagent_registry(sid).has_pending
 
