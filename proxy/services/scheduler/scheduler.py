@@ -2269,7 +2269,6 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             #    a pre-turn failure still shows the prompt and is visible in
             #    TaskRunView instead of "No messages yet." General task robustness:
             #    applies to every task type (scheduled / one-time / delegate).
-            user_sub = task.created_by if task.scope == "user" else f"task::{task.agent}"
             if task.target_chat_id:
                 # Worker chat (surface="chat") — the spawn path created the row
                 # with owner/origin/parent stamped. A missing row means the

@@ -4,6 +4,7 @@ Uses psycopg3 sync pool. All storage functions remain synchronous
 (called via asyncio.to_thread from async code).
 """
 
+import contextlib
 import os
 import threading
 
@@ -66,7 +67,5 @@ def close_pool(timeout: float = 3.0) -> None:
     with _pool_lock:
         pool, _pool = _pool, None
     if pool is not None:
-        try:
+        with contextlib.suppress(Exception):
             pool.close(timeout=timeout)
-        except Exception:
-            pass

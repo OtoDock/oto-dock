@@ -57,7 +57,7 @@ def _bind(session_id, sub_id, monkeypatch, calls):
         lambda *a, **k: None)
     monkeypatch.setattr(
         pool.subscription_store, "decrement_active_sessions",
-        lambda sub: calls.append(sub))
+        calls.append)
     pool.bind_session(session_id, sub_id)
 
 
@@ -132,7 +132,7 @@ async def test_delete_chat_closes_remote_session(monkeypatch):
     closed: list[str] = []
     remote = MagicMock()
     remote._sessions = {"sess-del-1": object()}
-    remote.close_session = AsyncMock(side_effect=lambda s: closed.append(s))
+    remote.close_session = AsyncMock(side_effect=closed.append)
     monkeypatch.setattr(session_manager, "_remote_layer", remote)
 
     await chats_mod._close_chat_session(

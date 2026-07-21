@@ -11,6 +11,7 @@ Environment variables (set by core/sandbox/env_builder.py in the CLI's subproces
   OTO_SESSION_ID - session UUID for this conversation
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -187,10 +188,9 @@ def main():
                 "Content-Type": "application/json",
             },
         )
-        try:
+        # memory feed is best-effort — never surface hook errors
+        with contextlib.suppress(Exception):
             urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass  # memory feed is best-effort — never surface hook errors
         return
 
     tool_name = inp.get("tool_name", "")

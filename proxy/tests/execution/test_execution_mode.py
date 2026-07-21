@@ -77,8 +77,7 @@ def test_kill_switch_unset_defaults_on(monkeypatch):
     # an explicit "0" (an admin who turned it off) stays off.
     from storage import database
     store = {}
-    monkeypatch.setattr(database, "get_platform_setting",
-                       lambda key: store.get(key))
+    monkeypatch.setattr(database, "get_platform_setting", store.get)
     assert em.is_interactive_enabled() is True
     store[em.KILL_SWITCH_KEY] = "0"
     assert em.is_interactive_enabled() is False
