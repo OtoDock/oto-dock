@@ -14,6 +14,19 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-07-21
+
+### Fixed
+
+- The Remote Machines settings tab no longer appears after a fresh login on
+  builds that ship without the remote-machines feature. Every login response
+  (password, 2FA, passkey, OAuth, account creation) now carries the same
+  feature flags as `/auth/me`, so the dashboard sees the correct feature
+  state immediately instead of only after a page reload.
+- Idle session cleanup works from the moment the server boots: sessions
+  with no recorded activity were mistakenly held open for the first
+  15 minutes after a host restart.
+
 ## [1.3.0] — 2026-07-21
 
 > **Upgrade note (Docker installs from before 1.2.0):** the compose file now
@@ -294,7 +307,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/OtoDock/oto-dock/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/OtoDock/oto-dock/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/OtoDock/oto-dock/compare/v1.1.0...v1.1.1

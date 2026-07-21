@@ -25,7 +25,7 @@ from auth.rate_limiter import check_ip_rate_limit, clear_rate_limit, hit as rate
 from auth.totp import consume_2fa_session_token, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, validate_2fa_session_token, verify_recovery_code, verify_totp
 from storage import database as task_store
 
-from api.auth._common import _build_user_response
+from api.auth._common import _build_user_response, build_feature_flags
 from api.auth._router import router
 
 logger = logging.getLogger("claude-proxy")
@@ -529,22 +529,10 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
 
     # Surface user-facing feature flags so the dashboard can hide
     # the Remote Machines section when the admin has disabled the feature
-    # (or the build ships without it entirely).
-    allow_user_paired = await asyncio.to_thread(
-        task_store.get_platform_setting, "allow_user_paired_machines",
-    )
-    from ws.satellite import satellite_source_available
-    from core import execution_mode
-    interactive_enabled = await asyncio.to_thread(
-        execution_mode.is_interactive_enabled,
-    )
-    feature_flags = {
-        "allow_user_paired_machines": (allow_user_paired or "") != "0",
-        "remote_machines_available": satellite_source_available(),
-        # Mirrors the global interactive kill-switch so the dashboard hides
-        # the interactive-terminal toggles when sessions always run headless.
-        "interactive_terminal_enabled": interactive_enabled,
-    }
+    # (or the build ships without it entirely). Shared with every login
+    # payload via _common.build_feature_flags — the flags must be identical
+    # on every path the dashboard stores as its user object.
+    feature_flags = await asyncio.to_thread(build_feature_flags)
 
     return {
         "user": {
