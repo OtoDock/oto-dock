@@ -5,6 +5,7 @@ Enhanced reader with document properties, sections, headers/footers, hyperlinks.
 search & replace, table manipulation, and mixed-formatting paragraphs.
 """
 
+import contextlib
 from pathlib import Path
 
 from equations import OMML_NS, latex_to_omml_element, omml_to_latex
@@ -331,7 +332,6 @@ def _search_replace_in_paragraph(paragraph, find: str, replace: str,
     # Try simple case first: text in a single run
     count = 0
     for run in paragraph.runs:
-        run_text = run.text if match_case else run.text.lower()
         if check_find in (run.text if match_case else run.text.lower()):
             if match_case:
                 run.text = run.text.replace(find, replace)
@@ -530,10 +530,8 @@ async def handle_write_docx(args: dict) -> str:
                 rows = op.get("rows", [])
                 style = op.get("style", "Table Grid")
                 table = doc.add_table(rows=1 + len(rows), cols=len(headers))
-                try:
+                with contextlib.suppress(Exception):
                     table.style = style
-                except Exception:
-                    pass
                 for i, h in enumerate(headers):
                     table.rows[0].cells[i].text = str(h)
                 for ri, row in enumerate(rows):
@@ -677,7 +675,7 @@ async def handle_write_docx(args: dict) -> str:
                 )
                 width = Inches(float(op.get("width_inches", 4.0)))
                 height = Inches(float(op["height_inches"])) if op.get("height_inches") else None
-                pic = doc.add_picture(img_path, width=width, height=height)
+                doc.add_picture(img_path, width=width, height=height)
                 # Center image if requested
                 alignment = op.get("alignment")
                 if alignment and alignment in align_map:

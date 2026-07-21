@@ -109,6 +109,7 @@ _session_codex_dirs: dict[str, dict] = {}
 # maps) lives in location_bridge.py; re-exported so `from core.session.session_state
 # import wait_for_location` (api/hooks) and `resolve_location` (ws/dashboard) work.
 from core.session.location_bridge import wait_for_location, resolve_location  # noqa: F401
+import contextlib
 
 # Hook activity tracking: updated every time a permission hook fires for a session.
 # Used by settle mode to detect that internal background agents are still working
@@ -426,10 +427,8 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
         mark_subagent_done(chat_id, sub_tid)
         push_pump_event(chat_id, {"type": "bg_agent_done", "tool_use_id": sub_tid})
     if translator is not None:
-        try:
+        with contextlib.suppress(Exception):
             translator.subagent_end_event(sub_tid)
-        except Exception:
-            pass
     return True
 
 
@@ -553,15 +552,39 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
             continue
         seen_queues.add(id(queue))
         for cid in chats:
-            try:
+            with contextlib.suppress(Exception):
                 queue.put_nowait({
                     "type": "liveness_clear",
                     "chat_id": cid,
                     "session_id": session_id,
                     "reason": reason,
                 })
-            except Exception:
-                pass
+
+
+def broadcast_chat_frame(chat_id: str, frame: dict) -> None:
+    """Push a chat-scoped UI frame to every dashboard notify queue.
+
+    Each socket's server-events handler forwards ``frame`` verbatim only when
+    it is viewing ``chat_id`` — a chat-targeted sibling of the
+    ``liveness_clear`` broadcast above. Used for UI-state frames that must
+    reach a live viewer INDEPENDENT of any delivery path (e.g. the terminal
+    ``delegate_result`` badge frame when the wake itself lands on the
+    pty/persistent/one-shot/none rungs, which carry no socket). Fire-and-
+    forget; sockets not viewing the chat drop it.
+    """
+    if not chat_id:
+        return
+    seen: set[int] = set()
+    for queue in list(_dashboard_notify_queues.values()):
+        if id(queue) in seen:
+            continue
+        seen.add(id(queue))
+        with contextlib.suppress(Exception):
+            queue.put_nowait({
+                "type": "chat_ui_frame",
+                "chat_id": chat_id,
+                "frame": frame,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -627,11 +650,10 @@ def reap_task_sessions(now: datetime | None = None) -> int:
             continue
         last_active = meta.get("last_active")
         if last_active:
-            try:
+            # Unparseable timestamp → treat as stale (fall through to reap).
+            with contextlib.suppress(ValueError, TypeError):
                 if datetime.fromisoformat(last_active) >= cutoff:
                     continue  # still recent — may be running; keep
-            except (ValueError, TypeError):
-                pass  # unparseable → treat as stale
         del _sessions[sid]
         removed += 1
     if removed:
@@ -901,15 +923,11 @@ def set_session_security(session_id: str, ctx) -> None:
     a context that already carries an id is left untouched.
     """
     if not getattr(ctx, "cli_session_id", ""):
-        try:
+        # Junk ids fail the UUID parse and fall closed to no carve; TypeError
+        # also covers duck-typed test contexts without the field.
+        with contextlib.suppress(ValueError, AttributeError, TypeError):
             uuid.UUID(session_id)
-        except (ValueError, AttributeError, TypeError):
-            pass
-        else:
-            try:
-                ctx = dataclasses.replace(ctx, cli_session_id=session_id.lower())
-            except TypeError:
-                pass  # duck-typed test contexts without the field
+            ctx = dataclasses.replace(ctx, cli_session_id=session_id.lower())
     _session_security[session_id] = ctx
     _session_security_ts[session_id] = time.time()
     _save_session_security()
@@ -1202,11 +1220,9 @@ def cleanup_session_permission_state(session_id: str) -> None:
     # Tear down any browser (camoufox) context bound to this session so a killed
     # proxy session frees its browser tab immediately — the router's idle-GC is
     # the backstop. Best-effort, fire-and-forget; never blocks teardown.
-    try:
+    with contextlib.suppress(Exception):
         from services.infra import browser_session
         browser_session.schedule_close(session_id)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------

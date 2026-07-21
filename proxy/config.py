@@ -1,10 +1,18 @@
-"""Platform configuration — config.env parsing, secrets, and derived settings."""
+"""Platform configuration — config.env parsing, secrets, and derived settings.
 
+Deliberately ONE module: a `config/` package split was reviewed and retired
+for good (2026-07-10) — the import-order-sensitive blocks make any split
+high-blast-radius for zero user value. Don't re-propose it.
+"""
+
+import contextlib
 import hmac
 import json
 import os
+import re as _re
 import secrets
 import shutil
+import sys
 import zoneinfo
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +22,12 @@ from dotenv import dotenv_values
 # Paths (needed early for config.env resolution)
 BASE_DIR = Path(__file__).parent
 PLATFORM_ROOT = BASE_DIR.parent  # oto-dock/
+
+
+def _boot_note(msg: str) -> None:
+    """Import-time boot notice — logging isn't configured yet, so write to
+    stderr, which reaches the container/systemd log."""
+    sys.stderr.write(msg + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +45,6 @@ _VERSIONS_MD = PLATFORM_ROOT / "VERSIONS.md"
 
 def _read_pinned_version(key: str) -> str:
     """Parse ``KEY=x.y.z`` out of VERSIONS.md. Returns "" if absent/unreadable."""
-    import re as _re
     try:
         text = _VERSIONS_MD.read_text(encoding="utf-8")
     except OSError:
@@ -62,6 +75,40 @@ PLATFORM_CONFIG_DIR = Path(os.environ.get("PLATFORM_CONFIG_DIR") or str(PLATFORM
 # PLATFORM_ROOT so dev + the bundled compose (which bind-mount config.env at the
 # platform root) are unchanged.
 _config_env = PLATFORM_CONFIG_DIR / "config.env"
+
+
+def _reject_directory_config(path: Path) -> None:
+    """Fail fast (clear message, no traceback) when the config path is a
+    directory instead of a file.
+
+    The bundled compose bind-mounts ``${OTODOCK_ENV_FILE:-./.env}`` onto this
+    path — and when that host file doesn't exist at ``docker compose up``,
+    Docker silently creates an empty *directory* in its place. dotenv then
+    reads a directory as "no config" (every key falls back to its default) and
+    the proxy only dies later, at the first secret persist, with a bare
+    IsADirectoryError crash-loop that says nothing about the cause. Upgrades
+    from installs that kept their settings in ``config.env`` (the pre-1.2.0
+    name) hit exactly this.
+    """
+    if not path.is_dir():
+        return
+    raise SystemExit(
+        f"FATAL: the OtoDock config file at {path} is a directory, not a file.\n"
+        "Docker creates an empty directory at a bind-mount source that does not\n"
+        "exist — the compose file mounts ${OTODOCK_ENV_FILE:-./.env} here, so this\n"
+        "means there was no .env file next to docker-compose.yml at compose up.\n"
+        "Fix it on the Docker host, in the directory with docker-compose.yml:\n"
+        "    docker compose down     # release the mount so the dir can be removed\n"
+        "    rmdir .env              # remove the empty directory Docker created\n"
+        "    mv config.env .env      # upgrading and your settings live in config.env\n"
+        "    # fresh install instead: cp config.env.example .env  (then edit it)\n"
+        "    docker compose up -d\n"
+        "(Source checkouts use scripts/compose.sh, which points the mount at\n"
+        "config.env via OTODOCK_ENV_FILE and is not affected.)"
+    )
+
+
+_reject_directory_config(_config_env)
 _file_cfg = dotenv_values(_config_env) if _config_env.exists() else {}
 
 
@@ -111,6 +158,29 @@ def _persist_secret(key: str, value: str) -> None:
             f"environment so no write is needed."
         ) from e
 
+
+def capture_dashboard_public_url(origin: str) -> bool:
+    """First-run capture of DASHBOARD_PUBLIC_URL (setup wizard).
+
+    Captures ONLY when the operator never set the value in config.env (the
+    FILE is the explicit user setting — compose always injects a localhost
+    default via the container environment, so an env check can never read
+    "unset") AND the effective value is empty or that localhost default.
+    A localhost origin is never captured (it IS the default). Explicit
+    config always wins; the new value applies at the next platform restart
+    (Collabora reads it at container start)."""
+    origin = (origin or "").strip().rstrip("/")
+    _localhost = _re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+    if not _re.match(r"^https?://[^\s/]+$", origin) or _localhost.match(origin):
+        return False
+    if (_file_cfg.get("DASHBOARD_PUBLIC_URL") or "").strip():
+        return False
+    effective = _cfg("DASHBOARD_PUBLIC_URL").strip().rstrip("/")
+    if effective and not _localhost.match(effective):
+        return False
+    _persist_secret("DASHBOARD_PUBLIC_URL", origin)
+    return True
+
 AGENTS_DIR = PLATFORM_DATA_DIR / "agents"  # persistent — overridable via PLATFORM_DATA_DIR
 # Workspace recover-bin (passive trash-can): the pre-change bytes of a deleted
 # file or the losing side of a genuine cross-user concurrent conflict are backed
@@ -156,7 +226,7 @@ API_KEY = _cfg("PROXY_API_KEY")
 if not API_KEY:
     API_KEY = secrets.token_urlsafe(32)
     _persist_secret("PROXY_API_KEY", API_KEY)
-    print(f"Generated PROXY_API_KEY — saved to {_config_env}")
+    _boot_note(f"Generated PROXY_API_KEY — saved to {_config_env}")
 
 
 def is_master_key(token: str) -> bool:
@@ -174,7 +244,7 @@ PHONE_API_SECRET = _cfg("PHONE_API_SECRET")
 if not PHONE_API_SECRET:
     PHONE_API_SECRET = secrets.token_urlsafe(32)
     _persist_secret("PHONE_API_SECRET", PHONE_API_SECRET)
-    print(f"Generated PHONE_API_SECRET — saved to {_config_env}")
+    _boot_note(f"Generated PHONE_API_SECRET — saved to {_config_env}")
 
 # ---------------------------------------------------------------------------
 # Rate limiting + request-size + pagination limits (centralized, env-overridable)
@@ -237,7 +307,7 @@ INSTALL_ID = _cfg("OTODOCK_INSTALL_ID")
 if not INSTALL_ID:
     INSTALL_ID = secrets.token_hex(4)  # 8 hex chars, e.g. "a1b2c3d4"
     _persist_secret("OTODOCK_INSTALL_ID", INSTALL_ID)
-    print(f"Generated OTODOCK_INSTALL_ID={INSTALL_ID} — saved to {_config_env}")
+    _boot_note(f"Generated OTODOCK_INSTALL_ID={INSTALL_ID} — saved to {_config_env}")
 
 # Claude Code settings. Same resolution ladder as CODEX_BIN below: explicit
 # override → PATH → the user-prefix npm bin. The absolute fallback matters
@@ -277,6 +347,18 @@ PHONE_SERVER_URL = _cfg("PHONE_SERVER_URL", "http://127.0.0.1:9093")
 ALLOWED_TOOLS = _cfg("ALLOWED_TOOLS", "").strip()
 # Empty = all tools allowed (via --dangerously-skip-permissions)
 
+# Agent names are slugs minted by ``agent_store.sanitize_slug`` (``[a-z0-9-]``);
+# built-in agents follow the same shape. This allowlist confines every
+# ``AGENTS_DIR / <name>`` join so a request-supplied agent name can never
+# traverse out of the agent tree (``/``, ``\``, ``..``, NUL are all excluded).
+_SAFE_AGENT_NAME = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def is_safe_agent_name(name: str) -> bool:
+    """True if ``name`` is a filesystem-safe agent slug (no path escape)."""
+    return bool(name) and ".." not in name and _SAFE_AGENT_NAME.fullmatch(name) is not None
+
+
 def get_agent_dir(agent_name: str) -> Path:
     """Return the root directory for an agent: AGENTS_DIR / agent_name."""
     return AGENTS_DIR / agent_name
@@ -297,6 +379,8 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
 
     Returns list of (relative_path, content) tuples.
     """
+    if not is_safe_agent_name(model):
+        return []
     agent_dir = AGENTS_DIR / model
     prompt_path = agent_dir / "config" / "prompt.md"
     if not prompt_path.exists():
@@ -665,6 +749,8 @@ def build_agent_prompt(model: str, *,
             Fail-closed defaults keep ``satellite_only`` / device-capability
             MCPs out of local-session prompts.
     """
+    if not is_safe_agent_name(model):
+        return None  # unsafe agent name → treat as unknown agent
     own_files = _read_agent_files(model)
     if not own_files:
         return None
@@ -686,12 +772,10 @@ def build_agent_prompt(model: str, *,
     )
     company_name = ""
     instructions = ""
-    try:
+    with contextlib.suppress(Exception):
         from storage import database as _db
         company_name = _db.get_platform_setting("company_name") or ""
         instructions = _db.get_platform_setting("platform_instructions") or ""
-    except Exception:
-        pass
     if company_name:
         parts.append(f"\n\n---\n\n# {company_name}\n")
         if instructions:
@@ -714,12 +798,10 @@ def build_agent_prompt(model: str, *,
 
     # Auto-create per-user directories
     if username:
-        try:
+        with contextlib.suppress(Exception):
             user_dir = agent_dir / "users" / username
             (user_dir / "workspace").mkdir(parents=True, exist_ok=True)
             (user_dir / "context").mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
 
     # Available Tools (MCPs) catalog — one-line summary per enabled MCP.
     # Sits BEFORE MCP Tool Skills so the agent gets a top-down map of its
@@ -727,7 +809,8 @@ def build_agent_prompt(model: str, *,
     # client_type against each manifest's exclude_from (defense in depth —
     # build_session_mcp_config already excludes the right ones, but this
     # keeps the prompt's catalog in sync with the actual loaded set).
-    try:
+    # mcp_registry not yet initialized (startup race) → no catalog.
+    with contextlib.suppress(Exception):
         from services.mcp import mcp_registry
         catalog = mcp_registry.build_available_mcps_section(
             model, context=client_type or "",
@@ -736,14 +819,13 @@ def build_agent_prompt(model: str, *,
         )
         if catalog:
             parts.append("\n\n---\n\n" + catalog)
-    except Exception:
-        pass  # mcp_registry not yet initialized (startup race)
 
     # Load MCP skills for this agent (from manifest-driven skill system).
     # The real client_type threads through so skill-level exclude_from
     # (e.g. voiceover's ["phone"]) is honored — it was dead at this call
     # site until 2026-07 (hardcoded "system_prompt" matched nothing).
-    try:
+    # mcp_registry not yet initialized (startup race) → no skills section.
+    with contextlib.suppress(Exception):
         from services.mcp import mcp_registry
         skills = mcp_registry.get_skills_for_agent(
             model, context=client_type or "",
@@ -764,8 +846,6 @@ def build_agent_prompt(model: str, *,
             )
             for skill_id, content in inline:
                 parts.append(f"\n{content}")
-    except Exception:
-        pass  # mcp_registry not yet initialized (startup race)
 
     # Dynamic MCP context (runtime-generated, only for assigned MCPs)
     if dynamic_contexts:
@@ -802,13 +882,11 @@ def build_agent_prompt(model: str, *,
                     if running_bytes + size > _USER_CTX_MAX_TOTAL_BYTES:
                         skipped.append((md_file.name, size, "exceeds total cap"))
                         continue
-                    try:
+                    with contextlib.suppress(Exception):
                         parts.append(
                             f"\n## `{md_file.name}`\n\n{md_file.read_text()}"
                         )
                         running_bytes += size
-                    except Exception:
-                        pass
                 if skipped:
                     skipped_md = "\n".join(
                         f"- `{n}` ({sz:,} bytes): {reason}"
@@ -826,14 +904,12 @@ def build_agent_prompt(model: str, *,
     # generic context loaders above never see these dirs (user-context glob
     # is flat; knowledge/ isn't auto-loaded) — this is their ONLY injection
     # point. Best-effort: a memory failure never breaks prompt build.
-    try:
+    with contextlib.suppress(Exception):
         memory_section = _render_memory_sections(
             model, agent_dir, username=username, role=role,
         )
         if memory_section:
             parts.append(memory_section)
-    except Exception:
-        pass
 
     # Workspace and user directory listing
     ws_listing = _scan_workspace(agent_dir, model, username=username, role=role,
@@ -876,13 +952,11 @@ PERSISTENT_SESSION_TIMEOUT = int(_cfg("PERSISTENT_SESSION_TIMEOUT", "900"))
 
 def get_session_timeout() -> int:
     """Return the CLI session timeout in seconds (from DB, fallback to env)."""
-    try:
+    with contextlib.suppress(Exception):
         from storage import database as _db
         val = _db.get_platform_setting("session_timeout")
         if val:
             return int(val)
-    except Exception:
-        pass
     return CLAUDE_TIMEOUT
 
 
@@ -897,25 +971,21 @@ def get_idle_timeout() -> int:
     satellite reconnect-grace (don't kill visible state) — that's not a longer
     timeout. Distinct from ``session_timeout`` (``get_session_timeout``), which
     is the per-TURN ceiling (CLAUDE_TIMEOUT, 2h)."""
-    try:
+    with contextlib.suppress(Exception):
         from storage import database as _db
         val = _db.get_platform_setting("session_idle_timeout")
         if val:
             return int(val)
-    except Exception:
-        pass
     return PERSISTENT_SESSION_TIMEOUT
 
 
 def get_jwt_expiry_hours() -> int:
     """Return JWT session expiry in hours (from DB, fallback to env)."""
-    try:
+    with contextlib.suppress(Exception):
         from storage import database as _db
         val = _db.get_platform_setting("jwt_expiry_hours")
         if val:
             return int(val)
-    except Exception:
-        pass
     return JWT_EXPIRY_HOURS
 
 # Max output tokens for Direct LLM API responses (all providers).
@@ -971,7 +1041,8 @@ MAX_THINKING_TOKENS = int(_cfg("MAX_THINKING_TOKENS", "100000"))
 VAPID_PUBLIC_KEY = _cfg("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = _cfg("VAPID_PRIVATE_KEY", "")
 if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
-    try:
+    # Any failure here → push notifications will be disabled.
+    with contextlib.suppress(Exception):
         import base64
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -982,9 +1053,7 @@ if not VAPID_PUBLIC_KEY or not VAPID_PRIVATE_KEY:
         VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(_pub_raw).rstrip(b"=").decode()
         _persist_secret("VAPID_PUBLIC_KEY", VAPID_PUBLIC_KEY)
         _persist_secret("VAPID_PRIVATE_KEY", VAPID_PRIVATE_KEY)
-        print(f"Generated VAPID key pair — saved to {_config_env}")
-    except Exception:
-        pass  # push notifications will be disabled
+        _boot_note(f"Generated VAPID key pair — saved to {_config_env}")
 VAPID_EMAIL = _cfg("VAPID_EMAIL", "admin@localhost")
 FCM_SERVICE_ACCOUNT_PATH = _cfg("FCM_SERVICE_ACCOUNT_PATH", "")
 
@@ -1149,13 +1218,11 @@ def get_model_supports_xhigh(model: str) -> bool:
     entry = MODEL_REGISTRY.get(model)
     if entry:
         return bool(entry.get("supports_xhigh", False))
-    try:
+    with contextlib.suppress(Exception):
         from storage import subscription_store
         for m in subscription_store.list_models():
             if m.get("model_id") == model:
                 return bool(m.get("supports_xhigh", 0))
-    except Exception:
-        pass
     return False
 
 
@@ -1184,14 +1251,12 @@ def get_model_provider(model: str) -> str:
     if entry:
         return entry.get("provider", "anthropic")
     # 2. Check DB (dynamically discovered/added models have provider set)
-    try:
+    with contextlib.suppress(Exception):
         from storage import subscription_store
         db_models = subscription_store.list_models(layer="direct-llm")
         for m in db_models:
             if m.get("model_id") == model and m.get("provider"):
                 return m["provider"]
-    except Exception:
-        pass
     # 3. Prefix heuristics for unknown models
     if model.startswith(("gpt-", "o1-", "o3", "o4-", "chatgpt-", "openai/")):
         return "openai"
@@ -1247,7 +1312,7 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
     If provider is given, use it directly for fallback instead of heuristic.
     """
     # 1. Check DB for custom pricing (dynamically added models)
-    try:
+    with contextlib.suppress(Exception):
         from storage import subscription_store
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("model_id") == model and m.get("pricing_input", 0) > 0:
@@ -1255,8 +1320,6 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
                     m["pricing_input"], m["pricing_output"],
                     m.get("pricing_cache_write", 0), m.get("pricing_cache_read", 0),
                 )
-    except Exception:
-        pass
     # 2. Check in-memory registry (Anthropic builtins)
     entry = MODEL_REGISTRY.get(model)
     if entry:
@@ -1272,13 +1335,11 @@ def get_model_context_window(model: str) -> int:
     Resolution order: DB → MODEL_REGISTRY → default.
     """
     # Check DB for custom context window
-    try:
+    with contextlib.suppress(Exception):
         from storage import subscription_store
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("model_id") == model and m.get("context_window", 0) > 0:
                 return m["context_window"]
-    except Exception:
-        pass
     entry = MODEL_REGISTRY.get(model)
     return entry["context_window"] if entry else MODEL_DEFAULT_CONTEXT_WINDOW
 
@@ -1294,13 +1355,11 @@ def model_supports_reasoning(model: str) -> bool:
     if entry:
         return entry.get("supports_reasoning", False)
     # Dynamic models: check DB (admin-configured via execution layers page)
-    try:
+    with contextlib.suppress(Exception):
         from storage import subscription_store
         for m in subscription_store.list_models():
             if m.get("model_id") == model:
                 return bool(m.get("supports_reasoning", 0))
-    except Exception:
-        pass
     return False
 
 
@@ -1596,7 +1655,7 @@ _jwt = _cfg("JWT_SECRET")
 if not _jwt:
     _jwt = secrets.token_urlsafe(64)
     _persist_secret("JWT_SECRET", _jwt)
-    print(f"Generated JWT_SECRET — saved to {_config_env}")
+    _boot_note(f"Generated JWT_SECRET — saved to {_config_env}")
 JWT_SECRET = _jwt
 JWT_EXPIRY_HOURS = int(_cfg("JWT_EXPIRY_HOURS", "168"))
 DASHBOARD_PUBLIC_URL = _cfg("DASHBOARD_PUBLIC_URL", "")
@@ -1679,10 +1738,16 @@ else:
 #     ``host.docker.internal``.
 #   OTODOCK_NETWORK               — the shared user-defined network every MCP
 #     container joins (used by the T2 compose rewrite in a later sub-step).
+#   OTODOCK_AGENTS_VOLUME         — the platform's shared agents named volume
+#     (`otodock-agents` in the shipped compose; `name:` is pinned there). The
+#     T2 compose rewrite maps an MCP's `${HOST_AGENTS_DIR}` agents-tree bind
+#     onto this volume so sidecars see the real agent files — the host path a
+#     containerised proxy would hand them is an empty auto-created dir.
 DOCKER_SOCKET_PROXY_HOST = _cfg("DOCKER_SOCKET_PROXY_HOST", "docker-socket-proxy")
 DOCKER_SOCKET_PROXY_PORT = int(_cfg("DOCKER_SOCKET_PROXY_PORT", "2375"))
 PROXY_SERVICE_NAME = _cfg("PROXY_SERVICE_NAME", "otodock-proxy")
 OTODOCK_NETWORK = _cfg("OTODOCK_NETWORK", "otodock")
+OTODOCK_AGENTS_VOLUME = _cfg("OTODOCK_AGENTS_VOLUME", "otodock-agents")
 
 # --- Docker-MCP address pool (T1 self-sufficiency) ---
 # OtoDock pins the subnet of every per-MCP bridge it creates on bare-metal (T1)
@@ -1866,7 +1931,7 @@ if OIDC_ENABLED and OIDC_DISCOVERY_URL:
         OIDC_USERINFO_URL = OIDC_USERINFO_URL or _meta.get("userinfo_endpoint", "")
         OIDC_LOGOUT_URL = OIDC_LOGOUT_URL or _meta.get("end_session_endpoint", "")
     except Exception as _e:
-        print(f"WARN: OIDC discovery failed for {OIDC_DISCOVERY_URL}: {_e}")
+        _boot_note(f"WARN: OIDC discovery failed for {OIDC_DISCOVERY_URL}: {_e}")
 
 # Group → role mapping, built only from explicitly-set env vars. An OIDC
 # deployment that wants role mapping MUST set the three OIDC_ROLE_*_GROUP

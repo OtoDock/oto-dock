@@ -9,7 +9,6 @@ tier logic, so an ``auto`` session auto-approves every tool.
 """
 
 import asyncio
-import os
 import sys
 
 import pytest
@@ -168,3 +167,98 @@ async def test_session_allow_memory_cleared_on_session_close(dashboard_session):
     assert session_state.is_session_tool_allowed(dashboard_session, "mcp__demo__do_thing")
     session_state.cleanup_session_permission_state(dashboard_session)
     assert not session_state.is_session_tool_allowed(dashboard_session, "mcp__demo__do_thing")
+
+
+# ─────────── Manifest permission tiers × auto mode ───────────────────────────
+# The tier lookup runs BEFORE the dontAsk/auto short-circuit: open–sensitive
+# keep the auto/dontAsk allow (status quo), critical falls through — to the
+# dashboard prompt when a human is present, to a deny in unattended sessions.
+
+
+@pytest.mark.asyncio
+async def test_auto_allows_open_through_sensitive_tiers(dashboard_session, monkeypatch):
+    from services.mcp import mcp_permissions
+    session_state.set_session_mode(dashboard_session, "auto")
+    for tier in ("open", "standard", "sensitive"):
+        monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t, _tier=tier: _tier)
+        assert (await _decide(dashboard_session))["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_auto_dashboard_critical_prompts(dashboard_session, monkeypatch):
+    """A critical tool in an auto-mode DASHBOARD session (human watching a
+    continued task) blocks on the dashboard prompt instead of auto-running."""
+    from services.mcp import mcp_permissions
+    from api.hooks import hooks as hooks_mod
+    session_state.set_session_mode(dashboard_session, "auto")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "critical")
+    prompted = {}
+
+    async def _fake_wait(request_id, session_id, timeout):
+        prompted["yes"] = True
+        return False
+
+    monkeypatch.setattr(hooks_mod, "wait_for_permission", _fake_wait)
+    decision = await _decide(dashboard_session)
+    assert prompted.get("yes")
+    assert decision["decision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_unattended_critical_denied_with_reason(dashboard_session, monkeypatch):
+    """A critical tool in a non-dashboard session (live task run, phone) is
+    denied with an explanation — there is no human to answer a prompt."""
+    from services.mcp import mcp_permissions
+    session_state._sessions[dashboard_session] = {"client_type": "task"}
+    session_state.set_session_mode(dashboard_session, "auto")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "critical")
+    decision = await _decide(dashboard_session)
+    assert decision["decision"] == "deny"
+    assert "unattended" in decision["reason"]
+
+
+@pytest.mark.asyncio
+async def test_headless_default_open_tier_allows_without_prompt(dashboard_session, monkeypatch):
+    """An open-tier tool in headless default mode runs with NO dashboard
+    prompt — the relaxation the tier system exists for. Also the path the
+    Codex approval bridge takes (it relays this decision as an elicitation
+    accept)."""
+    from services.mcp import mcp_permissions
+    from api.hooks import hooks as hooks_mod
+    session_state.set_session_mode(dashboard_session, "default")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "open")
+
+    async def _no_prompt_expected(request_id, session_id, timeout):
+        raise AssertionError("open tier must not prompt")
+
+    monkeypatch.setattr(hooks_mod, "wait_for_permission", _no_prompt_expected)
+    assert (await _decide(dashboard_session))["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_headless_default_standard_tier_still_prompts(dashboard_session, monkeypatch):
+    """standard relaxes acceptEdits only — default mode keeps the prompt."""
+    from services.mcp import mcp_permissions
+    from api.hooks import hooks as hooks_mod
+    session_state.set_session_mode(dashboard_session, "default")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "standard")
+
+    async def _approve(request_id, session_id, timeout):
+        return True
+
+    monkeypatch.setattr(hooks_mod, "wait_for_permission", _approve)
+    assert (await _decide(dashboard_session))["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_accept_edits_standard_tier_allows_without_prompt(dashboard_session, monkeypatch):
+    from services.mcp import mcp_permissions
+    from api.hooks import hooks as hooks_mod
+    session_state.set_session_mode(dashboard_session, "acceptEdits")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "standard")
+
+    async def _no_prompt_expected(request_id, session_id, timeout):
+        raise AssertionError("standard tier must not prompt in acceptEdits")
+
+    monkeypatch.setattr(hooks_mod, "wait_for_permission", _no_prompt_expected)
+    assert (await _decide(dashboard_session))["decision"] == "allow"

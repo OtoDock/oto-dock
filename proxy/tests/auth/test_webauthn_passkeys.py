@@ -28,7 +28,6 @@ client = TestClient(app)
 
 _PW = "correct-horse-battery-staple-11"
 _EMAIL = "pk@t.com"
-_CRED_ID = bytes_to_base64url(b"credential-raw-id-1")
 
 
 @pytest.fixture(autouse=True)
@@ -77,15 +76,24 @@ def test_feature_gate_requires_https_public_url(monkeypatch):
     _mk_user()
     for bad in ("", "http://192.168.1.10:8400"):
         monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", bad)
-        assert client.get("/auth/config").json()["passkeys_enabled"] is False
+        cfg = client.get("/auth/config").json()
+        assert cfg["passkeys_enabled"] is False
+        # No RP host while the feature is off — the login page must not gate
+        # (or hint) on a host passkeys can't be used with anyway.
+        assert cfg["passkey_rp_host"] == ""
         assert client.post("/auth/passkey/options").status_code == 400
         r = client.post("/v1/users/me/passkeys/register/options", json={"password": _PW})
         assert r.status_code == 400
 
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://dash.example.com")
-    assert client.get("/auth/config").json()["passkeys_enabled"] is True
+    cfg = client.get("/auth/config").json()
+    assert cfg["passkeys_enabled"] is True
+    # The login page compares location.hostname against this to hide the
+    # passkey buttons on origins where the browser refuses the ceremony.
+    assert cfg["passkey_rp_host"] == "dash.example.com"
     assert wa._rp_id() == "dash.example.com"
     assert wa._expected_origin() == "https://dash.example.com"
+    assert client.get("/v1/users/me/passkeys").json()["rp_host"] == "dash.example.com"
 
 
 def test_register_options_require_password():

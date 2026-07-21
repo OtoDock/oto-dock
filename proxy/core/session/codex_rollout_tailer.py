@@ -64,7 +64,7 @@ import re
 from core.session.history_seed import strip_seed_prefix
 from core.session.transcript_tool_events import (
     TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
-    persist_event, record_batch_usage, truncate_result,
+    persist_event, record_batch_usage,
 )
 
 logger = logging.getLogger("claude-proxy.codex_rollout_tailer")

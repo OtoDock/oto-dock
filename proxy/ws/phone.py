@@ -10,6 +10,7 @@ that drives MCP filtering — see proxy/adapters/phone.py).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -243,8 +244,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 finally:
                     try:
                         event_queue.put_nowait(CommonEvent(PRODUCER_DONE, {}))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("phone producer done signal failed: %s", e)
 
             producer = asyncio.create_task(_produce())
             turn_producers[turn_id] = producer
@@ -287,11 +288,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 producer.cancel()
         except Exception as e:
             logger.error(f"WS chat error: {e}", exc_info=True)
-            try:
+            with contextlib.suppress(Exception):
                 await _send({"type": "error", "turn": turn_id,
                              "data": {"message": str(e)}})
-            except Exception:
-                pass
         finally:
             turn_producers.pop(turn_id, None)
 

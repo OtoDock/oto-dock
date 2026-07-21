@@ -8,6 +8,7 @@ that is scoped to a specific file, user, agent, and permission level.
 """
 
 import base64
+import contextlib
 import logging
 import time
 import urllib.parse
@@ -180,12 +181,10 @@ def _post_message_origin() -> str:
     Falls back to ``"*"`` only if ``DASHBOARD_PUBLIC_URL`` is unconfigured."""
     raw = (getattr(config, "DASHBOARD_PUBLIC_URL", "") or "").strip()
     if raw:
-        try:
+        with contextlib.suppress(ValueError):
             p = urllib.parse.urlparse(raw)
             if p.scheme and p.netloc:
                 return f"{p.scheme}://{p.netloc}"
-        except ValueError:
-            pass
     return "*"
 
 
@@ -289,6 +288,46 @@ async def wopi_put_file(
     # ("<agent>/workspace/..." or "<agent>/users/{u}/...").
     rel = claims.get("file_path", "")
     agent_slug, _, tree_rel = rel.partition("/")
+    if rel.startswith(".remote-host-cache/"):
+        # Host-cache doc: the platform copy is a MIRROR of a file on the
+        # session's own machine (Desktop/Downloads pulled through the lazy
+        # cache). Persist the cache copy atomically, then push the bytes back
+        # to the REAL file via the sidecar's (machine, abs_path) — the
+        # satellite's host write policy is the authoritative gate there. If
+        # the machine refuses or is offline, FAIL the save (Collabora shows
+        # a save error) instead of letting cache and reality silently
+        # diverge. Never routed through propagate_write: host files have no
+        # agent-tree fan-out.
+        session_id = rel.split("/")[1] if rel.count("/") >= 2 else ""
+        try:
+            prev = file_path.read_bytes()
+        except OSError:
+            prev = None
+        tmp = Path(str(file_path) + ".partial")
+        tmp.write_bytes(body)
+        tmp.replace(file_path)
+        from core.remote import remote_file_flow
+        ok = await remote_file_flow.push_back_host_path(session_id, str(file_path))
+        if not ok:
+            # The cache MIRRORS the machine — a failed push must not leave
+            # diverged bytes that later reads would serve as truth. Restore
+            # the pre-save content (best-effort) and fail the save.
+            if prev is not None:
+                try:
+                    tmp.write_bytes(prev)
+                    tmp.replace(file_path)
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail="Could not write the file back to the remote machine "
+                       "(offline or refused) — the save was not applied there.",
+            )
+        logger.info(
+            "WOPI PutFile (host-cache → machine): %s (%d bytes) by %s",
+            file_path.name, len(body), claims.get("user_name"),
+        )
+        return Response(status_code=200)
     if agent_slug and tree_rel:
         from services.remote import workspace_fanout
         from storage import database as _db
@@ -527,3 +566,85 @@ async def generate_snapshot_wopi_url(
     )
     file_id = encode_file_id(rel_path)
     return {"wopi_url": build_cool_url(file_id, token, token_ttl)}
+
+
+@router.get("/v1/documents/preview-wopi-url")
+async def generate_preview_wopi_url(
+    chat_id: str = Query(...),
+    file_id: str = Query(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """Mint a fresh Collabora URL for a chat's LIVE preview block at render
+    time.
+
+    Preview events persist the URL minted at push time, whose token lasts 4
+    hours — reopening an older chat showed "session expired" with no way to
+    recover. The dashboard calls this when it renders a preview block whose
+    push is no longer fresh; the returned URL is never persisted. Access
+    mirrors snapshot-wopi-url: the requester's CHAT access plus a live
+    (non-dismissed) preview event for this file_id. Write capability is
+    recomputed for the REQUESTER — same rules as the push-time mint: workspace
+    files go through the agent-tree write matrix; a host-cache mirror (a file
+    on the remote machine's own disk) is editable by write-capable roles only
+    within the chat's own session. 404 tells the dashboard to fall back to the
+    persisted URL."""
+    u = require_auth(user)
+
+    if not config.COLLABORA_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="Document preview is unavailable: COLLABORA_URL is not configured.",
+        )
+
+    from storage import database as task_store
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    from api.agents.chats import can_access_chat
+    if not can_access_chat(u, chat):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if task_store.get_preview_event_by_file(chat_id, file_id) is None:
+        raise HTTPException(status_code=404, detail="Preview not found")
+
+    try:
+        rel_path = decode_file_id(file_id)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=404, detail="Preview not found")
+    # Preview events only ever reference agent-tree files; the snapshot
+    # namespace has its own endpoint (with snapshot-specific display naming).
+    if rel_path.startswith(_SNAPSHOT_NS + "/"):
+        raise HTTPException(status_code=404, detail="Preview not found")
+    full_path = (config.AGENTS_DIR / rel_path).resolve()
+    if not full_path.is_relative_to(config.AGENTS_DIR.resolve()):
+        raise HTTPException(status_code=403, detail="Path traversal blocked")
+    if not full_path.is_file():
+        raise HTTPException(status_code=404, detail="Preview not found")
+
+    agent = chat.get("agent") or ""
+    from core.remote.file_sync import can_write_back
+    from storage import database as _db
+    role = u.get_agent_role(agent)
+    username = _db.get_username_by_sub(u.sub) or ""
+    permissions = "view"
+    _session_id = chat.get("session_id") or ""
+    _is_host_cache = False
+    if _session_id:
+        from core.remote import remote_file_flow
+        with contextlib.suppress(OSError):
+            _is_host_cache = full_path.is_relative_to(
+                remote_file_flow.host_cache_session_root(_session_id).resolve()
+            )
+    if _is_host_cache:
+        # PutFile pushes the bytes back to the real file on the machine, where
+        # the satellite's own host write policy is the authoritative gate.
+        if role in ("editor", "manager", "admin"):
+            permissions = "edit"
+    elif can_write_back(rel_path.partition("/")[2], role, username):
+        permissions = "edit"
+
+    token, token_ttl = create_wopi_token(rel_path, u.sub, u.name, permissions, agent)
+    return {
+        "wopi_url": build_cool_url(file_id, token, token_ttl),
+        "permissions": permissions,
+    }

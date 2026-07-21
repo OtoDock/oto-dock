@@ -113,12 +113,11 @@ async def admin_set_user_agents(
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unknown agents: {invalid}")
 
-    # Enforce: platform members cannot be promoted to agent editor/manager.
-    # Platform role is the ceiling — a platform member stays a per-agent
-    # viewer everywhere.
+    # Per-agent roles are independent of the platform role: a platform
+    # member (who cannot create agents or reach admin surfaces) may still
+    # be manager/editor of specific agents an admin assigns. The only
+    # platform↔agent coupling is admin-only agents (checked above).
     roles = req.agent_roles or {}
-    if target["role"] == "member":
-        roles = {a: "viewer" for a in req.agents}
     # Validate role values (editor added alongside manager/viewer).
     for a, r in roles.items():
         if r not in ("manager", "editor", "viewer"):

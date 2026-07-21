@@ -44,7 +44,7 @@ async function jsonOrThrow(res: Response, fallback: string) {
 
 // --- Registration (authed, password-confirmed) ---
 
-export async function listPasskeys(): Promise<{ passkeys: PasskeyInfo[]; enabled: boolean }> {
+export async function listPasskeys(): Promise<{ passkeys: PasskeyInfo[]; enabled: boolean; rp_host?: string }> {
   const res = await apiFetch('/v1/users/me/passkeys')
   return jsonOrThrow(res, 'Failed to load passkeys')
 }

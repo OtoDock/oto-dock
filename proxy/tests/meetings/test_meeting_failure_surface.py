@@ -86,7 +86,8 @@ async def test_notify_waits_for_existing_pump(monkeypatch):
     await notify
 
     # The failure pump ran after the ack pump finished and unregistered itself.
-    assert _active_pumps.pop("chat-mf-2", None) is not fake_pump
+    leftover = _active_pumps.pop("chat-mf-2", None)
+    assert leftover is not fake_pump
     rows = task_store.get_chat_messages("chat-mf-2")
     assert any(r.get("event_type") == "system" for r in rows)
 

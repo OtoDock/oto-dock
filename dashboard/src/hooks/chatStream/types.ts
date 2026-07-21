@@ -48,6 +48,10 @@ export interface UseChatStreamOptions {
   appendErrorOnEmptyWarmupFail?: boolean
   /** title_updated tail (chat: refetchChats). */
   onTitleUpdated?: () => void
+  /** move_chat ack for the VIEWED chat (the hook drops acks for any other) —
+   * the page re-resumes it so the fresh warmup runs on the new target and
+   * the "moved" history card arrives. */
+  onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
   /** New interactive-history rows persisted (transcript tail batch) — pages
    *  use it to live-refresh an open rich-history (transcript) view. */
   onChatRows?: (data: { chat_id: string; agent?: string }) => void

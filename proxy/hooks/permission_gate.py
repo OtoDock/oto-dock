@@ -39,6 +39,27 @@ def _request_decision(req):
     return None
 
 
+def _path_note(tool_input, updated_input):
+    """One-line additionalContext teaching the model the native path mapping.
+
+    Edit / NotebookEdit validate their target BEFORE PreToolUse hooks run, so
+    a sandbox-virtual path there fails with file-not-found and no rewrite can
+    intervene — the note hands the model the native form at the moment it
+    learns the mapping, steering its later edits to paths that work.
+    """
+    for key, new in updated_input.items():
+        old = tool_input.get(key)
+        if isinstance(new, str) and isinstance(old, str) and old != new:
+            return (
+                f"OtoDock path note: `{old}` is `{new}` on this machine. "
+                "Path auto-translation covers Read/Write/Glob/Grep only — "
+                "the Edit and NotebookEdit tools check their target before "
+                "translation runs, so pass them the OS-native form (like "
+                "the resolved path above) directly."
+            )
+    return ""
+
+
 def main():
     # Read hook input from stdin
     try:
@@ -61,6 +82,9 @@ def main():
         "session_id": session_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
+        # LIVE mode from the CLI (reflects in-TUI Shift+Tab) — the proxy uses
+        # it as the effective mode for interactive sessions.
+        "permission_mode": inp.get("permission_mode", ""),
     }).encode()
 
     req = urllib.request.Request(
@@ -82,20 +106,12 @@ def main():
         reason = result.get("reason", "")
         updated_input = result.get("updated_input")
 
-    # "defer" (interactive TUI ask-tier): emit NO decision so Claude's own
-    # permission system — its native in-terminal prompt + Shift+Tab modes —
-    # decides. Exit 0 with no output = "the hook has no opinion" (≠ "ask", which
-    # would force a prompt and defeat Shift+Tab). Hard denies still come through
-    # as "deny" above.
-    if decision == "defer":
-        return
-
     # Codex's PreToolUse hook supports a DENY decision but REJECTS
     # permissionDecision:"allow" ("unsupported permissionDecision:allow"). Under
     # Codex (OTO_HOOK_DENY_ONLY=1, set on the interactive spawn) emit JSON only to
-    # DENY; any non-deny becomes "no opinion" (exit 0) → the CLI proceeds and
-    # Codex's own sandbox / -a on-request handles any prompt. Claude supports
-    # "allow" and needs it (esp. headless), so this gate is Codex-only.
+    # DENY; any non-deny (allow/ask) becomes "no opinion" (exit 0) → the CLI
+    # proceeds and Codex's own sandbox / -a on-request handles any prompt.
+    # Claude supports "allow"/"ask" and needs them, so this gate is Codex-only.
     if decision != "deny" and os.environ.get("OTO_HOOK_DENY_ONLY"):
         return
 
@@ -112,9 +128,13 @@ def main():
         output["hookSpecificOutput"]["permissionDecisionReason"] = "Denied by user"
     # Remote satellites: the proxy rewrote a sandbox-virtual / `~` path arg to
     # its satellite-host form — hand the CLI the corrected input so the tool
-    # runs against the real path (allow-only; deny/defer never rewrite).
-    if decision == "allow" and isinstance(updated_input, dict):
+    # runs against the real path (deny never rewrites). On "ask" the CLI
+    # prompts against — and then runs with — the corrected input.
+    if decision in ("allow", "ask") and isinstance(updated_input, dict):
         output["hookSpecificOutput"]["updatedInput"] = updated_input
+        note = _path_note(tool_input, updated_input)
+        if note:
+            output["hookSpecificOutput"]["additionalContext"] = note
 
     print(json.dumps(output))
 

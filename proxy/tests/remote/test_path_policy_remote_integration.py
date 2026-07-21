@@ -8,10 +8,8 @@ policy as MCP tool args.
 """
 
 import sys
-from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
 if str(_PROXY_DIR) not in sys.path:

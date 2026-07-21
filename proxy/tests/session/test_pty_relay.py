@@ -17,7 +17,7 @@ _ENV = {"TERM": "xterm-256color", "PATH": os.environ.get("PATH", "/usr/bin:/bin"
 def _collector():
     """Return (buf, on_output) where on_output appends to buf."""
     buf = bytearray()
-    return buf, (lambda data: buf.extend(data))
+    return buf, (buf.extend)
 
 
 def _exit_future(loop):
@@ -129,3 +129,43 @@ class TestPtyRelay:
         code = await asyncio.wait_for(fut, 5)
         assert code == 0
         assert b"TERM=xterm-256color" in bytes(out)
+
+
+@pytest.mark.asyncio
+async def test_large_write_survives_busy_child():
+    """A paste larger than the kernel PTY buffer into a child that isn't
+    reading yet must arrive intact: the non-blocking master returns partial
+    writes / EAGAIN and the relay buffers + flushes the remainder (dropping it
+    loses injected prompts — the delegate-wake bug)."""
+    import sys
+
+    child = (
+        "import os,sys,time,tty\n"
+        "tty.setraw(0)\n"
+        "sys.stdout.write('READY');sys.stdout.flush()\n"
+        "time.sleep(0.7)\n"
+        "n=0\n"
+        "while n < 200000:\n"
+        "    n += len(os.read(0, 65536))\n"
+        "sys.stdout.write('GOT:%d:END' % n);sys.stdout.flush()\n"
+    )
+    out, on_output = _collector()
+    loop = asyncio.get_running_loop()
+    fut, on_exit = _exit_future(loop)
+    proc = spawn_pty([sys.executable, "-u", "-c", child], env=_ENV,
+                     on_output=on_output, on_exit=on_exit)
+    try:
+        for _ in range(100):
+            if b"READY" in bytes(out):
+                break
+            await asyncio.sleep(0.05)
+        assert b"READY" in bytes(out)
+        proc.write(b"x" * 200000)
+        for _ in range(160):
+            if b"GOT:200000:END" in bytes(out):
+                break
+            await asyncio.sleep(0.05)
+        assert b"GOT:200000:END" in bytes(out)
+    finally:
+        proc.terminate()
+    await asyncio.wait_for(fut, 5)

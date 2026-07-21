@@ -13,6 +13,7 @@ _session_cumulative_cost) lives here and is imported by ws/dashboard.py.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -480,6 +481,19 @@ class ChatStreamPump:
             # can route new chats to the least-consumed account (headroom routing).
             sub_id = subscription_pool.get_session_subscription(self.session_id) or "default"
 
+            # Agent scope must mean platform-paid. A Shared-only agent's human
+            # chat mounts agent scope but runs on the interacting USER's
+            # subscription (the chat row's owner is the synthetic agent::{slug},
+            # not a person) — bill it to the payer so it lands in their Usage
+            # tab, not the agent bucket. Platform-paid sources (tasks, phone,
+            # meetings, service sessions) acquire agent-scope and have no payer,
+            # so they are untouched.
+            if self.scope == "agent":
+                payer = subscription_pool.get_session_payer_sub(self.session_id)
+                if payer:
+                    common["user_sub"] = payer
+                    common["scope"] = "user"
+
             rows: list[dict] = [{
                 **common,
                 "cost_usd": llm_cost,
@@ -570,8 +584,8 @@ class ChatStreamPump:
                     self.chat_id, "running",
                     only_from=("completed", "failed", "cancelled", "limit_exceeded"),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("resumed-task run status open failed: %s", e)
 
         try:
             while True:
@@ -596,10 +610,8 @@ class ChatStreamPump:
                 _touch_now = time.monotonic()
                 if _touch_now - self._activity_touch >= 60.0:
                     self._activity_touch = _touch_now
-                    try:
+                    with contextlib.suppress(Exception):
                         await asyncio.to_thread(task_store.touch_chat, self.chat_id)
-                    except Exception:
-                        pass
 
                 if event.type == ERROR:
                     err_msg = event.data.get("message", "")
@@ -736,10 +748,8 @@ class ChatStreamPump:
         finally:
             self._done = True
             self.producer.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.producer
-            except (asyncio.CancelledError, Exception):
-                pass
 
             # Save any unflushed text/events (error recovery)
             self._flush_pending_text()
@@ -830,13 +840,11 @@ class ChatStreamPump:
                 # A response (possibly partial, on abort) landed on this chat —
                 # stamp it for the sidebar unread indicator. Superseded pumps
                 # skip (the newer pump owns the chat's lifecycle).
-                try:
+                with contextlib.suppress(Exception):
                     task_store.update_chat(
                         self.chat_id,
                         last_response_at=datetime.now(timezone.utc).isoformat(),
                     )
-                except Exception:
-                    pass
                 if self.chat_id.startswith("task-run-") and self.source_type != "task":
                     # Close the resumed-task History row (mirror of the
                     # 'running' flip at turn start): the user stopping the
@@ -850,8 +858,8 @@ class ChatStreamPump:
                             "cancelled" if self._abort_requested else "completed",
                             only_from=("running",),
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("resumed-task run status close failed: %s", e)
 
             # Signal any remaining subscriber
             if self._ws_queue:
@@ -1421,6 +1429,18 @@ class ChatStreamPump:
                 self._turn_blocks.append(evt)
                 if live:
                     live["live_blocks"].append(evt)
+            elif phase == "usage":
+                # Post-compaction gauge state (no chip, not a turn block): a
+                # compaction at/after turn end has no follow-up METADATA frame,
+                # so the compacted size is persisted here — a reopened chat
+                # must not show the pre-compaction gauge.
+                post = int(ed.get("post_tokens", 0) or 0)
+                if post > 0:
+                    self._context_used = post
+                    if ed.get("context_max"):
+                        self._context_max = int(ed["context_max"])
+                    if self.chat_id:
+                        task_store.update_chat(self.chat_id, context_used=post)
 
         elif event.type == SYSTEM:
             subtype = ed.get("subtype", "")
@@ -1791,6 +1811,11 @@ class ChatStreamPump:
                 live["live_blocks"].append(evt)
         elif evt_type == "permission_prompt":
             # Gate: only show one blocking prompt at a time
+            await self._queue_or_show_permission(perm_data)
+        elif evt_type == "question_prompt":
+            # Codex request_user_input — the daemon holds the turn open until
+            # question_response resolves it, so this MUST reach the blocking-
+            # prompt gate (card + reconnect replay); dropping it hangs the turn.
             await self._queue_or_show_permission(perm_data)
         elif evt_type == "plan_review":
             plan_content = perm_data.get("plan", "")

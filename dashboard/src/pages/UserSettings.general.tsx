@@ -191,6 +191,7 @@ export function TwoFactorSection() {
   const { user, setUser } = useAuth()
   const [passkeys, setPasskeys] = useState<PasskeyInfo[]>([])
   const [pkFeature, setPkFeature] = useState(false)
+  const [pkRpHost, setPkRpHost] = useState('')
   const [loaded, setLoaded] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')  // rendered INSIDE the open box
@@ -222,6 +223,7 @@ export function TwoFactorSection() {
       const data = await listPasskeys()
       setPasskeys(data.passkeys)
       setPkFeature(data.enabled)
+      setPkRpHost(data.rp_host || '')
     } catch { /* list stays empty */ }
     finally { setLoaded(true) }
   }
@@ -307,7 +309,10 @@ export function TwoFactorSection() {
 
   const boxError = error && <div className="text-sm text-p-accent-red">{error}</div>
   const nothingEnrolled = passkeys.length === 0 && !user?.totp_enabled
-  const canAddPasskey = pkFeature && passkeySupported()
+  // RP-bound: enrolling from an origin other than the configured public host
+  // would fail in the browser — hide the button and explain instead.
+  const pkRpMismatch = !!pkRpHost && window.location.hostname !== pkRpHost
+  const canAddPasskey = pkFeature && passkeySupported() && !pkRpMismatch
 
   return (
     <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
@@ -485,6 +490,11 @@ export function TwoFactorSection() {
                   Passkeys need this platform to be served from an HTTPS address — ask your administrator.
                 </p>
               )}
+              {pkRpMismatch && (
+                <p className="text-[10px] text-p-text-light">
+                  Passkeys can only be added and used at https://{pkRpHost} — open OtoDock there.
+                </p>
+              )}
             </div>
           ) : (
             <div className="flex flex-wrap items-center gap-3">
@@ -496,6 +506,11 @@ export function TwoFactorSection() {
               {!user?.totp_enabled && (
                 <button onClick={startTotpSetup} disabled={busy}
                   className="text-xs font-medium text-brand hover:text-brand-hover disabled:opacity-50">+ Set up an authenticator app</button>
+              )}
+              {pkRpMismatch && (
+                <p className="w-full text-[10px] text-p-text-light">
+                  Passkeys can only be added and used at https://{pkRpHost} — open OtoDock there.
+                </p>
               )}
             </div>
           )

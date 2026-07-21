@@ -9,7 +9,6 @@ import base64
 import os
 from pathlib import Path
 
-import pytest
 
 
 def test_symlink_skipped_from_manifest(tmp_path: Path):

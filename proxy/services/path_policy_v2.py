@@ -396,9 +396,12 @@ def _protected_path_denial(normalized: str, *, writing: bool) -> str:
     Universal (read + write, every path kind): OAuth credential token dirs and
     SSH key material — neither has any legitimate agent path-tool use, and both
     live under the OS user's ``$HOME`` so home-only mode would otherwise admit
-    them. ``.env`` files are write-protected everywhere (parity with local);
-    ``.env`` *reads* are gated separately for pure satellite-host paths so an
-    agent's own in-tree workspace ``.env`` stays readable, matching local.
+    them. One exact READ carve-out: ``.ssh/config`` + ``.ssh/known_hosts*``
+    (directly under a ``.ssh`` dir) are host/alias metadata a session that may
+    RUN ssh legitimately needs — see the inline comment below. ``.env`` files
+    are write-protected everywhere (parity with local); ``.env`` *reads* are
+    gated separately for pure satellite-host paths so an agent's own in-tree
+    workspace ``.env`` stays readable, matching local.
 
     NOTE (residual): matching is name-based on the normalized path. A symlink
     placed on the satellite (``~/safe -> ~/.ssh``) would defeat it; fully
@@ -418,7 +421,18 @@ def _protected_path_denial(normalized: str, *, writing: bool) -> str:
         return "agent CLI config files are protected"
     segs = [p for p in normalized.split("/") if p]
     if any(s.lower() == ".ssh" for s in segs):
-        return "access to .ssh key material is denied"
+        # Read-only carve-out: ``.ssh/config`` + ``.ssh/known_hosts*`` are
+        # host/alias METADATA, not key material — a session that is allowed
+        # to RUN ssh (which uses the keys without disclosing them) needs
+        # them to know its destinations. Keys and every other file stay
+        # denied, and ALL writes stay denied: a config write would plant
+        # ``ProxyCommand`` (code execution on the operator's next ssh).
+        if (not writing and len(segs) >= 2 and segs[-2].lower() == ".ssh"
+                and (segs[-1].lower() == "config"
+                     or segs[-1].lower().startswith("known_hosts"))):
+            pass
+        else:
+            return "access to .ssh key material is denied"
     if writing and segs and segs[-1].lower() == ".env":
         return ".env files are write-protected"
     return ""

@@ -89,8 +89,9 @@ def test_interactive_argv_drops_headless_flags_keeps_shared():
     assert "--effort" in cmd and "high" in cmd
     assert "--session-id" in cmd
     # Interactive uses a real --permission-mode, NOT --dangerously-skip-permissions:
-    # no bypass-mode warning at launch + the PreToolUse hook's block-and-wait
-    # freezes the TUI on a gated tool until the dashboard decides.
+    # no bypass-mode warning at launch + the PreToolUse hook returns an explicit
+    # "ask" for the residual ask-tier, so the TUI renders its native prompt
+    # (see test_interactive_permission_mode.py).
     assert "--dangerously-skip-permissions" not in cmd
     assert "--permission-mode" in cmd
     # The TUI has AskUserQuestion natively — no stdio prompt tool.

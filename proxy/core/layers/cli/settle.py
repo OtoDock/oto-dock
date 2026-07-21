@@ -27,31 +27,36 @@ logger = logging.getLogger("cli-settle")
 # (e.g. a research subagent) legitimately runs for minutes.
 _SETTLE_PENDING_CEILING = 600.0
 
-# --- Foreign-result gating (interactive turns) -----------------------------
+# --- Foreign-result gating -------------------------------------------------
 #
 # After a ``claude --resume`` respawn, a `result` event can reach the turn
 # loop that does NOT belong to the driven prompt: the resume handshake
 # mini-turn ("Continue from where you left off." → "No response requested."
 # → result — its messages land only in the session JSONL, so zero content
-# streams before its result), or a stale result from the replaced process's
-# dying flush racing past the send-start drain. Ending the turn there
-# orphans the real answer (the Mode D incident: pump ended blocks=0 one
-# second after send; the answer was written to the JSONL 50s later with no
-# pump attached). These helpers let both turn loops re-arm across such
-# results instead of closing the turn.
+# streams before its result), a stale result from the replaced process's
+# dying flush racing past the send-start drain, or a whole BURST of
+# zero-content settlement mini-turns when the resumed transcript held
+# queued task-notifications / dangling subagent tool_uses (the 2026-07-20
+# incident: 6+ empty results closed the turn before the driven prompt's
+# first token). Foreign results are therefore ALWAYS skipped — a count can
+# never end a turn — and the post-skip silence valve is the sole closer for
+# the skip regime (see ForeignSkipGate). Applies to interactive AND task
+# turns: a foreign result must not enter settle either, or the 5s
+# job-done fast-grace closes the turn just the same.
 
-# The CLI's fixed handshake reply. String-matching CLI-synthesized text is
-# tolerable because the fleet CLI version is pinned (VERSIONS.md); the
-# content-count guard below catches the shape even if this string drifts.
-RESUME_HANDSHAKE_RESULT = "No response requested."
+from core.layers.cli.translator import RESUME_HANDSHAKE_RESULT  # noqa: F401 — re-export; historical home
 
-# Pathology bound: never re-arm more than this many times per turn.
+# Log throttle: warn per skip up to this many, then stay silent (the skip
+# REGIME is unbounded by design — the valve, not a count, ends it).
 FOREIGN_RESULT_SKIP_CAP = 5
 
-# After skipping a foreign result, how long to wait for the driven turn to
-# produce anything before closing the turn anyway (a legit empty-content
-# result that we mis-skipped must not hang the turn forever).
-FOREIGN_SKIP_SILENCE_S = 60.0
+# After skipping a foreign result, how long the valve waits with NO further
+# events before closing the turn anyway (a legit empty-content result that
+# we mis-skipped must not hang the turn forever). Sized to also cover
+# first-token latency after a settlement burst on a big resumed context
+# (incident measured 24s TTFT; 60s left too little margin — a false expiry
+# orphans the driven turn).
+FOREIGN_SKIP_SILENCE_S = 120.0
 
 
 def is_foreign_result(raw: dict, content_chunks: int) -> bool:
@@ -81,6 +86,76 @@ def chunk_is_content(chunk) -> bool:
     if et == "thinking":
         return chunk.event_data.get("phase") != "progress"
     return et in ("tool_start", "tool_info", "task_spawn", "delegate_spawn")
+
+
+class ForeignSkipGate:
+    """Per-turn foreign-result skip regime, shared by both CLI turn loops.
+
+    State machine:
+    - UNARMED until the first skipped foreign result.
+    - ARMED: every arriving event SLIDES the valve deadline (a noise frame
+      must not disarm the sole closer — and a healthy mid-turn CLI keeps
+      sliding it via its own events); only a proven content chunk CLEARS
+      the regime. Valve expiry = nothing followed the skip regime → the
+      caller closes the turn (legit empty answer / truly idle CLI).
+    - Content is counted SINCE THE LAST SKIP, so a burst's own junk text
+      cannot flip the next zero-content result to "real".
+
+    The foreign-or-not decision stays in the caller (module-level
+    `is_foreign_result` — test fixtures monkeypatch it per loop module);
+    the gate owns the regime state + the per-skip translator reset.
+    """
+
+    __slots__ = ("session_id", "translator", "content_since_skip", "skips",
+                 "deadline")
+
+    def __init__(self, session_id: str, translator: ClaudeCLIEventTranslator):
+        self.session_id = session_id
+        self.translator = translator
+        self.content_since_skip = 0
+        self.skips = 0
+        self.deadline: float | None = None
+
+    def clamp_timeout(self, timeout: float) -> float:
+        """Bound the loop's read timeout so valve expiry is observed."""
+        if self.deadline is None:
+            return timeout
+        return min(timeout, max(0.5, self.deadline - time.monotonic()))
+
+    def note_event(self) -> None:
+        """An event arrived — slide the valve if armed (never disarm)."""
+        if self.deadline is not None:
+            self.deadline = time.monotonic() + FOREIGN_SKIP_SILENCE_S
+
+    def note_content(self) -> None:
+        """A content chunk streamed — the driven turn is live; regime over."""
+        self.content_since_skip += 1
+        self.deadline = None
+
+    def expired(self) -> bool:
+        return (self.deadline is not None
+                and time.monotonic() >= self.deadline)
+
+    def re_arm(self) -> None:
+        """Push the deadline out (valve expiry deferred — e.g. the machine
+        is in reconnect grace and Mode A may still deliver the turn)."""
+        self.deadline = time.monotonic() + FOREIGN_SKIP_SILENCE_S
+
+    def record_skip(self, raw: dict) -> None:
+        """A foreign result was skipped: arm/slide the valve, restart the
+        content-since-skip window, clear stale parse state, log (throttled)."""
+        self.skips += 1
+        self.content_since_skip = 0
+        self.deadline = time.monotonic() + FOREIGN_SKIP_SILENCE_S
+        self.translator.reset_for_foreign_skip()
+        if self.skips <= FOREIGN_RESULT_SKIP_CAP:
+            suffix = (" (further skips unlogged)"
+                      if self.skips == FOREIGN_RESULT_SKIP_CAP else "")
+            logger.warning(
+                "[%s] skipping foreign result (skips=%d, result=%r)%s",
+                self.session_id[:8], self.skips,
+                str(raw.get("result", ""))[:80], suffix,
+            )
 
 
 class SettleController:

@@ -24,6 +24,7 @@ full history regardless of channel.
 """
 
 import asyncio
+import contextlib
 import logging
 import zoneinfo
 from dataclasses import dataclass
@@ -161,8 +162,8 @@ def broadcast_chat_status(owner_sub: str, chat_id: str, status: str, agent: str 
         for c in _user_connections.get(sub, []):
             try:
                 c.queue.put_nowait({"type": "chat_status", "chat_id": chat_id, "status": status})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("chat_status broadcast: %s", e)
 
 
 def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
@@ -176,8 +177,8 @@ def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
         for c in _user_connections.get(sub, []):
             try:
                 c.queue.put_nowait({"type": "chat_read", "chat_id": chat_id})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("chat_read broadcast: %s", e)
 
 
 def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> None:
@@ -192,8 +193,8 @@ def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> Non
     for c in _user_connections.get(user_sub, []):
         try:
             c.queue.put_nowait({"type": "goal_update", "chat_id": chat_id, "goal": goal})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("goal_update broadcast: %s", e)
 
 
 def broadcast_chat_rows(user_sub: str, chat_id: str, agent: str = "") -> None:
@@ -209,8 +210,8 @@ def broadcast_chat_rows(user_sub: str, chat_id: str, agent: str = "") -> None:
         try:
             c.queue.put_nowait(
                 {"type": "chat_rows", "chat_id": chat_id, "agent": agent})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("chat_rows broadcast: %s", e)
 
 
 def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "") -> None:
@@ -228,8 +229,8 @@ def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "
         for c in _user_connections.get(sub, []):
             try:
                 c.queue.put_nowait({"type": "title_updated", "chat_id": chat_id, "title": title})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("title_updated broadcast: %s", e)
 
 
 # --- Per-chat turn origin (which device sent the last user prompt) ---
@@ -773,10 +774,8 @@ def unregister_notification(notification_id: str) -> None:
     if config.SCHEDULER_MODE == "standalone" or not _scheduler_ref:
         return
     job_id = f"notif_{notification_id}"
-    try:
+    with contextlib.suppress(Exception):  # job may not exist
         _scheduler_ref.remove_job(job_id)
-    except Exception:
-        pass  # job may not exist
 
 
 async def _fire_scheduled_notification(notification_id: str) -> None:

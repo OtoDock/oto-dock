@@ -87,6 +87,16 @@ export interface WsCallbacks {
     // the human-readable name of the user's offline target machine so
     // the dashboard can render the brief soft-fallback banner.
     offline_machine_name?: string
+    // Pin-vs-current-target mismatch. Present ONLY when the open chat is
+    // pinned to an execution target different from the agent's currently-
+    // resolved one AND the viewer is the chat owner/admin. Absent = no
+    // mismatch — any previously stored mismatch for the chat is cleared
+    // (the fresh warmup after a successful move carries no fields).
+    // Drives the ChatTargetBanner + the sidebar kebab's move row.
+    pinned_target?: string
+    pinned_label?: string
+    resolved_target?: string
+    resolved_label?: string
   }) => void
   // Warmup lifecycle events — chat-level. All carry chat_id so the
   // dispatcher routes into the per-chat store regardless of which chat is
@@ -100,6 +110,11 @@ export interface WsCallbacks {
     execution_target?: string
   }) => void
   onWarmupFailed?: (data: { chat_id: string; error: string }) => void
+  // move_chat ack — the connection's OPEN chat was rebound to the agent's
+  // current target (session cleared server-side). The consumer re-resumes
+  // the chat so the fresh warmup runs there and the "moved" history card
+  // arrives. Failures come as standard error frames (toasts), not this.
+  onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
   // Auto-update: satellite lifecycle events broadcast to every
   // dashboard with access to the affected machine. Dispatched into
   // machineUpdateStore so the banner survives chat navigation.
@@ -162,7 +177,7 @@ export interface WsCallbacks {
   }) => void
   onTodoUpdate?: (data: { todos: Array<{ content: string; status: string; activeForm?: string }> }) => void
   onGoalUpdate?: (data: { goal: ThreadGoal | null }) => void
-  onContextCompact?: (data: { phase: string; trigger?: string; pre_tokens?: number; post_tokens?: number; messages_summarized?: number }) => void
+  onContextCompact?: (data: { phase: string; trigger?: string; pre_tokens?: number; post_tokens?: number; context_max?: number; messages_summarized?: number }) => void
   onNotification?: (data: { delivery: any }) => void
   // Silent inbox/badge update — fires on connected-but-inactive WS so the inbox stays in
   // sync while the user is on another tab or in the background. No toast, no sound.

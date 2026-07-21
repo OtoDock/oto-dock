@@ -37,6 +37,7 @@ All functions are synchronous (call via asyncio.to_thread).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -299,6 +300,47 @@ def looks_like_limit_error(message: str) -> bool:
 # Anthropic OAuth token endpoint and client_id (from Claude Code CLI v2.1.97+)
 _ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+
+
+def _derive_subscription_fields(profile: dict) -> tuple[str, str]:
+    """Map ``/api/oauth/profile`` JSON to the ``(subscriptionType,
+    rateLimitTier)`` pair of ``.credentials.json``. The Claude Code TUI gates
+    plan-included models (e.g. Fable 5 on Max) on ``subscriptionType`` — an
+    empty value makes it classify the login as API/credits and refuse them."""
+    account = profile.get("account") or {}
+    org = profile.get("organization") or {}
+    if account.get("has_claude_max"):
+        sub_type = "max"
+    elif account.get("has_claude_pro"):
+        sub_type = "pro"
+    else:
+        # organization_type is "claude_<tier>" (claude_max, claude_enterprise, …)
+        sub_type = str(org.get("organization_type") or "").removeprefix("claude_")
+    return sub_type, str(org.get("rate_limit_tier") or "")
+
+
+def fetch_anthropic_subscription_fields(access_token: str) -> tuple[str, str]:
+    """Best-effort plan-tier lookup for an Anthropic OAuth access token.
+
+    The token endpoint does not echo the plan tier, so it is resolved from the
+    profile endpoint the CLI itself uses. Returns ``("", "")`` on any failure —
+    callers treat that as "keep whatever is stored"."""
+    try:
+        import httpx as _httpx
+        resp = _httpx.get(
+            _ANTHROPIC_PROFILE_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return "", ""
+        return _derive_subscription_fields(resp.json())
+    except Exception:
+        return "", ""
 
 # Auth types a NON-owner user may borrow from the admin pool. OAuth consumer
 # subscriptions are deliberately excluded (they are strictly per-owner). To
@@ -583,6 +625,21 @@ def acquire_subscription(
             or _select(platform, allowed_auth=None)
 
     if handle and sticky_scope:
+        # Stickiness can only bridge sessions whose candidate lists overlap. A
+        # Shared-only agent's chats share ONE credential dir across ALL users
+        # (sender-pays: each user's session runs on their own account), so two
+        # users concurrently active on such an agent land different accounts on
+        # the same file — the last-write-wins flap stickiness exists to prevent.
+        # Surface it loudly; the full fix is per-payer credential delivery
+        # for shared scopes.
+        held = _sticky_subscription_id(sticky_scope)
+        if held and held != handle.subscription_id:
+            logger.warning(
+                f"Pool: credential scope {sticky_scope!r} is live on subscription "
+                f"{held[:8]} but this spawn selected {handle.subscription_id[:8]} "
+                f"(different payer) — concurrent sessions on this scope may "
+                f"contend over the shared credential file"
+            )
         # Commit the scope to this account for the acquire→bind window, so a
         # concurrent same-scope spawn can't pick a different one meanwhile.
         with _session_maps_lock:
@@ -692,8 +749,9 @@ def release_subscription(session_id: str) -> None:
         sub_id = _session_subscriptions.pop(session_id, None)
     try:
         subscription_store.delete_session_binding(session_id)
-    except Exception:
-        pass  # persisted mirror only — the startup TTL prune is the backstop
+    except Exception as e:
+        # persisted mirror only — the startup TTL prune is the backstop
+        logger.debug("session binding delete: %s", e)
     if sub_id:
         subscription_store.decrement_active_sessions(sub_id)
         logger.info(f"Pool: released subscription {sub_id[:8]} for session {session_id[:8]}")
@@ -730,6 +788,7 @@ def bind_session(
     """
     exp = _issued_token_expiry.get(subscription_id)
     with _session_maps_lock:
+        prior_sub = _session_subscriptions.get(session_id)
         _session_subscriptions[session_id] = subscription_id
         if layer and user_sub is not None:
             _session_binding_ctx[session_id] = (layer, user_sub)
@@ -759,6 +818,21 @@ def bind_session(
         )
     except Exception:
         logger.exception("Pool: persisting session binding failed (in-memory binding stands)")
+    # Re-bind of a live session (start_session reusing a warm process): the
+    # spawn flow acquired a FRESH seat for this round, so the replaced
+    # binding's seat must be released — same-sub included (two increments,
+    # one binding, one eventual release = +1 leak per warm continue round).
+    # Historically masked because a close always released the old binding
+    # before the next round's bind; a gracefully-aborted lane's session now
+    # stays warm across rounds. Only the layer spawn flows re-bind live
+    # sessions: restore_session_binding no-ops on a live binding and the
+    # selection rebind moves seats itself without bind_session.
+    if prior_sub:
+        subscription_store.decrement_active_sessions(prior_sub)
+        logger.info(
+            f"Pool: re-bound session {session_id[:8]} "
+            f"{prior_sub[:8]} → {subscription_id[:8]} (replaced seat released)"
+        )
 
 
 def get_session_subscription(session_id: str) -> str | None:
@@ -780,6 +854,72 @@ def get_session_subscription(session_id: str) -> str | None:
     if isinstance(row, dict):
         return row.get("subscription_id") or None
     return None
+
+
+def restore_session_binding(session_id: str) -> str | None:
+    """Re-establish the IN-MEMORY binding for a session that survived a proxy
+    restart (Mode C re-adopt). The persisted row keeps attribution working
+    read-through, but rotation fan-out and the freshness worker enumerate the
+    in-memory maps only — without this, a re-adopted session misses every
+    future token rotation. Also re-takes the seat the boot-time
+    ``reset_active_sessions()`` zeroed, so a later release's decrement stays
+    balanced (decrement floors at 0 either way).
+
+    Idempotent: an already-live binding is returned untouched. Returns the
+    subscription id, or None when no persisted binding exists (api-key
+    sessions, pool-external credentials)."""
+    with _session_maps_lock:
+        live = _session_subscriptions.get(session_id)
+    if live:
+        return live
+    try:
+        row = subscription_store.get_session_binding(session_id)
+    except Exception:
+        logger.exception("Pool: reading persisted binding failed on restore")
+        return None
+    if not isinstance(row, dict) or not row.get("subscription_id"):
+        return None
+    sub_id = row["subscription_id"]
+    bind_session(
+        session_id, sub_id,
+        layer=row.get("layer") or "",
+        user_sub=row.get("user_sub"),
+        scope_key=row.get("scope_key") or "",
+    )
+    try:
+        subscription_store.increment_active_sessions(sub_id)
+    except Exception:
+        logger.exception("Pool: re-taking seat on restore failed (continuing)")
+    logger.info(
+        "Pool: restored binding for re-adopted session %s -> %s",
+        session_id[:8], sub_id[:8],
+    )
+    return sub_id
+
+
+def get_session_payer_sub(session_id: str) -> str:
+    """The ``user_sub`` whose subscription this session acquired.
+
+    ``""`` means platform/agent-pool paid (agent-scope acquisition) or
+    unknown (no binding — e.g. credentials outside the pool). Same
+    read-through as :func:`get_session_subscription`: the in-memory
+    acquisition context first, then the persisted binding so usage
+    attribution survives a proxy restart. Usage recording uses this to
+    bill a Shared-only agent's human chats to the interacting user
+    (whose subscription actually served the turn) instead of the agent
+    bucket.
+    """
+    with _session_maps_lock:
+        ctx = _session_binding_ctx.get(session_id)
+    if ctx is not None:
+        return ctx[1] or ""
+    try:
+        row = subscription_store.get_session_binding(session_id)
+    except Exception:
+        return ""
+    if isinstance(row, dict):
+        return row.get("user_sub") or ""
+    return ""
 
 
 def session_token_expiry_ms(session_id: str) -> int | None:
@@ -932,8 +1072,9 @@ def _move_seat(old_sub: str, new_sub: str, session_id: str = "") -> None:
         if session_id:
             try:
                 subscription_store.update_session_binding_sub(session_id, new_sub)
-            except Exception:
-                pass  # persisted mirror only; memory is authoritative live
+            except Exception as e:
+                # persisted mirror only; memory is authoritative live
+                logger.debug("session binding rebind: %s", e)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1511,14 +1652,26 @@ def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> str | Non
         new_refresh = data.get("refresh_token", refresh_token)
         expires_in = data.get("expires_in", 28800)
 
+        # The refresh response does not echo the plan tier — preserve the
+        # stored values (overwriting them with "" strips the tier on every
+        # 8h rotation, and the TUI then gates Max-included models behind
+        # usage credits). Backfill once from the profile endpoint when the
+        # stored values are empty too.
+        old = subscription_store.get_credential_data(sub_id).get("oauth_token") or {}
+        sub_type = data.get("subscriptionType") or old.get("subscriptionType") or ""
+        rate_tier = data.get("rateLimitTier") or old.get("rateLimitTier") or ""
+        if not sub_type and new_access:
+            sub_type, fetched_tier = fetch_anthropic_subscription_fields(new_access)
+            rate_tier = rate_tier or fetched_tier
+
         new_cred = {
             "oauth_token": {
                 "accessToken": new_access,
                 "refreshToken": new_refresh,
                 "expiresAt": int((time.time() + expires_in) * 1000),
                 "scopes": data.get("scope", "").split() if data.get("scope") else [],
-                "subscriptionType": data.get("subscriptionType", ""),
-                "rateLimitTier": data.get("rateLimitTier", ""),
+                "subscriptionType": sub_type,
+                "rateLimitTier": rate_tier,
             }
         }
         subscription_store.update_credential_data(sub_id, new_cred)
@@ -1647,13 +1800,11 @@ def _resolve_oauth_access_token(
             # The refresher persisted the rotated credential; re-read for the
             # fresh token's real expiry (provider-reported expires_in).
             new_expires = 0
-            try:
+            with contextlib.suppress(Exception):
                 new_expires = int(
                     (subscription_store.get_credential_data(sub_id).get("oauth_token") or {})
                     .get("expiresAt") or 0
                 )
-            except Exception:
-                pass
             return new_access, new_expires
 
         attempts = (backoff_entry[1] + 1) if backoff_entry else 1

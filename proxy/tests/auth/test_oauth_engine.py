@@ -72,10 +72,8 @@ def test_purge_runs_during_create():
     """Expired states should be purged on the next create_state call.
     Verify by counting active states across an expiry boundary."""
     # Mint a bunch of states; all unexpired.
-    tokens = [
+    for i in range(3):
         oauth_engine.create_state(user_sub=f"u{i}", mcp_name="m", provider_id="p")
-        for i in range(3)
-    ]
     n_before = oauth_engine.active_state_count()
     assert n_before >= 3
 

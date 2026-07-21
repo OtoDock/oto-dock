@@ -7,6 +7,7 @@ this server no longer reports cost.
 """
 
 import base64
+import contextlib
 import io
 import logging
 import os
@@ -553,9 +554,6 @@ async def _edit_openai(image_path: str, prompt: str, mask_path: str | None,
     Multipart passes through the relay intact (the relay forwards the raw body +
     Content-Type and injects the vendor key)."""
     url, headers, params = _vendor_request_args("openai-image", "/v1/images/edits")
-    files: dict = {"image": (os.path.basename(image_path), open(image_path, "rb"))}
-    if mask_path and os.path.isfile(mask_path):
-        files["mask"] = (os.path.basename(mask_path), open(mask_path, "rb"))
     # Send an explicit quality + size so the hosted relay prices the edit
     # deterministically (its variant matrix) instead of the safe-high fallback.
     # 'high' → sharper/pricier; anything else → 'medium' (the default). Mirrors
@@ -563,19 +561,22 @@ async def _edit_openai(image_path: str, prompt: str, mask_path: str | None,
     q = "high" if quality == "high" else "medium"
     form = {"model": "gpt-image-1", "prompt": prompt, "n": "1",
             "size": "1024x1024", "quality": q}
-    try:
+    # Handles enter the stack as they open, so a failure between open and
+    # send can't leak them past the with.
+    with contextlib.ExitStack() as stack:
+        files = {
+            "image": (os.path.basename(image_path),
+                      stack.enter_context(open(image_path, "rb"))),
+        }
+        if mask_path and os.path.isfile(mask_path):
+            files["mask"] = (os.path.basename(mask_path),
+                             stack.enter_context(open(mask_path, "rb")))
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             resp = await client.post(
                 url, params=params, headers=headers, data=form, files=files,
             )
             resp.raise_for_status()
             data = resp.json()
-    finally:
-        for _name, fh in files.values():
-            try:
-                fh.close()
-            except Exception:
-                pass
     items = data.get("data") or []
     if items and items[0].get("b64_json"):
         return base64.b64decode(items[0]["b64_json"])

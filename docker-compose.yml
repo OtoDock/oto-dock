@@ -93,9 +93,13 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.2.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.3.0}
     restart: unless-stopped
     logging: *default-logging
+    # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
+    # session-close cap must fit before docker escalates to SIGKILL — the
+    # default 10s force-killed every stop mid-drain (exit 137).
+    stop_grace_period: 60s
     # Memory cap — DEFAULT 0 = unlimited (the proxy uses all host RAM for max
     # session concurrency; the live-RAM admission gates self-protect via Gate-2's
     # host MemAvailable read + LRU session eviction + swap). Operators sharing the
@@ -227,7 +231,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.2.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.3.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -251,7 +255,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.2.0}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.3.0}
     restart: unless-stopped
     logging: *default-logging
     environment:

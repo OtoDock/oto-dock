@@ -27,6 +27,7 @@ as defence in depth.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -241,10 +242,9 @@ async def _invoke_quarantined(
             setter(value)
 
     def _post(setter, value) -> None:
-        try:
+        # main loop already closed — nothing to deliver to
+        with contextlib.suppress(RuntimeError):
             loop.call_soon_threadsafe(_deliver, setter, value)
-        except RuntimeError:
-            pass  # main loop already closed — nothing to deliver to
 
     def _worker() -> None:
         try:

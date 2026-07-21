@@ -271,3 +271,59 @@ class TestSpawnCap:
 
 def test_invalid_scope_400(delegation_env):
     _denied(_admin(), 400, scope="global")
+
+
+class TestValidateSpawnOverrides:
+    """delegate() model/layer override validation — the accepted set must be
+    exactly what the delegation roster advertises (enabled models only)."""
+
+    def _agent(self, monkeypatch, path="claude-code-cli", extras=""):
+        from services.delegation import spawn_authz
+        monkeypatch.setattr(
+            spawn_authz.agent_store, "get_agent",
+            lambda slug: {"execution_path": path, "execution_paths": extras})
+
+    def _models(self, monkeypatch, rows):
+        from storage import subscription_store
+        monkeypatch.setattr(subscription_store, "list_models",
+                            lambda layer=None: rows)
+
+    def test_enabled_model_accepted(self, monkeypatch):
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        self._agent(monkeypatch)
+        self._models(monkeypatch, [{"model_id": "m1", "enabled": True}])
+        validate_spawn_overrides("w", None, "m1")  # no raise
+
+    def test_disabled_model_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        self._agent(monkeypatch)
+        self._models(monkeypatch, [{"model_id": "m1", "enabled": False}])
+        with pytest.raises(HTTPException):
+            validate_spawn_overrides("w", None, "m1")
+
+    def test_unknown_model_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        self._agent(monkeypatch)
+        self._models(monkeypatch, [{"model_id": "m1", "enabled": True}])
+        with pytest.raises(HTTPException):
+            validate_spawn_overrides("w", None, "m-nope")
+
+    def test_registry_error_fails_open(self, monkeypatch):
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        from storage import subscription_store
+
+        def _boom(layer=None):
+            raise RuntimeError("db down")
+
+        self._agent(monkeypatch)
+        monkeypatch.setattr(subscription_store, "list_models", _boom)
+        validate_spawn_overrides("w", None, "m1")  # no raise
+
+    def test_disallowed_layer_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+        from services.delegation.spawn_authz import validate_spawn_overrides
+        self._agent(monkeypatch, path="claude-code-cli")
+        with pytest.raises(HTTPException):
+            validate_spawn_overrides("w", "codex-cli", None)

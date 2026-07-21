@@ -39,6 +39,19 @@
     }
   ],
 
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "list_tasks",
+        "tier": "open"
+      },
+      {
+        "tool": "get_*",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

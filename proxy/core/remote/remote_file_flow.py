@@ -147,6 +147,13 @@ def _host_cache_paths(
     return cache_dir / basename, cache_dir / "_meta.json"
 
 
+def host_cache_session_root(session_id: str) -> Path:
+    """Root of THIS session's lazy-pull host cache. RBAC carve-outs key on
+    it: the cache holds only files this session's own path policy admitted
+    at pull time, and other sessions' caches stay invisible."""
+    return _host_cache_root() / session_id
+
+
 # --- Pull-stat revalidation (satellite ≥ 0.5.95) ---------------------------
 #
 # Both pull paths historically re-transferred the FULL file on every call —
@@ -546,6 +553,18 @@ async def pull_through(session_id: str, rel_path: str) -> Path | None:
             agent_slug=info.agent_name,
         )
         if not ok:
+            # Serve the platform mirror when the satellite can't provide the
+            # file — most commonly a file the PLATFORM ITSELF just wrote
+            # (file-tools convert/write) whose flush hasn't landed on the
+            # satellite yet (write-then-preview race, live-hit 2026-07-19).
+            # Availability over freshness: the preview/display/media read
+            # paths prefer last-known bytes + a log line over a hard 400.
+            if host_path.is_file():
+                logger.info(
+                    "pull_through: satellite pull failed for %s — serving "
+                    "the platform mirror", rel_path,
+                )
+                return host_path
             return None
         # Record the PRE-pull probe for the next read's revalidation; a probe
         # that was unavailable leaves no record (next read pulls — the

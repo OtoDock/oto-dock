@@ -1,0 +1,66 @@
+{
+  "name": "tts-mcp",
+  "label": "Text-to-Speech",
+  "description": "Voice-over generation from text via the platform's TTS providers — browse voices, mix and match per language and style, save WAV files to the workspace.",
+  "version": "1.0.0",
+  "category": "custom",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "instances": {
+    "delivery": "env",
+    "fields": [
+      {"key": "TTS_PROVIDER_ID", "label": "TTS provider", "input_type": "tts_provider_select", "required": false}
+    ],
+    "max_instances": 0
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "path_env": {
+    "AUDIO_SAVE_DIR": {"role": "workspace"}
+  },
+  "assignment_mode": "explicit",
+  "requires_capability": "audio_tts",
+  "exclude_from": ["phone"],
+
+  "tool_arg_paths": {
+    "generate_speech": {
+      "save_path": { "mode": "write" }
+    }
+  },
+  "skills": [
+    {
+      "id": "voiceover",
+      "loading": "on_demand",
+      "file": "skills/voiceover/SKILL.md",
+      "description": "Produce narrated voice-overs: choose the right voice per video style and language, generate segments, hand them to video tools. Use when a video needs narration or a voice-over track.",
+      "default_exclude_from": ["phone"]
+    }
+  ],
+  "permissions": {
+    "default_tier": "sensitive",
+    "rules": [
+      {
+        "tool": "list_voices",
+        "tier": "open"
+      },
+      {
+        "tool": "search_voice_library",
+        "tier": "open"
+      },
+      {
+        "tool": "generate_speech",
+        "tier": "standard"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

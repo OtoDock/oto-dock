@@ -158,6 +158,127 @@ class TestResumeIdleChat:
 
 
 # ---------------------------------------------------------------------------
+# warmup_ready locality-mismatch fields (session-locality-ux W1).
+# ---------------------------------------------------------------------------
+
+def _insert_machine(machine_id, name):
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO remote_machines (id, name, registered_by, created_at) "
+            "VALUES (%s, %s, 'admin-1', '2026-06-11T00:00:00+00:00')",
+            (machine_id, name),
+        )
+        conn.commit()
+
+
+class TestWarmupTargetMismatchFields:
+    """`_target_mismatch_fields` on warmup_ready: a chat PINNED away from the
+    agent's INDEPENDENTLY-resolved current target advertises the mismatch —
+    to its owner (or a platform admin) only; unpinned chats and non-owner
+    viewers get the plain frame (a non-owner's resolve is role-forced local,
+    so the fields would advertise a move the move op refuses)."""
+
+    def _stub_remote_layer(self, monkeypatch, layer):
+        # A machine-pinned chat resolves its execution layer via
+        # `_get_remote_layer()` — point it at the fake (patched at its own
+        # module) so pinned-chat resumes stay hermetic.
+        from core.session import session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+
+    def test_owner_sees_mismatch_fields_on_lazy_resume(self, temp_db,
+                                                       monkeypatch):
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        self._stub_remote_layer(monkeypatch, layer)
+        slug = make_test_agent()
+        _insert_machine("m-office", "Office-PC")
+        cid = _make_chat(slug, messages=(("user", "hi"),
+                                         ("assistant", "hello")))
+        task_store.update_chat(cid, execution_target="m-office")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                history = await ws.next_frame()
+                assert history["type"] == "chat_history"
+                # Lazy warmup_ready carries the 4-field mismatch payload.
+                await ws.expect({
+                    "type": "warmup_ready", "session_id": None,
+                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "execution_path": "claude-code-cli",
+                    "execution_mode": "", "needs_warmup": True,
+                    "pinned_target": "m-office", "pinned_label": "Office-PC",
+                    "resolved_target": "local",
+                    "resolved_label": "local sandbox",
+                })
+                await ws.expect({"type": "queue_snapshot", "chat_id": cid,
+                                 "messages": []})
+                assert layer.started == []  # still no spawn for browsing
+        run_ws_scenario(scenario)
+
+    def test_non_owner_viewer_gets_no_mismatch_fields(self, temp_db,
+                                                      monkeypatch):
+        # A Shared-only agent's assigned viewer may OPEN the owner's pinned
+        # chat, but the mismatch fields must stay off for them.
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        self._stub_remote_layer(monkeypatch, layer)
+        slug = make_test_agent(default_scope="agent", collaborative=False)
+        task_store.set_user_agents("user-viewer", [slug], "user-admin",
+                                   agent_roles={slug: "viewer"})
+        _insert_machine("m-office", "Office-PC")
+        cid = _make_chat(slug, user_sub="user-admin")
+        task_store.update_chat(cid, execution_target="m-office")
+
+        async def scenario():
+            cookie = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                    name="Viewer User", role="member")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                history = await ws.next_frame()
+                assert history["type"] == "chat_history"
+                await ws.expect({
+                    "type": "warmup_ready", "session_id": None,
+                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "execution_path": "claude-code-cli",
+                    "execution_mode": "", "needs_warmup": True,
+                })
+                await ws.expect({"type": "queue_snapshot", "chat_id": cid,
+                                 "messages": []})
+        run_ws_scenario(scenario)
+
+    def test_unpinned_chat_gets_no_mismatch_fields(self, temp_db,
+                                                   monkeypatch):
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        cid = _make_chat(slug)
+        task_store.update_chat(cid, execution_target="")  # no pin at all
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                history = await ws.next_frame()
+                assert history["type"] == "chat_history"
+                await ws.expect({
+                    "type": "warmup_ready", "session_id": None,
+                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "execution_path": "claude-code-cli",
+                    "execution_mode": "", "needs_warmup": True,
+                })
+                await ws.expect({"type": "queue_snapshot", "chat_id": cid,
+                                 "messages": []})
+        run_ws_scenario(scenario)
+
+
+# ---------------------------------------------------------------------------
 # mode/model change on an idle live session.
 # ---------------------------------------------------------------------------
 

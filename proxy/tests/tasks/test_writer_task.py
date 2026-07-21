@@ -174,8 +174,10 @@ def test_enqueue_send_bulk_routes_to_bulk_lane():
         await conn.enqueue_send({"type": "chunk"}, bulk=True)
         assert conn.send_queue.qsize() == 1
         assert conn.bulk_queue.qsize() == 1
-        assert conn.send_queue.get_nowait()["type"] == "cmd"
-        assert conn.bulk_queue.get_nowait()["type"] == "chunk"
+        sent = conn.send_queue.get_nowait()
+        assert sent["type"] == "cmd"
+        bulk = conn.bulk_queue.get_nowait()
+        assert bulk["type"] == "chunk"
 
     asyncio.run(_run())
 

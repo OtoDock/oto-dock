@@ -7,10 +7,9 @@ contract; the temp-URL pair covers create + serve + TTL + scope reject.
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -173,10 +172,15 @@ def test_temp_url_happy_path(tmp_agent_image):
 
 
 def test_temp_url_rejects_path_outside_agent_dir(tmp_agent_image):
-    """Path escape attempt — /etc/passwd should be rejected."""
+    """Path escape attempt — /etc/passwd should be rejected.
+
+    _classify_and_pull now denies out-of-tree host paths at the gate (returns
+    None → 404 here) rather than resolving them and leaning on this endpoint's
+    own relative_to(agent_dir) check (403). Either way the path is refused;
+    accept both so the earlier, cleaner rejection isn't treated as a regression.
+    """
     resp = _post_temp_url("/etc/passwd")
-    assert resp.status_code == 403
-    assert "outside" in resp.json()["detail"].lower()
+    assert resp.status_code in (403, 404)
 
 
 def test_temp_url_accepts_sandbox_virtual_path(tmp_agent_image):
@@ -185,7 +189,6 @@ def test_temp_url_accepts_sandbox_virtual_path(tmp_agent_image):
     the scope check — otherwise reverse image search 403s every time the
     agent passes its own IMAGE_WORKSPACE-rooted path.
     """
-    _abs, _agent = tmp_agent_image
     # The file lives at <agent_dir>/users/alice/workspace/test.jpg in the
     # fixture. The MCP would pass it as the sandbox-virtual form:
     sandbox_virtual = "/users/alice/workspace/test.jpg"

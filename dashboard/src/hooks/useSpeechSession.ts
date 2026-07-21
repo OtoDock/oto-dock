@@ -46,7 +46,11 @@ export interface SpeechSession {
   status: SpeechStatus
   available: boolean
   start: () => Promise<void>
-  stop: () => void
+  // stop(true) discards the tail: late finals/partials from the server's stop
+  // flush are dropped instead of delivered (Send already consumed the text —
+  // a delivered tail would re-fill the cleared input). Plain stop() keeps
+  // today's tail delivery (mic-button/focus stops WANT the last phrase).
+  stop: (discardTail?: boolean) => void
   toggle: () => void
 }
 
@@ -56,6 +60,9 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
   const [status, setStatus] = useState<SpeechStatus>('idle')
 
   const sessionRef = useRef<STTSession | null>(null)
+  // Kill switch for the CURRENT attempt's closure-local `dead` flag — set per
+  // runWith invocation so stop(discardTail=true) can reach it.
+  const killRef = useRef<(() => void) | null>(null)
   // Handlers may change every render; keep a live ref so the once-set session
   // callbacks always call the latest (avoids stale closures).
   const hRef = useRef(handlers)
@@ -63,7 +70,8 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
 
   const available = !!cap && cap.stt !== 'unavailable' && !!resolveSttBackend(cap, prefs?.stt_mode ?? 'auto')
 
-  const stop = useCallback(() => {
+  const stop = useCallback((discardTail = false) => {
+    if (discardTail) killRef.current?.()
     const s = sessionRef.current
     sessionRef.current = null
     setStatus('idle')
@@ -104,7 +112,10 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
       // (live repro 2026-07-16: paired 60s max_seconds usage records).
       // Note: a session stopped by the USER stays undead on purpose — its
       // tail final (the server's stop flush) must still be delivered.
+      // stop(true) is the exception: Send already took the text, so the
+      // kill switch marks the attempt dead and the tail is dropped.
       let dead = false
+      killRef.current = () => { dead = true }
       session.onPartial((t) => { if (!dead && t) hRef.current.onInterim?.(t) })
       session.onFinal((t) => {
         if (dead) return

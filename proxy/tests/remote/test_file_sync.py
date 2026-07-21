@@ -2,16 +2,12 @@
 
 import base64
 import hashlib
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from core.remote.file_sync import (
     FileEntry,
-    MergePlan,
-    FileAction,
     compute_manifest,
     diff_manifests,
     prepare_outgoing_files,
@@ -690,3 +686,130 @@ class TestShouldSyncToTarget:
         assert "config/prompt.md" not in paths          # non-owner config → excluded
         assert "users/bob/b.txt" in paths               # own dir → present
         assert "workspace/data.txt" in paths            # shared → present
+
+
+class TestEmptyFileSync:
+    """Zero-byte files are real writes — and are never delete-attributed
+    (2026-07-19 live sync test: empty files silently never synced, and a
+    poisoned converged base could delete the platform's empty file)."""
+
+    EMPTY = "sha256:" + __import__("hashlib").sha256(b"").hexdigest()
+
+    def test_apply_write_empty_content_creates_file(self, tmp_path):
+        apply_incoming_file(tmp_path, "workspace/pkg/__init__.py", "write", "")
+        f = tmp_path / "workspace/pkg/__init__.py"
+        assert f.exists() and f.stat().st_size == 0
+
+    def test_apply_write_none_is_pull_flow_noop(self, tmp_path):
+        apply_incoming_file(tmp_path, "workspace/big.bin", "write", None)
+        assert not (tmp_path / "workspace/big.bin").exists()
+
+    def test_platform_only_empty_file_pushes_never_deletes(self):
+        # Poisoned base: B == P == hash-of-empty, satellite tree alive but
+        # lacks the file (the historical ack-ok-on-skip shape).
+        local = [FileEntry("workspace/pkg/__init__.py", self.EMPTY, 0, 1.0)]
+        remote = [_r("workspace/other.txt", "sha256:zzz")]
+        plan = diff_manifests(
+            local, remote,
+            base={"workspace/pkg/__init__.py": (self.EMPTY, 1.0)},
+            target_role="manager",
+        )
+        a = _act(plan, "workspace/pkg/__init__.py")
+        assert a and a.op == "push"
+
+    def test_platform_only_nonempty_converged_still_delete_attributes(self):
+        local = [FileEntry("workspace/x.txt", "sha256:abc", 5, 1.0)]
+        remote = [_r("workspace/other.txt", "sha256:zzz")]
+        plan = diff_manifests(
+            local, remote,
+            base={"workspace/x.txt": ("sha256:abc", 1.0)},
+            target_role="manager",
+        )
+        a = _act(plan, "workspace/x.txt")
+        assert a and a.op == "delete_platform"
+
+
+class TestPruneEmptyParents:
+    """Dir deletes have no wire action — the delete apply prunes now-empty
+    parents, stopping at the platform skeleton."""
+
+    def _prune(self):
+        from core.remote.file_sync import prune_empty_parents
+        return prune_empty_parents
+
+    def test_prunes_to_depth1_boundary(self, tmp_path):
+        d = tmp_path / "workspace" / "proj" / "sub"
+        d.mkdir(parents=True)
+        f = d / "a.txt"
+        self._prune()(f, tmp_path)
+        assert not (tmp_path / "workspace" / "proj").exists()
+        assert (tmp_path / "workspace").exists()
+
+    def test_user_root_protected(self, tmp_path):
+        d = tmp_path / "users" / "alice" / "notes"
+        d.mkdir(parents=True)
+        self._prune()(d / "n.md", tmp_path)
+        assert not d.exists()
+        assert (tmp_path / "users" / "alice").exists()
+
+    def test_nonempty_parent_survives(self, tmp_path):
+        d = tmp_path / "workspace" / "proj"
+        (d / "sub").mkdir(parents=True)
+        (d / "keep.txt").write_text("k")
+        self._prune()(d / "sub" / "a.txt", tmp_path)
+        assert not (d / "sub").exists()
+        assert d.exists()
+
+    def test_delete_action_prunes(self, tmp_path):
+        (tmp_path / "workspace" / "deep" / "tree").mkdir(parents=True)
+        t = tmp_path / "workspace" / "deep" / "tree" / "f.txt"
+        t.write_text("x")
+        apply_incoming_file(tmp_path, "workspace/deep/tree/f.txt", "delete", None)
+        assert not (tmp_path / "workspace" / "deep").exists()
+        assert (tmp_path / "workspace").exists()
+
+
+class TestFileChangedInnerRouting:
+    """`_apply_file_changed_inner` routing: content key present (even "") =
+    inline write; absent + size>0 = chunked pull; absent + size 0 = drop."""
+
+    def _host(self, pulls):
+        from core.remote.satellite_file_transfer import SatelliteFileTransferMixin
+
+        class H(SatelliteFileTransferMixin):
+            def __init__(self):
+                pass
+
+            async def pull_file_to_path(self, machine_id, ref, dest,
+                                        agent_slug="", timeout=0.0):
+                pulls.append(str(dest))
+                return True
+
+        return H()
+
+    def test_empty_inline_write_lands(self, tmp_path):
+        import asyncio as _a
+        pulls: list = []
+        msg = {"path": "workspace/pkg/__init__.py", "content_b64": ""}
+        _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write"))
+        assert (tmp_path / "workspace/pkg/__init__.py").exists()
+        assert pulls == []
+
+    def test_large_file_routes_to_pull(self, tmp_path):
+        import asyncio as _a
+        pulls: list = []
+        msg = {"path": "workspace/big.bin", "size": 999}
+        _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write"))
+        assert len(pulls) == 1
+        assert not (tmp_path / "workspace/big.bin").exists()
+
+    def test_no_content_no_size_drops(self, tmp_path):
+        import asyncio as _a
+        pulls: list = []
+        msg = {"path": "workspace/mystery"}
+        _a.run(self._host(pulls)._apply_file_changed_inner(
+            tmp_path, msg, "m1", "agent-x", "write"))
+        assert pulls == []
+        assert not (tmp_path / "workspace/mystery").exists()

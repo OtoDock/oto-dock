@@ -75,6 +75,14 @@ interface InstallStoreState {
   ) => void
   fail: (data: { machine_id: string; agent: string; error: string }) => void
   clear: (machineId: string, agent: string) => void
+  /** Drop every NON-terminal slice (installing/verifying). Called on WS
+   * (re)connect: any genuinely in-flight install is immediately re-fed by
+   * the server's connect replay (install_registry.snapshot_inflight), so
+   * what this really removes is ghosts — a lifecycle whose done/failed
+   * frame was lost to a dropped socket (e.g. a proxy restart mid-install)
+   * would otherwise show "Preparing remote environment…" forever. Terminal
+   * slices keep their done-grace / failed-with-retry UI. */
+  clearInFlight: () => void
 }
 
 export const installKey = (machineId: string, agent: string): string =>
@@ -248,6 +256,20 @@ export const useInstallStore = create<InstallStoreState>((set) => ({
       if (!(k in s.byKey)) return s
       const { [k]: _, ...rest } = s.byKey
       return { byKey: rest }
+    }),
+
+  clearInFlight: () =>
+    set((s) => {
+      const rest: Record<string, InstallSlice> = {}
+      let dropped = false
+      for (const [k, slice] of Object.entries(s.byKey)) {
+        if (slice.status === 'installing' || slice.status === 'verifying') {
+          dropped = true
+          continue
+        }
+        rest[k] = slice
+      }
+      return dropped ? { byKey: rest } : s
     }),
 }))
 

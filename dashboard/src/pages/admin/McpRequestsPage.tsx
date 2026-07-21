@@ -63,7 +63,6 @@ export default function McpRequestsPage() {
         singles.push(r)
       }
     }
-    const out: Group[] = []
     // Order batches by the most recent row (descending). Singles interleaved
     // by their created_at; keep already-newest-first ordering from API.
     const merged: { sortKey: string; group: Group }[] = []

@@ -109,6 +109,24 @@ def strip_replies(data: bytes) -> bytes:
     return TERMINAL_REPLY_RE.sub(b"", data)
 
 
+# OSC 52 clipboard WRITE (``]52;<sel>;<b64>``) — the TUI's copy feature. It
+# must PASS on live output (the dashboard's ClipboardAddon is how Ctrl-C in
+# the TUI reaches the system clipboard) but must NOT survive into scrollback
+# REPLAYS: re-delivering the buffered sequence on every (re)attach silently
+# OVERWRITES the viewer's current clipboard with whatever was copied in the
+# session earlier — opening a terminal page must never mutate the clipboard.
+# The ``;?`` READ form is already stripped by TERMINAL_QUERY_RE.
+_OSC52_WRITE_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_clipboard_writes(data: bytes) -> bytes:
+    """Remove OSC 52 clipboard-set sequences from REPLAYED output only —
+    apply at scrollback-replay boundaries, never on the live stream."""
+    if b"\x1b" not in data:
+        return data
+    return _OSC52_WRITE_RE.sub(b"", data)
+
+
 # A trailing INCOMPLETE escape sequence: everything from the last ESC when that
 # ESC has not yet been terminated — a CSI still in its parameter/intermediate
 # bytes, an OSC/DCS body without its BEL/ST, an X10 mouse report short of its 3

@@ -16,14 +16,13 @@ gated.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from services import path_roles
 from services.mcp import mcp_registry
 from auth.path_policy import (
-    PathDecision,
     SecurityContext,
     _check_bash,
     _check_read_path,
@@ -165,7 +164,7 @@ def test_is_protected_empty_set_short_circuits(monkeypatch):
     is a fast no-op (and never accidentally protects everything)."""
     monkeypatch.setattr(
         mcp_registry, "get_protected_credentials_subpaths",
-        lambda: frozenset(),
+        frozenset,
     )
     assert not path_roles.is_protected_credentials_path(
         "agents/foo/workspace/google-tokens/x.json"
@@ -206,7 +205,7 @@ def test_command_references_does_not_match_lookalike(_protected_set):
 def test_command_references_empty_short_circuits(monkeypatch):
     monkeypatch.setattr(
         mcp_registry, "get_protected_credentials_subpaths",
-        lambda: frozenset(),
+        frozenset,
     )
     assert not path_roles.command_references_protected_path(
         "cat /workspace/google-tokens/x.json"

@@ -19,7 +19,10 @@ from typing import Any
 
 import config
 
-_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
+# Possessive quantifier: an unclosed ``${`` can never match by giving
+# characters back ("}" is excluded from the class), so backtracking on a
+# long tail is pure ReDoS surface.
+_TOKEN_RE = re.compile(r"\$\{([^}]++)\}")
 
 
 def _build_substitutions(

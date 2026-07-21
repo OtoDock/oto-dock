@@ -294,7 +294,7 @@ def pump_end(monkeypatch):
     async def fake_fire_ephemeral(user_sub, title, body, chat_id=None, **kw):
         calls["ephemeral"].append((user_sub, chat_id))
 
-    import core.events.stream_pump as sp
+    from core.events import stream_pump as sp
     monkeypatch.setattr(sp.task_store, "get_chat",
                         lambda cid: {"user_sub": "u", "agent": "researcher"})
     monkeypatch.setattr(sp.task_store, "get_active_meeting_for_chat", lambda cid: None)

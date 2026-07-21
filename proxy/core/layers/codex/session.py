@@ -16,6 +16,7 @@ so ``app.py`` / ``concurrency.py`` touchpoints keep working.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -741,19 +742,15 @@ class CodexAppServerSession:
         a dead sub-agent). Idempotent — safe to call on a fresh session."""
         if self._router_task is not None:
             self._router_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._router_task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._router_task = None
         sups = list(self._bg_supervisors.items())
         for _sub_tid, task in sups:
             task.cancel()
         for sub_tid, task in sups:
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
             # A cancelled supervisor's own ``finally`` already resolved it; this
             # is the idempotent backstop for one that never reached its finally.
             self._resolve_bg_subagent(sub_tid)

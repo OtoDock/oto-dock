@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 import config as app_config
 from services.memory import memory_file

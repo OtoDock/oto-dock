@@ -10,10 +10,8 @@ endpoints against `tmp_path`-backed agent dirs. Covers:
 """
 
 from io import BytesIO
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 

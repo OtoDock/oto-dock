@@ -7,7 +7,6 @@ happy-path detector that flips those runs to `failed`; these tests pin its
 shapes and, critically, its non-matches.
 """
 
-import pytest
 
 from services.scheduler.scheduler import _limit_notice
 

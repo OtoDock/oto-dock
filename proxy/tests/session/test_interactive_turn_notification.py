@@ -142,7 +142,7 @@ async def test_question_never_fires_task_callback():
     # Defense in depth: hooks deny AskUserQuestion for autonomous tasks, but a
     # question fold must never count as a task completion regardless.
     done = []
-    s = _new_session(on_turn_complete=lambda m: done.append(m))
+    s = _new_session(on_turn_complete=done.append)
     s._maybe_fire_turn_complete("", persisted=1, question=True)
     await _drain()
     assert done == []
@@ -186,7 +186,7 @@ async def test_meeting_chat_suppressed():
 
 async def test_task_run_suppresses_ping_but_fires_callback():
     fired = []
-    s = _new_session(chat_id="task-99", on_turn_complete=lambda msg: fired.append(msg))
+    s = _new_session(chat_id="task-99", on_turn_complete=fired.append)
     s._maybe_fire_turn_complete("result", persisted=1)
     await _drain()
     # An autonomous task run keeps the run callback + the ready broadcast, but

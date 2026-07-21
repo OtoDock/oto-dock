@@ -18,11 +18,8 @@ import importlib
 import importlib.util
 import os
 import sys
-from pathlib import Path
-from unittest.mock import AsyncMock
 
 import httpx
-import pytest
 
 
 from tests._paths import CUSTOM_MCPS

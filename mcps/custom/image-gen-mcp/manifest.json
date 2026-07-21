@@ -63,6 +63,9 @@
       "default_exclude_from": ["task"]
     }
   ],
+  "permissions": {
+    "default_tier": "standard"
+  },
   "patched": false,
   "patch_note": null
 }

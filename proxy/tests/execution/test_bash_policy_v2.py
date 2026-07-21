@@ -9,7 +9,6 @@ single raw-string scan (``bash -c "rm -rf /"``, ``$(rm -rf /)``).
 """
 
 import sys
-from pathlib import Path
 
 import pytest
 

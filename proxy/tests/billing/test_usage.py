@@ -174,7 +174,6 @@ class TestRecording:
 class TestAggregation:
     def _seed_usage(self):
         """Seed a variety of usage records."""
-        now = datetime.now(timezone.utc)
         for i in range(10):
             usage_service.record_usage(
                 user_sub="user-viewer", agent="agent-a", scope="user",
@@ -620,7 +619,6 @@ class TestAdminOverview:
 
 class TestTaskRunsCost:
     def test_update_run_with_cost(self, temp_db):
-        now = datetime.now(timezone.utc).isoformat()
         task_store.create_run("run-1", "task-1", "agent-a", "manual", None, "test prompt", "one-time")
         task_store.update_run("run-1", status="completed", cost_usd=1.234)
         run = task_store.get_run("run-1")

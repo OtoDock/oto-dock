@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
 import logging
+import uuid
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -43,7 +43,7 @@ from storage import database as task_store
 from services.billing import relay_client
 from services.mcp import mcp_registry
 from services.oauth import oauth_engine, oauth_account_store
-from auth.oauth_providers import get_provider
+from auth.oauth_providers import canonical_provider_id, get_provider
 from auth.providers import UserContext, get_current_user
 
 logger = logging.getLogger("claude-proxy.oauth-api")
@@ -77,22 +77,6 @@ class OAuthDisconnectRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _js(value: str) -> str:
-    """Encode a Python string as a safe JS string literal for an inline
-    ``<script>``. ``json.dumps`` handles quoting + escaping; the extra
-    substitutions stop the value from terminating the ``<script>`` element
-    early or breaking the page (``</script>``, ``<!--``, U+2028/9 line seps).
-    """
-    return (
-        json.dumps(str(value))
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-        .replace("\u2028", "\\u2028")
-        .replace("\u2029", "\\u2029")
-    )
-
-
 def _popup_origin() -> str:
     """Origin the OAuth popup may postMessage back to — the dashboard itself.
 
@@ -110,6 +94,9 @@ def _popup_origin() -> str:
 
 
 def _success_html(provider: str, email: str) -> str:
+    # Dynamic values reach the inline script only via HTML-escaped data
+    # attributes (attribute-safe: html.escape encodes &<>"'), so the script
+    # itself is fully static; `.dataset` reads decode back to the original.
     label = html.escape(provider.capitalize())
     return f"""\
 <!DOCTYPE html>
@@ -123,15 +110,17 @@ def _success_html(provider: str, email: str) -> str:
   h2 {{ color: #333; margin: 0 0 0.5rem; font-size: 1.1rem; }}
   p {{ color: #666; font-size: 0.9rem; margin: 0; }}
 </style></head>
-<body><div class="card">
+<body><div class="card" id="result" data-provider="{html.escape(provider)}"
+  data-email="{html.escape(email)}" data-origin="{html.escape(_popup_origin())}">
   <div class="check">&#10003;</div>
   <h2>{label} Account Connected</h2>
   <p>{html.escape(email)}</p>
   <p id="hint" style="margin-top:1rem;color:#999;font-size:0.8rem;">This window will close automatically.</p>
 </div>
 <script>
+  var el = document.getElementById("result");
   if (window.opener) {{
-    window.opener.postMessage({{type: "oauth-complete", provider: {_js(provider)}, email: {_js(email)}}}, {_js(_popup_origin())});
+    window.opener.postMessage({{type: "oauth-complete", provider: el.dataset.provider, email: el.dataset.email}}, el.dataset.origin);
     setTimeout(() => window.close(), 1500);
   }} else {{
     document.getElementById("hint").textContent = "You can close this tab and return to the app.";
@@ -153,14 +142,16 @@ def _error_html(provider: str, message: str) -> str:
   h2 {{ color: #333; margin: 0 0 0.5rem; font-size: 1.1rem; }}
   p {{ color: #da3536; font-size: 0.9rem; margin: 0; }}
 </style></head>
-<body><div class="card">
+<body><div class="card" id="result" data-provider="{html.escape(provider)}"
+  data-error="{html.escape(message)}" data-origin="{html.escape(_popup_origin())}">
   <div class="icon">&#10007;</div>
   <h2>Connection Failed</h2>
   <p>{html.escape(message)}</p>
   <p style="margin-top:1rem;color:#999;font-size:0.8rem;">You can close this window.</p>
 </div>
 <script>
-  window.opener?.postMessage({{type: "oauth-error", provider: {_js(provider)}, error: {_js(message)}}}, {_js(_popup_origin())});
+  var el = document.getElementById("result");
+  window.opener?.postMessage({{type: "oauth-error", provider: el.dataset.provider, error: el.dataset.error}}, el.dataset.origin);
 </script>
 </body></html>"""
 
@@ -372,10 +363,11 @@ async def oauth_callback(
     error: str = Query(None),
 ):
     """OAuth callback — web popup (HTML) or mobile deep-link (302)."""
-    # Reject an unknown provider before reflecting it anywhere (defense in depth
-    # on top of the HTML/JS escaping in the templates).
+    # Reject an unknown provider before reflecting it anywhere; the canonical
+    # id comes from the registry's key set, not the request path (defense in
+    # depth on top of the HTML escaping in the templates).
     try:
-        get_provider(provider)
+        provider = canonical_provider_id(provider)
     except KeyError:
         return HTMLResponse(_error_html("", "Unknown provider"), status_code=400)
     if error:
@@ -388,8 +380,14 @@ async def oauth_callback(
     try:
         result = await oauth_engine.do_oauth_exchange(code=code, state_token=state)
     except Exception as e:
+        # Never reflect the exception text — it can carry vendor response
+        # bodies / internal URLs. Full detail goes to the server log only.
         logger.exception("OAuth callback exchange failed (provider=%s)", provider)
-        return HTMLResponse(_error_html(provider, str(e)))
+        return HTMLResponse(_error_html(
+            provider,
+            f"Token exchange failed ({type(e).__name__}). "
+            "Check the proxy logs for details.",
+        ))
 
     if result.state.mobile:
         # Tag the source install so the multi-installation Android app routes the
@@ -1047,6 +1045,14 @@ async def admin_consent_callback(
             "microsoft", "Invalid or expired admin-consent state",
         ))
 
+    # Microsoft reports the tenant as a GUID. Parse + re-serialize so a
+    # forged callback can't smuggle arbitrary text into the deep link or
+    # the success page; anything non-GUID renders as unknown.
+    try:
+        tenant = str(uuid.UUID(tenant)) if tenant else ""
+    except ValueError:
+        tenant = ""
+
     logger.info(
         "Microsoft tenant-admin consent granted: user_sub=%s mcp=%s tenant=%s",
         ctx.user_sub[:8], ctx.mcp_name, tenant,
@@ -1061,7 +1067,7 @@ async def admin_consent_callback(
 
 def _admin_consent_success_html(tenant: str) -> str:
     """Success page for the tenant-admin consent callback."""
-    safe_tenant = tenant.replace("<", "&lt;").replace(">", "&gt;")
+    safe_tenant = html.escape(tenant)
     return f"""<!doctype html>
 <html><head><title>Tenant consent complete</title>
 <style>body{{font-family:system-ui,-apple-system,sans-serif;

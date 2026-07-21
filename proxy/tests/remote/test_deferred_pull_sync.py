@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from core.remote import remote_execution as re_mod
 from core.remote.remote_execution import (
     _DEFER_PULL_MIN_BYTES,
     RemoteExecutionLayer,

@@ -25,6 +25,7 @@ interactive chat.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 
@@ -429,10 +430,8 @@ def detach_local_session(session_id: str) -> None:
     sess.otodock_attached = False
     timer = sess._otodock_kick_timer
     if timer is not None:
-        try:
+        with contextlib.suppress(Exception):
             timer.cancel()
-        except Exception:
-            pass
         sess._otodock_kick_timer = None
     if sess.has_viewer:
         sess.notify_status("reconnected")

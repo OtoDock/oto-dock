@@ -13,7 +13,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 from core.config import task_config_builder as tcb
 

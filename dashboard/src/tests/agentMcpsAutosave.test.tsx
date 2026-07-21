@@ -2,7 +2,6 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import type { ReactNode } from 'react'
 
 // ─── Agent MCP toggles autosave on click (the Save button lived at the top
 //     of a long list, scrolled out of view, and toggles got silently lost) ───

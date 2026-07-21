@@ -77,6 +77,48 @@ describe('DocumentPreview — chain modes', () => {
   })
 })
 
+describe('DocumentPreview — stale live re-mint', () => {
+  // Persisted preview URLs carry a 4h token; blocks rendered from history
+  // mint a fresh URL at mount instead of loading a token Collabora rejects
+  // as "session expired". A fresh push keeps its streamed URL untouched.
+
+  it('a fresh block (recent generation) renders the persisted URL, no mint', () => {
+    renderPreview({ mode: 'live', generation: Date.now() - 5_000 })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe')!.getAttribute('src')).toContain('WOPISrc=x')
+  })
+
+  it('a stale block mints through preview-wopi-url and renders the fresh URL', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ wopi_url: `${window.location.origin}/collabora/cool.html?fresh=1` }),
+    })
+    renderPreview({ mode: 'live', generation: Date.now() - 60 * 60 * 1000 })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    expect(fetchMock.mock.calls[0][0]).toContain('/v1/documents/preview-wopi-url')
+    expect(fetchMock.mock.calls[0][0]).toContain('chat_id=chat-1')
+    expect(fetchMock.mock.calls[0][0]).toContain('file_id=f1')
+    expect(document.querySelector('iframe')!.getAttribute('src')).toContain('fresh=1')
+  })
+
+  it('a block with no generation (older history) also mints fresh', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ wopi_url: `${window.location.origin}/collabora/cool.html?fresh=2` }),
+    })
+    renderPreview({ mode: 'live' })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    expect(document.querySelector('iframe')!.getAttribute('src')).toContain('fresh=2')
+  })
+
+  it('a failed mint falls back to the persisted URL (never a blank block)', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404 })
+    renderPreview({ mode: 'live', generation: Date.now() - 60 * 60 * 1000 })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    expect(document.querySelector('iframe')!.getAttribute('src')).toContain('WOPISrc=x')
+  })
+})
+
 describe('DocumentPreview — dismissal scoping', () => {
   it('the live block dismisses the whole file trail (no scope params)', async () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => ({}) })

@@ -5,6 +5,7 @@ Part of the ``storage.database`` facade; import names from
 synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
+import contextlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -55,10 +56,8 @@ def count_active_meeting_participants(created_by: str) -> int:
         ).fetchall()
     total = 0
     for r in rows:
-        try:
+        with contextlib.suppress(ValueError, TypeError):
             total += len(_json.loads(r["participants"]) or [])
-        except (ValueError, TypeError):
-            pass
     return total
 
 

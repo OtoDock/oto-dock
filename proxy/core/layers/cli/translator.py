@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger("cli-translator")
 
 
+# The CLI's fixed `--resume` handshake reply. String-matching CLI-synthesized
+# text is tolerable because the fleet CLI version is pinned (VERSIONS.md);
+# settle.is_foreign_result's content-count guard catches the shape even if
+# this string drifts. Lives here (not settle.py) because _handle_result also
+# suppresses its fallback emission and settle imports this module.
+RESUME_HANDSHAKE_RESULT = "No response requested."
+
+
 # CLI system subtypes we never surface to the client — pure heartbeat noise.
 # `task_started` / `task_progress` are NOT suppressed: the former drives the
 # deterministic subagent registry + workflow start, the latter carries the
@@ -769,8 +777,12 @@ class ClaudeCLIEventTranslator:
                 session_id=self.actual_session_id,
                 is_error=True,
             ))
-        elif result_text and not self.has_emitted_text:
-            # Result text wasn't streamed via stream_events
+        elif (result_text and not self.has_emitted_text
+                and result_text != RESUME_HANDSHAKE_RESULT):
+            # Result text wasn't streamed via stream_events. The resume
+            # handshake sentinel is never emitted: it is CLI plumbing, not an
+            # answer — emitting it would both display junk and count as
+            # content against the foreign-result gate.
             chunks.append(ClaudeStreamChunk(
                 text=result_text,
                 session_id=self.actual_session_id,
@@ -812,3 +824,20 @@ class ClaudeCLIEventTranslator:
         self._tool_input_names.clear()
         self._pending_task_creates.clear()
         self._in_settle = True
+
+    def reset_for_foreign_skip(self) -> None:
+        """Reset per-turn parsing state after a skipped foreign result.
+
+        A resume-settlement mini-turn may have set has_emitted_text (or left
+        half-open blocks); without this reset the DRIVEN turn's result-text
+        fallback in _handle_result would be suppressed and the real answer
+        silently dropped. Same clears as reset_for_settle but the turn has
+        NOT entered settle — _in_settle stays off so background completions
+        that land next still surface with their normal semantics.
+        """
+        self.block_types.clear()
+        self.active_tool = None
+        self.has_emitted_text = False
+        self._tool_inputs.clear()
+        self._tool_input_names.clear()
+        self._pending_task_creates.clear()

@@ -212,10 +212,13 @@ def validate_spawn_overrides(
         # Same source of truth as the dashboard's cross-layer model guard
         # (ws/dashboard._model_allowed_for_path): a registry error must not
         # brick spawns — this guards cross-layer poison, not the registry.
+        # Enabled-only: the delegation roster advertises enabled models and
+        # the validator must accept exactly that set (an admin-disabled
+        # model is disabled for spawn overrides too).
         try:
             from storage import subscription_store
             ok = any(
-                (m.get("model_id") or "") == model
+                (m.get("model_id") or "") == model and m.get("enabled")
                 for m in subscription_store.list_models(exec_path)
             )
         except Exception:

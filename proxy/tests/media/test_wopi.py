@@ -256,3 +256,100 @@ def test_check_file_info_presence_fields(temp_db, tmp_path, monkeypatch):
     assert j["DisableInactiveMessages"] == "false"
     assert j["PostMessageOrigin"] == "https://app.example"
     assert j["UserCanWrite"] is True
+
+
+# ---------------------------------------------------------------------------
+# wopi_put_file — host-cache docs push back to the origin machine (2026-07-19)
+# ---------------------------------------------------------------------------
+
+
+def _seed_host_cache(tmp_path, session_id="sess-1", digest="abc123",
+                     name="x.docx", content=b"old bytes"):
+    d = tmp_path / ".remote-host-cache" / session_id / digest
+    d.mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        '{"machine_id": "m-1", "abs_path": "C:/Users/u/Desktop/x.docx"}'
+    )
+    p = d / name
+    p.write_bytes(content)
+    return p, f".remote-host-cache/{session_id}/{digest}/{name}"
+
+
+@pytest.mark.asyncio
+async def test_put_file_host_cache_pushes_back(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+
+    pw = AsyncMock()
+    push = AsyncMock(return_value=True)
+    monkeypatch.setattr(workspace_fanout, "propagate_write", pw)
+    monkeypatch.setattr(remote_file_flow, "push_back_host_path", push)
+
+    cache_file, rel = _seed_host_cache(tmp_path)
+    token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "edit", "test-agent")
+    file_id = _encode_file_id(rel)
+
+    app = FastAPI()
+    app.include_router(wopi.router)
+    resp = TestClient(app).post(
+        f"/wopi/files/{file_id}/contents?access_token={token}",
+        content=b"edited bytes",
+    )
+    assert resp.status_code == 200
+    assert cache_file.read_bytes() == b"edited bytes"
+    push.assert_awaited_once_with("sess-1", str(cache_file))
+    # Host files have no agent-tree fan-out.
+    pw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_put_file_host_cache_offline_fails_and_restores(
+    temp_db, tmp_path, monkeypatch,
+):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from core.remote import remote_file_flow
+
+    push = AsyncMock(return_value=False)
+    monkeypatch.setattr(remote_file_flow, "push_back_host_path", push)
+
+    cache_file, rel = _seed_host_cache(tmp_path)
+    token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "edit", "test-agent")
+    file_id = _encode_file_id(rel)
+
+    app = FastAPI()
+    app.include_router(wopi.router)
+    resp = TestClient(app).post(
+        f"/wopi/files/{file_id}/contents?access_token={token}",
+        content=b"edited bytes",
+    )
+    # Save FAILS loudly and the cache keeps mirroring the machine (old bytes) —
+    # a diverged cache copy must never be served as truth by later reads.
+    assert resp.status_code == 500
+    assert cache_file.read_bytes() == b"old bytes"
+
+
+@pytest.mark.asyncio
+async def test_put_file_host_cache_view_token_still_403(
+    temp_db, tmp_path, monkeypatch,
+):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from core.remote import remote_file_flow
+
+    push = AsyncMock(return_value=True)
+    monkeypatch.setattr(remote_file_flow, "push_back_host_path", push)
+
+    _cache_file, rel = _seed_host_cache(tmp_path)
+    token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "view", "test-agent")
+    file_id = _encode_file_id(rel)
+
+    app = FastAPI()
+    app.include_router(wopi.router)
+    resp = TestClient(app).post(
+        f"/wopi/files/{file_id}/contents?access_token={token}", content=b"x",
+    )
+    assert resp.status_code == 403
+    push.assert_not_awaited()

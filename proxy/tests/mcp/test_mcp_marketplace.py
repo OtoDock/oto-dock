@@ -16,7 +16,6 @@ Run: cd proxy && python -m pytest tests/mcp/test_mcp_marketplace.py -v
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -235,7 +234,7 @@ class TestAggregateQueries:
         from storage import mcp_request_store
 
         # Three requests, distinct (mcp, agent) pairs.
-        r1 = mcp_request_store.create_request("nextcloud", "agent-1", REQUESTER_SUB)
+        mcp_request_store.create_request("nextcloud", "agent-1", REQUESTER_SUB)
         r2 = mcp_request_store.create_request("nextcloud", "agent-2", REQUESTER_SUB)
         r3 = mcp_request_store.create_request("nextcloud", "agent-3", REQUESTER_SUB)
 
@@ -603,7 +602,7 @@ class TestExplicitInstanceAuthorization:
     def test_helper_single_instance_attaches_agent(self, temp_db):
         from services.community import community_installer
         from storage import mcp_store
-        iid = mcp_store.upsert_mcp_instance("prometheus", {
+        mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
             "field_values": {"PROM_URL": "http://prom:9090"},
             "agents": [],
@@ -1032,7 +1031,6 @@ class TestAdminAutoApprove:
         _seed_agent()
         from api.mcp.community import create_mcp_request, CreateRequestBody
         from services.community import community_installer
-        from storage import mcp_request_store
 
         class _Explicit:
             assignment_mode = "explicit"
@@ -1501,7 +1499,7 @@ class TestAgentDeleteCascade:
         assert trigger_store.list_triggers(agent="doomed") == []
 
     def test_delete_agent_removes_notifications_and_deliveries(self, temp_db):
-        from storage import agent_store, notification_store
+        from storage import agent_store
         from storage.pg import get_conn
 
         agent_store.create_agent("doomed", "Doomed")

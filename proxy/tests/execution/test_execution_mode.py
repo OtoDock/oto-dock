@@ -58,14 +58,6 @@ def test_is_interactive_wrapper(enabled):
     assert em.is_interactive(agent_default="interactive", is_meeting=True) is False
 
 
-def test_kill_switch_default_off(monkeypatch):
-    # With no platform setting, the switch reads OFF (opt-in, removable).
-    monkeypatch.setattr(
-        "storage.database.get_platform_setting", lambda *a, **k: None,
-    )
-    assert em.is_interactive_enabled() is False
-
-
 def test_parse_enabled_truth_table():
     # Shared with the admin settings API (GET mirrors the same parse).
     for on in ("1", "true", "yes", "on", "True", " ON "):
@@ -79,3 +71,24 @@ def test_kill_switch_reads_platform_setting(monkeypatch):
         "storage.database.get_platform_setting", lambda *a, **k: "1",
     )
     assert em.is_interactive_enabled() is True
+
+def test_kill_switch_unset_defaults_on(monkeypatch):
+    # R1.5 flip: an install that never touched the setting has interactive ON;
+    # an explicit "0" (an admin who turned it off) stays off.
+    from storage import database
+    store = {}
+    monkeypatch.setattr(database, "get_platform_setting",
+                       lambda key: store.get(key))
+    assert em.is_interactive_enabled() is True
+    store[em.KILL_SWITCH_KEY] = "0"
+    assert em.is_interactive_enabled() is False
+    store[em.KILL_SWITCH_KEY] = "1"
+    assert em.is_interactive_enabled() is True
+
+
+def test_effective_enabled_shared_semantics():
+    assert em.effective_enabled("") is True       # unset → shipped default
+    assert em.effective_enabled(None) is True
+    assert em.effective_enabled("0") is False
+    assert em.effective_enabled("false") is False
+    assert em.effective_enabled("1") is True

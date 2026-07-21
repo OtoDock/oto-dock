@@ -1,7 +1,7 @@
 type Status = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string
 
 const STATUS_STYLES: Record<string, string> = {
-  pending: 'bg-yellow-100 text-yellow-800',
+  pending: 'bg-indigo-100 text-indigo-800',
   running: 'bg-blue-100 text-blue-800',
   completed: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
   failed: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
@@ -21,7 +21,7 @@ export default function StatusBadge({ status }: { status: Status }) {
       {(status === 'running' || status === 'active') && (
         <span className="mr-1 w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
       )}
-      {status}
+      {status === 'pending' ? 'queued' : status}
     </span>
   )
 }

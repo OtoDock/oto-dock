@@ -215,6 +215,19 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict]) -> None:
             run_id=None, chat_id=chat["id"], agent=chat.get("agent") or "",
         ))
 
+    # This machine is back: redeliver any delegate wakes parked on ITS chats —
+    # including idle ones the adopt loops above never touch (a wake stored
+    # while the machine was away can only deliver now).
+    async def _machine_wake_pass() -> None:
+        from services.scheduler import scheduler as _sched
+        try:
+            await _sched.redeliver_pending_wakes(machine_id=machine_id)
+        except Exception:
+            logger.exception(
+                "Wake redelivery failed for machine %s", machine_id[:8],
+            )
+    asyncio.create_task(_machine_wake_pass())
+
 
 async def _recover_session(
     machine_id: str, session_id: str, info: dict,

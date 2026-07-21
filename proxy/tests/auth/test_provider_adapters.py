@@ -83,7 +83,7 @@ def test_ollama_inherits_openai_format():
 # not supported on this model". Mirrors the OpenAI adapter's supports_reasoning gate.
 
 from core.layers.providers import anthropic_adapter
-from core.layers.providers.anthropic_adapter import AnthropicAdapter
+from core.layers.providers.anthropic_adapter import AnthropicAdapter, _with_history_breakpoint
 
 
 class _FakeMsg:
@@ -207,8 +207,6 @@ def test_openai_usage_cost_matches_openai_bill_gpt56():
 # ---------------------------------------------------------------------------
 # Anthropic conversation-prefix caching (moving breakpoint on the last message)
 # ---------------------------------------------------------------------------
-
-from core.layers.providers.anthropic_adapter import _with_history_breakpoint
 
 
 def test_history_breakpoint_wraps_string_content():

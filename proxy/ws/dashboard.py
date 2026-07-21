@@ -15,52 +15,32 @@ at module level (several are imported by tests from this path).
 """
 
 import asyncio
-import base64
+import contextlib
 import json
 import logging
-import time
 import uuid
 from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-import config
 from storage import database as task_store
-from storage import agent_store
 from storage import notification_store
-from storage import remote_store
 from services.notifications import notification_manager
 from auth.providers import validate_session_jwt
 from core.session.session_state import (
     _dashboard_notify_queues,
-    _chat_streaming_state,
-    set_session_mode, get_session_mode,
-    get_permission_queue,
-    resolve_permission, resolve_location,
-    get_permission_request_session, get_meeting_session_info,
-    set_user_tz, get_user_tz, set_session_user_tz,
-    get_subagent_registry, clear_session_liveness,
 )
-from core.events.common_events import CommonEvent, ERROR, QUEUE_TURN, PRODUCER_DONE
 from core.execution_layer import ExecutionLayer
-from core.session.session_manager import get_execution_layer, resolve_execution_path
-from core.config.config_builder import build_agent_config, is_hard_fail_target, extract_offline_machine
-from services.engines.subscription_pool import NoSubscriptionError
-from core.session.history_seed import consume_pending_seed, consume_pending_seed_digest
+from core.session.session_manager import get_execution_layer
 from core.config.task_config_builder import resolve_task_identity
 from core.events.stream_pump import (
-    ChatStreamPump, _active_pumps, _pending_permissions,
-    _bg_agent_monitor, bg_monitor_running,
-    _bg_command_monitor, bg_command_monitor_running,
+    _active_pumps,
 )
-from core.events.bg_command_state import get_bg_command_registry
 from core.remote import install_registry
 from core.session import warmup_registry
 from core.session import visibility as _vis
 from core import execution_mode
-from core.session import interactive_session
-from core.events.artifact_events import artifact_event_from_perm_item
 
 logger = logging.getLogger("claude-proxy")
 
@@ -688,10 +668,8 @@ class DashboardConnection(
                 )
                 for t in pending:
                     t.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
 
                 for t in done:
                     if t is recv_task:
@@ -799,10 +777,8 @@ class DashboardConnection(
             # start_session can roll back its concurrency-slot acquisition.
             if self._pre_warmup_task and not self._pre_warmup_task.done():
                 self._pre_warmup_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._pre_warmup_task
-                except (asyncio.CancelledError, Exception):
-                    pass
             # Detach from any in-flight warmups this WS was listening to so the
             # registry stops fanning future events to a closed socket. The
             # warmup itself keeps running and will emit through any other
@@ -863,8 +839,19 @@ class DashboardConnection(
     def _can_access_agent(self, name: str) -> bool:
         return self.user_role == "admin" or name in self.user_agents
 
-    def _register_notify_queue(self):
-        """Register/update the notification queue for the current session_id."""
+    def _register_notify_queue(self, *, replaces: str = ""):
+        """Register/update the notification queue for the current session_id.
+
+        ``replaces`` names the session id this registration supersedes — a
+        re-warm minted a fresh id for the SAME chat. Its entry is dropped
+        (identity-guarded to this connection's queue): dead-session keys
+        otherwise accumulate and can misroute the server-kick session lookup
+        (session_delivery / hooks pick the stale sid as the "active" one).
+        Chat-SWITCH re-registers must NOT pass it — the connection's entries
+        for its other, backgrounded chats are load-bearing."""
+        if (replaces and replaces != self.session_id
+                and _dashboard_notify_queues.get(replaces) is self.notify_queue):
+            del _dashboard_notify_queues[replaces]
         if self.session_id:
             _dashboard_notify_queues[self.session_id] = self.notify_queue
             logger.info(f"WS dashboard: registered notify queue for session={self.session_id[:8]} (dict_id={id(_dashboard_notify_queues)}, len={len(_dashboard_notify_queues)})")

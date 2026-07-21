@@ -13,6 +13,7 @@ Protocol:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -68,10 +69,8 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
                 # with WebSocketDisconnect → normal teardown.
                 if time.monotonic() - last_pong > _PONG_TIMEOUT_S:
                     logger.warning("Phone management: pong timeout, disconnecting")
-                    try:
+                    with contextlib.suppress(Exception):
                         await websocket.close(code=1001, reason="pong timeout")
-                    except Exception:
-                        pass
                     break
 
         ping_task = asyncio.create_task(_ping_loop())

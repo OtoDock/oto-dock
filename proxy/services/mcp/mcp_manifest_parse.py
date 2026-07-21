@@ -33,8 +33,11 @@ from services.mcp.mcp_manifest_types import (
     McpManifest,
     NetworkTargetDecl,
     OutputRelocationDef,
+    PERMISSION_TIERS,
     PathEnvDecl,
     PathEnvValueRef,
+    PermissionRule,
+    PermissionsBlock,
     SKILL_ID_MAX_LEN,
     SKILL_ID_RE,
     SKILL_LOADING_DEFAULT,
@@ -49,6 +52,7 @@ from services.mcp.mcp_manifest_types import (
     _ENV_VAR_NAME_RE,
     _VALID_DEVICE_CAPABILITIES,
     _VALID_PLACEMENTS,
+    _VALID_REMOTE_POLICIES,
     _VALID_TOOL_ARG_MODES,
     _parse_companion_app,
 )
@@ -56,6 +60,78 @@ from services.mcp.mcp_validate_oauth import _validate_oauth_services
 from services.mcp.mcp_validate_webhooks import _validate_webhooks_block
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_permissions_block(raw: Any, mcp_name: str) -> PermissionsBlock | None:
+    """Parse + validate a manifest's ``permissions`` block.
+
+    Returns ``None`` if no block is declared. Raises ``ValueError`` on any
+    structural defect — strict-by-design like ``_parse_costs_block``, so a
+    bad manifest is rejected at install/scan time rather than degrading a
+    security-relevant declaration at runtime. The community exact-name rail
+    for ``open`` is NOT enforced here (rules stay as declared); it applies at
+    resolve time in ``mcp_permissions.resolve_tool_tier``, keyed off the
+    manifest's scan directory.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"permissions must be an object, got {type(raw).__name__}")
+
+    default_tier = raw.get("default_tier", "standard")
+    if default_tier not in PERMISSION_TIERS:
+        raise ValueError(
+            f"permissions.default_tier must be one of {list(PERMISSION_TIERS)}, "
+            f"got {default_tier!r}"
+        )
+
+    raw_rules = raw.get("rules", [])
+    if not isinstance(raw_rules, list):
+        raise ValueError(f"permissions.rules must be a list, got {type(raw_rules).__name__}")
+
+    rules: list[PermissionRule] = []
+    seen_exact: set[str] = set()
+    for idx, rraw in enumerate(raw_rules):
+        if not isinstance(rraw, dict):
+            raise ValueError(
+                f"permissions.rules[{idx}] must be an object, got {type(rraw).__name__}"
+            )
+        tool = rraw.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise ValueError(f"permissions.rules[{idx}].tool must be a non-empty string")
+        tool = tool.strip()
+        if tool.startswith("mcp__"):
+            raise ValueError(
+                f"permissions.rules[{idx}].tool must be the bare tool name "
+                f"(no 'mcp__' prefix), got {tool!r}"
+            )
+        tier = rraw.get("tier")
+        if tier not in PERMISSION_TIERS:
+            raise ValueError(
+                f"permissions.rules[{idx}].tier must be one of "
+                f"{list(PERMISSION_TIERS)}, got {tier!r}"
+            )
+        unknown = set(rraw) - {"tool", "tier"}
+        if unknown:
+            raise ValueError(
+                f"permissions.rules[{idx}] has unknown keys: {sorted(unknown)}"
+            )
+        # Duplicate EXACT rules are author error (the second can never win);
+        # repeated globs are legal ordering tools.
+        if not _is_permission_glob(tool):
+            if tool in seen_exact:
+                raise ValueError(
+                    f"permissions.rules[{idx}]: duplicate rule for tool {tool!r}"
+                )
+            seen_exact.add(tool)
+        rules.append(PermissionRule(tool=tool, tier=tier))
+
+    return PermissionsBlock(default_tier=default_tier, rules=rules)
+
+
+def _is_permission_glob(tool: str) -> bool:
+    """True if a permission rule's tool pattern is a glob (vs exact name)."""
+    return any(ch in tool for ch in "*?[")
 
 
 def _parse_costs_block(raw: Any, mcp_name: str) -> CostsBlock | None:
@@ -822,6 +898,12 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     except ValueError as e:
         raise ValueError(f"{name}: invalid costs block — {e}") from e
 
+    # Per-tool permission tiers (optional). Same strict-validation contract.
+    try:
+        permissions = _parse_permissions_block(data.get("permissions"), name)
+    except ValueError as e:
+        raise ValueError(f"{name}: invalid permissions block — {e}") from e
+
     # Per-session prompt blocks (optional). Same strict-validation contract.
     try:
         agent_context_blocks = _parse_agent_context(data.get("agent_context"), name)
@@ -855,6 +937,12 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     if placement not in _VALID_PLACEMENTS:
         raise ValueError(
             f"{name}: placement must be one of {sorted(_VALID_PLACEMENTS)}, got {placement!r}"
+        )
+    remote_policy = data.get("remote_policy", "any")
+    if remote_policy not in _VALID_REMOTE_POLICIES:
+        raise ValueError(
+            f"{name}: remote_policy must be one of "
+            f"{sorted(_VALID_REMOTE_POLICIES)}, got {remote_policy!r}"
         )
     device_capability = data.get("device_capability")
     if device_capability is not None and device_capability not in _VALID_DEVICE_CAPABILITIES:
@@ -924,9 +1012,11 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         path_env=_parse_path_env(data.get("path_env") or {}, name),
         tool_arg_paths=tool_arg_paths,
         costs=costs,
+        permissions=permissions,
         agent_context=agent_context_blocks,
         tool_filter=tool_filter,
         placement=placement,
+        remote_policy=remote_policy,
         requires_display=bool(data.get("requires_display", False)),
         device_capability=device_capability,
         companion_app=companion_app,

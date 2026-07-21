@@ -4,6 +4,7 @@ Provides start/stop/restart/status operations for MCP containers
 defined via docker-compose.yml in their manifest.
 """
 
+import contextlib
 import logging
 import os
 import re
@@ -73,10 +74,8 @@ def _run_compose_streaming(
 
     def _kill() -> None:
         timed_out.set()
-        try:
+        with contextlib.suppress(OSError):
             proc.kill()
-        except OSError:
-            pass
 
     watchdog = threading.Timer(timeout, _kill)
     watchdog.daemon = True

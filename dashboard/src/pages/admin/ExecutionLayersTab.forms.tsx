@@ -545,7 +545,6 @@ export function DiscoverModelsPanel({
     : discoveredModels
 
   const newModels = filtered.filter((m) => !existingModelIds.has(m.model_id))
-  const selectableCount = newModels.length
   const selectedCount = newModels.filter((m) => selected.has(m.model_id)).length
 
   const toggleModel = (id: string) => {

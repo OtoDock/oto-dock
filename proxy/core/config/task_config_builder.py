@@ -379,6 +379,10 @@ async def build_task_agent_config(
         user_sub=user_sub_for_creds or "",
         user_role=task_role or "",
         delegation_targets=resolved_targets,
+        # Pre-resolved off-loop: the delegation provider is no-I/O.
+        delegation_roster=await asyncio.to_thread(
+            dynamic_context.build_delegation_roster, resolved_targets,
+        ),
         trigger_payload=trigger_payload,
         is_remote=is_remote,
         target_admin_paired=(task_target_kind == "admin_remote"),

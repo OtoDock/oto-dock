@@ -39,15 +39,26 @@ def parse_enabled(val: object) -> bool:
     return str(val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def effective_enabled(val: object) -> bool:
+    """Kill-switch value → effective state. UNSET means ON (interactive ships
+    enabled since the R1.5 flip); an explicit value parses normally, so an
+    install that turned it off stays off. Shared with the admin settings API
+    so the GET view and the resolver can't drift."""
+    s = str(val or "").strip()
+    if not s:
+        return True
+    return parse_enabled(s)
+
+
 def is_interactive_enabled() -> bool:
-    """The global kill-switch. Defaults to OFF (``-p``) unless an admin enables
-    it — interactive is opt-in and removable in one flag."""
+    """The global kill-switch. Defaults to ON (unset = enabled) — interactive
+    is opt-out and still removable in one flag."""
     from storage import database
     try:
         val = database.get_platform_setting(KILL_SWITCH_KEY)
     except Exception:
-        return False
-    return parse_enabled(val)
+        return True  # fail to the shipped default, same as unset
+    return effective_enabled(val)
 
 
 def resolve_execution_mode(

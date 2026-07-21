@@ -5,6 +5,7 @@ import { useChatSlice } from '../../store/chatStore'
 import { useActiveChats } from '../../hooks/useActiveChats'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
+import MoveChatConfirm from './MoveChatConfirm'
 
 // Unread-row age steps: a fresh response tints the whole row with the full
 // brand surface; one that has sat unread fades in two steps, so the sidebar
@@ -56,6 +57,10 @@ interface Props {
       history (controlled by the page — ?tasks=1 deep links toggle it on). */
   tasksMode?: boolean
   onTasksModeChange?: (on: boolean) => void
+  /** Fires the move_chat WS op — the op acts on the connection's OPEN chat,
+      so the kebab's move action renders only on the active row (other rows
+      with mismatch data get a plain "Runs on <target>" info row). */
+  onMoveChat?: () => void
 }
 
 function timeAgo(dateStr: string): string {
@@ -148,12 +153,13 @@ function highlightTitle(title: string, query: string): JSX.Element {
 // alone blend into the sidebar (especially age-faded unread), and the ring
 // stays constant while the background pulses/fades so the row keeps a crisp
 // edge. Ring, not border — border-l is the project accent rail.
-function ChatRow({ chat, active, title, onClick, onDelete }: {
+function ChatRow({ chat, active, title, onClick, onDelete, onMoveChat }: {
   chat: Chat
   active: boolean
   title: string | JSX.Element
   onClick: () => void
   onDelete: (id: string) => void
+  onMoveChat?: () => void
 }) {
   const slice = useChatSlice(chat.id)
   const streaming = slice?.status === 'streaming'
@@ -200,7 +206,7 @@ function ChatRow({ chat, active, title, onClick, onDelete }: {
         </p>
         <p className={`text-[10px] mt-[2px] ${active ? 'text-white/70' : 'text-p-text-light'}`}>{timeAgo(chat.updated_at)}</p>
       </div>
-      <ChatItemMenu chatId={chat.id} onDelete={onDelete} onBrand={active} />
+      <ChatItemMenu chatId={chat.id} onDelete={onDelete} onBrand={active} isOpen={active} onMoveChat={onMoveChat} />
     </div>
   )
 }
@@ -260,10 +266,26 @@ function TaskRow({ chat, active, title, onClick }: {
 
 // `onBrand`: the row behind the trigger is the solid-brand active row — swap
 // the gray trigger colors for white ones so the dots stay visible on blue.
-function ChatItemMenu({ chatId, onDelete, onBrand = false }: { chatId: string; onDelete: (id: string) => void; onBrand?: boolean }) {
+// `isOpen`: this row is the OPEN chat — the move_chat op acts on the
+// connection's open chat, so only then is the target-mismatch row actionable.
+function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMoveChat }: {
+  chatId: string
+  onDelete: (id: string) => void
+  onBrand?: boolean
+  isOpen?: boolean
+  onMoveChat?: () => void
+}) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [confirmMove, setConfirmMove] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  // Pin-vs-current target mismatch + live status from the per-chat slice
+  // (populated by warmup_ready for chats opened this session; cleared by the
+  // first mismatch-free warmup after a move). The selector subscribes, so
+  // the row appears/disappears reactively while the menu is open.
+  const slice = useChatSlice(chatId)
+  const mismatch = slice?.targetMismatch ?? null
+  const moveBusy = slice?.status === 'streaming' || slice?.status === 'warming'
 
   // Close menu on outside click
   useEffect(() => {
@@ -288,6 +310,17 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false }: { chatId: string; o
     setConfirmDelete(false)
     onDelete(chatId)
   }, [chatId, onDelete])
+
+  const handleMoveClick = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation()
+    setMenuOpen(false)
+    setConfirmMove(true)
+  }, [])
+
+  const handleConfirmMove = useCallback(() => {
+    setConfirmMove(false)
+    onMoveChat?.()
+  }, [onMoveChat])
 
   return (
     <>
@@ -323,6 +356,24 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false }: { chatId: string; o
         {/* Dropdown menu */}
         {menuOpen && (
           <div className="absolute right-0 top-full mt-1 z-30 bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1 min-w-[120px]">
+            {/* Target-mismatch row — the banner's permanent home after
+                dismissal. Actionable only for the OPEN chat (the move op
+                acts on the connection's open chat); other rows just state
+                the pin so the fact stays visible. */}
+            {mismatch && (isOpen && onMoveChat ? (
+              <button
+                onClick={handleMoveClick}
+                disabled={moveBusy}
+                title={moveBusy ? 'Finish or stop the current turn first' : undefined}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+              >
+                Runs on {mismatch.pinnedLabel} — move to {mismatch.resolvedLabel}
+              </button>
+            ) : (
+              <div className="px-3 py-1.5 text-xs text-p-text-light">
+                Runs on {mismatch.pinnedLabel}
+              </div>
+            ))}
             <button
               onClick={handleDeleteClick}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-accent-red hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
@@ -370,13 +421,23 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false }: { chatId: string; o
         </div>,
         document.body,
       )}
+
+      {/* Move confirmation — shared portal dialog (same one the
+          ChatTargetBanner button opens). */}
+      {confirmMove && mismatch && (
+        <MoveChatConfirm
+          label={mismatch.resolvedLabel}
+          onConfirm={handleConfirmMove}
+          onCancel={() => setConfirmMove(false)}
+        />
+      )}
     </>
   )
 }
 
 export default function ChatHistory({
   chats, activeChatId, agentName, onSelect, onNew, onNavigate,
-  tasksMode = false, onTasksModeChange,
+  tasksMode = false, onTasksModeChange, onMoveChat,
 }: Props) {
   const deleteChat = useDeleteChat()
   const [searchInput, setSearchInput] = useState('')
@@ -404,8 +465,22 @@ export default function ChatHistory({
   const displayChats = isSearchActive && searchResults ? searchResults : modeChats
   const groups = useMemo(() => groupChats(displayChats), [displayChats])
 
+  // A failed DELETE otherwise vanishes (the confirm popover already closed
+  // and the list never refetches) — surface it inline above the list.
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const deleteErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (deleteErrorTimer.current) clearTimeout(deleteErrorTimer.current)
+  }, [])
+
   const handleDelete = useCallback((chatId: string) => {
-    deleteChat.mutate(chatId)
+    deleteChat.mutate(chatId, {
+      onError: (e) => {
+        setDeleteError((e as Error)?.message || 'Failed to delete chat')
+        if (deleteErrorTimer.current) clearTimeout(deleteErrorTimer.current)
+        deleteErrorTimer.current = setTimeout(() => setDeleteError(null), 8000)
+      },
+    })
   }, [deleteChat])
 
   return (
@@ -460,6 +535,21 @@ export default function ChatHistory({
             </button>
           )}
         </div>
+
+        {deleteError && (
+          <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-sm border border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
+            <span className="min-w-0 break-words">{deleteError}</span>
+            <button
+              onClick={() => setDeleteError(null)}
+              className="ml-auto shrink-0 hover:text-red-700 dark:hover:text-red-300"
+              aria-label="Dismiss"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Cross-agent "Active now" widget — hidden when nothing is running.
@@ -546,6 +636,7 @@ export default function ChatHistory({
                   title={title}
                   onClick={open}
                   onDelete={handleDelete}
+                  onMoveChat={onMoveChat}
                 />
               )
             })}

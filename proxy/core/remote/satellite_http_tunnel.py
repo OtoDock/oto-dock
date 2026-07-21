@@ -24,6 +24,7 @@ failure rather than hanging until timeout.
 
 import asyncio
 import base64
+import contextlib
 import logging
 import re
 import time
@@ -213,6 +214,24 @@ def _swap_brokered_bearer(path: str, headers: dict) -> None:
         if auth_key:
             headers.pop(auth_key, None)
         headers["Authorization"] = f"Bearer {bundle.http_bearer}"
+    elif bundle is None:
+        # Store miss on a valid session JWT → the sidecar 401s (fail-closed).
+        # Post-restart this is a re-adopted session whose broker bundles died
+        # with the process; log once per (session, mcp) so field reports
+        # self-identify — the recovery is a session re-warm.
+        key = (payload.get("sid") or "", mcp_match.group(1))
+        if key not in _swap_miss_logged:
+            _swap_miss_logged.add(key)
+            logger.info(
+                "tunnel bearer swap miss for session %s mcp %s — empty broker "
+                "store (proxy restarted?); MCP auth fails until re-warm",
+                key[0][:8], key[1],
+            )
+
+
+# (session_id, mcp) pairs whose bearer-swap miss was already logged — the miss
+# repeats on every request of the session, one line is enough.
+_swap_miss_logged: set[tuple[str, str]] = set()
 
 
 @dataclass
@@ -258,10 +277,8 @@ class SatelliteHttpTunnelDispatcher:
         """Cancel the sweeper and close the httpx client."""
         if self._sweep_task is not None:
             self._sweep_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._sweep_task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._sweep_task = None
         if self._client is not None:
             await self._client.aclose()

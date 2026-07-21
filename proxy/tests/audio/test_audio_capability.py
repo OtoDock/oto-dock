@@ -6,7 +6,6 @@ Exercises the policy × native-support × provider-config matrix + the
 
 from __future__ import annotations
 
-import pytest
 
 from services.media import audio_service
 from storage import audio_provider_store

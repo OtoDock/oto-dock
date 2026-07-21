@@ -101,10 +101,10 @@ def test_should_exit_on_silence_keeps_waiting_while_pending_with_no_hook_activit
 def test_should_exit_on_silence_settles_at_pending_ceiling():
     # Backstop for a genuinely lost SubagentStop: after the ceiling, settle even
     # with subagents still pending so a dropped hook can't hold the lock forever.
-    import core.layers.cli.settle as settle_mod
+    from core.layers.cli.settle import _SETTLE_PENDING_CEILING
     _, s = _mk(settle_after_result=30, pending=1)
     s.enter_settle()
-    s._settle_start = time.monotonic() - (settle_mod._SETTLE_PENDING_CEILING + 5)
+    s._settle_start = time.monotonic() - (_SETTLE_PENDING_CEILING + 5)
     assert s.should_exit_on_silence(5.0) is True
 
 
@@ -162,3 +162,82 @@ def test_chunk_is_content_ignores_progress_pings():
     assert chunk_is_content(ClaudeStreamChunk(
         event_type="metadata", event_data={},
     )) is False
+
+
+# --- ForeignSkipGate (the skip regime's state machine) ----------------------
+
+def _mk_gate():
+    t = ClaudeCLIEventTranslator(_SID)
+    from core.layers.cli.settle import ForeignSkipGate
+    return t, ForeignSkipGate(_SID, t)
+
+
+def test_gate_arms_on_skip_and_slides_on_noise(monkeypatch):
+    from core.layers.cli import settle as settle_mod
+    monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 10.0)
+    _, g = _mk_gate()
+    assert g.deadline is None
+    g.note_event()          # unarmed: no-op
+    assert g.deadline is None
+    g.record_skip({"result": ""})
+    first = g.deadline
+    assert first is not None
+    time.sleep(0.01)
+    g.note_event()          # armed: SLIDES — never disarms
+    assert g.deadline is not None and g.deadline > first
+
+
+def test_gate_content_clears_regime_and_counts_since_skip():
+    _, g = _mk_gate()
+    g.note_content()
+    g.note_content()
+    assert g.content_since_skip == 2
+    g.record_skip({"result": ""})
+    # Skip restarts the content window (a burst's own junk text must not
+    # flip the NEXT zero-content result to "real")…
+    assert g.content_since_skip == 0
+    assert g.deadline is not None
+    # …and proven content ends the regime.
+    g.note_content()
+    assert g.content_since_skip == 1
+    assert g.deadline is None
+
+
+def test_gate_expiry_and_rearm(monkeypatch):
+    from core.layers.cli import settle as settle_mod
+    monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 0.0)
+    _, g = _mk_gate()
+    g.record_skip({"result": ""})
+    assert g.expired() is True
+    monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 10.0)
+    g.re_arm()
+    assert g.expired() is False
+
+
+def test_gate_record_skip_resets_translator_without_settle():
+    t, g = _mk_gate()
+    t.has_emitted_text = True
+    t._tool_inputs = {0: ["partial"]}
+    g.record_skip({"result": "No response requested."})
+    # Parse state cleared so the driven turn's result-text fallback works…
+    assert t.has_emitted_text is False
+    assert t._tool_inputs == {}
+    # …but settle semantics NOT entered (bg completions must still surface).
+    assert t._in_settle is False
+
+
+def test_translator_suppresses_handshake_sentinel_fallback():
+    from core.layers.cli.translator import RESUME_HANDSHAKE_RESULT
+    t = ClaudeCLIEventTranslator(_SID)
+    chunks = t._handle_result({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": RESUME_HANDSHAKE_RESULT,
+    })
+    # No text chunk for the CLI's resume-handshake plumbing — metadata only.
+    assert all(not c.text for c in chunks)
+    # A real un-streamed answer still falls back to the result text.
+    chunks = t._handle_result({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "actual answer",
+    })
+    assert any(c.text == "actual answer" for c in chunks)

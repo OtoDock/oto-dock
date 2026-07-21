@@ -25,6 +25,7 @@ supplied by the WS layer through callbacks (``add_output_listener`` /
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -36,6 +37,7 @@ import config
 from core.sandbox import pty_relay
 from core.sandbox.pty_relay import PtyProcess
 from core.terminal_queries import strip_queries as _strip_terminal_queries
+from core.terminal_queries import strip_clipboard_writes as _strip_clipboard_writes
 from core.terminal_queries import strip_replies as _strip_terminal_replies
 
 logger = logging.getLogger("claude-proxy.interactive")
@@ -96,6 +98,22 @@ _SUBMIT_MAX_S = getattr(config, "INTERACTIVE_SUBMIT_MAX_S", 12.0)
 # Windows-remote Claude ONLY: one extra Enter this long after the first (the TUI is
 # idle by then). 2 Enters total. Codex / Linux-remote / local: single Enter.
 _SUBMIT_WIN_BACKSTOP_S = getattr(config, "INTERACTIVE_SUBMIT_WIN_BACKSTOP_S", 7.0)
+# Cold-flush CONFIRMATION: the readiness settle is a heuristic — on a cold
+# boot the welcome frame renders, output goes quiet ≥READY_SETTLE_S while the
+# MCPs are still warming, and the flush lands in a TUI whose composer isn't
+# live yet: body + Enter swallowed, first prompt lost (live repro 2026-07-21,
+# first message to a brand-new interactive chat). After the cold-submit Enter
+# fires, if the transcript hasn't confirmed the turn (_turn_open via the
+# journaled user line) within _COLD_RETRY_S, the flushed bytes are re-emitted,
+# up to _COLD_RETRY_MAX times. The window sits past the +4s submit tail so a
+# prompt that DID land is seen as confirmed before the watcher acts.
+_COLD_RETRY_S = getattr(config, "INTERACTIVE_COLD_RETRY_S", 5.0)
+_COLD_RETRY_MAX = getattr(config, "INTERACTIVE_COLD_RETRY_MAX", 2)
+# Floor on the readiness settle for fresh (non prompt-in-argv) TUIs: never
+# mark ready before this much time since spawn — the first post-render quiet
+# is usually the MCP warm, not a live composer (same precedent as MIN_TURN_S
+# guarding turn-complete false-fires). READY_MAX_S stays the hard backstop.
+READY_MIN_S = getattr(config, "INTERACTIVE_READY_MIN_S", 2.5)
 # After PTY output goes quiet for this long (a turn / long pause likely ended),
 # tail the transcript → chat_messages + the title backfill. The native TUI does
 # NOT reliably fire the Stop hook, so without this the DB (and the interactive
@@ -180,6 +198,14 @@ class InteractiveSession:
     ``PtyProcess`` and the per-session viewer/permission plumbing.
     """
 
+    # Class-level defaults for the cold-flush retry state: hand-built partial
+    # instances (``__new__`` test doubles) reach _set_turn_open → _clear_cold_flush
+    # without running __init__, and must degrade to a no-op.
+    _cold_flush_pending: bytes = b""
+    _cold_flush_seed = ""
+    _cold_flush_attempts = 0
+    _cold_flush_watcher: Optional[asyncio.TimerHandle] = None
+
     def __init__(
         self,
         *,
@@ -257,6 +283,10 @@ class InteractiveSession:
         self.had_viewer = False
         self.on_perm_event: Optional[PermEventCb] = None
         self.on_close: Optional[CloseCb] = None
+        # Child exit code, captured by _on_pty_exit BEFORE close(reason=
+        # "exited") — the dashboard surfaces a non-zero code ("process exited
+        # (code 1)") instead of a blank/ambiguous "session ended".
+        self.exit_code: Optional[int] = None
         # Viewer hook fired when the REMOTE PTY transport is
         # reconnecting/reconnected (satellite WS blip). Single-slot (last viewer
         # wins), like on_close/on_perm_event. Stays None for local sessions.
@@ -312,6 +342,14 @@ class InteractiveSession:
         # session went ready (→ live path), and a fixed-delay Enter then would be
         # too soon. Subsequent warm submits use the fast fixed gap.
         self._submitted_once = False
+        # Cold-flush confirm-and-retry (see _COLD_RETRY_S): the flushed
+        # first-prompt bytes (+ any seed digest) kept until the transcript
+        # confirms the turn opened; a bounded watcher re-emits them if not.
+        self._cold_flush_pending: bytes = b""
+        self._cold_flush_seed = ""
+        self._cold_flush_attempts = 0
+        self._cold_flush_watcher: Optional[asyncio.TimerHandle] = None
+        self._spawn_ts = time.monotonic()
         # DB-fallback resume: a restored-history digest stashed BEFORE the cold
         # flush; prepended (as a bracketed paste) to the first submission so the
         # fresh CLI continues with context. Cleared once consumed.
@@ -419,6 +457,13 @@ class InteractiveSession:
         buf = b"".join(self._input_buffer)
         self._input_buffer = []
         if buf:
+            # Keep the flush (+ seed digest) for the confirm-and-retry watcher
+            # (_fire_submit arms it once the cold Enter goes out) — readiness is
+            # a heuristic and this flush can be swallowed by a still-booting
+            # composer.
+            self._cold_flush_pending = buf
+            self._cold_flush_seed = self._pending_seed_digest
+            self._cold_flush_attempts = 0
             # Cold flush: send Enter only after the TUI's echo settles (the input
             # box has just rendered — a fixed short delay can miss it).
             self._emit_to_pty(buf, deferred_submit=True)
@@ -475,7 +520,12 @@ class InteractiveSession:
         # the mirror re-answer every buffered query on each (re)attach (see
         # core.terminal_queries). Remote rings are pre-stripped at feed
         # (remote_pty._feed_output); a local PTY ring is raw, so strip here.
-        return _strip_terminal_queries(sb) if self.target == "local" else sb
+        # Clipboard writes (OSC 52 set) are replay-stripped for BOTH targets:
+        # they pass live (the TUI's copy feature) but a replayed one would
+        # overwrite the viewer's clipboard on page open.
+        if self.target == "local":
+            sb = _strip_terminal_queries(sb)
+        return _strip_clipboard_writes(sb)
 
     def remove_output_listener(self, cb: OutputListener) -> None:
         self._output_listeners.discard(cb)
@@ -536,7 +586,12 @@ class InteractiveSession:
             if self._render_started:
                 if self._settle_handle is not None:
                     self._settle_handle.cancel()
-                self._settle_handle = self._loop.call_later(READY_SETTLE_S, self._mark_ready)
+                # Floor the settle so ready can't fire before READY_MIN_S since
+                # spawn: the first post-render quiet is usually the MCP warm,
+                # not a live composer.
+                delay = max(READY_SETTLE_S,
+                            READY_MIN_S - (time.monotonic() - self._spawn_ts))
+                self._settle_handle = self._loop.call_later(delay, self._mark_ready)
         # A deferred cold-start submit is waiting for the echo to settle — push
         # its Enter out while the text is still echoing (the max-fallback caps it).
         if self._submit_settle_handle is not None:
@@ -650,6 +705,7 @@ class InteractiveSession:
                 self.session_id[:8], len(data),
             )
             self._cancel_deferred_submit()
+            self._clear_cold_flush()  # the user is driving — no replay
         self._emit_to_pty(data)
 
     def interrupt_turn(self) -> bool:
@@ -667,7 +723,7 @@ class InteractiveSession:
         logger.info("interactive %s: dashboard abort sent ESC", self.session_id[:8])
         return True
 
-    def submit_prompt(self, text: str) -> None:
+    def submit_prompt(self, text: str, *, settle: bool = False) -> None:
         """Deliver a COMPLETE prompt to the TUI and submit it.
 
         Single-line text is a plain line-submit (text + CR). MULTI-LINE text (a
@@ -676,12 +732,31 @@ class InteractiveSession:
         first newline, then a trailing CR submits (mirrors the frontend's
         multi-line interactive send). The CR rides the readiness gate + the single
         deferred Enter like any cold prompt, so it lands even before the TUI is
-        ready."""
+        ready.
+
+        ``settle=True`` (server-injected prompts — delegate wakes, queued
+        follow-ups): a large bracketed paste can still be ingesting when the
+        warm fixed-gap Enter lands — the TUI swallows it and the text sits in
+        the composer unsent. Route the trailing Enter through the cold-submit
+        settle machinery instead (echo-quiet + max backstop). Guards mirror
+        ``write_input`` (dual-control drop, readiness buffering) minus the
+        composer-dirty tracking — this is not user typing, and it must not
+        cancel its own pending Enter the way real user input would."""
         raw = text.encode("utf-8")
         if b"\n" in raw or b"\r" in raw:
-            self.write_input(b"\x1b[200~" + raw.replace(b"\r\n", b"\n") + b"\x1b[201~\r")
+            data = b"\x1b[200~" + raw.replace(b"\r\n", b"\n") + b"\x1b[201~\r"
         else:
-            self.write_input(raw + b"\r")
+            data = raw + b"\r"
+        if not settle:
+            self.write_input(data)
+            return
+        if not self.alive or self.otodock_attached:
+            return
+        self._note_activity()
+        if not self._ready:
+            self._input_buffer.append(data)
+            return
+        self._emit_to_pty(data, deferred_submit=True)
 
     def _emit_to_pty(self, data: bytes, deferred_submit: bool = False) -> None:
         """Write to the PTY, ensuring a line-submit actually submits.
@@ -752,10 +827,8 @@ class InteractiveSession:
         if self._closed or not self._ready or not self.chat_id:
             return
         for h in self._submit_tail_handles:
-            try:
+            with contextlib.suppress(Exception):
                 h.cancel()
-            except Exception:
-                pass
         self._submit_tail_handles = [
             self._loop.call_later(delay, self._run_post_output_tail)
             for delay in (1.5, 4.0)
@@ -784,6 +857,11 @@ class InteractiveSession:
             "interactive %s: cold-submit Enter fired (try %d)",
             self.session_id[:8], self._submit_refires + 1,
         )
+        # A COLD flush (readiness-buffered first prompt) gets a confirmation
+        # watcher: if the transcript never journals the user line, this Enter
+        # was swallowed and the flush must be replayed.
+        if self._cold_flush_pending:
+            self._arm_cold_flush_watch()
         # WINDOWS-remote Claude ONLY: the ConPTY render race can swallow this single
         # post-settle Enter (it lands first-try local + Linux-remote). Fire ONE more
         # Enter _SUBMIT_WIN_BACKSTOP_S later — by then the TUI is idle. 2 Enters
@@ -804,6 +882,55 @@ class InteractiveSession:
                 h.cancel()
         self._submit_settle_handle = self._submit_max_handle = None
         self._submit_recheck_handle = None
+
+    # -- cold-flush confirm-and-retry ------------------------------------------
+    def _arm_cold_flush_watch(self) -> None:
+        if self._cold_flush_watcher is not None:
+            self._cold_flush_watcher.cancel()
+        self._cold_flush_watcher = self._loop.call_later(
+            _COLD_RETRY_S, self._check_cold_flush,
+        )
+
+    def _check_cold_flush(self) -> None:
+        """The cold Enter fired _COLD_RETRY_S ago. If the transcript never
+        confirmed the turn (journaled user line → ``_turn_open``), the flush was
+        swallowed by a still-booting composer — replay it. Bounded; stands down
+        the moment the turn opens (:meth:`_set_turn_open`) or the user starts
+        driving (``write_input`` clears the pending flush on real input)."""
+        self._cold_flush_watcher = None
+        if (not self._cold_flush_pending or self._turn_open
+                or not self.alive or self._closing or self._closed):
+            return
+        if self._cold_flush_attempts >= _COLD_RETRY_MAX:
+            logger.warning(
+                "interactive %s: cold first prompt unconfirmed after %d "
+                "attempt(s) — giving up (the user must resend)",
+                self.session_id[:8], self._cold_flush_attempts + 1,
+            )
+            self._cold_flush_pending = b""
+            self._cold_flush_seed = ""
+            return
+        self._cold_flush_attempts += 1
+        logger.info(
+            "interactive %s: cold first prompt unconfirmed — re-emitting "
+            "(retry %d/%d)",
+            self.session_id[:8], self._cold_flush_attempts, _COLD_RETRY_MAX,
+        )
+        # Replay the ORIGINAL flush shape: restore the seed digest and the
+        # first-submission flag so _emit_to_pty pastes seed + body + arms the
+        # deferred Enter exactly like the swallowed attempt did. Synchronous
+        # within this callback — nothing can interleave before the emit.
+        if self._cold_flush_seed:
+            self._pending_seed_digest = self._cold_flush_seed
+        self._submitted_once = False
+        self._emit_to_pty(self._cold_flush_pending, deferred_submit=True)
+
+    def _clear_cold_flush(self) -> None:
+        self._cold_flush_pending = b""
+        self._cold_flush_seed = ""
+        if self._cold_flush_watcher is not None:
+            self._cold_flush_watcher.cancel()
+            self._cold_flush_watcher = None
 
     def set_pending_seed(self, digest: str) -> None:
         """Stash a restored-history digest (DB-fallback) to prepend to the cold
@@ -883,6 +1010,7 @@ class InteractiveSession:
         self._turn_open = is_open
         if is_open:
             self._question_parked = False  # any open unparks (answer/inject)
+            self._clear_cold_flush()  # prompt confirmed — retry stands down
         if is_open == was or not self.chat_id or self.chat_id.startswith("meeting-"):
             return
         if is_open:
@@ -1110,7 +1238,10 @@ class InteractiveSession:
             # within a poll, but the flag must flip synchronously so a second
             # queued item can't ride the stale-idle window.
             self._set_turn_open(True)
-            self.submit_prompt(item["text"])
+            # settle=True: the trailing Enter waits for the paste echo to
+            # settle (large delegate results were landing in the composer
+            # with the fixed-gap Enter swallowed mid-ingest → never sent).
+            self.submit_prompt(item["text"], settle=True)
             logger.info(
                 "interactive %s: %s server prompt [%s] (%d left)",
                 self.session_id[:8],
@@ -1568,6 +1699,7 @@ class InteractiveSession:
         if self._closed or self._closing:
             return
         logger.info("interactive %s: pty exited code=%r", self.session_id[:8], code)
+        self.exit_code = code
         self._loop.create_task(self.close(reason="exited", _signal_child=False))
 
     async def close(self, *, reason: str = "closed", _signal_child: bool = True) -> None:
@@ -1585,19 +1717,16 @@ class InteractiveSession:
         self._settle_handle = self._ready_max_handle = self._tail_handle = None
         self._inject_backstop_handle = self._resume_tail_handle = None
         for _h in self._submit_tail_handles:
-            try:
+            with contextlib.suppress(Exception):
                 _h.cancel()
-            except Exception:
-                pass
         self._submit_tail_handles = []
         self._cancel_deferred_submit()
+        self._clear_cold_flush()
 
         if self._drainer is not None:
             self._drainer.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._drainer
-            except (asyncio.CancelledError, Exception):
-                pass
             self._drainer = None
 
         if self.pty is not None and not self.pty.closed:
@@ -1880,7 +2009,34 @@ async def _register_session(
         session._start_drainer()
         if not session._ready:  # prompt_in_argv sessions start ready — no gate
             session._arm_readiness()
-        return session
+
+    # Durable delegate-wake replay: results whose delivery failed entirely
+    # while this chat was dead were stored on the chat row — queue them as
+    # server prompts now, so the re-warmed orchestrator continues on its own
+    # (the drain injects at quiescence, after the readiness/cold-submit
+    # gates). Atomic claim: a racing headless turn can't double-inject.
+    # Outside the lock — a DB hop must not serialize other spawns.
+    if session.chat_id:
+        try:
+            from storage import database as task_store
+            wakes = await asyncio.to_thread(
+                task_store.claim_pending_delegate_wake, session.chat_id,
+            )
+            for wake in wakes:
+                session.queue_prompt(wake, "delegate_result_replay",
+                                     chat_id=session.chat_id)
+            if wakes:
+                logger.info(
+                    "interactive %s: queued %d pending delegate wake(s) for "
+                    "replay (chat=%s)", session.session_id[:8], len(wakes),
+                    session.chat_id[:8],
+                )
+        except Exception:
+            logger.exception(
+                "interactive %s: pending delegate-wake replay failed",
+                session.session_id[:8],
+            )
+    return session
 
 
 async def register(

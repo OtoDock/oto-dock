@@ -10,7 +10,6 @@ flag, cross-user PATH gate on shared-admin.
 
 import base64
 import sys
-from pathlib import Path
 
 import pytest
 

@@ -24,6 +24,7 @@ AMI protocol notes that shape this client:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 
@@ -112,10 +113,8 @@ class AMIClient:
         """Best-effort Logoff + socket teardown. Safe to call more than once."""
         if self._writer is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             await self._write_action({"Action": "Logoff"})
-        except Exception:
-            pass
         try:
             self._writer.close()
             await self._writer.wait_closed()

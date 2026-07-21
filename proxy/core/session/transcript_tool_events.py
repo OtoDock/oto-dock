@@ -225,6 +225,16 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
         agent = rec.get("agent", "")
         scope = "agent" if _vis.is_shared_only(agent) else "user"
         sub_id = subscription_pool.get_session_subscription(session_id) or "default"
+        user_sub = rec.get("user_sub")
+        # Pump parity: a Shared-only agent's human session runs on the
+        # interacting USER's subscription — bill the payer (real person),
+        # not the synthetic agent::{slug} chat owner. Agent-scope stays
+        # only for platform-paid sessions (no payer bound).
+        if scope == "agent":
+            payer = subscription_pool.get_session_payer_sub(session_id)
+            if payer:
+                user_sub = payer
+                scope = "user"
         rows: list[dict] = []
         for model, acc in usage_by_model.items():
             if not any((acc["input_tokens"], acc["output_tokens"],
@@ -238,7 +248,7 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
                     + acc["cache_write"] * p_cw + acc["cache_read"] * p_cr
                     ) / 1_000_000
             rows.append({
-                "user_sub": rec.get("user_sub"),
+                "user_sub": user_sub,
                 "agent": agent,
                 "scope": scope,
                 "source_type": rec.get("source_type") or "interactive",

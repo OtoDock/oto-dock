@@ -70,7 +70,8 @@ async def test_register_readopts_held_session_and_events_flow():
             "type": "session_event", "session_id": "s",
             "event": {"hello": 1},
         })
-        assert q.get_nowait() == {"hello": 1}
+        queued = q.get_nowait()
+        assert queued == {"hello": 1}
     finally:
         if conn.writer_task:
             conn.writer_task.cancel()
@@ -78,7 +79,7 @@ async def test_register_readopts_held_session_and_events_flow():
 
 @pytest.mark.asyncio
 async def test_grace_expiry_terminates_with_durable_marker():
-    import core.remote.satellite_connection as sc
+    from core.remote import satellite_connection as sc
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     cm = SatelliteConnectionManager()
@@ -98,7 +99,8 @@ async def test_grace_expiry_terminates_with_durable_marker():
     assert err["type"] == "error"
     assert err.get("durable_marker") is True
     assert "incomplete" in err["message"].lower()
-    assert q.get_nowait() is None
+    queued = q.get_nowait()
+    assert queued is None
     # Grace state cleared on expiry.
     assert "m" not in cm._grace_sessions
     assert not cm.is_session_in_grace("m", "s")

@@ -8,7 +8,6 @@ authoritative (a logged-out session is never resurrected).
 import time
 
 import jwt
-import pytest
 from fastapi.testclient import TestClient
 
 import config

@@ -9,7 +9,6 @@ implementation details and must never surface in the dashboard.
 Run: cd proxy && python -m pytest tests/tasks/test_scheduled_jobs_listing.py -v
 """
 
-import os
 import sys
 
 from tests._paths import PROXY_DIR

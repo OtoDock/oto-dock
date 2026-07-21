@@ -15,6 +15,7 @@ from auth.providers import UserContext, get_current_user, mask_email, require_ad
 from storage import database as task_store
 
 from api.auth._router import router
+import contextlib
 
 logger = logging.getLogger("claude-proxy")
 
@@ -29,8 +30,8 @@ class PlatformSettingsRequest(BaseModel):
     allow_user_paired_machines: bool | None = None
     remote_fallback_user_override: bool | None = None
     remote_fallback_agent_default: bool | None = None
-    # Global interactive kill-switch (core/execution_mode.py). Default OFF:
-    # interactive terminal sessions are opt-in per installation.
+    # Global interactive kill-switch (core/execution_mode.py). Default ON
+    # (unset = enabled since R1.5): interactive is opt-out per installation.
     interactive_cli_enabled: bool | None = None
     # Session retention (services/infra/retention.py)
     session_retention_enabled: bool | None = None
@@ -107,12 +108,10 @@ async def _enforce_user_paired_disabled() -> None:
                 )
             conn = cm.get_connection(machine_id)
             if conn is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await conn.ws.close(
                         code=4005, reason="feature_disabled_by_admin",
                     )
-                except Exception:
-                    pass
                 await cm.deregister(machine_id)
         # Offline user-paired machines — drop their targets too.
         for m in _rs.get_all_user_paired_machines():
@@ -159,9 +158,10 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # offline, hard-fail on agent-default offline)
         "remote_fallback_user_override": settings.get("remote_fallback_user_override", "") != "0",
         "remote_fallback_agent_default": settings.get("remote_fallback_agent_default", "") == "1",
-        # Global interactive kill-switch (core/execution_mode.py). Default OFF
-        # (unset = disabled): interactive terminal sessions are opt-in.
-        "interactive_cli_enabled": execution_mode.parse_enabled(
+        # Global interactive kill-switch (core/execution_mode.py). Default ON
+        # (unset = enabled since R1.5) — effective_enabled keeps this view and
+        # the resolver from drifting.
+        "interactive_cli_enabled": execution_mode.effective_enabled(
             settings.get(execution_mode.KILL_SWITCH_KEY, ""),
         ),
         # Session retention (services/infra/retention.py). Default ON @ 180 days
@@ -411,8 +411,9 @@ async def set_license(
         # Key changed/cleared → free the old binding + drop cached activation.
         try:
             await relay_client.deactivate_license(old_key)
-        except Exception:
-            pass  # best-effort (relay may be unbuilt/unreachable)
+        except Exception as exc:
+            # Best-effort — relay may be unbuilt/unreachable; binding is cleared locally.
+            logger.debug(f"License deactivation for the old key failed: {exc}")
         for k in ("license_activation_receipt", "license_check_status",
                   "license_last_ok_at", "license_last_check_at"):
             await asyncio.to_thread(task_store.set_platform_setting, k, "")
@@ -461,8 +462,9 @@ async def deactivate_license_binding(
     if key:
         try:
             await relay_client.deactivate_license(key)
-        except Exception:
-            pass  # best-effort
+        except Exception as exc:
+            # Best-effort — the cached activation is cleared regardless.
+            logger.debug(f"License deactivation failed: {exc}")
     for k in ("license_activation_receipt", "license_check_status",
               "license_last_ok_at", "license_last_check_at"):
         await asyncio.to_thread(task_store.set_platform_setting, k, "")

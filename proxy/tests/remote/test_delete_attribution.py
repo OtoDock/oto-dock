@@ -11,7 +11,6 @@ delete still leaves the tree non-empty, so it IS attributed — no volume heuris
 """
 
 import sys
-from pathlib import Path
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
 if str(_PROXY_DIR) not in sys.path:

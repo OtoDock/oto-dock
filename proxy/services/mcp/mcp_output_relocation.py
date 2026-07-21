@@ -217,9 +217,7 @@ def _prune_recent(dest_dir: Path, keep: int) -> None:
         return
     for p in files[keep:]:
         try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+            p.unlink(missing_ok=True)  # already-gone file is fine
         except OSError as e:
             logger.debug("keep_recent prune failed for %s: %s", p, e)
 

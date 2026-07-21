@@ -21,7 +21,11 @@ byte-for-byte untouched, so the live install is unaffected):
   not a host port; publishing one is needless attack surface and can collide);
 * convert host **bind-mounts → named volumes** — a relative/absolute host path
   resolves on the *daemon host*, not inside the proxy container, so a bind-mount
-  is meaningless in T2; named volumes already declared are kept as-is;
+  is meaningless in T2; named volumes already declared are kept as-is. The
+  ``${HOST_AGENTS_DIR}`` agents-tree bind (the catalog contract for MCPs that
+  work on agent files, e.g. video-tools) maps to the platform's **shared
+  external agents volume** (``config.OTODOCK_AGENTS_VOLUME``) — the same volume
+  the proxy and file-tools mount — never to a fresh empty per-MCP volume;
 * inject default **memory bounds + log rotation** into services that declare
   none of their own (``_missing_default_bounds`` — the same defaults reach T1
   through the generated override), so a leaky community sidecar can't starve
@@ -114,16 +118,44 @@ def _is_host_bind_source(src: str) -> bool:
     return src.startswith((".", "/", "~"))
 
 
-def _rewrite_volumes(volumes, mcp_name: str, declared: set[str]) -> list:
+# The catalog contract for "this MCP works on the agents tree": a bind whose
+# source is the ``${HOST_AGENTS_DIR}`` env var (optionally with a compose
+# ``:-default``), e.g. ``${HOST_AGENTS_DIR:-../../../agents}:/agents:rw``
+# (video-tools). On T1 the platform-written ``.env`` interpolates it to the
+# real host path — a working bind. On T2 the value would be the *proxy
+# container's* path, which on the daemon host is an empty (auto-created) dir —
+# the real agents tree lives in the platform's shared named volume — so the
+# rewrite maps this mount to that volume instead, declared ``external``
+# because the platform compose owns its lifecycle.
+_AGENTS_SRC_RE = re.compile(r"^\$\{HOST_AGENTS_DIR(?::?-[^}]*)?\}$")
+_AGENTS_SHORT_RE = re.compile(
+    r"^\$\{HOST_AGENTS_DIR(?::?-[^}]*)?\}:(?P<dst>[^:]+)(?::(?P<mode>[^:]+))?$"
+)
+
+
+def _rewrite_volumes(
+    volumes, mcp_name: str, declared: set[str], external: set[str],
+) -> list:
     """Convert host bind-mounts to per-MCP named volumes; keep named volumes.
 
-    Mutates ``declared`` with any named volumes it creates (the caller declares
-    them at the compose top level). Handles both short-form (``"src:dst[:mode]"``)
-    and long-form (``{type: bind, source, target}``) entries.
+    Mutates ``declared`` with any named volumes it creates and ``external``
+    when an agents-tree mount is mapped onto the shared platform volume (the
+    caller declares both at the compose top level). Handles both short-form
+    (``"src:dst[:mode]"``) and long-form (``{type: bind, source, target}``)
+    entries.
     """
+    agents_vol = config.OTODOCK_AGENTS_VOLUME
     out: list = []
     for v in volumes:
         if isinstance(v, str):
+            agents = _AGENTS_SHORT_RE.match(v)
+            if agents:
+                external.add(agents_vol)
+                mode = agents.group("mode")
+                out.append(
+                    f"{agents_vol}:{agents.group('dst')}" + (f":{mode}" if mode else "")
+                )
+                continue
             parts = v.split(":")
             src = parts[0]
             if _is_host_bind_source(src):
@@ -133,9 +165,21 @@ def _rewrite_volumes(volumes, mcp_name: str, declared: set[str]) -> list:
                 declared.add(name)
                 out.append(f"{name}:{dst}" + (f":{mode}" if mode else ""))
             else:
+                if "${" in src:
+                    logger.warning(
+                        "compose_rewrite: %s volume %r has an interpolated source "
+                        "this rewrite doesn't understand — left as-is (it will "
+                        "resolve as a host bind on the daemon host)",
+                        mcp_name, v,
+                    )
                 out.append(v)  # already a named volume
         elif isinstance(v, dict):
-            if v.get("type") == "bind":
+            src = str(v.get("source", ""))
+            if v.get("type") == "bind" and _AGENTS_SRC_RE.match(src):
+                external.add(agents_vol)
+                ro = ":ro" if v.get("read_only") else ""
+                out.append(f"{agents_vol}:{v.get('target', '')}{ro}")
+            elif v.get("type") == "bind":
                 dst = v.get("target", "")
                 name = f"otodock-{config.INSTALL_ID}-mcp-{_slug(mcp_name)}-{_slug(dst)}"
                 declared.add(name)
@@ -145,6 +189,24 @@ def _rewrite_volumes(volumes, mcp_name: str, declared: set[str]) -> list:
         else:
             out.append(v)
     return out
+
+
+def _declare_volumes(data: dict, declared: set[str], external: set[str]) -> None:
+    """Merge ``_rewrite_volumes``'s outputs into the compose top-level ``volumes``.
+
+    Per-MCP names get a default-driver declaration; the shared agents volume is
+    attached ``external`` (the platform compose owns it — attach, never create).
+    """
+    if not declared and not external:
+        return
+    vols = data.get("volumes")
+    if not isinstance(vols, dict):
+        vols = {}
+    for name in sorted(declared):
+        vols.setdefault(name, None)  # null ⇒ default-driver named volume
+    for name in sorted(external):
+        vols[name] = {"external": True, "name": name}
+    data["volumes"] = vols
 
 
 def _pick_target_service(services: dict, service_name: str) -> str:
@@ -200,6 +262,7 @@ def transform_compose_dict(
         )
 
     declared_volumes: set[str] = set()
+    external_volumes: set[str] = set()
     for key, svc in services.items():
         if not isinstance(svc, dict):
             raise ValueError(f"service {key!r} is not a mapping")
@@ -220,7 +283,9 @@ def transform_compose_dict(
             svc["container_name"] = container_name
             svc.pop("ports", None)
             if "volumes" in svc:
-                svc["volumes"] = _rewrite_volumes(svc["volumes"], mcp_name, declared_volumes)
+                svc["volumes"] = _rewrite_volumes(
+                    svc["volumes"], mcp_name, declared_volumes, external_volumes,
+                )
             svc["networks"] = {_NET_KEY: {"aliases": [service_name]}}
         else:
             # Sibling services (already image-based) join the same network so
@@ -230,13 +295,7 @@ def transform_compose_dict(
         svc.update(_missing_default_bounds(svc))
 
     data["networks"] = {_NET_KEY: {"external": True, "name": network_name}}
-    if declared_volumes:
-        vols = data.get("volumes")
-        if not isinstance(vols, dict):
-            vols = {}
-        for name in sorted(declared_volumes):
-            vols.setdefault(name, None)  # null ⇒ default-driver named volume
-        data["volumes"] = vols
+    _declare_volumes(data, declared_volumes, external_volumes)
     return data
 
 
@@ -275,12 +334,15 @@ def ensure_pull_compose(manifest) -> bool:
     services = data.get("services") or {}
     has_build = any(isinstance(s, dict) and "build" in s for s in services.values())
     if not has_build:
-        # Already pull-form — but verify the stamped container_name matches
-        # THIS install identity. The install-id lives in config.env, so a
-        # recreated config.env (install moved to a new folder) rotates it and
-        # a stale stamp makes every `up` collide with the previous
-        # generation's container ("name already in use" → opaque 500 on
-        # start, forever). Re-stamp instead of returning idempotent-False.
+        # Already pull-form — heal what a stale generated artifact can carry:
+        # (a) a container_name stamped by a PREVIOUS install identity. The
+        #     install-id lives in config.env, so a recreated config.env
+        #     (install moved to a new folder) rotates it and a stale stamp
+        #     makes every `up` collide with the previous generation's
+        #     container ("name already in use" → opaque 500 on start, forever).
+        # (b) an agents-tree bind (`${HOST_AGENTS_DIR}` source) left in place
+        #     by a rewrite that predates the shared-volume mapping — on T2 it
+        #     binds an empty host dir, so the MCP sees no agent files.
         expected = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}"
         try:
             target = _pick_target_service(
@@ -289,7 +351,10 @@ def ensure_pull_compose(manifest) -> bool:
         except ValueError:
             return False  # unrecognizable shape — leave it alone
         svc = services.get(target)
-        current = svc.get("container_name") if isinstance(svc, dict) else None
+        if not isinstance(svc, dict):
+            return False
+        changes: list[str] = []
+        current = svc.get("container_name")
         if (
             isinstance(current, str)
             and current.startswith("otodock-")
@@ -297,17 +362,28 @@ def ensure_pull_compose(manifest) -> bool:
             and current != expected
         ):
             svc["container_name"] = expected
-            compose_path.write_text(
-                _HEADER
-                + yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+            changes.append(
+                f"container_name {current} → {expected} (install identity changed)"
             )
-            logger.info(
-                "Re-stamped %s compose container_name %s → %s "
-                "(install identity changed)",
-                manifest.name, current, expected,
+        if isinstance(svc.get("volumes"), list):
+            declared: set[str] = set()
+            external: set[str] = set()
+            healed = _rewrite_volumes(
+                svc["volumes"], manifest.name, declared, external,
             )
-            return True
-        return False  # already pull-form and correctly stamped — idempotent
+            if healed != svc["volumes"]:
+                svc["volumes"] = healed
+                _declare_volumes(data, declared, external)
+                changes.append("host binds → named volumes")
+        if not changes:
+            return False  # already pull-form and healthy — idempotent
+        compose_path.write_text(
+            _HEADER + yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+        )
+        logger.info(
+            "Healed %s pull-form compose: %s", manifest.name, "; ".join(changes),
+        )
+        return True
 
     if not srv.image:
         raise ValueError(

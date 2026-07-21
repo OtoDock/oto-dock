@@ -9,7 +9,6 @@ on-disk layout — including the OS-aware bits (Windows uses
 """
 
 from unittest.mock import patch
-from pathlib import Path
 
 
 SAT_PORT = 49152  # arbitrary tunnel port for tests
@@ -222,7 +221,6 @@ class TestRewriteMcpToml:
         A naive prefix swap produced ``mcps/custom/schedules-mcp`` → a path that
         doesn't exist on the satellite → the MCP failed to start under Codex
         (Claude's JSON twin was immune; it always resolved via the manifest)."""
-        from unittest.mock import patch
         from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
 
@@ -243,7 +241,6 @@ class TestRewriteMcpToml:
         assert "mcps/custom/schedules-mcp" not in result
 
     def test_toml_rewrite_windows_category_aware_venv_layout(self):
-        from unittest.mock import patch
         from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
 
@@ -268,7 +265,6 @@ class TestRewriteMcpToml:
     def test_toml_rewrite_name_differs_from_dir(self):
         """workspace-mcp dir / google-workspace manifest name → the satellite
         path must use the manifest NAME (google-workspace)."""
-        from unittest.mock import patch
         from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
 

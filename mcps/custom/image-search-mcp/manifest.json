@@ -77,6 +77,19 @@
     }
   ],
 
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "find_images",
+        "tier": "open"
+      },
+      {
+        "tool": "search_by_image",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

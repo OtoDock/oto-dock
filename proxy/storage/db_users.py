@@ -5,9 +5,12 @@ Part of the ``storage.database`` facade; import names from
 synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
+import logging
 from datetime import datetime, timezone
 
 from storage.pg import get_conn
+
+logger = logging.getLogger("claude-proxy.db-users")
 
 
 def _make_username_slug(name: str, conn) -> str:
@@ -286,8 +289,9 @@ def _cascade_remove_user_scope_items(conn, sub: str, agent: str) -> None:
             mem_dir = agent_dir / "users" / username / "context" / "memory"
             if mem_dir.is_dir():
                 _shutil.rmtree(mem_dir)
-    except Exception:
-        pass  # Non-critical: dir may not exist yet
+    except Exception as exc:
+        # Non-critical: dir may not exist yet
+        logger.debug(f"User-scope memory cleanup for agent {agent} failed: {exc}")
 
 
 def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
@@ -315,17 +319,20 @@ def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
             try:
                 from services.infra import git_writer
                 git_writer.init_if_missing(user_dir / "context")
-            except Exception:
-                pass  # Non-critical
+            except Exception as exc:
+                # Non-critical
+                logger.debug(f"Git init of user context dir for {agent_name} failed: {exc}")
             # Bind this user's folder to its XFS project ID + limit before any
             # write (no-op unless the kernel quota tier is enabled).
             try:
                 from services.infra import storage_quota
                 storage_quota.ensure_scope(agent_name, "user", username)
-            except Exception:
-                pass  # Non-critical — the quota sweep re-asserts assignment
-    except Exception:
-        pass  # Non-critical — dirs will be created on first access anyway
+            except Exception as exc:
+                # Non-critical — the quota sweep re-asserts assignment
+                logger.debug(f"Quota scope binding for {agent_name} failed: {exc}")
+    except Exception as exc:
+        # Non-critical — dirs will be created on first access anyway
+        logger.debug(f"Ensuring user-agent dirs failed: {exc}")
 
 
 def set_user_agent_role(sub: str, agent: str, role: str) -> None:

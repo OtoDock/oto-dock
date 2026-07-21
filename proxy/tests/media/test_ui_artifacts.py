@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -44,7 +43,7 @@ def _user(sub: str = "user-viewer", role: str = "member",
 def authed():
     """Both serve routes are cookie-gated: default every test to a signed-in
     member of the test agent. The access-matrix tests swap the override."""
-    app.dependency_overrides[get_current_user] = lambda: _user()
+    app.dependency_overrides[get_current_user] = _user
     yield
     app.dependency_overrides.pop(get_current_user, None)
 

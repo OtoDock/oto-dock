@@ -872,7 +872,6 @@ async def handle_write_pptx(args: dict) -> str:
                 }
                 trans_tag = trans_map.get(transition, "fade")
                 ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
-                ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
                 # Remove existing transition
                 existing = slide._element.findall(qn("p:transition"))

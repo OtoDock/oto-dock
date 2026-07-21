@@ -13,7 +13,7 @@ Covers the subscription_pool scope-rebalancing invariants:
 - throttle_from_cli_error classifies CLI-reported error text only.
 """
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from services.engines import subscription_pool as sp
 from services.engines import token_fanout as tf
@@ -56,7 +56,7 @@ def _store_two_subs(mock_store, cons_a=500.0, cons_b=5.0):
     rows = {"sub-a": _row("sub-a"), "sub-b": _row("sub-b")}
     mock_store.list_platform_pool.return_value = list(rows.values())
     mock_store.list_personal.return_value = []
-    mock_store.get_subscription.side_effect = lambda sid: rows.get(sid)
+    mock_store.get_subscription.side_effect = rows.get
     mock_store.get_subscription_consumption.side_effect = (
         lambda sid, since: {"sub-a": cons_a, "sub-b": cons_b}[sid])
     mock_store.get_credential_data.return_value = {
@@ -153,7 +153,7 @@ class TestDriftRebalance:
         rows = {"sub-a": _row("sub-a")}
         mock_store.list_platform_pool.return_value = list(rows.values())
         mock_store.list_personal.return_value = []
-        mock_store.get_subscription.side_effect = lambda sid: rows.get(sid)
+        mock_store.get_subscription.side_effect = rows.get
         mock_store.get_subscription_consumption.return_value = 5000.0
         _bind()
         assert sp.rebalance_scopes(reason="test") == 0
@@ -230,7 +230,7 @@ class TestReactiveRebalance:
         mock_store.list_personal.return_value = [rows["sub-a"]]
         mock_store.list_platform_pool.return_value = []
         mock_store.get_user_allow_platform_auth.return_value = False
-        mock_store.get_subscription.side_effect = lambda sid: rows.get(sid)
+        mock_store.get_subscription.side_effect = rows.get
         mock_store.get_subscription_consumption.return_value = 1.0
         _bind(scope_sub="user-1")
         sp.mark_subscription_throttled("sess-1")

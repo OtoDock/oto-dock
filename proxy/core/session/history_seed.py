@@ -149,13 +149,20 @@ def consume_pending_seed_digest(
         return "", ""
 
     kind, _, detail = reason.partition(":")
-    machine_name = detail if kind == "machine_removed" else ""
+    machine_name = detail if kind in ("machine_removed", "moved") else ""
     if kind == "machine_removed":
         notice = (
             f"Original machine '{machine_name}' was removed — this chat "
             "continued with a fresh session on the agent's current target. "
             "The conversation was restored from history; files from the "
             "removed machine aren't available."
+        )
+    elif kind == "moved":
+        # The user's explicit "Move this chat to the current target" action.
+        notice = (
+            f"This chat moved from {machine_name or 'its previous target'} — "
+            "the session was restarted here from chat history. Files from "
+            "the previous session stay where they were."
         )
     elif kind == "resume_failed":
         # The warmup's resume gate refused (missing session file, RPC

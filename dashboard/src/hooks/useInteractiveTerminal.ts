@@ -402,12 +402,17 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       // ("superseded_otodock", dual-control) claimed it. Anything else = the
       // CLI process actually ended.
       const isTakeover = reason === 'superseded' || reason === 'superseded_otodock'
+      // Abnormal child death (non-zero exit) gets an explicit, visible line —
+      // an instant CLI crash used to read as a blank/ambiguous "session ended".
+      const exitCode = typeof m.code === 'number' ? m.code : null
       const note =
         reason === 'superseded'
           ? '\r\n\x1b[2m[opened on another device — reload to take over]\x1b[0m\r\n'
           : reason === 'superseded_otodock'
             ? '\r\n\x1b[2m[opened in a local terminal — reload to take over]\x1b[0m\r\n'
-            : '\r\n\x1b[2m[session ended]\x1b[0m\r\n'
+            : exitCode !== null && exitCode !== 0
+              ? `\r\n\x1b[31m[process exited unexpectedly (code ${exitCode}) — any error output is above]\x1b[0m\r\n`
+              : '\r\n\x1b[2m[session ended]\x1b[0m\r\n'
       try { term.write(note) } catch { /* noop */ }
       // A REAL exit (the CLI process died: a task finished, or the user quit the
       // TUI with Ctrl+C/Ctrl+D) — tell the page so it can leave the dead terminal

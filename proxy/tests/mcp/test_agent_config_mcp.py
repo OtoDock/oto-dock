@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 
-import pytest
 
 
 from tests._paths import CUSTOM_MCPS, load_mcp_server

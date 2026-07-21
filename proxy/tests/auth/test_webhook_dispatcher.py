@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 
 from tests._paths import PROXY_DIR
@@ -25,7 +24,7 @@ from auth import webhook_providers  # noqa: E402
 from auth.webhook_providers.generic import GenericWebhookProvider  # noqa: E402
 from services.webhooks import webhook_dispatcher  # noqa: E402
 from services.webhooks.event_normalizer import resolve_catalog_keys  # noqa: E402
-from storage import trigger_store, webhook_subscription_store  # noqa: E402
+from storage import credential_store, trigger_store, webhook_subscription_store  # noqa: E402
 
 _CATALOG = [
     {
@@ -221,7 +220,6 @@ import time
 from types import SimpleNamespace
 
 from services.billing import relay_client
-from storage import credential_store
 
 _FORWARD_SECRET = "fwd-secret"
 

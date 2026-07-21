@@ -15,7 +15,6 @@ Covers the full permission matrix:
   API key: all runs
 """
 
-import os
 import sys
 
 import pytest
@@ -330,7 +329,7 @@ class TestPermissionMatrixIntegration:
 
     def test_viewer_agent_page(self, temp_db):
         db = temp_db
-        runs = _seed_runs(db)
+        _seed_runs(db)
         # Viewer on agent page: own user-scoped + agent-scoped for that agent
         result = db.list_runs(limit=100, agent="support-bot", scope_user_sub="user-1")
         ids = {r["id"] for r in result}
@@ -338,7 +337,7 @@ class TestPermissionMatrixIntegration:
 
     def test_manager_agent_page(self, temp_db):
         db = temp_db
-        runs = _seed_runs(db)
+        _seed_runs(db)
         # Manager (sub=mgr-1) on agent page: agent-scoped + own (none) + legacy
         result = db.list_runs(limit=100, agent="support-bot", scope_user_sub="mgr-1")
         ids = {r["id"] for r in result}
@@ -349,7 +348,7 @@ class TestPermissionMatrixIntegration:
 
     def test_admin_agent_page(self, temp_db):
         db = temp_db
-        runs = _seed_runs(db)
+        _seed_runs(db)
         # Admin on agent page (agent param set) -- same as manager
         result = db.list_runs(limit=100, agent="support-bot", scope_user_sub="admin-1")
         ids = {r["id"] for r in result}
@@ -357,13 +356,13 @@ class TestPermissionMatrixIntegration:
 
     def test_admin_admin_page(self, temp_db):
         db = temp_db
-        runs = _seed_runs(db)
+        _seed_runs(db)
         # Admin on admin page (no scope filter) -- sees everything
         result = db.list_runs(limit=100, scope_user_sub=None)
         assert len(result) == 5
 
     def test_api_key_sees_all(self, temp_db):
         db = temp_db
-        runs = _seed_runs(db)
+        _seed_runs(db)
         result = db.list_runs(limit=100, scope_user_sub=None)
         assert len(result) == 5

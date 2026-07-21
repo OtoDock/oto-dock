@@ -18,7 +18,6 @@ and keep their inline bearer untouched — direct-to-vendor, gated on the
 streamable-HTTP-over-tunnel fix.
 """
 
-import os
 import sys
 
 import pytest

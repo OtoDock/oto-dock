@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 import config
+import contextlib
 
 logger = logging.getLogger("claude-proxy.media")
 
@@ -73,10 +74,8 @@ def create_snapshot(chat_id: str, source: Path) -> str | None:
         return snapshot_id
     except OSError as e:
         logger.warning("preview snapshot copy failed for chat %s: %s", chat_id, e)
-        try:
+        with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return None
 
 
@@ -84,10 +83,8 @@ def delete_snapshot(chat_id: str, snapshot_id: str) -> None:
     """Best-effort removal of one snapshot (intra-turn supersede, GC)."""
     if not (_valid_id(chat_id) and _valid_id(snapshot_id)):
         return
-    try:
+    with contextlib.suppress(OSError):
         (config.PREVIEW_SNAPSHOT_DIR / chat_id / snapshot_id).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def delete_chat_dir(chat_id: str) -> None:
@@ -124,13 +121,11 @@ def gc_chat(chat_id: str) -> int:
         # the same flush that triggers this GC).
         if entry.name in referenced:
             continue
-        try:
+        with contextlib.suppress(OSError):
             if time.time() - entry.stat().st_mtime < 300:
                 continue
             entry.unlink()
             removed += 1
-        except OSError:
-            pass
     return removed
 
 

@@ -4,7 +4,6 @@ success path, fail-open matrix, caching. No DB; httpx mocked."""
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 
 import httpx

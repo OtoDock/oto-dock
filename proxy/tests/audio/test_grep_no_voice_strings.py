@@ -14,7 +14,6 @@ Docs (``*.md``) are excluded — only code identifiers are guarded here.
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 
@@ -72,8 +71,10 @@ SCAN_DIRS = ["proxy", "phone", "dashboard/src", "mcps", "scripts"]
 SCAN_EXTS = {".py", ".ts", ".tsx", ".js", ".json", ".sh", ".service", ".toml"}
 # ``sessions`` = runtime-generated per-session MCP config caches (gitignored);
 # they carry stale env until the proxy restarts + satellites re-pull. Not source.
+# ``video-tools`` = the community MCP's AUDIO domain legitimately names a
+# "voice" EQ/denoise preset — nothing to do with the phone-feature rename.
 EXCLUDE_DIR_PARTS = {"venv", "node_modules", "__pycache__", ".git", "dist", "build",
-                     ".pytest_cache", "sessions"}
+                     ".pytest_cache", "sessions", "video-tools"}
 EXCLUDE_FILES = {"test_grep_no_voice_strings.py"}
 
 

@@ -56,6 +56,23 @@
     }
   ],
 
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "display_*",
+        "tier": "open"
+      },
+      {
+        "tool": "send_*",
+        "tier": "open"
+      },
+      {
+        "tool": "list_apps",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

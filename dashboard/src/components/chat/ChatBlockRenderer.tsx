@@ -514,6 +514,7 @@ export default function BlockRenderer({
           dbMessageId={block.dbMessageId}
           snapshotId={block.snapshotId}
           chatId={chatId}
+          generation={block.generation}
           mode={previewMode}
           onDismiss={(scope) => onDismissPreview?.(
             block.fileId,

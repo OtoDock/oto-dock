@@ -532,7 +532,8 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
 
     t1 = threading.Thread(target=C.tail_rollout, args=("st-race", "ct-race", path))
     t1.start()
-    assert entered.wait(timeout=5)  # t1 is inside the locked persist
+    entered_ok = entered.wait(timeout=5)
+    assert entered_ok  # t1 is inside the locked persist
     t2 = threading.Thread(target=C.tail_rollout, args=("st-race", "ct-race", path))
     t2.start()
     release.set()

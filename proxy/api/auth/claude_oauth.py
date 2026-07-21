@@ -149,6 +149,14 @@ async def oauth_exchange(
     scopes = token_data.get("scope", "").split() if token_data.get("scope") else []
     subscription_type = token_data.get("subscriptionType", "")
     rate_limit_tier = token_data.get("rateLimitTier", "")
+    if not subscription_type:
+        # The token response doesn't carry the plan tier, but the Claude Code
+        # TUI gates plan-included models on it — resolve it from the profile
+        # endpoint so the credential (and the auto-label below) start correct.
+        from services.engines.subscription_pool import fetch_anthropic_subscription_fields
+        fetched_type, fetched_tier = fetch_anthropic_subscription_fields(access_token)
+        subscription_type = fetched_type
+        rate_limit_tier = rate_limit_tier or fetched_tier
 
     # Build credential data in the same format as .credentials.json
     credential_data = {

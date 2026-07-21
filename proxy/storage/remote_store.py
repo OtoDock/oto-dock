@@ -652,6 +652,31 @@ def delete_remote_machine(machine_id: str) -> bool:
     return deleted
 
 
+def rebind_chat_to_current_target(chat_id: str, from_label: str) -> bool:
+    """Transition ONE chat to auto-continue on the agent's current target —
+    the user-facing "Move this chat" escape hatch.
+
+    The exact ``delete_remote_machine`` per-chat shape scoped to one row: the
+    pin is cleared to ``''`` (an explicit pin would be masked-then-restamped
+    by the next warmup — dashboard_warmup's ``w_pinned`` requires a live
+    session_id), session ids are dropped so the next turn fresh-spawns, and
+    ``pending_history_seed='moved:<from_label>'`` marks the chat for the
+    DB-history digest injection. The old session is abandoned where it lives
+    (idle reaper / satellite retention owns it)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE chats
+                  SET execution_target = '', session_id = NULL,
+                      codex_thread_id = NULL, last_turn_aborted = FALSE,
+                      last_abort_graceful = FALSE, context_used = 0,
+                      pending_history_seed = %s
+                WHERE id = %s""",
+            (f"moved:{from_label}", chat_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 # ---------------------------------------------------------------------------
 # Agent-machine targeting
 # ---------------------------------------------------------------------------

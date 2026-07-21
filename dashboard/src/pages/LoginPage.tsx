@@ -83,11 +83,22 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
   // method invoked on an object that is not injected" (silently, in the
   // webview) — that bug shipped once; don't reintroduce it.
   const androidBridge = (window as any).Android
+  // Passkeys are bound to the configured public host (the RP): on any OTHER
+  // origin — localhost, a LAN IP — the browser refuses the ceremony with its
+  // own scary security error. Hide the in-page buttons there and say where
+  // passkeys work instead. The native flow is exempt: its system-browser leg
+  // opens the public URL, so the origin matches by construction.
+  const rpHost = authConfig.passkey_rp_host || ''
+  const rpMismatch = !!rpHost && window.location.hostname !== rpHost
   const passwordlessPasskey = authConfig.passkeys_enabled
     && authConfig.passkey_login_mode !== 'second_factor'
-    && (isNative ? !!androidBridge?.openAuthBrowser : passkeySupported())
+    && (isNative ? !!androidBridge?.openAuthBrowser : passkeySupported() && !rpMismatch)
   // 2FA-step passkey: needs in-page WebAuthn (not available in the app webview).
   const stepPasskey = secondFactors.includes('passkey') && !isNative && passkeySupported()
+    && !rpMismatch
+  // The account HAS a passkey but this origin can't run it — the 2FA step
+  // explains instead of dead-ending.
+  const stepPasskeyElsewhere = secondFactors.includes('passkey') && !isNative && rpMismatch
   const stepTotp = secondFactors.includes('totp')
 
   async function handleLogin(e: React.FormEvent) {
@@ -234,6 +245,15 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
               ? 'Confirm with your passkey to finish signing in.'
               : 'Enter the 6-digit code from your authenticator app, or a recovery code.'}
         </p>
+        {stepPasskeyElsewhere && (
+          <p className="text-xs text-p-text-light mb-4">
+            Your passkey works when you open OtoDock at{' '}
+            <span className="font-medium text-p-text-secondary">https://{rpHost}</span>
+            {stepTotp
+              ? ' — here, use your authenticator code instead.'
+              : '. This address cannot run it, and this account has no authenticator app — sign in from that address, or ask an admin to reset your second factor.'}
+          </p>
+        )}
         {error && <div className="text-sm text-p-accent-red mb-4">{error}</div>}
 
         {stepPasskey && (

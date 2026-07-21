@@ -12,6 +12,7 @@ no-paid-credentials test double (CONTRIBUTING_PROVIDERS.md "Testing").
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from audio.capabilities import STTCapabilities
@@ -99,10 +100,8 @@ class ExampleSTT(STTProvider):
 
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
         self._ready.clear()
-        try:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
         return self.drain_transcript()
 
     def clear_queue(self) -> None:

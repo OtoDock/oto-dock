@@ -22,6 +22,7 @@ Credential schemas are read from MCP manifests via mcp_registry.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import dataclass, field
 
@@ -29,6 +30,9 @@ import config
 from storage import credential_store
 from storage import mcp_store
 from storage import database as task_store
+import contextlib
+
+logger = logging.getLogger("claude-proxy")
 
 
 @dataclass
@@ -381,11 +385,20 @@ def _resolve_oauth_mcp(
         user_sub=user_sub, task_scope=task_scope, agent_name=agent_name,
     )
     if picked is None:
+        logger.debug(
+            "oauth resolve %s: no bound account (provider=%s) — declared "
+            "credential delivery skipped", mcp_name, provider_id,
+        )
         return None
     source_dir, account_label, username = picked
 
     source_file = source_dir / f"{account_label}.json"
     if not source_file.exists():
+        logger.warning(
+            "oauth resolve %s: bound account '%s' has no token file at %s — "
+            "session spawns WITHOUT its declared credential env",
+            mcp_name, account_label, source_file,
+        )
         return None
 
     # `env_injection` (manifest opt-in): expose the bound account's
@@ -428,6 +441,13 @@ def _resolve_oauth_mcp(
             source_dir, account_label,
         ) or {}
         access_token = oauth_account_store.get_canonical_access_token(token_data)
+        if not access_token:
+            logger.warning(
+                "oauth resolve %s: bound account '%s' token file holds no "
+                "canonical access_token — declared env (%s) NOT injected",
+                mcp_name, account_label,
+                ",".join(injection_names + mcp_env_names) or "git helper",
+            )
         if injection_names and access_token:
             for env_name in injection_names:
                 env_injection_vars[env_name] = access_token
@@ -496,10 +516,8 @@ def _resolve_oauth_mcp(
         # account's token.
         for existing in dest_dir.glob("*.json"):
             if existing.name != source_file.name:
-                try:
+                with contextlib.suppress(OSError):
                     existing.unlink()
-                except OSError:
-                    pass
         shutil.copy2(source_file, dest_dir / source_file.name)
 
         result[env_var] = str(dest_dir)

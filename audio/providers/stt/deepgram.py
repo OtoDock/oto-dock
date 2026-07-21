@@ -8,6 +8,7 @@ via the prerecorded REST API (word-level timings for SRT generation).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -342,10 +343,8 @@ class DeepgramSTT(STTProvider):
         guessing.  Returns the transcript text, or None on timeout.
         """
         self._transcript_ready.clear()
-        try:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._transcript_ready.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
         return self.drain_transcript()
 
     async def force_endpoint(self) -> None:
@@ -400,10 +399,8 @@ class DeepgramSTT(STTProvider):
         """Close the connection without waiting for final transcript."""
         self._is_open = False
         if self._connection:
-            try:
+            with contextlib.suppress(Exception):
                 await self._connection.finish()
-            except Exception:
-                pass
             self._connection = None
 
     # ── Lifecycle hooks ──────────────────────────────────────────
@@ -445,10 +442,8 @@ class DeepgramSTT(STTProvider):
             logger.info("STT still alive after opening TTS")
             return True
         # Connection died during opening — reconnect
-        try:
+        with contextlib.suppress(Exception):
             await self.close()
-        except Exception:
-            pass
         try:
             await self.start(
                 language=language, interim_results=self._interim_results,

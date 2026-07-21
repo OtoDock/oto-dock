@@ -8,6 +8,7 @@ Protocol:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -162,14 +163,12 @@ async def ws_satellite_handler(websocket: WebSocket):
         msg = json.loads(raw)
     except (asyncio.TimeoutError, json.JSONDecodeError) as e:
         logger.warning("Satellite auth timeout or invalid JSON: %s", e)
-        try:
+        with contextlib.suppress(Exception):
             await websocket.send_text(json.dumps({
                 "type": "auth_result",
                 "status": "rejected",
                 "reason": "Auth timeout or invalid message",
             }))
-        except Exception:
-            pass
         await websocket.close(code=4001, reason="Auth failed")
         return
 

@@ -44,7 +44,7 @@ def _user(sub: str = "alice-sub", role: str = "member",
 
 @pytest.fixture(autouse=True)
 def authed():
-    app.dependency_overrides[get_current_user] = lambda: _user()
+    app.dependency_overrides[get_current_user] = _user
     yield
     app.dependency_overrides.pop(get_current_user, None)
 

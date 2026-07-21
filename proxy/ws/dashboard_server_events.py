@@ -230,6 +230,18 @@ class ServerNotificationController:
                     f"(session death: {notification.get('reason') or '-'})"
                 )
 
+        elif ntype == "chat_ui_frame":
+            # A chat-scoped UI frame broadcast independent of any delivery
+            # path (session_state.broadcast_chat_frame) — e.g. the terminal
+            # delegate_result badge frame when the wake landed on a rung with
+            # no socket (pty/persistent/one-shot/none). Forward verbatim to
+            # the viewer of that chat; no persistence (the ladder already
+            # persisted the event row), no server turn.
+            if notification.get("chat_id") == self.chat_id:
+                frame = notification.get("frame")
+                if isinstance(frame, dict) and frame:
+                    await self._send(frame)
+
         elif ntype == "task_result_prompt":
             task_id = notification.get("task_id", "")
             task_name = notification["task_name"]

@@ -8,7 +8,6 @@ per-session fan-out (the hot path is untouched: ``include_idle`` defaults False)
 """
 
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 

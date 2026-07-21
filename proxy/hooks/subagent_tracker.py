@@ -66,7 +66,7 @@ def main():
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10):
             pass  # Fire and forget
     except Exception:
         pass  # Non-blocking — never interrupt Claude

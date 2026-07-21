@@ -32,6 +32,7 @@ group), then write each file via tmp+fsync+rename.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import re
@@ -294,7 +295,7 @@ def scope_total_bytes(root: Path) -> int:
 def _topic_summary(path: Path) -> str:
     """First non-empty line, stripped of markdown heading markers, truncated
     to INDEX_SUMMARY_MAX_CHARS — the topic's one-line index entry."""
-    try:
+    with contextlib.suppress(OSError):
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 s = line.strip().lstrip("#").strip()
@@ -303,8 +304,6 @@ def _topic_summary(path: Path) -> str:
                         s[: INDEX_SUMMARY_MAX_CHARS - 1] + "…"
                         if len(s) > INDEX_SUMMARY_MAX_CHARS else s
                     )
-    except OSError:
-        pass
     return "(empty)"
 
 
@@ -347,11 +346,9 @@ def regenerate_index(root: Path) -> Path | None:
     index_path = root / INDEX_FILENAME
     new = build_index_content(root)
     wrote: Path | None = index_path
-    try:
+    with contextlib.suppress(OSError):
         if index_path.exists() and index_path.read_text(encoding="utf-8") == new:
             wrote = None
-    except OSError:
-        pass
     if wrote:
         _atomic_write(index_path, new)
     topics = iter_topic_files(root)

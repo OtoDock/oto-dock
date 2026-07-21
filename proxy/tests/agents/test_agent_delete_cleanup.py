@@ -10,10 +10,8 @@ Run: cd proxy && venv/bin/pytest tests/agents/test_agent_delete_cleanup.py -v
 
 from __future__ import annotations
 
-import os
 import sys
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)

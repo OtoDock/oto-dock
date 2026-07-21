@@ -9,11 +9,9 @@ Pure logic — no real MCP spawn, no network (``_fetch_mcp_credentials`` /
 ``urlopen`` are stubbed).
 """
 
-import os
 import sys
 import urllib.error
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)

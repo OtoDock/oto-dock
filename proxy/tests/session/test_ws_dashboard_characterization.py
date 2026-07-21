@@ -12,7 +12,6 @@ their own modules alongside this one.
 """
 
 import asyncio
-import uuid
 
 from tests.fixtures.ws_dashboard_harness import (
     ANY,

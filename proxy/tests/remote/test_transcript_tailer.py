@@ -764,7 +764,8 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
 
     t1 = threading.Thread(target=T.tail_transcript, args=("s-race", "c-race", path))
     t1.start()
-    assert entered.wait(timeout=5)  # t1 is inside the locked persist
+    entered_ok = entered.wait(timeout=5)
+    assert entered_ok  # t1 is inside the locked persist
     t2 = threading.Thread(target=T.tail_transcript, args=("s-race", "c-race", path))
     t2.start()
     release.set()
@@ -1284,3 +1285,40 @@ def test_prose_mentioning_limits_never_triggers_hook(tmp_path, _capture, monkeyp
         [{"type": "text", "text": "the 429 rate limit handling code looks fine"}]))
     T.tail_transcript("s-prose", "c-prose", path)
     assert calls == []
+
+
+def test_redelivered_assistant_text_persists_once(tmp_path, _capture):
+    """A concurrent-tail race (or a CLI line re-write) can deliver the SAME
+    assistant line twice. Text is claimed by line uuid + block index — like
+    thinking/tool/usage always were — so the duplicate row never persists
+    (live-hit 2026-07-19: 37 consecutive duplicate rows in one interactive
+    chat's transcript view)."""
+    line = _line({"type": "assistant", "uuid": "uniq-1",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "text", "text": "once only"}]}})
+    T.tail_lines("s1", "c1", [line])
+    T.tail_lines("s1", "c1", [line])  # re-delivery of the same line
+    assert _capture == [("assistant", "once only")]
+
+
+def test_distinct_lines_same_text_both_persist(tmp_path, _capture):
+    """The claim keys on the LINE (uuid), not the text — a model that really
+    says the same thing twice still persists both rows."""
+    l1 = _line({"type": "assistant", "uuid": "uniq-a",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "same words"}]}})
+    l2 = _line({"type": "assistant", "uuid": "uniq-b",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "same words"}]}})
+    T.tail_lines("s1", "c1", [l1, l2])
+    assert _capture == [("assistant", "same words"), ("assistant", "same words")]
+
+
+def test_uuidless_synthetic_text_line_still_persists(tmp_path, _capture):
+    """Synthetic lines without a uuid (API-error rows) can't be claimed —
+    they persist unconditionally, as before."""
+    line = _line({"type": "assistant",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "text", "text": "api error text"}]}})
+    T.tail_lines("s1", "c1", [line])
+    assert _capture == [("assistant", "api error text")]

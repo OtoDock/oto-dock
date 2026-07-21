@@ -152,19 +152,45 @@ def main():
     except (json.JSONDecodeError, ValueError):
         return
 
-    # Interactive TUI (OTO_INTERACTIVE set by the spawn): this hook is redundant
-    # — the terminal renders tool results itself and the dashboard shows the
-    # terminal, not the rich message list this feeds. It was also surfacing
-    # "PostToolUse hook error" noise in the TUI on some tool results. No-op here;
-    # headless -p still forwards. The PreToolUse permission gate stays active.
-    if os.environ.get("OTO_INTERACTIVE"):
-        return
-
     session_id = os.environ.get("OTO_SESSION_ID", "")
     proxy_url = os.environ.get("PROXY_URL", "")
     api_key = os.environ.get("PROXY_API_KEY", "")
 
     if not proxy_url or not api_key or not session_id:
+        return
+
+    # Interactive TUI (OTO_INTERACTIVE set by the spawn): rendering is
+    # redundant — the terminal shows tool results itself, and forwarding was
+    # surfacing "PostToolUse hook error" noise. But a successful mcp__ tool
+    # call still needs to reach the proxy's session allow-memory: execution
+    # is the only evidence the user clicked Allow in the native prompt, and
+    # without it every call of the same tool re-prompts. Send a MEMORY-ONLY
+    # ping for mcp__ tools (the proxy skips rendering for it); no-op for
+    # everything else. Headless -p still forwards everything.
+    if os.environ.get("OTO_INTERACTIVE"):
+        tool_name = inp.get("tool_name", "")
+        if not tool_name.startswith("mcp__"):
+            return
+        tool_result = inp.get("tool_response") or inp.get("tool_result") or {}
+        payload = json.dumps({
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "summary": "",
+            "is_error": _is_error_result(tool_result, ""),
+            "memory_only": True,
+        }).encode()
+        req = urllib.request.Request(
+            f"{proxy_url}/v1/hooks/tool-result",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass  # memory feed is best-effort — never surface hook errors
         return
 
     tool_name = inp.get("tool_name", "")
@@ -214,7 +240,7 @@ def main():
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5):
             pass  # Fire and forget
     except Exception:
         pass  # Non-blocking — don't interrupt Claude

@@ -123,7 +123,8 @@ export default function ChatInput({
   valueRef.current = value
   const [menuOpen, setMenuOpen] = useState(false)
   const [hasCamera, setHasCamera] = useState(false)
-  const [micStopSignal, setMicStopSignal] = useState(0)  // bump → close an open dictation mic on send
+  const [micStopSignal, setMicStopSignal] = useState(0)      // bump → close the mic, keep the tail (input focus)
+  const [micDiscardSignal, setMicDiscardSignal] = useState(0)  // bump → close the mic, drop the tail (send)
   const internalRef = useRef<HTMLTextAreaElement>(null)
   const textareaRef = (externalTextareaRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -175,7 +176,11 @@ export default function ChatInput({
     if (!trimmed && pendingImages.length === 0 && pendingFiles.length === 0) return
     onSend(trimmed)
     setText('')
-    setMicStopSignal(n => n + 1)  // close the dictation mic if it's open (non-live only)
+    // Close an open dictation mic AND drop its tail: the text was just sent,
+    // so a late stop-flush final must not re-fill the cleared input. Reset
+    // the dictation accumulator for the same reason.
+    dictBaseRef.current = ''
+    setMicDiscardSignal(n => n + 1)
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
@@ -534,6 +539,7 @@ export default function ChatInput({
                 onDictateFinal={appendTranscript}
                 onDictateActive={onMicActive}
                 interruptSignal={micStopSignal}
+                discardSignal={micDiscardSignal}
                 disabled={disabled}
               />
             ) : (

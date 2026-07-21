@@ -85,6 +85,13 @@ def passkey_login_mode() -> str:
     return mode if mode in ("passwordless", "second_factor") else "passwordless"
 
 
+def passkey_rp_host() -> str:
+    """The RP hostname enrolled passkeys are bound to — the login page
+    compares it against ``location.hostname`` to hide passkey buttons on
+    origins where the browser would refuse the ceremony."""
+    return _rp_id()
+
+
 def _rp_id() -> str:
     return urlparse(config.DASHBOARD_PUBLIC_URL.strip()).hostname or ""
 
@@ -196,7 +203,11 @@ async def list_passkeys(user: UserContext | None = Depends(get_current_user)):
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
     creds = await asyncio.to_thread(webauthn_store.list_credentials, u.sub)
-    return {"passkeys": creds, "enabled": passkeys_enabled()}
+    return {
+        "passkeys": creds,
+        "enabled": passkeys_enabled(),
+        "rp_host": passkey_rp_host() if passkeys_enabled() else "",
+    }
 
 
 @router.post("/v1/users/me/passkeys/register/options")

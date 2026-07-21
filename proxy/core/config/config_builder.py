@@ -371,6 +371,10 @@ async def build_agent_config(
         agent_name, assigned_mcp_names,
         user_sub=creds_sub or "", user_role=user_role,
         delegation_targets=resolved_targets,
+        # Pre-resolved off-loop: the delegation provider is no-I/O.
+        delegation_roster=await asyncio.to_thread(
+            dynamic_context.build_delegation_roster, resolved_targets,
+        ),
         is_remote=is_remote,
         target_admin_paired=(target_kind == "admin_remote"),
         target_os=target_os,

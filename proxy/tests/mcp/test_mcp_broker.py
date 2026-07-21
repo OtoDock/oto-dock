@@ -7,7 +7,6 @@ for one MCP can't fetch another's. Pure in-memory + JWT; no spawn-path wiring ye
 """
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 

@@ -1,0 +1,54 @@
+{
+  "name": "music-gen-mcp",
+  "label": "Music Generation",
+  "description": "AI music and sound-effect generation (ElevenLabs Music & SFX)",
+  "version": "1.0.0",
+  "category": "custom",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "instances": {
+    "delivery": "env",
+    "fields": [
+      {"key": "ELEVENLABS_API_KEY", "label": "ElevenLabs API Key", "input_type": "password", "secret": true}
+    ],
+    "max_instances": 0
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "path_env": {
+    "AUDIO_SAVE_DIR": {"role": "workspace"}
+  },
+  "assignment_mode": "explicit",
+  "exclude_from": ["task"],
+
+  "tool_arg_paths": {
+    "compose_music": {
+      "save_path": { "mode": "write" }
+    },
+    "sound_effect": {
+      "save_path": { "mode": "write" }
+    }
+  },
+  "skills": [
+    {
+      "id": "music-gen-usage",
+      "loading": "on_demand",
+      "file": "skills/music-gen-usage/SKILL.md",
+      "description": "Generate music tracks from text prompts. Use when a video or project needs background music, a jingle, or a soundtrack.",
+      "default_exclude_from": ["task"]
+    }
+  ],
+  "permissions": {
+    "default_tier": "standard"
+  },
+  "patched": false,
+  "patch_note": null
+}

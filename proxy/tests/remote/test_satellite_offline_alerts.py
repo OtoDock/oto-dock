@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import core.remote.satellite_connection as sc
+from core.remote import satellite_connection as sc
 from core.remote.satellite_connection import SatelliteConnectionManager
 
 

@@ -100,7 +100,6 @@ async def health():
     # Liveness + version payload (admin footer + fleet/version checks). Static
     # constants read once at import — cheap enough for the 10s Docker healthcheck.
     # community_mcps_version is omitted until it has a runtime source.
-    import config
     from ws.satellite import MIN_SATELLITE_VERSION
     return {
         "status": "ok",
@@ -637,7 +636,7 @@ async def warmup_session_endpoint(req: WarmupRequest, authorization: str | None 
     mcp_config_path, _, _, _, _ = mcp_registry.build_session_mcp_config(req.model, None)
 
     try:
-        session = await get_or_create_persistent_session(
+        await get_or_create_persistent_session(
             session_id=session_id,
             agent_prompt=agent_prompt,
             mcp_config_path=mcp_config_path,

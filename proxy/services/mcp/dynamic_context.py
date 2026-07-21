@@ -584,6 +584,100 @@ async def _resolve_manifest_blocks(
 # Built-in Python providers (iterative logic that doesn't fit templates)
 # ---------------------------------------------------------------------------
 
+# Cap on per-layer model ids rendered into the delegation roster — the full
+# catalog belongs in the dashboard picker, not every system prompt.
+_ROSTER_MODEL_CAP = 8
+
+
+def build_delegation_roster(
+    delegation_targets: list[str],
+) -> dict[str, list[dict]]:
+    """Resolve each target agent's enabled execution layers + models.
+
+    Returns ``{slug: [{path, is_default, local_only, default_model, models,
+    more}, …]}`` — the data ``_delegation_mcp_context`` renders so a
+    "delegate this on Opus / on codex" request can be validated and chosen
+    instead of delegating blind. Sources match the spawn validator
+    (``spawn_authz.validate_spawn_overrides``): ``_get_execution_paths`` for
+    layers, enabled ``list_models`` rows per layer (deduped — one query per
+    distinct layer, not per agent), ``resolve_agent_model`` for the default —
+    so the advertised set is exactly what a spawn override will pass.
+
+    Sync DB reads — call via ``asyncio.to_thread`` from the config builders
+    and pass the result through the ``delegation_roster`` kwarg; NEVER call
+    from a context provider (providers are no-I/O by contract).
+    """
+    import config as app_config
+    from api.agents._common import _get_execution_paths
+    from storage import agent_store, subscription_store
+
+    models_by_layer: dict[str, list[str]] = {}
+
+    def _layer_models(path: str) -> list[str]:
+        if path not in models_by_layer:
+            try:
+                models_by_layer[path] = [
+                    m["model_id"]
+                    for m in subscription_store.list_models(path)
+                    if m.get("enabled") and m.get("model_id")
+                ]
+            except Exception:
+                models_by_layer[path] = []
+        return models_by_layer[path]
+
+    roster: dict[str, list[dict]] = {}
+    for slug in delegation_targets:
+        data = agent_store.get_agent(slug)
+        if not data:
+            continue
+        try:
+            default_model = app_config.resolve_agent_model(slug)
+        except Exception:
+            default_model = ""
+        layers: list[dict] = []
+        for i, path in enumerate(_get_execution_paths(data)):
+            models = _layer_models(path)
+            # Default first so the cap can never hide it.
+            if default_model in models:
+                models = [default_model] + [
+                    m for m in models if m != default_model
+                ]
+            layers.append({
+                "path": path,
+                "is_default": i == 0,
+                "local_only": path == "direct-llm",
+                "default_model": default_model,
+                "models": models[:_ROSTER_MODEL_CAP],
+                "more": max(0, len(models) - _ROSTER_MODEL_CAP),
+            })
+        roster[slug] = layers
+    return roster
+
+
+def _fmt_roster_layers(layers: list[dict]) -> str:
+    """One compact `layers:` line for an agent's roster entry."""
+    rendered = []
+    for layer in layers:
+        parts = []
+        if layer["is_default"]:
+            parts.append("default")
+        if layer["local_only"]:
+            parts.append("local only")
+        if layer["models"]:
+            shown = ", ".join(
+                f"{m} [default]" if m == layer["default_model"] else m
+                for m in layer["models"]
+            )
+            if layer["more"]:
+                shown += f", +{layer['more']} more"
+            parts.append(f"models: {shown}")
+        rendered.append(
+            f"{layer['path']} ({' | '.join(parts)})" if parts
+            else layer["path"]
+        )
+    return " · ".join(rendered)
+
+
 def _delegation_mcp_context(
     agent_name: str,
     delegation_targets: list[str] | None = None,
@@ -591,10 +685,14 @@ def _delegation_mcp_context(
 ) -> str | None:
     """Inject available agents section into the prompt.
 
-    Lists self + delegation targets with descriptions. This section is
-    shared context — also used by meetings-mcp if enabled. A session-start
-    "active parallel sessions" block rides along — it covers layers with no
-    per-turn prelude injection (PTY, remote) on their first turn.
+    Lists self + delegation targets with descriptions, plus each agent's
+    enabled execution layers/models when the caller pre-resolved them
+    (``delegation_roster`` kwarg — built off-loop by the config builders via
+    ``build_delegation_roster``; this provider itself stays no-I/O beyond
+    the pre-existing agent-row reads). This section is shared context — also
+    used by meetings-mcp if enabled. A session-start "active parallel
+    sessions" block rides along — it covers layers with no per-turn prelude
+    injection (PTY, remote) on their first turn.
     """
     sibling_block = ""
     from core.session import sibling_awareness
@@ -608,6 +706,18 @@ def _delegation_mcp_context(
 
     from storage import agent_store
 
+    roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
+
+    def _agent_lines(slug: str, data: dict, *, is_self: bool) -> list[str]:
+        name = data.get("display_name", slug)
+        desc = data.get("description", "")
+        tag = " *(this is you)*" if is_self else ""
+        out = [f"- **{name}** (`{slug}`){tag}{f' — {desc}' if desc else ''}"]
+        layers = roster.get(slug) or []
+        if layers:
+            out.append(f"  layers: {_fmt_roster_layers(layers)}")
+        return out
+
     # Build agent roster: self first, then targets
     lines = [
         "## Available Agents\n",
@@ -617,9 +727,7 @@ def _delegation_mcp_context(
     # Self
     self_data = agent_store.get_agent(agent_name)
     if self_data:
-        self_name = self_data.get("display_name", agent_name)
-        self_desc = self_data.get("description", "")
-        lines.append(f"- **{self_name}** (`{agent_name}`) *(this is you)*{f' — {self_desc}' if self_desc else ''}")
+        lines.extend(_agent_lines(agent_name, self_data, is_self=True))
 
     # Delegation targets (excluding self if present)
     for slug in delegation_targets:
@@ -627,15 +735,19 @@ def _delegation_mcp_context(
             continue
         data = agent_store.get_agent(slug)
         if data:
-            name = data.get("display_name", slug)
-            desc = data.get("description", "")
-            lines.append(f"- **{name}** (`{slug}`){f' — {desc}' if desc else ''}")
+            lines.extend(_agent_lines(slug, data, is_self=False))
 
     lines.append("")
     lines.append(
         "**Delegation**: Use `delegate(agent=\"...\", surface=...)` to delegate work to another agent. "
         "Use `continue_id` with a prior task/chat id for multi-turn conversations."
     )
+    if roster:
+        lines.append(
+            "Model/layer overrides on `delegate()` must come from the "
+            "target's `layers:` line above; omit both to inherit the "
+            "worker's defaults (recommended). Ignored with `continue_id`."
+        )
     if sibling_block:
         lines.extend(["", sibling_block])
     return "\n".join(lines)
@@ -723,11 +835,6 @@ def _ssh_hosts_context(
     # sandbox /tmp is mount-namespaced private; the chain only lands on a
     # shared /tmp for exotic non-systemd admin-paired hosts).
     mux_capable = (not is_remote) or (target_os or "").lower() in ("linux", "darwin")
-    mux_part = (
-        " -o ControlMaster=auto"
-        ' -o ControlPath="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/oto-cm-%C"'
-        " -o ControlPersist=60s"
-    ) if mux_capable else ""
 
     lines = [
         "## SSH Hosts\n",
@@ -744,30 +851,60 @@ def _ssh_hosts_context(
     ]
     for inst in instances:
         fv = inst.get("field_values", {}) or {}
-        host = (fv.get("host") or "").strip()
-        if not host:
+        command = format_ssh_host_command(fv, mux=mux_capable)
+        if command is None:
             continue
-        name = (fv.get("name") or "").strip() or host
-        username = (fv.get("username") or "").strip()
-        port = str(fv.get("port") or "22").strip() or "22"
-        key_name = (fv.get("key_name") or "").strip()
-        target = f"{username}@{host}" if username else host
-        key_part = f' -i "$OTO_SSH_KEY_DIR/{key_name}"' if key_name else ""
-        # accept-new: without it the first connect dies on ssh's TOFU check in
-        # a non-interactive shell ("Host key verification failed"). Hosts are
-        # admin-configured and often reachable only from the machine the
-        # session runs on, so a platform-side pre-scan can't replace this
-        # (deliberate: reachability from the proxy is NOT assumed).
-        lines.append(
-            f"- **{name}** — `ssh{key_part} -o StrictHostKeyChecking=accept-new"
-            f"{mux_part} -p {port} {target}`"
-        )
+        name = (fv.get("name") or "").strip() or (fv.get("host") or "").strip()
+        lines.append(f"- **{name}** — `{command}`")
     if len(lines) == 2:
         return None  # every instance was missing its host
+    # The block above is static prompt text rendered once at session build —
+    # long sessions lose it to attention decay, so point at the queryable twin.
+    lines.append(
+        "\nIf you are no longer sure which hosts or keys are available, call "
+        "the `list_ssh_hosts` tool — it returns this same list on demand."
+    )
     return "\n".join(lines)
 
 
 register("ssh-hosts", _ssh_hosts_context)
+
+
+_SSH_MUX_OPTS = (
+    " -o ControlMaster=auto"
+    ' -o ControlPath="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/oto-cm-%C"'
+    " -o ControlPersist=60s"
+)
+
+
+def format_ssh_host_command(field_values: dict, *, mux: bool) -> str | None:
+    """One authorized ssh-hosts instance → its ready-to-run ssh command.
+
+    Single source for the SSH Hosts prompt block above AND the
+    ``GET /v1/agents/{name}/ssh-hosts`` endpoint behind the ``list_ssh_hosts``
+    tool — the two surfaces must never drift. Returns ``None`` when the
+    instance has no host. ``mux`` gates the ControlMaster options (see the
+    provider comment: no unix-socket mux on Windows / unknown targets).
+    """
+    fv = field_values or {}
+    host = (fv.get("host") or "").strip()
+    if not host:
+        return None
+    username = (fv.get("username") or "").strip()
+    port = str(fv.get("port") or "22").strip() or "22"
+    key_name = (fv.get("key_name") or "").strip()
+    target = f"{username}@{host}" if username else host
+    key_part = f' -i "$OTO_SSH_KEY_DIR/{key_name}"' if key_name else ""
+    mux_part = _SSH_MUX_OPTS if mux else ""
+    # accept-new: without it the first connect dies on ssh's TOFU check in
+    # a non-interactive shell ("Host key verification failed"). Hosts are
+    # admin-configured and often reachable only from the machine the
+    # session runs on, so a platform-side pre-scan can't replace this
+    # (deliberate: reachability from the proxy is NOT assumed).
+    return (
+        f"ssh{key_part} -o StrictHostKeyChecking=accept-new"
+        f"{mux_part} -p {port} {target}"
+    )
 
 # memory-mcp has no dynamic_context provider — memory reaches the prompt
 # via the dedicated # Memory sections (``config._render_memory_sections``:

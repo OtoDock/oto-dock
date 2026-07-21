@@ -12,6 +12,7 @@ its container and the platform proxy is uninvolved.
 """
 
 import asyncio
+import contextlib
 import logging
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -308,10 +309,8 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
                         elif msg.get("bytes") is not None:
                             await upstream.send(msg["bytes"])
                 except WebSocketDisconnect:
-                    try:
+                    with contextlib.suppress(Exception):
                         await upstream.close()
-                    except Exception:
-                        pass
 
             async def upstream_to_client():
                 try:
@@ -341,7 +340,5 @@ async def proxy_collabora_ws(websocket: WebSocket, path: str):
     except Exception:
         logger.exception(f"Collabora WS proxy error ({path})")
     finally:
-        try:
+        with contextlib.suppress(RuntimeError):
             await websocket.close()
-        except RuntimeError:
-            pass

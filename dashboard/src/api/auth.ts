@@ -51,6 +51,10 @@ export interface AuthConfig {
   // 'passwordless' (primary sign-in button) or 'second_factor' (passkeys
   // offered only at the 2FA step after a correct password)
   passkey_login_mode: string
+  // The RP hostname passkeys are bound to (empty when passkeys are off). On
+  // any other origin the browser refuses the ceremony — the login page hides
+  // its passkey buttons and points at this host instead.
+  passkey_rp_host: string
   // OtoDock connectivity + deployment. `air_gapped` (effective — forced false on
   // cloud) = this install makes no outbound calls to OtoDock; hosted toggles show
   // "disabled (air-gapped)". `relay_available` = connected AND a relay base is
@@ -80,6 +84,7 @@ export async function fetchAuthConfig(): Promise<AuthConfig> {
       email_links_available: false,
       password_min_score: 3, password_min_length: 8,
       passkeys_enabled: false, passkey_login_mode: 'passwordless',
+      passkey_rp_host: '',
       air_gapped: true, relay_available: false, cloud: false,
     }
   }
@@ -183,19 +188,25 @@ export async function verify2FA(
 
 export async function setupFirstUser(
   email: string, password: string, displayName: string
-): Promise<User> {
+): Promise<{ user: User; dashboardUrlCaptured: boolean }> {
   const res = await fetch('/auth/setup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ email, password, display_name: displayName }),
+    body: JSON.stringify({
+      email, password, display_name: displayName,
+      // First-run capture: the true origin the admin browses from becomes
+      // DASHBOARD_PUBLIC_URL when the operator never set one (preview works
+      // out of the box). The server never overwrites an explicit value.
+      origin: window.location.origin,
+    }),
   })
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))
     throw new Error(detail.detail || 'Setup failed')
   }
   const data = await res.json()
-  return data.user
+  return { user: data.user, dashboardUrlCaptured: !!data.dashboard_url_captured }
 }
 
 // --- Session ---

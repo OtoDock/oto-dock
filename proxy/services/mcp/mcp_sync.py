@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -53,6 +54,23 @@ def _is_update_deferred(machine_id: str, mcp_name: str) -> bool:
 def _mark_update_deferred(machine_id: str, mcp_name: str) -> None:
     _deferred_updates[(machine_id, mcp_name)] = time.monotonic() + _DEFER_BACKOFF_S
 
+
+# Per-(machine_id, mcp) memo of DETERMINISTIC install failures — the uv
+# resolver declaring the requirements unsatisfiable (e.g. the MCP needs
+# Python >= 3.11 and the satellite venv is 3.10). Retrying an unsatisfiable
+# resolve on EVERY session start re-ran a doomed ~0.5s install per warmup —
+# wasted latency plus an install-bar flash the user reads as "it's installing
+# something again". The memo keys on the SHIPPED version_hash: a platform-side
+# MCP change (new requirements) invalidates it, a successful install clears
+# it, and ``force`` (the dashboard retry button) bypasses + clears it.
+# In-memory: a proxy restart grants every memoized MCP one fresh attempt.
+# Transient failures (network, file locks, disk) are NEVER memoized.
+_UNSAT_FAIL_RE = re.compile(
+    r"No solution found when resolving dependencies"
+    r"|does not satisfy Python"
+)
+_unsatisfiable_installs: dict[tuple[str, str], dict] = {}
+
 # Callback signature: proxy-side mcp_sync calls this with each progress
 # event received from the satellite. Used by the pump to surface progress
 # as SYSTEM CommonEvents in the chat.
@@ -70,6 +88,11 @@ class SyncResult:
     # MCPs excluded from this session due to install failures. The caller
     # should strip these from the MCP config it ships to the satellite.
     excluded_names: set[str] = field(default_factory=set)
+    # Subset of excluded_names that were skipped from a MEMOIZED deterministic
+    # failure (no install was attempted this session) — the caller must not
+    # emit per-session mcp_install_failed frames for these: a lone failure
+    # frame outside a started/done lifecycle would seed a ghost install bar.
+    memoized: set[str] = field(default_factory=set)
     # MCPs that installed fine but failed the post-install pre-warm boot
     # check: name -> reason. Advisory only — these are NOT excluded
     # (a missing startup credential isn't a real failure; the real session
@@ -152,8 +175,56 @@ async def sync_mcps_for_session(
                 )
                 to_update -= deferred_now
 
+        # Memoized deterministic failures: don't re-attempt an install the
+        # resolver already declared unsatisfiable for the SAME platform bytes.
+        # ``force`` (the retry button) clears the memo and attempts anyway.
+        memo_skips: dict[str, str] = {}
+        _conn = cm.get_connection(machine_id)
+        _sat_ver = getattr(_conn, "satellite_version", "") or ""
+        for name in sorted(to_install | to_update):
+            memo = _unsatisfiable_installs.get((machine_id, name))
+            if memo is None:
+                continue
+            if force:
+                _unsatisfiable_installs.pop((machine_id, name), None)
+                continue
+            if memo.get("satellite_version") != _sat_ver:
+                # The satellite self-updated since the failure — installer
+                # behavior may have changed (e.g. a new python-floor retry) —
+                # the verdict deserves a fresh attempt.
+                _unsatisfiable_installs.pop((machine_id, name), None)
+                continue
+            manifest = mcp_registry.get_manifest(name)
+            try:
+                current_hash = (
+                    mcp_installer.compute_version_hash(manifest.mcp_dir)
+                    if manifest else ""
+                )
+            except Exception:
+                current_hash = ""
+            if current_hash and current_hash == memo.get("hash"):
+                memo_skips[name] = memo.get("error", "install unsatisfiable")
+            else:
+                # Platform-side MCP changed — the verdict may differ now.
+                _unsatisfiable_installs.pop((machine_id, name), None)
+        if memo_skips:
+            to_install -= set(memo_skips)
+            to_update -= set(memo_skips)
+            logger.info(
+                "sync_mcps: skipping %d memoized unsatisfiable install(s) "
+                "for %s: %s", len(memo_skips), machine_id[:8],
+                sorted(memo_skips),
+            )
+
+        def _with_memo_skips(r: SyncResult) -> SyncResult:
+            for name, err in memo_skips.items():
+                r.failed[name] = err
+                r.excluded_names.add(name)
+                r.memoized.add(name)
+            return r
+
         if not (to_install or to_update or to_remove):
-            return SyncResult(ok=True)
+            return _with_memo_skips(SyncResult(ok=True))
 
         # Announce the install plan upfront so the caller's UI can render
         # per-MCP rows even before the first progress event fires.
@@ -166,6 +237,7 @@ async def sync_mcps_for_session(
         # Build tarballs for install + update. Docker MCPs stay on the
         # platform; don't ship those.
         specs = []
+        shipped_hashes: dict[str, str] = {}
         for name in sorted(to_install | to_update):
             manifest = mcp_registry.get_manifest(name)
             if manifest is None:
@@ -181,6 +253,7 @@ async def sync_mcps_for_session(
             except Exception as e:
                 logger.exception("tarball build failed for %s: %s", name, e)
                 continue
+            shipped_hashes[name] = tb.version_hash
             specs.append({
                 "name": name,
                 "category": manifest.category,
@@ -235,7 +308,9 @@ async def sync_mcps_for_session(
         except Exception as e:
             logger.exception("sync_mcps command failed: %s", e)
             cm.unregister_install_progress(command_id)
-            return SyncResult(ok=False, failed={"__transport__": str(e)})
+            return _with_memo_skips(
+                SyncResult(ok=False, failed={"__transport__": str(e)})
+            )
         finally:
             cm.unregister_install_progress(command_id)
 
@@ -246,6 +321,7 @@ async def sync_mcps_for_session(
             if status == "ok":
                 # Update landed — clear any deferral backoff for this MCP.
                 _deferred_updates.pop((machine_id, name), None)
+                _unsatisfiable_installs.pop((machine_id, name), None)
                 if name in to_install:
                     result.installed.append(name)
                 else:
@@ -266,12 +342,21 @@ async def sync_mcps_for_session(
                 err = info.get("error", "unknown")
                 result.failed[name] = err
                 result.excluded_names.add(name)
+                # A resolver-unsatisfiable failure is DETERMINISTIC for these
+                # platform bytes on this machine — memo it so every later
+                # session skips the doomed re-attempt (and its bar flash)
+                # until the MCP changes, an install succeeds, or force retry.
+                if _UNSAT_FAIL_RE.search(err) and shipped_hashes.get(name):
+                    _unsatisfiable_installs[(machine_id, name)] = {
+                        "hash": shipped_hashes[name], "error": err,
+                        "satellite_version": _sat_ver,
+                    }
             # Pre-warm boot check. "warn:<reason>" = installed but
             # didn't answer initialize in time. Advisory — not excluded.
             warm = info.get("warmup", "")
             if isinstance(warm, str) and warm.startswith("warn:"):
                 result.warmup_failed[name] = warm[len("warn:"):]
-        return result
+        return _with_memo_skips(result)
 
 
 async def _fetch_satellite_state(cm, machine_id: str) -> dict[str, dict]:

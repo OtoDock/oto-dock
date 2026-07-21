@@ -8,6 +8,7 @@ the core data structures and path RBAC it builds on live in
 """
 
 import base64
+import contextlib
 import ipaddress
 import re
 import shlex
@@ -1455,14 +1456,17 @@ _PS_SHELL_UNWRAP_RE = re.compile(
     r"""(?:\s+-(?:noprofile|nop|nologo|noninteractive|nonint|mta|sta|windowstyle\s+\S+))*"""
     r"""\s+-c(?:ommand)?"""
     r"""|cmd(?:\.exe)?\s+/c)"""
-    r"""\s+(['"]?)(.*?)\1\s*$""",
+    # No trailing ``\s*`` — the input is rstripped before matching. With
+    # trailing whitespace in play, the lazy body + ``\s*$`` backtrack
+    # quadratically on long space runs (ReDoS).
+    r"""\s+(['"]?)(.*?)\1$""",
 )
 
 
 def _ps_unwrap_shell(command: str) -> str | None:
     """``powershell[.exe] -Command '<inner>'`` / ``pwsh -c …`` / ``cmd /c …`` →
     ``<inner>`` (one layer); None if not a recognized wrapper."""
-    m = _PS_SHELL_UNWRAP_RE.match(command)
+    m = _PS_SHELL_UNWRAP_RE.match(command.rstrip())
     return m.group(2) if m else None
 
 
@@ -1904,12 +1908,12 @@ def _check_webfetch(url: str, ctx: SecurityContext) -> PathDecision:
         if hostname.lower().endswith(suffix):
             return PathDecision(False, "WebFetch denied: private/internal address")
 
-    # Check if hostname is an IP address in private ranges
-    try:
+    # Check if hostname is an IP address in private ranges.
+    # A ValueError means not an IP literal — allow (Anthropic's server-side
+    # has its own protections).
+    with contextlib.suppress(ValueError):
         ip = ipaddress.ip_address(hostname)
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
             return PathDecision(False, "WebFetch denied: private/internal address")
-    except ValueError:
-        pass  # Not an IP literal — allow (Anthropic's server-side has its own protections)
 
     return _ALLOW

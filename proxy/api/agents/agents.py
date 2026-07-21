@@ -215,8 +215,9 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
                             default_enabled=True,
                             default_exclude_from=skill.default_exclude_from,
                         )
-        except Exception:
-            pass  # Non-critical
+        except Exception as exc:
+            # Non-critical
+            logger.debug(f"Seeding core MCPs/skills for new agent {slug} failed: {exc}")
 
     # Assign creator as manager of the new agent (preserve existing assignments)
     from storage import database as task_store
@@ -228,8 +229,9 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
                 task_store.set_user_agents, u.sub, list(current_roles.keys()), u.sub,
                 agent_roles=current_roles,
             )
-    except Exception:
-        pass  # Non-critical
+    except Exception as exc:
+        # Non-critical
+        logger.debug(f"Assigning creator as manager of new agent {slug} failed: {exc}")
 
     return agent
 

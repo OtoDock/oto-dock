@@ -5,11 +5,12 @@ import { render, screen, fireEvent } from '@testing-library/react'
 
 const searchMock = vi.fn(() => ({ data: null, isFetching: false }))
 const taskChatsMock = vi.fn<() => unknown[]>(() => [])
+const deleteMutateMock = vi.fn()
 vi.mock('@/api/chats', async (importOriginal) => {
   const orig = await importOriginal<typeof import('@/api/chats')>()
   return {
     ...orig,
-    useDeleteChat: () => ({ mutate: vi.fn() }),
+    useDeleteChat: () => ({ mutate: deleteMutateMock }),
     useSearchChats: (...args: unknown[]) => searchMock(...args as []),
     useTaskChats: () => ({ data: taskChatsMock() }),
   }
@@ -59,6 +60,7 @@ beforeEach(() => {
   searchMock.mockReturnValue({ data: null, isFetching: false })
   taskChatsMock.mockReturnValue([])
   activeRowsMock.mockReturnValue([])
+  deleteMutateMock.mockReset()
   useChatStore.setState({ byChat: {} })
 })
 
@@ -154,5 +156,34 @@ describe('ChatHistory — Task history view', () => {
   it('task-mode search passes kind=tasks', () => {
     renderHistory({ tasksMode: true })
     expect(searchMock).toHaveBeenCalledWith('dev', '', 'tasks')
+  })
+})
+
+describe('ChatHistory — delete failure surfacing', () => {
+  function confirmDeleteFirstRow() {
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Delete'))
+    // Menu is closed now — the only remaining Delete button is the confirm.
+    fireEvent.click(screen.getByText('Delete'))
+  }
+
+  it('a failed delete shows the backend error inline', () => {
+    deleteMutateMock.mockImplementation((_id: string, opts?: { onError?: (e: Error) => void }) => {
+      opts?.onError?.(new Error('Failed to delete chat (HTTP 500)'))
+    })
+    renderHistory()
+    confirmDeleteFirstRow()
+    expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
+    expect(screen.getByText('Failed to delete chat (HTTP 500)')).toBeTruthy()
+    // Dismissable.
+    fireEvent.click(screen.getByLabelText('Dismiss'))
+    expect(screen.queryByText('Failed to delete chat (HTTP 500)')).toBeNull()
+  })
+
+  it('a successful delete shows nothing', () => {
+    renderHistory()
+    confirmDeleteFirstRow()
+    expect(deleteMutateMock).toHaveBeenCalled()
+    expect(screen.queryByLabelText('Dismiss')).toBeNull()
   })
 })

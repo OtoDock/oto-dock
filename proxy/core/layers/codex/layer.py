@@ -12,6 +12,7 @@ identically to CLI or Direct LLM events.
 import json
 import logging
 import re
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -435,7 +436,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             from core.layers.codex.codex_approvals import approval_for_sandbox
             # Daemon-equivalent env for the bare TUI (mirror _build_env) + TERM +
             # OTO_INTERACTIVE (the PostToolUse forwarder no-ops; decide_tool_permission
-            # returns "defer" for the ask-tier → Codex's own -a on-request prompts).
+            # returns "ask" for the ask-tier — the deny-only gate stays silent on it,
+            # so Codex's own -a on-request prompts).
             proc_env = build_session_env(
                 session_id, config.agent_name,
                 username=username, user_role=_user_role,
@@ -928,7 +930,32 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         if mcp_toml:
             parts.append(mcp_toml.strip())
 
-        config_path.write_text("\n\n".join(parts) + "\n")
+        config_text = "\n\n".join(parts) + "\n"
+        # Validation gate: never hand Codex invalid TOML. The strict TUI
+        # hard-exits (code 1, blank terminal) and the app-server silently
+        # "uses defaults" (drops every MCP) — both are far worse failure
+        # modes than a loud spawn error here. Log line/col + the offending
+        # line with quoted values REDACTED (env blocks carry tokens).
+        try:
+            tomllib.loads(config_text)
+        except tomllib.TOMLDecodeError as e:
+            lineno = getattr(e, "lineno", None)
+            bad = ""
+            if isinstance(lineno, int) and lineno >= 1:
+                lines = config_text.splitlines()
+                if lineno <= len(lines):
+                    bad = re.sub(r'"[^"]*"', '"▮"', lines[lineno - 1])[:200]
+            logger.error(
+                "generated codex config.toml is INVALID (%s): %s | line: %s",
+                config_path, e, bad or "<unavailable>",
+            )
+            raise RuntimeError(
+                f"generated codex config.toml failed TOML validation: {e}"
+            )
+        config_path.write_text(config_text)
+        # config.toml can carry an inline MCP bearer (see the module header) —
+        # lock it owner-only, same as auth.json in this dir.
+        config_path.chmod(0o600)
 
         # Write system prompt as AGENTS.md — Codex's official mechanism
         # for injecting project-level instructions. Placed in CODEX_HOME

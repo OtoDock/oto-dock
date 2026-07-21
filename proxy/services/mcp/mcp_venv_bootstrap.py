@@ -28,6 +28,7 @@ lives in a separate file so additions don't bump ``SHARED_MCP_INSTALLER_HASH``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -65,14 +66,53 @@ def _uv_bin_if_present() -> str | None:
     return None
 
 
-def _venv_is_stale(deps_file: Path, target_dir: Path) -> bool:
-    """``True`` when ``target_dir`` is missing or older than ``deps_file``."""
+def _venv_is_stale(
+    deps_file: Path, target_dir: Path, mcp_dir: Path | None = None,
+) -> bool:
+    """``True`` when ``target_dir`` is missing, older than ``deps_file``, or —
+    when ``mcp_dir`` is given — not success-marked for the current
+    requirements. The marker hash (written only after a dep sync exits 0)
+    catches an INTERRUPTED install: mtime alone called a created-but-
+    never-synced venv fresh forever (live-hit 2026-07-11). Marker-less but
+    populated venvs (pre-marker installs) are backfilled without a rebuild;
+    marker-less EMPTY venvs rebuild."""
     if not target_dir.is_dir():
         return True
     try:
-        return deps_file.stat().st_mtime > target_dir.stat().st_mtime
+        if deps_file.stat().st_mtime > target_dir.stat().st_mtime:
+            return True
     except OSError:
         return True
+    if mcp_dir is None:
+        return False
+    current = _requirements_hash(deps_file)
+    marked = _read_marker(mcp_dir).get("requirements_sha256")
+    if marked == current:
+        return False
+    if marked is None and _venv_has_packages(target_dir):
+        # Pre-marker healthy venv: adopt it (no fleet-wide rebuild storm on
+        # upgrade) — a later requirements edit re-checks via the hash.
+        _write_marker(mcp_dir, requirements_sha256=current)
+        return False
+    return True
+
+
+def _venv_has_packages(venv_dir: Path) -> bool:
+    """At least one installed distribution in the venv's site-packages."""
+    try:
+        for sp in venv_dir.glob("lib/python*/site-packages"):
+            if any(sp.glob("*.dist-info")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _requirements_hash(deps_file: Path) -> str:
+    try:
+        return hashlib.sha256(deps_file.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def _venv_python_minor(venv_dir: Path) -> tuple[int, int] | None:
@@ -280,7 +320,7 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                 if not req_file.is_file():
                     results[name] = "skipped-no-reqs"
                     continue
-                reqs_stale = _venv_is_stale(req_file, venv_dir)
+                reqs_stale = _venv_is_stale(req_file, venv_dir, mcp_dir)
                 interp_stale = _needs_python_reconcile(venv_dir, target, mcp_dir)
                 if not reqs_stale and not interp_stale:
                     results[name] = "fresh"
@@ -303,6 +343,12 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                     )
                     if result.ok:
                         results[name] = "ok-py-reconcile" if interp_stale else "ok"
+                        # Success mark: the dep sync exited 0 for THESE
+                        # requirements — the staleness check trusts only this.
+                        _write_marker(
+                            mcp_dir,
+                            requirements_sha256=_requirements_hash(req_file),
+                        )
                         if interp_stale:
                             _write_marker(mcp_dir, python=f"{target[0]}.{target[1]}")
                     else:

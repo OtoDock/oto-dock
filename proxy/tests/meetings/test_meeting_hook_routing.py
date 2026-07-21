@@ -18,7 +18,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import app
-from api.hooks import hooks
 from api.hooks.hooks import resolve_hook_route, resolve_hook_chat_id
 from core.events.bg_command_state import (
     _bg_command_registries, get_bg_command_registry,

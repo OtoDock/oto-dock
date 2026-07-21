@@ -35,7 +35,7 @@ async def test_emit_forwards_event_to_async_cb():
 @pytest.mark.asyncio
 async def test_emit_forwards_to_sync_cb():
     seen: list[dict] = []
-    await ci._emit(lambda ev: seen.append(ev), "fetch", 5, "downloading")
+    await ci._emit(seen.append, "fetch", 5, "downloading")
     assert seen[0]["phase"] == "fetch" and seen[0]["pct"] == 5
 
 

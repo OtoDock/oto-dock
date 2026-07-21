@@ -36,7 +36,7 @@ _EVENT_BUDGET_SECONDS = 5.0       # whole-event ceiling
 _DEFAULT_TTL_SECONDS = 900
 _CACHE_MAX_ENTRIES = 512
 
-_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
+_TOKEN_RE = re.compile(r"\$\{([^}]++)\}")  # possessive — see webhook_template
 
 # (cache_key) -> (outputs_snapshot, monotonic_expiry)
 _cache: dict[tuple, tuple[dict[str, str], float]] = {}

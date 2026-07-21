@@ -6,8 +6,10 @@ sweepers on startup, and drains sessions + workers on shutdown.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -26,9 +28,29 @@ from core.layers.codex import reap_idle_codex_sessions
 
 logger = logging.getLogger("claude-proxy")
 
+# Background tasks the lifespan owns — cancelled in ``_shutdown_cleanup`` so
+# their teardown never races the closed DB pool.
+_bg_tasks: list[asyncio.Task] = []
+
+# Hard-exit failsafe (armed as the LAST shutdown step): non-daemon threads —
+# asyncio's default-executor workers above all — are joined by the interpreter
+# AFTER uvicorn logs "Finished server process"; one blocked worker used to
+# hang every stop until docker's 10s SIGKILL (exit 137). Tests flip the flag.
+_ARM_EXIT_FAILSAFE = True
+_EXIT_FAILSAFE_GRACE_S = 3.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # SIGUSR1 → all-thread stack dump on stderr; the field tool for shutdown
+    # hangs ("Finished server process" logged but the process never exits).
+    try:
+        import faulthandler
+        import signal
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except (ValueError, AttributeError, OSError):
+        pass  # non-main thread or no SIGUSR1 on this platform
+
     # Startup — register client adapters
     from adapters import register_adapter
     from adapters.phone import PhoneAdapter
@@ -192,7 +214,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Docker MCP bring-up failed (non-fatal)")
 
-    asyncio.create_task(_docker_mcp_bringup())
+    _bg_tasks.append(asyncio.create_task(_docker_mcp_bringup()))
     # Bootstrap core-MCP assignments for pre-existing agents.
     # ``api/agents/agents.py:create_agent`` auto-assigns core MCPs on agent
     # creation, but adding a new core MCP later (e.g. memory-mcp on
@@ -264,26 +286,26 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     # Initialize notification system (after scheduler so it can register jobs)
     notification_manager.start()
-    asyncio.create_task(reap_idle_sessions())
+    _bg_tasks.append(asyncio.create_task(reap_idle_sessions()))
     logger.info(
         f"Persistent session reaper started "
         f"(timeout={config.PERSISTENT_SESSION_TIMEOUT}s)"
     )
-    asyncio.create_task(reap_idle_direct_sessions())
+    _bg_tasks.append(asyncio.create_task(reap_idle_direct_sessions()))
     logger.info(
         f"Direct session reaper started "
         f"(timeout={config.DIRECT_SESSION_TIMEOUT}s)"
     )
-    asyncio.create_task(reap_idle_codex_sessions())
+    _bg_tasks.append(asyncio.create_task(reap_idle_codex_sessions()))
     logger.info("Codex session reaper started")
     from core.remote.remote_execution import reap_idle_remote_sessions
-    asyncio.create_task(reap_idle_remote_sessions())
+    _bg_tasks.append(asyncio.create_task(reap_idle_remote_sessions()))
     logger.info("Remote session reaper started")
     # Task ("is_task") session-index entries are popped on run completion in
     # scheduler._run_task; this is the backstop for any that leak (pre-launch
     # failure / restart mid-run) so the index can't grow unbounded.
     from core.session.session_state import reap_idle_task_sessions
-    asyncio.create_task(reap_idle_task_sessions())
+    _bg_tasks.append(asyncio.create_task(reap_idle_task_sessions()))
     logger.info("Task session reaper started")
     # Interactive CLI (PTY-backed) sessions: idle reaper spares viewed/active
     # sessions; the 120s slot reconciler already counts them live.
@@ -291,12 +313,12 @@ async def lifespan(app: FastAPI):
     interactive_session.start_idle_reaper()
     logger.info("Interactive CLI idle reaper started")
     from core.concurrency import _reconciliation_loop, maintenance_loop
-    asyncio.create_task(_reconciliation_loop())
+    _bg_tasks.append(asyncio.create_task(_reconciliation_loop()))
     logger.info("Chat slot reconciliation started (120s interval)")
-    asyncio.create_task(maintenance_loop())
+    _bg_tasks.append(asyncio.create_task(maintenance_loop()))
     logger.info("Concurrency maintenance loop started (parked-task wakeups + eviction)")
     from core.session import prewarm_session_registry
-    asyncio.create_task(prewarm_session_registry.reap_loop())
+    _bg_tasks.append(asyncio.create_task(prewarm_session_registry.reap_loop()))
     logger.info("Pre-warm TTL reaper started")
     # Start satellite heartbeat monitor
     from core.remote.satellite_connection import get_connection_manager
@@ -305,8 +327,22 @@ async def lifespan(app: FastAPI):
     # re-adopts parked in-flight runs. Registered before the heartbeat monitor
     # starts so the first reconnect's report is handled.
     run_recovery.register(_sat_cm)
-    asyncio.create_task(_sat_cm.heartbeat_monitor())
+    _bg_tasks.append(asyncio.create_task(_sat_cm.heartbeat_monitor()))
     logger.info("Satellite heartbeat monitor started")
+
+    # Delegate wakes parked across the restart: redeliver once boot settles.
+    # Delayed so satellites get their reconnect window first — a wake whose
+    # machine is still offline just re-persists and the machine's own
+    # reconnect pass (run_recovery.on_sessions_alive) retries it.
+    async def _boot_wake_redelivery() -> None:
+        await asyncio.sleep(15)
+        try:
+            woken = await scheduler.redeliver_pending_wakes()
+            if woken:
+                logger.info("Startup wake redelivery: woke %d chat(s)", woken)
+        except Exception:
+            logger.exception("Startup wake redelivery sweep failed")
+    _bg_tasks.append(asyncio.create_task(_boot_wake_redelivery()))
 
     # Start the HTTP-over-WS tunnel dispatcher (sweeps leaked streams,
     # owns the singleton httpx.AsyncClient).
@@ -413,7 +449,7 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("mcp auto-update sweep failed")
 
-    asyncio.create_task(_registry_sweep_loop())
+    _bg_tasks.append(asyncio.create_task(_registry_sweep_loop()))
     logger.info("Warmup + install registry sweeper started (60s interval)")
 
     # Hosted turn-classifier token refresh. When the Groq turn classifier runs
@@ -435,7 +471,7 @@ async def lifespan(app: FastAPI):
             except Exception:
                 logger.exception("phone classifier token refresh failed")
 
-    asyncio.create_task(_phone_classifier_token_refresh_loop())
+    _bg_tasks.append(asyncio.create_task(_phone_classifier_token_refresh_loop()))
     logger.info("Hosted phone-classifier token refresh started (6h interval)")
 
     # OAuth token refresh worker — proactively refreshes per-user
@@ -518,6 +554,65 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("HTTP tunnel dispatcher shutdown failed (continuing)")
 
+    await _shutdown_cleanup(logger)
+    logger.info("Proxy shutdown complete")
+
+
+async def _flush_active_pumps(logger) -> None:
+    """Flush still-open pumps' turn text before the process exits — the
+    lost-transcript class. Mode C-recoverable chats are SKIPPED: the satellite
+    replays their whole retained turn through a fresh recovery pump after the
+    restart, so a shutdown-time abort would stamp a stale interrupted marker
+    and duplicate the replayed rows."""
+    from services.scheduler import run_recovery
+    pumps = list(_active_pumps.items())
+    if not pumps:
+        return
+    waits = []
+    for chat_id, pump in pumps:
+        try:
+            if run_recovery.is_recovery_eligible(chat_id):
+                continue
+            pump.abort()
+            task = getattr(pump, "_task", None)
+            if task is not None:
+                waits.append(task)
+        except Exception as e:
+            logger.warning(f"Shutdown: pump flush {chat_id[:8]} error: {e}")
+    if waits:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(waits, timeout=5)
+        logger.info(f"Shutdown: flushed {len(waits)} open pump(s)")
+
+
+def _arm_exit_failsafe() -> None:
+    """Guarantee process exit after clean shutdown. A clean exit beats the
+    timer (a daemon timer dies with the process); a blocked non-daemon thread
+    makes it fire — log + hard-exit with a DISTINCT code so the journal
+    distinguishes the failsafe from a clean stop."""
+    if not _ARM_EXIT_FAILSAFE:
+        return
+
+    def _fire() -> None:
+        logger.error(
+            "Shutdown failsafe fired after %.0fs — a non-daemon thread "
+            "blocked interpreter exit (SIGUSR1 dumps stacks next time); "
+            "hard-exiting with code 3", _EXIT_FAILSAFE_GRACE_S,
+        )
+        logging.shutdown()
+        os._exit(3)
+
+    timer = threading.Timer(_EXIT_FAILSAFE_GRACE_S, _fire)
+    timer.daemon = True
+    timer.start()
+
+
+async def _shutdown_cleanup(logger) -> None:
+    """The ordered shutdown tail. Order is load-bearing: everything that
+    writes the DB (pump flush, orphan cleanup) runs BEFORE the pool closes;
+    the failsafe arms LAST so a clean exit beats it."""
+    await _flush_active_pumps(logger)
+
     # Safety net: mark any still-active DB records as failed.
     # Handles both close failures and non-graceful prior crashes — but LEAVE
     # recovery-eligible remote runs running (their CLI is still alive on the
@@ -540,8 +635,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Shutdown DB cleanup failed: {e}")
 
+    # Cancel the lifespan's own background loops so their teardown doesn't
+    # race the closed pool below (asyncio.run would cancel them anyway —
+    # but only AFTER lifespan, with the pool already gone).
+    for task in _bg_tasks:
+        task.cancel()
+    if _bg_tasks:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(_bg_tasks, timeout=3)
+    _bg_tasks.clear()
+
     scheduler.stop()
-    logger.info("Proxy shutdown complete")
+
+    # From here down nothing may touch the DB.
+    pg_pool.close_pool()
+
+    from core.layers.direct.mcp import stop_mcp_thread
+    stop_mcp_thread()
+
+    _arm_exit_failsafe()
 
 
 async def _shutdown_sessions(logger):

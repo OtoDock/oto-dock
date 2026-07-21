@@ -34,6 +34,7 @@ MCPs — so we cache tarballs by `version_hash` at
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import logging
 import tarfile
@@ -166,10 +167,8 @@ def build_tarball(mcp_name: str) -> TarballResult:
     if cache_path.is_file():
         content = cache_path.read_bytes()
         # Touch the cache entry so GC considers it recently used.
-        try:
+        with contextlib.suppress(OSError):
             cache_path.touch()
-        except OSError:
-            pass
         return TarballResult(
             tarball_b64=base64.b64encode(content).decode(),
             version_hash=version_hash,
@@ -219,10 +218,8 @@ def invalidate(mcp_name: str) -> None:
                 # always drop it.
                 keep = False
             if not keep:
-                try:
+                with contextlib.suppress(OSError):
                     entry.unlink()
-                except OSError:
-                    pass
     except Exception:
         logger.exception("tarball cache invalidate failed")
 

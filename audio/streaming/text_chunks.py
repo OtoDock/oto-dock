@@ -18,8 +18,10 @@ import re
 # they join clauses rather than end sentences, and a Greek question typed with a
 # plain ";" just yields one slightly larger chunk (still synthesized correctly).
 # The trailing ``(\s+|$)`` requires whitespace/end after the terminator, so
-# decimals ("3.14") and URLs are not split.
-_SENTENCE_END = re.compile(r"([.!?…]+)(\s+|$)")
+# decimals ("3.14") and URLs are not split. Possessive quantifiers: a
+# terminator run that isn't followed by whitespace/end can never match by
+# giving characters back, so backtracking is pure ReDoS surface.
+_SENTENCE_END = re.compile(r"([.!?…]++)(\s++|$)")
 
 
 def split_sentences(text: str, *, max_len: int = 240) -> list[str]:

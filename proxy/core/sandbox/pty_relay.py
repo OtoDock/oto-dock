@@ -26,6 +26,7 @@ the spawn seam here stays clean for it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import fcntl
 import logging
@@ -88,6 +89,13 @@ class PtyProcess:
         self._loop = asyncio.get_running_loop()
         self._closed = False
         self._reader_active = False
+        # Input awaiting the (non-blocking) master fd: the kernel PTY buffer
+        # is small and a busy TUI drains it between frames, so a large paste
+        # hits partial writes / EAGAIN. The remainder is buffered and flushed
+        # via add_writer — dropping it breaks bracketed-paste framing and
+        # loses injected prompts (delegate wakes).
+        self._write_buf = bytearray()
+        self._writer_armed = False
 
     # -- attach ---------------------------------------------------------------
     def _attach(self) -> None:
@@ -132,13 +140,46 @@ class PtyProcess:
 
     # -- input: proxy -> child ------------------------------------------------
     def write(self, data: bytes) -> None:
-        """Write raw bytes (keystrokes) to the PTY → the TUI's stdin."""
+        """Write raw bytes (keystrokes) to the PTY → the TUI's stdin.
+
+        Never drops accepted input: what the non-blocking master fd doesn't
+        take now (partial write / EAGAIN) is buffered and flushed when the fd
+        turns writable."""
         if self._closed or not data:
             return
-        try:
-            os.write(self.master_fd, data)
-        except OSError as exc:
-            logger.warning("pty %s: write failed: %s", self.pid, exc)
+        self._write_buf.extend(data)
+        self._flush_write_buf()
+
+    def _flush_write_buf(self) -> None:
+        while self._write_buf:
+            try:
+                n = os.write(self.master_fd, bytes(self._write_buf))
+            except (BlockingIOError, InterruptedError):
+                self._arm_writer()
+                return
+            except OSError as exc:
+                logger.warning(
+                    "pty %s: write failed, %d byte(s) dropped: %s",
+                    self.pid, len(self._write_buf), exc,
+                )
+                self._write_buf.clear()
+                break
+            if n <= 0:
+                self._arm_writer()
+                return
+            del self._write_buf[:n]
+        self._unarm_writer()
+
+    def _arm_writer(self) -> None:
+        if not self._writer_armed and not self._closed:
+            self._loop.add_writer(self.master_fd, self._flush_write_buf)
+            self._writer_armed = True
+
+    def _unarm_writer(self) -> None:
+        if self._writer_armed:
+            with contextlib.suppress(Exception):
+                self._loop.remove_writer(self.master_fd)
+            self._writer_armed = False
 
     def resize(self, rows: int, cols: int) -> None:
         """Relay a client window resize to the PTY (SIGWINCH to the TUI)."""
@@ -174,17 +215,20 @@ class PtyProcess:
             return
         self._closed = True
         if self._reader_active:
-            try:
+            with contextlib.suppress(Exception):  # pragma: no cover - loop teardown races
                 self._loop.remove_reader(self.master_fd)
-            except Exception:  # pragma: no cover - loop teardown races
-                pass
             self._reader_active = False
+        if self._write_buf:
+            logger.warning(
+                "pty %s: closing with %d unflushed input byte(s)",
+                self.pid, len(self._write_buf),
+            )
+            self._write_buf.clear()
+        self._unarm_writer()
         if signal_child:
             self._signal_group(signal.SIGTERM)
-        try:
+        with contextlib.suppress(OSError):
             os.close(self.master_fd)
-        except OSError:
-            pass
         self._loop.create_task(self._reap_and_notify())
 
     def _signal_group(self, sig: "signal.Signals") -> None:
@@ -254,10 +298,8 @@ def spawn_pty(
         env = {**env, "TERM": "xterm-256color"}
 
     master_fd, slave_fd = pty.openpty()
-    try:
+    with contextlib.suppress(OSError):
         _set_winsize(master_fd, rows, cols)
-    except OSError:
-        pass
 
     def _preexec() -> None:
         # Forked child, pre-exec. Establish the controlling tty by hand
@@ -284,17 +326,13 @@ def spawn_pty(
             close_fds=True,
         )
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.close(master_fd)
-        except OSError:
-            pass
         raise
     finally:
         # Parent keeps only the master end; the child holds its own dup'd copies.
-        try:
+        with contextlib.suppress(OSError):
             os.close(slave_fd)
-        except OSError:
-            pass
 
     proc = PtyProcess(
         popen=popen,

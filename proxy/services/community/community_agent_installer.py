@@ -35,6 +35,7 @@ template folder anymore — the catalog is the single source of truth.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 import uuid
@@ -768,25 +769,25 @@ def _seed_trigger_with_paired_task(
     trig_id = f"trig-{template_slug}-{item.slug}-{suffix}"[:120]
     enabled = item.default_state == "active"
 
-    # Ensure the paired trigger task exists.
+    # Ensure the paired trigger task exists. An existing task (UniqueViolation)
+    # is fine — same idempotency contract as task seeder.
     try:
-        db.create_dynamic_task(
-            task_id=task_id, agent=agent_slug,
-            name=f"[trigger] {item.description or item.slug}",
-            prompt=item.prompt, llm_mode="cli", task_type="trigger",
-            schedule=None, run_at=None,
-            delay_seconds=None, interval_seconds=None,
-            timeout_seconds=600, created_by=created_by, scope=item.scope,
-            on_complete_agent=None, on_complete_prompt=None,
-            on_complete_session_id=None, on_complete_chat_id=None,
-            continue_session=None, use_persistent=False,
-            notification_mode="manual", notify_severity="info",
-            user_tz="UTC",
-            community_template=template_slug,
-            community_template_item_slug=f"{item.slug}__task",
-        )
-    except psycopg.errors.UniqueViolation:
-        pass  # Existing task is fine — same idempotency contract as task seeder.
+        with contextlib.suppress(psycopg.errors.UniqueViolation):
+            db.create_dynamic_task(
+                task_id=task_id, agent=agent_slug,
+                name=f"[trigger] {item.description or item.slug}",
+                prompt=item.prompt, llm_mode="cli", task_type="trigger",
+                schedule=None, run_at=None,
+                delay_seconds=None, interval_seconds=None,
+                timeout_seconds=600, created_by=created_by, scope=item.scope,
+                on_complete_agent=None, on_complete_prompt=None,
+                on_complete_session_id=None, on_complete_chat_id=None,
+                continue_session=None, use_persistent=False,
+                notification_mode="manual", notify_severity="info",
+                user_tz="UTC",
+                community_template=template_slug,
+                community_template_item_slug=f"{item.slug}__task",
+            )
     except Exception:
         logger.exception("Failed to seed trigger-task %s for agent %s",
                          item.slug, agent_slug)

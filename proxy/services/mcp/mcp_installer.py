@@ -50,6 +50,15 @@ DEFAULT_INSTALL_TIMEOUT = 300  # seconds
 _VENV_BIN_DIR = "Scripts" if sys.platform == "win32" else "bin"
 _EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 
+# uv resolver naming a Python floor the current venv can't satisfy — both
+# phrasings: pypi installs report "Requires Python>=3.13", requirements.txt
+# resolves report "the current Python version (3.10.12) does not satisfy
+# Python>=3.11". Captured spec feeds `uv venv --python <spec>`, which
+# downloads a matching standalone CPython when the host lacks one.
+_PY_FLOOR_RE = re.compile(
+    r"Python(>=\s*\d+(?:\.\d+)?(?:\s*,\s*<\s*\d+(?:\.\d+)?)?)"
+)
+
 
 def _shell_argv(cmd: list[str]) -> list[str]:
     """Wrap an argv for cross-platform ``asyncio.create_subprocess_exec``.
@@ -688,7 +697,7 @@ async def install_mcp(
         # constraint and retry once. Single retry — if it still fails, surface
         # the original error.
         if not ok and uv_bin:
-            m = re.search(r"Python(>=\s*\d+(?:\.\d+)?(?:\s*,\s*<\s*\d+(?:\.\d+)?)?)", log)
+            m = _PY_FLOOR_RE.search(log)
             if m:
                 python_spec = m.group(1).replace(" ", "")
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30, "message": f"retry with Python{python_spec}"})
@@ -770,30 +779,63 @@ async def install_mcp(
                                            "pct": 100, "message": "venv failed",
                                            "error": log})
                 return InstallResult(ok=False, log=log)
+        async def _req_install() -> tuple[bool, str]:
+            # Prefer uv when available (much faster).
+            if uv_bin and os.path.isfile(uv_bin):
+                cmd = [uv_bin, "pip", "install",
+                       "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
+                       "-r", str(req_file)]
+                env = uv_env
+            else:
+                cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
+                       "install", "-r", str(req_file)]
+                env = None
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd, cwd=str(mcp_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                ),
+                timeout=timeout,
+            )
+            out, _ = await proc.communicate()
+            return proc.returncode == 0, out.decode(errors="replace")
+
         await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 50,
                                    "message": "pip install -r requirements.txt"})
-        # Prefer uv when available (much faster).
-        if uv_bin and os.path.isfile(uv_bin):
-            cmd = [uv_bin, "pip", "install",
-                   "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
-                   "-r", str(req_file)]
-            env = uv_env
-        else:
-            cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
-                   "install", "-r", str(req_file)]
-            env = None
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *cmd, cwd=str(mcp_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            ),
-            timeout=timeout,
-        )
-        out, _ = await proc.communicate()
-        log = out.decode(errors="replace")
-        if proc.returncode != 0:
+        ok, log = await _req_install()
+        # Python-floor retry — the pypi branch above has had this since the
+        # start; bundled MCPs (server.py + requirements.txt, i.e. every
+        # custom/core MCP) silently lacked it, so a satellite whose default
+        # python is too old failed them forever (live-hit 2026-07-19:
+        # music-gen-mcp needs >=3.11, satellite venv is 3.10 — uv can fetch a
+        # matching standalone CPython, it just was never asked). Recreate the
+        # venv with the reported constraint and retry once.
+        if not ok and uv_bin and os.path.isfile(uv_bin):
+            m = _PY_FLOOR_RE.search(log)
+            if m:
+                python_spec = m.group(1).replace(" ", "")
+                await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30,
+                                           "message": f"retry with Python{python_spec}"})
+                shutil.rmtree(venv_dir, ignore_errors=True)
+                proc = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        uv_bin, "venv", "--python", python_spec, str(venv_dir),
+                        cwd=str(mcp_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        env=uv_env,
+                    ),
+                    timeout=timeout,
+                )
+                out, _ = await proc.communicate()
+                if proc.returncode == 0:
+                    ok, log = await _req_install()
+                else:
+                    log = (f"venv creation with Python{python_spec} failed:\n"
+                           + out.decode(errors="replace"))
+        if not ok:
             await _emit(progress_cb, {"mcp": name, "phase": "failed",
                                        "pct": 100, "message": "pip install failed",
                                        "error": log})

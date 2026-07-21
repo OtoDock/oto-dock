@@ -14,6 +14,16 @@ import type { PendingImage, PendingFile } from './types'
 
 export type ChatStreamPhase = 'idle' | 'warming' | 'ready' | 'streaming' | 'failed'
 
+// Pin-vs-current execution-target mismatch, from warmup_ready's optional
+// pinned_*/resolved_* fields (attached for chat-owner/admin viewers only).
+// Drives the ChatTargetBanner + the sidebar kebab's move row.
+export interface TargetMismatch {
+  pinnedTarget: string
+  pinnedLabel: string
+  resolvedTarget: string
+  resolvedLabel: string
+}
+
 export interface ChatSlice {
   chatId: string
   status: ChatStreamPhase
@@ -21,6 +31,12 @@ export interface ChatSlice {
   executionPath: string
   executionTarget: string
   fallbackReason: string | null
+  // This chat is pinned to an execution target different from the agent's
+  // currently-resolved one (warmup_ready extras). Lives on the slice so it
+  // survives chat navigation and the sidebar kebab can read it. null = no
+  // mismatch; every warmup_ready overwrites it, so the mismatch-free warmup
+  // after a successful move clears it.
+  targetMismatch: TargetMismatch | null
   warmupStartedAt: number | null
   warmupError: string | null
   lastEventAt: number
@@ -73,6 +89,9 @@ interface ChatStoreState {
       // warmup_ready — true forces 'streaming', false forces 'ready',
       // absent (headless / fresh spawn) keeps the no-downgrade guard.
       turn_open?: boolean
+      // Pin-vs-current-target mismatch, or null/absent when the frame has
+      // none — always applied, so an absent mismatch CLEARS a stored one.
+      target_mismatch?: TargetMismatch | null
     },
   ) => void
   failWarmup: (chatId: string, error: string) => void
@@ -113,6 +132,7 @@ const _emptySlice = (chatId: string): ChatSlice => ({
   executionPath: '',
   executionTarget: '',
   fallbackReason: null,
+  targetMismatch: null,
   warmupStartedAt: null,
   warmupError: null,
   lastEventAt: 0,
@@ -216,6 +236,7 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
             executionPath: data.execution_path ?? prev.executionPath,
             executionTarget: data.execution_target ?? prev.executionTarget,
             fallbackReason: data.fallback_reason ?? null,
+            targetMismatch: data.target_mismatch ?? null,
             lastEventAt: Date.now(),
           },
         },

@@ -8,7 +8,6 @@ warmup, recovery fails and every chat turn 404s ("No session — send warmup
 first"). These tests pin the link + reverse lookup.
 """
 
-import pytest
 
 from storage import database as db
 

@@ -13,11 +13,9 @@ Run: cd proxy && python -m pytest tests/session/test_pause_resume.py -v
 """
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)
@@ -156,7 +154,6 @@ class TestSchedulerPauseResume:
         _create_recurring_task("task-resume-twice")
         # First resume
         asyncio.run(scheduler.resume_dynamic_task("task-resume-twice"))
-        first_job = scheduler._scheduler.get_job("task_task-resume-twice")
         # Second resume — must not raise
         asyncio.run(scheduler.resume_dynamic_task("task-resume-twice"))
         assert scheduler._scheduler.get_job("task_task-resume-twice") is not None

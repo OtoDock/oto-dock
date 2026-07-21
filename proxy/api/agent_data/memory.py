@@ -469,8 +469,8 @@ def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> int:
             git_writer.commit_paths(
                 repo, [root], f"memory: clear ({scope} scope)",
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Git commit of memory clear ({scope} scope) failed: {exc}")
     return len(files)
 
 

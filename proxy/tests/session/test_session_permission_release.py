@@ -19,7 +19,6 @@ the conftest DB-pool flake.
 """
 
 import asyncio
-import os
 import sys
 
 import pytest
@@ -29,7 +28,6 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from core.session import session_state # noqa: E402
 from core.session.session_state import (  # noqa: E402
     wait_for_permission,
     wait_for_question,

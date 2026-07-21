@@ -10,7 +10,7 @@ import httpx
 import pytest
 import websockets
 
-import audio.providers.stt.elevenlabs as el_mod
+from audio.providers.stt import elevenlabs as el_mod
 from audio.providers.stt.elevenlabs import ElevenLabsSTT, _to_elevenlabs_lang
 
 
@@ -236,7 +236,7 @@ async def test_streaming_lifecycle(fake_scribe):
     assert "language_code=el" in path
     assert "vad_silence_threshold_secs=0.4" in path
 
-    await stt.send_audio(b"\x00\x10" * 160)
+    await stt.send_audio(b"\x00\x10" * 2000)
     await asyncio.sleep(0.2)  # let the partial arrive
 
     # Interim dedup: first pop returns it, second returns None.
@@ -249,7 +249,7 @@ async def test_streaming_lifecycle(fake_scribe):
     assert frame["message_type"] == "input_audio_chunk"
     assert frame["sample_rate"] == 16000
     assert frame["commit"] is False
-    assert base64.b64decode(frame["audio_base_64"]) == b"\x00\x10" * 160
+    assert base64.b64decode(frame["audio_base_64"]) == b"\x00\x10" * 2000
 
     # force_endpoint commits → committed transcript lands in the queue.
     await stt.force_endpoint()
@@ -268,7 +268,7 @@ async def test_streaming_lifecycle(fake_scribe):
 async def test_finish_commits_and_drains(fake_scribe):
     stt = ElevenLabsSTT(api_key="k")
     await stt.start(sample_rate=16000)
-    await stt.send_audio(b"\x00\x10" * 160)  # voiced (RMS 4096, above the gate)
+    await stt.send_audio(b"\x00\x10" * 2000)  # voiced (RMS 4096, above the gate)
     text = await stt.finish()
     assert text == "Καλημέρα κόσμε"
 
@@ -297,7 +297,7 @@ async def test_recover_after_opening_reconnects(fake_scribe):
 
 
 async def test_drain_and_clear_queue(fake_scribe):
-    voiced = b"\x00\x10" * 160
+    voiced = b"\x00\x10" * 2000
     stt = ElevenLabsSTT(api_key="k")
     await stt.start(sample_rate=16000)
     await stt.send_audio(voiced)
@@ -330,7 +330,7 @@ async def test_finish_skips_commit_when_nothing_voiced(fake_scribe):
 
 
 async def test_commit_resumes_after_new_voiced_audio(fake_scribe):
-    voiced = b"\x00\x10" * 160
+    voiced = b"\x00\x10" * 2000
     stt = ElevenLabsSTT(api_key="k")
     await stt.start(sample_rate=16000)
     await stt.send_audio(voiced)
@@ -360,10 +360,41 @@ async def test_silence_only_committed_transcript_is_dropped(fake_scribe):
     await asyncio.sleep(0.2)
     assert stt.drain_transcript() is None
     # Real speech afterwards still comes through.
-    await stt.send_audio(b"\x00\x10" * 160)
+    await stt.send_audio(b"\x00\x10" * 2000)
     await fake_scribe.push_committed("Καλημέρα")
     await asyncio.sleep(0.2)
     assert stt.drain_transcript() == "Καλημέρα"
+    await stt.close()
+
+
+async def test_breath_frame_does_not_arm_guard(fake_scribe):
+    # A single short frame over the RMS gate (a trailing breath, ~10 ms here)
+    # must not arm the guard by itself — Scribe's VAD then commits a tiny
+    # "voiced" span and hallucinates a filler (live repro: trailing "Okay.").
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    await stt.send_audio(b"\x00\x10" * 160)  # 10 ms voiced — below _MIN_VOICED_ARM_S
+    await asyncio.sleep(0.1)
+    await fake_scribe.push_committed("Okay.")
+    await asyncio.sleep(0.2)
+    assert stt.drain_transcript() is None
+    # An explicit stop right after the breath sends no commit either.
+    await stt.force_endpoint()
+    await asyncio.sleep(0.2)
+    assert fake_scribe.commit_frames() == []
+    await stt.close()
+
+
+async def test_cumulative_voiced_time_arms_guard(fake_scribe):
+    # Short frames accumulate: once total voiced audio-time crosses
+    # _MIN_VOICED_ARM_S the guard arms and transcripts surface normally.
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    for _ in range(13):  # 13 × 10 ms = 130 ms ≥ 0.12 s
+        await stt.send_audio(b"\x00\x10" * 160)
+    await stt.force_endpoint()
+    assert await stt.wait_for_transcript(timeout=2.0) == "Καλημέρα κόσμε"
+    assert len(fake_scribe.commit_frames()) == 1
     await stt.close()
 
 
@@ -389,7 +420,7 @@ async def test_partials_suppressed_when_nothing_voiced(fake_scribe):
     assert stt.pop_interim() is None
     assert stt.latest_interim == ""
     # Voiced audio → partials flow again.
-    await stt.send_audio(b"\x00\x10" * 160)
+    await stt.send_audio(b"\x00\x10" * 2000)
     await asyncio.sleep(0.2)
     assert stt.pop_interim() == "kali"
     await stt.close()

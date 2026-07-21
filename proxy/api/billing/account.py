@@ -173,8 +173,13 @@ async def connect_callback(
     try:
         token = await relay_client.account_connect_exchange(code=code)
     except Exception as e:
+        # Never reflect the exception text — it can carry relay response
+        # bodies / internal URLs. Full detail goes to the server log only.
         logger.exception("account connect exchange failed")
-        return HTMLResponse(_error_html(str(e)))
+        return HTMLResponse(_error_html(
+            f"Connect exchange failed ({type(e).__name__}). "
+            "Check the proxy logs for details."
+        ))
     if not token:
         return HTMLResponse(_error_html("OtoDock returned no account token"))
     _enable_and_reconcile()

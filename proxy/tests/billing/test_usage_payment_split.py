@@ -10,7 +10,6 @@ subscription's id (no migration). See storage/database.py `basis=` +
 Run: cd proxy && python -m pytest tests/billing/test_usage_payment_split.py -v
 """
 
-import os
 import sys
 
 from tests._paths import PROXY_DIR

@@ -15,7 +15,6 @@ guard returns before anything touches the platform tree).
 
 import base64
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 

@@ -50,7 +50,7 @@ Stdlib + aiohttp; aiohttp is imported lazily so the lifecycle helpers are
 unit-testable without it.
 """
 import asyncio
-import json
+import contextlib
 import logging
 import os
 import time
@@ -179,11 +179,9 @@ def _sweep_screenshots() -> None:
         if age > SCREENSHOTS_MAX_AGE_S or (
             rank >= SCREENSHOTS_MAX_COUNT and age > SCREENSHOTS_GRACE_S
         ):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
                 removed += 1
-            except OSError:
-                pass
     if removed:
         log.info("screenshots sweep: removed %d orphan(s)", removed)
 
@@ -252,8 +250,13 @@ async def proxy_handler(request):
             ),
         )
     except Exception as e:
+        # Exception text can embed upstream URLs/headers — keep it in the
+        # sidecar log; the client gets the exception class for triage.
         log.warning("upstream %s %s: %s", request.method, path, e)
-        return web.Response(status=502, text=f"sidecar upstream error: {e}")
+        return web.Response(
+            status=502,
+            text=f"sidecar upstream error: {type(e).__name__} (see sidecar log)",
+        )
 
     # Register the session id the server assigns on initialize.
     resp_sid = upstream.headers.get("mcp-session-id", "")

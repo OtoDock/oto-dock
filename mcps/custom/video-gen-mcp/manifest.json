@@ -1,0 +1,211 @@
+{
+  "name": "video-gen-mcp",
+  "label": "Video Generation",
+  "description": "AI video generation, transitions, and editing (Gemini Omni Flash, Veo 3.1, Runway Aleph 2.0)",
+  "version": "1.0.0",
+  "category": "custom",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "server.py"
+    ]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "instances": {
+    "delivery": "env",
+    "fields": [
+      {
+        "key": "GOOGLE_AI_API_KEY",
+        "label": "Google AI API Key",
+        "input_type": "password",
+        "secret": true
+      },
+      {
+        "key": "RUNWAY_API_KEY",
+        "label": "Runway API Key",
+        "input_type": "password",
+        "secret": true
+      },
+      {
+        "key": "FAL_API_KEY",
+        "label": "fal.ai API Key (optional — premium transitions)",
+        "input_type": "password",
+        "secret": true
+      }
+    ],
+    "max_instances": 0
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "path_env": {
+    "VIDEO_SAVE_DIR": {
+      "role": "workspace"
+    }
+  },
+  "assignment_mode": "explicit",
+  "exclude_from": [
+    "task"
+  ],
+  "tool_arg_paths": {
+    "generate_video": {
+      "image_path": {
+        "mode": "read"
+      },
+      "save_path": {
+        "mode": "write"
+      }
+    },
+    "generate_transition": {
+      "video_a_path": {
+        "mode": "read"
+      },
+      "video_b_path": {
+        "mode": "read"
+      },
+      "save_path": {
+        "mode": "write"
+      }
+    },
+    "edit_video": {
+      "video_path": {
+        "mode": "read"
+      },
+      "save_path": {
+        "mode": "write"
+      }
+    }
+  },
+  "costs": {
+    "currency": "USD",
+    "provider": "video-gen",
+    "rules": [
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "omni-flash"
+        },
+        "amount": 0.1,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "veo-3.1",
+          "resolution": "4k"
+        },
+        "amount": 0.6,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "veo-3.1"
+        },
+        "amount": 0.4,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "veo-3.1-fast",
+          "resolution": "4k"
+        },
+        "amount": 0.3,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "veo-3.1-fast",
+          "resolution": "1080p"
+        },
+        "amount": 0.12,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "model": "veo-3.1-fast"
+        },
+        "amount": 0.1,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "resolution": "4k"
+        },
+        "amount": 0.3,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "match": {
+          "resolution": "1080p"
+        },
+        "amount": 0.12,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_video",
+        "amount": 0.1,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "match": {
+          "model": "seedance"
+        },
+        "amount": 0.1814,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "match": {
+          "model": "veo-3.1-fast"
+        },
+        "amount": 0.15,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "match": {
+          "model": "veo-3.1"
+        },
+        "amount": 0.4,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "generate_transition",
+        "amount": 0.1814,
+        "multiply_by": "duration_seconds"
+      },
+      {
+        "tool": "edit_video",
+        "amount": 0.28,
+        "multiply_by": "duration_seconds"
+      }
+    ]
+  },
+  "skills": [
+    {
+      "id": "video-gen-usage",
+      "loading": "on_demand",
+      "file": "skills/video-gen-usage/SKILL.md",
+      "description": "Generate AI videos, transitions between clips, and AI video edits. Use when a task needs new video footage, an AI transition bridge between two clips, or an object-level edit of an existing video.",
+      "default_exclude_from": [
+        "task"
+      ]
+    }
+  ],
+  "permissions": {
+    "default_tier": "sensitive"
+  },
+  "patched": false,
+  "patch_note": null
+}

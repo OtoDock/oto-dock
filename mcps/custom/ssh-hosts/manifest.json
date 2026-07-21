@@ -2,11 +2,15 @@
   "name": "ssh-hosts",
   "label": "SSH",
   "description": "SSH access to admin-configured hosts, straight from the agent's shell",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "category": "custom",
   "server": {
-    "runtime": "none",
-    "transport": "none"
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "server.py"
+    ]
   },
   "credentials": {
     "type": "none"
@@ -55,6 +59,15 @@
   "assignment_mode": "explicit",
   "exclude_from": [],
   "skills": [],
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "list_ssh_hosts",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null,
   "network_targets": [
@@ -64,5 +77,6 @@
       "port_key": "port",
       "port_default": 22
     }
-  ]
+  ],
+  "remote_policy": "admin_paired_only"
 }

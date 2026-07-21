@@ -1,7 +1,7 @@
 """Tests for execution layer routing with remote targets."""
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 
 class TestGetExecutionLayer:

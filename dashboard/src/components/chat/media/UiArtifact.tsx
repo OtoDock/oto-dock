@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTheme } from '../../../contexts/ThemeContext'
 import { onFileUpdate } from '../../../lib/fileUpdates'
 import { emitIframeSwipe } from '../../../lib/iframeGestures'

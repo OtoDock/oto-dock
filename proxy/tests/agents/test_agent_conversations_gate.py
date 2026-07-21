@@ -8,7 +8,6 @@ the frontend tab gate (``canManage``).
 Run: cd proxy && python -m pytest tests/agents/test_agent_conversations_gate.py -v
 """
 
-import os
 import sys
 
 import pytest

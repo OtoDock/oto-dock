@@ -16,7 +16,7 @@ Covers:
 Run: cd proxy && python -m pytest tests/agents/test_user_tz.py -v
 """
 
-import asyncio
+import contextlib
 import os
 import sys
 import zoneinfo
@@ -154,7 +154,7 @@ def test_format_current_time_includes_ampm_gloss(temp_db):
         fake = datetime(2026, 5, 8, hour, minute, 0, tzinfo=tz)
         with mock.patch.object(
             config, "datetime",
-            mock.Mock(now=lambda _tz: fake.astimezone(_tz)),
+            mock.Mock(now=fake.astimezone),
         ):
             out = config.format_current_time("Europe/Berlin")
         assert expected in out, (
@@ -230,10 +230,8 @@ def test_register_task_uses_user_tz_for_cron(temp_db):
     )
     # Use the in-process scheduler directly. start() is not required for add_job.
     if scheduler._scheduler.state == 0:  # not started
-        try:
+        with contextlib.suppress(Exception):
             scheduler._scheduler.start()
-        except Exception:
-            pass
     try:
         scheduler._register_task(task)
         job = scheduler._scheduler.get_job(f"task_{task.id}")
@@ -241,10 +239,8 @@ def test_register_task_uses_user_tz_for_cron(temp_db):
         # CronTrigger.timezone is the ZoneInfo we passed in.
         assert str(job.trigger.timezone) == "America/New_York"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             scheduler._scheduler.remove_job(f"task_{task.id}")
-        except Exception:
-            pass
 
 
 def test_register_task_naive_run_at_uses_row_tz(temp_db):
@@ -303,20 +299,16 @@ def test_register_task_user_tz_null_falls_back_to_platform(temp_db):
         source="dynamic",
     )
     if scheduler._scheduler.state == 0:
-        try:
+        with contextlib.suppress(Exception):
             scheduler._scheduler.start()
-        except Exception:
-            pass
     try:
         scheduler._register_task(task)
         job = scheduler._scheduler.get_job(f"task_{task.id}")
         assert job is not None
         assert str(job.trigger.timezone) == "Europe/Athens"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             scheduler._scheduler.remove_job(f"task_{task.id}")
-        except Exception:
-            pass
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -410,10 +402,8 @@ def test_standalone_register_task_uses_user_tz(temp_db):
     _set_platform_tz("Europe/Athens")
 
     if standalone_scheduler._scheduler.state == 0:
-        try:
+        with contextlib.suppress(Exception):
             standalone_scheduler._scheduler.start()
-        except Exception:
-            pass
     try:
         ok = standalone_scheduler._register_task_job(
             "task-standalone-tz",
@@ -428,10 +418,8 @@ def test_standalone_register_task_uses_user_tz(temp_db):
         assert job is not None
         assert str(job.trigger.timezone) == "America/New_York"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             standalone_scheduler._scheduler.remove_job("task_task-standalone-tz")
-        except Exception:
-            pass
 
 
 def test_standalone_register_notification_uses_user_tz(temp_db):
@@ -447,10 +435,8 @@ def test_standalone_register_notification_uses_user_tz(temp_db):
     }
 
     if standalone_scheduler._scheduler.state == 0:
-        try:
+        with contextlib.suppress(Exception):
             standalone_scheduler._scheduler.start()
-        except Exception:
-            pass
     try:
         ok = standalone_scheduler._register_notification_job(notif)
         assert ok
@@ -458,7 +444,5 @@ def test_standalone_register_notification_uses_user_tz(temp_db):
         assert job is not None
         assert str(job.trigger.timezone) == "Asia/Tokyo"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             standalone_scheduler._scheduler.remove_job("notif_notif-standalone-tz")
-        except Exception:
-            pass

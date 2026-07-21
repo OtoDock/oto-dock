@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -396,7 +394,7 @@ class TestSeeding:
             "services.notifications.notification_manager.fire_notification",
             new=AsyncMock(),
         ):
-            result = _install_admin(tdir)
+            _install_admin(tdir)
 
         tasks = db.list_dynamic_tasks(agent="demo-agent")
         assert len(tasks) == 1
@@ -443,7 +441,6 @@ class TestNotificationBatching:
     def test_batch_create_fires_one_notification_per_admin(self, tmp_path, temp_db):
         """Two missing MCPs in one cascade → one notification per admin, not
         two (per-request notifications are suppressed for batched rows)."""
-        from storage import mcp_request_store
 
         fire_mock = AsyncMock()
         tdir = _write_template(tmp_path, mcps=[
@@ -575,8 +572,6 @@ def _install_with_user_items(tmp_path, *, default_for_new_users=None):
 def _make_user(sub: str, email: str, role: str = "member") -> None:
     """Insert a minimal users row directly so add_user_agent's FK clears."""
     from storage import database as db
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
     # Use upsert_user — covers both fresh creation and re-runs.
     db.upsert_user(sub, email, email.split("@")[0], role)
 

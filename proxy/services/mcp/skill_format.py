@@ -78,12 +78,35 @@ def strip_frontmatter(text: str) -> str:
     return body.lstrip("\n")
 
 
-def scrub_frontmatter(text: str) -> str:
+def _salvage_descriptive_keys(fm: str) -> dict:
+    """Tolerant line-wise recovery of ``name``/``description`` from
+    YAML-invalid frontmatter. The classic authoring footgun is an unquoted
+    colon inside a description ("description: Do X: then Y") — invalid YAML,
+    but the intended value is unambiguous line-wise. Only these two purely
+    DESCRIPTIVE string keys are salvaged (never ``allowed-tools`` or any
+    other authorization-bearing key), so the scrub stays fail-closed where
+    it matters while a punctuation slip no longer silently destroys the
+    skill (the CLIs reject a frontmatter-less SKILL.md outright)."""
+    out: dict = {}
+    for line in fm.splitlines():
+        for key in ("name", "description"):
+            prefix = f"{key}:"
+            if line.startswith(prefix):
+                value = line[len(prefix):].strip().strip("\"'")
+                if value:
+                    out[key] = value
+    return out
+
+
+def scrub_frontmatter(text: str, origin: str = "") -> str:
     """Rewrite frontmatter keeping only ``FRONTMATTER_ALLOWED_KEYS``.
 
     Files without frontmatter are returned unchanged. Invalid-YAML
-    frontmatter is dropped entirely (fail closed — better a skill the CLI
-    ignores than un-vetted keys reaching it).
+    frontmatter falls back to the line-wise ``name``/``description``
+    salvage above (re-emitted as VALID YAML via safe_dump, so the CLIs
+    accept the skill); only a fully unrecoverable block is dropped (fail
+    closed — better a skill the CLI ignores than un-vetted keys reaching
+    it). ``origin`` names the file in logs.
     """
     fm, body = split_frontmatter(text)
     if fm is None:
@@ -93,8 +116,18 @@ def scrub_frontmatter(text: str) -> str:
     except yaml.YAMLError:
         data = None
     if not isinstance(data, dict):
-        logger.warning("SKILL.md frontmatter unparseable — dropped at scrub")
-        return body.lstrip("\n")
+        data = _salvage_descriptive_keys(fm)
+        if data:
+            logger.warning(
+                "SKILL.md frontmatter is invalid YAML (%s) — salvaged "
+                "name/description only", origin or "unknown source",
+            )
+        else:
+            logger.warning(
+                "SKILL.md frontmatter unparseable — dropped at scrub (%s)",
+                origin or "unknown source",
+            )
+            return body.lstrip("\n")
     kept = {k: data[k] for k in FRONTMATTER_ALLOWED_KEYS if k in data}
     dropped = sorted(set(data) - set(kept))
     if dropped:

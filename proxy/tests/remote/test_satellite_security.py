@@ -11,7 +11,6 @@ Three classes of test:
      (``user_sub=None``) routed to a user-paired machine.
 """
 
-from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -441,7 +440,6 @@ def test_routing_modules_do_not_key_on_owner_role():
     field exists only for display/diagnostics in remote_store's queries; no
     routing module may reference it.
     """
-    import pathlib
     proxy_root = PROXY_DIR
     routing_files = [
         "core/session/session_manager.py",

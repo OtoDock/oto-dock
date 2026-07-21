@@ -42,7 +42,7 @@ def _setup_layer(monkeypatch, sessions, secs):
     import core.session.session_manager as sm
     import core.session.session_state as ss
     monkeypatch.setattr(sm, "_get_remote_layer", lambda: _FakeLayer(sessions))
-    monkeypatch.setattr(ss, "get_session_security", lambda sid: secs.get(sid))
+    monkeypatch.setattr(ss, "get_session_security", secs.get)
 
 
 def _sec(username, role):
@@ -198,7 +198,7 @@ async def test_fan_out_write_pushes_to_targets(temp_db, monkeypatch):
         lambda a, r, *, exclude_machine_id=None: ["m1", "m2"],
     )
     fake_cm = AsyncMock()
-    import core.remote.satellite_connection as sc
+    from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
     await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
@@ -220,7 +220,7 @@ async def test_fan_out_delete_broadcasts(temp_db, monkeypatch):
         lambda a, r, *, exclude_machine_id=None: ["m1"],
     )
     fake_cm = AsyncMock()
-    import core.remote.satellite_connection as sc
+    from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
     await workspace_fanout.fan_out_delete("agent-1", "workspace/x.md")
@@ -241,7 +241,7 @@ async def test_fan_out_write_no_targets_is_noop(temp_db, monkeypatch):
         lambda a, r, *, exclude_machine_id=None: [],
     )
     fake_cm = AsyncMock()
-    import core.remote.satellite_connection as sc
+    from core.remote import satellite_connection as sc
     monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
 
     await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"d")
@@ -296,7 +296,7 @@ async def test_propagate_write_creates_parent_dirs(temp_db, tmp_path, monkeypatc
 def _patch_apply_deps(monkeypatch, *, sec, loser_sub_for, notifs):
     import config
     import core.session.session_state as ss
-    import services.remote.workspace_fanout as wf
+    from services.remote import workspace_fanout as wf
     import storage.database as db
     import services.notifications.notification_manager as nm
     monkeypatch.setattr(ss, "get_session_security", lambda sid: sec)

@@ -8,9 +8,7 @@ LLM comprehension).
 """
 
 import sys
-from pathlib import Path
 
-import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
 if str(_PROXY_DIR) not in sys.path:
@@ -128,12 +126,15 @@ class TestMcpTranslationGuidance:
         assert "translates them automatically" not in text
 
     def test_remote_native_tool_path_guidance(self):
-        # Native FILE tools now accept sandbox-virtual / ~ paths on remote
+        # Read/Write/Glob/Grep accept sandbox-virtual / ~ paths on remote
         # satellites (the permission hook rewrites them) — the prompt says
-        # so, while steering shell COMMANDS to OS-native paths (nothing
-        # rewrites inside a Bash command string).
+        # so, while carving out Edit/NotebookEdit (their validation runs
+        # before hooks, so no rewrite can reach them) and steering shell
+        # COMMANDS to OS-native paths (nothing rewrites inside a Bash
+        # command string).
         ctx = _ctx("user_remote", allow_full_fs=False)
         text = _build_execution_environment_section(ctx)
         assert "Native file tools" in text
         assert "rewrites the path to its satellite location" in text
+        assert "`Edit` and `NotebookEdit` do NOT" in text
         assert "OS-native paths ONLY" in text

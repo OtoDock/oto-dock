@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -332,10 +333,8 @@ def main() -> None:
     args = ap.parse_args()
     if not args.sample_only and not args.agent:
         ap.error("--agent is required unless --sample-only")
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run(args))
-    except KeyboardInterrupt:
-        pass
 
 
 if __name__ == "__main__":

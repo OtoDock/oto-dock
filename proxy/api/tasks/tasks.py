@@ -1091,6 +1091,11 @@ async def stream_run_output(
             yield f"data: {json.dumps({'type': 'done', 'status': run['status']})}\n\n"
             return
 
+        # Tell the subscriber what state it is joining — a parked run
+        # ("pending", waiting on the memory-admission slot) otherwise streams
+        # nothing but keep-alives for minutes with no explanation.
+        yield f"data: {json.dumps({'type': 'status', 'status': run['status']})}\n\n"
+
         # Subscribe to live updates from scheduler
         q = await scheduler.subscribe_run(run_id)
         try:

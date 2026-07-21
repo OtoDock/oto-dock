@@ -93,7 +93,7 @@ class TestInteractiveSession:
         s = await _register("sid-out")
         try:
             received = bytearray()
-            replay = s.add_output_listener(lambda b: received.extend(b))
+            replay = s.add_output_listener(received.extend)
             assert isinstance(replay, (bytes, bytearray))
             s._mark_ready()  # `cat` emits no startup output → bypass the readiness gate
             s.write_input(b"ping\n")
@@ -113,7 +113,7 @@ class TestInteractiveSession:
         s = await _register("sid-gate")
         try:
             received = bytearray()
-            s.add_output_listener(lambda b: received.extend(b))
+            s.add_output_listener(received.extend)
             assert s._ready is False
             s.write_input(b"buffered\n")
             await asyncio.sleep(0.2)
@@ -146,6 +146,82 @@ class TestInteractiveSession:
         finally:
             await s.close()
 
+    async def test_cold_flush_retries_when_unconfirmed(self, monkeypatch):
+        # Confirm-and-retry: the readiness settle is a heuristic — a flush can
+        # land in a still-booting composer and be swallowed. With no transcript
+        # user signal (`cat` journals nothing), the watcher must re-emit the
+        # flushed body after _COLD_RETRY_S.
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 0.1)
+        monkeypatch.setattr(isess, "_COLD_RETRY_S", 0.3)
+        s = await _register("sid-retry")
+        try:
+            writes: list[bytes] = []
+            orig = s.pty.write
+            s.pty.write = lambda b: (writes.append(bytes(b)), orig(b))[1]
+            s.write_input(b"hello\r")
+            s._mark_ready()
+            await asyncio.sleep(1.2)  # Enter fires, watcher window elapses
+            assert sum(1 for w in writes if b"hello" in w) >= 2  # re-emitted
+            assert s._cold_flush_attempts >= 1
+        finally:
+            await s.close()
+
+    async def test_cold_flush_confirmed_turn_stops_retry(self, monkeypatch):
+        # The transcript journals the user line (turn opens) before the watcher
+        # window ends → the retry stands down; the body is written exactly once.
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 0.1)
+        monkeypatch.setattr(isess, "_COLD_RETRY_S", 0.5)
+        s = await _register("sid-confirmed")
+        try:
+            writes: list[bytes] = []
+            orig = s.pty.write
+            s.pty.write = lambda b: (writes.append(bytes(b)), orig(b))[1]
+            s.write_input(b"hello\r")
+            s._mark_ready()
+            await asyncio.sleep(0.3)            # Enter fired, watcher armed
+            s._apply_turn_signal("user")        # transcript confirms the turn
+            assert s._cold_flush_pending == b""  # cleared on turn-open
+            await asyncio.sleep(0.7)             # past the watcher window
+            assert sum(1 for w in writes if b"hello" in w) == 1
+            assert s._cold_flush_attempts == 0
+        finally:
+            await s.close()
+
+    async def test_cold_flush_retries_exhaust_with_warning(self, monkeypatch, caplog):
+        # Retries are bounded: after _COLD_RETRY_MAX unconfirmed replays the
+        # watcher gives up with a WARNING — never loops, never raises.
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 0.05)
+        monkeypatch.setattr(isess, "_COLD_RETRY_S", 0.15)
+        monkeypatch.setattr(isess, "_COLD_RETRY_MAX", 1)
+        s = await _register("sid-exhaust")
+        try:
+            s.write_input(b"hello\r")
+            with caplog.at_level("WARNING"):
+                s._mark_ready()
+                await asyncio.sleep(1.5)  # first Enter + retry + give-up cycle
+            assert s._cold_flush_attempts == 1
+            assert s._cold_flush_pending == b""
+            assert "giving up" in caplog.text
+        finally:
+            await s.close()
+
+    async def test_ready_settle_floored_by_ready_min(self, monkeypatch):
+        # READY_MIN_S: on a fresh session the first post-render quiet is
+        # usually the MCP warm — the settle must not mark ready before
+        # READY_MIN_S since spawn, however early the output goes quiet.
+        monkeypatch.setattr(isess, "READY_SETTLE_S", 0.05)
+        monkeypatch.setattr(isess, "READY_MIN_S", 0.6)
+        s = await _register("sid-readymin")
+        try:
+            assert s._ready is False
+            s._fanout_output(b"\x1b[2J welcome frame")  # render started → settle arms
+            await asyncio.sleep(0.25)   # long past the 0.05 settle, before the floor
+            assert s._ready is False
+            await asyncio.sleep(0.6)    # past READY_MIN_S since spawn
+            assert s._ready is True
+        finally:
+            await s.close()
+
     async def test_drainer_forwards_perm_queue(self):
         s = await _register("sid-drain")
         try:
@@ -163,7 +239,7 @@ class TestInteractiveSession:
 
     async def test_pty_exit_auto_closes_session(self):
         # A process that exits immediately → on_exit → session auto-closes.
-        s = await _register("sid-exit", argv=("python3", "-c", "pass"))
+        await _register("sid-exit", argv=("python3", "-c", "pass"))
         for _ in range(50):
             if isess.get("sid-exit") is None:
                 break
@@ -203,7 +279,7 @@ class TestInteractiveSession:
         released = []
         monkeypatch.setattr(
             subscription_pool.subscription_store, "decrement_active_sessions",
-            lambda sub_id: released.append(sub_id),
+            released.append,
         )
         s = await _register("sid-sub")
         subscription_pool.bind_session("sid-sub", "sub-abc")
@@ -219,7 +295,7 @@ class TestInteractiveSession:
     async def test_turn_complete_fires_once_when_bg_empty(self):
         s = isess.InteractiveSession(session_id="tc-1", chat_id="c", agent_name="agent")
         fired = []
-        s.on_turn_complete = lambda msg: fired.append(msg)
+        s.on_turn_complete = fired.append
         s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)  # past min-time
         s._maybe_fire_turn_complete("final answer")
         assert fired == ["final answer"]
@@ -230,7 +306,7 @@ class TestInteractiveSession:
     async def test_turn_complete_holds_within_min_time(self):
         s = isess.InteractiveSession(session_id="tc-2", chat_id="c", agent_name="agent")
         fired = []
-        s.on_turn_complete = lambda msg: fired.append(msg)
+        s.on_turn_complete = fired.append
         # Freshly created → within MIN_TURN_S → no false-trigger on warm quiet.
         s._maybe_fire_turn_complete("too soon")
         assert fired == []
@@ -239,7 +315,7 @@ class TestInteractiveSession:
         from core.session.session_state import get_subagent_registry
         s = isess.InteractiveSession(session_id="tc-3", chat_id="c", agent_name="agent")
         fired = []
-        s.on_turn_complete = lambda msg: fired.append(msg)
+        s.on_turn_complete = fired.append
         s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
         reg = get_subagent_registry("tc-3")
         reg.register_spawn("task-1", "task-1")  # a bg subagent is still running
@@ -509,3 +585,36 @@ class TestPostBatchEffects:
         s._maybe_fire_turn_complete("", batch["persisted"],
                                     compacted=batch["compacted"])
         assert pings == [True]  # one ping, compacted wording
+
+
+class TestDelegateWakeReplayOnRegister:
+    """Durable delegate-wake replay: a wake stored while the chat was dead is
+    claimed at the next interactive registration and queued as a server
+    prompt, so a manual re-warm delivers the missed result on its own."""
+
+    @pytest.mark.asyncio
+    async def test_pending_wake_queued_on_register(self, temp_db):
+        from storage import database as task_store
+        task_store.create_chat("chat-wake", "user-1", "agent")
+        task_store.append_pending_delegate_wake("chat-wake", "REPLAYED WAKE")
+
+        s = await _register("sid-wake", chat_id="chat-wake")
+        try:
+            # Deterministically still queued: the fresh session's too_young /
+            # readiness gates hold the drain at this point.
+            queued = [item["text"] for item in s._prompt_queue]
+            assert queued == ["REPLAYED WAKE"]
+            # Claimed atomically — the store is empty now.
+            assert task_store.claim_pending_delegate_wake("chat-wake") == []
+        finally:
+            await s.close(reason="test-end")
+
+    @pytest.mark.asyncio
+    async def test_no_wake_no_queue(self, temp_db):
+        from storage import database as task_store
+        task_store.create_chat("chat-nowake", "user-1", "agent")
+        s = await _register("sid-nowake", chat_id="chat-nowake")
+        try:
+            assert len(s._prompt_queue) == 0
+        finally:
+            await s.close(reason="test-end")

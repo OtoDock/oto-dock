@@ -21,7 +21,7 @@ const LABELS: Record<string, string> = {
 }
 
 export default function SystemEvent({
-  subtype, agentName, agentColor,
+  subtype,
   mcpName, progressPct, phase, message,
 }: Props) {
   // Meeting turn start/end: no inline separators (indicator bar handles speaker identity)

@@ -55,6 +55,14 @@ def _check_path_traversal(resolved: Path, agent_dir: Path) -> None:
         )
 
 
+def _fs_error_reason(e: OSError | shutil.Error) -> str:
+    """Client-safe reason for a failed file operation — raw OSError text
+    embeds server-side absolute paths, so return only the errno description."""
+    if isinstance(e, OSError) and e.strerror:
+        return e.strerror
+    return "file operation failed (see proxy logs)"
+
+
 def _build_tree(directory: Path, base: Path, depth: int, max_depth: int) -> list[dict]:
     """Recursively build a directory tree structure.
 
@@ -1308,7 +1316,8 @@ async def move_agent_paths(
         except HTTPException as e:
             failed.append({"src": src_norm, "reason": e.detail})
         except (OSError, shutil.Error) as e:
-            failed.append({"src": src_norm, "reason": str(e)})
+            logger.warning("Move failed for %s: %s", src_norm, e)
+            failed.append({"src": src_norm, "reason": _fs_error_reason(e)})
 
     return {"moved": moved, "failed": failed}
 
@@ -1372,7 +1381,8 @@ async def copy_agent_paths(
         except HTTPException as e:
             failed.append({"src": src_norm, "reason": e.detail})
         except (OSError, shutil.Error) as e:
-            failed.append({"src": src_norm, "reason": str(e)})
+            logger.warning("Copy failed for %s: %s", src_norm, e)
+            failed.append({"src": src_norm, "reason": _fs_error_reason(e)})
 
     return {"copied": copied, "failed": failed}
 

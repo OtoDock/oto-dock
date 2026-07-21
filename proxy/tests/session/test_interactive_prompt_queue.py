@@ -77,7 +77,7 @@ class TestPromptQueueGates:
     async def test_injects_when_idle(self):
         s = await _register("sid-inj")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         assert s.queue_prompt("run the report", "delegate_result") is True
         await _drain_and_settle(s)
@@ -88,7 +88,7 @@ class TestPromptQueueGates:
     async def test_turn_open_holds_until_end_turn(self):
         s = await _register("sid-open")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         s.queue_prompt("held prompt", "delegate_result")
@@ -104,7 +104,7 @@ class TestPromptQueueGates:
     async def test_one_item_per_turn(self):
         s = await _register("sid-fifo")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s.queue_prompt("first item", "delegate_result")
         s.queue_prompt("second item", "delegate_result")
@@ -120,7 +120,7 @@ class TestPromptQueueGates:
     async def test_composer_dirty_holds_submit_clears(self):
         s = await _register("sid-dirty")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s.write_input(b"partial user tex")             # typing, no CR
         assert s._composer_dirty is True
@@ -160,7 +160,7 @@ class TestPromptQueueGates:
         # delegate results forever (observed live: depth=3, never injected).
         s = await _register("sid-dirty-ttl")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s.write_input(b"\x1b[A\x1b[A")
         assert s._composer_dirty is True
@@ -176,7 +176,7 @@ class TestPromptQueueGates:
     async def test_cold_submit_pending_holds(self):
         s = await _register("sid-cold")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         # A pending cold-submit Enter (the user's first prompt in flight) —
         # injecting now would cancel it and merge the prompts.
@@ -192,7 +192,7 @@ class TestPromptQueueGates:
         from core.session.session_state import _session_permission_requests
         s = await _register("sid-perm")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         _session_permission_requests["sid-perm"] = {"req-1"}
         try:
@@ -211,7 +211,7 @@ class TestPromptQueueGates:
         from core.session import transcript_tailer
         s = await _register("sid-stale")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         monkeypatch.setattr(
             transcript_tailer, "resolve_and_tail",
@@ -225,7 +225,7 @@ class TestPromptQueueGates:
     async def test_otodock_attached_holds_proxy_side(self):
         s = await _register("sid-otodock")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s.otodock_attached = True
         s.queue_prompt("terminal owned", "delegate_result")
@@ -250,7 +250,7 @@ class TestPromptQueueGates:
         monkeypatch.setattr(isess, "_INJECT_BACKSTOP_S", 60.0)
         s = await _register("sid-kick")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         s.queue_prompt("kicked prompt", "delegate_result")
@@ -280,7 +280,7 @@ class TestCloseHandback:
         s.queue_prompt(
             "undelivered result", "delegate_result",
             chat_id="chat-hb", agent="pa", role="manager", hops=0,
-            on_outcome=lambda o: outcomes.append(o),
+            on_outcome=outcomes.append,
         )
         await s.close()
         await asyncio.sleep(0.1)                       # handback task runs
@@ -384,7 +384,7 @@ class TestSteerItems:
     async def test_steer_injects_into_open_turn(self):
         s = await _register("sid-steer")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         s.last_activity = time.monotonic()            # streaming: never quiet
@@ -396,7 +396,7 @@ class TestSteerItems:
     async def test_steer_flag_inert_between_turns(self):
         s = await _register("sid-steer-idle")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s.last_activity = time.monotonic()            # turn CLOSED, not quiet
         s.queue_prompt("wait for quiet", "delegate_result", steer=True)
@@ -410,7 +410,7 @@ class TestSteerItems:
         from core.session.session_state import _session_permission_requests
         s = await _register("sid-steer-perm")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         _session_permission_requests["sid-steer-perm"] = {"req-1"}
@@ -426,7 +426,7 @@ class TestSteerItems:
     async def test_steer_still_blocked_by_composer_dirty(self):
         s = await _register("sid-steer-dirty")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         s._composer_dirty = True
@@ -440,7 +440,7 @@ class TestSteerItems:
         # it (head eligibility decides the gate run).
         s = await _register("sid-steer-mixed")
         received = bytearray()
-        s.add_output_listener(lambda b: received.extend(b))
+        s.add_output_listener(received.extend)
         _make_idle(s)
         s._turn_open = True
         s.queue_prompt("normal first", "delegate_result")

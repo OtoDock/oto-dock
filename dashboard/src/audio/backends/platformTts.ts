@@ -136,7 +136,7 @@ export const platformTts: TTSBackend = {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
-        if (value && value.length) player.enqueue(value)
+        if (value.length) player.enqueue(value)
       }
     } catch (e) {
       if ((e as { name?: string })?.name === 'AbortError') return  // stop() was called

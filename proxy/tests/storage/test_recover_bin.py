@@ -136,7 +136,7 @@ def _seed_three(monkeypatch):
     """alice (user-viewer) + bob (user-viewer2) user files + one shared file."""
     monkeypatch.setattr(
         "storage.database.get_user_sub_by_username",
-        lambda slug: {"alice": "user-viewer", "bob": "user-viewer2"}.get(slug),
+        {"alice": "user-viewer", "bob": "user-viewer2"}.get,
     )
     rb.capture(AGENT, "users/alice/a.txt", b"a", "deleted")
     rb.capture(AGENT, "users/bob/b.txt", b"b", "deleted")

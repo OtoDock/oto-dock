@@ -139,3 +139,14 @@ def test_config_toml_question_flag_dashboard_and_interactive(tmp_path):
     interactive = _written_config(tmp_path, interactive=True)
     assert interactive["features"]["default_mode_request_user_input"] is True
     assert interactive["features"]["hooks"] is True
+
+
+def test_config_toml_is_owner_only(tmp_path):
+    # config.toml can carry an inline MCP bearer — must be locked 0600 like
+    # auth.json, not world/group readable.
+    _Layer._write_config_toml(
+        tmp_path, "prompt",
+        mcp_toml='[mcp_servers.x.http_headers]\n"Authorization" = "Bearer secret"',
+    )
+    mode = (tmp_path / "config.toml").stat().st_mode & 0o777
+    assert mode == 0o600, oct(mode)

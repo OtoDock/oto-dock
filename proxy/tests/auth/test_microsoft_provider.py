@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import jwt
 
 from auth.oauth_providers import get_provider
-from auth.oauth_providers.base import TokenSet
 from auth.oauth_providers.microsoft import MicrosoftOAuthProvider
 
 

@@ -36,6 +36,7 @@ flagging chats never bumps ``updated_at`` (chat-list order is preserved).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -299,10 +300,8 @@ def _pass_codex_junk(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
             subdirs = sorted((p for p in tmp.rglob("*") if p.is_dir()),
                              key=lambda p: len(p.parts), reverse=True)
             for d in subdirs:
-                try:
+                with contextlib.suppress(OSError):
                     d.rmdir()
-                except OSError:
-                    pass
 
 
 def _pass_tarball_gc(stats: dict, dry_run: bool) -> None:
@@ -477,30 +476,22 @@ def compute_storage_usage() -> dict:
     codex_junk = 0
     for _agent, _username, home in iter_local_homes():
         for f in (home / ".claude" / "projects").glob("*/*.jsonl"):
-            try:
+            with contextlib.suppress(OSError):
                 session_files += f.lstat().st_size
-            except OSError:
-                pass
         for f in (home / ".codex" / "sessions").rglob("*.jsonl"):
-            try:
+            with contextlib.suppress(OSError):
                 session_files += f.lstat().st_size
-            except OSError:
-                pass
         codex = home / ".codex"
         for f in codex.glob("logs_*.sqlite*"):
-            try:
+            with contextlib.suppress(OSError):
                 codex_junk += f.lstat().st_size
-            except OSError:
-                pass
         codex_junk += _tree_bytes(codex / ".tmp")
 
     base = Path(config.BASE_DIR)
     logs = 0
     for f in base.glob("proxy.log*"):
-        try:
+        with contextlib.suppress(OSError):
             logs += f.lstat().st_size
-        except OSError:
-            pass
 
     last_sweep = None
     raw = task_store.get_platform_setting("session_retention_last_sweep")

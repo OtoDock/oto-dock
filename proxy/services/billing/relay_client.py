@@ -37,6 +37,7 @@ Two-level gating:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -325,10 +326,8 @@ async def _relay_post(path: str, payload: dict) -> dict:
         resp = await client.post(f"{base}{path}", json=payload)
     if 400 <= resp.status_code < 500:
         code = ""
-        try:
+        with contextlib.suppress(Exception):
             code = (resp.json() or {}).get("detail", "")
-        except Exception:
-            pass
         raise RelayError(code or f"http_{resp.status_code}")
     resp.raise_for_status()  # 5xx → httpx.HTTPStatusError → caller fails open
     return resp.json()
@@ -677,10 +676,8 @@ def mint_session_token(user_sub: str) -> str:
             )
         if 400 <= resp.status_code < 500:
             code = ""
-            try:
+            with contextlib.suppress(Exception):
                 code = (resp.json() or {}).get("detail", "")
-            except Exception:
-                pass
             raise RelayError(code or f"http_{resp.status_code}")
         resp.raise_for_status()
         token = (resp.json() or {}).get("token", "")

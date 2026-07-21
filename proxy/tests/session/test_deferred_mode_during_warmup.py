@@ -10,6 +10,7 @@ with mocked layer + session_state, verifying the contract that the helper
 honors the existing deferred_mode / deferred_model state variables.
 """
 
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -72,20 +73,16 @@ async def test_deferred_mode_helper_applies_to_alive_session():
                 session_state.set_session_mode(session_id, pending)
                 if chat_id:
                     task_store.update_chat(chat_id, permission_mode=pending)
-                try:
+                with contextlib.suppress(Exception):
                     await layer.change_mode(session_id, pending)
-                except Exception:
-                    pass
                 await _send({"type": "mode_changed", "mode": pending})
             if deferred_model:
                 pending = deferred_model
                 deferred_model = ""
                 if chat_id:
                     task_store.update_chat(chat_id, model=pending)
-                try:
+                with contextlib.suppress(Exception):
                     await layer.change_model(session_id, pending)
-                except Exception:
-                    pass
                 await _send({"type": "model_changed", "model": pending})
 
         await _reapply_deferred_after_warmup()
@@ -170,7 +167,6 @@ async def test_deferred_helper_noop_when_session_dead():
         sent_events.append(ev)
 
     session_id = "sess-3"
-    chat_id = "chat-3"
     layer = fake_layer
     deferred_mode = "dontAsk"
 

@@ -90,6 +90,21 @@ def list_provider_ids() -> list[str]:
     return sorted(set(_HARDCODED) | set(_MANIFEST_CACHE))
 
 
+def canonical_provider_id(provider_id: str) -> str:
+    """Validate ``provider_id`` and return the registry's own copy of it.
+
+    The returned string is drawn from the registry's key set, not from the
+    caller's input, so a request-derived id can be reflected into HTML or
+    redirect responses without carrying request taint. Raises ``KeyError``
+    for unknown ids (same contract as ``get_provider``).
+    """
+    get_provider(provider_id)  # KeyError if unknown; populates the lazy cache
+    for known in (*_HARDCODED, *_MANIFEST_CACHE):
+        if known == provider_id:
+            return known
+    raise KeyError(provider_id)
+
+
 def _build_from_manifest(provider_id: str) -> "OAuthProvider | None":
     """Scan loaded manifests for the first one whose oauth.provider_id matches.
 

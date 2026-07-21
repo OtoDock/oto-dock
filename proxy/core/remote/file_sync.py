@@ -5,6 +5,7 @@ push/pull operations over WebSocket.
 """
 
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import logging
@@ -15,6 +16,10 @@ from pathlib import Path
 logger = logging.getLogger("claude-proxy.file-sync")
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cache", ".mypy_cache", ".pytest_cache"}
+
+# Manifest hash of zero-byte content — merge logic treats empty files
+# specially (see the delete-attribution guard in _resolve_merge).
+_EMPTY_CONTENT_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 MAX_CHUNK_SIZE = 512 * 1024  # 512KB per chunk
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB cap on individual files (chunked push/pull handles large media)
 
@@ -701,7 +706,14 @@ def _resolve_merge(
         # undo). Otherwise RE-PUSH, never delete from absence: a brand-new file
         # (no base), an edit-vs-delete where the platform changed it since (B != P →
         # edit wins), a viewer with no write-back authority, or a wiped/empty satellite.
-        if B is not None and P == B and satellite_tree_present and cwb():
+        # ZERO-BYTE files are never delete-attributed: historically the
+        # satellite acked-ok while silently skipping empty writes, so a
+        # poisoned base (B == hash-of-empty, satellite never had the file)
+        # is indistinguishable from a real satellite delete — deleting here
+        # would destroy the platform's file. Re-push instead; the worst case
+        # is a deliberately-deleted empty file resurrecting (safe direction).
+        if (B is not None and P == B and satellite_tree_present and cwb()
+                and P != _EMPTY_CONTENT_HASH):
             return FileAction(
                 path, "delete_platform", clear_base=True,
                 capture_side="platform", capture_reason="deleted",
@@ -963,10 +975,37 @@ def prepare_outgoing_files(
 
 def _unlink_quiet(p: Path) -> None:
     """Best-effort unlink — used to reap a ``.partial`` left by a failed write."""
-    try:
+    with contextlib.suppress(OSError):
         p.unlink(missing_ok=True)
+
+
+def prune_empty_parents(file_path: Path, root: Path) -> None:
+    """After a file delete, remove now-empty parent directories bottom-up.
+
+    Sync has no rmdir action (manifests/snapshots are file-based), so a tree
+    delete propagates per-file deletes and leaves the empty dir skeleton
+    behind — this mirrors the deleter's intent instead. Never touches: the
+    sync root, its depth-1 children (the platform skeleton — workspace/
+    users/ config/ knowledge/ …), or per-user roots (users/<name>). The
+    first non-empty directory stops the walk (rmdir refuses it)."""
+    try:
+        root_r = Path(root).resolve()
+        cur = Path(file_path).parent.resolve()
     except OSError:
-        pass
+        return
+    while True:
+        try:
+            rel = cur.relative_to(root_r)
+        except ValueError:
+            return
+        depth = len(rel.parts)
+        if depth < 2 or (depth == 2 and rel.parts[0] == "users"):
+            return
+        try:
+            cur.rmdir()
+        except OSError:
+            return
+        cur = cur.parent
 
 
 def apply_incoming_file(
@@ -997,11 +1036,14 @@ def apply_incoming_file(
     if action == "delete":
         if target.exists():
             target.unlink()
+        prune_empty_parents(target, agent_dir)
     elif action == "mkdir":
         target.mkdir(parents=True, exist_ok=True)
     elif action == "write":
         target.parent.mkdir(parents=True, exist_ok=True)
-        if content_b64:
+        # "" is a real ZERO-BYTE write (b64 of empty content); only None means
+        # "no inline content" (large-file flow — the caller pulls instead).
+        if content_b64 is not None:
             content = base64.b64decode(content_b64)
             try:
                 with open(partial, "wb") as f:

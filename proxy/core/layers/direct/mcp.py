@@ -21,6 +21,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 import config
+import contextlib
 
 logger = logging.getLogger("mcp-manager")
 
@@ -59,6 +60,30 @@ async def _run_on_mcp_loop(coro):
     loop = _start_mcp_thread()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return await asyncio.wrap_future(future)
+
+
+def stop_mcp_thread(join_timeout: float = 2.0) -> None:
+    """Stop the MCP I/O loop at proxy shutdown (idempotent). The thread itself
+    is daemon, but its lazily-created default-executor workers are NOT — left
+    running they stall interpreter exit at the atexit thread join, after
+    uvicorn already logged its shutdown. ``loop.close()`` is skipped when the
+    thread doesn't stop within the timeout (closing a running loop raises)."""
+    global _mcp_loop, _mcp_thread
+    with _mcp_thread_lock:
+        loop, thread = _mcp_loop, _mcp_thread
+        _mcp_loop, _mcp_thread = None, None
+    if loop is None:
+        return
+    with contextlib.suppress(Exception):
+        loop.call_soon_threadsafe(loop.stop)
+    if thread is not None:
+        thread.join(timeout=join_timeout)
+    if thread is None or not thread.is_alive():
+        with contextlib.suppress(Exception):
+            loop.close()
+        logger.info("MCP I/O thread stopped")
+    else:
+        logger.warning("MCP I/O thread did not stop in %.1fs", join_timeout)
 
 
 class MCPServerConnection:
@@ -336,10 +361,8 @@ class MCPServerConnection:
         task = self._owner_task
         self._owner_task = None
         if task is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await task
-            except Exception:
-                pass
 
 
 class AgentMCPManager:

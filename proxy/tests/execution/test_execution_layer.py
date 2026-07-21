@@ -9,10 +9,7 @@ Verifies that:
 - config_builder produces valid AgentConfig
 """
 
-import asyncio
-import time
-from unittest.mock import patch, MagicMock, AsyncMock
-from dataclasses import fields
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -542,7 +539,7 @@ class TestSessionManager:
                 )
 
     def test_unknown_path_defaults_to_cli(self):
-        from core.session.session_manager import get_execution_layer, get_layer_by_path
+        from core.session.session_manager import get_layer_by_path
         from core.layers.cli.layer import CLIExecutionLayer
 
         layer = get_layer_by_path("unknown-path")

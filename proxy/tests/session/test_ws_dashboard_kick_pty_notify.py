@@ -181,6 +181,9 @@ class TestPtyViewer:
                 await ws.expect({
                     "type": "pty_exit", "chat_id": cid, "session_id": sid,
                     "reason": "exited",
+                    # exit_code rides the frame so an abnormal CLI death is
+                    # never a silent blank terminal (None here — no real pty).
+                    "code": None,
                 })
                 ws.client_send({"type": "close"})
             ws.no_more_frames()

@@ -6,10 +6,8 @@ asserts the attribution is correct without DB seeding — the resolver's MCP lis
 and per-type resolvers are stubbed.
 """
 
-import os
 import sys
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)

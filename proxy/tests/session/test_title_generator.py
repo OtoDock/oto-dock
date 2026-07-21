@@ -131,7 +131,7 @@ def _patch_provider(monkeypatch, title="🚀 Cool Title"):
                         lambda u, c, t, agent="": captured["broadcast"].append((u, c, t, agent)))
     from services.billing import usage_service
     monkeypatch.setattr(usage_service, "record_turn_usage",
-                        lambda rows: captured["usage"].extend(rows))
+                        captured["usage"].extend)
     return captured
 
 

@@ -10,6 +10,7 @@ import logging
 import re
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -27,12 +28,13 @@ from core.layers.cli.helpers import (
 )
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.layers.cli.settle import (
-    FOREIGN_RESULT_SKIP_CAP,
     FOREIGN_SKIP_SILENCE_S,
+    ForeignSkipGate,
     SettleController,
     chunk_is_content,
     is_foreign_result,
 )
+import contextlib
 
 logger = logging.getLogger("claude-proxy")
 
@@ -525,7 +527,7 @@ class PersistentSession:
         if self.proc is None or self.proc.stdout is None:
             return
 
-        drained = 0
+        drained: Counter[str] = Counter()
         timeout = 0.05  # initial probe — fast exit if pipe is clean
         while True:
             try:
@@ -534,13 +536,15 @@ class PersistentSession:
                 )
                 if not raw_line:
                     break  # EOF
-                drained += 1
+                drained["?"] += 1
                 timeout = 2.0  # stale data confirmed — wait for result event
                 # Check if we hit the result event (end of previous turn)
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if line:
-                    try:
+                    with contextlib.suppress(json.JSONDecodeError):
                         data = json.loads(line)
+                        drained["?"] -= 1
+                        drained[data.get("type", "?")] += 1
                         # A backgrounded command may have completed while the
                         # session was idle between turns — resolve it (badge clear
                         # + registry) instead of discarding the frame, else its
@@ -548,15 +552,17 @@ class PersistentSession:
                         resolve_bg_command_frame(self.session_id, data)
                         if data.get("type") == "result":
                             break  # Previous response fully drained
-                    except json.JSONDecodeError:
-                        pass
             except asyncio.TimeoutError:
                 break  # No more stale data — pipe is clean
 
         if drained:
+            # Type census only, never payloads — a swallowed late answer from
+            # an orphaned prior turn is otherwise invisible.
             logger.warning(
-                f"Persistent session {self.session_id}: "
-                f"drained {drained} stale lines from interrupted response"
+                f"Persistent session {self.session_id}: drained "
+                f"{sum(drained.values())} stale lines from interrupted "
+                f"response (types={dict(drained)}, "
+                f"results={drained.get('result', 0)})"
             )
 
     async def drain_bg_commands(self, budget: float = 2.0) -> bool:
@@ -796,33 +802,24 @@ class PersistentSession:
             self.session_id, settle_after_result, translator,
         )
 
-        # Foreign-result re-arm state (see settle.is_foreign_result): after a
-        # --resume respawn, the handshake mini-turn's result must not close
-        # the driven turn.
-        content_chunks = 0
-        foreign_skips = 0
-        foreign_skip_deadline: float | None = None
+        # Foreign-result skip regime (see settle.ForeignSkipGate): resume
+        # handshake / settlement results must not close the driven turn —
+        # the valve, not a count, ends the regime.
+        gate = ForeignSkipGate(self.session_id, translator)
         while True:
             # Choose readline timeout based on settle state. In pre-settle we
             # use a generous 60 s for heartbeat logging; in settle the
             # controller uses a short slice so it can re-check the
             # SubagentRegistry for pending background agents.
-            timeout = settle.effective_timeout()
-            if foreign_skip_deadline is not None:
-                timeout = min(
-                    timeout,
-                    max(0.5, foreign_skip_deadline - time.monotonic()),
-                )
+            timeout = gate.clamp_timeout(settle.effective_timeout())
             try:
                 raw_line = await asyncio.wait_for(
                     self.proc.stdout.readline(), timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                if (foreign_skip_deadline is not None
-                        and time.monotonic() >= foreign_skip_deadline
-                        and not settle.settling):
-                    # Silence valve: nothing followed the skipped result —
-                    # it was probably legitimate. Close the turn.
+                if gate.expired() and not settle.settling:
+                    # Silence valve: nothing followed the skip regime — the
+                    # mis-skipped result was probably legitimate. Close.
                     logger.warning(
                         f"Persistent session {self.session_id}: no stdout "
                         f"{FOREIGN_SKIP_SILENCE_S:.0f}s after a skipped "
@@ -856,13 +853,11 @@ class PersistentSession:
                 # EOF — process died
                 stderr_msg = ""
                 if self.proc and self.proc.stderr:
-                    try:
+                    with contextlib.suppress(Exception):
                         stderr_data = await asyncio.wait_for(
                             self.proc.stderr.read(), timeout=2,
                         )
                         stderr_msg = stderr_data.decode("utf-8", errors="replace").strip()
-                    except Exception:
-                        pass
                 rc = self.proc.returncode if self.proc else "?"
                 if settle.settling:
                     logger.info(
@@ -899,15 +894,16 @@ class PersistentSession:
                     ),
                 )
 
-            # A line arrived — the post-skip silence valve resets.
-            foreign_skip_deadline = None
+            # A line arrived — slide the post-skip valve (never disarm:
+            # noise must not remove the skip regime's only closer).
+            gate.note_event()
 
             # Parse the event into one or more chunks and yield them.
             # The translator owns all per-turn state; we only observe the
             # raw event to handle the result-boundary book-keeping below.
             for chunk in translator.feed(data):
                 if chunk_is_content(chunk):
-                    content_chunks += 1
+                    gate.note_content()
                 yield chunk
 
             if data.get("type") == "result":
@@ -931,6 +927,18 @@ class PersistentSession:
                     f"turns={num_turns}, agents_spawned={translator.agents_spawned}, "
                     f"text_preview={preview!r}"
                 )
+
+                # Foreign results skip BEFORE the wedge watch below: a
+                # settlement mini-turn's success must neither close the turn
+                # nor disarm the watch (the driven turn hasn't run yet).
+                # Error results are never foreign and still reach the repair.
+                # Task mode must not enter settle on one either — the
+                # job-done 5s fast-grace would close the turn just the same.
+                if not settle.settling and is_foreign_result(
+                    data, gate.content_since_skip,
+                ):
+                    gate.record_skip(data)
+                    continue
 
                 # #63943 wedge repair: a graceful interrupt mid-thinking can
                 # persist an unsigned thinking block that 400s every later
@@ -968,21 +976,6 @@ class PersistentSession:
                         self._post_interrupt_watch = False
 
                 if settle.is_interactive_done():
-                    if (foreign_skips < FOREIGN_RESULT_SKIP_CAP
-                            and is_foreign_result(data, content_chunks)):
-                        # Resume handshake / stale result — the driven
-                        # prompt's turn hasn't run yet. Re-arm.
-                        foreign_skips += 1
-                        foreign_skip_deadline = (
-                            time.monotonic() + FOREIGN_SKIP_SILENCE_S
-                        )
-                        logger.warning(
-                            f"Persistent session {self.session_id}: skipping "
-                            f"foreign result (content_chunks={content_chunks}, "
-                            f"skips={foreign_skips}, "
-                            f"result={str(data.get('result', ''))[:80]!r})"
-                        )
-                        continue
                     yield ClaudeStreamChunk(
                         is_done=True,
                         session_id=translator.actual_session_id,
@@ -1010,10 +1003,8 @@ class PersistentSession:
         _active_processes.pop(self.session_id, None)
         # Clean up temp prompt file (only exists for new sessions, not resumes)
         if self._prompt_file:
-            try:
+            with contextlib.suppress(Exception):
                 self._prompt_file.unlink(missing_ok=True)
-            except Exception:
-                pass
 
     @property
     def is_alive(self) -> bool:

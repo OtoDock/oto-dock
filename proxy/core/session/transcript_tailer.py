@@ -649,6 +649,16 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                 if btype == "text":
                     text = block.get("text", "")
                     if text.strip():
+                        # Claimed by line uuid + block index, exactly like
+                        # thinking below: the CLI can re-write a line and a
+                        # concurrent-tail race can re-deliver one — text was
+                        # the only unclaimed block type, so the SAME assistant
+                        # text persisted twice (live-hit 2026-07-19: 37
+                        # consecutive duplicate rows in one interactive chat;
+                        # tool/thinking/usage were already claim-protected).
+                        luid = obj.get("uuid") or ""
+                        if luid and not buf.claim(f"text:{luid}:{bi}"):
+                            continue
                         task_store.add_chat_message(chat_id, "assistant", text)
                         persisted += 1
                         msg_text_parts.append(text)

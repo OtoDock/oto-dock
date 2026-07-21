@@ -16,8 +16,12 @@ def _make_fake(phone_adapters, dids, healthy=True):
         adapter_type = "fake"
 
         def __init__(self, server):
-            self.server = server
-            self.server_id = server["id"]
+            super().__init__(
+                server,
+                credential_resolver=lambda suffix: {},
+                media_endpoint="127.0.0.1:40000",
+                register_endpoint="127.0.0.1:8600",
+            )
 
         async def health_check(self):
             return phone_adapters.HealthStatus(healthy=healthy, detail="probe")
@@ -60,7 +64,7 @@ def test_health_persisted(temp_db, monkeypatch):
 
     sid = _setup_verified_server_with_route()
     monkeypatch.setattr(phone_adapters, "load_adapter",
-                        lambda server: _make_fake(phone_adapters, ["+30210"])(server))
+                        _make_fake(phone_adapters, ["+30210"]))
     asyncio.run(phone_health_worker.run_health_tick())
     s = phone_server_store.get_server(sid)
     assert s["last_health_status"] == "healthy"
@@ -75,7 +79,7 @@ def test_drift_detected(temp_db, monkeypatch):
     sid = _setup_verified_server_with_route("+30210")
     # PBX reports a different DID set → drift.
     monkeypatch.setattr(phone_adapters, "load_adapter",
-                        lambda server: _make_fake(phone_adapters, ["+999"])(server))
+                        _make_fake(phone_adapters, ["+999"]))
     asyncio.run(phone_health_worker.run_health_tick())
     s = phone_server_store.get_server(sid)
     assert s["bootstrap_status"] == "drift"
@@ -88,7 +92,7 @@ def test_matching_routes_no_drift(temp_db, monkeypatch):
 
     sid = _setup_verified_server_with_route("+30210")
     monkeypatch.setattr(phone_adapters, "load_adapter",
-                        lambda server: _make_fake(phone_adapters, ["+30210"])(server))
+                        _make_fake(phone_adapters, ["+30210"]))
     asyncio.run(phone_health_worker.run_health_tick())
     assert phone_server_store.get_server(sid)["bootstrap_status"] == "verified"
 
@@ -100,6 +104,6 @@ def test_untracked_adapter_no_drift(temp_db, monkeypatch):
     sid = _setup_verified_server_with_route("+30210")
     # list_provisioned_routes returns None → drift untracked, stays verified.
     monkeypatch.setattr(phone_adapters, "load_adapter",
-                        lambda server: _make_fake(phone_adapters, None)(server))
+                        _make_fake(phone_adapters, None))
     asyncio.run(phone_health_worker.run_health_tick())
     assert phone_server_store.get_server(sid)["bootstrap_status"] == "verified"

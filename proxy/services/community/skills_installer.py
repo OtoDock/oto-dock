@@ -127,7 +127,7 @@ def _scrub_package_skills(data: dict, pkg_root: Path) -> None:
     from services.mcp.skill_format import scrub_frontmatter
     for sk in data.get("skills") or []:
         f = pkg_root / sk["file"]
-        f.write_text(scrub_frontmatter(f.read_text()))
+        f.write_text(scrub_frontmatter(f.read_text(), origin=str(f)))
 
 
 async def install_skill_package_from_extracted(

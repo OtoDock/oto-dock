@@ -1,5 +1,5 @@
-mcp>=1.0,<2.0
+mcp>=1.28.1,<2.0
 httpx>=0.27,<1.0
-Pillow>=10.0
+Pillow>=12.2
 # Vendor calls (Gemini image, OpenAI image) go through raw httpx now (relay-aware,
 # uniform with image-search) — the google-genai / openai SDKs are no longer needed.

@@ -15,6 +15,7 @@ connection multiplexes many sequential contexts (one per utterance / one-shot cl
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from cartesia import AsyncCartesia
@@ -102,16 +103,12 @@ class CartesiaTTS(TTSProvider):
     async def close(self) -> None:
         """Close the WebSocket connection."""
         if self._conn:
-            try:
+            with contextlib.suppress(Exception):
                 await self._conn.close()
-            except Exception:
-                pass
             self._conn = None
         self._ctx = None
-        try:
+        with contextlib.suppress(Exception):
             await self._client.close()
-        except Exception:
-            pass
 
     # ── One-shot synthesis (greetings / fillers) ───────────────────
 

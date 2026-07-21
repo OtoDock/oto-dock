@@ -13,7 +13,6 @@ unit tests pin the state-engine contract that the routes depend on.
 
 from __future__ import annotations
 
-import pytest
 
 from services.oauth import oauth_engine
 

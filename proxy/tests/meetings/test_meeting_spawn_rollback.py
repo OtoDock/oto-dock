@@ -58,7 +58,7 @@ async def test_partial_spawn_failure_closes_spawned_and_releases_all():
          patch("core.concurrency.acquire_meeting_slots",
                new=AsyncMock(return_value=True)), \
          patch("core.concurrency.release_meeting_slots",
-               side_effect=lambda sids: released.extend(sids)), \
+               side_effect=released.extend), \
          patch.object(MO, "_notify_meeting_failed", new=notify):
         await MO.start_meeting("m1")
 

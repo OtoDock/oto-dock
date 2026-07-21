@@ -16,7 +16,6 @@ Covers:
 Run: cd proxy && python -m pytest tests/auth/test_api_keys.py -v
 """
 
-import os
 import sys
 from datetime import datetime, timezone
 

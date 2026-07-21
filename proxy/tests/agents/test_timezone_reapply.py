@@ -8,7 +8,6 @@ new platform TZ) — immediately, with no polling job.
 Run: cd proxy && python -m pytest tests/agents/test_timezone_reapply.py -v
 """
 
-import os
 import sys
 
 from tests._paths import PROXY_DIR

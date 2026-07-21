@@ -178,3 +178,34 @@ def test_parse_unknown_skill_keys_tolerated(tmp_path):
     m = _manifest(tmp_path, [
         {"id": "my-skill", "file": "f.md", "some_future_key": 42}])
     assert m.skills[0].id == "my-skill"
+
+
+class TestScrubSalvage:
+    """Invalid-YAML frontmatter (the unquoted-colon description footgun,
+    found live 2026-07-19: the tts-mcp voiceover skill was silently
+    frontmatter-stripped at scrub → codex rejected the whole skill)."""
+
+    def test_unquoted_colon_description_salvaged(self):
+        from services.mcp.skill_format import parse_frontmatter, scrub_frontmatter
+        text = (
+            "---\n"
+            "name: voiceover\n"
+            "description: Produce voice-overs: choose the voice, generate.\n"
+            "allowed-tools: Bash\n"
+            "---\n\nBody here.\n"
+        )
+        out = scrub_frontmatter(text, origin="tts-mcp/voiceover")
+        data, body = parse_frontmatter(out)
+        # Valid YAML now, descriptive keys preserved, body intact...
+        assert data["name"] == "voiceover"
+        assert data["description"].startswith("Produce voice-overs:")
+        assert "Body here." in body
+        # ...and the authorization-bearing key did NOT survive the salvage.
+        assert "allowed-tools" not in out
+
+    def test_unrecoverable_frontmatter_still_dropped(self):
+        from services.mcp.skill_format import scrub_frontmatter, split_frontmatter
+        text = "---\n- just\n- a\n- list\n---\n\nBody.\n"
+        out = scrub_frontmatter(text, origin="x")
+        fm, body = split_frontmatter(out)
+        assert fm is None and "Body." in out

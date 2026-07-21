@@ -52,6 +52,23 @@
     }
   ],
 
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "read_document",
+        "tier": "open"
+      },
+      {
+        "tool": "analyze_image",
+        "tier": "open"
+      },
+      {
+        "tool": "preview_document",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

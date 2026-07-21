@@ -10,7 +10,7 @@ import type { WorkflowLive } from '../components/chat/plan/WorkflowPanel'
 import type { SessionPlan } from '../components/chat/plan/PlanPanel'
 import { useChatMessages } from './useChatMessages'
 import { buildLiveStateMessages } from './chatStream/liveStateBuilder'
-import type { ChatStreamQueueAdapter, UseChatStreamOptions } from './chatStream/types'
+import type { UseChatStreamOptions } from './chatStream/types'
 
 // Tools that should NOT generate tool_start/tool_end blocks (they have dedicated display events).
 // mcp__delegation-mcp__delegate renders as the (expandable) delegate pill from the proxy's
@@ -274,6 +274,15 @@ export function useChatStream(options: UseChatStreamOptions) {
       setOfflineMachineName(data.offline_machine_name || '')
 
       options.onWarmupReadyExtra?.(data)
+    },
+
+    onChatMoved: (data) => {
+      // The move op acts on the connection's open chat — drop the ack if the
+      // user already navigated elsewhere (that chat re-warms on next open).
+      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
+        return
+      }
+      options.onChatMoved?.(data)
     },
 
     onChatHistory: (data) => {
@@ -686,7 +695,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       updateCommandActive(toolId, false)
     },
 
-    onBgAgentsComplete: () => {
+    onBgAgentsComplete: (_msg) => {
       if (discardingRef.current) return
       // All background agents completed (sent by bg_nudge before auto-response).
       // Mark ALL remaining bg subagent blocks as done.
@@ -709,7 +718,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       )
     },
 
-    onBgCommandsComplete: () => {
+    onBgCommandsComplete: (_msg) => {
       if (discardingRef.current) return
       // All background commands finished (sent by bg_command_nudge before the
       // review turn). The per-command bg_command_done can't deliver post-turn
@@ -1029,7 +1038,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       setLimitWarning(data)
       setTimeout(() => setLimitWarning(null), 10000)
     },
-    onLimitReached: () => {
+    onLimitReached: (_msg) => {
       if (discardingRef.current) return
       setLimitReached(true)
     },
@@ -1083,7 +1092,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         caption: data.caption || undefined,
       })
     },
-    onMediaFailed: () => {
+    onMediaFailed: (_msg) => {
       if (discardingRef.current) return
       removeMediaProcessing()
     },
@@ -1139,7 +1148,13 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     onContextCompact: (data) => {
       if (discardingRef.current) return
-      if (data.phase === 'started') {
+      if (data.phase === 'usage') {
+        // Post-compaction gauge state (Codex reports the compacted prompt
+        // size on its next tokenUsage) — counter only, no chip: the
+        // 'completed' event already rendered the visible separator.
+        if (data.post_tokens != null) setContextUsed(data.post_tokens)
+        if (data.context_max) setContextMax(data.context_max)
+      } else if (data.phase === 'started') {
         setCompressingActive(true)
       } else if (data.phase === 'completed') {
         setCompressingActive(false)
@@ -1351,7 +1366,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (sentWithBubbleRef.current === data.text) return
       options.queue.addQueued(data.index, data.text)
     },
-    onQueueRemoved: () => {
+    onQueueRemoved: (_msg) => {
       // No-op for queuedMessages — the page's cancel/edit handlers already
       // removed from state before sending cancel_queued to the backend.
       // onQueueEditReturn handles pulling text back to input.
@@ -1457,7 +1472,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       )
     },
 
-    onTitleUpdated: () => {
+    onTitleUpdated: (_msg) => {
       // Refresh the sidebar — the chat row's title col is the live source.
       options.onTitleUpdated?.()
     },

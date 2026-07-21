@@ -162,10 +162,11 @@ async def dispatch_webhook(
         manifest_sig_block=sig_block,
     )
     if not verify.ok:
-        webhook_subscription_store.update_subscription_status(
-            subscription_id, row["status"],  # no-op transition; just to write last_error
-            last_error=f"signature: {verify.reason}",
-        ) if row["status"] not in ("creating",) else None
+        if row["status"] not in ("creating",):
+            webhook_subscription_store.update_subscription_status(
+                subscription_id, row["status"],  # no-op transition; just to write last_error
+                last_error=f"signature: {verify.reason}",
+            )
         return (401, {"error": "signature verification failed", "reason": verify.reason},
                 {"content-type": "application/json"})
 

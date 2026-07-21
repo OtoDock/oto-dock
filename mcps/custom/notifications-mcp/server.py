@@ -464,7 +464,7 @@ async def _handle_list(args: dict) -> list[TextContent]:
 async def _handle_cancel(args: dict) -> list[TextContent]:
     nid = args["id"]
     try:
-        result = await _delete(f"/v1/notifications/{nid}")
+        await _delete(f"/v1/notifications/{nid}")
         return [TextContent(type="text", text=f"Notification {nid} deleted.")]
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:

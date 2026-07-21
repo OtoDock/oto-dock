@@ -2,7 +2,9 @@
 
 Covers the digest builder (rendering rules, caps, budget, trailing-user skip),
 the atomic pending-seed claim, the consume flow (prepend + notice row + flag
-clear), and the delete_remote_machine chat transition that produces the flag.
+clear), and the chat transitions that produce the flag: delete_remote_machine
+(all pinned chats) and rebind_chat_to_current_target (one chat — the
+"Move this chat" escape hatch).
 """
 
 import json
@@ -259,6 +261,31 @@ def test_consume_resume_failed_reason(temp_db):
     assert block["machine_name"] == ""
 
 
+def test_consume_moved_reason(temp_db):
+    """The explicit "Move this chat" action stamps 'moved:<label>' — the
+    consumer's dedicated branch names the source label in the notice and the
+    persisted card carries reason='moved' + machine_name (an unknown kind
+    would fall to the wrong "files were cleaned up" copy)."""
+    from storage import database as db
+    from core.session.history_seed import consume_pending_seed
+    db.create_chat("c12c", "user-1", "agent-x")
+    _add(db, "c12c", "user", "old msg")
+    _add(db, "c12c", "assistant", "old reply")
+    db.update_chat("c12c", pending_history_seed="moved:Office-PC")
+
+    text, notice = consume_pending_seed("c12c", "go on")
+    assert "moved from Office-PC" in notice
+    assert text.startswith("[Context restore:") and text.endswith("go on")
+    block = json.loads(next(
+        m["event_data"] for m in db.get_chat_messages("c12c")
+        if m["event_type"] == "system"
+    ))
+    assert block["subtype"] == "session_reseeded"
+    assert block["reason"] == "moved"
+    assert block["machine_name"] == "Office-PC"
+    assert block["message"] == notice
+
+
 def test_consume_with_empty_history_still_notices(temp_db):
     """Flag set but nothing restorable: no digest, but the notice still
     persists and the flag clears (the fresh session is still a fact)."""
@@ -324,3 +351,47 @@ def test_delete_machine_transitions_pinned_chats(temp_db):
     assert local["execution_target"] == "local"
     assert local["session_id"] == "sess-3"
     assert local["pending_history_seed"] == ""
+
+
+# ---------------------------------------------------------------------------
+# rebind_chat_to_current_target — the per-chat "Move this chat" transition
+# ---------------------------------------------------------------------------
+
+def test_rebind_chat_transitions_one_chat(temp_db):
+    """The user-facing move op applies the machine-removed shape to ONE chat:
+    pin cleared (next warmup fresh-resolves + re-stamps), session ids dropped,
+    abort flags + context meter reset, and 'moved:<from_label>' queued for the
+    history-seed injection. Siblings on the same machine are untouched."""
+    from storage import database as db
+    from storage import remote_store
+
+    _insert_machine("m-office", "Office-PC")
+
+    db.create_chat("moving", "user-1", "agent-x")
+    db.update_chat("moving", execution_target="m-office", session_id="sess-1",
+                   codex_thread_id="thread-1", last_turn_aborted=True,
+                   context_used=120000)
+    db.create_chat("staying", "user-1", "agent-x")
+    db.update_chat("staying", execution_target="m-office", session_id="sess-2")
+
+    assert remote_store.rebind_chat_to_current_target(
+        "moving", "Office-PC") is True
+
+    moved = db.get_chat("moving")
+    assert moved["execution_target"] == ""
+    assert moved["session_id"] is None
+    assert moved["codex_thread_id"] is None
+    assert moved["last_turn_aborted"] is False
+    assert moved["context_used"] == 0
+    assert moved["pending_history_seed"] == "moved:Office-PC"
+
+    staying = db.get_chat("staying")
+    assert staying["execution_target"] == "m-office"
+    assert staying["session_id"] == "sess-2"
+    assert staying["pending_history_seed"] == ""
+
+
+def test_rebind_unknown_chat_returns_false(temp_db):
+    from storage import remote_store
+    assert remote_store.rebind_chat_to_current_target(
+        "no-such-chat", "Office-PC") is False

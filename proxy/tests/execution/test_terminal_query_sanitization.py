@@ -253,3 +253,31 @@ if __name__ == "__main__":
         print("\nall checks passed")
 
     asyncio.run(_main())
+
+
+async def test_replay_strips_osc52_clipboard_write():
+    # OSC 52 SET passes LIVE (the TUI's copy feature via the ClipboardAddon)
+    # but must never survive an attach replay — a replayed copy silently
+    # overwrites the viewer's clipboard on page open (2026-07-19).
+    from core.terminal_queries import strip_clipboard_writes
+    assert strip_clipboard_writes(b"a\x1b]52;c;aGk=\x07b") == b"ab"
+    assert strip_clipboard_writes(b"a\x1b]52;c;aGk=\x1b\\b") == b"ab"
+    assert strip_clipboard_writes(b"\x1b]0;title\x07x") == b"\x1b]0;title\x07x"
+
+    I._sessions.clear()
+    ring = b"scr\x1b]52;c;c2VjcmV0\x07een\x1b]52;c;aGk=\x1b\\tail"
+    for target in ("local", "m1"):
+        s = _mk("cb-" + target, target=target, ring=ring)
+        got = []
+        try:
+            sb = s.add_output_listener(got.append)
+            ok = _check(f"{target} replay strips ]52 writes", b"]52;" not in sb)
+            ok &= _check(f"{target} replay keeps rendering",
+                         b"scr" in sb and b"een" in sb and b"tail" in sb)
+            # LIVE fan-out keeps the copy feature working (write form passes).
+            s._fanout_output(b"live\x1b]52;c;bGl2ZQ==\x07bytes")
+            ok &= _check(f"{target} live keeps ]52 writes",
+                         any(b"]52;" in g for g in got))
+            assert ok
+        finally:
+            I._sessions.clear()

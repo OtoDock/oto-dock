@@ -165,7 +165,6 @@ const PERIODS = ['monthly', 'weekly'] as const
 
 function RoleDefaultsEditor({ limits }: { limits: UsageLimit[] }) {
   const setLimit = useSetUsageLimit()
-  const deleteLimit = useDeleteUsageLimit()
   const [edits, setEdits] = useState<Record<string, { value: string; noLimit: boolean }>>({})
 
   const getKey = (role: string, period: string) => `${role}:${period}`

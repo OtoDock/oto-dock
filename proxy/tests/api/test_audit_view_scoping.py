@@ -12,7 +12,6 @@ Run: cd proxy && venv/bin/pytest tests/api/test_audit_view_scoping.py -v
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 
 from tests._paths import PROXY_DIR

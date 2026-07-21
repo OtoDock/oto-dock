@@ -161,4 +161,20 @@ describe('useSpeechSession', () => {
     act(() => { fakes[0].emit.final('tail sentence') })
     expect(onFinal).toHaveBeenCalledWith('tail sentence')
   })
+
+  it('stop(true) discards the tail final (send already took the text)', async () => {
+    const onFinal = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onFinal }))
+
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    expect(result.current.status).toBe('recording')
+
+    act(() => { result.current.stop(true) })
+    // The stop-flush final still arrives — but Send consumed the input, so
+    // delivering it would re-fill the cleared composer. It must be dropped.
+    act(() => { fakes[0].emit.final('tail sentence') })
+    expect(onFinal).not.toHaveBeenCalled()
+  })
 })

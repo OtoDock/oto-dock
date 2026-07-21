@@ -68,7 +68,7 @@ def writeback_env(monkeypatch, tmp_path):
             return self
         def __exit__(self, *a):
             return False
-    monkeypatch.setattr(storage.pg, "get_conn", lambda: _FakeConn())
+    monkeypatch.setattr(storage.pg, "get_conn", _FakeConn)
 
     def set_ctx(session_scope, username):
         ctx = SimpleNamespace(

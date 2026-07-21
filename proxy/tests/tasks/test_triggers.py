@@ -18,8 +18,6 @@ Covers:
 Run: cd proxy && python -m pytest tests/tasks/test_triggers.py -v
 """
 
-import asyncio
-import os
 import sys
 import time
 from datetime import datetime, timezone

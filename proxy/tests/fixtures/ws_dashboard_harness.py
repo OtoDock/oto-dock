@@ -380,7 +380,7 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
         return conc.Admission(True)
     monkeypatch.setattr(conc, "acquire_chat_slot", _admit)
     monkeypatch.setattr(conc, "release_chat_slot",
-                        lambda sid: slots.released.append(sid))
+                        slots.released.append)
     return slots
 
 

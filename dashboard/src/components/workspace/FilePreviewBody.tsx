@@ -279,7 +279,8 @@ function DocumentPreview({
             src={effectiveUrl}
             className="w-full h-full border-0"
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
-            allow="clipboard-read; clipboard-write"
+            allow="clipboard-read; clipboard-write; fullscreen"
+              allowFullScreen
           />
         )}
       </div>

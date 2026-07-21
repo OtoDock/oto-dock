@@ -206,20 +206,16 @@ class ChatController:
                         )
 
         # ── Usage limit check ──
-        # Scope-aware, mirroring the scheduler: an agent-scoped chat (internal /
-        # shared-only agent) spends the platform pool → gate on the AGENT budget;
-        # a user-scoped chat → gate on the user's platform-auth budget.
+        # A dashboard chat always runs on the SENDER's subscription — Shared-only
+        # agents included (only the mount + chat history are agent-scope there;
+        # credentials follow the interacting user) — so gate on the sender's
+        # platform-auth budget. The AGENT budget gates the platform-paid sources
+        # (tasks / triggers / meetings / phone) at their own launch sites.
         try:
             from services.billing import usage_service
-            is_agent_scoped_chat = bool(self.agent_name) and _vis.is_shared_only(self.agent_name)
-            if is_agent_scoped_chat:
-                limit_status = await asyncio.to_thread(
-                    usage_service.check_agent_limit, self.agent_name
-                )
-            else:
-                limit_status = await asyncio.to_thread(
-                    usage_service.check_user_limit, self.user_sub, self.user_role
-                )
+            limit_status = await asyncio.to_thread(
+                usage_service.check_user_limit, self.user_sub, self.user_role
+            )
             if not limit_status["allowed"]:
                 await self._send({"type": "limit_reached", **limit_status["periods"]})
                 return
@@ -258,6 +254,40 @@ class ChatController:
                     "chat_id": self.chat_id,
                     "permission_mode": "default",
                 }, background=False)
+            elif _vis.is_shared_only(self.agent_name):
+                # Sender-pays (Shared-only): the live session is bound to the
+                # subscription — and identity (JWT, OTO_USER_SUB, role) — of
+                # whoever warmed it. When the conversation changes hands
+                # BETWEEN turns, recycle the session so this turn binds the
+                # current sender's subscription instead of silently spending
+                # the previous sender's account. A message that lands while a
+                # turn is streaming keeps the running turn's session (steer /
+                # queue semantics unchanged — that turn stays on its starter).
+                from services.engines import subscription_pool
+                pump = _active_pumps.get(self.chat_id)
+                turn_in_flight = bool(pump and not pump.is_done)
+                payer = subscription_pool.get_session_payer_sub(self.session_id)
+                if not turn_in_flight and payer and payer != self.user_sub:
+                    logger.info(
+                        f"WS dashboard _handle_chat: shared-only chat={self.chat_id} "
+                        f"changed sender — recycling session {self.session_id} to "
+                        f"bind the new sender's subscription"
+                    )
+                    try:
+                        # close_session releases the slot + subscription; the
+                        # JSONL stays, so the re-warm resumes the conversation.
+                        await self.layer.close_session(self.session_id)
+                    except Exception:
+                        logger.warning(
+                            f"sender-change recycle: close_session failed for "
+                            f"{self.session_id}", exc_info=True,
+                        )
+                    self.session_id = None
+                    await self._handle_warmup({
+                        "agent": self.agent_name,
+                        "chat_id": self.chat_id,
+                        "permission_mode": "default",
+                    }, background=False)
 
         if not self.session_id:
             await self._send_error("No session — send warmup first")
@@ -302,6 +332,13 @@ class ChatController:
             is_direct_llm=is_direct_llm,
         )
 
+        # Shared-only: detect a change of hands BEFORE persisting this message
+        # (afterwards the sender IS the last author). Drives the speaker-
+        # transition note injected below.
+        prev_author = ""
+        if is_agent_scoped and self.chat_id and not server_kick:
+            prev_author = task_store.get_last_user_message_author(self.chat_id)
+
         # Save original user text to DB (without image/file paths injection)
         event_meta = {}
         if image_meta:
@@ -339,6 +376,19 @@ class ChatController:
                     if cancelled:
                         cli_text = cancelled + "\n\n" + cli_text
                         logger.info(f"WS dashboard: injected cancelled turn context ({len(cancelled)} chars) for chat={self.chat_id}")
+
+        # Speaker-transition note (Shared-only): the resumed transcript may
+        # carry other teammates' turns, and the warmup's identity line names
+        # only the current sender — tell the agent who THIS message is from so
+        # it doesn't attribute the earlier conversation to them. Prompt-side
+        # only: the stored message row stays the raw text (author_sub carries
+        # the attribution).
+        if prev_author and prev_author != self.user_sub:
+            _display = self.user.get("name") or self.user.get("username") or "another teammate"
+            cli_text = (
+                f"[Shared chat: this message is from {_display}; earlier user "
+                f"messages may be from other teammates.]\n\n" + cli_text
+            )
 
         # Create pump and enter streaming loop. The user turn targets the viewed
         # chat (the connection attributes) — the common, behaviour-preserving path.
@@ -701,7 +751,14 @@ class ChatController:
                             # id-based cutoff: withhold the in-flight tail (live_state
                             # provides it). A row-count slice would over-keep once the
                             # window is paged, re-rendering live rows as ghost bubbles.
-                            extra_msgs = [m for m in extra_msgs if int(m["id"]) <= rp._db_msg_cutoff_id]
+                            # USER rows are exempt: a mid-turn STEERED message persists
+                            # above the cutoff and the pump replay never re-sends user
+                            # rows — filtering it made the message vanish on revisit.
+                            extra_msgs = [
+                                m for m in extra_msgs
+                                if int(m["id"]) <= rp._db_msg_cutoff_id
+                                or m.get("role") == "user"
+                            ]
                         if extra_msgs:
                             messages.extend(extra_msgs)
 
@@ -817,7 +874,17 @@ class ChatController:
         if pump and not pump.is_done and not view_only_external:
             # Primary chat has active pump — withhold ITS in-flight tail by id
             # (the live stream re-sends it; a count slice breaks under paging).
-            messages = [m for m in messages if int(m["id"]) <= pump._db_msg_cutoff_id]
+            # USER rows are exempt: a mid-turn STEERED message (persisted the
+            # moment the daemon accepts it, id ABOVE the cutoff) is NOT part of
+            # the pump's replayed blocks, so filtering it made the message
+            # vanish when the user switched away and back mid-turn. The pump
+            # never re-sends user rows (queued-not-yet-delivered messages ride
+            # queue_snapshot and aren't persisted yet), so no double-render.
+            messages = [
+                m for m in messages
+                if int(m["id"]) <= pump._db_msg_cutoff_id
+                or m.get("role") == "user"
+            ]
         elif active_task_pump:
             # Related turn has active pump — primary messages are complete,
             # related turn's messages already truncated above
@@ -884,6 +951,7 @@ class ChatController:
                 "mode": perm_mode,
                 "model": chat_model,
                 "execution_path": effective_exec_path,
+                **self._target_mismatch_fields(self.chat_id),
             })
             # Resync any reload-persisted queuedMessages on the
             # client against the pump's actual queue. Backend is the source
@@ -931,6 +999,7 @@ class ChatController:
                     # sidebar live state for good (broadcasts are
                     # transition-only; finishWarmup maps True → streaming).
                     "turn_open": isess.turn_open,
+                    **self._target_mismatch_fields(self.chat_id),
                 })
                 await self._send({"type": "queue_snapshot", "chat_id": self.chat_id, "messages": []})
                 # Client attaches the PTY viewer via pty_attach (see _dispatch).
@@ -957,6 +1026,7 @@ class ChatController:
                     "model": chat_model,
                     "execution_path": effective_exec_path,
                     "interactive": False,
+                    **self._target_mismatch_fields(self.chat_id),
                 })
                 # No active pump → queue is empty by definition. Emit so
                 # the client clears any reload-persisted stale entries.
@@ -1001,6 +1071,7 @@ class ChatController:
             "execution_path": effective_exec_path,
             "execution_mode": chat.get("execution_mode", ""),
             "needs_warmup": True,
+            **self._target_mismatch_fields(self.chat_id),
         })
         # Lazy path — no pump, no session yet. Clear any persisted queue
         # on the client (rare but possible if user reloaded after a turn
@@ -1146,6 +1217,19 @@ class ChatController:
                     "message": reseed_notice, "chat_id": target_chat_id,
                 })
 
+        # Durable delegate-wake replay: results whose delivery failed entirely
+        # (dead parent, resume failed) were stored on the chat — inject them
+        # ahead of this turn's prompt so the orchestrator finally processes
+        # them. Same chokepoint rationale + atomic claim as the seed above.
+        if target_chat_id:
+            pending_wakes = task_store.claim_pending_delegate_wake(target_chat_id)
+            if pending_wakes:
+                prompt = "\n\n".join(pending_wakes + [prompt])
+                logger.info(
+                    f"WS dashboard: injected {len(pending_wakes)} pending delegate "
+                    f"wake(s) into turn for chat={target_chat_id[:8]}"
+                )
+
         perm_queue = get_permission_queue(sid)
 
         # Message queue: only a turn on the VIEWED chat drains the connection's
@@ -1236,9 +1320,12 @@ class ChatController:
 
         producer = asyncio.create_task(_produce())
 
-        # Scope for usage tracking — Shared-only agents bill to agent scope. Use the
-        # target chat's agent (resolve from the row only for a non-viewed server
-        # turn; the viewed turn's agent is the connection's agent_name).
+        # Fallback usage scope — on a Shared-only agent the chat row's owner is
+        # synthetic, so "agent" is the bucket when no payer is known. When a USER
+        # subscription served the session, _record_usage re-attributes the row to
+        # that payer (user scope). Use the target chat's agent (resolve from the
+        # row only for a non-viewed server turn; the viewed turn's agent is the
+        # connection's agent_name).
         scope_agent = self.agent_name if is_viewed else (
             (task_store.get_chat(target_chat_id) or {}).get("agent") or self.agent_name
         )
@@ -1799,8 +1886,15 @@ class ChatController:
             if result.get("resume_msg"):
                 rm = result["resume_msg"]
                 if rm.get("type") == "resume_chat":
+                    prev_chat, prev_sid = self.chat_id, self.session_id
                     await self._handle_resume_chat(rm)
-                    self._register_notify_queue()
+                    # Only a SAME-chat resume supersedes the old sid — on a
+                    # chat switch the old entry still serves the backgrounded
+                    # chat's server kicks.
+                    self._register_notify_queue(
+                        replaces=prev_sid
+                        if rm.get("chat_id") == prev_chat else "",
+                    )
                 else:
                     # warmup / pre_warmup that escaped the streaming loop —
                     # route through the normal dispatcher (it backgrounds

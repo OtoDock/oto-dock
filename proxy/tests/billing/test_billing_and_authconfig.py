@@ -1,6 +1,5 @@
 """/auth/config relay flags + /v1/user/credits stub."""
 
-import pytest
 from fastapi.testclient import TestClient
 
 import config

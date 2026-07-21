@@ -9,7 +9,6 @@ TRIGGERED the run, so a change mid-merge re-triggers rather than being skipped).
 
 import asyncio
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 

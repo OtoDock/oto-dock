@@ -11,6 +11,7 @@ Run individually (conftest DB-pool gotcha):
     venv/bin/python -m pytest tests/session/test_session_delivery.py -q
 """
 import asyncio
+import contextlib
 import time
 
 from core.session import interactive_session as isess
@@ -347,13 +348,11 @@ class TestOneshotGuard:
             async def _boom(sid, agent, text, **kw):
                 raise RuntimeError("echo died")
 
-            try:
+            with contextlib.suppress(RuntimeError):
                 asyncio.run(deliver_prompt(
                     "chat-g4", "x", source="delegate_result",
                     session_id="sid-g4", agent="pa", oneshot_fn=_boom,
                 ))
-            except RuntimeError:
-                pass
             assert oneshot_inflight("chat-g4") is None  # finally released it
         finally:
             _cleanup()
@@ -394,3 +393,36 @@ class TestOneshotGuard:
             assert fake.queued[0]["text"] == "the result"
         finally:
             _cleanup()
+
+
+def test_register_notify_queue_replaces_superseded_sid(temp_db):
+    """A same-chat re-warm passes ``replaces`` — the dead sid's entry goes;
+    sibling-chat entries and other connections' entries survive."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from ws.dashboard import DashboardConnection
+
+    q_mine: asyncio.Queue = asyncio.Queue()
+    q_other: asyncio.Queue = asyncio.Queue()
+    conn = SimpleNamespace(session_id="sid-new", notify_queue=q_mine)
+    reg = DashboardConnection._register_notify_queue
+    try:
+        _dashboard_notify_queues["sid-old"] = q_mine   # superseded
+        _dashboard_notify_queues["sid-bg"] = q_mine    # sibling bg chat
+        reg(conn, replaces="sid-old")
+        assert "sid-old" not in _dashboard_notify_queues
+        assert _dashboard_notify_queues["sid-bg"] is q_mine
+        assert _dashboard_notify_queues["sid-new"] is q_mine
+
+        # A sid owned by ANOTHER connection's queue is never dropped.
+        _dashboard_notify_queues["sid-foreign"] = q_other
+        reg(conn, replaces="sid-foreign")
+        assert _dashboard_notify_queues["sid-foreign"] is q_other
+
+        # replaces == the current sid must not self-drop.
+        reg(conn, replaces="sid-new")
+        assert _dashboard_notify_queues["sid-new"] is q_mine
+    finally:
+        for k in ("sid-old", "sid-bg", "sid-new", "sid-foreign"):
+            _dashboard_notify_queues.pop(k, None)

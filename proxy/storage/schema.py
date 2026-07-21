@@ -7,6 +7,7 @@ single source of truth for the schema. Every CREATE TABLE / CREATE INDEX uses
 IF NOT EXISTS so re-runs are safe (the startup path is idempotent).
 """
 
+import contextlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,12 @@ def init_chats(conn) -> None:
             -- non-empty = the on-disk session is gone; the next turn injects a
             -- DB-history digest. Payload: 'machine_removed:<name>' | 'retention'.
             pending_history_seed TEXT NOT NULL DEFAULT '',
+            -- non-empty = delegate-result wakes that could not be delivered
+            -- (every ladder rung failed — e.g. dead interactive parent whose
+            -- resume also failed). JSON array of rendered wake prompts,
+            -- claimed atomically at the chat's next warmup/turn and injected
+            -- so the orchestrator continues.
+            pending_delegate_wake TEXT NOT NULL DEFAULT '',
             -- per-chat execution-mode override: '' (resolver default → -p) |
             -- 'interactive' | '-p'; persisted so a resume re-spawns the same mode.
             execution_mode TEXT NOT NULL DEFAULT '',
@@ -1751,6 +1758,13 @@ def run_migrations(conn) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pinned_apps_scope_project "
         "ON pinned_apps (scope_project_id) WHERE scope_project_id IS NOT NULL"
     )
+    # 2026-07-18: durable delegate-wake replay — undeliverable delegate
+    # results are stored on the parent chat and injected at its next
+    # warmup/turn.
+    conn.execute(
+        "ALTER TABLE chats "
+        "ADD COLUMN IF NOT EXISTS pending_delegate_wake TEXT NOT NULL DEFAULT ''"
+    )
     # 2026-07-13: cron day-of-week convention fix. Stored 5-field schedules
     # used to reach APScheduler verbatim, whose numeric day-of-week is
     # 0=Monday; the platform now stores/accepts STANDARD cron (0=Sunday) and
@@ -1850,10 +1864,8 @@ def check_schema_drift(conn) -> list[tuple[str, str]]:
     except Exception as e:  # the guard must never take the boot down with it
         logger.debug("schema drift probe skipped: %s", e)
     finally:
-        try:
+        with contextlib.suppress(Exception):
             conn.rollback()  # discard the probe schema + reset search_path
-        except Exception:
-            pass
     if drift:
         logger.error(
             "SCHEMA DRIFT: the live database is missing %d column(s) the "

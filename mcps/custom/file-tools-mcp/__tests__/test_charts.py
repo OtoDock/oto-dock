@@ -20,7 +20,6 @@ pytest.importorskip("matplotlib")
 # Make the parent dir importable as a top-level module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import charts  # noqa: E402
 from charts import _validate_series, handle_create_chart  # noqa: E402
 
 
@@ -33,7 +32,7 @@ def _capture_push(monkeypatch):
         pushed["bytes"] = png_bytes
         pushed["mime"] = mime
 
-    monkeypatch.setattr(charts, "_push_image_preview", fake_push)
+    monkeypatch.setattr("charts._push_image_preview", fake_push)
     yield pushed
 
 

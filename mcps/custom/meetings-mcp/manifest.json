@@ -39,6 +39,27 @@
       "default_exclude_from": ["phone", "terminal"]
     }
   ],
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "direct_to",
+        "tier": "open"
+      },
+      {
+        "tool": "propose_conclude",
+        "tier": "open"
+      },
+      {
+        "tool": "leave_meeting",
+        "tier": "open"
+      },
+      {
+        "tool": "end_meeting",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

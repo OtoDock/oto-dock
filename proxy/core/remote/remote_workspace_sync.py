@@ -6,6 +6,7 @@ with large conflict-free pulls deferred to the background. Mixed into
 RemoteExecutionLayer; split out of remote_execution.py.
 """
 
+import contextlib
 import logging
 import uuid
 
@@ -93,6 +94,25 @@ class RemoteWorkspaceSyncMixin:
             )
             target_role = (roles or {}).get(agent_slug, "")
         return (target_username, target_role)
+
+    async def presync_machine_agent(self, machine_id: str, agent_slug: str) -> None:
+        """W3 (sync-performance): warm a (machine, agent) workspace right at
+        ENABLE-CLICK (admin assign / user per-agent target) instead of making
+        the FIRST chat pay the whole initial transfer inline. Identity comes
+        from the machine pairing (no session exists yet); an offline machine
+        no-ops (the reconnect catch-up covers it); a concurrent warmup is
+        serialized by the per-(machine, agent) sync lock. Best-effort by
+        contract — callers fire-and-forget."""
+        if not self._cm.is_connected(machine_id):
+            return
+        ident = await self.resolve_machine_sync_identity(machine_id, agent_slug)
+        if ident is None:
+            return
+        target_username, target_role = ident
+        await self._initial_workspace_sync(
+            machine_id, agent_slug,
+            target_username=target_username, target_role=target_role,
+        )
 
     async def sync_all_agents_on_reconnect(self, machine_id: str) -> None:
         """Catch every agent previously synced to this machine up to the platform
@@ -281,6 +301,7 @@ class RemoteWorkspaceSyncMixin:
         *, target_username: str | None = None,
         target_role: str = "",
         session_username: str = "",
+        progress_cb=None,
     ) -> None:
         """Versioned last-write-wins sync of the agent_dir with a satellite at
         session start.
@@ -413,18 +434,39 @@ class RemoteWorkspaceSyncMixin:
             )
 
             local_mtime = {e.path: e.mtime for e in local_entries}
-            recover_tmp = None  # lazily-created per-sync temp dir for satellite pulls
+            # Created EAGERLY (not lazily on first capture): the windowed
+            # apply below runs actions concurrently, and a lazy nonlocal
+            # create could double-mkdtemp and leak the loser.
+            import tempfile as _tempfile
+            from pathlib import Path as _Path
+            recover_tmp = _Path(_tempfile.mkdtemp(prefix="oto-recover-"))
             to_notify: list[tuple[str, str]] = []
-            n = {"push": 0, "pull": 0, "delete": 0, "scrub": 0, "capture": 0}
+            n = {"push": 0, "pull": 0, "delete": 0, "scrub": 0, "capture": 0,
+                 "done": 0}
+
+            # W2 (sync-performance): throttled progress ticks → progress_cb
+            # (the warmup wires it to the dashboard install bar; background
+            # sweeps pass None). Always fire the FINAL tick so the bar lands
+            # on 100% even under throttle.
+            import time as _time_mod
+            _total = len(foreground_actions)
+            _last_tick = {"t": 0.0}
+
+            async def _progress_tick(final: bool = False) -> None:
+                if progress_cb is None or _total == 0:
+                    return
+                now = _time_mod.monotonic()
+                if not final and now - _last_tick["t"] < 0.5:
+                    return
+                _last_tick["t"] = now
+                try:
+                    await progress_cb(n["done"], _total)
+                except Exception:
+                    logger.debug("sync progress_cb failed", exc_info=True)
 
             async def _pull_satellite_bytes(rp: str) -> bytes | None:
                 """Pull the satellite's current copy of ``rp`` → bytes, or None on a
                 pull/read failure."""
-                nonlocal recover_tmp
-                import tempfile as _tf
-                from pathlib import Path as _P
-                if recover_tmp is None:
-                    recover_tmp = _P(_tf.mkdtemp(prefix="oto-recover-"))
                 dest = recover_tmp / uuid.uuid4().hex
                 ok = await self._cm.pull_file_to_path(
                     machine_id, PathRef("agent_tree", rp), dest, agent_slug=agent_slug,
@@ -436,10 +478,8 @@ class RemoteWorkspaceSyncMixin:
                 except OSError:
                     return None
                 finally:
-                    try:
+                    with contextlib.suppress(OSError):
                         dest.unlink()
-                    except OSError:
-                        pass
 
             def _read_platform_bytes(rp: str) -> bytes | None:
                 try:
@@ -590,6 +630,8 @@ class RemoteWorkspaceSyncMixin:
                         except OSError as e:
                             logger.warning("delete_platform unlink failed for %s: %s", rp, e)
                             return
+                        from core.remote import file_sync as _fs
+                        _fs.prune_empty_parents(dest, agent_dir)
                         n["delete"] += 1
                         import time as _t
                         await _asyncio.to_thread(
@@ -634,13 +676,35 @@ class RemoteWorkspaceSyncMixin:
                         agent_slug, rp, source="disk",
                     )
 
-            for action in foreground_actions:
-                try:
-                    await _apply(action)
-                except Exception:
-                    logger.exception(
-                        "initial-sync action failed for %s/%s", agent_slug, action.rel_path,
-                    )
+            # W1 (sync-performance): WINDOWED PIPELINING. The satellite applies
+            # frames serially on its event loop either way — but awaiting each
+            # per-file ack before SENDING the next serialized the WIRE, so a
+            # 1,500-file first sync cost RTT × N (the 25-minute first-turn
+            # report). A bounded window keeps the wire full while preserving
+            # every correctness property: per-path ordering rides the global
+            # path lock INSIDE _apply, failures still log-and-continue (same
+            # as the old loop), and counters/lists only mutate on the loop
+            # thread. Big chunked pushes may interleave with small files —
+            # the writer lanes already order control frames ahead.
+            _window = _asyncio.Semaphore(8)
+
+            async def _apply_windowed(action) -> None:
+                async with _window:
+                    try:
+                        await _apply(action)
+                    except Exception:
+                        logger.exception(
+                            "initial-sync action failed for %s/%s",
+                            agent_slug, action.rel_path,
+                        )
+                    finally:
+                        n["done"] += 1
+                        await _progress_tick()
+
+            await _asyncio.gather(
+                *(_apply_windowed(a) for a in foreground_actions)
+            )
+            await _progress_tick(final=True)
 
             # Isolation scrubs (another user's data / agent-scope creds that leaked
             # onto the satellite) — delete there, never captured, never base-tracked.

@@ -10,6 +10,7 @@ and that path also records $0/free-tier seconds).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -282,7 +283,5 @@ async def stream_with_cancellation(chunks, request, *, on_close=None):
             yield chunk
     finally:
         if on_close is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await on_close()
-            except Exception:
-                pass

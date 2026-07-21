@@ -12,7 +12,6 @@ Pure ``session_state`` + gate logic — no live daemon, no satellite.
 
 import asyncio
 import json
-import os
 import sys
 import time
 

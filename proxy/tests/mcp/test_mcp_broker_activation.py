@@ -17,7 +17,6 @@ config files (each MCP gets them via its bundle); these tests assert both the br
 strip (flat env stripped, bundle filtered to secrets, OTO_STRIP_KEYS injected).
 """
 
-import os
 import sys
 from types import SimpleNamespace
 
@@ -59,6 +58,7 @@ class _FakeManifest:
         self.network_targets = []
         self.network_access_default = True
         self.placement = "any"
+        self.remote_policy = "any"
         self.device_capability = None
         self.device_high_risk_tools = []
         self.assignment_mode = "auto"

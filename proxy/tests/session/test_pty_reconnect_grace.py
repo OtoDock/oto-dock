@@ -113,7 +113,7 @@ async def test_reconcile_ptys_exits_dead_and_closes_orphan():
     cm = SatelliteConnectionManager()
     cm.send_fire_and_forget = AsyncMock()
     exits = []
-    _fake_rp("m4", "s_dead", on_exit=lambda c: exits.append(c))
+    _fake_rp("m4", "s_dead", on_exit=exits.append)
     try:
         await cm._reconcile_ptys("m4", ["s_orphan"])
         assert exits == [None]                                   # s_dead exited
@@ -128,13 +128,13 @@ async def test_reconcile_ptys_exits_dead_and_closes_orphan():
 async def test_expire_pty_grace_terminates():
     """When the window lapses with no reconnect, the held PTYs are torn down
     (today's immediate behavior, just delayed)."""
-    import core.remote.satellite_connection as sc
+    from core.remote import satellite_connection as sc
     from core.remote import remote_pty
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     cm = SatelliteConnectionManager()
     exits = []
-    _fake_rp("m5", "s5", on_exit=lambda c: exits.append(c))
+    _fake_rp("m5", "s5", on_exit=exits.append)
     orig = sc._GRACE_WINDOW_S
     sc._GRACE_WINDOW_S = 0.01
     try:

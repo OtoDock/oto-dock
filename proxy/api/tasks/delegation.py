@@ -222,6 +222,10 @@ async def spawn_delegate(
         await asyncio.to_thread(
             task_store.update_chat, parent_chat_id, **orchestrator_stamp,
         )
+        _broadcast_orchestrator_stamp(
+            parent_chat_id,
+            project_id or (parent_chat or {}).get("project_id") or "",
+        )
 
     # The task row. Delegates always run with notification_mode="none" — the
     # result returns via the on-complete callback; a separate "Task Complete"
@@ -309,6 +313,95 @@ async def spawn_delegate(
         "scope": authz.scope,
         "scope_note": authz.scope_note or None,
         "project_id": project_id or None,
+    }
+
+
+def _broadcast_orchestrator_stamp(chat_id: str, project_id: str) -> None:
+    """Live ``chat_meta`` frame for an orchestrator stamp — the sidebar accent
+    and the Dock gate key on delegate_role/project_id from the chats list,
+    which otherwise refreshes only on its 30s poll / turn-end refetch."""
+    from core.session.session_state import broadcast_chat_frame
+    broadcast_chat_frame(chat_id, {
+        "type": "chat_meta",
+        "chat_id": chat_id,
+        "delegate_role": "orchestrator",
+        "project_id": project_id,
+    })
+
+
+class AdoptProjectRequest(BaseModel):
+    project_id: str
+
+
+@router.post("/v1/delegation/adopt")
+async def adopt_project(
+    req: AdoptProjectRequest,
+    user: UserContext | None = Depends(get_current_user),
+    x_agent_name: str | None = Header(None, alias="x-agent-name"),
+):
+    """Take over an existing delegation project as its orchestrator.
+
+    The caller's own chat (resolved from its session token) is stamped
+    ``delegate_role='orchestrator'`` + the project slug, so a session that
+    picks a project up from its board/handoff gets the Dock and the sidebar
+    accent without having to spawn a lane first. The previous orchestrator
+    keeps its historical stamp — the lane graph merges by project_id.
+    Idempotent; visibility mirrors the peek rule (own history pool, own
+    workers, or admin)."""
+    u = require_auth(user)
+    await asyncio.to_thread(_require_delegation_enabled)
+    project_id = (req.project_id or "").strip()
+    if not _PROJECT_ID_RE.match(project_id):
+        raise HTTPException(
+            400,
+            "project_id must be a short slug: lowercase letters, digits, "
+            "'-' or '_' (max 64 chars).",
+        )
+    _, owner, caller_chat_id = await asyncio.to_thread(
+        _caller_visibility, u, x_agent_name,
+    )
+    if not caller_chat_id:
+        raise HTTPException(
+            400,
+            "Adoption needs a session-bound chat — call this from the "
+            "session that should take over the project.",
+        )
+    rows = await asyncio.to_thread(task_store.list_chats_by_project, project_id)
+    lanes = [
+        r for r in rows
+        if r["id"] != caller_chat_id
+        and (u.is_admin or r.get("user_sub") == owner
+             or r.get("parent_chat_id") == caller_chat_id)
+    ]
+    if not lanes:
+        raise HTTPException(
+            404,
+            f"No delegation project '{project_id}' is visible to you — "
+            "adopt an existing project's slug, or start one by passing "
+            "project_id on a delegate call.",
+        )
+    await asyncio.to_thread(
+        task_store.update_chat, caller_chat_id,
+        delegate_role="orchestrator", project_id=project_id,
+    )
+    _broadcast_orchestrator_stamp(caller_chat_id, project_id)
+    logger.info(
+        f"Project adopted: project={project_id} chat={caller_chat_id} "
+        f"by={u.sub or u.agent or '-'} lanes={len(lanes)}"
+    )
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "chat_id": caller_chat_id,
+        "lanes": [
+            {
+                "id": r["id"],
+                "title": r.get("title") or "",
+                "agent": r.get("agent", ""),
+                "delegate_role": r.get("delegate_role") or "",
+            }
+            for r in lanes[:20]
+        ],
     }
 
 

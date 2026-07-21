@@ -356,6 +356,39 @@ class CostsBlock:
     rules: list[CostRule] = field(default_factory=list)
 
 
+# Permission tiers a manifest may assign to a tool, weakest gate first.
+# The tier → mode outcome table lives in ``services/mcp/mcp_permissions.py``;
+# this ordered tuple is the validation source of truth for manifest parsing.
+PERMISSION_TIERS = ("open", "standard", "sensitive", "critical")
+
+
+@dataclass
+class PermissionRule:
+    """A single rule under a manifest's ``permissions.rules[]``.
+
+    First-match-wins evaluation, like ``CostRule``: the resolver scans rules
+    in order and applies the first whose ``tool`` matches. Unlike cost rules,
+    ``tool`` accepts fnmatch globs (``list_*``) in addition to exact names and
+    ``"*"`` — tier tables have natural name-prefix families. Authors must
+    order specific rules before catch-alls.
+    """
+    tool: str   # exact tool name (no ``mcp__`` prefix), fnmatch glob, or "*"
+    tier: str   # one of PERMISSION_TIERS
+
+
+@dataclass
+class PermissionsBlock:
+    """Per-MCP tool permission tiers — resolved by ``mcp_permissions``.
+
+    ``default_tier`` applies to tools no rule matches. Manifests under
+    ``mcps/community/`` get ``open`` honored only from EXACT tool-name rules
+    (glob / default ``open`` clamps to ``standard`` at resolve time) — the
+    catalog-trust rail; see ``mcp_permissions.resolve_tool_tier``.
+    """
+    default_tier: str = "standard"
+    rules: list[PermissionRule] = field(default_factory=list)
+
+
 @dataclass
 class ToolFilterConfig:
     """Manifest-declared support for runtime tool filtering.
@@ -453,6 +486,10 @@ class AgentContextBlock:
 # ---------------------------------------------------------------------------
 
 _VALID_PLACEMENTS = {"any", "satellite_only"}
+# Remote-session eligibility. "admin_paired_only" MCPs (ssh-hosts) exist
+# exactly where their session data (infra key material) is delivered:
+# locally and on admin-paired satellites — never on user-paired machines.
+_VALID_REMOTE_POLICIES = {"any", "admin_paired_only"}
 _VALID_DEVICE_CAPABILITIES = {"computer", "browser", "app"}
 # Public alias: the canonical device-control capability keys, for callers
 # outside the registry (e.g. the per-machine device-grants endpoint validating
@@ -585,10 +622,12 @@ class McpManifest:
     # use ``tool_arg_paths_for(tool)`` to get the per-tool slice.
     tool_arg_paths: list[ToolArgPathDeclaration] = field(default_factory=list)
     costs: CostsBlock | None = None  # per-tool cost rules (see mcp_cost_engine)
+    permissions: PermissionsBlock | None = None  # per-tool permission tiers (see mcp_permissions)
     agent_context: list[AgentContextBlock] = field(default_factory=list)  # per-session prompt blocks
     tool_filter: ToolFilterConfig | None = None  # Runtime tool restriction support
     # Device-local MCP class (computer / browser / app-connector control)
     placement: str = "any"  # "any" | "satellite_only"
+    remote_policy: str = "any"  # "any" | "admin_paired_only"
     requires_display: bool = False
     device_capability: str | None = None  # None | "computer" | "browser" | "app"
     companion_app: CompanionAppConfig | None = None

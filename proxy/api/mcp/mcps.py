@@ -272,7 +272,10 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
                 )
         except Exception as e:
             docker_status = "failed"
-            docker_error = f"{type(e).__name__}: {e}"
+            docker_error = (
+                f"{type(e).__name__} while starting the container. "
+                "Check proxy logs for the full error."
+            )
             logger.warning("Failed to auto-start Docker MCP %s: %s", name, e)
 
     return {
@@ -655,6 +658,57 @@ async def set_agent_mcps(
     return {"status": "saved", "agent": name, "mcps": effective_mcps}
 
 
+@router.get("/v1/agents/{name}/ssh-hosts")
+async def get_agent_ssh_hosts(
+    name: str,
+    target_os: str = "linux",
+    user: UserContext = Depends(get_current_user),
+):
+    """The agent's authorized ssh-hosts instances, with ready-to-run commands.
+
+    Backs the ssh-hosts MCP's ``list_ssh_hosts`` tool — the queryable twin of
+    the SSH Hosts prompt block (static context fades in long sessions).
+    Returns key NAMES only; key material never leaves the materializer /
+    session-file-broker path. ``target_os`` gates the ControlMaster mux
+    options in ``command`` (no unix-socket mux on Windows).
+
+    Auth: the agent's OWN session JWT (the tool path — any role, matching the
+    prompt block every session already receives), or manage rights on the
+    agent (dashboard/debug callers).
+    """
+    if not (user and user.is_session and user.agent == name):
+        _require_manage(user, name)
+
+    if mcp_registry.get_manifest("ssh-hosts") is None:
+        raise HTTPException(404, "ssh-hosts MCP is not installed")
+    agent_mcps = await asyncio.to_thread(mcp_registry.get_agent_mcps, name)
+    if not any(m.name == "ssh-hosts" for m in agent_mcps):
+        raise HTTPException(403, "ssh-hosts is not enabled for this agent")
+
+    from services.mcp.dynamic_context import format_ssh_host_command
+
+    mux = (target_os or "").strip().lower() in ("linux", "darwin")
+    instances = await asyncio.to_thread(
+        mcp_store.get_mcp_instances_for_agent, "ssh-hosts", name,
+    )
+    hosts = []
+    for inst in instances:
+        fv = inst.get("field_values", {}) or {}
+        command = format_ssh_host_command(fv, mux=mux)
+        if command is None:
+            continue
+        host = (fv.get("host") or "").strip()
+        hosts.append({
+            "name": (fv.get("name") or "").strip() or host,
+            "host": host,
+            "port": str(fv.get("port") or "22").strip() or "22",
+            "username": (fv.get("username") or "").strip(),
+            "key_name": (fv.get("key_name") or "").strip(),
+            "command": command,
+        })
+    return {"hosts": hosts}
+
+
 # ---------------------------------------------------------------------------
 # Agent Skill Assignments
 # ---------------------------------------------------------------------------
@@ -676,7 +730,7 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
     package). ``standalone`` + ``loading`` drive the tab's source label and
     loading-mode badge.
     """
-    u = _require_manage(user, name)
+    _require_manage(user, name)
 
     db_skills = await asyncio.to_thread(mcp_store.get_agent_skills, name)
     skill_map = {s["skill_id"]: s for s in db_skills}

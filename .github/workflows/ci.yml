@@ -48,6 +48,12 @@ jobs:
             proxy/requirements.txt
             proxy/requirements-test.txt
 
+      - name: ruff
+        # Repo-root ruff.toml — the import/dead-code hygiene gate.
+        run: |
+          python -m pip install -q "ruff==0.15.22"
+          ruff check .
+
       - name: System tools used by the suite
         # The sysctl re-allows unprivileged user namespaces (Ubuntu 24.04
         # runners restrict them via AppArmor), which the sandbox

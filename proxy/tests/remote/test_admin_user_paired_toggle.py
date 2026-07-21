@@ -5,8 +5,6 @@ reconnect, session start) and the cascade that runs on ON→OFF flip
 (close live user-paired satellites + clear their target rows).
 """
 
-import asyncio
-import json
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -114,10 +112,10 @@ async def test_enforce_cascade_closes_user_paired_satellites(monkeypatch):
         return_value=["machine-user", "machine-admin"],
     )
     fake_cm.get_connection = MagicMock(
-        side_effect=lambda mid: {
+        side_effect={
             "machine-user": fake_conn_user,
             "machine-admin": fake_conn_admin,
-        }.get(mid),
+        }.get,
     )
     fake_cm.deregister = AsyncMock()
 
@@ -172,7 +170,7 @@ async def test_enforce_cascade_clears_offline_user_paired_machines(monkeypatch):
     cleared: list[str] = []
     monkeypatch.setattr(
         _rs, "clear_user_remote_targets_for_machine",
-        lambda mid: cleared.append(mid),
+        cleared.append,
     )
 
     with patch("core.remote.satellite_connection.get_connection_manager",

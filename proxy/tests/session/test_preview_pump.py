@@ -86,7 +86,7 @@ async def test_distinct_files_keep_their_snapshots(temp_db, monkeypatch):
 async def test_flush_forwards_and_persists_snapshot_identity(temp_db, monkeypatch):
     temp_db.create_chat("pv3", "user-admin", "a1")
     gc_calls: list[str] = []
-    monkeypatch.setattr(preview_snapshots, "gc_chat", lambda cid: gc_calls.append(cid))
+    monkeypatch.setattr(preview_snapshots, "gc_chat", gc_calls.append)
     pump = _mk_pump("pv3")
     try:
         q = pump.attach()

@@ -124,6 +124,75 @@ class TestResolveReportsExpiry:
         assert got == exp
 
 
+class TestRefreshPreservesPlanTier:
+    """The Anthropic token-refresh response does not echo subscriptionType /
+    rateLimitTier, and the Claude Code TUI gates plan-included models (Fable 5
+    on Max) on that field in .credentials.json — so a refresh must preserve the
+    stored values, and backfill them from the profile endpoint when empty."""
+
+    def setup_method(self):
+        _clean()
+
+    _REFRESH_RESP = {"access_token": "new", "refresh_token": "r2", "expires_in": 28800}
+
+    def _run_refresh(self, stored_token: dict, profile_fields=("", "")):
+        import httpx
+        updates: list[dict] = []
+        resp = type("R", (), {"status_code": 200, "json": lambda self: dict(self._d)})()
+        resp._d = self._REFRESH_RESP
+        with patch.object(httpx, "post", return_value=resp), \
+             patch.object(pool.subscription_store, "get_credential_data",
+                          return_value={"oauth_token": stored_token}), \
+             patch.object(pool.subscription_store, "update_credential_data",
+                          side_effect=lambda _sid, cred: updates.append(cred)), \
+             patch.object(pool, "fetch_anthropic_subscription_fields",
+                          return_value=profile_fields) as fetch:
+            got = pool._refresh_anthropic_oauth_token("sub-tier", "r")
+        assert got == "new"
+        assert len(updates) == 1
+        return updates[0]["oauth_token"], fetch
+
+    def test_refresh_preserves_stored_plan_tier(self):
+        tok, fetch = self._run_refresh(
+            {"accessToken": "old", "refreshToken": "r", "expiresAt": 1,
+             "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"},
+        )
+        assert tok["subscriptionType"] == "max"
+        assert tok["rateLimitTier"] == "default_claude_max_20x"
+        fetch.assert_not_called()
+
+    def test_refresh_backfills_empty_tier_from_profile(self):
+        tok, fetch = self._run_refresh(
+            {"accessToken": "old", "refreshToken": "r", "expiresAt": 1,
+             "subscriptionType": "", "rateLimitTier": ""},
+            profile_fields=("max", "default_claude_max_20x"),
+        )
+        assert tok["subscriptionType"] == "max"
+        assert tok["rateLimitTier"] == "default_claude_max_20x"
+        fetch.assert_called_once_with("new")
+
+    def test_refresh_backfill_failure_stays_empty(self):
+        tok, _ = self._run_refresh(
+            {"accessToken": "old", "refreshToken": "r", "expiresAt": 1},
+            profile_fields=("", ""),
+        )
+        assert tok["subscriptionType"] == ""
+        assert tok["rateLimitTier"] == ""
+
+    def test_derive_subscription_fields_mapping(self):
+        assert pool._derive_subscription_fields(
+            {"account": {"has_claude_max": True},
+             "organization": {"rate_limit_tier": "default_claude_max_20x"}},
+        ) == ("max", "default_claude_max_20x")
+        assert pool._derive_subscription_fields(
+            {"account": {"has_claude_pro": True}, "organization": {}},
+        ) == ("pro", "")
+        assert pool._derive_subscription_fields(
+            {"account": {}, "organization": {"organization_type": "claude_enterprise"}},
+        ) == ("enterprise", "")
+        assert pool._derive_subscription_fields({}) == ("", "")
+
+
 class TestIssueStamping:
     def setup_method(self):
         _clean()

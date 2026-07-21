@@ -31,6 +31,7 @@ import { useAppsAutoOpen } from '../../hooks/useAppsAutoOpen'
 import InstallProgressBar from '../../components/chat/InstallProgressBar'
 import MachineUpdateBanner from '../../components/chat/MachineUpdateBanner'
 import RemoteFallbackBanner from '../../components/chat/RemoteFallbackBanner'
+import ChatTargetBanner from '../../components/chat/ChatTargetBanner'
 import ChatStatusBar from '../../components/chat/ChatStatusBar'
 import PlanPanel from '../../components/chat/plan/PlanPanel'
 import TodoPanel from '../../components/chat/plan/TodoPanel'
@@ -291,6 +292,18 @@ export default function AgentChat() {
       pendingFilesRef.current = null
     },
     onTitleUpdated: () => refetchChats(),
+    onChatMoved: () => {
+      // move_chat ack for the open chat: the backend rebound the pin and
+      // dropped this connection's session binding — re-resume so the fresh
+      // warmup runs on the new target and the "moved" history card arrives
+      // (the same re-open path as clicking the chat row; no page reset
+      // needed, the chat_history reload is wholesale anyway).
+      const cid = chatIdRef.current
+      if (!cid) return
+      setSessionId(null)
+      interactive.resetSession()  // the old session (interactive included) was closed server-side
+      ws.resumeChat(cid)
+    },
     // Live rich view: new interactive-history rows persisted while the
     // terminal ⇄ transcript toggle shows the transcript → refetch the newest
     // page (same seed path as the toggle). Trailing debounce coalesces the
@@ -330,7 +343,7 @@ export default function AgentChat() {
       // dead interactive chat shows its DB history with the toggle reflected on.
       interactive.restoreFromMeta(data.execution_mode)
     },
-    onChatHistoryLoaded: () => {
+    onChatHistoryLoaded: (_data) => {
       // Open find bar if deferred from URL ?q= param (after messages are loaded)
       if (pendingFindQuery.current) {
         const q = pendingFindQuery.current
@@ -358,7 +371,7 @@ export default function AgentChat() {
       interactive.flushDeferredSwitch(chatIdRef.current)
       refetchChats()
     },
-    onTurnComplete: () => {
+    onTurnComplete: (_data) => {
       // Origin-routed end-of-turn ping: a hidden tab or a background chat
       // (useChatStream already drops it for the visible viewed chat, which
       // onTurnDone pings). The native app alerts via FCM instead.
@@ -447,6 +460,11 @@ export default function AgentChat() {
   // 'streaming' by every turn-start path (user_message / queue_sent / server_turn_start
   // / live_state / server-kick) and back to 'ready' on done/aborted, keyed by chat_id.
   const viewedStreaming = useChatStore((s) => (chatId ? s.byChat[chatId]?.status === 'streaming' : false))
+  // Pin-vs-current target mismatch for the VIEWED chat. Read from the
+  // per-chat slice (warmup_ready stores it there) rather than useChatStream
+  // state so the sidebar kebab reads the exact same fact — and the slice is
+  // cleared by the first mismatch-free warmup_ready, e.g. after a move.
+  const targetMismatch = useChatStore((s) => (chatId ? s.byChat[chatId]?.targetMismatch ?? null : null))
 
   // Read tracking for the sidebar unread dot: the viewer has SEEN this chat
   // whenever it is open in a visible tab — on open, when the viewed turn
@@ -1442,6 +1460,7 @@ export default function AgentChat() {
           onNavigate={() => setHistoryOpen(false)}
           tasksMode={tasksMode}
           onTasksModeChange={setTasksMode}
+          onMoveChat={() => ws.moveChat()}
         />
       </ResponsiveDrawer>
 
@@ -1618,6 +1637,13 @@ export default function AgentChat() {
         <RemoteFallbackBanner
           fallbackReason={sessionFallbackReason}
           machineName={offlineMachineName}
+        />
+
+        <ChatTargetBanner
+          chatId={chatId}
+          mismatch={targetMismatch}
+          moveDisabled={viewedStreaming || warming}
+          onMove={() => ws.moveChat()}
         />
 
         <InstallProgressBar

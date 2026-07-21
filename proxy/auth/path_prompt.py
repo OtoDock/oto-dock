@@ -277,19 +277,26 @@ def _remote_mcp_paths_section() -> str:
     """The framework auto-translates MCP tool-arg paths declared
     via ``tool_arg_paths`` in each MCP's manifest, so the LLM can use
     either sandbox-virtual or satellite-host paths in MCP calls. Native
-    FILE tools (Read/Write/Edit/Glob/Grep) get the same treatment via the
+    file READ-side tools plus Write get the same treatment via the
     permission hook: a sandbox-virtual or ``~`` path arg is rewritten to
     the satellite-host form before the tool runs (PreToolUse
-    ``updatedInput``). Shell command STRINGS are the exception — nothing
-    rewrites inside a Bash command, so those need OS-native paths.
+    ``updatedInput``). Edit/NotebookEdit are the documented exception —
+    the CLI validates their target (file-exists / read-state) BEFORE the
+    hook pipeline runs, so no rewrite can reach them and they need the
+    OS-native path. Shell command STRINGS are the other exception —
+    nothing rewrites inside a Bash command.
     """
     return (
         "**Native file tools** (`Read`, `Write`, `Edit`, `Glob`, `Grep`): "
         "prefer the OS-native paths shown above (under `# Folders` and the "
-        "home directory section). The sandbox-virtual forms "
-        "(`/workspace/...`, `/users/{u}/...`, `/knowledge/...`, "
-        "`/config/...`) and `~/...` also work — the platform rewrites the "
-        "path to its satellite location before the tool runs.\n\n"
+        "home directory section). `Read`, `Write`, `Glob` and `Grep` also "
+        "accept the sandbox-virtual forms (`/workspace/...`, "
+        "`/users/{u}/...`, `/knowledge/...`, `/config/...`) and `~/...` — "
+        "the platform rewrites the path to its satellite location before "
+        "the tool runs. `Edit` and `NotebookEdit` do NOT: they check their "
+        "target before the rewrite can happen, so give them the OS-native "
+        "path (a sandbox-virtual path there fails with "
+        "file-not-found).\n\n"
         "**Shell commands** (`Bash`): OS-native paths ONLY. Nothing "
         "rewrites inside a command string, so a sandbox-virtual path there "
         "fails with file-not-found (or hits the wrong location on "
@@ -655,8 +662,8 @@ def _build_building_agents_section(
     folder_bullets = [
         "- Edit the persona: `/config/prompt.md` (loaded first every session).\n",
         "- Add always-loaded knowledge: drop markdown files in "
-        "`/config/context/*` (operational rules, business context, vocabulary; "
-        "1MB per file, 5MB total cap, loaded EVERY session).\n",
+        + "`/config/context/*` (operational rules, business context, vocabulary; "
+        + "1MB per file, 5MB total cap, loaded EVERY session).\n",
     ]
     if ctx.mount_shared:
         folder_bullets.append(

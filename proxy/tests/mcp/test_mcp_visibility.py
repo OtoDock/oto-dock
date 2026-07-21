@@ -12,8 +12,6 @@ shape, and the integration scenario for the original bug.
 """
 
 from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -132,7 +130,7 @@ class TestVisibilityHelpers:
     def test_visibility_after_revoke(self, temp_db):
         """Removing agent from agents list flips visibility off (if not assigned_to_all)."""
         from storage import mcp_store
-        iid = _make_instance("image-gen", "primary", agents=["alice"])
+        _make_instance("image-gen", "primary", agents=["alice"])
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is True
         # Update with empty agents list (admin revokes)
         mcp_store.upsert_mcp_instance("image-gen", {
@@ -203,8 +201,8 @@ class TestInstancePrecedence:
         from storage import mcp_store
         first_id = _make_instance("image-gen", "shared-a",
                                   agents=[], assigned_to_all=True)
-        second_id = _make_instance("image-gen", "shared-b",
-                                   agents=[], assigned_to_all=True)
+        _make_instance("image-gen", "shared-b",
+                       agents=[], assigned_to_all=True)
         chosen = mcp_store.get_instance_for_agent_env_delivery(
             "image-gen", "alice",
         )
@@ -225,7 +223,7 @@ class TestInstancePrecedence:
         explicit_id = _make_instance("ssh-server", "host-a", agents=["alice"])
         all_id = _make_instance("ssh-server", "host-b",
                                 agents=[], assigned_to_all=True)
-        not_alice_id = _make_instance("ssh-server", "host-c", agents=["bob"])
+        _make_instance("ssh-server", "host-c", agents=["bob"])
 
         result = mcp_store.get_mcp_instances_for_agent("ssh-server", "alice")
         ids = [i["id"] for i in result]
@@ -556,7 +554,7 @@ class TestOriginalBugIntegration:
             client = TestClient(app)
 
             # Admin creates instance authorizing alice-agent
-            iid = _make_instance("image-gen", "primary", agents=["alice-agent"])
+            _make_instance("image-gen", "primary", agents=["alice-agent"])
 
             # GET shows it as visible-but-disabled
             payload = client.get("/v1/agents/alice-agent/mcps").json()

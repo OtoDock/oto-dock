@@ -170,7 +170,7 @@ async def auth_config():
     from services.infra import turnstile
     tcfg = turnstile.load_config(settings)
     from services.billing import relay_client
-    from api.auth.webauthn import passkey_login_mode, passkeys_enabled
+    from api.auth.webauthn import passkey_login_mode, passkey_rp_host, passkeys_enabled
     return {
         "oidc_enabled": config.OIDC_ENABLED,
         "oidc_provider_name": config.OIDC_PROVIDER_NAME,
@@ -190,6 +190,12 @@ async def auth_config():
         # appear only at the 2FA step after a correct password (second_factor).
         "passkeys_enabled": passkeys_enabled(),
         "passkey_login_mode": passkey_login_mode(),
+        # The RP hostname passkeys are bound to (the public dashboard URL's
+        # host). A browser on any OTHER origin (localhost, LAN IP) cannot run
+        # the ceremony, so the login page hides its passkey buttons and points
+        # at this host instead of letting the browser fail with its own
+        # security error.
+        "passkey_rp_host": passkey_rp_host() if passkeys_enabled() else "",
         # OtoDock connectivity + deployment. `air_gapped` (effective — forced
         # false on cloud) = this install makes no outbound calls to OtoDock.
         # `relay_base` stays server-side; only these derived booleans are exposed.

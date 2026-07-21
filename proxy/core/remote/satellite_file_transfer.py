@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+import contextlib
 
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathRef
@@ -313,14 +314,12 @@ class SatelliteFileTransferMixin:
 
     def _commit_pull(self, st: "_PullStream", expected_hash: str) -> None:
         """Finalize a completed pull: fsync, verify sha256, atomic rename."""
-        try:
+        with contextlib.suppress(OSError):
             if st.handle is not None:
                 st.handle.flush()
                 os.fsync(st.handle.fileno())
                 st.handle.close()
                 st.handle = None
-        except OSError:
-            pass
         actual = f"sha256:{st.hasher.hexdigest()}"
         if expected_hash and actual != expected_hash:
             logger.warning("pull hash mismatch for %s", st.dest_path)
@@ -350,16 +349,12 @@ class SatelliteFileTransferMixin:
         Idempotent — a committed stream already closed + renamed."""
         h = st.handle
         if h is not None:
-            try:
+            with contextlib.suppress(OSError):
                 h.close()
-            except OSError:
-                pass
             st.handle = None
-        try:
+        with contextlib.suppress(OSError):
             if st.partial_path.exists():
                 st.partial_path.unlink()
-        except OSError:
-            pass
 
     async def _apply_file_changed(self, machine_id: str, msg: dict) -> None:
         """Apply a satellite-side file change to the platform's agent_dir, then
@@ -656,8 +651,17 @@ class SatelliteFileTransferMixin:
             )
             return
 
-        content_b64 = msg.get("content_b64", "")
-        if not content_b64 and msg.get("size", 0) > 0:
+        # Routing: an inline write carries the content key (possibly "" — a
+        # ZERO-BYTE file is a real write, not an absence); a large-file
+        # notification carries no content key but a size, and is pulled.
+        if "content_b64" in msg:
+            await asyncio.to_thread(
+                core_file_sync.apply_incoming_file,
+                agent_dir, msg["path"], "write", msg.get("content_b64") or "",
+            )
+            return
+
+        if msg.get("size", 0) > 0:
             # Large file — stream the body straight to disk (chunked pull),
             # never holding the whole file in memory.
             from services.path_policy_v2 import PathRef
@@ -680,10 +684,3 @@ class SatelliteFileTransferMixin:
                 logger.warning(
                     "file_changed pull failed for %s", msg.get("path"),
                 )
-            return
-
-        if content_b64:
-            await asyncio.to_thread(
-                core_file_sync.apply_incoming_file,
-                agent_dir, msg["path"], "write", content_b64,
-            )

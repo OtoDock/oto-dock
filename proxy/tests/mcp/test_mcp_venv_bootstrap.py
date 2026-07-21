@@ -166,10 +166,15 @@ async def test_python_fresh_venv_is_skipped(fake_mcps_root):
     deps.write_text("requests==2.31\n")
     venv = mcp_dir / "venv"
     venv.mkdir()
-    # Bump venv mtime past deps' mtime
+    # Bump venv mtime past deps' mtime + success-mark it (an unmarked EMPTY
+    # venv is the poisoned interrupted-install shape and rebuilds by design).
     import os
     future = time.time() + 60
     os.utime(venv, (future, future))
+    mcp_venv_bootstrap._write_marker(
+        mcp_dir,
+        requirements_sha256=mcp_venv_bootstrap._requirements_hash(deps),
+    )
 
     with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock) as m:
         results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
@@ -383,6 +388,11 @@ async def test_interpreter_current_is_fresh(fake_mcps_root):
     import os
     future = time.time() + 60
     os.utime(venv, (future, future))
+    mcp_venv_bootstrap._write_marker(
+        mcp_dir,
+        requirements_sha256=mcp_venv_bootstrap._requirements_hash(
+            mcp_dir / "requirements.txt"),
+    )
 
     with patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock) as inst:
         results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
@@ -447,3 +457,50 @@ async def test_node_rebuild_failure_is_advisory(fake_mcps_root):
     assert results == {"node-mcp": "skipped-node-rebuild-fail"}
     marker = json.loads((mcp_dir / mcp_venv_bootstrap._RUNTIME_MARKER).read_text())
     assert marker["node_major"] == 22  # unchanged — retried next boot
+
+
+class TestSuccessMarkerStaleness:
+    """Interrupted installs poison the mtime heuristic (live-hit 2026-07-11):
+    the success marker (requirements sha256, written only after a dep sync
+    exits 0) is what the staleness check trusts."""
+
+    def _mcp(self, tmp_path, with_pkg):
+        from services.mcp.mcp_venv_bootstrap import _requirements_hash
+        mcp = tmp_path / "m"
+        mcp.mkdir()
+        req = mcp / "requirements.txt"
+        req.write_text("fastmcp\n")
+        venv = mcp / "venv"
+        venv.mkdir()  # created after reqs → mtime-fresh
+        if with_pkg:
+            sp = venv / "lib" / "python3.13" / "site-packages" / "pkg-1.0.dist-info"
+            sp.mkdir(parents=True)
+        return mcp, req, venv, _requirements_hash(req)
+
+    def test_interrupted_install_is_stale(self, tmp_path):
+        from services.mcp.mcp_venv_bootstrap import _venv_is_stale
+        mcp, req, venv, _ = self._mcp(tmp_path, with_pkg=False)
+        assert _venv_is_stale(req, venv, mcp) is True
+
+    def test_healthy_unmarked_venv_backfills_without_rebuild(self, tmp_path):
+        from services.mcp.mcp_venv_bootstrap import _venv_is_stale, _read_marker
+        mcp, req, venv, h = self._mcp(tmp_path, with_pkg=True)
+        assert _venv_is_stale(req, venv, mcp) is False
+        assert _read_marker(mcp).get("requirements_sha256") == h
+
+    def test_marker_match_is_fresh_even_when_venv_empty(self, tmp_path):
+        from services.mcp.mcp_venv_bootstrap import _venv_is_stale, _write_marker
+        mcp, req, venv, h = self._mcp(tmp_path, with_pkg=False)
+        _write_marker(mcp, requirements_sha256=h)
+        assert _venv_is_stale(req, venv, mcp) is False
+
+    def test_marker_mismatch_is_stale(self, tmp_path):
+        from services.mcp.mcp_venv_bootstrap import _venv_is_stale, _write_marker
+        mcp, req, venv, _ = self._mcp(tmp_path, with_pkg=True)
+        _write_marker(mcp, requirements_sha256="deadbeef")
+        assert _venv_is_stale(req, venv, mcp) is True
+
+    def test_no_mcp_dir_keeps_pure_mtime_behavior(self, tmp_path):
+        from services.mcp.mcp_venv_bootstrap import _venv_is_stale
+        _, req, venv, _ = self._mcp(tmp_path, with_pkg=False)
+        assert _venv_is_stale(req, venv) is False

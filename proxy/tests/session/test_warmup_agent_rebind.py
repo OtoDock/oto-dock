@@ -31,7 +31,7 @@ def _controller(*, accessible: set[str], do_warmup: AsyncMock):
 
 
 def _patch_stores(monkeypatch, *, chat_row, existing_agents):
-    import ws.dashboard_warmup as dw
+    from ws import dashboard_warmup as dw
     monkeypatch.setattr(dw.task_store, "get_chat", lambda cid: chat_row)
     monkeypatch.setattr(
         dw.agent_store, "agent_exists", lambda name: name in existing_agents)

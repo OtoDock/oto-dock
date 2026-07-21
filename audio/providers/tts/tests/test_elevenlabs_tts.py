@@ -9,7 +9,7 @@ import httpx
 import pytest
 import websockets
 
-import audio.providers.tts.elevenlabs as el_mod
+from audio.providers.tts import elevenlabs as el_mod
 from audio.providers.tts.base import UnsupportedProviderOperation
 from audio.providers.tts.elevenlabs import (
     ElevenLabsTTS,
@@ -92,7 +92,6 @@ def test_streaming_context_rejects_unknown_rate():
 
 
 async def test_default_list_voices_dedupes_configured_map():
-    tts = ElevenLabsTTS(api_key="x", voices={"en": "v1", "de": "v1", "el": "v2"})
     # ElevenLabs overrides list_voices with a live call; the base fallback is
     # exercised via Cartesia-style providers — here we only check the library
     # surface raises cleanly on a provider without one.
@@ -265,14 +264,37 @@ async def test_reconnect_after_socket_death(fake_ws):
     assert conn2[-1].get("flush") is True
 
 
-async def test_lost_is_final_ends_via_stall_guard(fake_ws, monkeypatch):
+async def test_no_is_final_ends_via_tail_guard(fake_ws):
+    """Live server behaviour: flush streams the audio but no isFinal ever
+    comes (the context stays open). Once audio flowed, the SHORT tail guard
+    must end the utterance — not the 10 s no-frames guard (a phone farewell
+    would otherwise sit ~10 s before hanging up)."""
     fake_ws.drop_is_final = True
-    monkeypatch.setattr(el_mod, "_POST_FLUSH_STALL_S", 2.0)
     tts = _provider()
     await tts.connect()
+    start = asyncio.get_running_loop().time()
     chunks = await asyncio.wait_for(_drive_utterance(tts), timeout=10)
+    elapsed = asyncio.get_running_loop().time() - start
     await tts.close()
-    assert chunks == AUDIO_CHUNKS  # audio still delivered; stall guard ended it
+    assert chunks == AUDIO_CHUNKS  # audio still delivered; tail guard ended it
+    assert elapsed < el_mod._POST_FLUSH_STALL_S - 1  # ended well before the long guard
+
+
+async def test_no_frames_after_flush_keeps_long_guard(fake_ws, monkeypatch):
+    """No audio at all after the flush (generation latency / lost flush) must
+    still use the LONG guard, not the tail guard — ending early with text
+    buffered server-side would truncate the utterance."""
+    fake_ws.audio_chunks = []
+    fake_ws.drop_is_final = True
+    monkeypatch.setattr(el_mod, "_POST_FLUSH_STALL_S", 4.0)
+    tts = _provider()
+    await tts.connect()
+    start = asyncio.get_running_loop().time()
+    chunks = await asyncio.wait_for(_drive_utterance(tts), timeout=10)
+    elapsed = asyncio.get_running_loop().time() - start
+    await tts.close()
+    assert chunks == []
+    assert elapsed >= el_mod._POST_FLUSH_TAIL_STALL_S + 0.5  # tail guard did NOT fire
 
 
 async def test_cancel_then_immediate_close(fake_ws):

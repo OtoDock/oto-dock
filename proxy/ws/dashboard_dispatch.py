@@ -7,6 +7,7 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 """
 
 import asyncio
+import contextlib
 import base64
 import logging
 import config
@@ -32,7 +33,7 @@ class ClientMessageDispatcher:
     """The between-turns client-message dispatcher (the in-stream twin lives
     in ChatController._stream_via_pump)."""
 
-    async def _dispatch_client_message(self, msg: dict):
+    async def _dispatch_client_message(self, msg: dict) -> str | None:
 
         msg_type = msg.get("type", "")
 
@@ -47,8 +48,10 @@ class ClientMessageDispatcher:
                 self._pre_warmup_task.cancel()
             self._pre_warmup_task = asyncio.create_task(self._handle_pre_warmup(msg))
         elif msg_type == "warmup":
+            prev_sid = self.session_id
             await self._handle_warmup(msg)
-            self._register_notify_queue()
+            # Same-chat warm: a fresh sid supersedes the previous one.
+            self._register_notify_queue(replaces=prev_sid)
             count = await asyncio.to_thread(notification_store.get_unread_count, self.user_sub)
             await self._send({"type": "notification_count", "count": count})
         elif msg_type == "chat":
@@ -93,7 +96,7 @@ class ClientMessageDispatcher:
             elif await self._may_resolve_permission(msg["request_id"]):
                 resolve_permission(msg["request_id"], msg.get("approved", True))
             else:
-                return
+                return None
             for sid, pd in list(_pending_permissions.items()):
                 if pd.get("request_id") == msg["request_id"]:
                     del _pending_permissions[sid]
@@ -175,9 +178,9 @@ class ClientMessageDispatcher:
             # `otodock` terminal controls the session (it reviews in the native TUI).
             _ds_isess = interactive_session.get(self.session_id) if self.session_id else None
             if _ds_isess is not None and _ds_isess.otodock_attached:
-                return
+                return None
             if not await self._may_resolve_permission(msg["request_id"]):
-                return
+                return None
             action = msg.get("action", "")
             plan_fn = msg.get("filename", "")
             approved = action != "edit"  # approve for implement + reject (cancel)
@@ -223,6 +226,8 @@ class ClientMessageDispatcher:
             await self._handle_switch_execution_mode(msg)
         elif msg_type == "compact_context":
             await self._handle_compact_context()
+        elif msg_type == "move_chat":
+            await self._handle_move_chat()
         elif msg_type == "implement_plan":
             await self._handle_implement_plan(msg)
             self._register_notify_queue()
@@ -333,6 +338,108 @@ class ClientMessageDispatcher:
             await self._send_error(f"Unknown message type: {msg_type}")
         return None
 
+    async def _handle_move_chat(self):
+        """Move the OPEN chat to the agent's CURRENT target — the locality
+        escape hatch.
+
+        Rebinds via the proven machine-removed shape: pin cleared, session
+        ids dropped, ``pending_history_seed='moved:<from>'`` — the next
+        warmup fresh-resolves, spawns on the current target and injects the
+        DB-history digest. The old session is closed here (headless
+        close_session releases slot + subscription; interactive PTYs are
+        closed for the chat) so a warm slot never leaks; its on-disk state
+        stays behind by design. Owner/admin only: shared-agent
+        editors/viewers can hold a connection to this chat, but a
+        non-owner's resolve is role-forced to 'local' and must never
+        relocate someone else's chat."""
+        from storage import remote_store
+        from ws.dashboard import _effective_agent_role
+
+        logger.info(
+            "WS dashboard: move_chat requested chat=%s session=%s streaming=%s",
+            self.chat_id or "?", (self.session_id or "?")[:8], self.streaming,
+        )
+        chat = task_store.get_chat(self.chat_id) if self.chat_id else None
+        if not chat:
+            await self._send({"type": "error", "message": "Chat not found."})
+            return
+        agent = chat.get("agent") or ""
+        role = _effective_agent_role(self.user_sub, agent)
+        if chat.get("user_sub") != self.user_sub and role != "admin":
+            await self._send({"type": "error",
+                              "message": "Only the chat owner can move it."})
+            return
+        if self._warmup_task and not self._warmup_task.done():
+            await self._send({"type": "error",
+                              "message": "The chat is still getting ready — "
+                                         "try again in a moment."})
+            return
+        pump = _active_pumps.get(self.chat_id) if self.chat_id else None
+        if self.streaming or (pump and not pump.is_done):
+            await self._send({"type": "error",
+                              "message": "Finish or stop the current turn "
+                                         "before moving the chat."})
+            return
+        isess = (interactive_session.get(self.session_id)
+                 if self.session_id else None)
+        if isess is not None and isess.alive and isess.turn_open:
+            await self._send({"type": "error",
+                              "message": "Finish or stop the current turn "
+                                         "before moving the chat."})
+            return
+
+        pin = chat.get("execution_target") or ""
+        resolved, _ = remote_store.resolve_execution_target(
+            agent, self.user_sub, role,
+        )
+        if not resolved or resolved.startswith("__offline__:"):
+            await self._send({"type": "error",
+                              "message": "The agent's current machine is "
+                                         "offline — nowhere to move to."})
+            return
+        if not pin or pin == resolved:
+            await self._send({"type": "error",
+                              "message": "This chat already runs on the "
+                                         "agent's current target."})
+            return
+
+        def _label(target: str) -> str:
+            if target == "local":
+                return "the local sandbox"
+            m = remote_store.get_remote_machine(target) or {}
+            return str(m.get("name") or "") or target[:8]
+
+        from_label = _label(pin)
+        # Close the old session FIRST (idle by the gates above): headless
+        # close releases the concurrency slot + subscription binding; the
+        # session file / satellite-side state stays behind by design.
+        if isess is not None and isess.alive:
+            with contextlib.suppress(Exception):
+                await interactive_session.close_for_chat(
+                    self.chat_id, reason="moved")
+        elif self.session_id and self.layer:
+            try:
+                await self.layer.close_session(self.session_id)
+            except Exception:
+                logger.warning("move_chat: close_session failed for %s",
+                               self.session_id, exc_info=True)
+
+        if not remote_store.rebind_chat_to_current_target(
+                self.chat_id, from_label):
+            await self._send({"type": "error", "message": "Move failed."})
+            return
+        self.session_id = None
+        logger.info(
+            "WS dashboard: chat %s moved (%s -> %s) by %s",
+            self.chat_id, pin, resolved, self.user_sub,
+        )
+        await self._send({
+            "type": "chat_moved",
+            "chat_id": self.chat_id,
+            "new_target": resolved,
+            "resolved_label": _label(resolved).removeprefix("the "),
+        })
+
     async def _handle_compact_context(self):
         """Manual context compaction — Codex ``thread/compact/start`` via
         ``layer.compact()``. Claude headless has no compaction channel (the
@@ -344,6 +451,14 @@ class ClientMessageDispatcher:
         idle, so it sends CONTEXT_COMPACT frames itself and persists the
         completed block exactly like the pump would."""
         import json as _json
+        # Always log the click — a silent refuse path made a remote-codex
+        # compact no-op look like the frame never reached the backend.
+        logger.info(
+            "WS dashboard: manual compact requested chat=%s session=%s "
+            "layer=%s streaming=%s",
+            self.chat_id or "?", (self.session_id or "?")[:8],
+            type(self.layer).__name__ if self.layer else None, self.streaming,
+        )
         if not (self.session_id and self.layer):
             # Lazy-resumed chat with no live session yet (e.g. right after a
             # proxy restart) — a silent no-op reads as a broken button.

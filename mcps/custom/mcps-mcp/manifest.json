@@ -25,6 +25,19 @@
 
   "skills": [],
 
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "list_*",
+        "tier": "open"
+      },
+      {
+        "tool": "get_request_status",
+        "tier": "open"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

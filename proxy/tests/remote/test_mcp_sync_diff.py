@@ -21,7 +21,7 @@ def test_install_when_missing():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)), \
+               side_effect=_fake_manifest), \
          patch("services.mcp.mcp_installer.compute_version_hash",
                return_value="abc123"):
         install, update, remove = mcp_sync._diff(
@@ -38,7 +38,7 @@ def test_update_when_hash_drifts():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)), \
+               side_effect=_fake_manifest), \
          patch("services.mcp.mcp_installer.compute_version_hash",
                return_value="NEW_HASH"):
         install, update, remove = mcp_sync._diff(
@@ -55,7 +55,7 @@ def test_remove_when_unassigned():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)):
+               side_effect=_fake_manifest):
         install, update, remove = mcp_sync._diff(
             desired={"foo"},
             installed={
@@ -84,7 +84,7 @@ def test_unhealthy_triggers_reinstall():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)):
+               side_effect=_fake_manifest):
         install, update, remove = mcp_sync._diff(
             desired={"foo"},
             installed={"foo": {"version_hash": "h", "healthy": False}},
@@ -97,7 +97,7 @@ def test_same_hash_no_update():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)), \
+               side_effect=_fake_manifest), \
          patch("services.mcp.mcp_installer.compute_version_hash",
                return_value="HASH"):
         install, update, remove = mcp_sync._diff(
@@ -114,7 +114,7 @@ def test_force_always_updates():
     from services.mcp import mcp_sync
 
     with patch("services.mcp.mcp_registry.get_manifest",
-               side_effect=lambda n: _fake_manifest(n)), \
+               side_effect=_fake_manifest), \
          patch("services.mcp.mcp_installer.compute_version_hash",
                return_value="HASH"):
         install, update, remove = mcp_sync._diff(

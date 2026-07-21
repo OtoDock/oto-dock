@@ -6,6 +6,7 @@ and manages per-session event queues for RemoteExecutionLayer consumption.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -85,6 +86,12 @@ _SOFT_INTERRUPT_MIN_VERSION = (0, 5, 89)
 # satellites would silently drop the frame — the proxy then skips the probe
 # and re-pulls unconditionally (today's behavior, no regression).
 _FILE_STAT_MIN_VERSION = (0, 5, 95)
+
+# Minimum SATELLITE_VERSION that handles the headless-Codex thread ops
+# (`codex_compact` / `codex_steer`). Older satellites would silently drop the
+# frame and the ack would only burn its timeout — gate BEFORE sending so the
+# caller degrades instantly (compact → "not supported", steer → queue).
+_CODEX_THREAD_OPS_MIN_VERSION = (0, 5, 98)
 
 
 @dataclass
@@ -467,10 +474,8 @@ class SatelliteConnectionManager(
                 logger.warning(
                     "Satellite %s: duplicate connection, closing old", machine_id[:8]
                 )
-                try:
+                with contextlib.suppress(Exception):
                     await old.ws.close(code=4002, reason="Replaced by new connection")
-                except Exception:
-                    pass
                 # Stop the old writer now — its handler's deregister is a
                 # no-op once we replace the dict entry (identity guard), so
                 # nobody else will cancel it.
@@ -843,6 +848,13 @@ class SatelliteConnectionManager(
         skips the probe and re-pulls unconditionally — the frame would be
         silently dropped and the probe would only burn its timeout."""
         return self._satellite_at_least(machine_id, _FILE_STAT_MIN_VERSION)
+
+    def supports_codex_thread_ops(self, machine_id: str) -> bool:
+        """True if the connected satellite handles ``codex_compact`` /
+        ``codex_steer`` (SATELLITE_VERSION 0.5.98). When False the remote
+        layer returns the unsupported result immediately instead of burning
+        an ack timeout on a silently-dropped frame."""
+        return self._satellite_at_least(machine_id, _CODEX_THREAD_OPS_MIN_VERSION)
 
     def _satellite_at_least(self, machine_id: str, version: tuple) -> bool:
         conn = self._connections.get(machine_id)
@@ -1264,7 +1276,12 @@ class SatelliteConnectionManager(
                             "command_id": msg.get("command_id", ""),
                         })
                     except asyncio.QueueFull:
-                        pass
+                        # Dropping the marker stalls the turn until the drain
+                        # timeout — leave a trace so it isn't a silent hang.
+                        logger.warning(
+                            "turn_ended marker dropped (queue full) for "
+                            "session=%s machine=%s", session_id, machine_id,
+                        )
 
         elif msg_type == "codex_thread_id":
             session_id = msg.get("session_id", "")
@@ -1382,12 +1399,10 @@ class SatelliteConnectionManager(
                 )
                 conn = self._connections.get(machine_id)
                 if conn:
-                    try:
+                    with contextlib.suppress(Exception):
                         await conn.ws.close(
                             code=4003, reason="Heartbeat timeout"
                         )
-                    except Exception:
-                        pass
                 await self.deregister(machine_id)
 
             # Reconcile sustained-outage admin notifications. Isolated in a

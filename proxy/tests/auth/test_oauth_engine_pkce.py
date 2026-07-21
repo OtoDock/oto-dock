@@ -10,7 +10,6 @@ import base64
 import hashlib
 from unittest.mock import patch, MagicMock
 
-import pytest
 
 from services.oauth import oauth_engine
 

@@ -10,7 +10,6 @@ SubagentRegistry's all-done state), so no layer should mention [JOB_DONE].
 
 from __future__ import annotations
 
-import os
 import sys
 
 from tests._paths import PROXY_DIR

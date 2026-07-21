@@ -36,6 +36,31 @@
     }
   ],
 
+  "permissions": {
+    "default_tier": "sensitive",
+    "rules": [
+      {
+        "tool": "list_*",
+        "tier": "open"
+      },
+      {
+        "tool": "get_trigger",
+        "tier": "open"
+      },
+      {
+        "tool": "pause_trigger",
+        "tier": "standard"
+      },
+      {
+        "tool": "resume_trigger",
+        "tier": "standard"
+      },
+      {
+        "tool": "fire_trigger",
+        "tier": "standard"
+      }
+    ]
+  },
   "patched": false,
   "patch_note": null
 }

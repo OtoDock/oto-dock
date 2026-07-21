@@ -17,6 +17,7 @@ Permission model:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -296,13 +297,11 @@ async def get_event_catalog(
     vendor_target_prefill = ""
     if account_label and scope in ("user", "service"):
         owner = (u.sub or "") if scope == "user" else ""
-        try:
+        with contextlib.suppress(Exception):
             effective_mode = subscription_manager.resolve_effective_registration_mode(
                 mcp_name=mcp_name, scope=scope, owner=owner, agent=agent,
                 account_label=account_label,
             )
-        except Exception:
-            pass
         extra_key = (webhooks.get("vendor_target_spec") or {}).get(
             "account_extra_key", "")
         if extra_key:

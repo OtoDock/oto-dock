@@ -5,7 +5,6 @@ declarations + the platform token registry — no hardcoded list, no leftover
 hand-edits creep into community MCP archives.
 """
 
-import json
 from pathlib import Path
 
 import pytest

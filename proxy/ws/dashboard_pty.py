@@ -95,6 +95,10 @@ class PtyViewerController:
             await self._send({
                 "type": "pty_exit", "chat_id": vcid, "session_id": vsid,
                 "reason": reason,
+                # Non-zero on an abnormal child death (reason "exited") — the
+                # terminal renders it so an instant CLI crash is never a
+                # silent blank screen.
+                "code": getattr(_s, "exit_code", None),
             })
 
         async def _evict_this_viewer(reason: str = "superseded") -> None:
@@ -122,9 +126,14 @@ class PtyViewerController:
             # (the satellite's control-first writer sends `pty_alive` ahead of the
             # pty lane), so the gap output then appends live onto the fresh screen.
             if state == "reconnected" and sess.pty is not None:
+                from core.terminal_queries import strip_clipboard_writes
                 await self._send({
                     "type": "pty_output", "chat_id": vcid, "session_id": vsid,
-                    "data": base64.b64encode(sess.pty.scrollback()).decode("ascii"),
+                    # Replay boundary: a buffered OSC 52 copy must not re-fire
+                    # into the viewer's clipboard on re-render.
+                    "data": base64.b64encode(
+                        strip_clipboard_writes(sess.pty.scrollback())
+                    ).decode("ascii"),
                     "replay": True, "reset": True,
                 })
             await self._send({

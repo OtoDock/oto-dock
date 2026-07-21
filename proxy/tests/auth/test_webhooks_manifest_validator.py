@@ -7,7 +7,6 @@ Pure validator tests (no DB, no httpx). Mirrors `test_manifest_costs.py`
 
 from __future__ import annotations
 
-import os
 import sys
 
 import pytest

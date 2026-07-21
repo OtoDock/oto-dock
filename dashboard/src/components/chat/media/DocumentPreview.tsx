@@ -14,6 +14,9 @@ interface Props {
   /** Push-time snapshot backing this block's "previous version" render. */
   snapshotId?: string
   chatId?: string
+  /** Push-time epoch ms of this block's event — decides at mount whether the
+   * persisted URL's token can still be alive or a fresh one must be minted. */
+  generation?: number
   /** Scoped dismissal: 'instance' removes only this block (a frozen
    * "previous version" closing itself); 'file' removes the file's whole
    * preview trail (the live block's close). */
@@ -39,6 +42,12 @@ const ENGAGED_RATIO = 0.3
  * message lands — this only needs to cover message delivery. */
 const SAVE_GRACE_MS = 1200
 
+/** How long after push the persisted preview URL is trusted. Tokens last 4h,
+ * but the push-time mint can reuse a URL cached for up to 3.5h, so ~30 min of
+ * validity is the only guarantee. Past this age the block mints a fresh URL
+ * at render instead of loading a token Collabora may reject as expired. */
+const LIVE_URL_TRUST_MS = 15 * 60 * 1000
+
 const MODE_RANK: Record<PreviewChainMode, number> = { live: 0, frozen: 1, chip: 2 }
 
 function getFileExtBadge(filename: string): string {
@@ -51,7 +60,7 @@ function getFileExtBadge(filename: string): string {
   return labels[ext] || ext.toUpperCase()
 }
 
-export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl, dbMessageId, snapshotId, chatId, onDismiss, embedded, mode }: Props) {
+export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl, dbMessageId, snapshotId, chatId, generation, onDismiss, embedded, mode }: Props) {
   const [fullscreen, setFullscreen] = useState(false)
   const [iframeLoaded, setIframeLoaded] = useState(false)
   const [refreshTs, setRefreshTs] = useState<number | null>(null)
@@ -88,10 +97,45 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
   }, [embedded, renderedMode])
   const engaged = visible || fullscreen
 
-  // Replace _t= timestamp to force iframe reload on refresh
-  const effectiveUrl = refreshTs
-    ? wopiUrl.replace(/&_t=\d+/, `&_t=${refreshTs}`)
-    : wopiUrl
+  // Stale live render: the persisted URL's token is only trusted briefly
+  // after push — decided ONCE at mount, so a long-open iframe (possibly
+  // mid-edit) is never reloaded out from under the user when it ages past
+  // the threshold. A fresh URL is minted through the chat-scoped endpoint
+  // (never persisted); any failure falls back to the persisted URL, which
+  // is at worst what rendered before this existed.
+  const [needsFreshUrl] = useState(
+    () => !!chatId && !!fileId &&
+      (generation == null || Date.now() - generation > LIVE_URL_TRUST_MS),
+  )
+  const [liveUrl, setLiveUrl] = useState<string | null>(null)
+  const [liveMintFailed, setLiveMintFailed] = useState(false)
+  useEffect(() => {
+    if (!needsFreshUrl || liveUrl || liveMintFailed) return
+    if (!embedded && renderedMode !== 'live') return
+    let alive = true
+    fetch(
+      `/v1/documents/preview-wopi-url?chat_id=${encodeURIComponent(chatId!)}&file_id=${encodeURIComponent(fileId)}`,
+      { credentials: 'include' },
+    )
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((j) => {
+        if (!alive) return
+        if (j?.wopi_url) setLiveUrl(j.wopi_url)
+        else setLiveMintFailed(true)
+      })
+      .catch(() => { if (alive) setLiveMintFailed(true) })
+    return () => { alive = false }
+  }, [needsFreshUrl, liveUrl, liveMintFailed, embedded, renderedMode, chatId, fileId])
+
+  // null while a fresh mint is in flight — renders the loading state, never
+  // an iframe pointed at a token we already believe is dead.
+  const liveBase = needsFreshUrl && !liveMintFailed ? liveUrl : wopiUrl
+
+  // Replace (or append) the _t= timestamp to force iframe reload on refresh
+  const effectiveUrl = liveBase == null ? null
+    : !refreshTs ? liveBase
+    : liveBase.includes('&_t=') ? liveBase.replace(/&_t=\d+/, `&_t=${refreshTs}`)
+    : `${liveBase}&_t=${refreshTs}`
 
   const handleRefresh = useCallback(() => {
     setIframeLoaded(false)
@@ -354,7 +398,8 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
                   className="w-full border-0"
                   style={{ height: '100%' }}
                   sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
-                  allow="clipboard-read; clipboard-write"
+                  allow="clipboard-read; clipboard-write; fullscreen"
+              allowFullScreen
                   onLoad={() => setIframeLoaded(true)}
                 />
               )}
@@ -376,7 +421,8 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
               src={frameSrc}
               className="w-full h-full border-0"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
-              allow="clipboard-read; clipboard-write"
+              allow="clipboard-read; clipboard-write; fullscreen"
+              allowFullScreen
             />
           ) : null}
         </FilePreviewPortal>

@@ -6,7 +6,6 @@ helpers, and the storage-helper queries. Filesystem fixtures are built under
 the test-redirected config.AGENTS_DIR (wiped per test by conftest).
 """
 
-import json
 import os
 import time
 import uuid

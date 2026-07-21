@@ -1,17 +1,17 @@
 fastapi==0.138.1
 uvicorn[standard]==0.49.0
 pydantic==2.11.3
-python-dotenv==1.1.0
+python-dotenv>=1.2.2
 anthropic>=0.52.0
 openai>=1.82.0
-mcp>=1.9.0
+mcp>=1.28.1
 apscheduler>=3.10.4,<4.0
-cryptography>=44.0.0
+cryptography>=48.0.1
 bcrypt>=4.0.0
 pyotp>=2.9.0
 zxcvbn-python>=4.4.24
 webauthn>=2.0.0
-PyJWT>=2.8.0
+PyJWT>=2.13.0
 psycopg[binary]>=3.1.0
 psycopg_pool>=3.1.0
 httpx>=0.27.0
@@ -22,7 +22,15 @@ py_vapid>=1.9.0
 # (proxy/services/push_sender.py); Pillow validates/resizes dashboard image
 # uploads (proxy/ws/dashboard.py).
 google-auth>=2.0.0
-pillow>=11.0.0
+pillow>=12.2.0
+# Security floors (2026-07 Dependabot sweep) for transitive deps — held here so
+# a churn-minimizing recompile cannot resolve below the patched versions.
+aiohttp>=3.14.1
+idna>=3.15
+pydantic-settings>=2.14.2
+python-multipart>=0.0.31
+requests>=2.33.0
+urllib3>=2.7.0
 # Chat audio (cloud STT/TTS + transcribe). Editable local package — its lean core
 # deps (deepgram-sdk / cartesia / numpy / httpx / …) are pinned transitively below
 # by `uv pip compile`. NOT the [localmodels] extra:

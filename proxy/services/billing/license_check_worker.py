@@ -29,6 +29,7 @@ and a forced re-check is a clean no-op.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from datetime import datetime, timezone
 
@@ -80,10 +81,8 @@ async def stop_worker() -> None:
     if not _worker_task:
         return
     _worker_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
         await _worker_task
-    except (asyncio.CancelledError, Exception):
-        pass
     _worker_task = None
     logger.info("License check worker stopped")
 

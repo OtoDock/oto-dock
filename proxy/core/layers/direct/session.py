@@ -450,30 +450,48 @@ async def run_direct_stream(
 
             # If MCP tools were called, execute them and loop
             if stop_reason == "tool_use" and tool_calls:
-                # Permission gate: check session mode and prompt user if needed
+                # Permission gate: manifest permission tier × session mode per
+                # tool (services/mcp/mcp_permissions.py) — the same table the
+                # CLI hook applies, evaluated inline since the direct path has
+                # no hook subprocess. open runs silently, standard is silent
+                # in acceptEdits, sensitive prompts in both prompting modes,
+                # critical prompts everywhere and is denied in unattended
+                # `auto` sessions (nobody can answer).
+                from services.mcp import mcp_permissions
                 perm_mode = get_session_mode(session.session_id) or "auto"
-                needs_approval = perm_mode in ("default", "acceptEdits")
 
                 approved_calls: list[dict] = []
-                denied_calls: list[dict] = []
+                denied_calls: list[tuple[dict, str]] = []
 
-                if needs_approval:
-                    for tc in tool_calls:
-                        request_id = str(uuid.uuid4())
-                        perm_queue = get_permission_queue(session.session_id)
-                        await perm_queue.put({
-                            "event_type": "permission_prompt",
-                            "request_id": request_id,
-                            "tool_name": tc["name"],
-                            "tool_input": tc.get("input", {}),
-                        })
-                        approved = await wait_for_permission(request_id, session.session_id, timeout=604800.0)
-                        if approved:
-                            approved_calls.append(tc)
-                        else:
-                            denied_calls.append(tc)
-                else:
-                    approved_calls = tool_calls
+                for tc in tool_calls:
+                    parts = (tc["name"] or "").split("__", 2)
+                    tier = mcp_permissions.resolve_tool_tier(
+                        parts[1] if len(parts) >= 2 else "",
+                        parts[2] if len(parts) >= 3 else "",
+                    )
+                    outcome = mcp_permissions.tier_decision(tier, perm_mode)
+                    if outcome == "allow":
+                        approved_calls.append(tc)
+                        continue
+                    if outcome == "deny":
+                        denied_calls.append((tc, (
+                            f"{tc['name']} requires interactive user approval "
+                            "and this session runs unattended."
+                        )))
+                        continue
+                    request_id = str(uuid.uuid4())
+                    perm_queue = get_permission_queue(session.session_id)
+                    await perm_queue.put({
+                        "event_type": "permission_prompt",
+                        "request_id": request_id,
+                        "tool_name": tc["name"],
+                        "tool_input": tc.get("input", {}),
+                    })
+                    approved = await wait_for_permission(request_id, session.session_id, timeout=604800.0)
+                    if approved:
+                        approved_calls.append(tc)
+                    else:
+                        denied_calls.append((tc, "Tool use denied by user."))
 
                 # Execute approved tools
                 results: list[dict] = []
@@ -489,10 +507,10 @@ async def run_direct_stream(
                     ]
 
                 # Add denied results
-                for tc in denied_calls:
+                for tc, reason in denied_calls:
                     results.append({
                         "tool_use_id": tc["id"],
-                        "content": "Tool use denied by user.",
+                        "content": reason,
                     })
 
                 # Emit tool_end events

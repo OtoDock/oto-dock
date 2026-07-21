@@ -326,3 +326,113 @@ def test_ensure_leaves_non_otodock_container_name(tmp_path, monkeypatch):
     original = (tmp_path / "docker-compose.yml").read_text()
     assert compose_rewrite.ensure_pull_compose(m) is False
     assert (tmp_path / "docker-compose.yml").read_text() == original
+
+
+# --------------------------------------------------------------------------- #
+# agents-tree mount → shared external platform volume
+# --------------------------------------------------------------------------- #
+
+# The video-tools shape: the catalog contract for "works on agent files" is a
+# bind sourced from `${HOST_AGENTS_DIR}` (see mcps/community/video-tools).
+VIDEO_TOOLS_COMPOSE = {
+    "services": {
+        "video-tools": {
+            "build": ".",
+            "container_name": "video-tools-mcp",
+            "ports": ["127.0.0.1:8933:8933"],
+            "volumes": ["${HOST_AGENTS_DIR:-../../../agents}:/agents:rw"],
+            "env_file": ".env",
+        }
+    }
+}
+
+
+def test_agents_bind_maps_to_shared_external_volume():
+    out = _transform(
+        VIDEO_TOOLS_COMPOSE, service_name="video-tools", mcp_name="video-tools",
+    )
+    svc = out["services"]["video-tools"]
+    assert svc["volumes"] == [f"{config.OTODOCK_AGENTS_VOLUME}:/agents:rw"]
+    # attached external — the platform compose owns the volume's lifecycle
+    assert out["volumes"][config.OTODOCK_AGENTS_VOLUME] == {
+        "external": True, "name": config.OTODOCK_AGENTS_VOLUME,
+    }
+
+
+def test_agents_bind_without_default_or_mode():
+    data = {"services": {"m": {"build": ".", "volumes": ["${HOST_AGENTS_DIR}:/agents"]}}}
+    svc = _transform(data, service_name="m", mcp_name="m")["services"]["m"]
+    assert svc["volumes"] == [f"{config.OTODOCK_AGENTS_VOLUME}:/agents"]
+
+
+def test_agents_bind_long_form_read_only():
+    data = {"services": {"m": {"build": ".", "volumes": [
+        {
+            "type": "bind",
+            "source": "${HOST_AGENTS_DIR:-../../agents}",
+            "target": "/agents",
+            "read_only": True,
+        },
+    ]}}}
+    svc = _transform(data, service_name="m", mcp_name="m")["services"]["m"]
+    assert svc["volumes"] == [f"{config.OTODOCK_AGENTS_VOLUME}:/agents:ro"]
+
+
+def test_other_interpolated_source_left_alone():
+    """A `${VAR}` source that isn't the agents contract is not ours to guess —
+    it passes through (and logs a warning)."""
+    data = {"services": {"m": {"build": ".", "volumes": ["${OTHER_DIR:-./x}:/x"]}}}
+    svc = _transform(data, service_name="m", mcp_name="m")["services"]["m"]
+    assert svc["volumes"] == ["${OTHER_DIR:-./x}:/x"]
+
+
+def test_agents_bind_with_subpath_left_alone():
+    """A subpath of the agents tree can't be mapped onto a named volume —
+    left as-is rather than silently mounting the wrong thing."""
+    data = {"services": {"m": {"build": ".", "volumes": [
+        "${HOST_AGENTS_DIR}/sub:/agents",
+    ]}}}
+    svc = _transform(data, service_name="m", mcp_name="m")["services"]["m"]
+    assert svc["volumes"] == ["${HOST_AGENTS_DIR}/sub:/agents"]
+
+
+def test_ensure_heals_agents_bind_in_pull_form(tmp_path, monkeypatch):
+    """A compose already rewritten to pull form BEFORE the shared-volume
+    mapping existed still carries the `${HOST_AGENTS_DIR}` bind — on T2 that
+    binds an empty host dir. ensure_pull_compose heals it in place."""
+    monkeypatch.setattr(deployment, "in_docker_compose", lambda: True)
+    pull_form = {
+        "services": {
+            "video-tools": {
+                "image": "ghcr.io/otodock/video-tools:0.1.0",
+                "container_name": f"otodock-{config.INSTALL_ID}-mcp-video-tools",
+                "volumes": ["${HOST_AGENTS_DIR:-../../../agents}:/agents:rw"],
+                "networks": {"otodock": {"aliases": ["video-tools"]}},
+            }
+        },
+        "networks": {"otodock": {"external": True, "name": "otodock"}},
+    }
+    (tmp_path / "docker-compose.yml").write_text(yaml.safe_dump(pull_form))
+    m = SimpleNamespace(
+        name="video-tools",
+        mcp_dir=tmp_path,
+        server=SimpleNamespace(
+            runtime="docker",
+            docker_compose="docker-compose.yml",
+            image="ghcr.io/otodock/video-tools:0.1.0",
+            service_name="video-tools",
+        ),
+    )
+
+    assert compose_rewrite.ensure_pull_compose(m) is True
+    written = yaml.safe_load((tmp_path / "docker-compose.yml").read_text())
+    svc = written["services"]["video-tools"]
+    assert svc["volumes"] == [f"{config.OTODOCK_AGENTS_VOLUME}:/agents:rw"]
+    assert written["volumes"][config.OTODOCK_AGENTS_VOLUME] == {
+        "external": True, "name": config.OTODOCK_AGENTS_VOLUME,
+    }
+    # untouched: identity stamp + network shape
+    assert svc["container_name"] == f"otodock-{config.INSTALL_ID}-mcp-video-tools"
+    assert written["networks"] == {"otodock": {"external": True, "name": "otodock"}}
+    # second call: healed → idempotent no-op
+    assert compose_rewrite.ensure_pull_compose(m) is False

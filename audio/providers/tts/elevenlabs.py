@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import uuid
@@ -63,6 +64,17 @@ _INACTIVITY_TIMEOUT_S = 180
 # long — treat it as end-of-utterance so a lost isFinal degrades to a stall
 # guard instead of a hung turn.
 _POST_FLUSH_STALL_S = 10.0
+
+# Observed live (2026-07): the multi-context server streams the flushed audio
+# but sends NO isFinal — the context stays open for more text — so every
+# utterance ended via the 10 s guard above (a phone farewell then sits ~10 s
+# before the hang-up). Once audio HAS flowed for a flushed context, a short
+# silent gap is conclusive: post-flush generation streams continuously, and
+# the receive loop only waits on the socket between frames (local playback
+# pacing suspends it), so 2 s of true recv-silence means the utterance is
+# done. The 10 s guard still covers the pre-audio phase (generation latency,
+# or a lost flush with text still buffered).
+_POST_FLUSH_TAIL_STALL_S = 2.0
 
 # PCM output rates the API offers (raw s16le mono — our provider contract).
 _PCM_RATES = (8000, 16000, 22050, 24000, 44100)
@@ -243,10 +255,8 @@ class ElevenLabsTTS(TTSProvider):
 
     async def _close_ws_locked(self) -> None:
         if self._ws is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._ws.close()
-            except Exception:
-                pass
             self._ws = None
             self._ws_bound = None
 
@@ -307,12 +317,11 @@ class ElevenLabsTTS(TTSProvider):
         # time (this method is sync per the ABC — the real open happens under
         # the lock, so the first send_text_chunk never double-connects).
         if _is_ws_model(self._model_id) and self.voice_id:
-            try:
+            # no running loop (sync tests) — first chunk connects
+            with contextlib.suppress(RuntimeError):
                 self._prewarm_task = asyncio.get_running_loop().create_task(
                     self._prewarm(self._ctx)
                 )
-            except RuntimeError:
-                pass  # no running loop (sync tests) — first chunk connects
         logger.debug("TTS streaming context started")
 
     async def _prewarm(self, ctx: _Context) -> None:
@@ -387,6 +396,7 @@ class ElevenLabsTTS(TTSProvider):
                 logger.error(f"TTS receive connect error: {e}")
             return
         stalled_s = 0.0
+        yielded = 0
         while not self._cancelled and self._ctx is ctx:
             try:
                 # Short poll so cancel()/input_done state changes are noticed
@@ -397,10 +407,20 @@ class ElevenLabsTTS(TTSProvider):
             except asyncio.TimeoutError:
                 if ctx.input_done:
                     # Input flushed → generation streams continuously; a silent
-                    # gap means isFinal was lost — end instead of hanging.
+                    # gap means the utterance is over (the server keeps the
+                    # context open and sends no isFinal — see the tail guard
+                    # note above) or isFinal/flush was lost — end, don't hang.
                     stalled_s += 1.0
-                    if stalled_s >= _POST_FLUSH_STALL_S:
-                        logger.warning("ElevenLabs TTS: no frames after flush — ending utterance")
+                    limit = (_POST_FLUSH_TAIL_STALL_S if yielded
+                             else _POST_FLUSH_STALL_S)
+                    if stalled_s >= limit:
+                        if yielded:
+                            logger.info(
+                                "ElevenLabs TTS: flushed audio drained "
+                                "(no isFinal) — ending utterance"
+                            )
+                        else:
+                            logger.warning("ElevenLabs TTS: no frames after flush — ending utterance")
                         break
                 continue
             except websockets.ConnectionClosed:
@@ -420,8 +440,10 @@ class ElevenLabsTTS(TTSProvider):
                 except Exception:
                     continue
                 if chunk:
+                    yielded += 1
                     yield chunk
             if msg.get("isFinal"):
+                logger.debug("ElevenLabs TTS: isFinal received")
                 break
             if msg.get("error"):
                 logger.error(f"ElevenLabs TTS error frame: {str(msg)[:200]}")
@@ -479,15 +501,12 @@ class ElevenLabsTTS(TTSProvider):
             frame = json.dumps({"context_id": ctx.id, "close_context": True})
 
             async def _send_close() -> None:
-                try:
+                # socket already gone — the reconnect path cleans up
+                with contextlib.suppress(Exception):
                     await ws.send(frame)
-                except Exception:
-                    pass  # socket already gone — the reconnect path cleans up
 
-            try:
+            with contextlib.suppress(RuntimeError):
                 asyncio.get_running_loop().create_task(_send_close())
-            except RuntimeError:
-                pass
         logger.debug("TTS streaming cancelled (barge-in)")
 
     # ── Voice discovery ────────────────────────────────────────────

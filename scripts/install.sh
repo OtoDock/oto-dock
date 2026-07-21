@@ -2,13 +2,15 @@
 #
 # OtoDock — one-command install for the Docker quick start.
 #
+#   mkdir otodock && cd otodock
 #   curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/install.sh
 #   bash install.sh
 #
 # What it does (each step announces itself before it runs):
 #   1. Checks that Docker and the Compose plugin are installed and reachable.
-#   2. Creates the install directory — ./otodock, or $OTODOCK_DIR — and
-#      refuses to touch a directory that already holds an install.
+#   2. Installs into the directory it is run from (give it a folder of its
+#      own) — and refuses to touch a directory that already holds an install.
+#      $OTODOCK_DIR is still honored as an override for older one-liners.
 #   3. Writes a minimal .env with a generated PostgreSQL password (kept as-is
 #      if one already exists; the server appends its own generated secrets to
 #      the same file on first boot).
@@ -22,8 +24,8 @@
 # Fresh installs only — it never upgrades or overwrites an existing install
 # (upgrades: https://docs.otodock.io/administration/upgrading). Safe to re-run
 # if a step stopped it: everything that already exists is kept. All files land
-# inside the install directory; nothing else on the host is touched (except
-# the optional AppArmor profile in step 4, which its own script documents).
+# in the current directory; nothing else on the host is touched (except the
+# optional AppArmor profile in step 4, which its own script documents).
 set -euo pipefail
 
 # Where files are fetched from. OTODOCK_REF selects a branch or tag — the
@@ -72,16 +74,26 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # --- 2. Install directory ----------------------------------------------------
-_dir="${OTODOCK_DIR:-./otodock}"
-if [ -f "$_dir/docker-compose.yml" ]; then
-    fail "$_dir already contains a docker-compose.yml — this script performs fresh
-  installs only and never touches an existing one.
-    To upgrade it:            https://docs.otodock.io/administration/upgrading
-    To install fresh here:    remove the directory first (only if you are sure
-                              it holds nothing you want to keep)."
+# The install lands right here, in the directory the script is run from —
+# give it a folder of its own first (mkdir otodock && cd otodock). OTODOCK_DIR
+# is honored as an override so older one-liners keep installing where they
+# always did.
+if [ -n "${OTODOCK_DIR:-}" ]; then
+    mkdir -p "$OTODOCK_DIR"
+    cd "$OTODOCK_DIR"
 fi
-mkdir -p "$_dir"
-cd "$_dir"
+if [ -n "${HOME:-}" ] && [ "$(pwd -P)" = "$(cd "$HOME" && pwd -P)" ]; then
+    fail "this is your home directory — give the install a folder of its own:
+      mkdir otodock && cd otodock
+  then re-run this script from there."
+fi
+if [ -f docker-compose.yml ]; then
+    fail "this directory already contains a docker-compose.yml — this script performs
+  fresh installs only and never touches an existing one.
+    To upgrade it:            https://docs.otodock.io/administration/upgrading
+    To install fresh:         create a new, empty folder (mkdir otodock && cd otodock)
+                              and re-run this script from there."
+fi
 say "installing into $(pwd)"
 
 # --- 3. Configuration (.env) -------------------------------------------------

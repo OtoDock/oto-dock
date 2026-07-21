@@ -8,6 +8,7 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -52,6 +53,48 @@ class WarmupController:
     """Session warmup + spawn: pre-warm, warmup (inline reuse or backgrounded
     spawn tail), deferred mode/model re-apply, and the single create/resume
     funnel every spawn path goes through."""
+
+    def _target_mismatch_fields(self, chat_id: str) -> dict:
+        """Locality-mismatch fields for warmup frames, or {}.
+
+        A pinned chat keeps running on its pin (config_builder honors it
+        verbatim), so the session's own resolved target can never disagree
+        with the pin — the mismatch is computed against an INDEPENDENT
+        resolve of the agent's CURRENT target for this user. Attached only
+        for the chat owner / a platform admin: a non-owner's resolve is
+        forced 'local', which would advertise a move the move op refuses.
+        Best-effort — a lookup failure just means no banner."""
+        try:
+            chat = task_store.get_chat(chat_id) or {}
+            pin = chat.get("execution_target") or ""
+            if not pin:
+                return {}
+            agent = chat.get("agent") or ""
+            role = _effective_agent_role(self.user_sub, agent)
+            if chat.get("user_sub") != self.user_sub and role != "admin":
+                return {}
+            resolved, _ = remote_store.resolve_execution_target(
+                agent, self.user_sub, role,
+            )
+            if not resolved or resolved == pin or resolved.startswith("__offline__:"):
+                return {}
+
+            def _label(target: str) -> str:
+                if target == "local":
+                    return "local sandbox"
+                m = remote_store.get_remote_machine(target) or {}
+                return str(m.get("name") or "") or target[:8]
+
+            return {
+                "pinned_target": pin,
+                "pinned_label": _label(pin),
+                "resolved_target": resolved,
+                "resolved_label": _label(resolved),
+            }
+        except Exception:
+            logger.debug("target-mismatch fields failed for %s", chat_id,
+                         exc_info=True)
+            return {}
 
     async def _handle_pre_warmup(self, msg: dict):
         """Pre-warm a session for a new chat (MCP init in background).
@@ -273,10 +316,8 @@ class WarmupController:
         # backgrounded spawn so session_id is set before we return. The spawn
         # carried no text, so it enqueues no kick.
         if not background and outcome == "bg" and self._warmup_task:
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._warmup_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
         # Server-owned first turn for the INLINE-ready paths: the
         # session is live now, so kick the turn. The prompt was persisted at
@@ -408,7 +449,7 @@ class WarmupController:
                         adm = await acquire_chat_slot(old_session_id, target=chat.get("execution_target") or "local", execution_path=chat.get("execution_path"))
                         if not adm:
                             await self._send_error(adm.user_message)
-                            return
+                            return "skip"
                         self.session_id = old_session_id
                         await self._send({
                             "type": "warmup_ready",
@@ -426,7 +467,6 @@ class WarmupController:
                 # it from the SAME denied/deleted row): keeping it would make
                 # the fresh spawn below adopt that chat id and overwrite its
                 # session binding instead of creating a genuinely new chat.
-                cid = None
                 self.chat_id = None
                 self.session_id = None
         else:
@@ -667,10 +707,8 @@ class WarmupController:
                     # (a concurrent new-chat pre-warm may own _pre_warmed_sid by now);
                     # the next pre_warm/warmup or the idle reaper reclaims a stale one.
                     if pw_task is not None and not pw_task.done():
-                        try:
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
                             await pw_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
                     pw_match = (
                         self._pre_warmed_sid is not None
                         and self._pre_warmed_agent == w_agent
@@ -766,6 +804,7 @@ class WarmupController:
                 # clobber it. The DB + registry already hold the truth either way.
                 still_viewing = (self.chat_id == wcid)
                 if still_viewing:
+                    prev_sid = self.session_id
                     self.session_id = res.session_id
                     self.layer = res.layer
                     self.session_execution_target = res.execution_target
@@ -778,7 +817,8 @@ class WarmupController:
                     # `_dashboard_notify_queues` — which breaks location-mcp's
                     # "find the active dashboard session" lookup (api/hooks/hooks.py
                     # request_user_location → "No active dashboard session").
-                    self._register_notify_queue()
+                    # Same chat, fresh sid — the replaced sid's entry goes too.
+                    self._register_notify_queue(replaces=prev_sid)
 
                 # Reconcile chat row + warmup_ready mode with the spawned
                 # session's actual mode (a mode_change may have raced the spawn).
@@ -806,6 +846,7 @@ class WarmupController:
                     "fallback_reason": res.fallback_reason,
                     "offline_machine_name": offline_machine_name,
                     "interactive": res.interactive,
+                    **self._target_mismatch_fields(wcid),
                 })
                 # surface the "restored from history" card live (also persisted
                 # to chat_messages by the digest claim, so it renders on reload).

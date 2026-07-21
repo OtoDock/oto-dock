@@ -13,11 +13,9 @@ Run: cd proxy && python -m pytest tests/tasks/test_interval_scheduling.py -v
 """
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)
@@ -280,7 +278,7 @@ class TestNotificationInterval:
         from storage import notification_store
 
         # Start with cron
-        notif = notification_store.create_notification(
+        notification_store.create_notification(
             notification_id="n-swap",
             title="t", body="b", severity="info",
             scope="user", target="user-1", source="mcp",

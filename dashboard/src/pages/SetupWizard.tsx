@@ -14,6 +14,7 @@ export default function SetupWizard() {
   const [confirmPassword, setConfirmPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [urlCaptured, setUrlCaptured] = useState(false)
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -26,14 +27,45 @@ export default function SetupWizard() {
 
     setLoading(true)
     try {
-      const user = await setupFirstUser(email, password, displayName)
+      const { user, dashboardUrlCaptured } = await setupFirstUser(email, password, displayName)
       setUser(user)
-      navigate('/admin/platform', { replace: true })
+      if (dashboardUrlCaptured) {
+        // One-time note: the captured origin applies at the next platform
+        // restart (Collabora reads it at container start) — show it before
+        // leaving the wizard, there is no other done-screen.
+        setUrlCaptured(true)
+      } else {
+        navigate('/admin/platform', { replace: true })
+      }
     } catch (err: any) {
       setError(err.message || 'Setup failed')
     } finally {
       setLoading(false)
     }
+  }
+
+  if (urlCaptured) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-p-bg">
+        <div className="w-full max-w-md mx-4">
+          <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs text-center">
+            <h1 className="text-2xl font-bold text-p-text">You're all set</h1>
+            <p className="text-sm text-p-text-secondary mt-3">
+              Document preview was pinned to{' '}
+              <span className="font-mono text-p-text">{window.location.origin}</span>.
+              To activate it, run <span className="font-mono">docker compose up -d</span>{' '}
+              once (or restart the platform). Everything else works right away.
+            </p>
+            <button
+              onClick={() => navigate('/admin/platform', { replace: true })}
+              className="mt-5 w-full py-2 text-sm font-medium rounded-lg bg-brand text-white hover:opacity-90 transition-opacity"
+            >
+              Continue to dashboard
+            </button>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (

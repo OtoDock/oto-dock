@@ -8,7 +8,6 @@ helper, and the GET /v1/chats/{id}?before_id= older-page endpoint.
 
 import json
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app import app

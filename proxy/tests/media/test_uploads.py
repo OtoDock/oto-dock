@@ -14,8 +14,6 @@ resolution branches without DB/auth ceremony — same approach as
 
 import asyncio
 from io import BytesIO
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI

@@ -12,7 +12,6 @@ Run: cd proxy && venv/bin/pytest tests/agents/test_agent_grid_counts.py -v
 
 from __future__ import annotations
 
-import os
 import sys
 
 from tests._paths import PROXY_DIR

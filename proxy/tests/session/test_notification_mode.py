@@ -9,8 +9,6 @@ Covers:
 Run: cd proxy && python -m pytest tests/session/test_notification_mode.py -v
 """
 
-import asyncio
-import os
 import sys
 
 import pytest

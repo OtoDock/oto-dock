@@ -533,7 +533,6 @@ async def create_mcp_request(
     # Short-circuit when the MCP is already enabled on the agent — no need to
     # bother the admin.
     from storage import mcp_store, mcp_request_store
-    import asyncio
     current = await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, slug)
     if body.mcp_name in current:
         raise HTTPException(409, f"{body.mcp_name} is already enabled on {slug}")
@@ -587,7 +586,6 @@ async def list_agent_mcp_requests(
         raise HTTPException(403, "Manager access required for this agent")
 
     from storage import mcp_request_store
-    import asyncio
     requested_by = None if user.role == "admin" else user.sub
     rows = await asyncio.to_thread(
         mcp_request_store.list_requests_for_agent, slug, requested_by,
@@ -622,7 +620,6 @@ async def list_admin_mcp_requests(
     """All requests across all agents. Admin only."""
     _require_admin(user)
     from storage import mcp_request_store
-    import asyncio
     if open_only:
         rows = await asyncio.to_thread(mcp_request_store.list_open_requests)
     else:
@@ -793,8 +790,8 @@ async def preview_community_agent_install(
                 (m["name"] for m in mcps_registry.get("mcps", []) if m.get("name") == name),
                 None,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"Community registry lookup for MCP {name} failed: {exc}")
         if local_manifest is None:
             mcp_status.append({
                 "name": name,
@@ -902,7 +899,10 @@ async def admin_reseed_template_items(
             )
         except Exception as exc:
             logger.exception("reseed failed for (%s, %s)", slug, sub)
-            per_user.append({"sub": sub, "role": role, "error": str(exc)})
+            per_user.append({
+                "sub": sub, "role": role,
+                "error": f"{type(exc).__name__} (see proxy logs)",
+            })
             continue
         totals["tasks"] += counts["tasks"]
         totals["triggers"] += counts["triggers"]

@@ -658,7 +658,7 @@ export default function SystemSettingsTab() {
         </div>
         </>)}
 
-        {/* Interactive terminal sessions (global kill-switch, default OFF) */}
+        {/* Interactive terminal sessions (global kill-switch, default ON since R1.5) */}
         <div className="flex items-center justify-between gap-4">
           <div className="flex-1">
             <label className="block text-sm font-medium text-p-text mb-0.5">Interactive terminal sessions</label>

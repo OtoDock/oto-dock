@@ -3,8 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useStats, useSchedules } from '../api/tasks'
 import { useRuns } from '../api/runs'
 import GroupedRunsTable from '../components/GroupedRunsTable'
-import StatusBadge from '../components/StatusBadge'
-import { formatRelativeTime, formatDuration, formatNextRun } from '../lib/format'
+import { formatRelativeTime, formatNextRun } from '../lib/format'
 
 function StatCard({ label, value, color = 'text-p-text' }: {
   label: string

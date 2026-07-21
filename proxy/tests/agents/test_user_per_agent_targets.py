@@ -8,7 +8,6 @@ deletes legacy global rows on first startup.
 
 from unittest.mock import patch, MagicMock
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 

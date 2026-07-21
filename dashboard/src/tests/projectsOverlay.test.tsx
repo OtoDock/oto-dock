@@ -62,9 +62,9 @@ function pin(slug: string, over: Partial<PinnedApp> = {}): PinnedApp {
 function slice(chatId: string, status: 'streaming' | 'ready') {
   return {
     chatId, status, agent: 'dev', executionPath: '', executionTarget: '',
-    fallbackReason: null, warmupStartedAt: null, warmupError: null,
-    lastEventAt: 0, draftInput: '', queuedMessages: [], pendingImages: [],
-    pendingFiles: [],
+    fallbackReason: null, targetMismatch: null, warmupStartedAt: null,
+    warmupError: null, lastEventAt: 0, draftInput: '', queuedMessages: [],
+    pendingImages: [], pendingFiles: [],
   }
 }
 

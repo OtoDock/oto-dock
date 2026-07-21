@@ -4,6 +4,7 @@ Scans mcps/ on startup, loads manifest.json files, and provides the core engine
 for generating per-session mcp-config.json from manifests + DB state + credentials.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -66,6 +67,7 @@ _validate_oauth_services = _mvo._validate_oauth_services
 _validate_webhooks_block = _mvw._validate_webhooks_block
 _parse_manifest = _mmp._parse_manifest
 _parse_costs_block = _mmp._parse_costs_block
+_parse_permissions_block = _mmp._parse_permissions_block
 _parse_builder_block = _mmp._parse_builder_block
 _parse_agent_context = _mmp._parse_agent_context
 _parse_tool_filter = _mmp._parse_tool_filter
@@ -483,11 +485,10 @@ def _resolve_to_ips(host: str) -> list[str]:
     host = (host or "").strip()
     if not host:
         return []
-    try:
+    # Not an IP literal → fall through to DNS resolution.
+    with contextlib.suppress(ValueError):
         ipaddress.ip_address(host)
         return [host]  # already a literal
-    except ValueError:
-        pass
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
@@ -523,6 +524,11 @@ def _is_local_host_ip(ip: str) -> bool:
     co-located service. T1 concern only — in T2 the proxy is a container.
     """
     import socket
+    if not ip:
+        # An empty host would bind all interfaces — never a "local host IP".
+        # Callers only pass resolved literals (_resolve_to_ips), so this is
+        # defensive; it also keeps the probe from ever binding wildcard.
+        return False
     fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_STREAM)
     try:
@@ -891,11 +897,9 @@ def loopback_if_host_self(url: str) -> str:
     host = urlparse(url if "://" in url else f"//{url}").hostname or ""
     if not host or host in ("localhost", "127.0.0.1", "::1"):
         return url
-    try:
+    with contextlib.suppress(Exception):
         if any(_is_local_host_ip(ip) for ip in _resolve_to_ips(host)):
             return url.replace(host, "127.0.0.1", 1)
-    except Exception:  # noqa: BLE001
-        pass
     return url
 
 
@@ -1806,13 +1810,24 @@ def build_session_mcp_config(
             )
             continue
 
-        # Context-only MCPs (transport "none" — ssh-hosts): no server process,
-        # so nothing to emit into mcpServers. Skills, dynamic prompt context,
-        # instance authorization and network_targets all apply through their
-        # own paths. On REMOTE sessions they are allowed only on ADMIN-PAIRED
-        # targets — their session data (SSH keys) rides the session-file
-        # broker there; infra key material never reaches a user-paired
-        # satellite (mirrors the agent-scope-credentials rule).
+        # Admin-paired-only MCPs (ssh-hosts): the tool surface exists exactly
+        # where the MCP's session data (SSH keys) is delivered — locally and
+        # on admin-paired satellites. A user-paired machine gets a visible
+        # exclusion instead (mirrors the agent-scope-credentials rule).
+        if (manifest.remote_policy == "admin_paired_only"
+                and is_remote and not target_admin_paired):
+            exclusion_reasons[mcp_name] = (
+                f"{manifest.label} is unavailable on this machine — "
+                "it is delivered only to admin-paired machines"
+            )
+            continue
+
+        # Context-only MCPs (transport "none"): no server process, so nothing
+        # to emit into mcpServers. Skills, dynamic prompt context, instance
+        # authorization and network_targets all apply through their own
+        # paths. On REMOTE sessions they are allowed only on ADMIN-PAIRED
+        # targets — their session data rides the session-file broker there;
+        # key material never reaches a user-paired satellite.
         if manifest.server.transport == "none":
             if is_remote and not target_admin_paired:
                 exclusion_reasons[mcp_name] = (

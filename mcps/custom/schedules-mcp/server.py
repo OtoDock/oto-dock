@@ -721,7 +721,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     async with client.stream(
                         "GET", url,
                         headers=_headers(),
-                        timeout=httpx.Timeout(connect=5.0, read=float(timeout_seconds + 30)),
+                        # A default is REQUIRED (httpx >= 0.28 raises ValueError
+                        # for partial kwargs without one) — the old
+                        # Timeout(connect=..., read=...) form crashed wait mode
+                        # before the stream ever opened.
+                        timeout=httpx.Timeout(
+                            float(timeout_seconds + 30), connect=5.0,
+                        ),
                     ) as resp:
                         async for line in resp.aiter_lines():
                             if not line.startswith("data:"):
@@ -730,13 +736,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                                 ev = json.loads(line[5:].strip())
                             except json.JSONDecodeError:
                                 continue
-                            if ev.get("type") == "text":
+                            if ev.get("type") == "status":
+                                if ev.get("status") == "pending":
+                                    output_parts.append(
+                                        "[queued — waiting for a free task "
+                                        "slot]\n"
+                                    )
+                            elif ev.get("type") == "text":
                                 output_parts.append(ev.get("text", ""))
                             elif ev.get("type") == "done":
                                 final_status = ev.get("status", "completed")
                                 break
             except httpx.ReadTimeout:
                 final_status = "timeout"
+            except httpx.HTTPError as e:
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Task triggered (run: {run_id}) but the wait stream "
+                        f"failed: {e}. The run continues in the background — "
+                        f"check get_task_result('{task_id}') later."
+                    ),
+                )]
 
             if final_status == "timeout":
                 return [TextContent(

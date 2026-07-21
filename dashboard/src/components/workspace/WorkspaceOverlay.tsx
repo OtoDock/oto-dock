@@ -15,7 +15,6 @@ import {
 import { apiFetch } from '../../api/auth'
 import type { useWorkspaceState } from '../../hooks/useWorkspaceState'
 import { pushEscHandler } from '../../lib/escStack'
-import { getFileKind } from '../../lib/fileTypes'
 import { parentDir, resolveActionTargets } from '../../lib/paths'
 import FileTree from '../FileTree'
 import FilePreviewBody from './FilePreviewBody'

@@ -30,6 +30,7 @@ from auth.providers import get_current_user, require_auth, UserContext
 from services.engines import subscription_pool
 from storage import subscription_store
 import config as app_config
+import contextlib
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -83,13 +84,11 @@ async def oauth_start(
     # Kill any active login process
     for lid, meta in _active_logins.items():
         if meta["proc"].returncode is None:
-            try:
+            with contextlib.suppress(Exception):
                 meta["proc"].terminate()
                 await asyncio.sleep(0.5)
                 if meta["proc"].returncode is None:
                     meta["proc"].kill()
-            except Exception:
-                pass
     _active_logins.clear()
 
     # Remove existing auth.json so we can detect when a new one is written
@@ -164,10 +163,8 @@ async def oauth_start(
             f"codex device-auth: missing url={bool(verification_url)} "
             f"code={bool(user_code)}. Output: {clean_output[:10]}"
         )
-        try:
+        with contextlib.suppress(Exception):
             proc.terminate()
-        except Exception:
-            pass
         raise HTTPException(
             500,
             "Failed to start device code auth — could not extract code. "
@@ -213,10 +210,8 @@ async def oauth_status(
 
     # Device codes expire after 15 minutes
     if time.monotonic() - meta["started_at"] > 900:
-        try:
+        with contextlib.suppress(Exception):
             proc.terminate()
-        except Exception:
-            pass
         return {"status": "failed", "message": "Device code expired (15 minutes). Please try again."}
 
     return {"status": "pending"}
@@ -241,13 +236,11 @@ async def oauth_finish(
     # Kill the process if still running
     proc = meta["proc"]
     if proc.returncode is None:
-        try:
+        with contextlib.suppress(Exception):
             proc.terminate()
             await asyncio.sleep(1)
             if proc.returncode is None:
                 proc.kill()
-        except Exception:
-            pass
 
     # Read auth.json
     if not _AUTH_JSON_PATH.exists():
@@ -374,7 +367,5 @@ def _cleanup_stale_logins():
     for lid in stale:
         meta = _active_logins.pop(lid, None)
         if meta and meta["proc"].returncode is None:
-            try:
+            with contextlib.suppress(Exception):
                 meta["proc"].terminate()
-            except Exception:
-                pass

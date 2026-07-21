@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import uuid
 import pytest
-from pathlib import Path
 
 from services.mcp import dynamic_context, mcp_registry
 from services.mcp.mcp_registry import AgentContextBlock, McpManifest, ServerConfig, CredentialConfig
@@ -583,3 +582,73 @@ class TestTriggerRequiresGate:
             trigger_payload={"body": {"issue": {"title": "ship it"}}},
         )
         assert rendered == ["Issue: ship it"]
+
+
+# ---------------------------------------------------------------------------
+# Delegation roster (delegate() layers/models discoverability)
+# ---------------------------------------------------------------------------
+
+
+def _roster_env(monkeypatch, *, models, default_model="m-default",
+                paths=("claude-code-cli",)):
+    import json as _json
+
+    import config as app_config
+    from storage import agent_store, subscription_store
+
+    agent_row = {
+        "display_name": "Worker", "description": "does work",
+        "execution_path": paths[0],
+        "execution_paths": (_json.dumps(list(paths[1:]))
+                            if len(paths) > 1 else ""),
+        "default_model": default_model,
+    }
+    monkeypatch.setattr(agent_store, "get_agent", lambda slug: dict(agent_row))
+    monkeypatch.setattr(subscription_store, "list_models",
+                        lambda layer=None: [dict(m) for m in models])
+    monkeypatch.setattr(app_config, "resolve_agent_model",
+                        lambda slug: default_model)
+
+
+def test_build_delegation_roster_enabled_only_default_first(monkeypatch):
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-a", "enabled": True},
+        {"model_id": "m-disabled", "enabled": False},
+        {"model_id": "m-default", "enabled": True},
+    ])
+    roster = dynamic_context.build_delegation_roster(["worker"])
+    (layer,) = roster["worker"]
+    assert layer["path"] == "claude-code-cli" and layer["is_default"]
+    assert layer["models"] == ["m-default", "m-a"]
+    assert layer["more"] == 0 and not layer["local_only"]
+
+
+def test_build_delegation_roster_caps_and_tags(monkeypatch):
+    _roster_env(
+        monkeypatch,
+        models=[{"model_id": f"m-{i}", "enabled": True} for i in range(10)]
+        + [{"model_id": "m-default", "enabled": True}],
+        paths=("claude-code-cli", "direct-llm"),
+    )
+    layers = dynamic_context.build_delegation_roster(["worker"])["worker"]
+    cli, direct = layers
+    assert len(cli["models"]) == 8 and cli["models"][0] == "m-default"
+    assert cli["more"] == 3  # 11 enabled − 8 shown
+    assert direct["path"] == "direct-llm" and direct["local_only"]
+    assert not direct["is_default"]
+
+
+def test_delegation_context_renders_roster(monkeypatch, temp_db):
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-default", "enabled": True},
+        {"model_id": "m-b", "enabled": True},
+    ])
+    roster = dynamic_context.build_delegation_roster(["worker"])
+    text = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], delegation_roster=roster)
+    assert ("layers: claude-code-cli (default | models: "
+            "m-default [default], m-b)") in text
+    assert "Ignored with `continue_id`" in text
+    # Without the pre-resolved roster the provider stays name-only (no I/O).
+    text2 = dynamic_context._delegation_mcp_context("self-agent", ["worker"])
+    assert "layers:" not in text2

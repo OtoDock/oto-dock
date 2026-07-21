@@ -54,3 +54,19 @@ def get_conn():
     On exception the transaction is rolled back automatically.
     """
     return get_pool().connection()
+
+
+def close_pool(timeout: float = 3.0) -> None:
+    """Close the pool at shutdown (idempotent). Its worker/scheduler threads
+    are non-daemon — left open they stall interpreter exit until the atexit
+    thread join, after uvicorn already logged its shutdown. A later
+    ``get_pool()`` call would lazily re-create the pool, so this must be one
+    of the LAST shutdown steps."""
+    global _pool
+    with _pool_lock:
+        pool, _pool = _pool, None
+    if pool is not None:
+        try:
+            pool.close(timeout=timeout)
+        except Exception:
+            pass

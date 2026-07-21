@@ -8,7 +8,7 @@ import { useSearch } from '../../contexts/SearchContext'
 
 const baseComponents: Components = {
   // Code blocks + inline code
-  code({ className, children, ...props }) {
+  code({ className, children }) {
     const match = /language-(\w+)/.exec(className || '')
     const text = String(children).replace(/\n$/, '')
 

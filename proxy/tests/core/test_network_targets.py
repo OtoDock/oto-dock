@@ -2,7 +2,6 @@
 carve-out it feeds (part of the always-on sandbox-isolation work).
 """
 
-import config as _app_config
 from services.mcp import mcp_registry
 from services.mcp.mcp_registry import (
     McpManifest, ServerConfig, NetworkTargetDecl,

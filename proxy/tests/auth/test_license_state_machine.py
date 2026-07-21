@@ -38,7 +38,7 @@ def store(monkeypatch):
     data = {"install_id": "test-install"}
     monkeypatch.setattr(L.db, "get_all_platform_settings", lambda: dict(data))
     monkeypatch.setattr(L.db, "get_platform_setting", lambda k: data.get(k, ""))
-    monkeypatch.setattr(L.db, "set_platform_setting", lambda k, v: data.__setitem__(k, v))
+    monkeypatch.setattr(L.db, "set_platform_setting", data.__setitem__)
     return data
 
 

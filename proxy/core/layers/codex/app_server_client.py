@@ -25,6 +25,7 @@ optional sandbox command prefix for the local bwrap.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -328,10 +329,8 @@ class AppServerClient:
         proc = self.proc
         if not proc or proc.returncode is not None:
             return
-        try:
+        with contextlib.suppress(OSError, AttributeError):
             proc.stdin.close()  # type: ignore[union-attr]
-        except (OSError, AttributeError):
-            pass
         # POSIX: SIGTERM the whole process group — start_new_session=True put
         # the daemon + its MCP children in their own group, so the group kill
         # reaps the children too. Windows has neither os.killpg/os.getpgid (they
@@ -342,15 +341,11 @@ class AppServerClient:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except (OSError, ProcessLookupError):
-                try:
+                with contextlib.suppress(OSError, ProcessLookupError):
                     proc.terminate()
-                except (OSError, ProcessLookupError):
-                    pass
         else:
-            try:
+            with contextlib.suppress(OSError, ProcessLookupError):
                 proc.terminate()
-            except (OSError, ProcessLookupError):
-                pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
             return
@@ -358,18 +353,14 @@ class AppServerClient:
             pass
         # Escalate to a hard kill.
         if hasattr(os, "killpg"):
-            try:
+            with contextlib.suppress(OSError, ProcessLookupError):
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
         else:
             # Windows: terminate()/kill() only hit the daemon itself, so walk
             # and force-kill the child tree via taskkill first.
             await self._taskkill_tree(proc.pid)
-            try:
+            with contextlib.suppress(OSError, ProcessLookupError):
                 proc.kill()
-            except (OSError, ProcessLookupError):
-                pass
 
     @staticmethod
     async def _taskkill_tree(pid: int) -> None:

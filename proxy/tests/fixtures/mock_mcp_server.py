@@ -18,7 +18,7 @@ import asyncio
 import gc
 import json
 import socket
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Awaitable, Callable
 
 import pytest_asyncio
@@ -163,10 +163,8 @@ async def mock_mcp():
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
             task.cancel()
-            try:
+            with suppress(asyncio.CancelledError, BaseException):
                 await task
-            except (asyncio.CancelledError, BaseException):
-                pass
 
         # This shutdown is exactly what latches AppStatus.should_exit (the
         # watcher polls every 0.5s and a drained-but-lingering connection

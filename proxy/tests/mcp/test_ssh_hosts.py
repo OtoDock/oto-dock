@@ -1,10 +1,13 @@
-"""ssh-hosts — the context-only (transport "none") MCP.
+"""ssh-hosts — SSH access through the agent's shell + the list_ssh_hosts tool.
 
 ssh-hosts replaces the community ssh-server wrapper: agents run plain
 ``ssh``/``scp`` from bash against admin-configured instance hosts. The MCP
-contributes NO server process — only instances (authorization + admin UI),
-the dynamic-context host list, per-session key materialization, and
-network_targets. These tests cover each framework seam.
+contributes instances (authorization + admin UI), the dynamic-context host
+list, per-session key materialization, network_targets, and a minimal stdio
+server whose single ``list_ssh_hosts`` tool re-fetches the host list
+mid-session (``GET /v1/agents/{name}/ssh-hosts``). These tests cover each
+framework seam; the context-only (transport "none") mechanism tests below
+use a synthetic manifest — the mechanism outlived ssh-hosts's server flip.
 """
 
 import sys
@@ -42,7 +45,12 @@ def test_shipped_manifest_parses():
     m = _parse_manifest(path)
     assert m is not None
     assert m.name == "ssh-hosts"
-    assert m.server.transport == "none" and m.server.runtime == "none"
+    # A minimal stdio server backs the list_ssh_hosts lookup tool; SSH itself
+    # stays plain ssh/scp from bash (no exec-style tool surface).
+    assert m.server.transport == "stdio" and m.server.runtime == "python"
+    # Server + keys + prompt block exist only where key material is
+    # delivered: locally and on admin-paired satellites.
+    assert m.remote_policy == "admin_paired_only"
     assert m.assignment_mode == "explicit"
     assert m.instances and m.instances.delivery == "none"
     assert {f.key for f in m.instances.fields} == {
@@ -71,7 +79,8 @@ def test_context_only_mcp_emits_no_server_entry_locally(monkeypatch, tmp_path):
     assert "ssh-hosts" not in bundles
     if path:  # config written only when other MCPs produced entries
         import json
-        assert "ssh-hosts" not in json.load(open(path)).get("mcpServers", {})
+        written = json.loads(Path(path).read_text())
+        assert "ssh-hosts" not in written.get("mcpServers", {})
 
 
 def test_context_only_mcp_excluded_on_remote(monkeypatch, tmp_path):
@@ -256,3 +265,176 @@ def test_mcp_sync_diff_skips_runtime_none():
         )
     assert to_install == set() and to_update == set()
 
+
+
+# ---------------------------------------------------------------------------
+# remote_policy = "admin_paired_only" — server entry follows the key material
+# ---------------------------------------------------------------------------
+
+
+def _admin_paired_only_manifest(name="ssh-hosts"):
+    fm = _FakeManifest(name)
+    fm.remote_policy = "admin_paired_only"
+    return fm
+
+
+def test_admin_paired_only_included_locally(monkeypatch, tmp_path):
+    from services.mcp import mcp_registry
+    _stub_assembly(
+        monkeypatch, [_admin_paired_only_manifest()],
+        env_by_mcp={"ssh-hosts": {}}, tmp_path=tmp_path,
+    )
+
+    _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
+        "agent", None, is_remote=False,
+    )
+    assert "ssh-hosts" not in excluded
+
+
+def test_admin_paired_only_included_on_admin_paired_remote(monkeypatch, tmp_path):
+    from services.mcp import mcp_registry
+    _stub_assembly(
+        monkeypatch, [_admin_paired_only_manifest()],
+        env_by_mcp={"ssh-hosts": {}}, tmp_path=tmp_path,
+    )
+
+    _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
+        "agent", None, is_remote=True, target_admin_paired=True,
+    )
+    assert "ssh-hosts" not in excluded
+
+
+def test_admin_paired_only_excluded_on_user_paired_remote(monkeypatch, tmp_path):
+    from services.mcp import mcp_registry
+    _stub_assembly(
+        monkeypatch, [_admin_paired_only_manifest()],
+        env_by_mcp={"ssh-hosts": {}}, tmp_path=tmp_path,
+    )
+
+    _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
+        "agent", None, is_remote=True,
+    )
+    assert "ssh-hosts" in excluded
+    assert "admin-paired" in excluded["ssh-hosts"]
+
+
+# ---------------------------------------------------------------------------
+# Shared command renderer (prompt block + endpoint must never drift)
+# ---------------------------------------------------------------------------
+
+
+def test_format_ssh_host_command():
+    from services.mcp.dynamic_context import format_ssh_host_command
+
+    fv = {"name": "prod", "host": "10.0.0.5", "port": "2222",
+          "username": "root", "key_name": "prod_key"}
+    with_mux = format_ssh_host_command(fv, mux=True)
+    assert with_mux == (
+        'ssh -i "$OTO_SSH_KEY_DIR/prod_key" -o StrictHostKeyChecking=accept-new'
+        " -o ControlMaster=auto"
+        ' -o ControlPath="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/oto-cm-%C"'
+        " -o ControlPersist=60s -p 2222 root@10.0.0.5"
+    )
+    no_mux = format_ssh_host_command(fv, mux=False)
+    assert "ControlMaster" not in no_mux
+    # No key / no port / no username → keyless, default port, bare host.
+    assert format_ssh_host_command({"host": "backup.lan"}, mux=False) == (
+        "ssh -o StrictHostKeyChecking=accept-new -p 22 backup.lan"
+    )
+    assert format_ssh_host_command({"name": "x"}, mux=True) is None  # no host
+
+
+def test_provider_block_cross_links_the_tool():
+    from services.mcp.dynamic_context import _ssh_hosts_context
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+        text = _ssh_hosts_context("agent")
+    assert "list_ssh_hosts" in text
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/agents/{name}/ssh-hosts — the endpoint behind list_ssh_hosts
+# ---------------------------------------------------------------------------
+
+
+def _ssh_hosts_app(user):
+    from fastapi import FastAPI
+    from api.mcp import mcps as mcps_api
+    from auth.providers import get_current_user
+
+    app = FastAPI()
+    app.include_router(mcps_api.router)
+    app.dependency_overrides[get_current_user] = lambda: user
+    return app
+
+
+def _session_user(agent="agent"):
+    from auth.providers import UserContext
+    return UserContext(
+        sub="user-1", email="", name="", role="member",
+        is_api_key=True, session_id="sid-1", agent=agent,
+    )
+
+
+def _endpoint_patches(instances):
+    manifest = SimpleNamespace(name="ssh-hosts")
+    return (
+        patch("services.mcp.mcp_registry.get_manifest", return_value=manifest),
+        patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[manifest]),
+        patch("storage.mcp_store.get_mcp_instances_for_agent",
+              return_value=instances),
+    )
+
+
+def test_endpoint_session_caller_gets_hosts_with_commands():
+    from fastapi.testclient import TestClient
+
+    rows = _instances(
+        {"name": "prod", "host": "10.0.0.5", "port": "2222",
+         "username": "root", "key_name": "prod_key"},
+    )
+    p1, p2, p3 = _endpoint_patches(rows)
+    client = TestClient(_ssh_hosts_app(_session_user()))
+    with p1, p2, p3:
+        resp = client.get("/v1/agents/agent/ssh-hosts")
+    assert resp.status_code == 200
+    hosts = resp.json()["hosts"]
+    assert len(hosts) == 1
+    h = hosts[0]
+    assert h["name"] == "prod" and h["key_name"] == "prod_key"
+    assert h["command"].startswith('ssh -i "$OTO_SSH_KEY_DIR/prod_key"')
+    assert "ControlMaster" in h["command"]  # default target_os=linux → mux
+
+
+def test_endpoint_target_os_windows_drops_mux():
+    from fastapi.testclient import TestClient
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    p1, p2, p3 = _endpoint_patches(rows)
+    client = TestClient(_ssh_hosts_app(_session_user()))
+    with p1, p2, p3:
+        resp = client.get("/v1/agents/agent/ssh-hosts?target_os=windows")
+    assert resp.status_code == 200
+    assert "ControlMaster" not in resp.json()["hosts"][0]["command"]
+
+
+def test_endpoint_rejects_wrong_agent_session():
+    from fastapi.testclient import TestClient
+
+    p1, p2, p3 = _endpoint_patches([])
+    client = TestClient(_ssh_hosts_app(_session_user(agent="other-agent")))
+    with p1, p2, p3:
+        resp = client.get("/v1/agents/agent/ssh-hosts")
+    assert resp.status_code == 403
+
+
+def test_endpoint_403_when_not_enabled_for_agent():
+    from fastapi.testclient import TestClient
+
+    manifest = SimpleNamespace(name="ssh-hosts")
+    client = TestClient(_ssh_hosts_app(_session_user()))
+    with patch("services.mcp.mcp_registry.get_manifest", return_value=manifest), \
+         patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[]):
+        resp = client.get("/v1/agents/agent/ssh-hosts")
+    assert resp.status_code == 403

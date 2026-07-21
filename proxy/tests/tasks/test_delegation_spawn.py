@@ -304,7 +304,7 @@ class TestSpawnOverrides:
     def test_overrides_ride_the_task_and_chat_pins(self, client, monkeypatch):
         from storage import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "claude-opus-4-8"}])
+                            lambda p: [{"model_id": "claude-opus-4-8", "enabled": True}])
         r = _spawn(client, surface="chat", model="claude-opus-4-8",
                    layer="claude-code-cli", mode="interactive")
         assert r.status_code == 200
@@ -334,7 +334,7 @@ class TestSpawnOverrides:
     def test_model_foreign_to_layer_400(self, client, monkeypatch):
         from storage import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "other-model"}])
+                            lambda p: [{"model_id": "other-model", "enabled": True}])
         r = _spawn(client, model="gpt-5.4")
         assert r.status_code == 400
         assert client.fired == []
@@ -380,3 +380,61 @@ class TestSpawnOverrides:
         assert task.override_model == "claude-opus-4-8"
         assert task.override_execution_path == "claude-code-cli"
         assert task.override_execution_mode == "interactive"
+
+
+class TestAdoptProject:
+    """POST /v1/delegation/adopt — takeover stamping for board/handoff pickups."""
+
+    def _mk_project(self, project_id="proj-x", owner="user-alice"):
+        lane = str(uuid.uuid4())
+        task_store.create_chat(lane, owner, AGENT, "auto", origin="delegated",
+                               project_id=project_id, delegate_role="worker",
+                               title="old lane")
+        return lane
+
+    def test_adopt_stamps_caller_chat_and_broadcasts(self, client, monkeypatch):
+        from core.session import session_state
+        frames: list[tuple[str, dict]] = []
+        monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                            lambda cid, frame: frames.append((cid, frame)))
+        lane = self._mk_project()
+        r = client.post("/v1/delegation/adopt", json={"project_id": "proj-x"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["chat_id"] == client.parent_chat_id
+        assert [row["id"] for row in data["lanes"]] == [lane]
+        chat = task_store.get_chat(client.parent_chat_id)
+        assert chat["delegate_role"] == "orchestrator"
+        assert chat["project_id"] == "proj-x"
+        assert frames == [(client.parent_chat_id,
+                           {"type": "chat_meta",
+                            "chat_id": client.parent_chat_id,
+                            "delegate_role": "orchestrator",
+                            "project_id": "proj-x"})]
+
+    def test_adopt_is_idempotent(self, client):
+        self._mk_project()
+        assert client.post("/v1/delegation/adopt",
+                           json={"project_id": "proj-x"}).status_code == 200
+        assert client.post("/v1/delegation/adopt",
+                           json={"project_id": "proj-x"}).status_code == 200
+
+    def test_adopt_unknown_project_404(self, client):
+        r = client.post("/v1/delegation/adopt", json={"project_id": "nope"})
+        assert r.status_code == 404
+
+    def test_adopt_foreign_project_404(self, client):
+        # Same slug, different owner pool — invisible, so not adoptable.
+        self._mk_project(owner="user-bob")
+        r = client.post("/v1/delegation/adopt", json={"project_id": "proj-x"})
+        assert r.status_code == 404
+
+    def test_adopt_needs_session_bound_chat(self, client):
+        self._mk_project()
+        client.app_ref.state.user = _cookie_user()
+        r = client.post("/v1/delegation/adopt", json={"project_id": "proj-x"})
+        assert r.status_code == 400
+
+    def test_adopt_rejects_bad_slug(self, client):
+        r = client.post("/v1/delegation/adopt", json={"project_id": "Not A Slug!"})
+        assert r.status_code == 400

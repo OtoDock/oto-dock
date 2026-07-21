@@ -1,5 +1,4 @@
 """Tests for remote machine storage layer."""
-import hashlib
 import pytest
 from contextlib import contextmanager
 from unittest.mock import patch, MagicMock

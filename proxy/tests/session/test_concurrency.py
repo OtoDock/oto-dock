@@ -386,7 +386,6 @@ class TestSwapCredit:
     """
 
     def _credit(self, monkeypatch, swap_mb, cap):
-        import config
         from core import concurrency
         from core.sandbox import host_resources
         monkeypatch.setattr(config, "SESSION_SWAP_CREDIT_MB", cap)

@@ -38,7 +38,8 @@ export interface VoiceControlProps {
   onDictateInterim: (text: string) => void       // input live partial (both modes — feedback)
   onDictateFinal: (text: string) => void          // input committed phrase
   onDictateActive: (active: boolean) => void       // input base snapshot
-  interruptSignal: number                        // bumped on manual send / input focus → stop the mic
+  interruptSignal: number                        // bumped on input focus → stop the mic, KEEP the tail
+  discardSignal: number                          // bumped on manual send → stop the mic, DROP the tail
   disabled?: boolean
 }
 
@@ -46,7 +47,7 @@ type Phase = 'off' | 'listen' | 'flush' | 'await' | 'paused'
 
 export function VoiceControl({
   ttsAvailable, live, onSetLive, speaking, onBargeIn, streaming,
-  onSendText, onClearInput, onDictateInterim, onDictateFinal, onDictateActive, interruptSignal, disabled,
+  onSendText, onClearInput, onDictateInterim, onDictateFinal, onDictateActive, interruptSignal, discardSignal, disabled,
 }: VoiceControlProps) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const errorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -55,6 +56,7 @@ export function VoiceControl({
   const didMountRef = useRef(false)
   const dragRef = useRef<{ x: number; slid: boolean } | null>(null)  // slide-to-enable gesture
   const interruptMounted = useRef(false)
+  const discardMounted = useRef(false)
   const silenceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const endRef = useRef<() => void>(() => {})  // end-of-turn (assigned after `speech`)
 
@@ -137,8 +139,9 @@ export function VoiceControl({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, speaking, streaming, speech.status])
 
-  // A manual send (Enter / Send) or clicking into the input closes the mic — in
-  // live mode it pauses the loop (the user is taking manual control).
+  // Clicking into the input closes the mic — in live mode it pauses the loop
+  // (the user is taking manual control). The tail final still lands in the
+  // input: the user keeps the words they already said and edits them.
   useEffect(() => {
     if (!interruptMounted.current) { interruptMounted.current = true; return }
     clearSilence()
@@ -146,6 +149,17 @@ export function VoiceControl({
     speech.stop()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interruptSignal])
+
+  // A manual send (Enter / Send) closes the mic AND discards the tail: Send
+  // already consumed the input, so a late final/partial from the stop flush
+  // must not re-fill the cleared composer (it used to re-appear ~1-2s later).
+  useEffect(() => {
+    if (!discardMounted.current) { discardMounted.current = true; return }
+    clearSilence()
+    if (live) phaseRef.current = 'paused'
+    speech.stop(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [discardSignal])
 
   // Stop the mic if this control unmounts.
   useEffect(() => () => { clearSilence(); speech.stop() }, [])  // eslint-disable-line react-hooks/exhaustive-deps

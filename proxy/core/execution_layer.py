@@ -6,6 +6,7 @@ execution layers exclusively through this contract.
 """
 
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -325,10 +326,8 @@ class ExecutionLayer(ABC):
         n = reg.pending_count
         if n == 0:
             return 0
-        try:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(reg.wait_all_done(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
         return n
 
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:

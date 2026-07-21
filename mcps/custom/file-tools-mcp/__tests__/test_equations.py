@@ -151,14 +151,14 @@ def test_docx_bad_equation_fails_op_without_leftover_paragraph(tmp_path, _word):
 
 
 def test_pdf_math_span_extraction_rules():
-    from pdf import _extract_math_spans
+    import pdf as pdf_mod
 
     text = (
         "Cost $100 and $200, range $5-$10.\n"
         "Real math $x^2$ and \\(a+b\\) and $$\\frac{1}{2}$$\n"
         "`code $x$ here` and\n```\nblock $y^2$ money\n```\n"
     )
-    replaced, spans = _extract_math_spans(text, is_markdown=True)
+    replaced, spans = pdf_mod._extract_math_spans(text, is_markdown=True)
     latexes = [s[1] for s in spans]
     # Extraction order follows delimiter precedence: $$ / \[ first, then \(, then $
     assert latexes == [r"\frac{1}{2}", "a+b", "x^2"]

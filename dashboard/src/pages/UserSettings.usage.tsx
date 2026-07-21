@@ -79,7 +79,7 @@ export function UsageSection() {
       </div>
 
       {/* Daily chart */}
-      {usage.daily_chart && usage.daily_chart.length > 0 && (
+      {usage.daily_chart.length > 0 && (
         <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4 mb-4">
           <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-3">Daily Usage (30 days)</div>
           <div className="h-40">
@@ -100,7 +100,7 @@ export function UsageSection() {
       )}
 
       {/* Agent breakdown */}
-      {usage.agent_breakdown && usage.agent_breakdown.length > 0 && (
+      {usage.agent_breakdown.length > 0 && (
         <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4">
           <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-3">By Agent (This Month)</div>
           <div className="space-y-2">

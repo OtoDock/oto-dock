@@ -45,6 +45,7 @@ at ``proxy/core/stdio_path_interceptor.py`` and is vendored to the satellite via
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -484,10 +485,8 @@ def _pump_inbound(
                 mcp_stdin.flush()
             except (BrokenPipeError, OSError):
                 break
-    try:
+    with contextlib.suppress(BrokenPipeError, OSError):
         mcp_stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
 
 
 def _pump_outbound(

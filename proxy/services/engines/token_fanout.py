@@ -37,6 +37,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+import contextlib
 
 logger = logging.getLogger("claude-proxy.token-fanout")
 
@@ -321,8 +322,6 @@ async def stop_worker() -> None:
     if _worker_task is None:
         return
     _worker_task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await _worker_task
-    except asyncio.CancelledError:
-        pass
     _worker_task = None

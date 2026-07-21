@@ -17,8 +17,8 @@ Covered:
    bg-thread events, so older ones leave supervision off (no spurious nudge).
 """
 import asyncio
+import contextlib
 
-from core.events.common_events import SUBAGENT_END
 from core.layers.codex.layer import CodexEventTranslator
 from core.layers.codex.session import CodexEvent
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
@@ -71,10 +71,8 @@ def test_router_demuxes_main_and_sub_threads():
             assert info.thread_consumers[SUB].qsize() == 1
         finally:
             router.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await router
-            except (asyncio.CancelledError, Exception):
-                pass
 
     asyncio.run(run())
 
@@ -98,10 +96,8 @@ def test_router_captures_codex_thread_id_marker():
             assert SUB in info.thread_consumers
         finally:
             router.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await router
-            except (asyncio.CancelledError, Exception):
-                pass
 
     asyncio.run(run())
 
@@ -115,8 +111,10 @@ def test_router_fans_out_session_ended_sentinel():
         info.event_queue.put_nowait(None)  # satellite session_ended sentinel
         await asyncio.wait_for(router, timeout=2)  # router returns after fan-out
         # Every waiter gets the sentinel so none hang on a terminal that never comes.
-        assert info.default_consumer.get_nowait() is None
-        assert info.thread_consumers[SUB].get_nowait() is None
+        default_sentinel = info.default_consumer.get_nowait()
+        assert default_sentinel is None
+        thread_sentinel = info.thread_consumers[SUB].get_nowait()
+        assert thread_sentinel is None
 
     asyncio.run(run())
 

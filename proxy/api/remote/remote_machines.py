@@ -11,6 +11,7 @@ These two routes are intentionally unauthenticated — the pairing token in
 the install command is the auth.
 """
 
+import contextlib
 import hashlib
 import io
 import logging
@@ -44,6 +45,26 @@ def _merge_live_status(machine: dict) -> dict:
 
 logger = logging.getLogger("claude-proxy.remote-machines")
 router = APIRouter()
+
+
+def _kick_presync(machine_id: str, agent_slug: str) -> None:
+    """W3 (sync-performance): fire-and-forget workspace warm for a freshly
+    ENABLED (machine, agent) pairing, so the first chat starts against a
+    warm (or in-progress) tree instead of paying the whole initial transfer
+    inline. Harmless + idempotent (per-(machine, agent) sync lock inside);
+    offline machines no-op (the reconnect catch-up covers them)."""
+    import asyncio
+
+    async def _run() -> None:
+        try:
+            from core.remote.remote_execution import get_remote_layer
+            await get_remote_layer().presync_machine_agent(machine_id, agent_slug)
+        except Exception:
+            logger.exception(
+                "enable pre-sync failed for %s/%s", machine_id[:8], agent_slug,
+            )
+
+    asyncio.create_task(_run())
 
 
 # --- Satellite installer assets ---
@@ -1099,6 +1120,7 @@ async def assign_agent(
         machine_id=machine_id,
         added_by=user.sub,
     )
+    _kick_presync(machine_id, body.agent_slug)
     return {"ok": True}
 
 
@@ -1339,10 +1361,8 @@ async def _trigger_self_uninstall(machine_id: str) -> None:
         # machine was deleted (fallback path if uninstall message somehow
         # didn't arrive — satellite's WS client handles 4006 by running
         # self-uninstall too, belt-and-suspenders).
-        try:
+        with contextlib.suppress(Exception):
             await conn.ws.close(code=4006, reason="machine_deleted")
-        except Exception:
-            pass
         await cm.deregister(machine_id)
     except Exception:
         logger.exception(
@@ -1419,6 +1439,7 @@ async def set_my_per_agent_target(
         remote_store.set_user_remote_target(u.sub, body.machine_id, agent_slug)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _kick_presync(body.machine_id, agent_slug)
     return {"ok": True}
 
 

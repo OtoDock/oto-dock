@@ -8,6 +8,7 @@ RemoteExecutionLayer; split out of remote_execution.py.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -202,19 +203,15 @@ class RemoteBgSubagentMixin:
         a dead sub-agent). Idempotent. Mirrors the LOCAL _teardown_bg."""
         if info.router_task is not None:
             info.router_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await info.router_task
-            except (asyncio.CancelledError, Exception):
-                pass
             info.router_task = None
         sups = list(info.bg_supervisors.items())
         for _sub_tid, task in sups:
             task.cancel()
         for sub_tid, task in sups:
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
             # A cancelled supervisor's own finally already resolved it; this is
             # the idempotent backstop for one that never reached its finally.
             self._resolve_remote_bg_subagent(info, sub_tid)

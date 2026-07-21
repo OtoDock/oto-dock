@@ -33,8 +33,12 @@ def cascade(temp_db, monkeypatch):
         adapter_type = "fake"
 
         def __init__(self, server):
-            self.server = server
-            self.server_id = server["id"]
+            super().__init__(
+                server,
+                credential_resolver=lambda suffix: {},
+                media_endpoint="127.0.0.1:40000",
+                register_endpoint="127.0.0.1:8600",
+            )
 
         async def health_check(self):
             return phone_adapters.HealthStatus(healthy=True, detail="ok")
@@ -62,7 +66,7 @@ def cascade(temp_db, monkeypatch):
             if state.fail_deprovision:
                 raise phone_adapters.PhoneAdapterError("deprovision boom")
 
-    monkeypatch.setattr(phone_adapters, "load_adapter", lambda server: FakeAdapter(server))
+    monkeypatch.setattr(phone_adapters, "load_adapter", FakeAdapter)
 
     app = FastAPI()
     app.include_router(phone_router.router)

@@ -25,6 +25,7 @@ from __future__ import annotations
 import array
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import math
@@ -74,6 +75,17 @@ _SILENCE_GATE_RMS = 300
 # so soft trailing syllables aren't zeroed mid-word.
 _GATE_HANGOVER_S = 0.6
 
+# Cumulative voiced audio-time required before ``_voiced_since_commit`` arms.
+# A single frame over the RMS gate (a breath, a chair creak — dictation
+# chunks are ~85 ms) used to arm the guard on its own, and Scribe's VAD then
+# emitted a tiny "voiced" commit holding only a hallucinated filler (observed
+# live: trailing "Okay." after the sentence ended). Any real word accumulates
+# well past this; a lone breath frame no longer unlocks a filler-only commit,
+# so the silence-only drop path swallows it. Pass-through frames (gate
+# disabled, non-pcm16) still arm instantly — the guard must never drop audio
+# it didn't inspect.
+_MIN_VOICED_ARM_S = 0.12
+
 
 def _to_elevenlabs_lang(tag: str | None) -> str | None:
     """BCP-47 → ISO 639-1 (``el-GR`` → ``el``); ``multi``/empty → ``None``
@@ -114,6 +126,7 @@ class ElevenLabsSTT(STTProvider):
         self._silence_gate_rms = silence_gate_rms
         self._gate_hangover_left = 0.0
         self._voiced_since_commit = False
+        self._voiced_time_since_commit = 0.0
         self._ws: websockets.ClientConnection | None = None
         self._reader_task: asyncio.Task | None = None
         self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -261,6 +274,7 @@ class ElevenLabsSTT(STTProvider):
         self._last_interim_sent = ""
         self._gate_hangover_left = 0.0
         self._voiced_since_commit = False
+        self._voiced_time_since_commit = 0.0
         self._fatal_error = None
         self._transcript_queue = asyncio.Queue()
         self._transcript_ready.clear()
@@ -301,6 +315,7 @@ class ElevenLabsSTT(STTProvider):
                     text = (msg.get("text") or "").strip()
                     voiced = self._voiced_since_commit
                     self._voiced_since_commit = False  # commit consumed the buffer
+                    self._voiced_time_since_commit = 0.0
                     if text and not voiced:
                         # The dropped text is still a transcript (Rule #1) —
                         # only the DEBUG-gated policy path may carry it.
@@ -355,10 +370,13 @@ class ElevenLabsSTT(STTProvider):
         so soft trailing syllables survive.
 
         Also tracks ``_voiced_since_commit`` for the hallucination guard:
-        pass-through frames (gate disabled, non-pcm16) count as voiced so the
-        guard can never drop audio it didn't inspect; hangover frames don't
-        set it on their own — they only ever follow a voiced frame within the
-        same uncommitted segment."""
+        pass-through frames (gate disabled, non-pcm16) count as voiced
+        INSTANTLY so the guard can never drop audio it didn't inspect;
+        inspected voiced frames arm only after ``_MIN_VOICED_ARM_S`` of
+        cumulative voiced audio, so a lone breath frame over the RMS gate
+        can't unlock a filler-only commit; hangover frames don't count on
+        their own — they only ever follow a voiced frame within the same
+        uncommitted segment."""
         if not chunk:
             return chunk
         if self._silence_gate_rms <= 0 or len(chunk) % 2:
@@ -369,7 +387,9 @@ class ElevenLabsSTT(STTProvider):
         rms = math.sqrt(sum(x * x for x in samples) / len(samples))
         if rms >= self._silence_gate_rms:
             self._gate_hangover_left = _GATE_HANGOVER_S
-            self._voiced_since_commit = True
+            self._voiced_time_since_commit += duration_s
+            if self._voiced_time_since_commit >= _MIN_VOICED_ARM_S:
+                self._voiced_since_commit = True
             return chunk
         if self._gate_hangover_left > 0:
             self._gate_hangover_left -= duration_s
@@ -424,10 +444,8 @@ class ElevenLabsSTT(STTProvider):
 
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
         self._transcript_ready.clear()
-        try:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._transcript_ready.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
         return self.drain_transcript()
 
     def clear_queue(self) -> None:
@@ -465,10 +483,8 @@ class ElevenLabsSTT(STTProvider):
             self._reader_task.cancel()
             self._reader_task = None
         if self._ws is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await self._ws.close()
-            except Exception:
-                pass
             self._ws = None
 
     # ── Lifecycle hooks ────────────────────────────────────────────
@@ -479,10 +495,8 @@ class ElevenLabsSTT(STTProvider):
         if self._is_open:
             self.clear_queue()
             return True
-        try:
+        with contextlib.suppress(Exception):
             await self.close()
-        except Exception:
-            pass
         try:
             await self.start(
                 language=language, sample_rate=self._active_rate,

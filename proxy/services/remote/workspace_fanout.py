@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import contextlib
 
 logger = logging.getLogger("claude-proxy.workspace-fanout")
 
@@ -407,10 +408,8 @@ async def _atomic_write_agent_file(
             # EDQUOT / ENOSPC: drop the orphan .partial (manifest-invisible →
             # would leak quota) and re-raise so the caller surfaces the failed
             # write instead of falsely converging sync state.
-            try:
+            with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             raise
     await asyncio.to_thread(_write)
 

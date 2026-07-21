@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.2.0
+OTODOCK_VERSION=1.3.0
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
@@ -38,8 +38,8 @@ UV_VERSION=0.11.24
 NPM_VERSION=11.16.0
 PNPM_VERSION=11.9.0
 SYMPY_VERSION=1.14.0
-CLAUDE_CODE_VERSION=2.1.206
-CODEX_VERSION=0.144.1
+CLAUDE_CODE_VERSION=2.1.215
+CODEX_VERSION=0.144.6
 GH_VERSION=2.94.0
 BUBBLEWRAP_VERSION=0.6.1
 BUBBLEWRAP_MIN_VERSION=0.6.0

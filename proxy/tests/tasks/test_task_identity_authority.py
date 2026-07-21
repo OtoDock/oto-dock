@@ -22,7 +22,6 @@ The four caller classes under test:
 Run: cd proxy && python -m pytest tests/tasks/test_task_identity_authority.py -v
 """
 
-import os
 import sys
 
 import pytest

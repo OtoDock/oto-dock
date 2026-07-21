@@ -7,7 +7,6 @@ interpreter + path so the proxy's local bwrap paths can reuse it.
 """
 
 import sys
-from pathlib import Path
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
 if str(_PROXY_DIR) not in sys.path:

@@ -6,6 +6,7 @@ run in parallel. All responses go to a shared transcript visible to everyone.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -870,10 +871,11 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
         # the chat's pump registration.
         existing_pump = _active_pumps.get(parent_chat_id)
         if existing_pump and not existing_pump.is_done:
-            try:
+            # Keep TimeoutError + Exception (a doomed prior pump must not block
+            # the failure path) but let CancelledError propagate — swallowing it
+            # would keep a superseded/aborted meeting running.
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(existing_pump._task, timeout=120.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass
             await asyncio.sleep(0.5)
 
         pump_session_id = "meeting-" + meeting_id
@@ -970,10 +972,11 @@ async def start_meeting(meeting_id: str) -> None:
         parent_session_id = existing_pump.session_id or ""
     if existing_pump and not existing_pump.is_done:
         logger.info(f"Meeting {meeting_id}: waiting for existing pump on {parent_chat_id[:8]} to finish")
-        try:
+        # Keep TimeoutError + Exception (a doomed prior pump must not block
+        # meeting setup) but let CancelledError propagate — swallowing it would
+        # keep a superseded/aborted meeting running.
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
             await asyncio.wait_for(existing_pump._task, timeout=120.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            pass
         # Brief pause for WS to process pump_ended
         await asyncio.sleep(0.5)
 
@@ -1092,10 +1095,8 @@ async def start_meeting(meeting_id: str) -> None:
             layer = _meeting_session_layers.pop(sid, None)
             if layer is None:
                 continue  # never reached start_session — nothing to close
-            try:
+            with contextlib.suppress(Exception):
                 await layer.close_session(sid)
-            except Exception:
-                pass
         release_meeting_slots(all_sids)
         await _notify_meeting_failed(
             meeting_id,

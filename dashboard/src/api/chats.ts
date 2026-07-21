@@ -156,7 +156,10 @@ export function useDeleteChat() {
   return useMutation({
     mutationFn: async (chatId: string) => {
       const res = await apiFetch(`/v1/chats/${chatId}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete chat')
+      if (!res.ok) {
+        const detail = await res.json().then(d => d?.detail).catch(() => '')
+        throw new Error(detail || `Failed to delete chat (HTTP ${res.status})`)
+      }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['chats'] })

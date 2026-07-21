@@ -19,6 +19,7 @@ class SetupRequest(BaseModel):
     email: str
     password: str
     display_name: str
+    origin: str = ""  # window.location.origin — first-run DASHBOARD_PUBLIC_URL capture
 
 
 @router.post("/auth/setup")
@@ -108,8 +109,29 @@ async def setup_first_user(req: SetupRequest):
         "is_owner": True, "must_change_password": False,
     }
 
+    # First-run DASHBOARD_PUBLIC_URL capture: the wizard runs on the TRUE
+    # origin the admin browses from, and document preview (Collabora) only
+    # works on the ONE configured origin. Never overwrites an explicit value.
+    dashboard_url_captured = False
+    if req.origin:
+        try:
+            import config as app_config
+            dashboard_url_captured = await asyncio.to_thread(
+                app_config.capture_dashboard_public_url, req.origin,
+            )
+            if dashboard_url_captured:
+                logger.info(
+                    "Setup wizard: captured DASHBOARD_PUBLIC_URL=%s",
+                    req.origin.strip().rstrip("/"),
+                )
+        except Exception:
+            logger.exception("Setup wizard: origin capture failed (non-fatal)")
+
     token = create_session_jwt(sub, email, display_name, "admin", auth_provider="local")
-    response = JSONResponse(content={"user": user_data})
+    response = JSONResponse(content={
+        "user": user_data,
+        "dashboard_url_captured": dashboard_url_captured,
+    })
     apply_session_cookie(response, token)
     logger.info(f"Setup wizard: created owner admin {email}")
     return response

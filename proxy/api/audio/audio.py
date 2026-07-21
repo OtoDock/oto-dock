@@ -12,6 +12,7 @@ this router owns everything "audio".
 """
 
 import asyncio
+import contextlib
 import io
 import logging
 import wave
@@ -745,10 +746,8 @@ async def tts_generate(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS generation failed: {e}")
     finally:
-        try:
+        with contextlib.suppress(Exception):
             await provider.close()
-        except Exception:
-            pass
 
     pcm = b"".join(pcm_parts)
     if not pcm:

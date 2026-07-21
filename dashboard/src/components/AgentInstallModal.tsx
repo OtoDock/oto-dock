@@ -13,7 +13,7 @@
  *   silently up to 3 times.
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateAgent } from '../api/agents'

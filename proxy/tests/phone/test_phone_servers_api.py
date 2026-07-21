@@ -40,7 +40,8 @@ def test_create_first_is_default(client):
 def test_set_default_moves(client):
     s1 = client.post("/v1/admin/phone-servers", json={"name": "pbx1"}).json()
     s2 = client.post("/v1/admin/phone-servers", json={"name": "pbx2"}).json()
-    assert client.put(f"/v1/admin/phone-servers/{s2['id']}/default").status_code == 200
+    resp = client.put(f"/v1/admin/phone-servers/{s2['id']}/default")
+    assert resp.status_code == 200
     servers = {x["id"]: x for x in client.get("/v1/admin/phone-servers").json()["servers"]}
     assert servers[s1["id"]]["is_default"] is False
     assert servers[s2["id"]]["is_default"] is True
@@ -48,7 +49,8 @@ def test_set_default_moves(client):
 
 def test_ami_secret_set_status_and_delete(client):
     s = client.post("/v1/admin/phone-servers", json={"name": "pbx"}).json()
-    assert client.put(f"/v1/admin/phone-servers/{s['id']}/ami-secret", json={"value": "topsecret"}).status_code == 200
+    resp = client.put(f"/v1/admin/phone-servers/{s['id']}/ami-secret", json={"value": "topsecret"})
+    assert resp.status_code == 200
     fetched = client.get("/v1/admin/phone-servers").json()["servers"][0]
     assert fetched["ami_secret_configured"] is True
     # The secret must NOT be echoed back on the row.

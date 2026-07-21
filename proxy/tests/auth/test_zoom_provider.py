@@ -20,7 +20,6 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from auth.oauth_providers import get_provider
-from auth.oauth_providers.base import TokenSet
 from auth.oauth_providers.zoom import ZoomOAuthProvider
 
 

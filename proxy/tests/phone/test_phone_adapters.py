@@ -11,7 +11,6 @@ import asyncio
 
 import pytest
 
-from services.phone import phone_adapters
 from services.phone.phone_adapters import (
     BootstrapResult,
     HealthStatus,

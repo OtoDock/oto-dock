@@ -15,7 +15,6 @@ ServerRequest/response shapes:
 No daemon / no DB — pure logic.
 """
 
-import os
 import sys
 
 import pytest

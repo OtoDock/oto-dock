@@ -143,8 +143,10 @@ def _resolve_template(
     for key, val in replacements.items():
         result = result.replace(key, val)
 
-    # Cross-MCP config references: ${config:mcp_name:key}
-    for match in re.finditer(r'\$\{config:([^:}]+):([^}]+)\}', result):
+    # Cross-MCP config references: ${config:mcp_name:key}. Possessive
+    # quantifiers — an unclosed reference can't match by backtracking, so
+    # giving characters back is pure ReDoS surface.
+    for match in re.finditer(r'\$\{config:([^:}]++):([^}]++)\}', result):
         ref_mcp, ref_key = match.group(1), match.group(2)
         ref_val = mcp_store.get_mcp_config_values(ref_mcp).get(ref_key, "")
         result = result.replace(match.group(0), ref_val)

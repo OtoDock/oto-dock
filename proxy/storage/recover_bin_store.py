@@ -24,6 +24,7 @@ The pooled connection commits on clean context exit (see ``storage/pg.py``), so
 no explicit ``conn.commit()`` is needed.
 """
 
+import contextlib
 import hashlib
 import logging
 import uuid
@@ -264,10 +265,8 @@ def capture(
         # Roll back the on-disk bytes so we don't leak an orphan file.
         logger.exception("recover-bin: insert failed for %s/%s",
                          agent_slug, rel_path)
-        try:
+        with contextlib.suppress(OSError):
             dest.unlink()
-        except OSError:
-            pass
         return None
 
     return {
@@ -346,10 +345,8 @@ def delete(entry_id: str) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM recover_bin WHERE entry_id=%s", (entry_id,))
     if entry is not None:
-        try:
+        with contextlib.suppress(OSError):
             _entry_path(entry["agent_slug"], entry_id).unlink()
-        except OSError:
-            pass
 
 
 def delete_expired() -> int:
@@ -374,15 +371,11 @@ def delete_expired() -> int:
     touched_dirs = set()
     for row in rows:
         path = _entry_path(row["agent_slug"], row["entry_id"])
-        try:
+        with contextlib.suppress(OSError):
             path.unlink()
-        except OSError:
-            pass
         touched_dirs.add(path.parent)
     # Prune now-empty per-agent dirs (rmdir only succeeds when empty).
     for d in touched_dirs:
-        try:
+        with contextlib.suppress(OSError):
             d.rmdir()
-        except OSError:
-            pass
     return len(rows)

@@ -14,8 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 openpyxl = pytest.importorskip("openpyxl")
 
-import excel as excel_mod
-from excel import read_xlsx
+from excel import _anchor_cell, _describe_anchor, handle_write_xlsx, read_xlsx
 
 
 @pytest.fixture(autouse=True)
@@ -23,12 +22,12 @@ def _no_proxy(monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr(excel_mod, "_resolve_path", lambda p, writing=False: p)
-    monkeypatch.setattr(excel_mod, "_push_preview", _noop_preview)
+    monkeypatch.setattr("excel._resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr("excel._push_preview", _noop_preview)
 
 
 def _write(args: dict) -> str:
-    return asyncio.run(excel_mod.handle_write_xlsx(args))
+    return asyncio.run(handle_write_xlsx(args))
 
 
 def _make_wb(path: Path, cells: dict[str, object], sheet_ops=None):
@@ -299,7 +298,7 @@ def test_anchor_cell_normalizer_all_shapes(tmp_path):
     )
 
     # Plain string (image added in the current batch)
-    assert excel_mod._anchor_cell(SimpleNamespace(anchor="b2")) == (2, 2)
+    assert _anchor_cell(SimpleNamespace(anchor="b2")) == (2, 2)
     # OneCellAnchor as produced by a real save+load round-trip
     from openpyxl.drawing.image import Image as XlImage
 
@@ -308,15 +307,15 @@ def test_anchor_cell_normalizer_all_shapes(tmp_path):
     wb.active.add_image(XlImage(str(_png(tmp_path))), "C5")
     wb.save(f)
     loaded = openpyxl.load_workbook(f).active._images[0]
-    assert excel_mod._anchor_cell(loaded) == (3, 5)  # C5, not B4
+    assert _anchor_cell(loaded) == (3, 5)  # C5, not B4
     # TwoCellAnchor (the default shape for user-inserted pictures)
     tca = TwoCellAnchor(
         _from=AnchorMarker(col=2, row=4), to=AnchorMarker(col=4, row=6)
     )
-    assert excel_mod._anchor_cell(SimpleNamespace(anchor=tca)) == (3, 5)
-    assert excel_mod._describe_anchor(SimpleNamespace(anchor=tca))[0] == "C5"
+    assert _anchor_cell(SimpleNamespace(anchor=tca)) == (3, 5)
+    assert _describe_anchor(SimpleNamespace(anchor=tca))[0] == "C5"
     # AbsoluteAnchor (no cell) — must not raise
-    assert excel_mod._anchor_cell(SimpleNamespace(anchor=AbsoluteAnchor())) is None
+    assert _anchor_cell(SimpleNamespace(anchor=AbsoluteAnchor())) is None
 
 
 def test_equation_image_and_comment_survive_second_write(tmp_path):
@@ -419,7 +418,7 @@ def test_add_equation_on_merged_range_uses_anchor(tmp_path):
     wb = openpyxl.load_workbook(f)
     ws = wb.active
     assert ws["A1"].comment is not None and "e=mc^2" in ws["A1"].comment.text
-    assert excel_mod._anchor_cell(ws._images[0]) == (1, 1)
+    assert _anchor_cell(ws._images[0]) == (1, 1)
 
 
 def test_chart_bearing_workbook_warns_on_edit(tmp_path):

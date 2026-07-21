@@ -5,6 +5,8 @@ Part of the ``storage.database`` facade; import names from
 synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
+import contextlib
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -363,6 +365,82 @@ def claim_pending_history_seed(chat_id: str) -> str:
         return row["pending_history_seed"] if row else ""
 
 
+def append_pending_delegate_wake(chat_id: str, wake_prompt: str) -> bool:
+    """Append an undeliverable delegate-result wake to the chat's durable
+    replay store (``chats.pending_delegate_wake`` — a JSON array of rendered
+    wake prompts). Written when every delivery-ladder rung failed; claimed
+    and injected at the chat's next warmup/turn. Row-locked read-modify-write
+    so two concurrent failed deliveries can't drop each other's wake.
+    """
+    if not wake_prompt:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT pending_delegate_wake FROM chats WHERE id = %s FOR UPDATE",
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return False
+        try:
+            wakes = json.loads(row["pending_delegate_wake"] or "[]")
+            if not isinstance(wakes, list):
+                wakes = []
+        except Exception:
+            wakes = []
+        wakes.append(wake_prompt)
+        conn.execute(
+            "UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
+            (json.dumps(wakes), chat_id),
+        )
+        conn.commit()
+        return True
+
+
+def claim_pending_delegate_wake(chat_id: str) -> list[str]:
+    """Atomically claim-and-clear the chat's pending delegate wakes.
+
+    Returns the list of rendered wake prompts (oldest first) or ``[]``. Same
+    single-statement claim shape as ``claim_pending_history_seed`` — exactly
+    one of two racing turns gets the wakes.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """UPDATE chats c SET pending_delegate_wake = ''
+               FROM (SELECT id, pending_delegate_wake FROM chats
+                      WHERE id = %s FOR UPDATE) old
+               WHERE c.id = old.id AND old.pending_delegate_wake <> ''
+               RETURNING old.pending_delegate_wake""",
+            (chat_id,),
+        ).fetchone()
+        conn.commit()
+        if not row:
+            return []
+        try:
+            wakes = json.loads(row["pending_delegate_wake"] or "[]")
+            return [w for w in wakes if isinstance(w, str) and w] \
+                if isinstance(wakes, list) else []
+        except Exception:
+            return []
+
+
+def list_chats_with_pending_wakes(execution_target: str | None = None) -> list[dict]:
+    """Chats holding undelivered delegate wakes (see
+    ``append_pending_delegate_wake``). ``execution_target`` scopes the list to
+    one machine's pinned chats (satellite-reconnect redelivery); None = all —
+    the startup sweep. Claiming stays per-chat and atomic, so this list is a
+    candidate set, not a lock."""
+    q = ("SELECT id, agent, user_sub, session_id, execution_target "
+         "FROM chats WHERE pending_delegate_wake <> ''")
+    params: tuple = ()
+    if execution_target:
+        q += " AND execution_target = %s"
+        params = (execution_target,)
+    with get_conn() as conn:
+        rows = conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+
 def claim_title_generation(chat_id: str) -> bool:
     """Atomically claim the one-time LLM chat-title upgrade.
 
@@ -516,10 +594,8 @@ def delete_chat(chat_id: str) -> bool:
         deleted = cur.rowcount > 0
     if deleted:
         for p in cache_paths:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(p)
-            except OSError:
-                pass
     return deleted
 
 
@@ -618,6 +694,23 @@ def get_last_chat_message_id(chat_id: str) -> int:
     return int(row["m"]) if row and row["m"] is not None else 0
 
 
+def get_last_user_message_author(chat_id: str) -> str:
+    """``author_sub`` of the most recent user message ('' if none/unset).
+
+    Shared-only chats use this to detect a change of hands: when the
+    current sender differs from the previous author, the turn gets a
+    speaker-transition note so the agent doesn't attribute the earlier
+    conversation to the new sender.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT author_sub FROM chat_messages WHERE chat_id=%s AND role='user' "
+            "ORDER BY id DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+    return (row["author_sub"] or "") if row else ""
+
+
 def get_last_todo_snapshot(chat_id: str) -> list[dict]:
     """The most recent TodoWrite checklist snapshot in a chat, for the idle-reload
     panel restore — searched over FULL history so it is independent of the loaded
@@ -629,7 +722,6 @@ def get_last_todo_snapshot(chat_id: str) -> list[dict]:
     throw (Postgres doesn't guarantee predicate short-circuit) — prefilter with a
     LIKE that can't trip a cast, then parse in Python.
     """
-    import json
     with get_conn() as conn:
         row = conn.execute(
             "SELECT event_data FROM chat_messages "
@@ -746,10 +838,8 @@ def sweep_expired_media_tokens() -> int:
         ).fetchall()
         for r in rows:
             if r["cache_owned"]:
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(r["abs_path"])
-                except OSError:
-                    pass
         conn.execute(
             "DELETE FROM media_tokens WHERE expires_at <> '' AND expires_at < %s",
             (now_iso,),
@@ -821,6 +911,31 @@ def get_preview_event_by_snapshot(chat_id: str, snapshot_id: str) -> dict | None
         except ValueError:
             continue
         if data.get("snapshot_id") == snapshot_id and not data.get("dismissed"):
+            return data
+    return None
+
+
+def get_preview_event_by_file(chat_id: str, file_id: str) -> dict | None:
+    """The non-dismissed document_preview event data for a file_id, or None.
+
+    Re-minting a preview URL at render time requires a live reference in the
+    chat — once every instance of a file's preview is dismissed, its URL must
+    not be re-mintable through the chat."""
+    import json as _json
+    if not file_id:
+        return None
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages "
+            "WHERE chat_id=%s AND event_type='document_preview'",
+            (chat_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            data = _json.loads(row["event_data"] or "{}")
+        except ValueError:
+            continue
+        if data.get("file_id") == file_id and not data.get("dismissed"):
             return data
     return None
 

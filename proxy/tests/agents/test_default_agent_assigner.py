@@ -16,12 +16,10 @@ Run: cd proxy && venv/bin/pytest tests/agents/test_default_agent_assigner.py -v
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-import pytest
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)

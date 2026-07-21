@@ -8,7 +8,7 @@
  */
 import { useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import type { ActiveChat } from '../api/chats'
+import type { ActiveChat, Chat } from '../api/chats'
 
 import { useChatStore, getActiveChatIds } from '@/store/chatStore'
 import { useInstallStore } from '@/store/installStore'
@@ -37,7 +37,7 @@ const PER_CHAT_FRAMES = new Set([
   'file', 'document_preview', 'mode_changed', 'model_changed',
   'thinking_changed', 'queued', 'queue_removed', 'queue_sent', 'queue_cleared',
   'queue_snapshot', 'steered', 'question', 'aborted', 'live_state', 'todo_update',
-  'goal_update', 'context_compact', 'chat_rows',
+  'goal_update', 'context_compact', 'chat_rows', 'chat_meta',
   // Interactive CLI (PTY) frames — belong to one chat's terminal.
   'pty_output', 'pty_exit', 'pty_permission', 'pty_artifact', 'pty_status',
   // NOT 'turn_complete' — it is the origin-routed cross-chat end-of-turn
@@ -63,6 +63,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // recovery below never fires.
   const streamingRef = useRef(_streaming)
   streamingRef.current = _streaming
+  // One auto-attach per streaming episode of the viewed chat (chat_status
+  // handler): set synchronously on send, cleared when the chat leaves
+  // streaming — the backend echoes chat_status streaming straight to the
+  // socket that resumes, so deriving this from store state would loop.
+  const autoAttachRef = useRef<string | null>(null)
   // Wrap setStreaming to also notify Android native (controls background wake lock)
   const streaming = _streaming
   const setStreaming = useCallback((value: boolean) => {
@@ -202,6 +207,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       reconnectDelay.current = 1000
       pongReceived.current = true
       missedPongs.current = 0
+
+      // Reconcile install-bar state with the server: drop non-terminal
+      // slices — the connect replay (snapshot_inflight) immediately re-feeds
+      // any install genuinely still running, so this only kills ghosts whose
+      // done/failed frame was lost on a dropped socket (proxy restart
+      // mid-install → "Preparing remote environment…" stuck forever).
+      useInstallStore.getState().clearInFlight()
 
       // Tell backend what platform + IANA timezone we're on. Platform controls
       // ephemeral notification routing; time_zone snapshots onto the session
@@ -449,6 +461,17 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                 execution_target: msg.execution_target,
                 fallback_reason: msg.fallback_reason,
                 turn_open: msg.turn_open,
+                // Pin-vs-current-target mismatch (owner/admin frames only).
+                // null when the fields are absent so a stale mismatch clears
+                // — the fresh warmup after a successful move carries none.
+                target_mismatch: msg.pinned_target && msg.resolved_target
+                  ? {
+                      pinnedTarget: msg.pinned_target,
+                      pinnedLabel: msg.pinned_label || msg.pinned_target,
+                      resolvedTarget: msg.resolved_target,
+                      resolvedLabel: msg.resolved_label || msg.resolved_target,
+                    }
+                  : null,
               })
             }
             cb.onWarmupReady?.(msg)
@@ -490,6 +513,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case 'warmup_failed':
             useChatStore.getState().failWarmup(msg.chat_id, msg.error || 'warmup failed')
             cb.onWarmupFailed?.(msg)
+            break
+          case 'chat_moved':
+            // move_chat ack (the op acts on the connection's OPEN chat). The
+            // consumer re-resumes the chat so the fresh warmup runs on the
+            // new target and the "moved" history card arrives. Failures come
+            // as standard error frames instead.
+            cb.onChatMoved?.(msg)
             break
           // ── Install lifecycle (keyed by machine_id + agent, NOT chat_id) ──
           case 'install_started':
@@ -625,7 +655,23 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             if (msg.chat_id) {
               if (msg.status === 'streaming') {
                 useChatStore.getState().setStreaming(msg.chat_id)
+                // Auto-attach: a pump started server-side on the chat this
+                // socket is ALREADY viewing (delegate echo, queued task run
+                // leaving the park) — the open page never re-attaches on its
+                // own (resume fires only on navigation), so the stream stayed
+                // invisible until a reload.
+                {
+                  const viewed = cb.viewedChatId
+                  if (viewed && msg.chat_id === viewed
+                      && currentChatId.current === viewed
+                      && !streamingRef.current
+                      && autoAttachRef.current !== viewed) {
+                    autoAttachRef.current = viewed
+                    ws.send(JSON.stringify({ type: 'resume_chat', chat_id: viewed }))
+                  }
+                }
               } else {
+                if (autoAttachRef.current === msg.chat_id) autoAttachRef.current = null
                 useChatStore.getState().setReady(msg.chat_id)
                 // A turn just finished somewhere the user isn't looking →
                 // flip the sidebar unread dot immediately (the server row
@@ -679,6 +725,22 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             break
           case 'chat_rows':
             cb.onChatRows?.(msg)
+            break
+          case 'chat_meta':
+            // Orchestrator stamp (project adoption / first delegation): patch
+            // the cached chat rows so the sidebar accent + Dock gate flip
+            // immediately instead of on the chats poll.
+            queryClient.setQueriesData<Chat[]>({ queryKey: ['chats'] }, (old) =>
+              old?.map((c) => (c.id === msg.chat_id
+                ? {
+                    ...c,
+                    ...(msg.delegate_role ? { delegate_role: msg.delegate_role } : {}),
+                    ...(msg.project_id ? { project_id: msg.project_id } : {}),
+                  }
+                : c)))
+            if (msg.chat_id) {
+              queryClient.invalidateQueries({ queryKey: ['chat-project', msg.chat_id] })
+            }
             break
           case 'aborted':
             setStreaming(false)
@@ -955,6 +1017,18 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     [send],
   )
 
+  // "Move this chat to the current target" — rebinds the connection's OPEN
+  // chat to the agent's currently-resolved execution target (the pin is
+  // cleared, a fresh session starts there, history reloads from DB). Acked
+  // with chat_moved; refusals (mid-turn, no mismatch) arrive as standard
+  // error frames.
+  const moveChat = useCallback(
+    () => {
+      send({ type: 'move_chat' })
+    },
+    [send],
+  )
+
   const implementPlan = useCallback(
     (planPath: string, mode = 'acceptEdits') => {
       send({ type: 'implement_plan', plan_path: planPath, mode })
@@ -1167,6 +1241,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     changeThinking,
     implementPlan,
     compactContext,
+    moveChat,
     resetStreaming,
     resumeChat,
     sendChatRead,
@@ -1200,6 +1275,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     changeThinking,
     implementPlan,
     compactContext,
+    moveChat,
     resetStreaming,
     resumeChat,
     sendChatRead,

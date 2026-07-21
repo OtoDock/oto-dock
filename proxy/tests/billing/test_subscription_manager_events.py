@@ -6,7 +6,6 @@ delete behavior. Pure unit tests: stores + relay_client monkeypatched.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 
 import pytest

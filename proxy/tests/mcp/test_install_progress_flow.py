@@ -380,3 +380,242 @@ class _async_ctx:
 
     async def __aexit__(self, *args):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Deterministic-failure memo (_unsatisfiable_installs): a resolver-
+# unsatisfiable install (e.g. MCP needs Python >= 3.11, satellite venv is
+# 3.10) must not be re-attempted on every session — the doomed ~0.5s install
+# re-ran per warmup and flashed the install bar each time. Memo keys on the
+# shipped hash; success / platform change / force all clear it; transient
+# failures are never memoized.
+# ---------------------------------------------------------------------------
+
+_UNSAT_ERR = (
+    "RuntimeError: Using Python 3.10.12 environment at: venv\n"
+    "  x No solution found when resolving dependencies:\n"
+    "  Because the current Python version (3.10.12) does not satisfy "
+    "Python>=3.11 ..."
+)
+
+
+def _memo_env(monkeypatch, *, results, version_hash="hash1"):
+    """Shared mock rig for sync_mcps_for_session memo tests. Returns
+    (fake_cm, plan_events)."""
+    from services.mcp import mcp_sync
+
+    plan_events: list[dict] = []
+
+    async def _plan_cb(ev):
+        plan_events.append(ev)
+
+    fake_cm = MagicMock()
+    fake_cm.is_connected = MagicMock(return_value=True)
+    fake_cm.get_install_lock = MagicMock(return_value=_async_ctx())
+    fake_cm.send_command = AsyncMock(return_value={"results": results})
+    fake_cm.register_install_progress = MagicMock()
+    fake_cm.unregister_install_progress = MagicMock()
+    fake_cm.get_connection = MagicMock(
+        return_value=MagicMock(satellite_version="0.5.100"))
+
+    fake_layer = MagicMock()
+    fake_layer._sessions = {}
+
+    async def _fake_fetch(cm, machine_id):
+        return {}  # nothing installed → music-gen-mcp plans as to_install
+
+    fake_manifest = MagicMock()
+    fake_manifest.server.runtime = "python"
+    fake_manifest.server.source = "local"
+    fake_manifest.category = "custom"
+    fake_manifest.mcp_dir = "/tmp/music-gen-mcp"
+    for f in ("debian", "ubuntu", "rhel", "arch", "macos_brew"):
+        setattr(fake_manifest.system_requirements, f, [])
+    fake_manifest.system_requirements.node_min = ""
+    fake_manifest.system_requirements.notes = ""
+
+    fake_tarball = MagicMock()
+    fake_tarball.tarball_b64 = ""
+    fake_tarball.version_hash = version_hash
+
+    monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _fake_fetch)
+    monkeypatch.setattr(
+        "services.mcp.mcp_registry.get_manifest",
+        lambda name: fake_manifest if name == "music-gen-mcp" else None,
+    )
+    monkeypatch.setattr(
+        "services.mcp.mcp_installer.compute_version_hash",
+        lambda mcp_dir: version_hash,
+    )
+    monkeypatch.setattr(
+        "services.mcp.mcp_tarball.build_tarball", lambda name: fake_tarball,
+    )
+    monkeypatch.setattr(
+        "core.remote.satellite_connection.get_connection_manager",
+        lambda: fake_cm,
+    )
+    monkeypatch.setattr(
+        "core.remote.remote_execution.get_remote_layer", lambda: fake_layer,
+    )
+    monkeypatch.setattr(
+        mcp_sync, "_manifest_to_dict", lambda m: {"name": "music-gen-mcp"},
+    )
+    return fake_cm, _plan_cb, plan_events
+
+
+@pytest.mark.asyncio
+async def test_unsat_failure_memoizes_and_skips_next_sync(monkeypatch):
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch,
+        results={"music-gen-mcp": {"status": "error", "error": _UNSAT_ERR}},
+    )
+
+    r1 = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert "music-gen-mcp" in r1.excluded_names
+    assert not r1.memoized  # first failure was a REAL attempt
+    assert ("machine-1", "music-gen-mcp") in mcp_sync._unsatisfiable_installs
+    assert fake_cm.send_command.await_count == 1
+    assert len(plan_events) == 1
+
+    # Second session: no re-attempt, no plan (→ no install bar), still
+    # excluded so the CLI config strips it, and flagged memoized so the
+    # caller skips the per-session failure frame.
+    r2 = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert r2.ok is True
+    assert "music-gen-mcp" in r2.excluded_names
+    assert "music-gen-mcp" in r2.memoized
+    assert "No solution found" in r2.failed["music-gen-mcp"]
+    assert fake_cm.send_command.await_count == 1  # unchanged
+    assert len(plan_events) == 1  # unchanged
+
+    # Another machine is unaffected by this machine's memo.
+    assert ("machine-2", "music-gen-mcp") not in mcp_sync._unsatisfiable_installs
+    mcp_sync._unsatisfiable_installs.clear()
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_is_not_memoized(monkeypatch):
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch,
+        results={"music-gen-mcp": {"status": "error",
+                                   "error": "network timeout fetching wheel"}},
+    )
+    r1 = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert "music-gen-mcp" in r1.excluded_names
+    assert not mcp_sync._unsatisfiable_installs  # transient → no memo
+    # Next session attempts again.
+    await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert fake_cm.send_command.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_memo_cleared_when_platform_mcp_changes(monkeypatch):
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    mcp_sync._unsatisfiable_installs[("machine-1", "music-gen-mcp")] = {
+        "hash": "OLD_HASH", "error": _UNSAT_ERR,
+    }
+    # Platform now hashes differently → the verdict may differ → retry.
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch, results={"music-gen-mcp": {"status": "ok"}},
+        version_hash="NEW_HASH",
+    )
+    r = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert fake_cm.send_command.await_count == 1
+    assert r.installed == ["music-gen-mcp"]
+    assert not mcp_sync._unsatisfiable_installs  # dropped pre-attempt
+
+
+@pytest.mark.asyncio
+async def test_force_clears_memo_and_retries(monkeypatch):
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    mcp_sync._unsatisfiable_installs[("machine-1", "music-gen-mcp")] = {
+        "hash": "hash1", "error": _UNSAT_ERR,
+    }
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch, results={"music-gen-mcp": {"status": "ok"}},
+    )
+    r = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb, force=True,
+    )
+    assert fake_cm.send_command.await_count == 1
+    assert r.installed == ["music-gen-mcp"]
+    assert not mcp_sync._unsatisfiable_installs
+
+
+@pytest.mark.asyncio
+async def test_successful_install_clears_memo(monkeypatch):
+    # Belt-and-braces: a satellite that somehow installs it (e.g. its venv
+    # python was upgraded and force-retried elsewhere) clears the memo via
+    # the ok branch even if an entry lingered.
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch, results={"music-gen-mcp": {"status": "ok"}},
+        version_hash="hash2",
+    )
+    mcp_sync._unsatisfiable_installs[("machine-1", "music-gen-mcp")] = {
+        "hash": "STALE", "error": _UNSAT_ERR,
+    }
+    await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert not mcp_sync._unsatisfiable_installs
+
+
+@pytest.mark.asyncio
+async def test_memo_cleared_when_satellite_updates(monkeypatch):
+    """A satellite self-update can change installer behavior (e.g. gain the
+    python-floor retry) — a memo recorded under the old version must not
+    mask the fix. The memo keys on satellite_version and re-attempts once
+    the connected version differs."""
+    from services.mcp import mcp_sync
+
+    mcp_sync._unsatisfiable_installs.clear()
+    fake_cm, plan_cb, plan_events = _memo_env(
+        monkeypatch,
+        results={"music-gen-mcp": {"status": "error", "error": _UNSAT_ERR}},
+    )
+    await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s1", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    memo = mcp_sync._unsatisfiable_installs[("machine-1", "music-gen-mcp")]
+    assert memo["satellite_version"] == "0.5.100"
+
+    # Same version → skipped.
+    await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s2", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert fake_cm.send_command.await_count == 1
+
+    # Satellite updated → memo dropped, install re-attempted.
+    fake_cm.get_connection = MagicMock(
+        return_value=MagicMock(satellite_version="0.5.101"))
+    fake_cm.send_command = AsyncMock(
+        return_value={"results": {"music-gen-mcp": {"status": "ok"}}})
+    r = await mcp_sync.sync_mcps_for_session(
+        "machine-1", "s3", ["music-gen-mcp"], plan_cb=plan_cb,
+    )
+    assert fake_cm.send_command.await_count == 1
+    assert r.installed == ["music-gen-mcp"]
+    assert not mcp_sync._unsatisfiable_installs

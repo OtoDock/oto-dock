@@ -99,7 +99,9 @@ def _stage_skill(source: Path, skill_id: str, description: str,
             if p.is_symlink():
                 p.unlink()
         skill_md = staging / "SKILL.md"
-        skill_md.write_text(scrub_frontmatter(skill_md.read_text()))
+        skill_md.write_text(
+            scrub_frontmatter(skill_md.read_text(), origin=str(source))
+        )
     else:
         staging.mkdir(parents=True)
         fm = yaml.safe_dump(
@@ -107,7 +109,7 @@ def _stage_skill(source: Path, skill_id: str, description: str,
              "description": description or f"Platform skill {skill_id}."},
             sort_keys=False, allow_unicode=True, default_flow_style=False,
         )
-        body = scrub_frontmatter(source.read_text())
+        body = scrub_frontmatter(source.read_text(), origin=str(source))
         (staging / "SKILL.md").write_text(f"---\n{fm}---\n\n{body}")
 
 

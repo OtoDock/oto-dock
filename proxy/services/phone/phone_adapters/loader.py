@@ -39,7 +39,6 @@ LOCAL_PBX_ADAPTERS = frozenset({"asterisk_manual", "asterisk_freepbx"})
 def available_adapter_types() -> list[str]:
     """Adapter types an admin may create on THIS install — ``ADAPTER_CLASSES`` minus
     the local-PBX (Asterisk/FreePBX) ones when ``config.LOCAL_PBX_ENABLED`` is false."""
-    import config
     if config.LOCAL_PBX_ENABLED:
         return list(ADAPTER_CLASSES)
     return [t for t in ADAPTER_CLASSES if t not in LOCAL_PBX_ADAPTERS]

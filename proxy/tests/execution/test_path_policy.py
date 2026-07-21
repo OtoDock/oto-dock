@@ -23,7 +23,6 @@ from auth.path_policy import (
     _check_read_path,
     _check_write_path,
     _is_other_users_dir,
-    _resolve_path,
     build_permission_context,
 )
 

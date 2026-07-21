@@ -8,6 +8,7 @@ Lightroom-style editing with research-backed algorithms:
 - Cosine-bell HSL per-color adjustment
 """
 
+import contextlib
 import io
 from pathlib import Path
 
@@ -502,10 +503,8 @@ async def handle_edit_image(args: dict) -> str:
                 norm = arr / (A[np.newaxis, np.newaxis, :] + 1e-7)
                 t_map = 1.0 - strength * np.min(norm, axis=2)
                 t_map = np.clip(t_map, 0.1, 1.0)
-                try:
+                with contextlib.suppress(Exception):
                     t_map = uniform_filter(t_map, size=win * 4)
-                except Exception:
-                    pass
                 t_3d = t_map[:, :, np.newaxis]
                 arr = (arr - A[np.newaxis, np.newaxis, :]) / np.maximum(
                     t_3d, 0.1

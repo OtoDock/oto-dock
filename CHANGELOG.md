@@ -14,6 +14,99 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-21
+
+> **Upgrade note (Docker installs from before 1.2.0):** the compose file now
+> reads operator settings from a `.env` file next to `docker-compose.yml`
+> (older installs used `config.env`). If your settings still live in
+> `config.env`, rename it — `mv config.env .env` — or set
+> `OTODOCK_ENV_FILE=config.env`. Starting without a `.env` file no longer
+> crash-loops: the proxy detects Docker's silently-created directory and
+> stops with instructions naming the exact fix.
+
+### Added
+
+- **The video toolkit.** Agents can now produce finished videos end to end.
+  Three MCPs ship with the platform: **video-gen** (AI footage, transitions
+  and Runway Aleph edits, with your Google / Runway / fal.ai keys),
+  **music-gen** (ElevenLabs music and sound effects) and **tts** (voice-overs
+  via the platform's TTS providers). The **video-tools** editing MCP
+  (timelines, transitions, captions, color grading, FFmpeg rendering) is in
+  the community catalog, installable on any 1.0+ install.
+- **One-command install.** `scripts/install.sh` bootstraps a fresh Docker
+  install end to end: Docker preflight, `.env` generation, the Ubuntu 24.04+
+  AppArmor step, and first start.
+- Chats tell you where they run: a chat stays on the machine it started on,
+  says so when that differs from the agent's current machine, and an
+  owner/admin can move it to the current machine with its conversation
+  reloaded.
+- Delegation: a session can adopt an existing project as its orchestrator,
+  and the delegation tool lists each agent's layers and models so requests
+  are validated instead of failing blind.
+- The SSH MCP can list its authorized hosts mid-session (`list_ssh_hosts`).
+
+### Changed
+
+- Interactive terminal sessions are **enabled by default**, and tool
+  permission prompts are now risk-based: read-only tools never prompt,
+  reversible actions stop prompting in Accept Edits mode, and outward-facing
+  or costly actions always prompt. MCPs without a declared tier keep their
+  old prompting behavior.
+- The installer installs into the directory it is run from, refuses your
+  home directory, and performs fresh installs only, as before.
+- **Per-agent roles decoupled from the platform role**: any non-admin user
+  can hold any per-agent role (manager / editor / viewer).
+- **Shared-only agents bill the person, not the platform**: dashboard chats
+  are attributed to the user whose subscription serves the session, and a
+  shared chat changing hands recycles the live session under the new sender
+  so one user's messages never spend another user's account.
+- Remote agents allowed to run `ssh` can read `~/.ssh/config` and
+  `known_hosts` (private keys stay unreadable, writes stay denied).
+
+### Fixed
+
+- Interactive terminals: the first message into a cold terminal is no longer
+  lost, assistant text no longer duplicates, a dying CLI says "process
+  exited" instead of going blank, opening a terminal no longer overwrites
+  your clipboard, and Codex permission questions show their card in headless
+  mode.
+- Remote machines: replies no longer land one turn late after background
+  work, the first workspace sync shows live progress instead of silent
+  minutes, zero-byte files and folder deletions sync correctly, files on the
+  machine's own disk preview and save reliably, and MCPs that need a newer
+  Python install it instead of failing forever.
+- Delegation: results reliably wake sleeping orchestrators (and are replayed
+  if delivery fails), stopping a worker mid-turn no longer kills its
+  session, and the "Delegated" badge always completes.
+- Documents: previews in older chats no longer show "session expired", and
+  the setup wizard pins document preview to the address you browse from, so
+  fresh installs get a working preview on any origin.
+- Tasks: "Run now" shows an honest queued state and attaches the open chat
+  when streaming starts; `run_task` with `wait: true` works again.
+- Connected Claude accounts keep their plan tier (Max/Pro) across token
+  refreshes, so sessions no longer refuse plan-included models.
+- Voice input no longer appends an invented filler word after you stop
+  speaking.
+- Plus a round of smaller fixes across meetings, chat deletion, skill
+  loading, passkeys, browser-tool contention, and platform shutdown.
+
+### Security
+
+- Interactive terminal sessions enforce the chat's permission mode: in
+  Default mode, file edits, gated shell commands and tool calls prompt in
+  the terminal before running; mode changes made inside the terminal are
+  respected.
+- Display and media hooks are confined to the agent workspace, closing a
+  path that could read arbitrary proxy-host files into the chat.
+- OAuth connect pages escape reflected input and confine post-login
+  redirects; API errors return clean messages and keep exception detail
+  server-side.
+- Template and text regexes are linear-time (ReDoS), the per-session Codex
+  config is written owner-only, and prompt-file loading is confined to the
+  agent tree.
+- Dependency refresh across the proxy and bundled MCP servers — every open
+  Dependabot advisory with an available fix is cleared.
+
 ## [1.2.0] — 2026-07-18
 
 ### Added
@@ -201,7 +294,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/OtoDock/oto-dock/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/OtoDock/oto-dock/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/OtoDock/oto-dock/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/OtoDock/oto-dock/compare/v1.0.2...v1.1.0

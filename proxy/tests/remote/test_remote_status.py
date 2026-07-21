@@ -3,7 +3,6 @@
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 def _fake_conn(last_heartbeat_age_s: float):

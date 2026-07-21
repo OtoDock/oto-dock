@@ -4,6 +4,7 @@ Provides read_xlsx (enhanced with range, formula view, metadata) and
 handle_write_xlsx (27 operations covering full spreadsheet functionality).
 """
 
+import contextlib
 import re
 import uuid
 from copy import copy
@@ -1100,10 +1101,8 @@ async def handle_write_xlsx(args: dict) -> str:
         wb.save(path)
     finally:
         for tmp_path in eq_tmp_files:
-            try:
+            with contextlib.suppress(OSError):
                 Path(tmp_path).unlink()
-            except OSError:
-                pass
     await _push_preview(path)
 
     msg = f"Workbook saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"

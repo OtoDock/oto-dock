@@ -18,7 +18,6 @@ Two guarantees are covered:
 """
 import asyncio
 
-import pytest
 
 from core.events.common_events import SUBAGENT_START, SUBAGENT_END
 from core.layers.codex.layer import CodexEventTranslator

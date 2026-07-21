@@ -38,7 +38,7 @@ dependencies = [
 # installs the lean core and the phone installs ``oto-audio[localmodels]``.
 localmodels = [
     "onnxruntime>=1.23,<2.0",   # Silero VAD + Smart Turn ONNX inference
-    "transformers>=4.57,<5.0",  # Smart Turn mel features (WhisperFeatureExtractor; its config is vendored at models/whisper_feature_extractor/ — offline, HF Hub only as fallback)
+    "transformers>=5.5,<6.0",   # Smart Turn mel features (WhisperFeatureExtractor; its config is vendored at models/whisper_feature_extractor/ — offline, HF Hub only as fallback). >=5.5 clears the model-loading RCE CVEs; our path is numpy-only (no torch) and yields bit-identical mel features on the vendored config across 4.57→5.x.
     "silero-vad-lite==0.2.1",   # exact-pin: runtime-semantics VAD dep
 ]
 # Heavy local PROVIDER engines ship as importable stubs in the core install;

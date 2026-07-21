@@ -11,7 +11,7 @@ import logging
 import config as app_config
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
-    SUBAGENT_START, SUBAGENT_END, SYSTEM, METADATA, DONE, ERROR, TODO_UPDATE,
+    SUBAGENT_START, SUBAGENT_END, METADATA, DONE, ERROR, TODO_UPDATE,
     GOAL_UPDATE, CONTEXT_COMPACT,
 )
 from core.layers.codex.session import CodexEvent
@@ -139,6 +139,12 @@ class CodexEventTranslator:
         # per-turn — no cumulative diffing needed, unlike the exec model).
         self._last_usage: dict = {}
         self._ctx_window: int | None = None
+        # Armed by a compaction (auto or manual, item or legacy notification):
+        # the NEXT tokenUsage carries the post-compaction prompt size, which
+        # the context gauge must show without waiting for the next turn to
+        # complete — a compaction landing at/after turn end otherwise leaves
+        # the gauge (and chats.context_used) at the pre-compaction number.
+        self._await_post_compact_usage = False
         # itemIds whose text/thinking streamed via delta notifications, so the
         # item/completed fallback only fires when nothing streamed.
         self._streamed_text: set[str] = set()
@@ -230,6 +236,16 @@ class CodexEventTranslator:
             usage = params.get("tokenUsage", {})
             self._last_usage = usage.get("last", {}) or {}
             self._ctx_window = usage.get("modelContextWindow")
+            if self._await_post_compact_usage:
+                self._await_post_compact_usage = False
+                post = int(self._last_usage.get("inputTokens", 0) or 0)
+                if post > 0:
+                    # Gauge-only phase: moves the live counter (and the
+                    # persisted chat context) to the compacted size — no chip.
+                    return [CommonEvent(type=CONTEXT_COMPACT, data={
+                        "phase": "usage", "post_tokens": post,
+                        "context_max": int(self._ctx_window or 0),
+                    })]
             return []
 
         if method == "thread/compacted":
@@ -237,6 +253,7 @@ class CodexEventTranslator:
             # app-server now swallows it — the canonical signal is the
             # contextCompaction ITEM handled in _on_item_completed). Same
             # first-class contract as the Claude layer's compact lift.
+            self._await_post_compact_usage = True
             return [CommonEvent(type=CONTEXT_COMPACT, data={
                 "phase": "completed", "trigger": "auto",
             })]
@@ -367,6 +384,7 @@ class CodexEventTranslator:
             # The canonical v2 compaction signal (0.142+: the app-server
             # swallows the deprecated thread/compacted for v2 clients) —
             # auto AND manual compaction both arrive as this item.
+            self._await_post_compact_usage = True
             return [CommonEvent(type=CONTEXT_COMPACT, data={
                 "phase": "completed", "trigger": "auto",
             })]

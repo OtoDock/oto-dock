@@ -11,7 +11,6 @@ contract.
 
 import base64
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 

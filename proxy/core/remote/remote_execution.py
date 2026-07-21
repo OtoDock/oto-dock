@@ -10,6 +10,7 @@ import json
 import logging
 import time
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -19,8 +20,8 @@ from core.execution_layer import ExecutionLayer, AgentConfig, LayerCapabilities
 from core.layers.cli.layer import cli_chunk_to_events
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.layers.cli.settle import (
-    FOREIGN_RESULT_SKIP_CAP,
     FOREIGN_SKIP_SILENCE_S,
+    ForeignSkipGate,
     SettleController,
     chunk_is_content,
     is_foreign_result,
@@ -361,31 +362,18 @@ class RemoteExecutionLayer(
         # mirroring the live-path file_changed applier.
         target_role = getattr(config.security_context, "role", "") or ""
         session_username = getattr(config.security_context, "username", "") or ""
-        try:
-            await self._initial_workspace_sync(
-                machine_id, config.agent_name,
-                target_username=target_username,
-                target_role=target_role,
-                session_username=session_username,
-            )
-        except Exception as e:
-            logger.warning(
-                "Initial workspace sync failed for session %s: %s",
-                session_id[:8], e,
-            )
 
-        # Sync MCPs to the satellite BEFORE starting the CLI. Any failed
-        # install soft-fails and removes that MCP from the session's
-        # config so the CLI doesn't try to spawn a broken stdio server.
-        #
-        # Install progress fans out through ``install_registry`` keyed by
-        # (machine_id, agent_slug) — NOT chat_id. The install is a
-        # satellite-level operation shared across chats: a new chat or a
-        # task run for the same (machine, agent) reuses the same install
-        # slot. Phone + scheduler paths drive the same lifecycle but no
-        # dashboard WS attaches as a listener; events accumulate in the
-        # registry's bounded history and the sweeper drops the entry
-        # after 600s ("fire and drop").
+        # Workspace sync + MCP install share ONE install-registry lifecycle,
+        # keyed by (machine_id, agent_slug) — NOT chat_id: both are
+        # satellite-level operations shared across chats. Registered BEFORE
+        # the workspace sync (it used to cover only the MCP install) so the
+        # sync's progress events ride the same dashboard bar — the initial
+        # sync of a big workspace used to be pure dead air. Any failed MCP
+        # install soft-fails and removes that MCP from the session's config
+        # so the CLI doesn't try to spawn a broken stdio server. Phone +
+        # scheduler paths drive the same lifecycle with no dashboard WS
+        # listener; events accumulate in the registry's bounded history and
+        # the sweeper drops the entry after 600s ("fire and drop").
         from services.mcp import mcp_sync
         from core.remote import install_registry
 
@@ -467,7 +455,36 @@ class RemoteExecutionLayer(
                 "message": ev.get("message", ""),
             })
 
+        async def _sync_progress(done: int, total: int) -> None:
+            # W2 (sync-performance): live workspace-sync progress in the SAME
+            # install bar ("workspace files — N%"). Throttling lives in
+            # _initial_workspace_sync; the started-once defer keeps an
+            # already-synced tree bar-free (no 100% flash).
+            await _emit_install_started_once()
+            await install_registry.emit(machine_id, config.agent_name, {
+                "type": "install_progress",
+                "machine_id": machine_id,
+                "agent": config.agent_name,
+                "mcp": "workspace files",
+                "phase": "syncing",
+                "pct": int(done * 100 / max(total, 1)),
+                "message": f"{done}/{total} files",
+            })
+
         try:
+            try:
+                await self._initial_workspace_sync(
+                    machine_id, config.agent_name,
+                    target_username=target_username,
+                    target_role=target_role,
+                    session_username=session_username,
+                    progress_cb=_sync_progress,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Initial workspace sync failed for session %s: %s",
+                    session_id[:8], e,
+                )
             try:
                 sync_result = await mcp_sync.sync_mcps_for_session(
                     machine_id, session_id, list(assigned_mcps),
@@ -489,6 +506,12 @@ class RemoteExecutionLayer(
                         },
                     )
                     for failed_name in sorted(sync_result.excluded_names):
+                        # Memoized skips attempted nothing this session — a
+                        # lone failure frame outside a started/done lifecycle
+                        # would seed a ghost "installing" bar client-side.
+                        # The exclusion itself (config strip) still applies.
+                        if failed_name in sync_result.memoized:
+                            continue
                         await install_registry.emit(machine_id, config.agent_name, {
                             "type": "mcp_install_failed",
                             "machine_id": machine_id,
@@ -657,6 +680,52 @@ class RemoteExecutionLayer(
             ),
         )
 
+    @staticmethod
+    def _restore_adopted_credentials(
+        session_id: str, machine_id: str, agent_name: str,
+    ) -> None:
+        """Sync (run via ``to_thread``) — the adopt-time counterpart of
+        ``_bind_subscription``. Restores the in-memory subscription binding
+        from its persisted row, re-registers the satellite credential file as
+        a fan-out target, and pushes the CURRENT stored token to repair any
+        rotation the restart window swallowed. Adopt is claude-cli-only, and
+        ``dir_relative`` is recomputed from the persisted SecurityContext's
+        ``mount_username`` with the same rule the spawn used. Best-effort:
+        the adopted turn streams fine without it; only future rotations and
+        seat accounting depend on this."""
+        from core.session.session_state import get_session_security
+        from services.engines import subscription_pool, token_fanout
+        from storage import subscription_store
+        try:
+            sub_id = subscription_pool.restore_session_binding(session_id)
+            if not sub_id:
+                return
+            cred = subscription_store.get_credential_data(sub_id) or {}
+            oauth = cred.get("oauth_token") or {}
+            if not (isinstance(oauth, dict) and oauth.get("accessToken")):
+                return  # API-key subscription — no credential file to rewrite
+            ctx = get_session_security(session_id)
+            mount_username = getattr(ctx, "mount_username", "") if ctx else ""
+            dir_relative = (
+                f"users/{mount_username}/.claude" if mount_username
+                else "workspace/.claude"
+            )
+            token_fanout.register_session_target(
+                session_id,
+                token_fanout.CredentialFileTarget(
+                    kind="claude",
+                    machine_id=machine_id,
+                    agent_name=agent_name,
+                    dir_relative=dir_relative,
+                ),
+            )
+            subscription_pool.fan_out_current_token(sub_id)
+        except Exception:
+            logger.exception(
+                "adopt %s: credential rebind failed (session streams on; "
+                "future rotations may miss it until re-warm)", session_id[:8],
+            )
+
     async def adopt_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
         command_id: str, use_native_permissions: bool = False,
@@ -689,6 +758,15 @@ class RemoteExecutionLayer(
         self._sessions[session_id] = info
         reset_subagent_registry(session_id)
         reset_bg_command_registry(session_id)
+        # Restore the runtime state a spawn would have created: last_active
+        # (idle reaper + /v1/session/current), the in-memory subscription
+        # binding, and the rotation fan-out target — all in-memory-only, so a
+        # re-adopted session would otherwise miss every future token rotation
+        # until its next full re-warm (the GH_TOKEN incident class).
+        _record_session_use(session_id, client_type="", agent=agent_name)
+        await asyncio.to_thread(
+            self._restore_adopted_credentials, session_id, machine_id, agent_name,
+        )
 
         # Ask the satellite to replay. Fire-and-forget: the replay arrives as
         # session_event frames on the queue we just created.
@@ -843,17 +921,24 @@ class RemoteExecutionLayer(
             info.default_consumer = asyncio.Queue()
         else:
             # Drain any stale events left over from a previous aborted turn —
-            # analog of PersistentSession._drain_stale_output on local.
-            drained = 0
+            # analog of PersistentSession._drain_stale_output on local. Log a
+            # bounded type census (never payloads — frames can carry base64
+            # bodies): a swallowed late answer from an orphaned prior turn is
+            # otherwise invisible (queue events buffered satellite-side
+            # between turns arrive AFTER this drain and are handled by the
+            # foreign-skip gate instead).
+            drained: Counter[str] = Counter()
             while True:
                 try:
-                    info.event_queue.get_nowait()
-                    drained += 1
+                    ev = info.event_queue.get_nowait()
+                    drained[(ev or {}).get("type", "?") if isinstance(ev, dict) else "?"] += 1
                 except asyncio.QueueEmpty:
                     break
             if drained:
                 logger.warning(
-                    "Remote session %s: drained %d stale events", session_id[:8], drained,
+                    "Remote session %s: drained %d stale events (types=%s, results=%d)",
+                    session_id[:8], sum(drained.values()), dict(drained),
+                    drained.get("result", 0),
                 )
 
         # Fresh per-turn state for CLI. Codex translator persists across turns
@@ -886,12 +971,25 @@ class RemoteExecutionLayer(
                 "inject_time": inject_time,
             }, command_id=command_id)
         except Exception as e:
-            # If the satellite reports its CLI subprocess is dead, flag the
-            # session so the dashboard's auto-resume path spawns a fresh
-            # one on the next attempt. Catches crash cases that didn't
-            # come through ``abort()``.
+            # If the satellite reports there's no live session to take the
+            # message, flag it so the dashboard's auto-resume path spawns a
+            # fresh one (resumed from the on-disk transcript) on the next
+            # attempt. Two shapes mean the same "no session on the satellite":
+            #   - "CLI process not running": the session object survives but
+            #     its subprocess died (crash / prior abort) — see
+            #     session_manager.send_message.
+            #   - "Session not found": the session object itself is gone from
+            #     the satellite registry — the dominant case after a satellite
+            #     WS drop/reconnect kills and drops in-flight sessions while
+            #     the proxy still holds a stale, connected-looking info (so
+            #     is_session_process_dead read False and let the send through).
+            # Without mapping the latter to cli_dead the chat was bricked:
+            # every resend hit the same dead id and re-raised "Session not
+            # found", never triggering auto-resume. can_resume_session still
+            # RPC-verifies the transcript before issuing --resume, so a truly
+            # unresumable chat reseeds from history rather than resuming blind.
             err_text = str(e)
-            if "CLI process not running" in err_text:
+            if "CLI process not running" in err_text or "Session not found" in err_text:
                 info.cli_dead = True
             yield CommonEvent(type=ERROR, data={"message": err_text})
             yield CommonEvent(type=DONE)
@@ -938,29 +1036,32 @@ class RemoteExecutionLayer(
         assert translator and settle  # invariant: set in send_message
 
         expected_cmd_id = info.current_send_command_id
-        # Foreign-result re-arm state (see settle.is_foreign_result): a
-        # resume-handshake / stale result must not close the driven turn.
-        content_chunks = 0
-        foreign_skips = 0
-        foreign_skip_deadline: float | None = None
+        # Foreign-result skip regime (see settle.ForeignSkipGate): resume
+        # handshake / settlement results must not close the driven turn —
+        # the valve, not a count, ends the regime.
+        gate = ForeignSkipGate(info.session_id, translator)
         while True:
-            timeout = settle.effective_timeout()
-            if foreign_skip_deadline is not None:
-                timeout = min(
-                    timeout,
-                    max(0.5, foreign_skip_deadline - time.monotonic()),
-                )
+            timeout = gate.clamp_timeout(settle.effective_timeout())
             try:
                 raw = await asyncio.wait_for(
                     info.event_queue.get(), timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                if (foreign_skip_deadline is not None
-                        and time.monotonic() >= foreign_skip_deadline
-                        and not settle.settling):
-                    # Silence valve: nothing followed the skipped result —
-                    # it was probably legitimate after all. Close the turn
-                    # instead of hanging it forever.
+                if gate.expired() and not settle.settling:
+                    if self._cm.is_session_in_grace(
+                        info.machine_id, info.session_id,
+                    ):
+                        # WS-drop grace: events are buffering satellite-side
+                        # and Mode A may still deliver the turn — closing
+                        # here would recreate the empty-turn/orphan pair.
+                        # Bounded: grace expiry pushes error+None sentinels
+                        # that close the turn regardless of the valve.
+                        gate.re_arm()
+                        continue
+                    # Silence valve: nothing followed the skip regime — the
+                    # mis-skipped result was probably legitimate after all
+                    # (empty answer / idle CLI). Close the turn instead of
+                    # hanging it forever.
                     logger.warning(
                         "Remote session %s: no events %.0fs after a skipped "
                         "foreign result — closing the turn",
@@ -993,8 +1094,9 @@ class RemoteExecutionLayer(
                 yield CommonEvent(type=DONE)
                 return
 
-            # An event arrived — the post-skip silence valve resets.
-            foreign_skip_deadline = None
+            # An event arrived — slide the post-skip valve (never disarm:
+            # noise must not remove the skip regime's only closer).
+            gate.note_event()
 
             rtype = raw.get("type", "")
             # Stale-turn filter: the satellite tags each CLI turn event with
@@ -1037,33 +1139,32 @@ class RemoteExecutionLayer(
                 yield CommonEvent(type=DONE)
                 return
 
-            # Feed the translator and forward all chunks.
+            # Feed the translator and forward all chunks. Content counts
+            # only from events streamed under THIS command (untagged passes
+            # for old satellites): content-typed stale events deliberately
+            # bypass the stale filter above, and a dying prior process's
+            # junk text must not flip the next zero-content result to
+            # "real" and close the turn on it.
             info.last_activity = time.monotonic()
             for chunk in translator.feed(raw):
-                if chunk_is_content(chunk):
-                    content_chunks += 1
+                if (chunk_is_content(chunk)
+                        and (not ev_cmd or ev_cmd == expected_cmd_id)):
+                    gate.note_content()
                 for event in cli_chunk_to_events(chunk):
                     yield event
 
-            # Result-event book-keeping — turn-end logic.
+            # Result-event book-keeping — turn-end logic. A foreign result
+            # (resume handshake / zero-content settlement mini-turn) never
+            # ends the turn in EITHER mode: interactive must not close on
+            # it, and task mode must not enter settle on it (the job-done
+            # 5s fast-grace would close the turn just the same).
             if rtype == "result":
+                if not settle.settling and is_foreign_result(
+                    raw, gate.content_since_skip,
+                ):
+                    gate.record_skip(raw)
+                    continue
                 if settle.is_interactive_done():
-                    if (foreign_skips < FOREIGN_RESULT_SKIP_CAP
-                            and is_foreign_result(raw, content_chunks)):
-                        # Resume handshake / stale result — the driven
-                        # prompt's turn hasn't run yet. Re-arm.
-                        foreign_skips += 1
-                        foreign_skip_deadline = (
-                            time.monotonic() + FOREIGN_SKIP_SILENCE_S
-                        )
-                        logger.warning(
-                            "Remote session %s: skipping foreign result "
-                            "(content_chunks=%d, skips=%d, result=%r)",
-                            info.session_id[:8], content_chunks,
-                            foreign_skips,
-                            str(raw.get("result", ""))[:80],
-                        )
-                        continue
                     # Interactive chat: no settle — tell satellite to stop.
                     await self._send_stop_turn(info)
                     await self._drain_until_turn_ended(
@@ -1746,6 +1847,65 @@ class RemoteExecutionLayer(
             return False
         return not self._cm.is_session_stream_attached(info.machine_id, session_id)
 
+    async def steer(self, session_id: str, text: str) -> bool:
+        """Mid-turn steering for a REMOTE headless Codex session — tunnel twin
+        of the local layer's ``turn/steer``. Version-gated: an old satellite
+        would silently drop the frame, so return False immediately and let the
+        caller take today's queue fallback. ``steered`` in the ack is strict
+        (True only on daemon accept) — the exactly-once contract the
+        steer-vs-queue branch in dashboard_chat depends on."""
+        info = self._sessions.get(session_id)
+        if not info or info.execution_path != "codex-cli" or not text:
+            return False
+        if not self._cm.supports_codex_thread_ops(info.machine_id):
+            logger.info(
+                "remote steer unsupported by satellite %s (< 0.5.98) — "
+                "falling back to queue", info.machine_id[:8],
+            )
+            return False
+        try:
+            ack = await self._cm.send_command(info.machine_id, {
+                "type": "codex_steer",
+                "session_id": session_id,
+                "text": text,
+            }, timeout=15.0)
+        except RuntimeError as e:
+            logger.warning("remote steer RPC failed for %s: %s", session_id[:8], e)
+            return False
+        return bool(ack.get("steered"))
+
+    async def compact(self, session_id: str) -> dict | None:
+        """Manual context compaction for a REMOTE headless Codex session —
+        tunnel twin of the local layer's ``thread/compact/start`` flow. The
+        satellite runs the whole wait loop (up to ~125s) and acks
+        ``{ok, post_tokens|reason}``; version-gated like ``steer``."""
+        info = self._sessions.get(session_id)
+        if not info or info.execution_path != "codex-cli":
+            return None
+        if not self._cm.supports_codex_thread_ops(info.machine_id):
+            logger.info(
+                "remote compact unsupported by satellite %s (< 0.5.98)",
+                info.machine_id[:8],
+            )
+            return None
+        try:
+            ack = await self._cm.send_command(info.machine_id, {
+                "type": "codex_compact",
+                "session_id": session_id,
+            }, timeout=150.0)
+        except RuntimeError as e:
+            logger.warning(
+                "remote compact RPC failed for %s: %s", session_id[:8], e,
+            )
+            return None
+        if not ack.get("ok"):
+            logger.info(
+                "remote compact refused for %s: %s",
+                session_id[:8], ack.get("reason", "unknown"),
+            )
+            return None
+        return {"post_tokens": ack.get("post_tokens")}
+
     async def prepare_resume(self, session_id: str) -> None:
         # Remove dead session entry so a new start_session can be issued
         info = self._sessions.pop(session_id, None)
@@ -1915,7 +2075,6 @@ class RemoteExecutionLayer(
         # equivalent for the payload env the satellite will inherit into
         # the spawned CLI/Codex process.
         from auth.session_token import create_session_token
-        import config as app_config
         # PROXY_URL points at the satellite's local tunnel server
         # on 127.0.0.1, NOT a public platform endpoint. Subprocess hooks +
         # MCP HTTP traffic ride the existing WS tunnel back to the platform.
@@ -1984,7 +2143,6 @@ class RemoteExecutionLayer(
         # (gpt-5.6 multi-agent orchestration) — the `claude` CLI rejects it,
         # clamp to the ceiling. The Codex branch below overrides effort with
         # its own mapping from the raw value.
-        import config as app_config
         cli_effort = config.effort
         if cli_effort == "ultra":
             cli_effort = "max"
@@ -2080,12 +2238,17 @@ class RemoteExecutionLayer(
                 except Exception:
                     logger.exception("Codex MCP TOML build failed")
             # Enable request_user_input in DEFAULT collaboration mode for remote
-            # dashboard chats (plan mode gets it natively). The shipped remote
-            # config carries only [mcp_servers.*] sections (the header is
-            # local-only), so prepend a standalone [features] block. OFF for
-            # autonomous runs (task/phone/meeting/trigger — nobody answers). An
-            # old satellite writes the extra key through harmlessly.
-            if config.client_type == "dashboard" and payload.get("mcp_config_toml"):
+            # HEADLESS dashboard chats (plan mode gets it natively). The shipped
+            # headless remote config carries only [mcp_servers.*] sections, so a
+            # standalone [features] block is safe there. NEVER for INTERACTIVE:
+            # the satellite's TUI preamble (_build_codex_config_toml) already
+            # emits [features] — with this flag in it — and a second [features]
+            # table is a DUPLICATE KEY the strict TUI hard-exits on (the
+            # "interactive codex terminal is empty" bug; the tolerant app-server
+            # masked it on headless). OFF for autonomous runs (task/phone/
+            # meeting/trigger — nobody answers).
+            if (config.client_type == "dashboard" and not config.interactive
+                    and payload.get("mcp_config_toml")):
                 payload["mcp_config_toml"] = (
                     "[features]\ndefault_mode_request_user_input = true\n\n"
                     + payload["mcp_config_toml"]
@@ -2189,6 +2352,24 @@ from core.remote.remote_mcp_rewrite import (  # noqa: F401
 # Remote session reaper
 # ---------------------------------------------------------------------------
 
+def _idle_session_has_pending_work(
+    sid: str, now: float, idle_timeout: float,
+) -> bool:
+    """Between-turns leash for the idle reaper (mirrors the LOCAL reaper's
+    hook-activity extension): a warm session whose subagent children are
+    still running — e.g. a gracefully-aborted lane whose interrupt resolved
+    the registry but not the child processes — must not be closed under them
+    while hooks still fire. A silent subagent fires no hooks until its Stop —
+    the registry-pending check is the leg that covers that window."""
+    from core.session.session_state import (
+        get_hook_activity, get_subagent_registry,
+    )
+    last_hook = get_hook_activity(sid)
+    if last_hook is not None and now - last_hook <= idle_timeout:
+        return True
+    return get_subagent_registry(sid).has_pending
+
+
 async def reap_idle_remote_sessions() -> None:
     """Background task: reap idle remote sessions periodically."""
     import config as app_config
@@ -2232,6 +2413,12 @@ async def reap_idle_remote_sessions() -> None:
                             to_reap.append(sid)
                         continue
                 if idle > idle_timeout or not connected:
+                    # Between-turns leash, bounded by the CLI turn ceiling so
+                    # a stuck subagent can't pin the session forever.
+                    if (connected and idle <= app_config.CLAUDE_TIMEOUT
+                            and _idle_session_has_pending_work(
+                                sid, now, idle_timeout)):
+                        continue
                     to_reap.append(sid)
 
             for sid in to_reap:

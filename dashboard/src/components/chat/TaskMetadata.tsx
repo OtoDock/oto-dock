@@ -33,7 +33,8 @@ export default function TaskMetadata({ run }: Props) {
 
   const statusColor =
     run.status === 'completed' ? 'bg-green-500' :
-    run.status === 'running' || run.status === 'pending' ? 'bg-yellow-500' :
+    run.status === 'running' ? 'bg-yellow-500' :
+    run.status === 'pending' ? 'bg-indigo-400' :
     run.status === 'failed' ? 'bg-red-500' :
     'bg-gray-400'
 
@@ -42,7 +43,9 @@ export default function TaskMetadata({ run }: Props) {
       {/* Icon button */}
       <button
         onClick={() => setOpen(!open)}
-        title={`Task run: ${run.status}`}
+        title={run.status === 'pending'
+          ? 'Task run: queued — waiting for a free task slot'
+          : `Task run: ${run.status}`}
         className="relative w-10 h-10 rounded-xl bg-white/80 dark:bg-gray-900/80 backdrop-blur-xs border border-p-border-light shadow-xs
                    hover:shadow-md hover:bg-white dark:hover:bg-p-surface transition-all flex items-center justify-center"
       >
@@ -56,6 +59,9 @@ export default function TaskMetadata({ run }: Props) {
         <span className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full ${statusColor} border-2 border-white dark:border-gray-900`}>
           {run.status === 'running' && (
             <span className="absolute inset-0 rounded-full animate-ping bg-yellow-400 opacity-50" />
+          )}
+          {run.status === 'pending' && (
+            <span className="absolute inset-0 rounded-full animate-ping bg-indigo-400 opacity-40" />
           )}
         </span>
       </button>

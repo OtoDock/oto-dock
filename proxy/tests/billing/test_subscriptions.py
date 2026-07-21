@@ -56,7 +56,7 @@ class TestPKCE:
         assert c1 != c2
 
     def test_build_auth_url_contains_required_params(self):
-        from auth.claude_oauth import build_auth_url, CLIENT_ID, REDIRECT_URI
+        from auth.claude_oauth import build_auth_url, CLIENT_ID
 
         url = build_auth_url("test-challenge", "test-state")
         assert "platform.claude.com/oauth/authorize" in url
@@ -149,7 +149,6 @@ class TestTokenExchange:
             # httpx uses content= for pre-serialized body
             content = call_kwargs.kwargs.get("content")
             assert content is not None
-            import json
             body = json.loads(content)
             assert body["grant_type"] == "authorization_code"
             assert body["state"] == "test-state"
@@ -1031,6 +1030,9 @@ class TestOAuthState:
         state = _create_state("user-1", "platform")
         meta = _oauth_states[state]
 
+        # PKCE S256 (RFC 7636): code_challenge = BASE64URL(SHA256(verifier)).
+        # SHA256 is the algorithm the spec mandates here — the verifier is a
+        # one-time high-entropy nonce, not a stored password.
         expected = base64.urlsafe_b64encode(
             hashlib.sha256(meta["code_verifier"].encode()).digest()
         ).rstrip(b"=").decode()
@@ -1468,3 +1470,61 @@ class TestSelectionRebindHooks:
             self._run(api_mod.admin_set_platform_auth(
                 "u2", req, user=self._admin()))
             pool_mock.schedule_rebind.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Restore binding after proxy restart (Mode C re-adopt)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreSessionBinding:
+    def _clear_maps(self):
+        from services.engines import subscription_pool as sp
+        with sp._session_maps_lock:
+            sp._session_subscriptions.clear()
+            sp._session_binding_ctx.clear()
+            sp._session_scope_keys.clear()
+            sp._session_token_expiry.clear()
+
+    def test_restores_maps_and_seat_from_persisted_row(self, temp_db):
+        from services.engines import subscription_pool as sp
+        from storage import subscription_store as store
+
+        sub = store.add_subscription(
+            "claude-code-cli", "anthropic", "oauth", owner_sub="u1",
+            credential_data={"oauth_token": {"accessToken": "at"}},
+        )
+        sp.bind_session("sess-r1", sub["id"], layer="claude-code-cli",
+                        user_sub="u1", scope_key="local:/x")
+        # Simulate restart: in-memory maps die, counters reset.
+        self._clear_maps()
+        store.reset_active_sessions()
+
+        restored = sp.restore_session_binding("sess-r1")
+        assert restored == sub["id"]
+        with sp._session_maps_lock:
+            assert sp._session_subscriptions["sess-r1"] == sub["id"]
+            assert sp._session_binding_ctx["sess-r1"] == ("claude-code-cli", "u1")
+            assert sp._session_scope_keys["sess-r1"] == "local:/x"
+        row = store.get_subscription(sub["id"])
+        assert row["active_sessions"] == 1
+
+    def test_idempotent_when_binding_live(self, temp_db):
+        from services.engines import subscription_pool as sp
+        from storage import subscription_store as store
+
+        sub = store.add_subscription(
+            "claude-code-cli", "anthropic", "oauth", owner_sub="u1",
+            credential_data={},
+        )
+        sp.bind_session("sess-r2", sub["id"])
+        store.reset_active_sessions()
+        # Binding already live in memory: no seat re-take, same id back.
+        assert sp.restore_session_binding("sess-r2") == sub["id"]
+        assert store.get_subscription(sub["id"])["active_sessions"] == 0
+        self._clear_maps()
+
+    def test_no_persisted_row_returns_none(self, temp_db):
+        from services.engines import subscription_pool as sp
+        self._clear_maps()
+        assert sp.restore_session_binding("sess-never-bound") is None

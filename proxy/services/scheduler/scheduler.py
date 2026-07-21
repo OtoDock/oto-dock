@@ -5,6 +5,7 @@ APScheduler. All tasks live in the DB — no filesystem definitions.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -184,6 +185,107 @@ async def _await_lane_quiescence(chat_id: str, *, ceiling_seconds: float = 1800.
             logger.info(f"Delegate delivery waiting on active lane chat {chat_id[:8]}")
             last_heartbeat = now
         await asyncio.sleep(1.0)
+
+
+def _lane_pump_wedged(pump) -> bool:
+    """Can the prior round's open pump still make progress? Healthy live
+    pumps get a quiescence wait instead of a reap — a reap here would cancel
+    a user's in-flight turn on the lane (its producer holds
+    layer.session_lock; the reap shoots the holder)."""
+    sid = pump.session_id
+    from core.session.session_manager import _remote_layer
+    if _remote_layer is not None and sid in _remote_layer._sessions:
+        info = _remote_layer._sessions[sid]
+        return _remote_layer.remote_stream_severed(sid) or info.cli_dead
+    from core.layers.cli.session import _persistent_sessions
+    ps = _persistent_sessions.get(sid)
+    if ps is not None:
+        return ps.proc is None or ps.proc.returncode is not None
+    from core.layers.codex.session import _codex_sessions
+    from core.layers.direct.session import _direct_sessions
+    if sid in _codex_sessions or sid in _direct_sessions:
+        return False
+    # No live session backs the pump at all — orphaned producer.
+    return True
+
+
+async def _settle_prior_lane(chat_id: str, run_id: str) -> bool:
+    """Run-start lane gate: wait out a HEALTHY prior round / user turn (the
+    delivery-side quiescence gate never covered run START — the reap used to
+    cancel live turns), then reap only what is genuinely wedged. Returns True
+    when a reap happened — the round must then respawn, never reuse: a
+    producer-cancel leaves the satellite's per-turn read loop running, so
+    reusing would put two concurrent stdout readers on one CLI, while the
+    respawn path's stale-live guard closes the old process first."""
+    from core.events.stream_pump import _active_pumps
+    prior = _active_pumps.get(chat_id)
+    if prior is None or prior.is_done:
+        return False
+    if not _lane_pump_wedged(prior):
+        await _await_lane_quiescence(chat_id)
+        prior = _active_pumps.get(chat_id)
+        if prior is None or prior.is_done:
+            return False
+    await _reap_prior_lane_pump(chat_id, run_id)
+    return True
+
+
+async def _try_reuse_warm_session(
+    layer, agent_cfg, session_id: str, run_id: str,
+) -> bool:
+    """A2 reuse decision for a delegate continue round: True = drive the turn
+    on the already-alive warm REMOTE session instead of respawning.
+
+    Remote-only: local start_session already reuses an alive process and
+    re-stamps identity/binding internally, but the remote spawn path commands
+    the satellite, whose stale-live guard KILLS the existing CLI (the
+    2026-07-20 incident destroyed a healthy worker mid-round this way).
+    Every fall-through lands on the respawn path — the correct cleanup for
+    dead/reaped/foreign states. Conditions:
+    - the resolved layer is the remote layer, it holds the session alive,
+      no turn in flight, process not known-dead;
+    - the session lives on the machine this run resolved to;
+    - the session was task-spawned (is_task): a dashboard-warmed session on
+      the lane chat runs under the viewer's context/subscription/env — a
+      task round must not ride it."""
+    from core.session import session_state as _state
+    from core.session.session_manager import _remote_layer
+    if _remote_layer is None or layer is not _remote_layer:
+        return False
+    info = _remote_layer._sessions.get(session_id)
+    if info is None or not info.alive or info.cli_dead or info.turn_active:
+        return False
+    if info.machine_id != (agent_cfg.execution_target or ""):
+        return False
+    if not (_state._sessions.get(session_id) or {}).get("is_task"):
+        return False
+    if await _remote_layer.is_session_process_dead(session_id):
+        return False
+    logger.info(
+        f"Task {run_id}: reusing warm remote session {session_id[:8]} "
+        f"on {info.machine_id[:8]} (no respawn)"
+    )
+    return True
+
+
+def _post_run_session_action(chat_row: dict | None) -> tuple[str, bool]:
+    """Map a finished lane turn's abort flags to (final_status, keep_warm).
+
+    A user-stopped lane's session close depends on HOW it stopped. GRACEFUL
+    abort (soft interrupt landed, turn closed normally): the CLI/daemon +
+    MCP sidecars survived by contract — keep the session warm exactly like a
+    dashboard chat, so the next prompt or continue round reuses it (no cold
+    re-warm, live model changes apply, still-running subagent children keep
+    reporting); the idle reaper collects it if nobody returns. HARD abort:
+    the process is gone / the stream is not reliably writable again — close
+    outright: the chat row keeps its session_id, so the user's next message
+    takes the lazy-warmup path (honoring a model change made while stopped)
+    and --resume restores the conversation. Interactive-PTY stops and run
+    crashes never stamp the graceful flag, so they always close."""
+    row = chat_row or {}
+    if not row.get("last_turn_aborted"):
+        return "completed", False
+    return "user_interrupted", bool(row.get("last_abort_graceful"))
 
 
 async def _reap_prior_lane_pump(chat_id: str, run_id: str) -> None:
@@ -780,10 +882,9 @@ async def pause_dynamic_task(task_id: str) -> bool:
     await asyncio.to_thread(task_store.set_dynamic_task_enabled, task_id, False)
     if config.SCHEDULER_MODE != "standalone":
         job_id = f"task_{task_id}"
-        try:
+        # job may not exist (e.g. past run_at, already-fired)
+        with contextlib.suppress(Exception):
             _scheduler.remove_job(job_id)
-        except Exception:
-            pass  # job may not exist (e.g. past run_at, already-fired)
     return True
 
 
@@ -914,10 +1015,8 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
         if refreshed and refreshed.get("enabled"):
             # Drop any existing job before re-registering so a switch from
             # recurring → one-time-past-run_at correctly leaves no job.
-            try:
+            with contextlib.suppress(Exception):
                 _scheduler.remove_job(f"task_{task_id}")
-            except Exception:
-                pass
             task = _row_to_task(refreshed)
             _register_task(task)
     return True, None
@@ -1187,8 +1286,123 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: Tas
             f"Task result delivered via {outcome.path}: "
             f"session={outcome.session_id[:8] if outcome.session_id else '-'}, task={task.name}"
         )
+
+        # Live badge correctness: the ws/steer/pump rungs deliver the
+        # delegate_result frame to the viewer themselves; the other rungs
+        # (pty/persistent/oneshot/none) carry no socket, so a live viewer's
+        # "Delegated" badge would spin until a full history reload. Broadcast
+        # the terminal frame chat-scoped, independent of the wake delivery.
+        # Idempotent on the frontend (status keyed by task_id).
+        if chat_id and outcome.path not in ("ws", "steer", "pump"):
+            from core.session.session_state import broadcast_chat_frame
+            broadcast_chat_frame(chat_id, delegate_event)
+
+        # Durable replay: every rung failed — the orchestrator was never woken
+        # (the delegate_result event row IS persisted, but no turn ran). Store
+        # the wake on the parent chat; the next warmup/turn claims and injects
+        # it so the orchestrator continues then (a manual re-warm included).
+        if chat_id and outcome.path == "none":
+            stored = task_store.append_pending_delegate_wake(chat_id, result_prompt)
+            if stored:
+                logger.info(
+                    f"Delegate wake undeliverable — stored for replay on next "
+                    f"warmup: chat={chat_id[:8]}, task={task.name}"
+                )
     except Exception as e:
         logger.error(f"Task result delivery failed: session={session_id[:8]}, task={task.id}: {e}", exc_info=True)
+
+
+async def redeliver_pending_wakes(machine_id: str | None = None) -> int:
+    """Redeliver delegate wakes parked on chats (stored when every delivery
+    rung failed — typically the proxy restarted inside the delivery window).
+
+    Startup runs it once after boot settles; every satellite reconnect runs it
+    scoped to that machine's pinned chats (an idle satellite chat's wake can
+    only deliver once its machine is back). Per-chat claims are atomic, so a
+    concurrent warmup/turn claim wins cleanly and this pass no-ops for that
+    chat. A chat whose session is parked for Mode C re-adopt is skipped —
+    the reconnect pass retries it after the adopt settles. Failed deliveries
+    re-persist the original wakes (same caller-side contract as
+    ``_deliver_task_result``). Returns the number of chats woken."""
+    from services.scheduler import run_recovery
+    from core.session.session_delivery import deliver_prompt
+
+    rows = await asyncio.to_thread(
+        task_store.list_chats_with_pending_wakes, machine_id,
+    )
+    woken = 0
+    for chat in rows:
+        chat_id = chat["id"]
+        if (chat.get("session_id") or "") in run_recovery._parked:
+            continue
+        wakes = await asyncio.to_thread(
+            task_store.claim_pending_delegate_wake, chat_id,
+        )
+        if not wakes:
+            continue
+        agent = chat.get("agent") or ""
+        owner = chat.get("user_sub") or ""
+        # ``task::`` owners are the unified task chats — agent-scope delivery
+        # semantics, never a personal remote-target pin.
+        if owner and not owner.startswith("task::"):
+            deliver_user_sub: str | None = owner
+            role = (await asyncio.to_thread(
+                task_store.get_user_agent_roles, owner,
+            )).get(agent, "viewer")
+        else:
+            deliver_user_sub = None
+            role = "manager"
+
+        def _save_echo(outcome) -> None:
+            # Same contract as _deliver_task_result's echo hook: pump-driven
+            # turns return "" (already persisted); dead resumes return None.
+            if outcome.response and outcome.chat_id:
+                task_store.add_chat_message(
+                    outcome.chat_id, "assistant", outcome.response,
+                )
+
+        try:
+            outcome = await deliver_prompt(
+                chat_id, "\n\n".join(wakes),
+                source="delegate_result_replay",
+                session_id=chat.get("session_id") or "",
+                agent=agent,
+                user_sub=deliver_user_sub,
+                role=role,
+                persistent_fn=_deliver_via_persistent,
+                oneshot_fn=_deliver_via_oneshot,
+                on_outcome=_save_echo,
+            )
+        except Exception:
+            # One chat's broken spawn (bad config, dead layer) must neither
+            # kill the sweep nor eat the CLAIMED wakes — re-persist and move
+            # on (live-hit on T1: a corrupt user config.toml failed the
+            # oneshot and the claimed wake was lost with the sweep).
+            logger.exception(
+                "Wake redelivery: chat %s delivery raised — re-storing %d "
+                "wake(s)", chat_id[:8], len(wakes),
+            )
+            for w in wakes:
+                await asyncio.to_thread(
+                    task_store.append_pending_delegate_wake, chat_id, w,
+                )
+            continue
+        if outcome.path == "none":
+            for w in wakes:
+                await asyncio.to_thread(
+                    task_store.append_pending_delegate_wake, chat_id, w,
+                )
+            logger.info(
+                "Wake redelivery: chat %s undeliverable — re-stored %d wake(s)",
+                chat_id[:8], len(wakes),
+            )
+        else:
+            woken += 1
+            logger.info(
+                "Wake redelivery: chat %s woken via %s (%d wake(s))",
+                chat_id[:8], outcome.path, len(wakes),
+            )
+    return woken
 
 
 async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
@@ -1235,13 +1449,11 @@ async def _run_echo_turn_pumped(layer, session_id: str, chat_id: str,
     )
     _active_pumps[chat_id] = pump
     pump.start()
-    try:
+    # A _TaskTurnStalled reap persisted the partial turn and closed the chat
+    # status — delivered as far as it went; never fall through to another rung
+    # (that would run a SECOND echo turn).
+    with contextlib.suppress(_TaskTurnStalled):
         await _watch_task_pump(layer, pump, echo_id, chat_id, session_id)
-    except _TaskTurnStalled:
-        # The reap persisted the partial turn and closed the chat status —
-        # delivered as far as it went; never fall through to another rung
-        # (that would run a SECOND echo turn).
-        pass
     return ""
 
 
@@ -1319,7 +1531,15 @@ async def _deliver_via_oneshot(
     # Resolve the target once so the layer and the config agree — a bare
     # resolve would default the config target to "local" and the remote layer
     # would reject the start (RemoteExecutionLayer called with local target).
-    exec_path = resolve_execution_path(agent)
+    # The CHAT's pinned layer beats the agent default: a wake for a chat on
+    # the non-default layer (agent default codex, chat on claude) resolved
+    # the wrong layer and always failed the resumability pre-check.
+    _chat_row: dict | None = None
+    chat_exec = ""
+    if chat_id:
+        _chat_row = await asyncio.to_thread(task_store.get_chat, chat_id)
+        chat_exec = (_chat_row or {}).get("execution_path") or ""
+    exec_path = resolve_execution_path(agent, chat_exec)
     target, _reason = remote_store.resolve_execution_target(agent, user_sub, role)
     if target.startswith("__offline__:"):
         logger.warning(
@@ -1395,7 +1615,28 @@ async def _deliver_via_oneshot(
         execution_target=target,
         execution_path=exec_path,
         sandbox_host_claude_dir=oneshot_claude_dir,
+        # The CHAT's pinned model — an empty model falls back to the AGENT
+        # default, which belongs to the agent's default LAYER; on a chat
+        # pinned to the other CLI that yields an unusable/empty model
+        # ("API Error: 400 model: String should have at least 1 character").
+        model=(_chat_row or {}).get("model") or "",
     )
+    # A chat pinned interactive gets its wake in ITS OWN MODE: re-warm the
+    # terminal session, inject the result, await the orchestrator's turn,
+    # close (unless a viewer attached meanwhile). The headless echo below
+    # would run the wake invisibly outside the terminal the chat lives in
+    # (previously: "interactive resume/delegation is future work"). On any
+    # failure return None — the caller's path="none" stores the wake for
+    # durable replay at the chat's next warmup.
+    from core import execution_mode as _exec_mode
+    chat_row = _chat_row
+    if chat_row and _exec_mode.is_interactive(
+        chat_override=chat_row.get("execution_mode") or None,
+    ):
+        return await _rewarm_interactive_and_wake(
+            layer, session_id, agent, result_prompt,
+            chat_id=chat_id, base_cfg=oneshot_cfg, chat_row=chat_row,
+        )
     await layer.start_session(session_id, oneshot_cfg)
     if chat_id:
         return await _run_echo_turn_pumped(
@@ -1409,6 +1650,173 @@ async def _deliver_via_oneshot(
                 if content:
                     parts.append(content)
     return "".join(parts) if parts else ""
+
+
+# Turn-open verification window for interactive wakes: covers CLI spawn →
+# readiness gate → paste flush → one transcript-tail poll of lag. Two windows
+# run back to back (initial submit, then the bare-Enter nudge).
+_WAKE_TURN_OPEN_S = 45.0
+
+
+async def _wait_turn_open(isess, timeout: float) -> bool:
+    """Poll until the session's transcript-derived turn-open flag flips."""
+    waited = 0.0
+    while waited < timeout:
+        if isess.turn_open:
+            return True
+        if not isess.alive:
+            return False
+        await asyncio.sleep(1.0)
+        waited += 1.0
+    return bool(isess.turn_open)
+
+
+async def _rewarm_interactive_and_wake(
+    layer, session_id: str, agent: str, result_prompt: str,
+    *, chat_id: str, base_cfg, chat_row: dict,
+) -> str | None:
+    """Re-warm a DEAD interactive-pinned chat and inject the delegate wake.
+
+    The interactive sibling of the headless one-shot: resume the chat's
+    session as a PTY (``interactive=True``, chat-bound, the chat's own
+    permission mode + baked TUI theme), submit the wake with the settle
+    Enter, VERIFY the turn opened (transcript-derived — an unverified submit
+    silently loses the payload), await the orchestrator's continuation turn
+    (``_run_interactive_task`` shape: turn-end callback + liveness poll + max
+    backstop), then leave the terminal to the idle reaper so a user opening
+    the chat shortly after still attaches to it. The chat-bound tailer
+    persists the whole exchange to chat history as it runs.
+
+    A ``warmup_registry`` entry brackets the spawn so a racing delivery's
+    ``_oneshot_blocked`` defers to this re-warm and a dashboard opening the
+    chat mid-wake attaches instead of double-spawning.
+
+    Returns "" on success (the tailer persisted the turn — no echo row to
+    save) or None on any failure (the caller stores the wake for durable
+    replay)."""
+    from core.session import interactive_session, warmup_registry
+
+    cfg = base_cfg
+    cfg.interactive = True
+    # The chat binding is LOAD-BEARING: the InteractiveSession registers with
+    # cfg.chat_id, and transcript tailing → chat_messages, the turn-open /
+    # turn-complete signals, the streaming-status broadcasts AND the
+    # dashboard's pty_attach chat guard all gate on it. Without it the wake
+    # turn runs invisibly and unpersisted, and an open chat refuses to attach
+    # to the live terminal (the original wake-recovery shipped that way).
+    cfg.chat_id = chat_id
+    # The wake turn runs unattended — keep the task-grade "auto" permission
+    # mode from base_cfg (a "default"-mode prompt would sit unanswered with
+    # nobody watching; same rationale as headless task re-warms).
+    cfg.interactive_theme = chat_row.get("tui_theme") or ""
+
+    registered = False
+    spawned = False
+    try:
+        try:
+            await warmup_registry.register(chat_id, cfg.user_sub or "", agent)
+            registered = True
+        except Exception:
+            pass  # registry is an optimization, never a spawn blocker
+
+        await layer.start_session(session_id, cfg)
+        spawned = True
+        isess = interactive_session.get(session_id)
+        if isess is None:
+            logger.warning(
+                f"Delegate interactive re-warm: no PTY registered for "
+                f"session={session_id[:8]} (chat={chat_id[:8]})"
+            )
+            return None
+
+        done = asyncio.Event()
+        isess.on_turn_complete = lambda _msg: done.set()
+        # Cold wake prompt: buffered behind the readiness gate, flushed with
+        # the settle Enter (large pastes were losing the fixed-gap Enter).
+        isess.submit_prompt(result_prompt, settle=True)
+        logger.info(
+            f"Delegate wake re-warmed interactive: session={session_id[:8]}, "
+            f"chat={chat_id[:8]}, agent={agent}"
+        )
+        if registered:
+            # Spawn is live — release the registry so the queued-prompt drain
+            # and dashboard attach gates stop deferring to it.
+            await warmup_registry.unregister(chat_id)
+            registered = False
+
+        # Verify the turn actually OPENED before counting the wake delivered.
+        # turn_open is transcript-derived (both CLIs write the user line at
+        # submit), so a paste that never submitted leaves it False while the
+        # PTY idles — previously that "delivery" silently lost the payload.
+        # One bare-Enter nudge covers a paste that ate its settle Enter.
+        if not await _wait_turn_open(isess, _WAKE_TURN_OPEN_S):
+            if isess.alive:
+                isess.submit_prompt("", settle=True)
+            if not await _wait_turn_open(isess, _WAKE_TURN_OPEN_S):
+                logger.warning(
+                    f"Delegate wake never opened a turn (paste lost?): "
+                    f"session={session_id[:8]}, chat={chat_id[:8]} — storing "
+                    f"for durable replay"
+                )
+                if isess.alive and not isess.has_viewer:
+                    await interactive_session.close_session(
+                        session_id, reason="delegate_wake_unsubmitted",
+                    )
+                return None
+
+        waited = 0.0
+        _STEP = 5.0
+        while True:
+            try:
+                await asyncio.wait_for(done.wait(), timeout=_STEP)
+                break  # orchestrator's continuation turn completed
+            except asyncio.TimeoutError:
+                if not isess.alive:
+                    logger.warning(
+                        f"Delegate wake interactive session died mid-turn: "
+                        f"session={session_id[:8]} (chat={chat_id[:8]})"
+                    )
+                    # The turn opened; the tailer persisted whatever ran.
+                    # Treat as delivered — a re-store would double-wake.
+                    return ""
+                waited += _STEP
+                if waited >= INTERACTIVE_TASK_MAX_S:
+                    logger.warning(
+                        f"Delegate wake turn exceeded {int(INTERACTIVE_TASK_MAX_S)}s "
+                        f"backstop: session={session_id[:8]} — leaving session to "
+                        f"the idle reaper"
+                    )
+                    return ""
+
+        # Turn done. Leave the terminal ALIVE either way — the idle reaper
+        # owns its end. A user opening the chat within the idle window
+        # attaches to the real terminal with the wake turn on screen instead
+        # of finding it torn down the instant the turn ended.
+        logger.info(
+            f"Delegate wake turn complete: session={session_id[:8]}, "
+            f"viewer={'yes' if isess.has_viewer else 'no'} — terminal left "
+            f"to the idle reaper"
+        )
+        return ""
+    except Exception:
+        logger.exception(
+            f"Delegate interactive re-warm failed: session={session_id[:8]}, "
+            f"chat={chat_id[:8]}"
+        )
+        if spawned:
+            try:
+                isess = interactive_session.get(session_id)
+                if isess is not None and not isess.has_viewer:
+                    await interactive_session.close_session(
+                        session_id, reason="delegate_wake_failed",
+                    )
+            except Exception:
+                pass
+        return None
+    finally:
+        if registered:
+            with contextlib.suppress(Exception):
+                await warmup_registry.unregister(chat_id)
 
 
 async def _fire_task(task: TaskDefinition) -> None:
@@ -1568,6 +1976,31 @@ async def _fire_continuation(task: TaskDefinition) -> str:
     return ""
 
 
+def _create_task_chat_row(chat_id: str, run_id: str, task: TaskDefinition) -> None:
+    """The run's chat row + ``runs.chat_id`` stamp (sync — call via to_thread).
+
+    Task-surface delegate workers keep the shared ``agent::`` owner for agent
+    scope, the delegate name as seed title, the delegated origin (purple
+    worker accent + LLM title upgrade) and the delegation lineage for the
+    dock's lane graph; plain runs use the ``task::`` owner convention."""
+    task_model = config.get_cli_model(task.agent)
+    if task.task_type == "delegate":
+        worker_sub = (task.created_by if task.scope == "user"
+                      else f"agent::{task.agent}")
+        task_store.create_chat(chat_id, worker_sub, task.agent, "auto",
+                               model=task_model, origin="delegated",
+                               parent_chat_id=task.parent_chat_id or "",
+                               project_id=task.project_id or "",
+                               delegate_role="worker",
+                               title=task.name)
+    else:
+        user_sub = (task.created_by if task.scope == "user"
+                    else f"task::{task.agent}")
+        task_store.create_chat(chat_id, user_sub, task.agent, "auto",
+                               model=task_model)
+    task_store.update_run(run_id, chat_id=chat_id)
+
+
 async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                         trigger_source: str | None = None,
                         prompt_override: str | None = None, attempt: int = 1,
@@ -1681,6 +2114,16 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
             run_id, task.id, task.agent, trigger_type, trigger_source, final_prompt,
             task_type, task.scope, task.created_by,
         )
+
+        # Create the run's chat row BEFORE the admission slot: a parked run
+        # ("pending", waiting on host memory) must be visible — the dashboard
+        # opens task-<run_id> immediately and needs the row + runs.chat_id to
+        # show an honest "queued" state instead of "Chat not found". Worker
+        # chats (target_chat_id) already exist from the spawn path.
+        if not task.target_chat_id:
+            await asyncio.to_thread(
+                _create_task_chat_row, f"task-{run_id}", run_id, task,
+            )
 
         t = asyncio.create_task(
             _run_task(run_id, session_id, task, final_prompt, trigger_type,
@@ -1812,6 +2255,13 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
         output_cursor = 0  # pre-run message cursor; set in step 1
         prompt_row_id = 0  # the driven prompt's own row; excluded from collection
         layer = None  # bound in step 2; guards the except cleanup if config build fails
+        # Set when a graceful abort leaves the session warm (step 7): the
+        # finally must then keep its session-index entry so the idle reaper
+        # + /v1/session/current still see the live session.
+        session_kept_warm = False
+        # Set when the step-1 lane gate had to reap a wedged prior pump: the
+        # round must then respawn, never reuse (see _settle_prior_lane).
+        lane_reaped = False
 
         try:
             # 1. Persist the chat row + the user's prompt FIRST — BEFORE the slow
@@ -1820,7 +2270,6 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             #    TaskRunView instead of "No messages yet." General task robustness:
             #    applies to every task type (scheduled / one-time / delegate).
             user_sub = task.created_by if task.scope == "user" else f"task::{task.agent}"
-            task_model = config.get_cli_model(task.agent)
             if task.target_chat_id:
                 # Worker chat (surface="chat") — the spawn path created the row
                 # with owner/origin/parent stamped. A missing row means the
@@ -1829,29 +2278,23 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                     raise RuntimeError("The worker chat for this run no longer exists")
                 # BEFORE the output cursor below: a reap flushes the prior
                 # round's blocks, and those rows must not be collected as
-                # this run's output.
-                await _reap_prior_lane_pump(chat_id, run_id)
-            elif task.task_type == "delegate":
-                # Task-surface delegate worker: lives in the sidebar's TASK
-                # mode like every task run, but keeps the shared agent:: owner
-                # for agent scope, the delegate name as the seed title, the
-                # delegated origin (drives the purple worker accent + LLM
-                # title upgrade), and the delegation lineage so the dock's
-                # lane graph and continuation authority can trace it.
-                worker_sub = (task.created_by if task.scope == "user"
-                              else f"agent::{task.agent}")
-                task_store.create_chat(chat_id, worker_sub, task.agent, "auto",
-                                       model=task_model, origin="delegated",
-                                       parent_chat_id=task.parent_chat_id or "",
-                                       project_id=task.project_id or "",
-                                       delegate_role="worker",
-                                       title=task.name)
-            else:
-                task_store.create_chat(chat_id, user_sub, task.agent, "auto", model=task_model)
-            # Clear a stale abort flag from a PRIOR round on this chat —
+                # this run's output. Healthy live turns are WAITED out, not
+                # reaped (a reap cancels the user's in-flight turn).
+                lane_reaped = await _settle_prior_lane(chat_id, run_id)
+            elif not task_store.get_chat(chat_id):
+                # Backstop: _execute_task pre-creates the row before the slot
+                # (queued visibility); this covers direct _run_task callers
+                # and a chat deleted while the run was parked.
+                _create_task_chat_row(chat_id, run_id, task)
+            # Clear stale abort flags from a PRIOR round on this chat —
             # scheduler-driven turns don't run the dashboard's turn-start clear,
-            # and the post-run user_interrupted check keys on this flag.
-            task_store.update_chat(chat_id, session_id=session_id, last_turn_aborted=False)
+            # and the post-run user_interrupted check keys on these flags (a
+            # stale graceful=True from a prior round must not suppress a
+            # close after THIS round's non-graceful abort).
+            task_store.update_chat(
+                chat_id, session_id=session_id,
+                last_turn_aborted=False, last_abort_graceful=False,
+            )
             # Cursor BEFORE this round's prompt lands: output collection (and
             # the failure-path collection) reports only what THIS run produced.
             output_cursor = task_store.get_last_chat_message_id(chat_id)
@@ -1931,39 +2374,79 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             agent_cfg.extra_env["MEETINGS_MCP_SESSION_ID"] = session_id
             agent_cfg.extra_env["NOTIF_MCP_CHAT_ID"] = chat_id
 
-            # For continue_session (multi-turn delegation), the session has
-            # prior conversation on disk — use --resume to preserve context.
+            # For continue_session (multi-turn delegation), prefer driving the
+            # turn on the still-warm session; otherwise the session has prior
+            # conversation on disk — use --resume to preserve context.
             # Same UUID guard as _execute_task: bad data falls back to fresh
             # session rather than passing "--resume false" to the CLI.
-            # Resumability pre-check (same gate as dashboard warmups and the
-            # one-shot delivery): a blind --resume on a missing conversation
-            # makes the CLI's "No conversation found with session ID: …" the
-            # run's entire output. Fall back to a fresh session in the SAME
-            # chat instead — a fresh id, so a half-present file under the old
-            # one can't collide.
+            reused_warm = False
             if _is_valid_session_uuid(task.continue_session):
-                resume_username = ""
-                if task.scope == "user" and task.created_by:
-                    resume_username = task_store.get_username_by_sub(task.created_by) or ""
-                if await layer.can_resume_session(
-                    session_id, agent_name=task.agent, username=resume_username,
-                ):
-                    agent_cfg.resume = True
+                # Final lane gate at the decision point: the config build did
+                # DB/thread work since the step-1 gate — a user turn may have
+                # started on the lane meanwhile. A quiet observation here
+                # means the respawn path can't hit the satellite stale-live
+                # guard mid-turn and the pump registration won't clobber a
+                # live dashboard pump (post-gate races on the reuse path are
+                # serialized by layer.session_lock).
+                _prior = _active_pumps.get(chat_id)
+                if _prior is not None and not _prior.is_done:
+                    await _await_lane_quiescence(chat_id)
+                    # The wait may have let a user turn land rows/flags —
+                    # re-take the output cursor + re-clear the abort flags so
+                    # that turn is neither collected as this run's output nor
+                    # mis-promoted to user_interrupted.
+                    task_store.update_chat(
+                        chat_id,
+                        last_turn_aborted=False, last_abort_graceful=False,
+                    )
+                    output_cursor = task_store.get_last_chat_message_id(chat_id)
+                if not lane_reaped:
+                    reused_warm = await _try_reuse_warm_session(
+                        layer, agent_cfg, session_id, run_id,
+                    )
+                if reused_warm:
+                    # No spawn: the turn rides the warm session (dashboard
+                    # turn-2+ semantics; spawn-time binding/context stand).
+                    # Release the seat this round's config build acquired —
+                    # nothing will bind it — and force headless: the
+                    # force-headless below keys on agent_cfg.resume, which
+                    # reuse never sets.
+                    agent_cfg.interactive = False
+                    if agent_cfg.subscription_id:
+                        from storage import subscription_store
+                        subscription_store.decrement_active_sessions(
+                            agent_cfg.subscription_id,
+                        )
                 else:
-                    old_sid = session_id
-                    session_id = str(uuid.uuid4())
-                    _state._sessions[session_id] = _state._sessions.pop(
-                        old_sid, {"created": True, "message_count": 0},
-                    )
-                    task_store.update_chat(chat_id, session_id=session_id)
-                    await asyncio.to_thread(
-                        task_store.update_run, run_id, session_id=session_id,
-                    )
-                    logger.warning(
-                        f"Delegate continue: session {old_sid[:8]} has no resumable "
-                        f"conversation on agent={task.agent} — fresh session "
-                        f"{session_id[:8]} in the same chat"
-                    )
+                    # Resumability pre-check (same gate as dashboard warmups
+                    # and the one-shot delivery): a blind --resume on a
+                    # missing conversation makes the CLI's "No conversation
+                    # found with session ID: …" the run's entire output. Fall
+                    # back to a fresh session in the SAME chat instead — a
+                    # fresh id, so a half-present file under the old one
+                    # can't collide.
+                    resume_username = ""
+                    if task.scope == "user" and task.created_by:
+                        resume_username = task_store.get_username_by_sub(task.created_by) or ""
+                    if await layer.can_resume_session(
+                        session_id, agent_name=task.agent, username=resume_username,
+                    ):
+                        agent_cfg.resume = True
+                    else:
+                        old_sid = session_id
+                        session_id = str(uuid.uuid4())
+                        _state._sessions[session_id] = _state._sessions.pop(
+                            old_sid, {"created": True, "message_count": 0},
+                        )
+                        task_store.update_chat(chat_id, session_id=session_id)
+                        await asyncio.to_thread(
+                            task_store.update_run, run_id, session_id=session_id,
+                        )
+                        logger.warning(
+                            f"Delegate continue: session {old_sid[:8]} has no resumable "
+                            f"conversation on agent={task.agent} — fresh session "
+                            f"{session_id[:8]} in the same chat"
+                        )
 
             # Interactive task prep. Only FRESH interactive spawns run
             # interactive — a continue_session RESUME stays headless
@@ -2014,8 +2497,10 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                     event_data=json.dumps(prompt_agent_meta),
                 )
 
-            # 3. Start session via execution layer
-            await layer.start_session(session_id, agent_cfg)
+            # 3. Start session via execution layer (skipped when the round
+            #    rides an already-warm session — see _try_reuse_warm_session)
+            if not reused_warm:
+                await layer.start_session(session_id, agent_cfg)
 
             # 4. Mark as task session so /v1/session/current excludes it.
             _state._sessions.setdefault(session_id, {"created": True, "message_count": 0})
@@ -2095,25 +2580,21 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             # flag; step 1 cleared any stale one). The run itself completed —
             # partial output is persisted — but the delegating agent must see
             # "user_interrupted", not a clean completion.
-            final_status = (
-                "user_interrupted"
-                if (chat_row or {}).get("last_turn_aborted") else "completed"
-            )
-            # A user-stopped lane's session is done serving scheduler turns,
-            # and an aborted (especially remote) CLI stream is not reliably
-            # writable again — later dashboard sends drained stale events into
-            # empty zero-block turns. Close it outright: the chat row keeps
-            # its session_id, so the user's next message takes the lazy-warmup
-            # path (honoring a model change made while stopped) and --resume
-            # restores the conversation.
+            final_status, session_kept_warm = _post_run_session_action(chat_row)
             if final_status == "user_interrupted" and layer is not None:
-                try:
-                    await layer.close_session(session_id)
-                except Exception:
-                    logger.debug(
-                        f"Task {run_id}: post-abort close_session failed",
-                        exc_info=True,
+                if session_kept_warm:
+                    logger.info(
+                        f"Task {run_id}: graceful abort — keeping session "
+                        f"{session_id[:8]} warm on lane chat {chat_id[:8]}"
                     )
+                else:
+                    try:
+                        await layer.close_session(session_id)
+                    except Exception:
+                        logger.debug(
+                            f"Task {run_id}: post-abort close_session failed",
+                            exc_info=True,
+                        )
 
             # 8. Collect output text for the on-complete delivery payload.
             # For meetings: use the moderator's final summary (not the entire
@@ -2344,7 +2825,11 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             # process is already closed by the layer, and any callback re-binds via
             # the persistent chat_id (not this entry), so dropping it here is safe.
             # Idempotent under retries (the retry's _run_task already popped it).
-            if _state._sessions.pop(session_id, None) is not None:
+            # EXCEPT after a graceful abort: the session was deliberately left
+            # warm, so its entry must survive for the idle reaper +
+            # /v1/session/current until the layer actually closes it.
+            if (not session_kept_warm
+                    and _state._sessions.pop(session_id, None) is not None):
                 _state._save_sessions()
             # Release the dedup reservation — but only if it still points at THIS
             # run, so a retry hand-off (which re-reserved task.id under its own
@@ -2374,5 +2859,5 @@ async def _broadcast(run_id: str, event: dict) -> None:
     for q in list(_run_subscribers.get(run_id, [])):
         try:
             await q.put(event)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("run event broadcast: %s", e)

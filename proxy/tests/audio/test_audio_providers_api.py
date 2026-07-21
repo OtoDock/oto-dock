@@ -59,13 +59,16 @@ def test_create_list_update_delete(client):
 def test_default_unique_per_type_and_context(client):
     a = _create(client, provider_type="stt", provider_name="deepgram")
     b = _create(client, provider_type="stt", provider_name="canary")
-    assert client.put(f"/v1/admin/audio/providers/{a['id']}/default?context=calls").status_code == 200
-    assert client.put(f"/v1/admin/audio/providers/{b['id']}/default?context=calls").status_code == 200
+    resp = client.put(f"/v1/admin/audio/providers/{a['id']}/default?context=calls")
+    assert resp.status_code == 200
+    resp = client.put(f"/v1/admin/audio/providers/{b['id']}/default?context=calls")
+    assert resp.status_code == 200
     providers = {x["id"]: x for x in client.get("/v1/admin/audio/providers").json()["providers"]}
     assert providers[a["id"]]["is_default_calls"] is False
     assert providers[b["id"]]["is_default_calls"] is True
     # calls/chat defaults are independent
-    assert client.put(f"/v1/admin/audio/providers/{a['id']}/default?context=chat").status_code == 200
+    resp = client.put(f"/v1/admin/audio/providers/{a['id']}/default?context=chat")
+    assert resp.status_code == 200
     providers = {x["id"]: x for x in client.get("/v1/admin/audio/providers").json()["providers"]}
     assert providers[a["id"]]["is_default_chat"] is True
     assert providers[b["id"]]["is_default_calls"] is True
@@ -80,7 +83,8 @@ def test_cannot_default_a_disabled_context(client):
 
 def test_disabling_a_context_demotes_its_default(client):
     p = _create(client)
-    assert client.put(f"/v1/admin/audio/providers/{p['id']}/default?context=calls").status_code == 200
+    resp = client.put(f"/v1/admin/audio/providers/{p['id']}/default?context=calls")
+    assert resp.status_code == 200
     r = client.put(f"/v1/admin/audio/providers/{p['id']}", json={"enabled_for_calls": False})
     assert r.status_code == 200
     assert r.json()["is_default_calls"] is False
@@ -89,7 +93,8 @@ def test_disabling_a_context_demotes_its_default(client):
 
 def test_credential_set_and_status(client):
     p = _create(client, credential_key="audio-deepgram")
-    assert client.put(f"/v1/admin/audio/providers/{p['id']}/credential", json={"value": "sk-test"}).status_code == 200
+    resp = client.put(f"/v1/admin/audio/providers/{p['id']}/credential", json={"value": "sk-test"})
+    assert resp.status_code == 200
     fetched = next(x for x in client.get("/v1/admin/audio/providers").json()["providers"] if x["id"] == p["id"])
     assert fetched["credential_configured"] is True
     assert client.delete(f"/v1/admin/audio/providers/{p['id']}/credential").status_code == 200

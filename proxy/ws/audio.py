@@ -148,10 +148,8 @@ async def ws_audio_stt_handler(websocket: WebSocket):
         logger.warning("audio STT ws error: %s", e)
     finally:
         if provider is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await provider.close()
-            except Exception:
-                pass
             if user_sub and total_bytes:
                 seconds = total_bytes / (sample_rate * sampwidth)
                 try:
@@ -159,8 +157,8 @@ async def ws_audio_stt_handler(websocket: WebSocket):
                         audio_service.record_audio_usage,
                         user_sub, "audio-stt-chat", provider_name, provider, seconds=seconds,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("audio STT usage record failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -282,15 +280,13 @@ async def ws_audio_tts_handler(websocket: WebSocket):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await pump
         if provider is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await provider.close()
-            except Exception:
-                pass
             if user_sub and total_chars:
                 try:
                     await asyncio.to_thread(
                         audio_service.record_audio_usage,
                         user_sub, "audio-tts-chat", provider_name, provider, chars=total_chars,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("audio TTS usage record failed: %s", e)

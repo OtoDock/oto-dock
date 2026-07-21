@@ -10,6 +10,7 @@ re-implementing chat-message decoding.
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -117,10 +118,8 @@ async def task_produce(
             return
         sse_evt = _event_to_sse(event)
         if sse_evt:
-            try:
+            with contextlib.suppress(Exception):
                 await broadcast_fn(run_id, sse_evt)
-            except Exception:
-                pass
 
     try:
         # Suppress the chat-path bg monitors for the whole run: this producer
@@ -340,28 +339,22 @@ async def task_produce(
 
         # Broadcast SSE done
         if broadcast_fn:
-            try:
+            with contextlib.suppress(Exception):
                 await broadcast_fn(run_id, {"type": "done", "status": "completed"})
-            except Exception:
-                pass
 
     except asyncio.CancelledError:
         # Task was cancelled
         if broadcast_fn:
-            try:
+            with contextlib.suppress(Exception):
                 await broadcast_fn(run_id, {"type": "done", "status": "cancelled"})
-            except Exception:
-                pass
         raise
 
     except Exception as e:
         logger.error(f"Task producer error: {e}", exc_info=True)
         await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
         if broadcast_fn:
-            try:
+            with contextlib.suppress(Exception):
                 await broadcast_fn(run_id, {"type": "done", "status": "failed"})
-            except Exception:
-                pass
 
     finally:
         await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))

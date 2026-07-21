@@ -195,6 +195,9 @@ def _mk_layer() -> RemoteExecutionLayer:
     layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
     layer._cm = MagicMock()
     layer._cm.send_fire_and_forget = AsyncMock()
+    # A bare MagicMock returns truthy — the valve branch would read "in
+    # grace" and re-arm forever. Default to a healthy attached stream.
+    layer._cm.is_session_in_grace = MagicMock(return_value=False)
     layer._sessions = {}
     return layer
 
@@ -277,23 +280,33 @@ class TestForeignResultGate:
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
-    async def test_skip_cap_closes_turn(self):
+    async def test_burst_beyond_cap_still_streams_real_answer(self):
+        """The 2026-07-20 incident: a poisoned --resume flushes MORE
+        zero-content settlement results than the old skip cap (5); the 6th
+        used to close the turn empty while the real answer ran orphaned.
+        The count must never end the turn — only the real result does."""
         from core.layers.cli.settle import FOREIGN_RESULT_SKIP_CAP
         layer = _mk_layer()
         info = _make_info()
         info.current_send_command_id = "new-cmd"
-        for _ in range(FOREIGN_RESULT_SKIP_CAP + 1):
+        for _ in range(FOREIGN_RESULT_SKIP_CAP + 3):
             info.event_queue.put_nowait(_result_event("No response requested."))
+        info.event_queue.put_nowait(_text_event("THE REAL ANSWER"))
+        info.event_queue.put_nowait(_result_event("THE REAL ANSWER"))
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
         events = [e async for e in layer._stream_cli_turn(info)]
+        assert any(e.data.get("content") == "THE REAL ANSWER"
+                   for e in events if e.type not in (DONE,))
+        assert [e.type for e in events].count(DONE) == 1
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
     async def test_silence_after_skip_closes_turn(self, monkeypatch):
-        import core.remote.remote_execution as rex
-        monkeypatch.setattr(rex, "FOREIGN_SKIP_SILENCE_S", 0.3)
+        # The gate resolves the valve constant from the settle module.
+        from core.layers.cli import settle as settle_mod
+        monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 0.3)
         layer = _mk_layer()
         info = _make_info()
         info.current_send_command_id = "new-cmd"
@@ -303,6 +316,99 @@ class TestForeignResultGate:
 
         events = await asyncio.wait_for(
             _collect(layer._stream_cli_turn(info)), timeout=5.0)
+        assert events[-1].type == DONE
+
+    @pytest.mark.asyncio
+    async def test_noise_slides_but_does_not_disarm_valve(self, monkeypatch):
+        """Non-content noise after a skip must not remove the valve (the old
+        code disarmed on ANY event — with no cap that would hang the turn
+        forever); the turn still closes a valve-width after the last event."""
+        from core.layers.cli import settle as settle_mod
+        monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 0.3)
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "new-cmd"
+        info.event_queue.put_nowait(_result_event("No response requested."))
+        for _ in range(3):
+            info.event_queue.put_nowait({"type": "system",
+                                         "subtype": "status"})
+
+        events = await asyncio.wait_for(
+            _collect(layer._stream_cli_turn(info)), timeout=5.0)
+        assert events[-1].type == DONE
+
+    @pytest.mark.asyncio
+    async def test_valve_rearms_while_in_reconnect_grace(self, monkeypatch):
+        """Valve expiry during a WS-drop grace window must NOT close the
+        turn — Mode A may still deliver it; the answer arriving after the
+        grace-length silence streams normally."""
+        from core.layers.cli import settle as settle_mod
+        monkeypatch.setattr(settle_mod, "FOREIGN_SKIP_SILENCE_S", 0.2)
+        layer = _mk_layer()
+        layer._cm.is_session_in_grace = MagicMock(return_value=True)
+        info = _make_info()
+        info.current_send_command_id = "new-cmd"
+        info.event_queue.put_nowait(_result_event("No response requested."))
+
+        async def _late_delivery():
+            await asyncio.sleep(0.7)  # several valve-widths of silence
+            info.event_queue.put_nowait(_text_event("THE REAL ANSWER"))
+            info.event_queue.put_nowait(_result_event("THE REAL ANSWER"))
+            info.event_queue.put_nowait({"type": "_turn_ended",
+                                         "command_id": "new-cmd"})
+
+        delivery = asyncio.create_task(_late_delivery())
+        events = await asyncio.wait_for(
+            _collect(layer._stream_cli_turn(info)), timeout=5.0)
+        await delivery
+        assert any(e.data.get("content") == "THE REAL ANSWER"
+                   for e in events if e.type not in (DONE,))
+        assert events[-1].type == DONE
+
+    @pytest.mark.asyncio
+    async def test_task_mode_foreign_result_does_not_enter_settle(self):
+        """Task turns (settle_after_result > 0) must not enter settle on a
+        foreign result — the job-done 5s fast-grace would close the turn
+        before the driven prompt's first token (incident empty turn #2)."""
+        layer = _mk_layer()
+        info = _make_info()
+        info.cli_settle = SettleController(
+            info.session_id, 30, info.cli_translator)
+        info.current_send_command_id = "new-cmd"
+        info.event_queue.put_nowait(_result_event("No response requested."))
+
+        collector = asyncio.create_task(
+            _collect(layer._stream_cli_turn(info)))
+        await asyncio.sleep(0.3)  # let the loop consume the foreign result
+        try:
+            assert info.cli_settle.settling is False
+        finally:
+            collector.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await collector
+
+    @pytest.mark.asyncio
+    async def test_stale_tagged_content_does_not_unlock_close(self):
+        """Content-typed events from a PRIOR command pass the stale filter by
+        design, but must not count as driven-turn content — otherwise a dying
+        process's junk text lets the next zero-content result close the turn."""
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "new-cmd"
+        info.event_queue.put_nowait(_result_event("No response requested."))
+        stale_text = _text_event("junk from the old turn")
+        stale_text["_command_id"] = "old-cmd"
+        info.event_queue.put_nowait(stale_text)
+        info.event_queue.put_nowait(_result_event(""))  # still foreign
+        info.event_queue.put_nowait(_text_event("THE REAL ANSWER"))
+        info.event_queue.put_nowait(_result_event("THE REAL ANSWER"))
+        info.event_queue.put_nowait({"type": "_turn_ended",
+                                     "command_id": "new-cmd"})
+
+        events = [e async for e in layer._stream_cli_turn(info)]
+        assert any(e.data.get("content") == "THE REAL ANSWER"
+                   for e in events if e.type not in (DONE,))
+        assert [e.type for e in events].count(DONE) == 1
         assert events[-1].type == DONE
 
 

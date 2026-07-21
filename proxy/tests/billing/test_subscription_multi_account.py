@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import api.auth.claude_oauth as claude_api
+from api.auth import claude_oauth as claude_api
 from api.auth.claude_oauth import OAuthExchangeRequest
 
 
@@ -108,7 +108,7 @@ def test_no_identity_falls_back_to_single_row_refresh():
 # ── owner-scoped update endpoint (per-account toggles for every role) ───────
 
 def _update(user_role, owner_sub="user-1", **body):
-    import api.admin.execution_layers as el
+    from api.admin import execution_layers as el
     from api.admin.execution_layers import (
         UpdateSubscriptionRequest, user_update_subscription,
     )

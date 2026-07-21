@@ -378,7 +378,7 @@ export default function UsersPage() {
               className="rounded-sm border-p-border-light shrink-0"
             />
             <span className="min-w-[120px]">{agent}</span>
-            {editAgents.includes(agent) && editRole !== 'member' && (
+            {editAgents.includes(agent) && (
               <select
                 value={editAgentRoles[agent] || 'viewer'}
                 onChange={(e) => setEditAgentRoles((prev) => ({ ...prev, [agent]: e.target.value }))}
@@ -392,6 +392,10 @@ export default function UsersPage() {
           </label>
         ))}
       </div>
+      <p className="text-[11px] text-p-text-secondary">
+        Per-agent roles are independent of the platform role — the platform role only
+        controls platform-level actions (creating agents, admin settings).
+      </p>
     </div>
   )
 

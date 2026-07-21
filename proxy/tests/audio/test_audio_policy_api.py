@@ -34,15 +34,18 @@ def test_policy_default_and_update(client):
     assert p["chat_enabled"] is True
     assert p["chat_user_policy"] == "native_preferred"
     assert p["show_experimental"] is False
-    assert client.put("/v1/admin/audio/policy", json={"chat_user_policy": "user_choice", "show_experimental": True}).status_code == 200
+    resp = client.put("/v1/admin/audio/policy", json={"chat_user_policy": "user_choice", "show_experimental": True})
+    assert resp.status_code == 200
     p = client.get("/v1/admin/audio/policy").json()
     assert p["chat_user_policy"] == "user_choice" and p["show_experimental"] is True
 
 
 def test_policy_chat_enabled_kill_switch(client):
-    assert client.put("/v1/admin/audio/policy", json={"chat_enabled": False}).status_code == 200
+    resp = client.put("/v1/admin/audio/policy", json={"chat_enabled": False})
+    assert resp.status_code == 200
     assert client.get("/v1/admin/audio/policy").json()["chat_enabled"] is False
-    assert client.put("/v1/admin/audio/policy", json={"chat_enabled": True}).status_code == 200
+    resp = client.put("/v1/admin/audio/policy", json={"chat_enabled": True})
+    assert resp.status_code == 200
     assert client.get("/v1/admin/audio/policy").json()["chat_enabled"] is True
 
 
@@ -68,14 +71,17 @@ def test_turn_classifier_active_from_direct_llm(client):
     assert client.get("/v1/admin/audio/turn-classifier").json()["active"] is True
 
     # The old enable/model + credential endpoints are gone.
-    assert client.put("/v1/admin/audio/turn-classifier", json={"enabled": False}).status_code == 405
-    assert client.put("/v1/admin/audio/turn-classifier/credential", json={"value": "x"}).status_code == 404
+    resp = client.put("/v1/admin/audio/turn-classifier", json={"enabled": False})
+    assert resp.status_code == 405
+    resp = client.put("/v1/admin/audio/turn-classifier/credential", json={"value": "x"})
+    assert resp.status_code == 404
 
 
 # --- audio settings -------------------------------------------------------
 
 def test_audio_settings_roundtrip_and_policy_excluded(client):
-    assert client.put("/v1/admin/audio/settings", json={"vad_threshold": "0.55"}).status_code == 200
+    resp = client.put("/v1/admin/audio/settings", json={"vad_threshold": "0.55"})
+    assert resp.status_code == 200
     s = client.get("/v1/admin/audio/settings").json()
     assert s["vad_threshold"] == "0.55"
     # Policy keys live behind /policy, not the settings bag.

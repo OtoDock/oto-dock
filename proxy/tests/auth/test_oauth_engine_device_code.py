@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from unittest.mock import patch, AsyncMock, MagicMock
 
-import httpx
 import pytest
 
 from auth.oauth_providers.generic import GenericOAuthProvider

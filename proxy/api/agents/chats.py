@@ -327,7 +327,6 @@ async def get_chat_pins(
     if not can_access_chat(u, chat):
         raise HTTPException(status_code=403, detail="Access denied")
     from api.apps.apps import app_access, shape_app_rows
-    import asyncio
 
     def _load() -> dict:
         out: dict = {"chat": None, "project": None, "files": []}
@@ -397,6 +396,45 @@ async def update_chat(
     return {"status": "ok"}
 
 
+async def _close_chat_session(chat: dict) -> None:
+    """Close a deleted chat's live session on whichever layer holds it.
+
+    Without this, deleting a chat leaves its warm CLI/daemon running headless
+    (holding a subscription seat + satellite/local slot) until the idle
+    reaper — or longer, when background work keeps extending the reaper's
+    leash. Registry membership, not resolution, picks the layer: the chat's
+    stored execution_path may be stale relative to where the session actually
+    lives. Best-effort — an absent/dead session is fine."""
+    session_id = chat.get("session_id") or ""
+    agent = chat.get("agent") or ""
+    if not session_id or not agent:
+        return
+    try:
+        from core.session.session_manager import (
+            get_execution_layer, _remote_layer,
+        )
+        from core.layers.cli.session import _persistent_sessions
+        from core.layers.codex.session import _codex_sessions
+        from core.layers.direct.session import _direct_sessions
+        if _remote_layer and session_id in _remote_layer._sessions:
+            layer = _remote_layer
+        elif session_id in _persistent_sessions:
+            layer = get_execution_layer(agent, execution_path="claude-code-cli",
+                                        execution_target="local")
+        elif session_id in _codex_sessions:
+            layer = get_execution_layer(agent, execution_path="codex-cli",
+                                        execution_target="local")
+        elif session_id in _direct_sessions:
+            layer = get_execution_layer(agent, execution_path="direct-llm",
+                                        execution_target="local")
+        else:
+            return
+        await layer.close_session(session_id)
+    except Exception:
+        logger.warning("Chat delete: closing live session %s failed",
+                       session_id[:8], exc_info=True)
+
+
 @router.delete("/v1/chats/{chat_id}")
 async def delete_chat(
     chat_id: str,
@@ -413,6 +451,7 @@ async def delete_chat(
     from services.scheduler import scheduler
     for cont in task_store.list_continuations_for_chat(chat_id):
         await scheduler.remove_dynamic_task(cont["id"])
+    await _close_chat_session(chat)
     task_store.delete_chat(chat_id)
     from services.media import preview_snapshots
     await asyncio.to_thread(preview_snapshots.delete_chat_dir, chat_id)

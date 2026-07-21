@@ -8,6 +8,7 @@ without exercising the real layers or DB persistence.
 """
 
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -64,10 +65,8 @@ class FakeWebSocket:
                     f"no frame matched within {timeout}s; sent={self.sent}"
                 )
             self._sent_event.clear()
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._sent_event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                pass
 
 
 class FakeLayer:

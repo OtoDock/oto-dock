@@ -70,6 +70,23 @@ async def test_native_path_allow_has_no_updated_input(_stub):
 
 
 @pytest.mark.asyncio
+async def test_ask_carries_updated_input(_stub, monkeypatch):
+    # Interactive TUI + default mode: a write-tier tool returns "ask" (the
+    # CLI renders its native prompt) — the rewrite must still ride along, or
+    # the tool runs against the raw sandbox-virtual path and fails ENOENT.
+    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
+    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
+    monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/notes.md", "content": "x"},
+    )
+    assert res["decision"] == "ask"
+    assert res["updated_input"]["file_path"] == (
+        "/home/dave/.oto-dock/agents/my-agent/workspace/notes.md"
+    )
+
+
+@pytest.mark.asyncio
 async def test_deny_never_carries_updated_input(_stub, monkeypatch):
     monkeypatch.setattr(
         hooks, "get_session_security", lambda sid: _remote_ctx(role="viewer"),
@@ -81,7 +98,8 @@ async def test_deny_never_carries_updated_input(_stub, monkeypatch):
     assert "updated_input" not in res
 
 
-def _run_gate(hook_stdin: dict, proxy_response: dict) -> dict | None:
+def _run_gate(hook_stdin: dict, proxy_response: dict,
+              extra_env: dict | None = None) -> dict | None:
     """Run proxy/hooks/permission_gate.py as the CLI would, with
     urllib.request.urlopen stubbed to return ``proxy_response``. Returns the
     parsed hookSpecificOutput JSON, or None when the gate emitted nothing."""
@@ -108,6 +126,7 @@ def _run_gate(hook_stdin: dict, proxy_response: dict) -> dict | None:
             "PROXY_URL": "http://127.0.0.1:1",
             "PROXY_API_KEY": "k",
             "PATH": "/usr/bin:/bin",
+            **(extra_env or {}),
         },
     )
     assert proc.returncode == 0, proc.stderr
@@ -123,6 +142,80 @@ def test_gate_emits_updated_input_on_allow():
     hso = out["hookSpecificOutput"]
     assert hso["permissionDecision"] == "allow"
     assert hso["updatedInput"] == {"file_path": "/real/x"}
+    # The rewrite also teaches the model the native mapping (Edit/NotebookEdit
+    # can't be rewritten — their validation runs before hooks).
+    assert "/workspace/x" in hso["additionalContext"]
+    assert "/real/x" in hso["additionalContext"]
+
+
+def test_gate_ask_emits_decision_with_rewrite():
+    # Interactive residual-ask: an explicit permissionDecision:"ask" forces
+    # the CLI's native prompt (hook silence would be treated as allow in a
+    # trusted workspace dir); the corrected input + path note ride along.
+    out = _run_gate(
+        {"tool_name": "Write", "tool_input": {"file_path": "/workspace/x"}},
+        {"decision": "ask", "reason": "needs approval",
+         "updated_input": {"file_path": "/real/x"}},
+    )
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "ask"
+    assert hso["permissionDecisionReason"] == "needs approval"
+    assert hso["updatedInput"] == {"file_path": "/real/x"}
+    assert "/real/x" in hso["additionalContext"]
+
+
+def test_gate_ask_plain_emits_ask():
+    out = _run_gate(
+        {"tool_name": "Write", "tool_input": {"file_path": "/real/x"}},
+        {"decision": "ask"},
+    )
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "ask"
+    assert "updatedInput" not in hso
+
+
+def test_gate_deny_only_env_suppresses_ask():
+    # Codex spawns set OTO_HOOK_DENY_ONLY=1 — any non-deny stays silent,
+    # including an ask that carries a rewrite (Codex rejects non-deny JSON;
+    # its own -a on-request layer prompts instead).
+    out = _run_gate(
+        {"tool_name": "Write", "tool_input": {"file_path": "/workspace/x"}},
+        {"decision": "ask", "updated_input": {"file_path": "/real/x"}},
+        extra_env={"OTO_HOOK_DENY_ONLY": "1"},
+    )
+    assert out is None
+
+
+def test_gate_forwards_permission_mode():
+    # The CLI reports its LIVE mode (Shift+Tab) on every hook call; the gate
+    # must forward it to the proxy, which uses it as the effective mode for
+    # interactive sessions.
+    stub = (
+        "import json, sys, urllib.request\n"
+        "class _Resp:\n"
+        "    def __init__(self, body): self._body = body\n"
+        "    def read(self): return self._body\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "def _urlopen(req, timeout=0):\n"
+        "    sent = json.loads(req.data)\n"
+        "    return _Resp(json.dumps({'decision': 'deny',\n"
+        "        'reason': 'mode=' + sent.get('permission_mode', '<missing>')}).encode())\n"
+        "urllib.request.urlopen = _urlopen\n"
+        "sys.argv = ['permission_gate.py']\n"
+        f"exec(compile(open({str(_GATE_SCRIPT)!r}).read(), 'permission_gate.py', 'exec'))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", stub],
+        input=json.dumps({"tool_name": "Write", "tool_input": {},
+                          "permission_mode": "acceptEdits"}),
+        capture_output=True, text=True, timeout=30,
+        env={"OTO_SESSION_ID": "s", "PROXY_URL": "http://127.0.0.1:1",
+             "PROXY_API_KEY": "k", "PATH": "/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    hso = json.loads(proc.stdout.strip())["hookSpecificOutput"]
+    assert hso["permissionDecisionReason"] == "mode=acceptEdits"
 
 
 def test_gate_omits_updated_input_on_deny():

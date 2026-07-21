@@ -330,3 +330,114 @@ def test_dismiss_unscoped_takes_whole_trail(temp_db):
     count, freed = task_store.dismiss_document_previews("chat-1", "f1")
     assert count == 2 and set(freed) == {"s1", "s2"}
     assert task_store.get_referenced_preview_snapshot_ids("chat-1") == {"other"}
+
+
+# ---------------------------------------------------------------------------
+# /v1/documents/preview-wopi-url — render-time re-mint for the LIVE block
+# ---------------------------------------------------------------------------
+# Preview events persist the push-time URL, whose token lasts 4h — reopening
+# an older chat gave "session expired" with no recovery. The dashboard mints
+# fresh at render through this endpoint; these tests pin its gates.
+
+
+def _seed_workspace_file(tmp_path, rel="test-agent/workspace/report.xlsx"):
+    import config
+    from api.media.wopi import encode_file_id
+    full = config.AGENTS_DIR / rel
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_bytes(b"doc bytes")
+    return encode_file_id(rel)
+
+
+def _remint(client, chat_id, file_id):
+    return client.get(
+        f"/v1/documents/preview-wopi-url?chat_id={chat_id}&file_id={file_id}",
+    )
+
+
+def _claims(url):
+    import jwt as _jwt
+
+    import config
+    token = url.split("access_token=")[1].split("&")[0]
+    return _jwt.decode(token, config.WOPI_SECRET, algorithms=["HS256"])
+
+
+def test_preview_remint_recomputes_requester_permission(temp_db, tmp_path, monkeypatch):
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    manager = _mint_app(monkeypatch, tmp_path)
+    fid = _seed_workspace_file(tmp_path)
+    _add_preview_row("chat-1", fid, "")
+    r = _remint(manager, "chat-1", fid)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["wopi_url"].startswith(
+        "https://collabora.example/browser/dist/cool.html?WOPISrc="
+    )
+    assert body["permissions"] == "edit"
+    assert _claims(body["wopi_url"])["permissions"] == "edit"
+    # Same chat owner with NO per-agent role → viewer → view-only token.
+    viewer = _mint_app(monkeypatch, tmp_path, agents=())
+    body = _remint(viewer, "chat-1", fid).json()
+    assert body["permissions"] == "view"
+    assert _claims(body["wopi_url"])["permissions"] == "view"
+
+
+def test_preview_remint_requires_chat_access(temp_db, tmp_path, monkeypatch):
+    task_store.create_chat("chat-1", "user-owner", "test-agent")
+    stranger = _mint_app(monkeypatch, tmp_path, sub="user-stranger")
+    fid = _seed_workspace_file(tmp_path)  # after _mint_app points AGENTS_DIR
+    _add_preview_row("chat-1", fid, "")
+    assert _remint(stranger, "chat-1", fid).status_code == 403
+    admin = _mint_app(monkeypatch, tmp_path, sub="user-admin", is_admin=True)
+    assert _remint(admin, "chat-1", fid).status_code == 200
+
+
+def test_preview_remint_404s(temp_db, tmp_path, monkeypatch):
+    from api.media.wopi import encode_file_id
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    client = _mint_app(monkeypatch, tmp_path)
+    fid = _seed_workspace_file(tmp_path)
+    # Unknown chat.
+    assert _remint(client, "chat-none", fid).status_code == 404
+    # No referencing event in this chat.
+    assert _remint(client, "chat-1", fid).status_code == 404
+    # Dismissed trail no longer re-mints.
+    _add_preview_row("chat-1", fid, "", dismissed=True)
+    assert _remint(client, "chat-1", fid).status_code == 404
+    # Referenced but the file is gone → 404 (dashboard falls back).
+    gone = encode_file_id("test-agent/workspace/deleted.xlsx")
+    _add_preview_row("chat-1", gone, "")
+    assert _remint(client, "chat-1", gone).status_code == 404
+    # Snapshot-namespace ids have their own endpoint — never served here.
+    snap_fid = encode_file_id(".preview-snapshots/chat-1/abc")
+    _add_preview_row("chat-1", snap_fid, "")
+    assert _remint(client, "chat-1", snap_fid).status_code == 404
+    # Malformed file_id (bad base64) — but only with a matching event row,
+    # which can't exist; the event gate 404s first.
+    assert _remint(client, "chat-1", "%%bad%%").status_code == 404
+
+
+def test_preview_remint_host_cache_is_session_scoped(temp_db, tmp_path, monkeypatch):
+    import config
+    from api.media.wopi import encode_file_id
+    task_store.create_chat("chat-1", "user-a", "test-agent")
+    task_store.update_chat("chat-1", session_id="sess-1")
+    client = _mint_app(monkeypatch, tmp_path)  # manager role
+    # A mirror in the CHAT'S OWN session cache → edit for write-capable roles.
+    own_rel = ".remote-host-cache/sess-1/d1/notes.docx"
+    (config.AGENTS_DIR / own_rel).parent.mkdir(parents=True, exist_ok=True)
+    (config.AGENTS_DIR / own_rel).write_bytes(b"host bytes")
+    own_fid = encode_file_id(own_rel)
+    _add_preview_row("chat-1", own_fid, "")
+    body = _remint(client, "chat-1", own_fid).json()
+    assert body["permissions"] == "edit"
+    # ANOTHER session's cache: still readable through the chat's live event,
+    # but never editable — write-back is scoped to the chat's own session.
+    other_rel = ".remote-host-cache/sess-other/d2/notes.docx"
+    (config.AGENTS_DIR / other_rel).parent.mkdir(parents=True, exist_ok=True)
+    (config.AGENTS_DIR / other_rel).write_bytes(b"host bytes")
+    other_fid = encode_file_id(other_rel)
+    _add_preview_row("chat-1", other_fid, "")
+    body = _remint(client, "chat-1", other_fid).json()
+    assert body["permissions"] == "view"

@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 
 from core.session.session_state import (
-    SubagentRegistry, get_subagent_registry, reset_subagent_registry,
+    SubagentRegistry, _chat_streaming_state, _dashboard_notify_queues,
+    _subagent_registries, clear_session_liveness, get_subagent_registry,
+    reset_subagent_registry,
 )
 
 
@@ -126,10 +128,6 @@ def test_module_accessors_get_and_reset():
 # ---------------------------------------------------------------------------
 
 from core.session import session_state
-from core.session.session_state import (
-    _chat_streaming_state, _dashboard_notify_queues, _subagent_registries,
-    clear_session_liveness,
-)
 from core.events.bg_command_state import (
     _bg_command_registries, get_bg_command_registry,
 )
@@ -210,7 +208,8 @@ def test_cleanup_session_permission_state_clears_liveness(monkeypatch):
     try:
         session_state.cleanup_session_permission_state(sid)
         assert "chat-cleanup-4" not in _chat_streaming_state
-        assert q.get_nowait()["type"] == "liveness_clear"
+        msg = q.get_nowait()
+        assert msg["type"] == "liveness_clear"
     finally:
         _chat_streaming_state.pop("chat-cleanup-4", None)
         _dashboard_notify_queues.pop("viewer-e", None)

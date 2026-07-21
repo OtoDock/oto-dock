@@ -5,7 +5,7 @@
 # The suite needs a PostgreSQL server (the dev docker-compose Postgres is fine).
 # conftest.py auto-creates + wipes disposable `otodock_test*` databases; it
 # never touches the real `otodock` database. See tests/README.md.
-pytest==9.0.2
+pytest==9.0.3
 pytest-asyncio==1.3.0
 pytest-xdist==3.8.0        # parallel workers (-n) — one DB per worker
 pytest-timeout==2.4.0      # per-test timeout so a hang can't wedge the suite

@@ -1,0 +1,25 @@
+# Repo-wide lint gate scoped to import hygiene and dead/no-effect code —
+# deliberately NOT a general style or format gate.
+target-version = "py310" # satellite's floor; proxy/phone/audio run 3.13
+
+# .gitignore already hides venvs, node_modules, and runtime trees from ruff;
+# these cover checkouts where ignored trees exist without the ignore rules.
+extend-exclude = ["mcps/.uv-python", "mcps/community"]
+
+[lint]
+select = [
+    "F401",    # unused import
+    "F403",    # star import
+    "F405",    # possibly-undefined name via star import
+    "F811",    # redefinition / duplicate import
+    "F841",    # unused local variable
+    "B018",    # expression statement with no effect
+    "E722",    # bare except
+    "SIM105",  # try/except/pass -> contextlib.suppress
+    "PLW0108", # lambda that only forwards its arguments to a callable
+]
+
+[lint.per-file-ignores]
+# pytest fixture re-import: the module-level import IS the fixture
+# registration; test parameters legitimately shadow it.
+"proxy/tests/mcp/test_builder_blocks.py" = ["F811"]

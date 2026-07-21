@@ -9,7 +9,7 @@ import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
   usePhoneServers, useCreatePhoneServer,
   usePhoneSettings, useSavePhoneSettings,
-  type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
+  type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
 } from '../../api/phone'
 import {
   useAudioProviders, type AudioProvider,

@@ -180,8 +180,7 @@ class TestRuntimeInjector:
         # bearer_required is irrelevant for stdio (no URL to check)
         # because the entry has no `url` key.
         from services.mcp.mcp_registry import (
-            maybe_inject_bearer_header, McpManifest, ServerConfig,
-            CredentialConfig,
+            maybe_inject_bearer_header,
         )
         m = _make_manifest(
             transport="stdio",

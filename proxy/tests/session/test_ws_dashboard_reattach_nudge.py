@@ -222,3 +222,116 @@ class TestExistingChatWarmupInline:
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
+
+
+class TestMidTurnReattachKeepsSteeredMessage:
+    def test_steered_user_row_survives_mid_turn_resume(self, temp_db,
+                                                       monkeypatch):
+        # Regression (2026-07-19): a STEERED message persists mid-turn with an
+        # id ABOVE the pump's cutoff; the resume's id-based truncation withheld
+        # it and the pump replay never re-sends user rows — so switching away
+        # and back mid-turn made the just-steered message vanish. USER rows are
+        # now exempt from the cutoff filter.
+        from core.events.common_events import CommonEvent, TEXT, DONE
+        from storage import database as task_store
+
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+
+        async def scenario():
+            hold = asyncio.Event()
+
+            async def slow_turn():
+                yield CommonEvent(type=TEXT, data={"content": "working…"})
+                await hold.wait()
+                yield CommonEvent(type=DONE, data={})
+
+            layer.turn_events = lambda sid, prompt: slow_turn()
+
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+
+                ws.client_send({"type": "chat", "text": "long job",
+                                "chat_id": chat_id})
+                await ws.expect({"type": "title_updated", "chat_id": chat_id,
+                                 "title": "long job"})
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "streaming"})
+                await ws.expect({
+                    "type": "live_state", "chat_id": chat_id,
+                    "streaming": True, "session_id": sid, "started_at": ANY,
+                    "live_blocks": [], "active_tools": [],
+                    "active_agents": [], "active_delegates": [],
+                    "active_commands": [], "pending_permission": None,
+                    "thinking_active": False, "thinking_text": "",
+                    "thinking_tokens": 0, "todos": [], "goal": None,
+                    "meeting_agent": None,
+                    "meeting_participants": [], "workflows": {},
+                })
+                await ws.expect({"type": "text", "content": "working…",
+                                 "chat_id": chat_id})
+
+                # The steer branch persists the accepted message IMMEDIATELY
+                # (dashboard_chat: steered → add_chat_message) — mid-turn, so
+                # its id lands ABOVE the pump cutoff.
+                task_store.add_chat_message(
+                    chat_id, "user", "steer: go deeper",
+                    author_sub="user-admin",
+                )
+
+                ws.client_send({"type": "resume_chat", "chat_id": chat_id})
+                history = await ws.expect({
+                    "type": "chat_history", "chat_id": chat_id, "agent": ANY,
+                    "messages": ANY, "has_more": False,
+                    "restore": {"todos": [], "meeting": None, "goal": None},
+                    "plans": [], "total_cost": 0, "context_used": 0,
+                    "context_max": 0, "cache_read": 0, "cache_write": 0,
+                    "output_tokens": 0,
+                    "execution_path": "claude-code-cli",
+                    "execution_mode": "", "model": TEST_MODEL,
+                    "mode": "default",
+                })
+                # BOTH user rows survive the cutoff; the in-flight assistant
+                # tail stays withheld (it rides live_state).
+                assert [(m["role"], m["content"])
+                        for m in history["messages"]] == [
+                    ("user", "long job"),
+                    ("user", "steer: go deeper"),
+                ]
+                await ws.expect({
+                    "type": "warmup_ready", "session_id": sid,
+                    "chat_id": chat_id, "mode": "default",
+                    "model": TEST_MODEL,
+                    "execution_path": "claude-code-cli",
+                })
+                await ws.expect({"type": "queue_snapshot",
+                                 "chat_id": chat_id, "messages": []})
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "streaming"})
+                await ws.expect({
+                    "type": "live_state", "chat_id": chat_id,
+                    "streaming": True, "session_id": sid, "started_at": ANY,
+                    "live_blocks": ANY, "active_tools": [],
+                    "active_agents": [], "active_delegates": [],
+                    "active_commands": [], "pending_permission": None,
+                    "thinking_active": False, "thinking_text": "",
+                    "thinking_tokens": 0, "todos": [], "goal": None,
+                    "meeting_agent": None,
+                    "meeting_participants": [], "workflows": {},
+                })
+
+                hold.set()
+                await ws.expect({"type": "done", "chat_id": chat_id})
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "streaming"})
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "ready"})
+                await ws.expect({"type": "turn_complete", "chat_id": chat_id,
+                                 "title": f"{slug} finished",
+                                 "body": "Response ready"})
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)

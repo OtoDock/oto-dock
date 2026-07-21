@@ -5,7 +5,6 @@ edge case from the design has at least one test below.
 """
 
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -15,8 +14,6 @@ if str(_PROXY_DIR) not in sys.path:
 
 from services.path_policy_v2 import (  # noqa: E402
     PathPolicyContext,
-    PathRef,
-    PathResolution,
     ResolveItem,
     SessionTargetRevoked,
     classify_path,
@@ -675,6 +672,39 @@ class TestCredentialDenylist:
         ctx = _user_remote_ctx()
         r = resolve_path_for_session(ctx, "~/.ssh/id_ed25519")
         assert not r.allowed
+
+    def test_ssh_config_read_allowed(self):
+        """``.ssh/config`` is host/alias metadata, not key material — a
+        session allowed to RUN ssh needs it to know its destinations."""
+        ctx = _user_remote_ctx()
+        r = resolve_path_for_session(ctx, "/home/dave/.ssh/config")
+        assert r.allowed, r.error
+
+    def test_ssh_known_hosts_read_allowed(self):
+        ctx = _user_remote_ctx()
+        for p in ("/home/dave/.ssh/known_hosts",
+                  "/home/dave/.ssh/known_hosts.old"):
+            r = resolve_path_for_session(ctx, p)
+            assert r.allowed, (p, r.error)
+
+    def test_ssh_config_write_still_denied(self):
+        """A config write would plant ProxyCommand (code execution on the
+        operator's next ssh) — writes stay denied for EVERY .ssh path."""
+        ctx = _user_remote_ctx()
+        for p in ("/home/dave/.ssh/config", "/home/dave/.ssh/known_hosts"):
+            r = resolve_path_for_session(ctx, p, writing=True)
+            assert not r.allowed, p
+            assert ".ssh" in r.error.lower()
+
+    def test_ssh_other_files_still_denied(self):
+        """The carve-out is exact — keys and everything else stay denied,
+        including a 'config' NOT directly under .ssh."""
+        ctx = _user_remote_ctx()
+        for p in ("/home/dave/.ssh/authorized_keys",
+                  "/home/dave/.ssh/id_rsa.pub",
+                  "/home/dave/.ssh/backup/config"):
+            r = resolve_path_for_session(ctx, p)
+            assert not r.allowed, p
 
     def test_env_write_denied_in_workspace(self):
         """.env writes are blocked everywhere (parity with local)."""
