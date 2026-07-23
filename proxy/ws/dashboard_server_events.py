@@ -77,8 +77,23 @@ class ServerNotificationController:
 
         if ntype == "chat_status":
             # Per-chat live-dot signal (pump turn start/end, broadcast to every
-            # connection of the chat owner) — forward verbatim so the sidebar
-            # dot lights/clears for chats generating in the background.
+            # connection of the chat owner) — forward so the sidebar dot
+            # lights/clears for chats generating in the background. The notify
+            # queue is only drained BETWEEN the viewed chat's turns, so a
+            # turn-START "streaming" can sit queued for a whole turn and land
+            # right after `done` — where the frontend's auto-attach reads it as
+            # a fresh turn and pointlessly re-resumes the chat (a full-history
+            # reload flash at every turn end). Drop a "streaming" whose chat no
+            # longer has a live turn; its matching "ready" is right behind.
+            if notification.get("status") == "streaming":
+                from core.events.stream_pump import _active_pumps
+                from core.session import interactive_session
+                cid = notification.get("chat_id") or ""
+                pump = _active_pumps.get(cid)
+                if pump is None or pump.is_done:
+                    isess = interactive_session.find_live_for_chat(cid)
+                    if isess is None or not isess.turn_open:
+                        return
             await self._send(notification)
             return
 

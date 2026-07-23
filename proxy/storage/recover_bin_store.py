@@ -149,21 +149,25 @@ def can_restore(
     """Whether the requester may list / restore / discard this entry.
 
     Mirrors the write-permission tier of the path (you can recover what you
-    could have written); admin always may. Used by ``list_for`` AND the
-    restore/discard endpoints so the gate is identical at both layers.
+    could have written). Admins count as manager-tier for the SHARED scopes
+    (workspace/knowledge/config — admins manage agents; ``can_edit`` /
+    ``can_manage`` already include them, ``is_admin`` is a defensive belt for
+    callers passing per-agent-only flags) but get NO bypass for personal
+    entries: a ``users/<slug>/`` file is restorable by its owner alone. Used
+    by ``list_for`` AND the restore/discard endpoints so the gate is
+    identical at both layers.
     """
-    if is_admin:
-        return True
+    manager_tier = can_manage or is_admin
     tier = restore_tier(entry.get("rel_path", ""))
     if tier == "manager":
-        return can_manage
+        return manager_tier
     if tier == "editor":
-        return can_edit
-    # tier == "user": the owner restores; an orphaned personal file (slug no
-    # longer maps to a user → no owner_sub) falls back to manager-tier so it is
-    # never left unrecoverable.
+        return can_edit or is_admin
+    # tier == "user": the owner restores — nobody else, admins included; an
+    # orphaned personal file (slug no longer maps to a user → no owner_sub)
+    # falls back to manager-tier so it is never left unrecoverable.
     owner = entry.get("owner_sub") or ""
-    return (owner == requester_sub) if owner else can_manage
+    return (owner == requester_sub) if owner else manager_tier
 
 
 def _enforce_agent_cap(agent_slug: str, incoming: int) -> None:

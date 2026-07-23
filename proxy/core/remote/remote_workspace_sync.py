@@ -55,9 +55,15 @@ class RemoteWorkspaceSyncMixin:
 
           * admin-PAIRED machine → ``(None, role)`` — admin-shared, NO per-user
             filter, so it receives EVERY user's folder (mirrors
-            ``should_sync_to_target``'s ``username is None`` branch);
-          * user-paired machine  → ``(owner_username, owner's per-agent role)``;
-          * platform-admin OWNER → role ``"admin"`` on every agent.
+            ``should_sync_to_target``'s ``username is None`` branch); owned by
+            a platform admin → role ``"admin"`` on every agent;
+          * user-paired machine  → ``(owner_username, owner's per-agent role)``
+            — for EVERYONE, platform admins included. An admin who is
+            per-agent viewer/editor used to get role ``"admin"`` here, which
+            granted their personal machine config/ push + write-back; that
+            override let a satellite that lost its copy delete-attribute the
+            agent's prompt (Jul 2026 incident). Machine-scope sync authority
+            comes from the pairing + per-agent role, never the platform role.
 
         ``None`` ⇒ the machine isn't paired / has vanished (skip it). The role gates
         ``config/`` on the push side and ``can_write_back`` on the satellite→platform
@@ -71,10 +77,10 @@ class RemoteWorkspaceSyncMixin:
             return None
         owner_sub = machine.get("registered_by", "") or ""
         is_admin_paired = machine.get("pairing_scope", "") == "admin"
-        # Is the machine OWNER a PLATFORM admin (distinct from admin-PAIRED)? A
-        # platform admin's effective role is "admin" on every agent, so we skip the
-        # per-agent role lookup. (Mirrors notification_manager._role_and_name.)
-        owner_is_admin = bool(owner_sub) and (
+        # Platform-admin check — ONLY consulted for admin-PAIRED machines
+        # (admin-shared, role "admin"). User-paired machines always resolve
+        # the owner's per-agent role, platform admins included (see docstring).
+        owner_is_admin = is_admin_paired and bool(owner_sub) and (
             (await _asyncio.to_thread(_db.get_user, owner_sub)) or {}
         ).get("role") == "admin"
         # Per-user isolation: user-paired → scope to the owner; admin-paired → None.

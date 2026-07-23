@@ -45,12 +45,15 @@ describe('useDashboardWs auto-attach on chat_status streaming', () => {
     vi.unstubAllGlobals()
   })
 
-  function connect(viewedChatId: string | null) {
+  function connect(viewedChatId: string | null, ptyLive = false) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const wrapper = ({ children }: { children: React.ReactNode }) => (
       <QueryClientProvider client={qc}>{children}</QueryClientProvider>
     )
-    const hook = renderHook(() => useDashboardWs({ viewedChatId }), { wrapper })
+    const hook = renderHook(
+      () => useDashboardWs({ viewedChatId, isViewedChatPtyLive: () => ptyLive }),
+      { wrapper },
+    )
     act(() => { hook.result.current.connect() })
     const ws = FakeWebSocket.instances[0]
     act(() => { ws.onopen?.() })
@@ -93,5 +96,19 @@ describe('useDashboardWs auto-attach on chat_status streaming', () => {
     const { ws } = connect(null)
     frame(ws, { type: 'chat_status', chat_id: 'task-abc', status: 'streaming' })
     expect(resumes(ws, 'task-abc')).toBe(0)
+  })
+
+  it('never resumes a live interactive (PTY) chat', () => {
+    // A prompt sent to a live PTY opens the turn → a legit `streaming`
+    // broadcast for the viewed chat. Resuming would replay history and
+    // re-attach the PTY viewer — a visible terminal reload — so the PTY
+    // gate must swallow the auto-attach entirely.
+    const { hook, ws } = connect('chat-pty', true)
+    act(() => { hook.result.current.resumeChat('chat-pty') })
+    expect(resumes(ws, 'chat-pty')).toBe(1)
+    frame(ws, { type: 'chat_status', chat_id: 'chat-pty', status: 'streaming' })
+    frame(ws, { type: 'chat_status', chat_id: 'chat-pty', status: 'ready' })
+    frame(ws, { type: 'chat_status', chat_id: 'chat-pty', status: 'streaming' })
+    expect(resumes(ws, 'chat-pty')).toBe(1)  // only the explicit resume
   })
 })

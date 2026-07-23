@@ -665,6 +665,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                   if (viewed && msg.chat_id === viewed
                       && currentChatId.current === viewed
                       && !streamingRef.current
+                      && !cb.isViewedChatPtyLive?.()
                       && autoAttachRef.current !== viewed) {
                     autoAttachRef.current = viewed
                     ws.send(JSON.stringify({ type: 'resume_chat', chat_id: viewed }))

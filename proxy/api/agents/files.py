@@ -154,18 +154,20 @@ def _filter_tree(nodes: list[dict], role: str, username: str = "") -> list[dict]
     - Editor: sees knowledge/, workspace/, own users/{username}/.
       Can WRITE workspace + own users/{username}/; knowledge is read-only.
     - Manager (= owner): all four subtrees including config/, full RW.
-    - Admin: full tree (other users' dirs visible too).
+    - Admin: owner-tier view — config/ visible, users/ filtered to their
+      OWN folder like everyone else. Other users' personal dirs are
+      private-by-default even from admins in the browsing UI; targeted
+      admin cross-user path access (recover-bin restores) stays available
+      via _check_file_role.
 
     `/config/` is OWNER-only (admin + manager) — editor + viewer don't
     see it at all (no tree entry, no read, no write). Config shapes
     agent behavior — owner curation, not workspace collaboration.
     """
-    if role == "admin":
-        return nodes
     result = []
-    # Owner-tier (manager only at this point — admin already returned)
-    # sees config too. Editor + viewer omit it entirely.
-    owner_tier = role == "manager"
+    # Owner-tier (manager + admin) sees config too. Editor + viewer
+    # omit it entirely.
+    owner_tier = role in ("manager", "admin")
     for node in nodes:
         if node["type"] == "dir" and node["name"] == "users" and node.get("children"):
             # Show users/ but filter to own username only
@@ -845,10 +847,11 @@ async def list_recover_bin(
 ):
     """List the recoverable files for this agent that the caller may restore.
 
-    Scope is server-enforced: a member sees only their own ``users/<slug>/``
-    entries; a manager additionally sees shared ``workspace/`` / ``knowledge/``
-    / ``config/`` entries; an admin sees everything. A user never sees another
-    user's personal files. Entries expire after 7 days.
+    Scope is server-enforced: everyone sees their own ``users/<slug>/``
+    entries; editors additionally see shared ``workspace/`` entries; managers
+    and admins additionally see ``knowledge/`` / ``config/`` entries. Nobody —
+    admins included — sees another user's personal files. Entries expire
+    after 7 days.
     """
     u = require_auth(user)
     require_agent_access(u, name)
@@ -879,8 +882,10 @@ async def restore_recover_bin(
 ):
     """Restore selected recover-bin entries to their original paths.
 
-    Each entry's scope is RE-checked server-side (own user file, or manager for
-    a shared file, or admin) — the client's selection is never trusted. A
+    Each entry's scope is RE-checked server-side (own user file; editor tier
+    for shared workspace; manager/admin for knowledge + config — personal
+    files are owner-only, even for admins) — the client's selection is never
+    trusted. A
     restored file goes back to its exact original path; if something now
     occupies that path it is written alongside as ``name (recovered).ext``
     (NEVER overwritten, so concurrent work is preserved). Restored files re-sync

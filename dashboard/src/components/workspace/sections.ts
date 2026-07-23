@@ -38,14 +38,21 @@ export function buildSections(
   tree: FileNode[],
   canManage: boolean,
   canEdit: boolean = canManage,
+  username?: string,
 ): WorkspaceSection[] {
   const sections: WorkspaceSection[] = []
 
   const usersNode = tree.find((n) => n.name === 'users' && n.type === 'dir')
   if (usersNode?.children?.length) {
-    const userDir = usersNode.children[0]
-    const userWorkspace = userDir.children?.find((c) => c.name === 'workspace')
-    const userContext = userDir.children?.find((c) => c.name === 'context')
+    // The backend filters users/ to the caller's own folder, so a single
+    // child is the norm — but never assume position: match the logged-in
+    // username first, first dir child only as a legacy-response fallback.
+    const userDir =
+      (username
+        ? usersNode.children.find((c) => c.type === 'dir' && c.name === username)
+        : undefined) ?? usersNode.children.find((c) => c.type === 'dir')
+    const userWorkspace = userDir?.children?.find((c) => c.name === 'workspace')
+    const userContext = userDir?.children?.find((c) => c.name === 'context')
 
     if (userWorkspace) {
       sections.push({

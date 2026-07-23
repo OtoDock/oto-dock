@@ -226,6 +226,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // tagged for any OTHER chat (background generation must not render here).
     // null until warmup_started mints the id for a brand-new chat.
     viewedChatId: chatId,
+    isViewedChatPtyLive: options.isViewedChatPtyLive,
     onPreWarmupReady: (data) => {
       if (discardingRef.current) return
       options.onPreWarmupReady?.(data)

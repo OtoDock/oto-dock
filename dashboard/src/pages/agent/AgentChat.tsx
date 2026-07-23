@@ -160,6 +160,11 @@ export default function AgentChat() {
   // notification options below.
   const chatNotif = useChatNotifications()
 
+  // Live-PTY flag mirrored into a ref for useDashboardWs's auto-attach gate —
+  // the interactive hook is created after useChatStream (it needs `ws`), so
+  // callbacks reach the current value through this ref, never the closure.
+  const sessionInteractiveRef = useRef(false)
+
   // Shared chat-stream state machine — messages + status + meeting state, the
   // entire `useDashboardWs` callback object, and the shared handlers. Returned
   // values are destructured into the same names the page used when this logic
@@ -382,6 +387,7 @@ export default function AgentChat() {
       refetchChats()
     },
     enableDefensiveRefetch: true,
+    isViewedChatPtyLive: () => sessionInteractiveRef.current,
     onNotification: chatNotif.onNotification,
     onNotificationSilent: chatNotif.onNotificationSilent,
     onNotificationCount: chatNotif.onNotificationCount,
@@ -397,6 +403,7 @@ export default function AgentChat() {
   const chatRowsTimerRef = useRef<number | null>(null)
   const interactive = useInteractiveChat(ws, currentAgent?.default_execution_mode || '')
   showRichViewRef.current = interactive.showRichView
+  sessionInteractiveRef.current = interactive.sessionInteractive
 
   // Interactive-CLI display/file-tools artifact windows.
   // Lifted here so the minimized dock can render in the top-left panel stack

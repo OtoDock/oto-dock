@@ -156,12 +156,35 @@ def test_list_other_member_sees_only_own(monkeypatch):
     assert {e["rel_path"] for e in out} == {"users/bob/b.txt"}
 
 
-def test_list_admin_sees_all(monkeypatch):
+def test_list_admin_sees_shared_but_not_others_personal(monkeypatch):
+    # Personal files are owner-only — the admin bypass is gone. An admin sees
+    # every SHARED entry plus their own users/ files, never someone else's.
     _seed_three(monkeypatch)
     out = rb.list_for(AGENT, "user-admin", can_edit=True, can_manage=True, is_admin=True)
-    assert {e["rel_path"] for e in out} == {
-        "users/alice/a.txt", "users/bob/b.txt", "workspace/shared.txt",
-    }
+    assert {e["rel_path"] for e in out} == {"workspace/shared.txt"}
+
+
+def test_list_admin_sees_own_personal(monkeypatch):
+    monkeypatch.setattr(
+        "storage.database.get_user_sub_by_username",
+        {"boss": "user-admin"}.get,
+    )
+    rb.capture(AGENT, "users/boss/mine.txt", b"m", "deleted")
+    out = rb.list_for(AGENT, "user-admin", can_edit=True, can_manage=True, is_admin=True)
+    assert {e["rel_path"] for e in out} == {"users/boss/mine.txt"}
+
+
+def test_list_orphaned_personal_falls_back_to_manager_tier(monkeypatch):
+    # Slug no longer maps to a user → no owner_sub → manager-tier fallback so
+    # the entry is never left unrecoverable (admins included via can_manage).
+    monkeypatch.setattr(
+        "storage.database.get_user_sub_by_username", lambda slug: None,
+    )
+    rb.capture(AGENT, "users/ghost/lost.txt", b"g", "deleted")
+    admin = rb.list_for(AGENT, "user-admin", can_edit=True, can_manage=True, is_admin=True)
+    assert {e["rel_path"] for e in admin} == {"users/ghost/lost.txt"}
+    viewer = rb.list_for(AGENT, "user-viewer", can_edit=False, can_manage=False, is_admin=False)
+    assert viewer == []
 
 
 def _seed_tiers():
@@ -354,6 +377,42 @@ async def test_restore_allows_member_on_own_user_file(_fanout_calls, monkeypatch
         _member_with_agent(),
     )
     assert [r["rel_path"] for r in res["restored"]] == ["users/viewer/note.txt"]
+    assert rb.get(e["entry_id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_restore_denies_admin_on_other_users_personal(_fanout_calls, monkeypatch):
+    # Personal entries are owner-only: the blanket admin bypass is gone. The
+    # entry is NOT consumed — the owner can still recover it themselves.
+    _make_agent()
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    monkeypatch.setattr(
+        "storage.database.get_user_sub_by_username",
+        lambda slug: "user-viewer" if slug == "viewer" else None,
+    )
+    e = rb.capture(AGENT, "users/viewer/note.txt", b"mine", "deleted")
+    assert e["owner_sub"] == "user-viewer"
+
+    res = await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert res["denied"] == [e["entry_id"]]
+    assert res["restored"] == []
+    assert rb.get(e["entry_id"]) is not None
+    assert _fanout_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restore_admin_keeps_manager_tier_on_config(_fanout_calls):
+    # Admins stay manager-equivalent for the SHARED scopes — config restores work.
+    _make_agent()
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    e = rb.capture(AGENT, "config/prompt.md", b"prompt", "deleted")
+
+    res = await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert [r["rel_path"] for r in res["restored"]] == ["config/prompt.md"]
     assert rb.get(e["entry_id"]) is None
 
 

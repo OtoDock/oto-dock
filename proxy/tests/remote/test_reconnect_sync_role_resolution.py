@@ -1,13 +1,18 @@
-"""Regression: `sync_all_agents_on_reconnect` resolves (username, role) from the
-machine PAIRING and must not NameError.
+"""Machine-scope sync identity: (username, role) resolves from the PAIRING.
 
-`owner_is_admin` was referenced but never defined — a latent NameError that
-silently killed the ENTIRE reconnect catch-up sync (trigger #2 of the workspace
-sync model) for any machine that had synced agents (the best-effort caller
-swallowed it). These pin the resolution it must produce:
-  * admin-PAIRED machine  → admin-shared (target_username=None);
-  * platform-admin OWNER  → target_role="admin" on every agent (skip per-agent lookup);
-  * normal user-paired    → the owner's username + the owner's per-agent role.
+Pins the resolution `resolve_machine_sync_identity` must produce:
+  * admin-PAIRED machine  → admin-shared (target_username=None); owned by a
+    platform admin → target_role="admin" on every agent;
+  * user-paired machine   → the owner's username + the owner's PER-AGENT
+    role — for EVERYONE, platform admins included.
+
+The last rule is regression coverage for the prompt-deletion incident: a
+platform admin who was per-agent VIEWER used to get target_role="admin" on
+their personal machine, granting config/ push + write-back — so a satellite
+that lost its copy delete-attributed the agent's prompt at sync time.
+`_machine_sync_role` (the session-start path's equivalent) is pinned here
+too: same pairing-derived authority, session role only on admin-shared
+machines.
 """
 
 import sys
@@ -66,19 +71,63 @@ async def test_admin_paired_resolves_admin_shared():
 
 
 @pytest.mark.asyncio
-async def test_platform_admin_owner_user_paired_skips_per_agent_role():
+async def test_platform_admin_owner_user_paired_uses_per_agent_role():
     # A platform admin's OWN (user-paired) machine: scoped to them by username,
-    # but role "admin" on every agent (the per-agent role lookup is skipped).
+    # with their PER-AGENT role — the platform role never inflates machine-scope
+    # sync authority (the prompt-deletion incident: role "admin" here granted a
+    # per-agent VIEWER's machine config/ write-back).
     layer, calls = _layer_with_capture()
     with patch("storage.remote_store.get_remote_machine",
                return_value={"registered_by": "sub-admin", "pairing_scope": "user"}), \
          patch("storage.database.get_user", return_value={"role": "admin"}), \
          patch("storage.database.get_username_by_sub", return_value="adminuser"), \
-         patch("storage.database.get_user_agent_roles", return_value={}) as roles, \
+         patch("storage.database.get_user_agent_roles",
+               return_value={"agent-1": "viewer"}), \
          patch("storage.sync_state_store.agents_for_machine", return_value={"agent-1"}):
         await layer.sync_all_agents_on_reconnect("m1")
-    assert calls == [("agent-1", "adminuser", "admin")]
-    roles.assert_not_called()  # platform admin → per-agent role lookup skipped
+    assert calls == [("agent-1", "adminuser", "viewer")]
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_owner_without_explicit_role_fails_closed():
+    # No explicit per-agent role → "" (viewer-equivalent sync: personal dirs
+    # only), NOT "admin".
+    layer, calls = _layer_with_capture()
+    with patch("storage.remote_store.get_remote_machine",
+               return_value={"registered_by": "sub-admin", "pairing_scope": "user"}), \
+         patch("storage.database.get_user", return_value={"role": "admin"}), \
+         patch("storage.database.get_username_by_sub", return_value="adminuser"), \
+         patch("storage.database.get_user_agent_roles", return_value={}), \
+         patch("storage.sync_state_store.agents_for_machine", return_value={"agent-1"}):
+        await layer.sync_all_agents_on_reconnect("m1")
+    assert calls == [("agent-1", "adminuser", "")]
+
+
+# --- _machine_sync_role (session-start path's machine-scope role) ---
+
+
+def test_session_role_kept_on_admin_paired_machine():
+    from core.remote.remote_execution import _machine_sync_role
+    machine = {"registered_by": "sub-x", "pairing_scope": "admin"}
+    assert _machine_sync_role(machine, "agent-1", "editor") == "editor"
+    assert _machine_sync_role(None, "agent-1", "admin") == "admin"
+
+
+def test_session_role_replaced_by_per_agent_role_on_user_paired():
+    from core.remote.remote_execution import _machine_sync_role
+    machine = {"registered_by": "sub-admin", "pairing_scope": "user"}
+    with patch("storage.database.get_user_agent_roles",
+               return_value={"agent-1": "viewer"}):
+        # The session says "admin" (platform-inflated) — the machine syncs
+        # as the owner's per-agent viewer role.
+        assert _machine_sync_role(machine, "agent-1", "admin") == "viewer"
+        assert _machine_sync_role(machine, "other-agent", "admin") == ""
+
+
+def test_user_paired_without_owner_fails_closed():
+    from core.remote.remote_execution import _machine_sync_role
+    machine = {"registered_by": "", "pairing_scope": "user"}
+    assert _machine_sync_role(machine, "agent-1", "admin") == ""
 
 
 @pytest.mark.asyncio

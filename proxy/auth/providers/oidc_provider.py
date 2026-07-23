@@ -4,7 +4,9 @@ Replaces the Authentik-specific code with a generic OIDC implementation
 that works with any OIDC provider (Authentik, Authelia, Keycloak, Okta, etc.).
 """
 
+import asyncio
 import logging
+import time
 
 import httpx
 
@@ -12,6 +14,57 @@ import config
 from auth.providers.base import AuthProvider, AuthResult
 
 logger = logging.getLogger("claude-proxy")
+
+# Lazy re-discovery guard — module-level so it is shared across all callers
+# and provider instances. `at` is the monotonic time of the LAST attempt
+# (success or failure); attempts are spaced at least the interval apart so a
+# down IdP is neither hammered nor log-spammed on every login click.
+_DISCOVERY_RETRY_INTERVAL_S = 30
+_discovery_guard = {"at": 0.0}
+_discovery_lock = asyncio.Lock()
+
+
+def _discovery_needed() -> bool:
+    if not (config.OIDC_ENABLED and config.OIDC_DISCOVERY_URL):
+        return False
+    # LOGOUT_URL is deliberately excluded: many IdPs omit end_session_endpoint
+    # and get_logout_url degrades gracefully — requiring it here would retry
+    # forever against such providers.
+    return not (config.OIDC_AUTHORIZE_URL and config.OIDC_TOKEN_URL
+                and config.OIDC_USERINFO_URL)
+
+
+async def ensure_oidc_discovery() -> None:
+    """Re-attempt OIDC endpoint discovery when the boot-time fetch failed
+    (e.g. proxy and a co-hosted IdP racing up after a power cut). Fast path
+    is a bare attribute check; on success the config globals are populated
+    via config.apply_oidc_discovery (explicit env vars still win)."""
+    if not _discovery_needed():
+        return
+    async with _discovery_lock:
+        if not _discovery_needed():  # a concurrent caller just recovered it
+            return
+        now = time.monotonic()
+        if now - _discovery_guard["at"] < _DISCOVERY_RETRY_INTERVAL_S:
+            return
+        _discovery_guard["at"] = now
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    config.OIDC_DISCOVERY_URL,
+                    headers={"User-Agent": config.OIDC_DISCOVERY_USER_AGENT},
+                )
+                resp.raise_for_status()
+                meta = resp.json()
+        except Exception as e:
+            # The guard timestamp already advanced — a down IdP logs one line
+            # per retry window, not one per click.
+            logger.warning(
+                f"OIDC discovery retry failed for {config.OIDC_DISCOVERY_URL}: {e}"
+            )
+            return
+        config.apply_oidc_discovery(meta)
+        logger.info(f"OIDC discovery recovered: authorize={config.OIDC_AUTHORIZE_URL}")
 
 
 class OIDCAuthProvider(AuthProvider):
@@ -24,6 +77,11 @@ class OIDCAuthProvider(AuthProvider):
         """
         code = request_data.get("code", "")
         redirect_uri = request_data.get("redirect_uri")
+
+        # Covers the token/userinfo leg when boot-time discovery failed but a
+        # callback still arrives (authorize URL set explicitly, or recovery
+        # happened between the login click and the callback).
+        await ensure_oidc_discovery()
 
         # Exchange code for tokens
         try:

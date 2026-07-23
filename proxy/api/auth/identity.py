@@ -20,7 +20,7 @@ from auth.license import check_seat_limit
 from auth.password import check_password_strength, hash_password, verify_password
 from auth.providers import UserContext, apply_session_cookie, create_session_jwt, get_current_user, mask_email, require_auth, validate_oauth_state
 from auth.providers.local_provider import LocalAuthProvider
-from auth.providers.oidc_provider import OIDCAuthProvider
+from auth.providers.oidc_provider import OIDCAuthProvider, ensure_oidc_discovery
 from auth.rate_limiter import check_ip_rate_limit, clear_rate_limit, hit as rate_limit_hit, record_failed_attempt, record_successful_login
 from auth.totp import consume_2fa_session_token, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, validate_2fa_session_token, verify_recovery_code, verify_totp
 from storage import database as task_store
@@ -215,6 +215,7 @@ async def auth_login(mobile: bool = False):
     """
     if config.AUTH_PROVIDER_BYPASS and config.OIDC_ENABLED:
         # Bypass mode: go straight to OIDC (current Authentik behavior)
+        await ensure_oidc_discovery()
         url = _oidc_provider.get_login_url(
             redirect_uri="otodock://auth/callback" if mobile else None,
             mobile=mobile,
@@ -232,6 +233,7 @@ async def auth_oidc_url(request: Request, mobile: bool = False):
     """Get OIDC authorization URL (called when user clicks 'Sign in with SSO')."""
     if not config.OIDC_ENABLED:
         raise HTTPException(status_code=503, detail="OIDC not configured")
+    await ensure_oidc_discovery()
     url = _oidc_provider.get_login_url(
         redirect_uri="otodock://auth/callback" if mobile else None,
         mobile=mobile,
@@ -539,6 +541,10 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
             "sub": user.sub,
             "email": user.email,
             "name": user.name,
+            # Filesystem-safe slug backing `users/<username>/` in agent
+            # workspaces — lets the dashboard pick the caller's OWN folder
+            # from the file tree instead of assuming position.
+            "username": (db_user.get("username") or "") if db_user else "",
             "role": user.role,
             "agents": user.agents,
             "default_agent": user.default_agent,

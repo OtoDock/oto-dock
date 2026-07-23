@@ -4,6 +4,8 @@ export interface User {
   sub: string
   email: string
   name: string
+  /** Filesystem-safe slug backing `users/<username>/` in agent workspaces. */
+  username?: string
   display_name?: string
   role: 'admin' | 'creator' | 'member'
   agents: string[]

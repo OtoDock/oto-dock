@@ -4,9 +4,13 @@ Switching into a chat whose turn is ending raced the pump teardown ("the
 story ended mid-sentence until I refreshed"). These tests lock the
 pump-level invariants the fixes rely on:
 
-- detach() is OWNERSHIP-CHECKED: a stale holder (an old socket's close path
-  racing a new viewer's attach) can no longer null the queue the new viewer
-  reads — frames keep flowing to the current subscriber.
+- attach() is FAN-OUT: a second viewer (another device/tab, a teammate on a
+  shared chat) gets its own queue and every frame — it never displaces the
+  first viewer (the old single-slot steal made concurrent viewers' 3s
+  _task_pump_poll fight over the stream, wholesale-reloading the chat every
+  few seconds mid-generation).
+- detach() removes only the CALLER's queue: a stale holder's close path can
+  never stop another viewer's frames.
 - DONE (turn boundary) KEEPS live_blocks accumulating: a consumer attaching
   between the turn's final save and the producer's exit still reconstructs
   the whole turn from live_state.
@@ -74,21 +78,57 @@ def _drain(q: asyncio.Queue) -> list:
 
 
 @pytest.mark.asyncio
-async def test_detach_requires_ownership(temp_db):
+async def test_attach_fans_out_to_all_viewers(temp_db):
     temp_db.create_chat("pc1", "user-admin", "a1")
     pump = _mk_pump("pc1")
     try:
         q1 = pump.attach()
-        q2 = pump.attach()  # a new viewer takes over; q1 got the sentinel
-        assert [i["pump_type"] for i in _drain(q1)] == ["detached"]
+        q2 = pump.attach()  # a second viewer joins — q1 keeps streaming
+        assert _drain(q1) == []  # no steal sentinel
 
-        pump.detach(q1)  # stale holder (old socket's close) — must be a no-op
         await pump._forward({"pump_type": "ws_event", "event": {"type": "text"}})
-        assert len(_drain(q2)) == 1  # frames still flow to the live viewer
+        assert len(_drain(q1)) == 1  # both viewers get every frame
+        assert len(_drain(q2)) == 1
 
-        pump.detach(q2)  # the owner detaches — clears
+        pump.detach(q1)  # one viewer leaves — the other keeps streaming
+        await pump._forward({"pump_type": "ws_event", "event": {"type": "text"}})
+        assert _drain(q1) == []
+        assert len(_drain(q2)) == 1
+
+        pump.detach(q1)  # double-detach of a gone queue is a no-op
+        pump.detach(q2)
         await pump._forward({"pump_type": "ws_event", "event": {"type": "text"}})
         assert _drain(q2) == []
+    finally:
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_pump_ended_reaches_all_viewers(temp_db):
+    temp_db.create_chat("pc1b", "user-admin", "a1")
+    pump = _mk_pump("pc1b")
+    try:
+        q1 = pump.attach()
+        q2 = pump.attach()
+        for q in list(pump._ws_queues):
+            q.put_nowait({"pump_type": "pump_ended"})  # the _run finally
+        assert [i["pump_type"] for i in _drain(q1)] == ["pump_ended"]
+        assert [i["pump_type"] for i in _drain(q2)] == ["pump_ended"]
+    finally:
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_push_ws_event_fans_out(temp_db):
+    temp_db.create_chat("pc1c", "user-admin", "a1")
+    pump = _mk_pump("pc1c")
+    try:
+        assert pump.push_ws_event({"type": "text"}) is False  # nobody attached
+        q1 = pump.attach()
+        q2 = pump.attach()
+        assert pump.push_ws_event({"type": "text"}) is True
+        assert [i["event"]["type"] for i in _drain(q1)] == ["text"]
+        assert [i["event"]["type"] for i in _drain(q2)] == ["text"]
     finally:
         pump.producer.cancel()
 
@@ -109,8 +149,8 @@ async def test_detach_own_queue_clears(temp_db):
 def test_external_driven_sources_policy():
     """Dashboard view-only policy: opening a chat whose pump is
     driven OUT-OF-BAND (the phone pipeline plays its stream as TTS) must NOT
-    attach — attach() is single-consumer, so it would steal the stream and kill
-    the live call. Only externally-driven sources are view-only; 'task'/'meeting'
+    attach — the dashboard must never inject itself into a live call's
+    delivery path (and pre-fan-out, attach() stole the stream outright). Only externally-driven sources are view-only; 'task'/'meeting'
     pumps MUST stay attachable (the dashboard is their live viewer).
     """
     from ws.dashboard import _EXTERNAL_DRIVEN_SOURCES

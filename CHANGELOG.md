@@ -14,6 +14,40 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-07-23
+
+### Added
+- The installer now offers a one-time host tuning (`vm.swappiness=10` via
+  `/etc/sysctl.d/`, sudo-gated, safe to decline) that prevents dashboard
+  stalls after memory-heavy tool runs. Existing installs can apply it once
+  with `sudo bash scripts/setup-host-tuning.sh`.
+
+### Fixed
+- Viewing a generating chat from more than one device or tab no longer makes
+  the view reload every few seconds — all viewers now stream the turn live,
+  simultaneously. This also removes the response lag those reloads caused.
+- The chat no longer flashes a reload right after a response completes, and
+  sending a message to a live interactive terminal from the chat input no
+  longer reloads the terminal view.
+- Hardened the Windows shell-wrapper analysis in the command permission gate
+  against pathological regex backtracking on adversarial command strings.
+- SSO login no longer fails with "OIDC not configured" until a proxy restart
+  when the identity provider was unreachable at proxy startup (e.g. proxy and
+  a co-hosted IdP cold-starting together after a power cut). OIDC endpoint
+  discovery now retries automatically on the next login attempt, at most once
+  per 30 seconds; explicitly configured endpoint URLs are never overwritten.
+- Admin accounts now see only their **own** personal folder in the agent
+  workspace file browser, like managers — this also fixes admins sometimes
+  being shown an empty "My Workspace".
+- Workspace sync to a user-paired remote machine now runs with the owner's
+  per-agent role instead of full admin authority, and agent `config/` files
+  are never deleted through sync absence-inference anymore (deliberate
+  deletes still propagate). Previously a machine that had lost its working
+  copy could delete the agent's prompt on the platform at sync time.
+- Deleted personal files in the recover bin are now restorable only by their
+  owner; shared workspace/knowledge/config entries keep their
+  editor/manager tiers.
+
 ## [1.3.1] — 2026-07-21
 
 ### Fixed
@@ -307,7 +341,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/OtoDock/oto-dock/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/OtoDock/oto-dock/compare/v1.1.1...v1.2.0

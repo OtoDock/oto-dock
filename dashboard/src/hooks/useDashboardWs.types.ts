@@ -18,6 +18,11 @@ export interface WsCallbacks {
    * render into this view.
    */
   viewedChatId?: string | null
+  /** True while the viewed chat renders a LIVE interactive PTY. Gates the
+   *  chat_status auto-attach: a legit mid-turn "streaming" broadcast for a
+   *  PTY chat must not trigger resume_chat — the resume replays history +
+   *  re-attaches the PTY viewer, visibly reloading the terminal. */
+  isViewedChatPtyLive?: () => boolean
   onText?: (content: string) => void
   onThinking?: (data: { phase?: string; text?: string; estimated_tokens?: number }) => void
   onToolStart?: (data: { name: string; tool_id?: string }) => void

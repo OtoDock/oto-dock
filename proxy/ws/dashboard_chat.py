@@ -1687,6 +1687,11 @@ class ChatController:
                             self.user_sub, self.notify_connection_id, False,
                             away=bool(client_msg.get("away")),
                         )
+                    elif cm_type == "chat_read":
+                        # Read receipts arrive mid-turn too (the client marks
+                        # the chat read on every history load) — same handler
+                        # as between turns; DB + fan-out only, stream-safe.
+                        await self._handle_chat_read(client_msg)
                     else:
                         logger.warning(
                             f"WS dashboard: unhandled client message type={cm_type!r} during pump streaming — dropped"

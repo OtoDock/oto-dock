@@ -124,7 +124,7 @@ class ChatStreamPump:
         self.scope = scope
         self.source_type = source_type
 
-        self._ws_queue: asyncio.Queue | None = None
+        self._ws_queues: list[asyncio.Queue] = []
         self._done = False
         self._abort_requested = False  # abort() sets; drives the resumed-task run-status close
         self._task: asyncio.Task | None = None
@@ -224,26 +224,27 @@ class ChatStreamPump:
         return self._done
 
     def attach(self) -> asyncio.Queue:
-        """Attach a WS consumer. Returns queue to read pump events from."""
+        """Attach a WS consumer. Returns queue to read pump events from.
+
+        Fan-out: every attached consumer gets every frame. A second viewer
+        (another device/tab of the same user, or a teammate on a shared chat)
+        must never displace the first — the old single-slot steal made the
+        viewers' 3s `_task_pump_poll` fight over the stream, wholesale-reloading
+        the chat on every takeover (the "chat refreshes mid-generation" bug).
+        """
         q: asyncio.Queue = asyncio.Queue()
-        old = self._ws_queue
-        self._ws_queue = q
-        if old:
-            old.put_nowait({"pump_type": "detached"})
+        self._ws_queues.append(q)
         return q
 
     def detach(self, q: asyncio.Queue):
-        """Detach WS consumer. Pump continues independently.
+        """Detach ONE WS consumer's queue. Pump continues independently.
 
-        ``q`` is the queue the caller received from :meth:`attach` — a holder
-        may only detach ITSELF. If another connection attached since (attach()
-        swapped the queue), this is a no-op: a stale detach (an old socket's
-        close/disconnect path racing a new viewer's attach) must not stop the
-        new viewer's frames mid-stream.
+        ``q`` is the queue the caller received from :meth:`attach` — removing
+        it never touches other viewers' queues, so a stale detach (an old
+        socket's close path racing a new viewer) is inherently harmless.
         """
-        if self._ws_queue is not q:
-            return
-        self._ws_queue = None
+        with contextlib.suppress(ValueError):
+            self._ws_queues.remove(q)
 
     def abort(self):
         """Kill the producer — pump will exit its loop."""
@@ -526,9 +527,18 @@ class ChatStreamPump:
             logger.error(f"Failed to record usage: {e}")
 
     async def _forward(self, item: dict):
-        """Forward event to WS subscriber if attached."""
-        if self._ws_queue:
-            await self._ws_queue.put(item)
+        """Forward event to every attached WS subscriber."""
+        for q in self._ws_queues:
+            await q.put(item)
+
+    def push_ws_event(self, event: dict) -> bool:
+        """External push (scheduler / session_state): fan a ready-made ws_event
+        to every attached subscriber. Returns whether anyone received it."""
+        if not self._ws_queues:
+            return False
+        for q in list(self._ws_queues):
+            q.put_nowait({"pump_type": "ws_event", "event": event})
+        return True
 
     def start(self) -> asyncio.Task:
         """Start the pump's background processing task."""
@@ -598,7 +608,7 @@ class ChatStreamPump:
                         pass
 
                 # Read CommonEvent from event queue (faster poll when WS attached)
-                timeout = 0.15 if self._ws_queue else 2.0
+                timeout = 0.15 if self._ws_queues else 2.0
                 try:
                     event: CommonEvent = await asyncio.wait_for(
                         self.event_queue.get(), timeout=timeout,
@@ -861,9 +871,9 @@ class ChatStreamPump:
                     except Exception as e:
                         logger.debug("resumed-task run status close failed: %s", e)
 
-            # Signal any remaining subscriber
-            if self._ws_queue:
-                self._ws_queue.put_nowait({"pump_type": "pump_ended"})
+            # Signal any remaining subscribers
+            for q in list(self._ws_queues):
+                q.put_nowait({"pump_type": "pump_ended"})
 
             # Fire the ephemeral turn-complete signal — but NOT while background
             # subagents are still running. When the LLM spawns bg agents and ends

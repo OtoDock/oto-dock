@@ -13,6 +13,7 @@ import {
   type FileNode,
 } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
+import { useAuth } from '../../contexts/AuthContext'
 import type { useWorkspaceState } from '../../hooks/useWorkspaceState'
 import { pushEscHandler } from '../../lib/escStack'
 import { parentDir, resolveActionTargets } from '../../lib/paths'
@@ -116,6 +117,7 @@ export default function WorkspaceOverlay({
   // canManage when caller hasn't been updated (preserves the owner-only
   // behavior — workspace gated to manager).
   const effectiveCanEdit = canEdit ?? canManage
+  const { user } = useAuth()
   const { data: tree = [] } = useAgentFiles(agent)
   const { data: recoverEntries = [] } = useRecoverBin(agent)
   const createDir = useCreateAgentDir()
@@ -140,8 +142,8 @@ export default function WorkspaceOverlay({
   }, [agent, qc])
 
   const allSections = useMemo(
-    () => buildSections(tree, canManage, effectiveCanEdit),
-    [tree, canManage, effectiveCanEdit],
+    () => buildSections(tree, canManage, effectiveCanEdit, user?.username),
+    [tree, canManage, effectiveCanEdit, user?.username],
   )
   const sections = useMemo(
     () => (allowedScopes ? allSections.filter((s) => allowedScopes.includes(s.key)) : allSections),

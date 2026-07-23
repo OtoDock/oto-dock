@@ -75,7 +75,7 @@ class TestPumpPayerAttribution:
         )
 
         async def _build_and_record():
-            producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+            producer = asyncio.get_running_loop().create_task(asyncio.sleep(3600))
             pump = ChatStreamPump(
                 chat_id=chat_id,
                 session_id=session_id,
@@ -90,7 +90,11 @@ class TestPumpPayerAttribution:
             pump._record_usage(task_store.get_chat(chat_id))
             producer.cancel()
 
-        asyncio.get_event_loop().run_until_complete(_build_and_record())
+        # asyncio.run(): the deprecated get_event_loop().run_until_complete()
+        # raised "no current event loop" (py3.13) whenever an async suite ran
+        # earlier in the worker and pytest-asyncio tore its loop down — the
+        # order-dependent flake behind the full-suite-only failures here.
+        asyncio.run(_build_and_record())
         return captured
 
     def test_user_paid_session_bills_payer_user_scope(self, monkeypatch):

@@ -406,8 +406,8 @@ class TestStreamingTurnControls:
                                  "chat_id": chat_id})
                 await ws.expect({"type": "done", "chat_id": chat_id})
 
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
@@ -480,8 +480,8 @@ class TestStreamingTurnControls:
 
                 hold.set()  # the (steered) turn completes — nothing queued
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
@@ -616,8 +616,8 @@ class TestStreamingTurnControls:
                 # detached pump finishes headless; its broadcasts drain later.
                 # A CLI abort kills the whole process group, so the liveness
                 # cohort clears ride along (clear_session_liveness → notify).
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "bg_agents_complete", "count": 0})
                 await ws.expect({"type": "bg_commands_complete", "count": 0})
                 await ws.expect({"type": "fg_agents_complete"})
@@ -742,8 +742,8 @@ class TestStreamingTurnControls:
                 await ws.expect({"type": "text", "content": "approved!",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
@@ -818,8 +818,8 @@ class TestPlanFilenameCarryOver:
                                  "tool_input": {"file_path": plan_path},
                                  "file_path": plan_path})
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
@@ -848,8 +848,8 @@ class TestPlanFilenameCarryOver:
 
                 hold.set()
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,

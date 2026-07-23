@@ -75,6 +75,10 @@ export interface UseChatStreamOptions {
   /** Schedule the 400ms defensive resume_chat when the bubble has no text
    * (chat: true). */
   enableDefensiveRefetch?: boolean
+  /** True while the viewed chat renders a live interactive PTY — forwarded to
+   *  useDashboardWs to suppress the chat_status auto-attach (a resume would
+   *  reload the terminal view). */
+  isViewedChatPtyLive?: () => boolean
 
   // --- Notifications (page-owned; AgentChat / useChatNotifications) ---
   onNotification?: (data: any) => void

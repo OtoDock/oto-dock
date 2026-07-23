@@ -15,17 +15,21 @@
 #      if one already exists; the server appends its own generated secrets to
 #      the same file on first boot).
 #   4. Ubuntu 24.04+ only: installs the scoped `otodock_userns` AppArmor
-#      profile the agent sandbox needs on such hosts. This is the one step
-#      that may ask for your sudo password; the system-wide hardening stays
-#      enabled. Other hosts skip it entirely.
-#   5. Downloads the release-pinned docker-compose.yml, starts the stack, and
+#      profile the agent sandbox needs on such hosts. May ask for your sudo
+#      password; the system-wide hardening stays enabled. Other hosts skip
+#      it entirely.
+#   5. Linux only: applies the recommended vm.swappiness=10 host tuning via
+#      /etc/sysctl.d/ (sudo again; declining it is safe — the install
+#      continues either way).
+#   6. Downloads the release-pinned docker-compose.yml, starts the stack, and
 #      prints the dashboard URL.
 #
 # Fresh installs only — it never upgrades or overwrites an existing install
 # (upgrades: https://docs.otodock.io/administration/upgrading). Safe to re-run
 # if a step stopped it: everything that already exists is kept. All files land
 # in the current directory; nothing else on the host is touched (except the
-# optional AppArmor profile in step 4, which its own script documents).
+# optional AppArmor profile in step 4 and the optional sysctl drop-in in
+# step 5, each documented in its own short script).
 set -euo pipefail
 
 # Where files are fetched from. OTODOCK_REF selects a branch or tag — the
@@ -48,7 +52,7 @@ fetch() { # fetch <url> <dest>
 # --- 1. Preflight ------------------------------------------------------------
 # Run as a regular user: the stack itself needs no root, and the server's own
 # files should not end up root-owned. Sudo is used only for the optional
-# AppArmor step below.
+# AppArmor and host-tuning steps below.
 if [ "$(id -u)" -eq 0 ]; then
     fail "please run as a regular user, not root — sudo is used only where needed.
   (On a fresh server: adduser <name> && usermod -aG docker,sudo <name>, then re-run as them.)"
@@ -167,7 +171,37 @@ elif [ "$(cat "$_userns_sysctl" 2>/dev/null || echo 0)" = "1" ]; then
     echo "OTODOCK_APPARMOR_PROFILE=otodock_userns" >> .env
 fi
 
-# --- 5. Fetch the compose file and start ------------------------------------
+# --- 5. Host tuning: keep the platform out of swap ---------------------------
+# Linux's default vm.swappiness=60 lets a memory burst from a sandboxed tool
+# container push the OtoDock server's own processes into swap — and the next
+# request that touches those pages stalls the dashboard while they page back
+# in. scripts/setup-host-tuning.sh writes /etc/sysctl.d/90-otodock.conf with
+# vm.swappiness=10 (standard sysctl precedence — easy to override or remove).
+# Best-effort on purpose: this is a tuning, not a requirement, so an install
+# never fails over it. Hosts without the knob (macOS/Windows) or already at
+# <= 10 skip it silently inside the script.
+if [ "$(cat /proc/sys/vm/swappiness 2>/dev/null || echo 0)" -gt 10 ]; then
+    say "tuning the host to keep OtoDock out of swap (vm.swappiness=10 via
+  /etc/sysctl.d/90-otodock.conf — one time, needs sudo; skipping is safe):"
+    # Best-effort throughout — a tuning step must never abort the install,
+    # so even its download failing only skips it (unlike the fatal fetch()).
+    if curl -fsSL "$_raw/scripts/setup-host-tuning.sh" -o setup-host-tuning.sh.tmp \
+            && mv setup-host-tuning.sh.tmp setup-host-tuning.sh; then
+        _sudo=(sudo)
+        if [ ! -t 0 ]; then _sudo=(sudo -n); fi
+        if ! command -v sudo >/dev/null 2>&1 || ! "${_sudo[@]}" bash setup-host-tuning.sh; then
+            say "skipped (sudo unavailable or declined) — OtoDock runs fine without it.
+  For smoother behaviour under memory pressure, run once when convenient:
+      sudo bash $(pwd)/setup-host-tuning.sh"
+        fi
+    else
+        rm -f setup-host-tuning.sh.tmp
+        say "skipped (could not download the tuning script) — OtoDock runs fine
+  without it; see scripts/setup-host-tuning.sh in the repo to apply it later."
+    fi
+fi
+
+# --- 6. Fetch the compose file and start ------------------------------------
 # The compose file pins the OtoDock release it shipped with, so the install is
 # reproducible; upgrading later is a one-line version bump (see the upgrade
 # docs). Fetched last on purpose: its presence is what marks this directory as

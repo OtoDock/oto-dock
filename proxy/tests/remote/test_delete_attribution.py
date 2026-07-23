@@ -110,3 +110,30 @@ def test_viewer_can_delete_own_user_dir():
                           target_role="viewer", target_username="alice")
     a = _act(plan, "users/alice/workspace/mine.md")
     assert a is not None and a.op == "delete_platform"
+
+
+def test_config_never_delete_attributed_from_absence():
+    # Even a MANAGER with full config write-back: a config/ file absent on the
+    # satellite is RE-PUSHED, never delete-attributed — the blast radius of a
+    # wrong inference is the agent's prompt (the Jul 2026 incident deleted
+    # config/prompt.md this way). Deliberate config deletes travel as live
+    # file_changed frames during a session, not absence at initial sync.
+    local = [FileEntry("config/prompt.md", "sha256:v1", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    base = {"config/prompt.md": ("sha256:v1", 1.0)}
+    plan = diff_manifests(local, [_ALIVE], base=base,
+                          target_role="manager", target_username="alice")
+    a = _act(plan, "config/prompt.md")
+    assert a is not None and a.op == "push"
+
+
+def test_knowledge_delete_attribution_unchanged():
+    # The config/ guard is deliberately NARROW: knowledge/ (also owner-tier)
+    # still delete-attributes on converged absence.
+    local = [FileEntry("knowledge/old-doc.md", "sha256:v1", 10, 1.0),
+             FileEntry("workspace/keep.txt", "sha256:keep", 10, 1.0)]
+    base = {"knowledge/old-doc.md": ("sha256:v1", 1.0)}
+    plan = diff_manifests(local, [_ALIVE], base=base,
+                          target_role="manager", target_username="alice")
+    a = _act(plan, "knowledge/old-doc.md")
+    assert a is not None and a.op == "delete_platform"

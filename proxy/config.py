@@ -1909,27 +1909,43 @@ OIDC_ROLE_ADMIN_GROUP = _cfg("OIDC_ROLE_ADMIN_GROUP", "")
 OIDC_ROLE_CREATOR_GROUP = _cfg("OIDC_ROLE_CREATOR_GROUP", "")
 OIDC_ROLE_MEMBER_GROUP = _cfg("OIDC_ROLE_MEMBER_GROUP", "")
 
+# Explicit UA — Authentik (and many WAFs) reject the default Python client
+# User-Agents with 403.
+OIDC_DISCOVERY_USER_AGENT = "OtoDock/1.0 OIDC-Discovery"
+
+
+def apply_oidc_discovery(meta: dict) -> None:
+    """Fill any OIDC endpoint URL not explicitly set via env from a parsed
+    .well-known/openid-configuration document. Explicit env vars always win —
+    a URL that already has a value is never overwritten. Shared by the
+    import-time fetch below and the lazy re-discovery in
+    auth.providers.oidc_provider (for an IdP that boots slower than the proxy).
+    """
+    global OIDC_AUTHORIZE_URL, OIDC_TOKEN_URL, OIDC_USERINFO_URL, OIDC_LOGOUT_URL
+    OIDC_AUTHORIZE_URL = OIDC_AUTHORIZE_URL or meta.get("authorization_endpoint", "")
+    OIDC_TOKEN_URL = OIDC_TOKEN_URL or meta.get("token_endpoint", "")
+    OIDC_USERINFO_URL = OIDC_USERINFO_URL or meta.get("userinfo_endpoint", "")
+    OIDC_LOGOUT_URL = OIDC_LOGOUT_URL or meta.get("end_session_endpoint", "")
+
+
 # OIDC discovery: if OIDC_DISCOVERY_URL is set, fetch .well-known and
 # populate any of OIDC_{AUTHORIZE,TOKEN,USERINFO,LOGOUT}_URL that
 # weren't individually set. Explicit env vars always win. Failures
-# log a warning but don't block startup — OIDC will simply not work
-# until the URLs resolve.
+# log a warning but don't block startup — the endpoints are then
+# re-discovered lazily on the next SSO login attempt
+# (auth.providers.oidc_provider.ensure_oidc_discovery), so an IdP that
+# comes up after the proxy doesn't require a proxy restart.
 if OIDC_ENABLED and OIDC_DISCOVERY_URL:
     import json as _json
     import urllib.request as _urllib_request
     try:
-        # Explicit UA — Authentik (and many WAFs) reject the default
-        # "Python-urllib/*" User-Agent with 403.
         _req = _urllib_request.Request(
             OIDC_DISCOVERY_URL,
-            headers={"User-Agent": "OtoDock/1.0 OIDC-Discovery"},
+            headers={"User-Agent": OIDC_DISCOVERY_USER_AGENT},
         )
         with _urllib_request.urlopen(_req, timeout=5) as _resp:
             _meta = _json.loads(_resp.read())
-        OIDC_AUTHORIZE_URL = OIDC_AUTHORIZE_URL or _meta.get("authorization_endpoint", "")
-        OIDC_TOKEN_URL = OIDC_TOKEN_URL or _meta.get("token_endpoint", "")
-        OIDC_USERINFO_URL = OIDC_USERINFO_URL or _meta.get("userinfo_endpoint", "")
-        OIDC_LOGOUT_URL = OIDC_LOGOUT_URL or _meta.get("end_session_endpoint", "")
+        apply_oidc_discovery(_meta)
     except Exception as _e:
         _boot_note(f"WARN: OIDC discovery failed for {OIDC_DISCOVERY_URL}: {_e}")
 

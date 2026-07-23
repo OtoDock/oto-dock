@@ -62,10 +62,9 @@ async def lifespan(app: FastAPI):
     # and queue prompts on active pumps without circular imports.
     def _push_to_pump(chat_id: str, event: dict) -> bool:
         pump = _active_pumps.get(chat_id)
-        if pump and pump._ws_queue:
+        if pump:
             try:
-                pump._ws_queue.put_nowait({"pump_type": "ws_event", "event": event})
-                return True
+                return pump.push_ws_event(event)
             except Exception:
                 pass
         return False

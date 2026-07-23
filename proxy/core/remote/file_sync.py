@@ -712,8 +712,17 @@ def _resolve_merge(
         # is indistinguishable from a real satellite delete — deleting here
         # would destroy the platform's file. Re-push instead; the worst case
         # is a deliberately-deleted empty file resurrecting (safe direction).
+        # CONFIG/ paths are never delete-attributed from absence either: the
+        # blast radius of a wrong inference (poisoned base, satellite
+        # restored from backup, tree partially lost) is the agent's prompt /
+        # behavior files. A deliberate satellite-side config delete arrives
+        # as a live file_changed frame DURING a session — absence at initial
+        # sync is not that signal. Re-push; worst case a config file deleted
+        # on an OFFLINE satellite resurrects (delete it via the dashboard or
+        # in-session instead).
         if (B is not None and P == B and satellite_tree_present and cwb()
-                and P != _EMPTY_CONTENT_HASH):
+                and P != _EMPTY_CONTENT_HASH
+                and path.split("/", 1)[0] != "config"):
             return FileAction(
                 path, "delete_platform", clear_base=True,
                 capture_side="platform", capture_reason="deleted",

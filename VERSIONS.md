@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.3.1
+OTODOCK_VERSION=1.3.2
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).

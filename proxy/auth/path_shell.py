@@ -1451,15 +1451,19 @@ _PS_ENCODED_RE = re.compile(r"(?i)-e(?:c|nc|ncodedcommand)?\b\s+([A-Za-z0-9+/=]{
 # before -Command; an exotic switch form falls through to "ask" (safe — the raw
 # dangerous scan + encoded-command decode already ran). Validated by tests.
 _PS_SHELL_UNWRAP_RE = re.compile(
-    r"""(?is)^\s*(?:[a-z]:)?[\\/]?(?:[^\s'"|&;\\/]+[\\/])*"""
+    r"""(?is)^\s*(?:[a-z]:)?[\\/]?(?:[^\s'"|&;\\/]+[\\/])*+"""
     r"""(?:(?:powershell|pwsh)(?:\.exe)?"""
-    r"""(?:\s+-(?:noprofile|nop|nologo|noninteractive|nonint|mta|sta|windowstyle\s+\S+))*"""
+    r"""(?:\s+-(?:noprofile|nop|nologo|noninteractive|nonint|mta|sta|windowstyle\s+\S+))*+"""
     r"""\s+-c(?:ommand)?"""
     r"""|cmd(?:\.exe)?\s+/c)"""
-    # No trailing ``\s*`` — the input is rstripped before matching. With
-    # trailing whitespace in play, the lazy body + ``\s*$`` backtrack
-    # quadratically on long space runs (ReDoS).
-    r"""\s+(['"]?)(.*?)\1$""",
+    # Linear-time tail (the input is also rstripped before matching): the old
+    # ``(['"]?)(.*?)\1$`` backref form let a long interior space run re-split
+    # against the lazy body quadratically (ReDoS on adversarial commands). The
+    # explicit quoted/quoted/bare alternation is backtracking-free, and the
+    # possessive ``\s++`` / ``*+`` on the prefix runs pin every ambiguous
+    # boundary. Same semantics: an unterminated quote falls to the bare arm
+    # (quote kept in the body), exactly like the empty-backref branch did.
+    r"""\s++(?:'(.*)'|"(.*)"|(.*))$""",
 )
 
 
@@ -1467,7 +1471,12 @@ def _ps_unwrap_shell(command: str) -> str | None:
     """``powershell[.exe] -Command '<inner>'`` / ``pwsh -c …`` / ``cmd /c …`` →
     ``<inner>`` (one layer); None if not a recognized wrapper."""
     m = _PS_SHELL_UNWRAP_RE.match(command.rstrip())
-    return m.group(2) if m else None
+    if m is None:
+        return None
+    for g in (m.group(1), m.group(2), m.group(3)):
+        if g is not None:
+            return g
+    return None
 
 
 def _ps_tokenize(s: str) -> list[str]:

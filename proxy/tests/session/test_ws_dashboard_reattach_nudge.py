@@ -109,8 +109,8 @@ class TestMidTurnReattach:
 
                 hold.set()
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
@@ -168,8 +168,8 @@ class TestBgNudgeServerTurn:
                 await ws.expect({"type": "text", "content": "reviewed",
                                  "chat_id": chat_id})
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 # NO turn_complete: this chat never recorded a turn origin
@@ -325,8 +325,8 @@ class TestMidTurnReattachKeepsSteeredMessage:
 
                 hold.set()
                 await ws.expect({"type": "done", "chat_id": chat_id})
-                await ws.expect({"type": "chat_status", "chat_id": chat_id,
-                                 "status": "streaming"})
+                # The queued turn-start "streaming" broadcast is dropped as stale at
+                # drain time (the turn already ended) — only the "ready" flows.
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,

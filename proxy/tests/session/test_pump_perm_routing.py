@@ -25,7 +25,7 @@ def _mk_pump(chat_id: str) -> ChatStreamPump:
         event_queue=asyncio.Queue(),
         perm_queue=None,
     )
-    pump._ws_queue = asyncio.Queue()
+    pump.attach()  # a viewer is watching — prompts surface instead of parking
     return pump
 
 
@@ -56,7 +56,7 @@ async def test_question_prompt_reaches_blocking_gate(temp_db, monkeypatch):
         # replay, and forwarded as the question card frame.
         assert pump._permission_active["request_id"] == "req-q1"
         assert _pending_permissions[pump.session_id]["request_id"] == "req-q1"
-        frame = pump._ws_queue.get_nowait()
+        frame = pump._ws_queues[0].get_nowait()
         assert frame["pump_type"] == "perm_question_prompt"
         assert frame["perm_data"]["request_id"] == "req-q1"
     finally:

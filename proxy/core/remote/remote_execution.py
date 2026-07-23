@@ -161,6 +161,31 @@ from core.remote.remote_workspace_sync import (  # noqa: F401
 )
 
 
+def _machine_sync_role(
+    machine: dict | None, agent_slug: str, session_role: str,
+) -> str:
+    """The role the workspace SYNC runs with for this session's machine.
+
+    ADMIN-paired machines sync with the session's own role (the person
+    driving the session there gates config/ push per-session). USER-paired
+    machines sync with the OWNER's per-agent role — never the session's
+    platform-inflated one. A platform admin who is per-agent viewer/editor
+    carries role "admin" in the SecurityContext, which used to grant their
+    personal machine config/ push + write-back — letting a satellite that
+    lost its copy delete-attribute the agent's prompt at session start.
+    Machine-scope sync authority comes from the pairing (mirrors
+    ``resolve_machine_sync_identity``); the SESSION keeps its full role
+    everywhere else. Missing owner / role ⇒ ``""`` (fail-closed: syncs
+    like a viewer — personal dirs only).
+    """
+    if not machine or machine.get("pairing_scope", "") == "admin":
+        return session_role
+    from storage import database as _db
+    owner_sub = machine.get("registered_by", "") or ""
+    roles = _db.get_user_agent_roles(owner_sub) if owner_sub else {}
+    return (roles or {}).get(agent_slug, "")
+
+
 def _collect_session_files(
     config: AgentConfig,
     machine: dict | None,
@@ -360,7 +385,10 @@ class RemoteExecutionLayer(
         # target_username is None by design — the sync's owner-tier config/
         # write-back must key on the person driving the session there,
         # mirroring the live-path file_changed applier.
-        target_role = getattr(config.security_context, "role", "") or ""
+        target_role = _machine_sync_role(
+            machine, config.agent_name,
+            getattr(config.security_context, "role", "") or "",
+        )
         session_username = getattr(config.security_context, "username", "") or ""
 
         # Workspace sync + MCP install share ONE install-registry lifecycle,
