@@ -7,11 +7,14 @@ synchronous (called via ``asyncio.to_thread`` from async code).
 
 import contextlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
 from storage.pg import get_conn
+
+logger = logging.getLogger("db_chats")
 
 
 # --- Chat Search (tsvector) ---
@@ -100,7 +103,10 @@ _TASK_RUN_JOIN = """
 _TASK_RUN_COLS = """
        FALSE AS unread,
        tr.id AS run_id, tr.status AS run_status, tr.task_type AS run_task_type,
-       dt.name AS task_name
+       tr.task_id AS task_id, tr.scope AS run_scope,
+       tr.created_by AS run_created_by,
+       dt.name AS task_name, dt.created_by AS task_created_by,
+       dt.scope AS task_scope
 """
 
 # The run-visibility rule of /v1/tasks/runs' user-view: agent-scoped runs for
@@ -340,7 +346,47 @@ def update_chat(chat_id: str, **fields: Any) -> bool:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
             except Exception:
-                pass
+                # A stale FTS row keeps matching the old title until the next
+                # rebuild — recoverable, but worth a trace instead of silence.
+                logger.warning("chat_search rebuild failed for %s", chat_id,
+                               exc_info=True)
+        return cur.rowcount > 0
+
+
+def rebind_chat_for_engine_switch(
+    chat_id: str,
+    new_path: str,
+    new_model: str,
+    expected_old_path: str,
+    expected_session_id: str | None,
+    pending_seed: str,
+) -> bool:
+    """Flip ONE chat to a different execution engine — the cross-engine
+    resume rebind (WS ``switch_engine``).
+
+    Compare-and-swap: the WHERE clause re-asserts the exact (execution_path,
+    session_id) pair the handler's gates observed, so a concurrent warmup /
+    dead-session adopt that re-bound the row between gate-check and commit
+    makes this a clean no-op (rowcount 0 → the op is denied, never half
+    applied). Shape mirrors ``remote_store.rebind_chat_to_current_target``
+    minus the pin clear — an engine switch does NOT move machines — plus the
+    engine/model flip. ``pending_seed`` is ``'engine_switch:<old_path>'`` for
+    CLI targets and ``''`` for direct-llm (which never consumes seeds and
+    rebuilds full DB history every turn)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE chats
+                  SET execution_path = %s, model = %s, session_id = NULL,
+                      codex_thread_id = NULL, last_turn_aborted = FALSE,
+                      last_abort_graceful = FALSE, context_used = 0,
+                      pending_history_seed = %s, updated_at = %s
+                WHERE id = %s AND execution_path = %s
+                  AND session_id IS NOT DISTINCT FROM %s""",
+            (new_path, new_model, pending_seed,
+             datetime.now(timezone.utc).isoformat(), chat_id,
+             expected_old_path, expected_session_id),
+        )
+        conn.commit()
         return cur.rowcount > 0
 
 
@@ -441,28 +487,62 @@ def list_chats_with_pending_wakes(execution_target: str | None = None) -> list[d
         return [dict(r) for r in rows]
 
 
-def claim_title_generation(chat_id: str) -> bool:
+def claim_title_generation(chat_id: str) -> tuple[bool, str | None]:
     """Atomically claim the one-time LLM chat-title upgrade.
 
-    Returns True for exactly ONE caller — the first to flip ``title_generated``
-    FALSE→TRUE — and False for every subsequent call. This is the once-only
-    guard for ``services/title_generator.py``: the headless pump may fire at the
-    response-length threshold AND again at turn-end, the interactive tailer fires
-    on debounce + close + reaper, and a later turn could fire again — all funnel
-    here and only the winner generates a title. Single UPDATE..FROM..FOR UPDATE
+    Returns ``(True, pre_claim_title)`` for exactly ONE caller — the first to
+    flip ``title_generated`` FALSE→TRUE — and ``(False, None)`` for every
+    subsequent call. This is the once-only guard for
+    ``services/title_generator.py``: the headless pump may fire at the
+    text/tool thresholds AND again at turn-end, the interactive funnel fires
+    from batch counters + timer + turn-complete, and a later turn could fire
+    again — all funnel here and only the winner generates a title. The
+    returned title is the snapshot the winner must CAS against on its final
+    write (``update_chat_title_cas``), so a manual rename landing AFTER the
+    claim always beats the generated title. Single UPDATE..FROM..FOR UPDATE
     (mirrors ``claim_pending_history_seed``) so concurrent callers can't both win.
     """
     with get_conn() as conn:
         row = conn.execute(
             """UPDATE chats c SET title_generated = TRUE
-               FROM (SELECT id, title_generated FROM chats
+               FROM (SELECT id, title_generated, title FROM chats
                       WHERE id = %s FOR UPDATE) old
                WHERE c.id = old.id AND old.title_generated = FALSE
-               RETURNING old.title_generated""",
+               RETURNING old.title""",
             (chat_id,),
         ).fetchone()
         conn.commit()
-        return row is not None
+        if row is None:
+            return False, None
+        return True, row["title"]
+
+
+def update_chat_title_cas(chat_id: str, new_title: str,
+                          expected_title: str | None) -> bool:
+    """Conditional title write for the LLM upgrade's final step.
+
+    Succeeds only while the title is still exactly the claim-time snapshot
+    (NULL-safe compare) — a manual rename that landed between the claim and
+    this write wins, and the generated title is discarded. Returns whether
+    the row was written; the FTS row is rebuilt only on an actual write.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE chats SET title=%s, updated_at=%s
+                WHERE id=%s AND title IS NOT DISTINCT FROM %s""",
+            (new_title, now, chat_id, expected_title),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return False
+        try:
+            _rebuild_chat_search_row(conn, chat_id)
+            conn.commit()
+        except Exception:
+            logger.warning("chat_search rebuild failed for %s", chat_id,
+                           exc_info=True)
+        return True
 
 
 def get_retention_candidate_chats(cutoff_iso: str) -> list[dict]:

@@ -38,6 +38,10 @@ interface FileTreeProps {
   onDelete?: (path: string, type: 'file' | 'dir') => void
   /** Internal drag dropped on a folder row — host calls /move. */
   onMoveDrop?: (destPath: string, srcPaths: string[]) => void
+  /** Folders forced open IN ADDITION to the user's expand state — the
+   * workspace search passes the pruned tree's dir set so every branch
+   * leading to a match is visible (VS Code filter behavior). */
+  extraExpanded?: Set<string>
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +296,9 @@ function TreeNode(props: TreeNodeProps) {
         ))}
 
         <button
+          data-ta-name={node.name}
+          data-ta-path={node.path}
+          data-ta-dir={isDir ? '1' : undefined}
           onClick={(e) => {
             // Stop propagation so a row click doesn't also fire the tree
             // wrapper's empty-area onClick (which clears selection).
@@ -424,6 +431,7 @@ export default function FileTree({
   onLongPress,
   onDelete,
   onMoveDrop,
+  extraExpanded,
 }: FileTreeProps) {
   // Auto-expand folders along the active path so switching from grid mode
   // doesn't drop the user at a collapsed root.
@@ -449,9 +457,16 @@ export default function FileTree({
     })
   }
 
+  const effExpanded = useMemo(
+    () => (extraExpanded && extraExpanded.size
+      ? new Set([...expanded, ...extraExpanded])
+      : expanded),
+    [expanded, extraExpanded],
+  )
+
   const visibleOrder = useMemo(
-    () => flattenVisible(nodes, expanded),
-    [nodes, expanded],
+    () => flattenVisible(nodes, effExpanded),
+    [nodes, effExpanded],
   )
 
   // Shared across all TreeNodes so a fast pair of clicks on the SAME row
@@ -488,7 +503,7 @@ export default function FileTree({
           onLongPress={onLongPress}
           onDelete={onDelete}
           onMoveDrop={onMoveDrop}
-          expanded={expanded}
+          expanded={effExpanded}
           toggleExpand={toggleExpand}
         />
       ))}

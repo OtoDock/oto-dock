@@ -608,9 +608,13 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # supervised_bg=True: the local session runs a per-thread bg supervisor,
         # so background sub-agents are NOT swept at turn end (the supervisor emits
         # their SUBAGENT_END on real completion). The remote path leaves this off.
+        # supervised_bg_commands=True: background terminals (unified_exec) stay
+        # tracked past turn end too — completion arrives cross-turn (pump), idle
+        # (the router's OOB hook), or via drain_bg_commands reconciliation.
         if not session.translator:
             session.translator = CodexEventTranslator(
                 model=session.model, supervised_bg=True,
+                session_id=session_id, supervised_bg_commands=True,
             )
         translator = session.translator
         # Seed the multi-agent demux with the AUTHORITATIVE main thread id (the
@@ -713,6 +717,15 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         if not session:
             return None
         return await session.compact()
+
+    async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
+        """Reconcile background-terminal completions for an idle Codex session
+        (badge clear + registry) — see CodexAppServerSession.drain_bg_commands.
+        The bg-command monitor polls this; a turn in flight makes it a no-op."""
+        session = await get_codex_session(session_id)
+        if not session:
+            return False
+        return await session.drain_bg_commands(budget=budget)
 
     async def respond_permission(
         self, session_id: str, request_id: str, approved: bool,
@@ -913,17 +926,19 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             parts.append('trust_level = "trusted"')
 
         # Custom model provider for a local OpenAI-compatible endpoint
-        # (Ollama, LM Studio, LiteLLM, vLLM, …). wire_api="chat" = the
-        # OpenAI /chat/completions wire format every such server speaks; no
-        # env_key (these servers are keyless). The agent dials base_url; the
-        # sandbox carves egress to that host.
+        # (Ollama, LM Studio, LiteLLM, vLLM, …). wire_api MUST be "responses":
+        # codex-rs removed the "chat" wire format (deserializing it is a hard
+        # serde error since ≤0.144.1 — model-provider-info/src/lib.rs), so the
+        # local server must expose an OpenAI Responses-compatible endpoint.
+        # No env_key (these servers are keyless). The agent dials base_url;
+        # the sandbox carves egress to that host.
         if local_endpoint:
             _esc_ep = local_endpoint.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(
                 "[model_providers.oto_local]\n"
                 'name = "Local"\n'
                 f'base_url = "{_esc_ep}"\n'
-                'wire_api = "chat"'
+                'wire_api = "responses"'
             )
 
         # MCP server sections (already formatted as TOML by mcp_registry)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 
+import pytest
 
 import server
 
@@ -191,3 +192,101 @@ def test_format_result_error_output_verbatim():
         "is_error": True, "warnings": [],
     })
     assert out == "Error: File a.md already exists"
+
+
+# ---------------------------------------------------------------------------
+# Command normalization (near-miss command names)
+# ---------------------------------------------------------------------------
+
+def test_normalize_command_editor_variant_maps_to_str_replace():
+    assert server._normalize_command(
+        {"command": "str_replace_based_edit_20250124"}) == "str_replace"
+
+
+def test_normalize_command_destructive_needs_exact_token():
+    assert server._normalize_command({"command": "remove_topic"}) == "delete"
+    assert server._normalize_command({"command": "move_topic"}) == "rename"
+    # Substring matches must NOT trigger: "reformat" contains "rm",
+    # "truncate" contains "cat" — both pass through for the proxy's
+    # self-correcting error instead of becoming delete/view.
+    assert server._normalize_command(
+        {"command": "reformat_memory"}) == "reformat_memory"
+    assert server._normalize_command({"command": "truncate"}) == "truncate"
+
+
+def test_normalize_command_infers_view_from_path_only():
+    assert server._normalize_command({"path": "/memories/agent"}) == "view"
+    # A write payload means the intent was NOT a read — don't guess.
+    assert server._normalize_command({"path": "x.md", "file_text": "y"}) is None
+
+
+def test_normalize_path_view_root_sentinels():
+    assert server._normalize_path("view", None) == "/memories"
+    assert server._normalize_path("view", "") == "/memories"
+    assert server._normalize_path("view", "/") == "/memories"
+    # Regression: these already work server-side — keep passing them through.
+    assert server._normalize_path("view", "memories") == "memories"
+    assert server._normalize_path("view", "/memories/") == "/memories/"
+
+
+def test_normalize_path_bare_filename_view_uses_default_scope(monkeypatch):
+    srv = _reload_with_env(
+        monkeypatch, OTO_USER_SUB="u1", OTO_DEFAULT_SCOPE="user")
+    assert srv._normalize_path("view", "prefs.md") == "/memories/user/prefs.md"
+
+
+def test_bare_filename_write_refused_names_both_scopes(monkeypatch):
+    # Agent-only default: the fixed scope order would land a personal note in
+    # SHARED agent memory — the refusal must name both scopes so the model
+    # can self-correct with a full path.
+    srv = _reload_with_env(monkeypatch)
+    with pytest.raises(srv.ToolArgError) as ei:
+        srv.build_op_body("memory", {
+            "command": "create", "path": "n.md", "file_text": "x",
+        })
+    msg = str(ei.value)
+    assert "/memories/agent/n.md" in msg
+    assert "/memories/user/n.md" in msg
+
+
+# ---------------------------------------------------------------------------
+# call_tool dispatch (validate_input=False tolerance)
+# ---------------------------------------------------------------------------
+
+def _call(monkeypatch, arguments, srv=None):
+    srv = srv or _reload_with_env(monkeypatch, OTO_USER_SUB="u1")
+
+    async def fake_post(body):
+        fake_post.body = body
+        return {"output": "ok", "is_error": False, "warnings": []}
+
+    monkeypatch.setattr(srv, "_post_op", fake_post)
+    result = asyncio.run(srv.call_tool("memory", arguments))
+    return result[0].text, getattr(fake_post, "body", None)
+
+
+def test_call_tool_accepts_json_string_arguments(monkeypatch):
+    text, body = _call(monkeypatch, '{"command": "view", "path": "/memories"}')
+    assert text == "ok"
+    assert body["command"] == "view"
+
+
+def test_call_tool_junk_arguments_ask_for_command(monkeypatch):
+    text, body = _call(monkeypatch, "///not json")
+    assert text == "command required"
+    assert body is None
+
+
+def test_call_tool_missing_command_with_path_infers_view(monkeypatch):
+    text, body = _call(monkeypatch, {"path": "/memories/agent"})
+    assert text == "ok"
+    assert body["command"] == "view"
+
+
+def test_call_tool_bare_filename_write_refusal(monkeypatch):
+    text, body = _call(monkeypatch, {
+        "command": "create", "path": "n.md", "file_text": "x",
+    })
+    assert "/memories/agent/n.md" in text
+    assert "/memories/user/n.md" in text
+    assert body is None

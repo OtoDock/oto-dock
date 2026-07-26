@@ -25,6 +25,10 @@ from equations import (
 )
 
 
+async def _async_ident(p, writing=False, **kw):
+    return p
+
+
 # ---------------------------------------------------------------------------
 # Normalization + validation guard
 # ---------------------------------------------------------------------------
@@ -104,7 +108,7 @@ def _word(monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr(word_mod, "_resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr(word_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(word_mod, "_push_preview", _noop_preview)
     return word_mod
 
@@ -176,7 +180,7 @@ def test_pdf_renders_svg_and_reports_failures(tmp_path, monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr(pdf_mod, "_resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr(pdf_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(pdf_mod, "_push_preview", _noop_preview)
 
     f = tmp_path / "eq.pdf"
@@ -214,7 +218,7 @@ def test_xlsx_equation_anchor_and_comment(tmp_path, monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr(excel_mod, "_resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr(excel_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(excel_mod, "_push_preview", _noop_preview)
 
     f = tmp_path / "eq.xlsx"

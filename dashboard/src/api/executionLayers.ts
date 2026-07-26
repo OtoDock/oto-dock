@@ -74,6 +74,11 @@ export interface UserLayerInfo {
   user_subscriptions: Subscription[]
   platform_available: boolean
   allow_platform_auth: boolean
+  // Server-computed "can this user run this engine" (own sub OR borrowable
+  // platform credential) — the single predicate behind the chat page's
+  // engine/model filtering and the cross-engine switch options. Optional:
+  // absent on stale caches from an older proxy → treat as true (no filtering).
+  can_run?: boolean
 }
 
 // ---------------------------------------------------------------------------

@@ -70,17 +70,19 @@ async def test_native_path_allow_has_no_updated_input(_stub):
 
 
 @pytest.mark.asyncio
-async def test_ask_carries_updated_input(_stub, monkeypatch):
-    # Interactive TUI + default mode: a write-tier tool returns "ask" (the
-    # CLI renders its native prompt) — the rewrite must still ride along, or
-    # the tool runs against the raw sandbox-virtual path and fails ENOENT.
+async def test_interactive_rewrite_rides_allow(_stub, monkeypatch):
+    # Interactive TUI + default mode, satellite session: the flip would
+    # normally DEFER here, but a Pass-1 path rewrite only rides
+    # "allow"/"ask" — silence would run the tool against the raw
+    # sandbox-virtual path (ENOENT). The decision is "allow" with the
+    # rewrite attached; promptless matches trusted-dir native behavior.
     monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
     monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
     monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
     res = await hooks.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/notes.md", "content": "x"},
     )
-    assert res["decision"] == "ask"
+    assert res["decision"] == "allow"
     assert res["updated_input"]["file_path"] == (
         "/home/dave/.oto-dock/agents/my-agent/workspace/notes.md"
     )
@@ -302,3 +304,75 @@ def test_gate_retries_transient_failure_then_honors_decision():
     )
     hso = out["hookSpecificOutput"]
     assert hso["permissionDecision"] == "allow"
+
+
+def _run_gate_custom(prelude: str, hook_stdin: str, home: str) -> subprocess.CompletedProcess:
+    """Run the gate with an arbitrary stub prelude (crash-path tests)."""
+    script = prelude + (
+        "sys.argv = ['permission_gate.py']\n"
+        f"exec(compile(open({str(_GATE_SCRIPT)!r}).read(), 'permission_gate.py', 'exec'))\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        input=hook_stdin,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            "OTO_SESSION_ID": "s",
+            "PROXY_URL": "http://127.0.0.1:1",
+            "PROXY_API_KEY": "k",
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+        },
+    )
+
+
+def test_gate_unreadable_stdin_still_decides(tmp_path):
+    # OSError on stdin.read() (Windows pipe edge cases) → treated as an empty
+    # payload; the gate still consults the proxy and emits its decision.
+    prelude = (
+        "import json, sys, urllib.request\n"
+        "class _Resp:\n"
+        "    def __init__(self, body): self._body = body\n"
+        "    def read(self): return self._body\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "_BODY = json.dumps({'decision': 'deny', 'reason': 'r'}).encode()\n"
+        "urllib.request.urlopen = lambda req, timeout=0: _Resp(_BODY)\n"
+        "class _BadStdin:\n"
+        "    def read(self): raise OSError('unreadable')\n"
+        "sys.stdin = _BadStdin()\n"
+    )
+    proc = _run_gate_custom(prelude, "", str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip())
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gate_crash_exits_zero_with_breadcrumb(tmp_path):
+    # An unexpected crash enforces nothing (both CLIs run the tool on a
+    # non-zero exit) — so it must exit 0 with no output instead of surfacing
+    # "hook exited with code 1" in the TUI, and leave a traceback breadcrumb.
+    prelude = (
+        "import sys, urllib.request\n"
+        "def _boom(*a, **k): raise RuntimeError('boom')\n"
+        "urllib.request.Request = _boom\n"
+    )
+    proc = _run_gate_custom(prelude, "{}", str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""
+    log = tmp_path / ".oto-dock" / "hook-error.log"
+    assert log.exists()
+    assert "RuntimeError" in log.read_text()
+
+
+def test_gate_defer_emits_nothing():
+    # "defer" = the platform has no opinion: the gate must stay SILENT so
+    # the CLI's own permission engine governs — emitting an unknown
+    # permissionDecision value would be treated as a hook error.
+    out = _run_gate(
+        {"tool_name": "Write", "tool_input": {"file_path": "x"}},
+        {"decision": "defer"},
+    )
+    assert out is None

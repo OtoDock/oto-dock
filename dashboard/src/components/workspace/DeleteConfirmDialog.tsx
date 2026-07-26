@@ -10,6 +10,10 @@ interface Props {
   isDir: boolean
   /** Total descendants across all `names` — used to show recursion count. */
   childCount?: number
+  /** Files in the selection too large for the Recover bin: their deletion
+   * cannot be undone (the server skips capture above the bin cap). > 0
+   * renders a prominent warning line. */
+  binSkippedCount?: number
   pending?: boolean
   onConfirm: () => void
   onCancel: () => void
@@ -24,6 +28,7 @@ export default function DeleteConfirmDialog({
   names,
   isDir,
   childCount = 0,
+  binSkippedCount = 0,
   pending,
   onConfirm,
   onCancel,
@@ -60,6 +65,13 @@ export default function DeleteConfirmDialog({
             ))}
             {remaining > 0 && <li>…and {remaining} more</li>}
           </ul>
+        )}
+        {binSkippedCount > 0 && (
+          <p className="text-xs text-amber-600 dark:text-amber-500 mb-3">
+            {binSkippedCount === 1
+              ? 'One file is too large for the Recover bin — deleting it cannot be undone.'
+              : `${binSkippedCount} files are too large for the Recover bin — deleting them cannot be undone.`}
+          </p>
         )}
         <div className="flex items-center justify-end gap-2">
           <button

@@ -30,6 +30,11 @@ export interface Chat {
   parent_chat_id?: string | null
   project_id?: string | null
   delegate_role?: string
+  // Server-computed mutation flags (listing AND search endpoints) — the
+  // kebab renders Rename/Delete from these; the role matrix lives entirely
+  // backend-side. Optional: absent on stale caches from an older proxy.
+  can_rename?: boolean
+  can_delete?: boolean
 }
 
 export interface ChatMessage {
@@ -42,7 +47,7 @@ export interface ChatMessage {
   created_at: string
 }
 
-export function useChats(agent?: string) {
+export function useChats(agent?: string, pollPaused = false) {
   return useQuery({
     queryKey: ['chats', agent],
     queryFn: async () => {
@@ -52,7 +57,10 @@ export function useChats(agent?: string) {
       const data = await res.json()
       return data.chats as Chat[]
     },
-    refetchInterval: 30000,
+    // Paused while an inline rename is being typed: a poll-driven reorder
+    // moves the row's DOM node, which blurs the input and would silently
+    // discard the user's in-progress edit (blur cancels).
+    refetchInterval: pollPaused ? false : 30000,
   })
 }
 
@@ -64,12 +72,15 @@ export interface TaskChat extends Chat {
   run_status?: string
   run_task_type?: string | null
   task_name?: string
+  // The dynamic task behind the latest run — the rename target for rows
+  // labeled by task_name ("rename what you see": PATCH /v1/tasks/{task_id}).
+  task_id?: string | null
 }
 
 /** The sidebar's task mode: the agent's task-run chats, newest first,
  * permission-shaped like the task history was (agent-scoped runs for anyone
  * with agent access, user-scoped runs only for their creator). */
-export function useTaskChats(agent?: string, enabled = true) {
+export function useTaskChats(agent?: string, enabled = true, pollPaused = false) {
   return useQuery({
     queryKey: ['task-chats', agent],
     queryFn: async () => {
@@ -79,7 +90,8 @@ export function useTaskChats(agent?: string, enabled = true) {
       return data.chats as TaskChat[]
     },
     enabled: !!agent && enabled,
-    refetchInterval: 30000,
+    // Paused while an inline rename is being typed (see useChats).
+    refetchInterval: pollPaused ? false : 30000,
   })
 }
 
@@ -163,6 +175,77 @@ export function useDeleteChat() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['chats'] })
+      queryClient.invalidateQueries({ queryKey: ['task-chats'] })
+      queryClient.invalidateQueries({ queryKey: ['active-chats'] })
+    },
+  })
+}
+
+/** Inline rename of a chat / task-run history entry (PATCH /v1/chats).
+ * Optimistic: the one row's `title` patches in every list cache; the server
+ * echo (sanitized title) settles via invalidation. */
+export function useRenameChat() {
+  const queryClient = useQueryClient()
+  const patchTitle = (chatId: string, title: string) => {
+    queryClient.setQueriesData<Chat[]>({ queryKey: ['chats'] }, (old) =>
+      old?.map((c) => (c.id === chatId ? { ...c, title } : c)))
+    queryClient.setQueriesData<TaskChat[]>({ queryKey: ['task-chats'] }, (old) =>
+      old?.map((c) => (c.id === chatId ? { ...c, title } : c)))
+  }
+  return useMutation({
+    mutationFn: async ({ chatId, title }: { chatId: string; title: string }) => {
+      const res = await apiFetch(`/v1/chats/${chatId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().then(d => d?.detail).catch(() => '')
+        throw new Error(detail || `Failed to rename (HTTP ${res.status})`)
+      }
+      return res.json() as Promise<{ title?: string }>
+    },
+    onMutate: async ({ chatId, title }) => {
+      // Stop in-flight polls from resurrecting the old title mid-patch.
+      await queryClient.cancelQueries({ queryKey: ['chats'] })
+      await queryClient.cancelQueries({ queryKey: ['task-chats'] })
+      patchTitle(chatId, title)
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['chats'] })
+      queryClient.invalidateQueries({ queryKey: ['task-chats'] })
+      queryClient.invalidateQueries({ queryKey: ['active-chats'] })
+    },
+  })
+}
+
+/** Rename a task DEFINITION from its history row ("rename what you see":
+ * name-labeled rows hit PATCH /v1/tasks, so every sibling run row and the
+ * Schedules page update together). Optimistic on `task_name` across ALL
+ * cached rows sharing the task_id — recurring tasks list one row per run. */
+export function useRenameTask() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ taskId, name }: { taskId: string; name: string }) => {
+      const res = await apiFetch(`/v1/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().then(d => d?.detail).catch(() => '')
+        throw new Error(detail || `Failed to rename (HTTP ${res.status})`)
+      }
+    },
+    onMutate: async ({ taskId, name }) => {
+      await queryClient.cancelQueries({ queryKey: ['task-chats'] })
+      queryClient.setQueriesData<TaskChat[]>({ queryKey: ['task-chats'] }, (old) =>
+        old?.map((c) => (c.task_id === taskId ? { ...c, task_name: name } : c)))
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['task-chats'] })
+      queryClient.invalidateQueries({ queryKey: ['active-chats'] })
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
 }

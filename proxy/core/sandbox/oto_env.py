@@ -30,6 +30,7 @@ def build_oto_env(
     username: str = "",
     user_sub: str = "",
     user_role: str = "",
+    platform_role: str = "",
     session_id: str = "",
     memory_user_enabled: bool = True,
     memory_agent_enabled: bool = True,
@@ -48,6 +49,12 @@ def build_oto_env(
             ``OTO_USER_SUB`` so MCPs scoping data per-user (e.g. memory-mcp)
             don't have to decode the session JWT.
         user_role: access level (``"viewer"``/``"manager"``/``"admin"``/``""``).
+        platform_role: the session user's PLATFORM role
+            (``"admin"``/``"creator"``/``"member"``), empty for sessions
+            without a human user. Distinct from ``user_role``, which is the
+            per-agent role and flattens platform admins into ``"admin"``.
+            MCPs gating on platform capability (e.g. agent creation) read
+            this; the proxy endpoint remains the real boundary.
         session_id: current session id (literal — used as-is, not the
             ``{session_id}`` template token).
         memory_user_enabled: effective user-memory toggle (master AND
@@ -115,6 +122,7 @@ def build_oto_env(
         "OTO_USER_SUB": user_sub,
         "OTO_SCOPE": scope,
         "OTO_ROLE": user_role,
+        "OTO_PLATFORM_ROLE": platform_role,
         "OTO_SESSION_ID": session_id,
         "OTO_WORKSPACE_DIR": workspace_dir,
         "OTO_USER_ROOT": user_root,

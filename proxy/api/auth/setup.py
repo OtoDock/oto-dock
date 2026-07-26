@@ -62,29 +62,31 @@ async def setup_first_user(req: SetupRequest):
     if not user:
         raise HTTPException(status_code=500, detail="Failed to create user")
 
-    # Auto-install personal-assistant-lite from the community catalog as the
+    # Auto-install the Personal Assistant from the community catalog as the
     # new owner's agent. Runs WITH the admin's identity + admin role so the
     # install pipeline's admin branch (services/community/community_agent_installer.py)
     # auto-installs/enables every required MCP inline — no admin-
     # approval requests, no permission prompts. The admin lands on the
-    # dashboard with PA-lite ready to chat.
+    # dashboard with the assistant ready to chat.
     #
     # Network failure (offline / GitHub unreachable) is non-fatal: the admin
-    # can install PA-lite manually via Browse Community Agents later.
+    # can install it manually via Browse Community Agents later.
     try:
         from services.community import community_agent_installer
         result = await community_agent_installer.install_from_catalog(
-            template_slug="personal-assistant-lite",
-            target_slug="personal-assistant-lite",
+            template_slug="personal-assistant",
+            target_slug="personal-assistant",
             installer_user_sub=sub,
             installer_role="admin",
         )
         logger.info(
-            "Setup wizard: PA-lite installed for new owner: %s",
+            "Setup wizard: Personal Assistant installed for new owner: %s",
             {k: v for k, v in result.items() if k != "agent"},
         )
     except Exception:
-        logger.exception("Setup wizard: PA-lite catalog install failed (non-fatal)")
+        logger.exception(
+            "Setup wizard: Personal Assistant catalog install failed (non-fatal)"
+        )
 
     # Walk the default-for-new-users agents and attach the new
     # admin as the manifest-declared role. PA-lite (just installed above)

@@ -32,6 +32,18 @@ interface Props {
    * list endpoint already scopes what each user can recover). */
   recoverCount?: number
   onOpenRecover?: () => void
+  /** Active uploads/syncs for the CURRENT section. The transfer icon renders
+   * only while > 0 (mirrors the recover-bin gating) and pulses while any
+   * transfer is genuinely moving (vs merely lingering done/failed). */
+  transferCount?: number
+  transferActive?: boolean
+  /** Click handler receives the anchor point for the portaled popup. */
+  onOpenTransfers?: (anchor: { left: number; top: number }) => void
+  /** Per-section search toggle (Phase G): the magnifier lives here in the
+   * right icon group (no toolbar space for an inline input, esp. mobile);
+   * the host renders the query row underneath while open. */
+  searchOpen?: boolean
+  onToggleSearch?: () => void
 }
 
 export default function WorkspaceToolbar({
@@ -44,6 +56,11 @@ export default function WorkspaceToolbar({
   targetDisplay,
   recoverCount = 0,
   onOpenRecover,
+  transferCount = 0,
+  transferActive = false,
+  onOpenTransfers,
+  searchOpen = false,
+  onToggleSearch,
 }: Props) {
   // Anchor coords for the New File dropdown. We render the dropdown via
   // `createPortal` to `document.body` (instead of inline-absolute under the
@@ -137,6 +154,34 @@ export default function WorkspaceToolbar({
       )}
       <span className="flex-1" />
 
+      {onOpenTransfers && transferCount > 0 && (
+        // Transfer-progress icon (uploads + machine sync for the CURRENT
+        // section). Appears only while something is in flight or lingering
+        // done/failed; same badge pattern as the recover bin beside it.
+        <button
+          onClick={(e) => {
+            const rect = (e.currentTarget as HTMLButtonElement).getBoundingClientRect()
+            onOpenTransfers({ left: Math.max(8, rect.right - 300), top: rect.bottom + 4 })
+          }}
+          className={`${btnBase} relative mr-1`}
+          title={`${transferCount} transfer${transferCount === 1 ? '' : 's'} in progress`}
+          aria-label={`Transfers: ${transferCount} in progress`}
+        >
+          <svg
+            width={14} height={14} viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth={2}
+            className={transferActive ? 'animate-pulse text-brand' : ''}
+          >
+            {/* cloud with up/down arrows — upload + sync */}
+            <path strokeLinecap="round" strokeLinejoin="round" d="M20 17.6A4.5 4.5 0 0 0 17.5 9h-1.1A6 6 0 1 0 5 15.7" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9.5 14.5 12 12l2.5 2.5M12 12v9" />
+          </svg>
+          <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-brand text-white text-[10px] font-semibold pointer-events-none">
+            {transferCount > 99 ? '99+' : transferCount}
+          </span>
+        </button>
+      )}
+
       {onOpenRecover && recoverCount > 0 && (
         // Icon-only bin with a count badge. The badge overflows the button's
         // top-right into the toolbar's py-2 padding (still inside the
@@ -157,6 +202,20 @@ export default function WorkspaceToolbar({
           <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-brand text-white text-[10px] font-semibold pointer-events-none">
             {recoverCount > 99 ? '99+' : recoverCount}
           </span>
+        </button>
+      )}
+
+      {onToggleSearch && (
+        <button
+          onClick={onToggleSearch}
+          className={`${btnBase} mr-1 ${searchOpen ? 'bg-brand-surface text-brand border-brand/40' : ''}`}
+          title={searchOpen ? 'Close search' : 'Search this section'}
+          aria-label={searchOpen ? 'Close search' : 'Search this section'}
+        >
+          <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+            <circle cx="11" cy="11" r="7" />
+            <path strokeLinecap="round" d="m21 21-4.35-4.35" />
+          </svg>
         </button>
       )}
 

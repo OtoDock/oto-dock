@@ -341,11 +341,19 @@ export default function AgentConfig() {
                 const meta = ENGINE_META[path] || {}
                 const label = meta.label || layers?.[path]?.display_name || path
                 const checked = executionPaths.includes(path)
+                // Platform-level gate (server mirror: PATCH /v1/agents refuses
+                // newly-added unconfigured engines). `!== false` so a loading
+                // list or an older proxy (field absent) never flashes a locked
+                // card. Already-enabled engines stay uncheckable-only when
+                // their platform subscription vanished (grandfathering);
+                // admins toggle freely (they're about to connect one).
+                const configured = layers?.[path]?.configured !== false
+                const lockedOff = !checked && !configured && !isAdmin
                 return (
                   <button
                     type="button"
                     key={path}
-                    disabled={isReadOnly}
+                    disabled={isReadOnly || lockedOff}
                     onClick={() => {
                       let next: string[]
                       if (checked) {
@@ -366,7 +374,7 @@ export default function AgentConfig() {
                     }}
                     className={`w-full flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
                       checked ? 'border-brand bg-brand-surface' : 'border-p-border-light hover:bg-p-surface-hover'
-                    } ${isReadOnly ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+                    } ${isReadOnly || lockedOff ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
                   >
                     <span className={`mt-0.5 w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center ${
                       checked ? 'bg-brand border-brand text-white' : 'border-p-border-light'
@@ -387,6 +395,12 @@ export default function AgentConfig() {
                         <span className="text-sm font-medium text-p-text">{label}</span>
                       </span>
                       {meta.desc && <span className="block text-xs text-p-text-light mt-0.5">{meta.desc}</span>}
+                      {!configured && !checked && (
+                        <span className="block text-xs text-amber-600 dark:text-amber-500 mt-0.5">
+                          No {label} subscription is connected on this platform
+                          {isAdmin ? ' — connect one in Platform → AI Engines' : ''}
+                        </span>
+                      )}
                     </span>
                   </button>
                 )

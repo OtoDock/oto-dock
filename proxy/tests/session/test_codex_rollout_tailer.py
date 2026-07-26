@@ -56,7 +56,7 @@ def _capture(monkeypatch):
     updates = []
     import storage.database as db
 
-    def _add(chat_id, role, content="", event_type="", event_data=""):
+    def _add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
         if role == "event":
             rows.events.append((event_type, json.loads(event_data)))
             rows.order.append(("event", event_type))
@@ -106,6 +106,9 @@ def test_persists_user_and_assistant_filters_synthetic(tmp_path, _capture):
         ("assistant", "On it."),
         ("assistant", "Found 3 unread."),
     ]
+    # Early-title counters: assistant text only (the user row never counts).
+    assert stats["assistant_chars"] == len("On it.") + len("Found 3 unread.")
+    assert stats["tool_rows"] == 0
     # Thread id captured from session_meta.id.
     assert {"codex_thread_id": "019ec-tid"} in _capture.updates
 
@@ -522,7 +525,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     release = threading.Event()
     rows = []
 
-    def _slow_add(chat_id, role, content="", event_type="", event_data=""):
+    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
         rows.append((role, content))
         entered.set()
         release.wait(timeout=5)

@@ -6,11 +6,15 @@ import { render, screen, fireEvent } from '@testing-library/react'
 const searchMock = vi.fn(() => ({ data: null, isFetching: false }))
 const taskChatsMock = vi.fn<() => unknown[]>(() => [])
 const deleteMutateMock = vi.fn()
+const renameChatMutateMock = vi.fn()
+const renameTaskMutateMock = vi.fn()
 vi.mock('@/api/chats', async (importOriginal) => {
   const orig = await importOriginal<typeof import('@/api/chats')>()
   return {
     ...orig,
     useDeleteChat: () => ({ mutate: deleteMutateMock }),
+    useRenameChat: () => ({ mutate: renameChatMutateMock }),
+    useRenameTask: () => ({ mutate: renameTaskMutateMock }),
     useSearchChats: (...args: unknown[]) => searchMock(...args as []),
     useTaskChats: () => ({ data: taskChatsMock() }),
   }
@@ -61,6 +65,8 @@ beforeEach(() => {
   taskChatsMock.mockReturnValue([])
   activeRowsMock.mockReturnValue([])
   deleteMutateMock.mockReset()
+  renameChatMutateMock.mockReset()
+  renameTaskMutateMock.mockReset()
   useChatStore.setState({ byChat: {} })
 })
 
@@ -112,7 +118,8 @@ describe('ChatHistory — Task history view', () => {
   it('a running task row pulses purple (run_status seed, no store slice)', () => {
     taskChatsMock.mockReturnValue([taskChat('task-run-2', 'busy task', { run_status: 'running' })])
     renderHistory({ tasksMode: true })
-    const row = screen.getByTitle('Task running…')
+    // aria-label, not title — the full-title tooltip owns hover on rows.
+    const row = screen.getByLabelText('Task running…')
     expect(row.className).toContain('oto-row-live-purple')
     // Plain scheduled tasks carry NO left accent — the rail is role-based.
     expect(row.className).toContain('border-l-transparent')
@@ -156,6 +163,142 @@ describe('ChatHistory — Task history view', () => {
   it('task-mode search passes kind=tasks', () => {
     renderHistory({ tasksMode: true })
     expect(searchMock).toHaveBeenCalledWith('dev', '', 'tasks')
+  })
+})
+
+describe('ChatHistory — task kebab + inline rename (server-flag driven)', () => {
+  it('flags absent → no kebab on task rows (older-proxy cache)', () => {
+    taskChatsMock.mockReturnValue([taskChat('task-run-10', 'no flags')])
+    renderHistory({ tasksMode: true })
+    expect(screen.queryByTitle('Options')).toBeNull()
+  })
+
+  it('flags true → kebab with Rename + Delete; false flags hide each', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-11', 'own run', { can_rename: true, can_delete: true }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    expect(screen.getByText('Rename')).toBeTruthy()
+    expect(screen.getByText('Delete')).toBeTruthy()
+  })
+
+  it('rename on a NAME-labeled row targets the task definition', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-12', 'run subtitle', {
+        task_name: 'Nightly report', task_id: 't-9',
+        can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const input = screen.getByTestId('rename-input') as HTMLInputElement
+    expect(input.value).toBe('Nightly report')  // prefilled from DATA
+    fireEvent.change(input, { target: { value: 'Weekly report' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(renameTaskMutateMock).toHaveBeenCalledWith(
+      { taskId: 't-9', name: 'Weekly report' }, expect.anything())
+    expect(renameChatMutateMock).not.toHaveBeenCalled()
+  })
+
+  it('rename on a TITLE-labeled row (definition gone) targets the run chat', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-13', 'one-off prompt', {
+        task_name: undefined, can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const input = screen.getByTestId('rename-input') as HTMLInputElement
+    expect(input.value).toBe('one-off prompt')
+    fireEvent.change(input, { target: { value: 'Named run' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(renameChatMutateMock).toHaveBeenCalledWith(
+      { chatId: 'task-run-13', title: 'Named run' }, expect.anything())
+    expect(renameTaskMutateMock).not.toHaveBeenCalled()
+  })
+
+  it('blur CANCELS the edit — click-away must never save (mobile wipe guard)', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-16', 'precious title', {
+        task_name: undefined, can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const input = screen.getByTestId('rename-input') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'accidental wipe' } })
+    fireEvent.blur(input)
+    expect(renameChatMutateMock).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('rename-input')).toBeNull()
+    expect(screen.getByText('precious title')).toBeTruthy()
+  })
+
+  it('the ✓ save button commits exactly once (pointerdown beats blur)', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-17', 'old name', {
+        task_name: undefined, can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const input = screen.getByTestId('rename-input') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'saved name' } })
+    const save = screen.getByTestId('rename-save')
+    // Real browsers fire pointerdown → blur → click; the save must land on
+    // pointerdown and the follow-ups must dedupe.
+    fireEvent.pointerDown(save)
+    fireEvent.blur(input)
+    fireEvent.click(save)
+    expect(renameChatMutateMock).toHaveBeenCalledTimes(1)
+    expect(renameChatMutateMock).toHaveBeenCalledWith(
+      { chatId: 'task-run-17', title: 'saved name' }, expect.anything())
+  })
+
+  it('Escape cancels without committing; unchanged commit is a cancel', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-14', 'keep me', {
+        task_name: undefined, can_rename: true, can_delete: true,
+      }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const input = screen.getByTestId('rename-input') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'discarded' } })
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(renameChatMutateMock).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('rename-input')).toBeNull()
+    // Reopen and commit UNCHANGED → also no mutation (an unchanged commit
+    // would still stamp title_generated server-side).
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Rename'))
+    const again = screen.getByTestId('rename-input') as HTMLInputElement
+    fireEvent.keyDown(again, { key: 'Enter' })
+    expect(renameChatMutateMock).not.toHaveBeenCalled()
+  })
+
+  it('task delete confirm uses run-history wording', () => {
+    taskChatsMock.mockReturnValue([
+      taskChat('task-run-15', 'del me', { can_rename: false, can_delete: true }),
+    ])
+    renderHistory({ tasksMode: true })
+    fireEvent.click(screen.getByTitle('Options'))
+    expect(screen.queryByText('Rename')).toBeNull()  // can_rename false
+    fireEvent.click(screen.getByText('Delete'))
+    expect(screen.getByText('Delete task run')).toBeTruthy()
+    expect(screen.getByText(/scheduled task itself is not deleted/)).toBeTruthy()
+  })
+
+  it('chat rows without flags keep their historical kebab', () => {
+    renderHistory()  // chat c1, no can_* fields → owner defaults
+    fireEvent.click(screen.getByTitle('Options'))
+    expect(screen.getByText('Rename')).toBeTruthy()
+    expect(screen.getByText('Delete')).toBeTruthy()
   })
 })
 

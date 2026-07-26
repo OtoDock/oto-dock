@@ -17,12 +17,16 @@ openpyxl = pytest.importorskip("openpyxl")
 from excel import _anchor_cell, _describe_anchor, handle_write_xlsx, read_xlsx
 
 
+async def _async_ident(p, writing=False, **kw):
+    return p
+
+
 @pytest.fixture(autouse=True)
 def _no_proxy(monkeypatch):
     async def _noop_preview(path, filename=None):
         return None
 
-    monkeypatch.setattr("excel._resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr("excel._resolve_path", _async_ident)
     monkeypatch.setattr("excel._push_preview", _noop_preview)
 
 

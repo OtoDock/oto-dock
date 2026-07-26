@@ -343,6 +343,64 @@ def _model_allowed_for_path(model: str, exec_path: str) -> bool:
         return True
 
 
+async def chat_process_alive(chat: dict) -> bool:
+    """Is the chat's session PROCESS alive right now — the one predicate behind
+    the cross-engine switch gate and the client's ``process_alive`` signal.
+
+    Registry membership picks the layer (the stored execution_path may be
+    stale relative to where the session actually lives — same trap
+    ``_close_chat_session`` documents). All checks are in-memory dict lookups;
+    no RPC. Rules:
+      - a live interactive PTY for the chat counts (any target);
+      - a remote session counts when alive OR grace-held (a satellite WS blip
+        deregisters the machine, so ``is_session_alive`` alone reads a
+        reconnecting session as dead — it will be re-adopted);
+      - direct-llm sessions NEVER count: no OS process exists and every turn
+        rebuilds full DB history, so there is nothing to lose by abandoning
+        one (its in-memory object reads "alive" until idle-reap, which would
+        otherwise block switching for no benefit).
+    """
+    from core.session import interactive_session
+
+    chat_id = chat.get("id") or ""
+    if interactive_session.find_live_for_chat(chat_id) is not None:
+        return True
+    sid = chat.get("session_id") or ""
+    if not sid:
+        return False
+    try:
+        from core.session.session_manager import (
+            _remote_layer, resolve_execution_path,
+        )
+        from core.layers.cli.session import _persistent_sessions
+        from core.layers.codex.session import _codex_sessions
+        if _remote_layer is not None and sid in _remote_layer._sessions:
+            if await _remote_layer.is_session_alive(sid):
+                return True
+            return _remote_layer.is_session_grace_held(sid)
+        if sid in _persistent_sessions:
+            return bool(_persistent_sessions[sid].is_alive)
+        if sid in _codex_sessions:
+            return bool(_codex_sessions[sid].is_alive)
+        # Not in any registry → dead for every real layer (their
+        # is_session_alive reads the same registries, so this fallback is a
+        # production no-op) — but it keeps stubbed layers (tests) visible.
+        # direct-llm stays excluded: its in-memory object reads "alive" with
+        # no process behind it.
+        agent = chat.get("agent") or ""
+        path = resolve_execution_path(agent, chat.get("execution_path") or "")
+        if path != "direct-llm":
+            layer = get_execution_layer(
+                agent, execution_path=path,
+                execution_target=chat.get("execution_target") or "",
+            )
+            return bool(await layer.is_session_alive(sid))
+    except Exception:
+        logger.debug("chat_process_alive: liveness probe failed for %s",
+                     sid[:8], exc_info=True)
+    return False
+
+
 def _resume_username_for_chat(
     cid_for_resume: str, agent_for_resume: str, viewer_username: str,
 ) -> str:
@@ -594,6 +652,23 @@ class DashboardConnection(
                         break
         except Exception:
             logger.exception("install replay-on-connect failed")
+
+        # Workspace transfer progress replay (Feature E): one authoritative
+        # ``transfer_state`` snapshot per in-flight/lingering item this user
+        # may see — a tab opened mid-transfer renders current progress
+        # immediately. Recipient set was resolved at item creation with the
+        # same per-user isolation the fan-out itself applies.
+        try:
+            from core.remote import transfer_registry
+            for _t in transfer_registry.snapshot_inflight():
+                if self.user_sub not in _t.recipients:
+                    continue
+                try:
+                    self.notify_queue.put_nowait(transfer_registry.snapshot_event(_t))
+                except asyncio.QueueFull:
+                    break
+        except Exception:
+            logger.exception("transfer replay-on-connect failed")
 
         # Reconcile satellite-update banners on (re)connect. `satellite_updating` /
         # `satellite_updated` are transient per-connection broadcasts, so a dashboard

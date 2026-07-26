@@ -694,6 +694,24 @@ def user_can_run(layer: str, user_sub: str, *, provider: str = "") -> bool:
     return borrowable_pool_available(layer, user_sub, provider=provider)
 
 
+def layer_platform_configured(layer: str) -> bool:
+    """True when the platform POOL has a subscription for ``layer`` — an
+    active ``contribute_platform`` row owned by a current admin, or owner-less
+    platform infra like the hosted relay (:func:`subscription_store.list_platform_pool`).
+
+    This is the agent engine-enablement gate's predicate (operator decision
+    2026-07-25, revised post-review): agent-scoped background work —
+    scheduled tasks, phone conversations, triggers, anything with no driving
+    user — can ONLY run on the pool, so an engine enabled on the strength of
+    one user's personal connection would break the moment any non-user-scoped
+    run touches it. Personal connections deliberately do NOT count here; they
+    serve only that user's own chats, and per-user visibility is
+    :func:`user_can_run`'s job at chat time. Still deliberately weaker than
+    run-time credential resolution ("is enabling this sensible", not "will
+    this specific run resolve a credential")."""
+    return bool(subscription_store.list_platform_pool(layer))
+
+
 # Execution layers (AI engines) eligible for auto-enable on agent create/install,
 # in priority order. ``direct-llm`` is intentionally excluded — it is never the
 # auto-pick for a fresh agent (it needs an explicit model + provider to be useful,

@@ -224,6 +224,7 @@ async def _create_entry(agent: str, row: dict, scope_key: str) -> _Entry:
         session_id=session_id,
         sandbox_builder=builder,
         prebuilt_config=(mcp_config, bundles),
+        enable_http_transport=True,
     )
     try:
         async with _start_sem:

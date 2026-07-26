@@ -395,11 +395,53 @@ def test_unknown_agent_404(client):
     assert r.status_code == 404
 
 
-def test_unknown_command_400(client):
+def test_unknown_command_is_contract_error(client):
+    # Contract outcome, not an HTTP error: a 400 reaches the model wrapped
+    # as "API error 400: {...}" — the 200 shape is what lets it self-correct.
     _seed_agent("acme")
     h = _headers("s-20", "acme")
     r = _op(client, h, command="explode", path="/memories")
-    assert r.status_code == 400
+    assert r.status_code == 200
+    assert r.json()["is_error"] is True
+    assert "unknown command" in r.json()["output"]
+
+
+def test_missing_path_is_contract_error(client):
+    _seed_agent("acme")
+    h = _headers("s-20b", "acme")
+    r = _op(client, h, command="create", file_text="x")
+    assert r.status_code == 200
+    assert r.json()["is_error"] is True
+    assert "path required" in r.json()["output"]
+
+
+def test_view_bare_slash_lists_scopes(client):
+    _seed_agent("acme")
+    h = _headers("s-20c", "acme")
+    r = _op(client, h, command="view", path="/")
+    assert r.status_code == 200, r.text
+    assert r.json()["is_error"] is False
+
+
+def test_git_history_covers_knowledge_scope(client):
+    # An agent-scope memory write commits into knowledge/ — its history must
+    # be reachable through the git API's knowledge scope so a memory delete
+    # there is recoverable.
+    _seed_agent("acme")
+    _assign_role("user-manager", "acme", "manager")
+    h = _headers("s-git", "acme", "user-manager")
+    r = _op(
+        client, h, command="create", path="/memories/agent/ops.md",
+        file_text="# Ops\n- fact (2026-07-26)\n",
+    )
+    assert r.json()["is_error"] is False
+    r = client.get(
+        "/v1/internal/git/log",
+        params={"agent": "acme", "scope": "knowledge"},
+        headers=_admin_cookie(),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["commits"], "memory write missing from knowledge/ history"
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,17 @@ class ServerNotificationController:
             await self._send(notification)
             return
 
+        if ntype.startswith("transfer_"):
+            # Workspace upload/sync transfer lifecycle (transfer_started /
+            # transfer_machine_state / transfer_progress / transfer_done /
+            # transfer_state replay). Pushed by core/remote/transfer_registry
+            # via ws/satellite.py::push_transfer_event; recipients were
+            # per-user-isolation-filtered at item creation. Frontend routes
+            # these into useTransferStore (workspace toolbar progress popup).
+            # Forward verbatim.
+            await self._send(notification)
+            return
+
         if ntype == "turn_complete":
             # Forward turn-complete signal to frontend for subtle ping sound
             await self._send(notification)

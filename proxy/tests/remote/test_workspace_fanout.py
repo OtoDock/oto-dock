@@ -495,3 +495,149 @@ async def test_apply_agent_mismatch_rejected(temp_db, tmp_path, monkeypatch):
     assert not (tmp_path / "spoofed-agent" / "workspace" / "x.md").exists()
 
 
+
+
+# ---------------------------------------------------------------------------
+# fan_out_write ↔ transfer_registry tracking (Feature E, 1.4.0)
+# ---------------------------------------------------------------------------
+
+
+def _tracked_setup(monkeypatch, machines=("m1", "m2")):
+    from services.remote import workspace_fanout
+    from core.remote import satellite_connection as sc
+    from core.remote import transfer_registry as tr
+    monkeypatch.setattr(
+        workspace_fanout, "fanout_targets",
+        lambda a, r, *, exclude_machine_id=None: list(machines),
+    )
+    fake_cm = AsyncMock()
+    fake_cm.push_file.return_value = True
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    tr._items.clear()
+    tr.set_broadcaster(None)
+    monkeypatch.setattr(tr, "_machine_name", lambda mid: mid)
+    monkeypatch.setattr(tr, "_resolve_recipients", lambda a, p: frozenset({"u1"}))
+    return workspace_fanout, fake_cm, tr
+
+
+@pytest.mark.asyncio
+async def test_fan_out_big_payload_creates_item_and_done_rows(temp_db, monkeypatch):
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch)
+    big = b"x" * (600 * 1024)  # > MAX_CHUNK_SIZE → tracked without explicit id
+    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    items = tr.snapshot_inflight()
+    assert len(items) == 1
+    assert {r.state for r in items[0].machines.values()} == {"done"}
+    assert items[0].done_at is not None
+    # progress_cb was forwarded per machine
+    for call in fake_cm.push_file.await_args_list:
+        assert call.kwargs.get("progress_cb") is not None
+
+
+@pytest.mark.asyncio
+async def test_fan_out_small_sync_payload_untracked(temp_db, monkeypatch):
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch)
+    await workspace_fanout.fan_out_write("agent-1", "workspace/small.md", b"tiny")
+    assert tr.snapshot_inflight() == []
+    # untracked pushes carry no progress callback
+    for call in fake_cm.push_file.await_args_list:
+        assert call.kwargs.get("progress_cb") is None
+
+
+@pytest.mark.asyncio
+async def test_fan_out_explicit_transfer_id_tracks_any_size(temp_db, monkeypatch):
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch, machines=("m1",))
+    await workspace_fanout.fan_out_write(
+        "agent-1", "workspace/small.md", b"tiny",
+        transfer_kind="upload", transfer_id="upl-1",
+    )
+    item = tr.get("upl-1")
+    assert item is not None and item.kind == "upload"
+    assert item.machines["m1"].state == "done"
+
+
+@pytest.mark.asyncio
+async def test_fan_out_failed_push_marks_row_failed(temp_db, monkeypatch):
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch, machines=("m1", "m2"))
+
+    async def _push(mid, ref, source, **kw):
+        return mid != "m2"  # m2 offline
+
+    fake_cm.push_file.side_effect = _push
+    big = b"x" * (600 * 1024)
+    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    item = tr.snapshot_inflight()[0]
+    assert item.machines["m1"].state == "done"
+    assert item.machines["m2"].state == "failed"
+    assert "retries at next sync" in item.machines["m2"].error
+    assert item.done_at is not None
+
+
+# ---------------------------------------------------------------------------
+# fan_out_write ↔ transfer_gate (Feature F, 1.4.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_out_respects_global_gate(temp_db, monkeypatch):
+    import asyncio
+    import config
+    from core.remote import transfer_gate
+    monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
+    monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 0, raising=False)
+    transfer_gate.reset_for_tests()
+    workspace_fanout, fake_cm, tr = _tracked_setup(
+        monkeypatch, machines=("m1", "m2", "m3"),
+    )
+    state = {"active": 0, "max_active": 0}
+
+    async def _push(mid, ref, source, **kw):
+        state["active"] += 1
+        state["max_active"] = max(state["max_active"], state["active"])
+        await asyncio.sleep(0.02)
+        state["active"] -= 1
+        return True
+
+    fake_cm.push_file.side_effect = _push
+    big = b"x" * (600 * 1024)
+    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    transfer_gate.reset_for_tests()
+    assert state["max_active"] == 1          # gate caps concurrency
+    assert fake_cm.push_file.await_count == 3  # every machine still pushed
+    # base-advance intact for all acked machines
+    item = tr.snapshot_inflight()[0]
+    assert {r.state for r in item.machines.values()} == {"done"}
+
+
+@pytest.mark.asyncio
+async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
+    import asyncio
+    import config
+    from core.remote import transfer_gate
+    monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
+    monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 0, raising=False)
+    transfer_gate.reset_for_tests()
+    workspace_fanout, fake_cm, tr = _tracked_setup(monkeypatch, machines=("m1", "m2"))
+    seen_states: list[tuple[str, str]] = []
+    orig_set_state = tr.set_state
+
+    async def _spy(tid, mid, state, **kw):
+        seen_states.append((mid, state))
+        await orig_set_state(tid, mid, state, **kw)
+
+    monkeypatch.setattr(tr, "set_state", _spy)
+
+    async def _push(mid, ref, source, **kw):
+        await asyncio.sleep(0.02)
+        return True
+
+    fake_cm.push_file.side_effect = _push
+    big = b"x" * (600 * 1024)
+    await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big)
+    transfer_gate.reset_for_tests()
+    # With one slot and two machines, ONE of them was queued first.
+    assert ("m1", "queued") in seen_states or ("m2", "queued") in seen_states
+    # Both passed through active and reached done.
+    for mid in ("m1", "m2"):
+        assert (mid, "active") in seen_states
+        assert (mid, "done") in seen_states

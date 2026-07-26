@@ -118,6 +118,9 @@ class ClientMessageDispatcher:
             isess = interactive_session.get(self.session_id) if self.session_id else None
             if isess is not None and isess.alive and isess.chat_id == msg.get("chat_id"):
                 await self._attach_pty_viewer(isess)
+        elif msg_type == "pty_takeover":
+            # Read-only viewer of another user's terminal asks for control.
+            await self._handle_pty_takeover(msg)
         elif msg_type == "pty_input":
             # Interactive (PTY) keystrokes → the connection's VIEWED session
             # (session_id, set on warmup_ready). Routing by session_id (not the
@@ -127,10 +130,12 @@ class ClientMessageDispatcher:
             isess = interactive_session.get(self.session_id) if self.session_id else None
             if isess is not None:
                 try:
-                    isess.deliver_dashboard_input(
+                    if not isess.deliver_dashboard_input(
                         base64.b64decode(msg.get("data", "")),
                         composer=bool(msg.get("composer")),
-                    )
+                        sender_sub=self.user_sub,
+                    ):
+                        await self._send_pty_read_only(isess)
                 except Exception:
                     logger.debug("pty_input decode/write failed", exc_info=True)
         elif msg_type == "pty_resize":
@@ -150,6 +155,11 @@ class ClientMessageDispatcher:
             # multi-line path block lands as one input) and submit with Enter.
             isess = interactive_session.get(self.session_id) if self.session_id else None
             if isess is not None and isess.alive:
+                if not isess.may_drive(self.user_sub):
+                    # Refuse BEFORE the upload work — a read-only viewer must not
+                    # even write attachment files into the agent's workspace.
+                    await self._send_pty_read_only(isess)
+                    return None
                 try:
                     is_agent_scoped = _vis.is_shared_only(self.agent_name)
                     agent_dir = config.get_agent_dir(self.agent_name)
@@ -162,7 +172,8 @@ class ClientMessageDispatcher:
                     payload = "\x1b[200~" + cli_text + "\x1b[201~\r"
                     # Attachment sends only ever come from the composer — same
                     # question-parked hold as flagged pty_input.
-                    isess.deliver_dashboard_input(payload.encode("utf-8"), composer=True)
+                    isess.deliver_dashboard_input(payload.encode("utf-8"), composer=True,
+                                                  sender_sub=self.user_sub)
                 except Exception:
                     logger.exception("pty_attachments failed")
         elif msg_type == "location_response":
@@ -228,6 +239,23 @@ class ClientMessageDispatcher:
             await self._handle_compact_context()
         elif msg_type == "move_chat":
             await self._handle_move_chat()
+        elif msg_type == "switch_engine":
+            await self._handle_switch_engine(msg)
+        elif msg_type == "probe_liveness":
+            # Lazy client-side liveness refresh (fired when the model dropdown
+            # opens): headless idle-reap emits no frame, so without this the
+            # cross-engine options never appear on a chat that died while
+            # being viewed. Bound chat only — arbitrary ids aren't probeable.
+            from ws.dashboard import chat_process_alive
+            _cid = self.chat_id or ""
+            _chat = task_store.get_chat(_cid) if _cid else None
+            _alive = False
+            if _chat:
+                _pump = _active_pumps.get(_cid)
+                _alive = bool(_pump and not _pump.is_done) or \
+                    await chat_process_alive(_chat)
+            await self._send({"type": "liveness", "chat_id": _cid,
+                              "process_alive": _alive})
         elif msg_type == "implement_plan":
             await self._handle_implement_plan(msg)
             self._register_notify_queue()
@@ -254,6 +282,10 @@ class ClientMessageDispatcher:
             # markers → chat_status ready.
             isess = interactive_session.get(self.session_id) if self.session_id else None
             if isess is not None and isess.alive:
+                # Aborting someone else's turn is driving their session.
+                if not isess.may_drive(self.user_sub):
+                    await self._send_pty_read_only(isess)
+                    return None
                 isess.interrupt_turn()
                 await self._send({"type": "aborted", "chat_id": self.chat_id or ""})
                 return None
@@ -374,6 +406,15 @@ class ClientMessageDispatcher:
                               "message": "The chat is still getting ready — "
                                          "try again in a moment."})
             return
+        # A warmup from ANOTHER connection (second tab) registers globally but
+        # is invisible to the connection-scoped check above — its tail would
+        # stamp a session spawned for the OLD pin onto the moved row.
+        from core.session import warmup_registry as _wreg
+        if _wreg.get(self.chat_id) is not None:
+            await self._send({"type": "error",
+                              "message": "The chat is still getting ready — "
+                                         "try again in a moment."})
+            return
         pump = _active_pumps.get(self.chat_id) if self.chat_id else None
         if self.streaming or (pump and not pump.is_done):
             await self._send({"type": "error",
@@ -439,6 +480,180 @@ class ClientMessageDispatcher:
             "new_target": resolved,
             "resolved_label": _label(resolved).removeprefix("the "),
         })
+
+    async def _handle_switch_engine(self, msg: dict):
+        """Cross-engine resume: flip the OPEN chat's execution engine + model
+        so the next warmup fresh-spawns on the new engine with the DB-history
+        digest (``pending_history_seed='engine_switch:<old>'``).
+
+        Only for a DEAD session — while the process is alive the chat stays
+        locked to its engine (the dropdown never offers foreign models). The
+        chat row is authoritative for every resume read-site, so the rebind
+        alone re-routes all subsequent spawns; the rebind is a CAS so a
+        concurrent warmup/adopt that re-bound the row makes this a clean
+        no-op. Owner/admin only (move_chat parity — deliberately stricter
+        than rename/delete: an editor must not switch a shared chat's engine
+        out from under its other senders). Task-run and phone chats are
+        denied outright — their pipelines resolve the engine from task/agent
+        config, never from ``chats.execution_path``, so a switch there would
+        flip the badge while runs continue on the old engine."""
+        import json as _json
+        from api.agents._common import _get_execution_paths
+        from services.engines import subscription_pool
+        from services.notifications import notification_manager as _nm
+        from storage import agent_store, subscription_store
+        from core.session import history_seed, session_delivery, warmup_registry
+        from core.session.session_manager import get_execution_layer
+        from ws.dashboard import _effective_agent_role, chat_process_alive
+
+        new_path = (msg.get("execution_path") or "").strip()
+        new_model = (msg.get("model") or "").strip()
+
+        async def _deny(reason: str, *, alive: bool | None = None):
+            payload = {"type": "switch_engine_denied",
+                       "chat_id": self.chat_id or "", "message": reason}
+            if alive is not None:
+                payload["process_alive"] = alive
+            await self._send(payload)
+
+        logger.info(
+            "WS dashboard: switch_engine requested chat=%s -> %s/%s",
+            self.chat_id or "?", new_path or "?", new_model or "?",
+        )
+        chat = task_store.get_chat(self.chat_id) if self.chat_id else None
+        if not chat:
+            await _deny("Chat not found.")
+            return
+        cid = chat["id"]
+        agent = chat.get("agent") or ""
+        if cid.startswith("task-") or chat.get("source_type") == "phone":
+            await _deny("Task and phone chats can't switch engines — their "
+                        "runs resolve the engine from the task/agent "
+                        "configuration.")
+            return
+        role = _effective_agent_role(self.user_sub, agent)
+        if chat.get("user_sub") != self.user_sub and role != "admin":
+            await _deny("Only the chat owner can switch its engine.")
+            return
+        if ((self._warmup_task and not self._warmup_task.done())
+                or warmup_registry.get(cid) is not None
+                or session_delivery.oneshot_inflight(cid) is not None):
+            await _deny("The chat is still getting ready — try again in a "
+                        "moment.")
+            return
+        pump = _active_pumps.get(cid)
+        if self.streaming or (pump and not pump.is_done):
+            await _deny("Finish or stop the current turn before switching "
+                        "engines.", alive=True)
+            return
+        if await chat_process_alive(chat):
+            await _deny("The session is still active — switching engines is "
+                        "possible once it has ended.", alive=True)
+            return
+
+        old_path_raw = chat.get("execution_path") or ""
+        old_path = resolve_execution_path(agent, old_path_raw)
+        if not new_path or new_path == old_path:
+            await _deny("Pick a different AI engine to switch to.")
+            return
+        agent_rec = agent_store.get_agent(agent) or {}
+        if new_path not in _get_execution_paths(agent_rec):
+            await _deny("That AI engine isn't enabled for this agent.")
+            return
+        if not await asyncio.to_thread(
+                subscription_pool.user_can_run, new_path, self.user_sub):
+            await _deny("You don't have access to that AI engine — connect "
+                        "it in your AI-engine settings first.")
+            return
+        try:
+            _models = await asyncio.to_thread(
+                subscription_store.list_models, new_path)
+        except Exception:
+            _models = []
+        if not new_model or not any(
+            m.get("enabled") and (m.get("model_id") or "") == new_model
+            for m in _models
+        ):
+            await _deny("That model isn't available on the selected engine.")
+            return
+
+        # Teardown of any still-REGISTERED dead session: registry-membership
+        # close (the stored path may be stale relative to where the session
+        # actually lives), liveness badges, stale permission prompts, slot.
+        old_sid = chat.get("session_id") or ""
+        with contextlib.suppress(Exception):
+            await interactive_session.close_for_chat(
+                cid, reason="engine_switch")
+        if old_sid:
+            with contextlib.suppress(Exception):
+                from api.agents.chats import _close_chat_session
+                await _close_chat_session(chat)
+            clear_session_liveness(old_sid, reason="engine_switch")
+            _pending_permissions.pop(old_sid, None)
+            from core.concurrency import release_chat_slot
+            with contextlib.suppress(Exception):
+                release_chat_slot(old_sid)
+
+        # FINAL re-validation + CAS rebind. Everything from here to the
+        # UPDATE is synchronous (no await), so no coroutine can interleave a
+        # warmup between the re-check and the commit; a warmup that raced the
+        # teardown above re-bound the row and fails the CAS instead.
+        if (warmup_registry.get(cid) is not None
+                or session_delivery.oneshot_inflight(cid) is not None):
+            await _deny("The chat re-warmed while switching — try again.")
+            return
+        if new_path == "direct-llm":
+            # direct-llm never consumes seeds (it rebuilds full DB history
+            # every turn): don't leave a flag to fire a stale digest on a
+            # later hop back — and claim/persist any PRIOR pending notice
+            # (moved:/machine_removed:) so its card isn't silently swallowed.
+            if chat.get("pending_history_seed"):
+                history_seed.consume_pending_seed_digest(cid, max_chars=0)
+            pending_seed = ""
+        else:
+            pending_seed = f"engine_switch:{old_path}"
+        if not task_store.rebind_chat_for_engine_switch(
+            cid, new_path, new_model,
+            expected_old_path=old_path_raw,
+            expected_session_id=chat.get("session_id"),
+            pending_seed=pending_seed,
+        ):
+            await _deny("The chat changed underneath — try again.")
+            return
+
+        if new_path == "direct-llm":
+            # No seed will ever be consumed, so persist the switch card now.
+            with contextlib.suppress(Exception):
+                task_store.add_chat_message(
+                    cid, "event", "",
+                    event_type="system",
+                    event_data=_json.dumps({
+                        "type": "system", "subtype": "session_reseeded",
+                        "message": history_seed.engine_switch_notice(old_path),
+                        "machine_name": "", "reason": "engine_switch",
+                    }),
+                )
+        self.session_id = None
+        # Re-home the connection's layer so the next send resolves the NEW
+        # engine (move_chat leaves this to the next resume; here the user
+        # stays on the open chat and prompts immediately).
+        with contextlib.suppress(Exception):
+            self.layer = get_execution_layer(
+                agent, execution_path=new_path, user_sub=self.user_sub,
+                role=role, execution_target=chat.get("execution_target") or "",
+            )
+        logger.info(
+            "WS dashboard: chat %s switched engine (%s -> %s, model=%s) by %s",
+            cid, old_path, new_path, new_model, self.user_sub,
+        )
+        ack = {"type": "engine_switched", "chat_id": cid,
+               "execution_path": new_path, "model": new_model}
+        await self._send(ack)
+        # Sibling tabs (same owner) re-home their locked dropdowns; the
+        # acting socket receives the frame twice — receivers are idempotent.
+        _nm.broadcast_engine_switched(
+            chat.get("user_sub") or "", cid, new_path, new_model, agent=agent,
+        )
 
     async def _handle_compact_context(self):
         """Manual context compaction — Codex ``thread/compact/start`` via

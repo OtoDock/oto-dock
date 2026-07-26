@@ -32,8 +32,13 @@ vi.mock('@/api/agents', () => ({
 }))
 vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
-  useMemorySettings: () => ({ data: { user_memory_enabled: true, agent_memory_enabled: true } }),
-  useAgentMemorySettings: () => ({ data: { user_memory_enabled: true, agent_memory_enabled: true } }),
+  useAgentMemorySettings: () => ({
+    data: {
+      user_memory_enabled: true,
+      agent_memory_enabled: true,
+      master: { user_memory_enabled: true, agent_memory_enabled: true },
+    },
+  }),
   useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
   useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
 }))

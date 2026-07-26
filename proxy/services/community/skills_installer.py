@@ -208,6 +208,20 @@ async def install_skill_package_from_catalog(
     if not _is_safe_name(name):
         raise HTTPException(400, f"Invalid skill package name: {name!r}")
 
+    from services.community import community_catalog
+    try:
+        registry = await community_catalog.fetch_skills_registry()
+        _entry = next(
+            (e for e in registry.get("skills", []) if e.get("name") == name),
+            None,
+        )
+    except Exception:
+        _entry = None
+    if _entry is not None:
+        community_catalog.require_platform_compat(
+            name, _entry.get("platform_min_version"),
+        )
+
     await _emit(progress_cb, "fetch", 5, "Downloading from skills catalog")
     tarball = await _fetch_catalog_tarball(url=SKILLS_TARBALL_URL)
 

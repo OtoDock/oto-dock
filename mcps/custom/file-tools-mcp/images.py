@@ -106,12 +106,12 @@ async def handle_edit_image(args: dict) -> str:
     # must resolve as a write for the proxy's write-RBAC to fire (an editor
     # could otherwise edit a /knowledge image in place through the
     # read-resolved path). With an output_path the input stays read-only.
-    path = _resolve_path(args["path"], writing=not output_path)
+    path = await _resolve_path(args["path"], writing=not output_path)
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
     if output_path:
-        out = _resolve_path(output_path, writing=True)
+        out = await _resolve_path(output_path, writing=True)
         Path(out).parent.mkdir(parents=True, exist_ok=True)
     else:
         out = path
@@ -292,7 +292,7 @@ async def handle_edit_image(args: dict) -> str:
                 img = ImageOps.expand(img, border=border_w, fill=color)
 
             elif ot == "paste_image":
-                overlay_path = _resolve_path(op["image_path"])
+                overlay_path = await _resolve_path(op["image_path"])
                 overlay = Image.open(overlay_path)
                 x = int(op.get("x", 0))
                 y = int(op.get("y", 0))
@@ -856,7 +856,7 @@ async def handle_analyze_image(args: dict) -> str:
 
     import numpy as np
 
-    path = _resolve_path(args["path"])
+    path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
@@ -1019,7 +1019,7 @@ async def handle_ocr_image(args: dict) -> str:
     """Extract text from an image using tesseract OCR."""
     import subprocess
 
-    path = _resolve_path(args["path"])
+    path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 

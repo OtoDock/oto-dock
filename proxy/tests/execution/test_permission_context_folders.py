@@ -170,7 +170,7 @@ def test_building_agents_renders_for_manager(temp_db):
     )
     assert "# Building Agents" in text
     # Mentions all key folders
-    assert "/config/prompt.md" in text
+    assert "/config/agent.md" in text
     assert "/config/context/" in text
     assert "/knowledge/" in text
     assert "/workspace/" in text

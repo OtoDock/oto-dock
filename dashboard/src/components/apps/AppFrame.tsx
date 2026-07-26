@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useTheme } from '../../contexts/ThemeContext'
 import { onFileUpdate } from '../../lib/fileUpdates'
 import { emitIframeSwipe } from '../../lib/iframeGestures'
+import { hasUserActivation, openExternalUrl, validateBridgedUrl } from '../../lib/openExternal'
 import { fireAppAction, type PinnedApp } from '../../api/apps'
 import { useActiveChats } from '../../hooks/useActiveChats'
 
@@ -45,6 +46,24 @@ interface Props {
 // frame tall enough to be usable and short enough to never trap the page.
 const AUTO_HEIGHT_MIN = 120
 const AUTO_HEIGHT_MAX = 8000
+
+// open_url bridge guards (mirrors UiArtifact — the two hosts deliberately
+// don't share a message vocabulary, so the handler is written twice).
+const OPEN_URL_BURST = 3
+const OPEN_URL_WINDOW_MS = 10_000
+
+type OpenConsent = 'unset' | 'allowed' | 'blocked'
+
+function openUrlConsentKey(appId: string): string {
+  return `otodock-app-openurl:${appId}`
+}
+
+function readOpenConsent(key: string): OpenConsent {
+  try {
+    const v = localStorage.getItem(key)
+    return v === 'allowed' || v === 'blocked' ? v : 'unset'
+  } catch { return 'unset' }
+}
 
 export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoHeight = false }: Props) {
   const { resolvedTheme } = useTheme()
@@ -120,6 +139,38 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // Content height reported by the shim (autoHeight mode only).
   const [contentHeight, setContentHeight] = useState<number | null>(null)
 
+  // open_url bridge state: first-use consent (destination ORIGIN) + burst.
+  const [openPrompt, setOpenPrompt] = useState<{ origin: string } | null>(null)
+  const pendingOpenRef = useRef<{ win: Window; url: string } | null>(null)
+  const openTimesRef = useRef<number[]>([])
+
+  const openAckTo = (win: Window, status: string, reason?: string) => {
+    try {
+      win.postMessage(
+        { source: 'otodock-host', type: 'open_url_ack', status, ...(reason ? { reason } : {}) },
+        '*',
+      )
+    } catch { /* frame gone */ }
+  }
+
+  const deliverOpen = (win: Window, url: string) => {
+    void openExternalUrl(url).then((r) => {
+      if (r === 'opened') openAckTo(win, 'opened')
+      else openAckTo(win, 'blocked', 'popup blocked — try again')
+    })
+  }
+
+  const resolveOpenConsent = (allow: boolean) => {
+    const consent: OpenConsent = allow ? 'allowed' : 'blocked'
+    try { localStorage.setItem(openUrlConsentKey(appRef.current.id), consent) } catch { /* private mode */ }
+    setOpenPrompt(null)
+    const pending = pendingOpenRef.current
+    pendingOpenRef.current = null
+    if (!pending) return
+    if (allow) deliverOpen(pending.win, pending.url)
+    else openAckTo(pending.win, 'blocked')
+  }
+
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       const win = e.source as Window | null
@@ -141,6 +192,30 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (frame && (d.dir === 'left' || d.dir === 'right')) {
           emitIframeSwipe({ el: frame, dir: d.dir })
         }
+        return
+      }
+      if (d.type === 'open_url') {
+        // Links bridged out of the sandbox. Must NOT bypass the app's
+        // standing approval (every other app channel is actions_approved-
+        // gated; an actionless app approves vacuously and the first-use
+        // origin chip below is its consent). Validation + activation +
+        // burst mirror UiArtifact.
+        if (!appRef.current.actions_approved) {
+          return openAckTo(win, 'denied', 'actions not approved')
+        }
+        const v = validateBridgedUrl(d.url)
+        if ('error' in v) return openAckTo(win, 'denied', v.error)
+        if (!hasUserActivation()) return openAckTo(win, 'denied', 'no user gesture')
+        const nowOpen = Date.now()
+        const times = openTimesRef.current.filter((t) => nowOpen - t < OPEN_URL_WINDOW_MS)
+        openTimesRef.current = times
+        if (times.length >= OPEN_URL_BURST) return openAckTo(win, 'denied', 'rate limited')
+        times.push(nowOpen)
+        const consent = readOpenConsent(openUrlConsentKey(appRef.current.id))
+        if (consent === 'blocked') return openAckTo(win, 'blocked')
+        if (consent === 'allowed') return deliverOpen(win, v.url)
+        pendingOpenRef.current = { win, url: v.url }
+        setOpenPrompt({ origin: v.origin })
         return
       }
       const ack = (status: string, reason?: string) => {
@@ -250,7 +325,33 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     )
   }, [resolvedTheme])
 
+  const openChip = openPrompt ? (
+    <div className="absolute inset-x-2 top-2 z-10" data-testid="app-openurl-chip">
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-p-border-light/60 bg-white/95 px-3 py-2 text-xs shadow-md backdrop-blur-sm dark:bg-p-surface/95">
+        <span className="text-p-text-secondary">
+          This mini-app wants to open <span className="font-medium text-p-text">{openPrompt.origin}</span> in a new tab.
+        </span>
+        <span className="ml-auto flex gap-1.5">
+          <button
+            onClick={() => resolveOpenConsent(true)}
+            className="rounded-md bg-blue-500 px-2.5 py-1 font-medium text-white transition-colors hover:bg-blue-600"
+          >
+            Allow
+          </button>
+          <button
+            onClick={() => resolveOpenConsent(false)}
+            className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface"
+          >
+            Block
+          </button>
+        </span>
+      </div>
+    </div>
+  ) : null
+
   return (
+    <div className={`relative w-full ${autoHeight ? '' : 'h-full'}`}>
+    {openChip}
     <iframe
       ref={iframeRef}
       src={src}
@@ -275,5 +376,6 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       style={autoHeight ? { height: contentHeight ?? 320 } : undefined}
       scrolling={autoHeight ? 'no' : undefined}
     />
+    </div>
   )
 }

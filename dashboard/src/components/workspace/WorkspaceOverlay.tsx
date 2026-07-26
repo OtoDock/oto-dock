@@ -12,8 +12,13 @@ import {
   useRecoverBin,
   type FileNode,
 } from '../../api/agents'
-import { apiFetch } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
+import { uploadWithProgress } from '../../lib/uploadWithProgress'
+import { useTransferStore, useTransfersForSection, isTransferActive } from '../../store/transferStore'
+import TransferPopup from './TransferPopup'
+import { emptyTypeAhead, pushChar, findMatch } from '../../lib/typeAhead'
+import { searchSection, pruneTree, expandedDirsOf } from '../../lib/workspaceSearch'
+import { Icon } from './workspaceIcons'
 import type { useWorkspaceState } from '../../hooks/useWorkspaceState'
 import { pushEscHandler } from '../../lib/escStack'
 import { parentDir, resolveActionTargets } from '../../lib/paths'
@@ -48,7 +53,7 @@ const SCOPE_INFO: Record<ScopeKey, string> = {
   'agent-knowledge':
     'The agent’s reference library — docs, templates, and reference material curated by a manager. Not auto-loaded into context — the agent reads files here on demand. Universal (the same files in every session, user-scope or agent-scope).',
   'agent-config':
-    'The agent’s configuration folder. prompt.md plus every .md file under context/ is auto-loaded into every session for this agent.',
+    'The agent’s configuration folder. agent.md (the persona) plus every .md file under context/ is auto-loaded into every session for this agent.',
 }
 
 type WSState = ReturnType<typeof useWorkspaceState>['state']
@@ -88,6 +93,9 @@ interface ContextMenuPayload {
 interface PendingDelete {
   nodes: FileNode[]
   totalDescendants: number
+  /** Files in the selection too large for the Recover bin — their deletion
+   * cannot be undone (server skips capture above recover_bin_max_bytes). */
+  binSkippedCount: number
 }
 
 const IS_DESKTOP = typeof window === 'undefined' ? true : !window.matchMedia('(hover: none)').matches
@@ -212,6 +220,56 @@ export default function WorkspaceOverlay({
   const [renamingPath, setRenamingPath] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null)
   const [showRecover, setShowRecover] = useState(false)
+  // ---- Per-section recursive search (Phase G) ----
+  // Toggled by the toolbar's magnifier icon; closing ALWAYS clears the query
+  // so the full listing returns. Query resets on section switch.
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false)
+    setSearchQuery('')
+  }, [])
+  useEffect(() => {
+    closeSearch()
+  }, [activeSection?.key, agent, closeSearch])
+  const searchActive = searchOpen && searchQuery.trim().length > 0
+  const searchResult = useMemo(
+    () => (searchActive && activeSection
+      ? searchSection(activeSection.nodes, activeSection.pathPrefix, searchQuery)
+      : null),
+    [searchActive, activeSection, searchQuery],
+  )
+  const prunedTreeNodes = useMemo(
+    () => (searchActive && activeSection
+      ? pruneTree(activeSection.nodes, searchQuery)
+      : null),
+    [searchActive, activeSection, searchQuery],
+  )
+  const searchExpandedDirs = useMemo(
+    () => (prunedTreeNodes ? expandedDirsOf(prunedTreeNodes) : undefined),
+    [prunedTreeNodes],
+  )
+
+  // ---- Explorer-style type-ahead selection (Phase G) ----
+  // DOM-driven so one handler covers BOTH views: visible items carry
+  // data-ta-name/path attributes (grid tiles + tree rows) in display order.
+  const typeAheadRef = useRef(emptyTypeAhead())
+  const fileAreaRef = useRef<HTMLDivElement>(null)
+
+  // Transfer-progress popup (Feature E): anchored under the toolbar icon;
+  // items are the CURRENT section's active uploads/machine-syncs.
+  const [transferAnchor, setTransferAnchor] = useState<{ left: number; top: number } | null>(null)
+  const transfers = useTransfersForSection(
+    agent, activeSection?.key ?? '', user?.username,
+  )
+  // Close the popup when the last item prunes away or the agent changes.
+  useEffect(() => {
+    if (transfers.length === 0) setTransferAnchor(null)
+  }, [transfers.length])
+  useEffect(() => {
+    setTransferAnchor(null)
+  }, [agent])
   // Deep-link: a `?recover=1` arrival (file-conflict notification) opens the
   // Recover bin straight away. Consume the flag so it doesn't re-fire.
   useEffect(() => {
@@ -259,19 +317,36 @@ export default function WorkspaceOverlay({
     async (files: FileList) => {
       if (!activeSection || !activeSection.canWrite) return
       const dir = state.path || activeSection.pathPrefix
+      const ts = useTransferStore.getState()
+      // Sequential on purpose: preserves server-side conflict-suffix
+      // ordering and keeps failure attribution per-file; the progress list
+      // makes the sequencing visible instead of confusing.
       for (const file of Array.from(files)) {
-        const fd = new FormData()
-        fd.append('file', file)
-        fd.append('agent', agent)
-        fd.append('target_dir', dir)
+        // NOT crypto.randomUUID(): that's secure-context-only, and plenty of
+        // self-hosted installs serve the dashboard over plain http on a LAN.
+        const clientId = `local:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+        ts.beginLocalUpload({
+          clientId, agent, targetDir: dir,
+          filename: file.name, bytesTotal: file.size,
+        })
         try {
-          await apiFetch('/v1/upload', { method: 'POST', body: fd })
+          const res = await uploadWithProgress(file, agent, dir, (sent) =>
+            useTransferStore.getState().updateLocalUpload(clientId, sent),
+          )
+          useTransferStore.getState().linkUpload(clientId, {
+            transferId: res.transfer_id,
+            relPath: res.path,
+            remotePush: res.remote_push,
+          })
         } catch (e) {
+          useTransferStore.getState().failLocalUpload(clientId)
           // eslint-disable-next-line no-console
           console.error('upload failed', file.name, e)
         }
+        // Refresh after EACH file so big multi-file batches appear as they
+        // land, not only at the end.
+        qc.invalidateQueries({ queryKey: ['agent-files', agent] })
       }
-      qc.invalidateQueries({ queryKey: ['agent-files', agent] })
     },
     [activeSection, state.path, agent, qc],
   )
@@ -285,6 +360,61 @@ export default function WorkspaceOverlay({
       }
     },
     [actions],
+  )
+
+  const handleRefresh = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ['agent-files', agent] })
+    qc.invalidateQueries({ queryKey: ['recover-bin', agent] })
+  }, [qc, agent])
+
+  // Explorer-style type-ahead: printable chars accumulate (1s reset) and
+  // select the first visible item whose name starts with the buffer;
+  // repeating one char cycles its matches; Enter opens; Escape clears.
+  // Works in BOTH views via the data-ta-* attributes rendered by grid
+  // tiles and tree rows (queried in display order).
+  const handleTypeAhead = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (searchOpen || state.preview || showRecover || pendingDelete || menu || renamingPath) return
+      const target = e.target as HTMLElement
+      if (target.closest('input, textarea, [contenteditable="true"]')) return
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const container = fileAreaRef.current
+      if (!container) return
+      if (e.key === 'Escape') {
+        typeAheadRef.current = emptyTypeAhead()
+        return
+      }
+      const els = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-ta-name]'),
+      )
+      if (!els.length) return
+      const selPath = state.selected.length === 1 ? state.selected[0] : null
+      if (e.key === 'Enter' && selPath) {
+        const node = findNode(tree, selPath)
+        if (node) {
+          e.preventDefault()
+          handleOpen(node)
+        }
+        return
+      }
+      if (e.key.length !== 1) return
+      typeAheadRef.current = pushChar(typeAheadRef.current, e.key, Date.now())
+      const names = els.map((el) => el.dataset.taName || '')
+      const curIdx = selPath
+        ? els.findIndex((el) => el.dataset.taPath === selPath)
+        : -1
+      const idx = findMatch(names, typeAheadRef.current, curIdx)
+      if (idx >= 0) {
+        e.preventDefault()
+        const el = els[idx]
+        actions.select(el.dataset.taPath!, true)
+        el.scrollIntoView({ block: 'nearest' })
+      }
+    },
+    [
+      searchOpen, state.preview, state.selected, showRecover, pendingDelete,
+      menu, renamingPath, tree, actions, handleOpen,
+    ],
   )
 
   // ---- Batch action handlers (delete / download / paste) ----
@@ -374,14 +504,18 @@ export default function WorkspaceOverlay({
     [actions, movePaths, copyPaths, agent],
   )
 
+  const binCap = user?.feature_flags?.recover_bin_max_bytes ?? 100 * 1024 * 1024
   const queueDelete = useCallback((nodes: FileNode[]) => {
     if (nodes.length === 0) return
     const totalDescendants = nodes.reduce(
       (sum, n) => sum + (n.type === 'dir' ? countDescendants(n) : 0),
       0,
     )
-    setPendingDelete({ nodes, totalDescendants })
-  }, [])
+    const binSkippedCount = nodes.reduce(
+      (sum, n) => sum + countBinSkipped(n, binCap), 0,
+    )
+    setPendingDelete({ nodes, totalDescendants, binSkippedCount })
+  }, [binCap])
 
   // ---- Context-menu actions ----
 
@@ -426,8 +560,9 @@ export default function WorkspaceOverlay({
         handleNewFolder,
         handlePaste,
         emptyUploadInputRef,
+        onRefresh: handleRefresh,
       }),
-    [activeSection, state.path, actions.clipboard, handleNewFile, handleNewFolder, handlePaste],
+    [activeSection, state.path, actions.clipboard, handleNewFile, handleNewFolder, handlePaste, handleRefresh],
   )
 
   const confirmDelete = useCallback(async () => {
@@ -563,7 +698,49 @@ export default function WorkspaceOverlay({
             targetDisplay={targetDisplay}
             recoverCount={recoverEntries.length}
             onOpenRecover={() => setShowRecover(true)}
+            transferCount={transfers.length}
+            transferActive={transfers.some((t) => isTransferActive(t))}
+            onOpenTransfers={(anchor) =>
+              setTransferAnchor((cur) => (cur ? null : anchor))
+            }
+            searchOpen={searchOpen}
+            onToggleSearch={() => {
+              if (searchOpen) {
+                closeSearch()
+              } else {
+                setSearchOpen(true)
+                // Focus after the row renders.
+                setTimeout(() => searchInputRef.current?.focus(), 0)
+              }
+            }}
           />
+          {searchOpen && (
+            <div className="flex items-center gap-2 px-3 pb-2">
+              <span className="text-p-text-light"><Icon name="search" /></span>
+              <input
+                ref={searchInputRef}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.stopPropagation()
+                    closeSearch()
+                  }
+                }}
+                placeholder={`Search ${activeSection.label}…`}
+                className="flex-1 min-w-0 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="text-xs text-p-text-light hover:text-p-text"
+                  title="Clear"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          )}
           {actions.clipboard && (
             <div className="flex items-center px-3 pb-1">
               <ClipboardIndicator
@@ -581,7 +758,12 @@ export default function WorkspaceOverlay({
             </div>
           )}
           <div className="border-t border-p-border-light" />
-          <div className="flex-1 min-h-0 overflow-hidden relative">
+          <div
+            ref={fileAreaRef}
+            tabIndex={-1}
+            onKeyDown={handleTypeAhead}
+            className="flex-1 min-h-0 overflow-hidden relative outline-none"
+          >
             {/* One-line description of the active scope, with an info glyph.
                 Sits just above the files so users learn what each folder
                 is for without leaving the workspace. */}
@@ -611,7 +793,58 @@ export default function WorkspaceOverlay({
                 {state.selected.length > 0 ? `Done · ${state.selected.length}` : 'Done'}
               </button>
             )}
-            {state.view === 'grid' ? (
+            {state.view === 'grid' && searchActive && searchResult ? (
+              <div className="h-full overflow-auto pb-24 px-2 py-1">
+                {searchResult.matches.length === 0 ? (
+                  <div className="flex items-center justify-center h-24 text-xs text-p-text-light">
+                    No matches for “{searchQuery.trim()}”
+                  </div>
+                ) : (
+                  <>
+                    {searchResult.matches.map(({ node, parentRel }) => (
+                      <button
+                        key={node.path}
+                        data-ta-name={node.name}
+                        data-ta-path={node.path}
+                        onClick={() => {
+                          if (node.type === 'dir') {
+                            closeSearch()
+                            actions.setPath(node.path)
+                          } else {
+                            actions.openPreview(node.path)
+                          }
+                        }}
+                        onContextMenu={(e) => {
+                          e.preventDefault()
+                          setMenu({ node, point: { clientX: e.clientX, clientY: e.clientY } })
+                        }}
+                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left hover:bg-p-surface-hover min-w-0"
+                      >
+                        {node.type === 'dir' ? (
+                          <span className="text-p-text-secondary shrink-0"><Icon name="folder" /></span>
+                        ) : (
+                          <svg className="w-3.5 h-3.5 shrink-0 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M14 2v6h6" />
+                          </svg>
+                        )}
+                        <span className="flex-1 min-w-0">
+                          <span className="block text-xs text-p-text truncate">{node.name}</span>
+                          <span className="block text-[10px] text-p-text-light truncate">
+                            {parentRel || '(section root)'}
+                          </span>
+                        </span>
+                      </button>
+                    ))}
+                    {searchResult.truncated && (
+                      <div className="px-2 py-2 text-[11px] text-p-text-light">
+                        Showing the first {searchResult.matches.length} matches — refine your search.
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            ) : state.view === 'grid' ? (
               <FileGrid
                 agent={agent}
                 nodes={children}
@@ -672,7 +905,10 @@ export default function WorkspaceOverlay({
                   // Tree mode shows the FULL section subtree (vscode-style);
                   // folder clicks expand + mark the folder as the active
                   // upload target (state.path), they don't filter the tree.
-                  nodes={activeSection.nodes}
+                  // While SEARCHING: the pruned tree (matches + ancestors,
+                  // auto-expanded — VS Code filter behavior).
+                  nodes={prunedTreeNodes ?? activeSection.nodes}
+                  extraExpanded={searchExpandedDirs}
                   selectedPaths={selectedSet}
                   cutPaths={cutSet}
                   activeDirPath={state.path}
@@ -734,6 +970,7 @@ export default function WorkspaceOverlay({
           names={pendingDelete.nodes.map((n) => n.name)}
           isDir={pendingDelete.nodes.length === 1 && pendingDelete.nodes[0].type === 'dir'}
           childCount={pendingDelete.totalDescendants}
+          binSkippedCount={pendingDelete.binSkippedCount}
           pending={deletePath.isPending}
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
@@ -744,6 +981,13 @@ export default function WorkspaceOverlay({
           agent={agent}
           entries={recoverEntries}
           onClose={() => setShowRecover(false)}
+        />
+      )}
+      {transferAnchor && (
+        <TransferPopup
+          items={transfers}
+          anchor={transferAnchor}
+          onClose={() => setTransferAnchor(null)}
         />
       )}
       {previewNode && (
@@ -771,6 +1015,14 @@ function findNode(nodes: FileNode[], path: string): FileNode | null {
     }
   }
   return null
+}
+
+/** Files at/under `node` too large for the Recover bin (no undo copy). */
+function countBinSkipped(node: FileNode, cap: number): number {
+  if (node.type !== 'dir') return (node.size ?? 0) > cap ? 1 : 0
+  let total = 0
+  for (const c of node.children ?? []) total += countBinSkipped(c, cap)
+  return total
 }
 
 function countDescendants(node: FileNode): number {

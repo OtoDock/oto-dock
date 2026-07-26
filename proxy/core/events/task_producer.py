@@ -164,7 +164,9 @@ async def task_produce(
             #           both registries read 0 here.
             #   Codex — the main turn ends while bg subs keep running on their own
             #           threads, so they're still pending in the subagent registry
-            #           here (Codex has no background bash).
+            #           here; background terminals (unified_exec) likewise stay
+            #           pending, resolved by their late item/completed or the
+            #           drain reconciliation below.
             # Wait for whichever cohort is outstanding, then nudge a review of
             # what COMPLETED. Loop so a synthesis turn that itself spawns MORE
             # bg work is also awaited. Every wait is BOUNDED and the nudge

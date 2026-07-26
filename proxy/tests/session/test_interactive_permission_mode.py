@@ -1,11 +1,16 @@
-"""Interactive-TUI permission enforcement: explicit "ask" + live-mode override.
+"""Interactive-TUI permission posture: defer-to-CLI + live-mode override.
 
-The interactive spawn keeps the CLI's own permission UI, but the platform is
-the decision authority: the residual ask-tier returns an explicit
-``permissionDecision:"ask"`` (hook silence is treated as ALLOW by the CLI in a
-trusted workspace dir — the pre-fix "defer" silently allowed the whole
-ask-tier), and the CLI-reported LIVE mode (Shift+Tab) overrides the chat's
-stored mode so an in-TUI acceptEdits/bypass choice still auto-allows.
+Operator decision 2026-07-26: with a human at the keyboard, the platform has
+NO OPINION on the residual ask-tier — ``{"decision": "defer"}`` makes the
+gate script emit nothing and the CLI's own permission engine (the live
+Shift+Tab mode) governs, exactly like Claude Code outside the platform.
+Hard denies (Pass-1) hold on every surface, and three carve-outs still
+return the platform "ask" (which feeds the CLI's ONE native prompt, never a
+second dialog): critical-tier MCP tools, high-risk device tools, and
+destructive Bash. The CLI-reported LIVE mode (Shift+Tab) still overrides
+the chat's stored mode; stored dontAsk stays a hard allow (explicit
+silence the TUI cannot express); unattended interactive TASKS are excluded
+from the flip.
 """
 import pytest
 
@@ -37,12 +42,13 @@ def _interactive(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_interactive_default_write_asks(_interactive):
+async def test_interactive_default_write_defers_to_cli(_interactive):
+    # Post-flip: the platform has no opinion — the CLI's native trusted-dir
+    # behavior governs (Write/Edit run promptless in default mode).
     res = await hooks.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/x.md", "content": "x"},
     )
-    assert res["decision"] == "ask"
-    assert "approval" in res["reason"]
+    assert res["decision"] == "defer"
 
 
 @pytest.mark.asyncio
@@ -125,11 +131,11 @@ async def test_headless_ignores_live_mode(monkeypatch):
     assert res["decision"] == "deny"
 
 
-# ─────────── PostToolUse feeds the session allow-memory (interactive) ────────
-# Headless parity: on the dashboard one Allow covers an mcp__ tool's later
-# calls. The native TUI prompt's outcome is invisible to the platform, but an
-# ask-tier mcp__ tool that RAN was approved — so the tool-result hook feeds
-# the same memory.
+# ─────────── PostToolUse allow-memory inference: REMOVED ────────────────────
+# Post-flip the platform defers the interactive residual tier to the CLI, so
+# a tool that ran may reflect a native "allow once" — feeding OUR memory from
+# it would hard-allow every later call and suppress the CLI's own re-prompt.
+# The CLI's own allow-memory now owns interactive persistence.
 
 from unittest.mock import patch
 
@@ -152,11 +158,11 @@ def _post_tool_result(sid: str, tool: str, is_error: bool = False):
     assert resp.status_code == 200
 
 
-def test_interactive_mcp_tool_result_feeds_allow_memory(monkeypatch):
+def test_interactive_mcp_tool_result_no_longer_feeds_allow_memory(monkeypatch):
     monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
     sid = "int-sess-mem-1"
     _post_tool_result(sid, "mcp__display__display_ui")
-    assert session_state.is_session_tool_allowed(sid, "mcp__display__display_ui")
+    assert not session_state.is_session_tool_allowed(sid, "mcp__display__display_ui")
 
 
 def test_failed_mcp_tool_result_not_remembered(monkeypatch):
@@ -184,9 +190,9 @@ def test_headless_tool_result_not_remembered(monkeypatch):
     assert not session_state.is_session_tool_allowed(sid, "mcp__display__display_ui")
 
 
-def test_memory_only_feeds_memory_without_rendering(monkeypatch):
-    # The interactive forwarder sends memory_only pings for mcp__ tools (the
-    # TUI already rendered the result) — memory is fed, no pump event lands.
+def test_memory_only_ping_renders_nothing_and_feeds_nothing(monkeypatch):
+    # The interactive forwarder's memory_only ping stays a silent no-op: no
+    # pump event AND (post-flip) no allow-memory feed.
     monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
     sid = "int-sess-mem-5"
     with patch("api.hooks.hooks.verify_session_match"):
@@ -197,7 +203,7 @@ def test_memory_only_feeds_memory_without_rendering(monkeypatch):
             headers={"Authorization": "Bearer dummy"},
         )
     assert resp.status_code == 200
-    assert session_state.is_session_tool_allowed(sid, "mcp__ssh-hosts__list_ssh_hosts")
+    assert not session_state.is_session_tool_allowed(sid, "mcp__ssh-hosts__list_ssh_hosts")
     queue = session_state.get_permission_queue(sid)
     assert queue.empty()
 
@@ -223,12 +229,12 @@ async def test_open_tier_allows_in_interactive_default(_interactive, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_standard_tier_asks_in_default_allows_in_live_accept_edits(
+async def test_standard_tier_defers_in_default_allows_in_live_accept_edits(
     _interactive, monkeypatch,
 ):
     _pin_tier(monkeypatch, "standard")
     res = await hooks.decide_tool_permission("s", "mcp__demo__delegate", {})
-    assert res["decision"] == "ask"
+    assert res["decision"] == "defer"
     res = await hooks.decide_tool_permission(
         "s", "mcp__demo__delegate", {}, live_permission_mode="acceptEdits",
     )
@@ -236,12 +242,15 @@ async def test_standard_tier_asks_in_default_allows_in_live_accept_edits(
 
 
 @pytest.mark.asyncio
-async def test_sensitive_tier_still_asks_in_live_accept_edits(_interactive, monkeypatch):
+async def test_sensitive_tier_defers_to_cli_in_interactive(_interactive, monkeypatch):
+    # Stated, accepted residual of the flip: sensitive-tier (including every
+    # undeclared community tool, which defaults to sensitive) becomes
+    # CLI-governed in interactive terminals.
     _pin_tier(monkeypatch, "sensitive")
     res = await hooks.decide_tool_permission(
         "s", "mcp__demo__send_email", {}, live_permission_mode="acceptEdits",
     )
-    assert res["decision"] == "ask"
+    assert res["decision"] == "defer"
 
 
 @pytest.mark.asyncio
@@ -299,3 +308,90 @@ def test_critical_tool_result_never_remembered(monkeypatch):
     sid = "int-sess-mem-6"
     _post_tool_result(sid, "mcp__demo__launch")
     assert not session_state.is_session_tool_allowed(sid, "mcp__demo__launch")
+
+
+# ─────────── Flip boundary cases (operator decision 2026-07-26) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_headless_interactive_switch_changes_posture(monkeypatch):
+    # The SAME session decided under both postures: interactive defers the
+    # residual tier; headless keeps the dashboard block-and-wait.
+    monkeypatch.setattr(hooks, "record_hook_activity", lambda sid: None)
+    monkeypatch.setattr(hooks, "get_meeting_session_info", lambda sid: None)
+    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
+    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
+    monkeypatch.setattr(hooks, "get_session_security", lambda sid: _local_ctx())
+    from services import path_policy_v2
+    monkeypatch.setattr(path_policy_v2, "check_target_still_valid", lambda ctx: "")
+
+    monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/x.md", "content": "x"})
+    assert res["decision"] == "defer"
+
+    monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: False)
+
+    async def _fake_prompt(request_id, session_id, timeout):
+        return True
+
+    monkeypatch.setattr(hooks, "wait_for_permission", _fake_prompt)
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/x.md", "content": "x"})
+    assert res["decision"] == "allow"  # via the dashboard approval
+
+
+@pytest.mark.asyncio
+async def test_satellite_path_rewrite_survives_the_flip(_interactive, monkeypatch):
+    # A Pass-1 path rewrite (satellite sessions) only rides "allow"/"ask" —
+    # deferring would lose it and the tool would run against the
+    # sandbox-virtual path. The flip must return allow + updated_input.
+    from auth.path_policy import PathDecision
+    rewritten = {"file_path": "C:/Users/erin/.oto-dock/agents/a/users/d/workspace/x.md"}
+    monkeypatch.setattr(
+        hooks, "check_tool_access",
+        lambda tool, args, ctx: (
+            PathDecision(allowed=True, updated_input=rewritten), None),
+    )
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/x.md", "content": "x"})
+    assert res["decision"] == "allow"
+    assert res["updated_input"] == rewritten
+
+
+@pytest.mark.asyncio
+async def test_viewer_gets_the_same_native_posture(_interactive, monkeypatch):
+    # Operator decision: NO role gate — viewers keep interactive terminals
+    # with the CLI-native posture. Hard denies still bind them: the residual
+    # defers, but a Pass-1 role denial stays a deny.
+    monkeypatch.setattr(
+        hooks, "get_session_security", lambda sid: _local_ctx(role="viewer"))
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/users/dave/workspace/x.md", "content": "x"})
+    assert res["decision"] == "defer"
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/knowledge/notes.md", "content": "x"})
+    assert res["decision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_interactive_task_keeps_the_auto_posture(_interactive, monkeypatch):
+    # Interactive TASKS are excluded from the flip structurally: a task
+    # client never enters the dashboard branch, so it keeps the unattended
+    # auto posture — allow, with the Pass-1 hard-deny floor still binding.
+    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "task")
+    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "auto")
+    res = await hooks.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/x.md", "content": "x"})
+    assert res["decision"] == "allow"
+    res = await hooks.decide_tool_permission("s", "Bash", {"command": "rm -rf /"})
+    assert res["decision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_destructive_bash_carve_out_in_interactive_default(_interactive):
+    # The carve-out floor: destructive Bash keeps the platform "ask" (which
+    # feeds the CLI's single native prompt) in every live mode.
+    res = await hooks.decide_tool_permission(
+        "s", "Bash", {"command": "rm -rf /workspace/scratch"})
+    assert res["decision"] == "ask"

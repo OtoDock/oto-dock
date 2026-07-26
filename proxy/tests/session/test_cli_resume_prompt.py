@@ -15,7 +15,7 @@ def _mk(resume: bool, claude_dir) -> PersistentSession:
         session_id="sess-resume001122",
         agent_prompt="AGENT IDENTITY BLOCK",
         mcp_config_path=None,
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         effort="high",
         agent_name="agent",
         resume=resume,

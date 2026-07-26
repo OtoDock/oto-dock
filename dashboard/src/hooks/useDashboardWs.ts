@@ -12,6 +12,7 @@ import type { ActiveChat, Chat } from '../api/chats'
 
 import { useChatStore, getActiveChatIds } from '@/store/chatStore'
 import { useInstallStore } from '@/store/installStore'
+import { useTransferStore } from '@/store/transferStore'
 import { useMachineUpdateStore } from '@/store/machineUpdateStore'
 import { emitFileUpdate } from '../lib/fileUpdates'
 import type { WsCallbacks } from './useDashboardWs.types'
@@ -86,6 +87,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // Track current chatId so we can re-resume on reconnect
   const currentChatId = useRef<string | null>(null)
   const reconnectedRef = useRef(false)
+  // title_updated fallback-invalidation bounds (see the handler): once per
+  // chat id + a min interval so rename bursts can't refetch-storm the
+  // Active-now seed; plus the debounce for the task-list invalidation.
+  const titleInvalidatedIds = useRef<Set<string>>(new Set())
+  const lastTitleInvalidateAt = useRef(0)
+  const taskChatsInvalidateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Track last reported IANA timezone so we can re-send on visibility change
   // when the user crosses time zones (laptop closed in Athens, opened in NYC).
   const lastSentTz = useRef<string | null>(null)
@@ -215,6 +222,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // mid-install → "Preparing remote environment…" stuck forever).
       useInstallStore.getState().clearInFlight()
 
+      // Same reconciliation for workspace transfer progress: in-flight items
+      // are re-fed by the server's transfer_state connect replay; phase-1
+      // (local XHR) items are locally owned and kept.
+      useTransferStore.getState().clearInFlight()
+
       // Tell backend what platform + IANA timezone we're on. Platform controls
       // ephemeral notification routing; time_zone snapshots onto the session
       // so scheduled tasks/notifications resolve in the user's local TZ.
@@ -246,6 +258,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         for (const cid of ids) {
           ws.send(JSON.stringify({ type: 'resume_chat', chat_id: cid }))
         }
+        // A title_updated missed across the gap leaves the Active-now widget
+        // stale forever (it has no poll, unlike the history list) — refetch
+        // the seed once per reconnect. One GET per tab; observers dedupe.
+        queryClient.invalidateQueries({ queryKey: ['active-chats'] })
       }
       reconnectedRef.current = true
     }
@@ -521,6 +537,23 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // as standard error frames instead.
             cb.onChatMoved?.(msg)
             break
+          case 'engine_switched':
+            // Cross-engine switch: direct ack to the acting socket AND a
+            // per-user broadcast to sibling tabs — consumers must be
+            // idempotent (the actor receives it twice).
+            cb.onEngineSwitched?.(msg)
+            break
+          case 'switch_engine_denied':
+            // Dedicated frame (NOT the generic error rail — that only
+            // renders into an open stream bubble, invisible on the idle dead
+            // chats this op runs on). Rendered inside the switch dialog.
+            cb.onSwitchEngineDenied?.(msg)
+            break
+          case 'liveness':
+            // probe_liveness answer — lazy process_alive refresh for the
+            // bound chat (fired when the model dropdown opens).
+            cb.onLiveness?.(msg)
+            break
           // ── Install lifecycle (keyed by machine_id + agent, NOT chat_id) ──
           case 'install_started':
             useInstallStore.getState().begin(msg)
@@ -561,6 +594,22 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               agent: msg.agent,
               error: msg.error || 'install failed',
             })
+            break
+          // ── Workspace transfer progress (keyed by transfer_id) ──
+          case 'transfer_started':
+            useTransferStore.getState().applyStarted(msg)
+            break
+          case 'transfer_machine_state':
+            useTransferStore.getState().applyMachineState(msg)
+            break
+          case 'transfer_progress':
+            useTransferStore.getState().applyProgress(msg)
+            break
+          case 'transfer_done':
+            useTransferStore.getState().applyDone(msg)
+            break
+          case 'transfer_state':
+            useTransferStore.getState().applySnapshot(msg)
             break
           case 'satellite_updating':
             useMachineUpdateStore.getState().beginUpdate(msg)
@@ -715,15 +764,49 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case 'tool_result':
             cb.onToolResult?.(msg)
             break
-          case 'title_updated':
+          case 'title_updated': {
             // Patch the Active-now seed in place: its rows render straight from
             // this cache, and a retitle landing AFTER the seed fetch (auto-title
             // of a still-streaming chat) otherwise shows the stale pre-title
             // until the next natural refetch.
+            let matched = false
             queryClient.setQueryData<ActiveChat[]>(['active-chats'], (old) =>
-              old?.map((r) => (r.id === msg.chat_id ? { ...r, title: msg.title } : r)))
+              old?.map((r) => {
+                if (r.id !== msg.chat_id) return r
+                matched = true
+                return { ...r, title: msg.title }
+              }))
+            if (!matched) {
+              // No row to patch — the frame beat the chat's appearance in the
+              // widget cache (and the one-shot store reseed may already be
+              // spent for this id). Refetch the seed, BOUNDED like the reseed
+              // discipline: once per chat id + a min interval, so a rename
+              // burst (task-definition rename fans one frame per live run)
+              // can't turn into a refetch storm. Renamed idle chats hit this
+              // too — the per-id set is what keeps that cheap.
+              const now = Date.now()
+              if (!titleInvalidatedIds.current.has(msg.chat_id) &&
+                  now - lastTitleInvalidateAt.current > 5000) {
+                titleInvalidatedIds.current.add(msg.chat_id)
+                lastTitleInvalidateAt.current = now
+                queryClient.invalidateQueries({ queryKey: ['active-chats'] })
+              }
+            }
+            // Task rows label from task_name/chat title — keep the task list
+            // fresh on OTHER clients. Scoped to task- ids (uuid worker chats
+            // ride onTitleUpdated → refetchChats) and debounced.
+            if (typeof msg.chat_id === 'string' && msg.chat_id.startsWith('task-')) {
+              if (taskChatsInvalidateTimer.current) {
+                clearTimeout(taskChatsInvalidateTimer.current)
+              }
+              taskChatsInvalidateTimer.current = setTimeout(() => {
+                taskChatsInvalidateTimer.current = null
+                queryClient.invalidateQueries({ queryKey: ['task-chats'] })
+              }, 400)
+            }
             cb.onTitleUpdated?.(msg)
             break
+          }
           case 'chat_rows':
             cb.onChatRows?.(msg)
             break
@@ -948,6 +1031,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     [send],
   )
 
+  // Claim control of a terminal another user warmed (Shared-only agents put
+  // several people on one chat). The backend ends that session; the terminal
+  // then re-warms under THIS user on the next send, resuming the conversation.
+  const sendPtyTakeover = useCallback(
+    (chatId: string) => {
+      send({ type: 'pty_takeover', chat_id: chatId })
+    },
+    [send],
+  )
+
   // Interactive CLI attachments: photos (base64) +
   // already-uploaded files. The backend saves the photos to the agent workspace
   // (same path as a normal chat turn), then types the prompt + the Read-tool
@@ -1026,6 +1119,26 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const moveChat = useCallback(
     () => {
       send({ type: 'move_chat' })
+    },
+    [send],
+  )
+
+  // Cross-engine resume: flip the OPEN chat's engine + model (dead sessions
+  // only — the backend gate is authoritative). Acked with engine_switched
+  // (direct + per-user broadcast); refusals arrive as switch_engine_denied.
+  const switchEngine = useCallback(
+    (executionPath: string, model: string) => {
+      send({ type: 'switch_engine', execution_path: executionPath, model })
+    },
+    [send],
+  )
+
+  // Lazy liveness refresh for the bound chat (answered with a liveness
+  // frame) — fired when the model dropdown opens, since headless idle-reap
+  // emits no frame a viewer would see.
+  const probeLiveness = useCallback(
+    () => {
+      send({ type: 'probe_liveness' })
     },
     [send],
   )
@@ -1212,6 +1325,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       if (pingTimer.current) clearTimeout(pingTimer.current)
       if (healthCheckTimer.current) clearTimeout(healthCheckTimer.current)
+      if (taskChatsInvalidateTimer.current) clearTimeout(taskChatsInvalidateTimer.current)
       wsRef.current?.close()
     }
   }, [])
@@ -1243,6 +1357,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     implementPlan,
     compactContext,
     moveChat,
+    switchEngine,
+    probeLiveness,
     resetStreaming,
     resumeChat,
     sendChatRead,
@@ -1254,6 +1370,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     sendPtyAttach,
     sendPtyInput,
     sendPtyResize,
+    sendPtyTakeover,
     sendPtyAttachments,
   }), [
     connected,
@@ -1277,6 +1394,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     implementPlan,
     compactContext,
     moveChat,
+    switchEngine,
+    probeLiveness,
     resetStreaming,
     resumeChat,
     sendChatRead,
@@ -1288,6 +1407,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     sendPtyAttach,
     sendPtyInput,
     sendPtyResize,
+    sendPtyTakeover,
     sendPtyAttachments,
   ])
 }

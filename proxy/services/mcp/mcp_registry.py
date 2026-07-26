@@ -261,6 +261,42 @@ def get_all_manifests() -> dict[str, McpManifest]:
     return dict(_manifests)
 
 
+def core_mcp_names() -> list[str]:
+    """Core MCPs every agent gets.
+
+    ``assignment_mode == "explicit"`` disqualifies an MCP — that mode means
+    an admin authorizes it per-agent via an instance. ``exclude_from`` does
+    NOT: it filters at session-config time, not at assignment time.
+    """
+    return [
+        name for name, m in _manifests.items()
+        if m.category == "core" and m.assignment_mode != "explicit"
+    ]
+
+
+def assign_core_mcps(agent_slug: str) -> list[str]:
+    """Assign every core MCP (and its skill rows) to ``agent_slug``.
+
+    Additive — safe to call on an agent that already has some of them, and
+    safe to call after a template's own MCP cascade. Returns the names
+    assigned. Callers treat failures as non-fatal: the startup backfill
+    re-runs this for every agent on the next boot.
+    """
+    names = core_mcp_names()
+    for name in names:
+        mcp_store.add_agent_mcp(agent_slug, name)
+        manifest = _manifests.get(name)
+        if not manifest:
+            continue
+        for skill in manifest.skills:
+            mcp_store.ensure_agent_skill(
+                agent_slug, skill.id,
+                default_enabled=True,
+                default_exclude_from=skill.default_exclude_from,
+            )
+    return names
+
+
 def get_mcps_by_provider(provider_id: str) -> list[McpManifest]:
     """Return manifests whose ``credentials.oauth.provider_id`` matches.
 
@@ -1674,6 +1710,7 @@ def build_session_mcp_config(
     *,
     phone_mode: bool = False,
     task_mode: bool = False,
+    meeting_mode: bool = False,
     interactive_local: bool = False,
     task_scope: str = "user",
     delegation_targets: list[str] | None = None,
@@ -1692,6 +1729,15 @@ def build_session_mcp_config(
     """Main entry point: build a complete MCP config for a session.
 
     Args:
+        meeting_mode: meeting-participant session. Meetings RIDE the task lane
+            (callers also pass ``task_mode=True``), so their base exclusion
+            context stays ``"task"`` — this flag ADDITIONALLY matches
+            ``"meeting"`` in ``exclude_from``, letting a manifest opt out of
+            meetings without leaving scheduled tasks. Needed for config/prompt
+            agreement: the prompt catalog and skills filter by ``client_type``
+            (which IS ``"meeting"`` there), so without this a
+            meeting-excluded manifest would vanish from the prompt while its
+            tools still loaded.
         extra_mcps: MCP names to force-include even if not assigned to the agent
                     (e.g. meetings-mcp for meeting participants).
         mcp_config_format: "json" (Claude CLI) or "toml" (Codex CLI).
@@ -1734,6 +1780,12 @@ def build_session_mcp_config(
         # user's own machine) — exclude device/UI MCPs that make no sense there
         # (location GPS, display image-viewer; see their manifests' exclude_from).
         context = "terminal"
+    # Meeting sessions match "meeting" IN ADDITION to their base context
+    # ("task" — meetings ride the task lane), so a manifest can opt out of
+    # meetings alone. Kept as a union, never a replacement: manifests that
+    # exclude only "task" have always been absent from meetings, and swapping
+    # the context would silently re-admit them all.
+    exclusion_contexts = {context, "meeting"} if meeting_mode else {context}
 
     # Get assigned + enabled MCPs for this agent. Device-local placement /
     # consent / display filtering happens here; the dropped device MCPs
@@ -1799,8 +1851,13 @@ def build_session_mcp_config(
         mcp_name = manifest.name
 
         # Check context exclusion (from manifest)
-        if context in manifest.exclude_from:
-            exclusion_reasons[mcp_name] = f"Excluded in {context} mode"
+        matched_context = next(
+            (c for c in ("meeting", context) if c in exclusion_contexts
+             and c in (manifest.exclude_from or [])),
+            None,
+        )
+        if matched_context:
+            exclusion_reasons[mcp_name] = f"Excluded in {matched_context} mode"
             continue
 
         # Check credential exclusion

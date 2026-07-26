@@ -255,9 +255,11 @@ async def memory_op(
     body = await request.json()
     command = body.get("command")
     if command not in _COMMANDS:
-        raise HTTPException(
-            400,
-            f"unknown command: {command!r} (expected one of {sorted(_COMMANDS)})",
+        # Contract outcome, not an HTTP error (see module docstring): a 400
+        # reaches the model wrapped as "API error 400: {...}" — the 200 shape
+        # is what lets it self-correct.
+        return _err(
+            f"unknown command: {command!r} (expected one of {sorted(_COMMANDS)})"
         )
 
     # Identity is token-authoritative: a session-JWT caller's acting user comes
@@ -288,7 +290,7 @@ async def memory_op(
     # rename carries two paths; both must land in the SAME scope.
     raw_path = body.get("old_path") if command == "rename" else body.get("path")
     if not raw_path or not isinstance(raw_path, str):
-        raise HTTPException(400, "path required")
+        return _err("path required")
 
     try:
         scope, rel = memory_file.split_virtual_path(raw_path)
@@ -419,7 +421,16 @@ async def get_agent_settings(
     u = require_auth(user)
     if not (u.is_admin or u.can_manage_agent(agent)):
         raise HTTPException(403, "manager or admin only")
-    return await asyncio.to_thread(memory_store.get_agent_toggles, agent)
+    toggles = await asyncio.to_thread(memory_store.get_agent_toggles, agent)
+    # The platform master switches ride along under a distinct key (the
+    # per-agent toggles reuse the same field names) so agent managers can
+    # grey out the UI without the admin-only GET /settings endpoint.
+    settings = await asyncio.to_thread(memory_store.get_settings)
+    toggles["master"] = {
+        "user_memory_enabled": settings.get("user_memory_enabled", True),
+        "agent_memory_enabled": settings.get("agent_memory_enabled", True),
+    }
+    return toggles
 
 
 @router.patch("/agent-settings/{agent}")

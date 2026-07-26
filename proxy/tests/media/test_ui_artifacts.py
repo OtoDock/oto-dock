@@ -288,17 +288,51 @@ def test_csp_origin_prefers_public_url_on_matching_host(agent_tree, tmp_path, mo
         resp.headers["Content-Security-Policy"]
 
 
-def test_serve_ui_full_document_verbatim(agent_tree, tmp_path):
+def test_serve_ui_full_document_gets_runtime_injected(agent_tree, tmp_path):
     doc = "<!DOCTYPE html><html><head></head><body>standalone</body></html>"
     f = tmp_path / "full.html"
     f.write_text(doc)
     token = _mint_ui_token(str(f))
     resp = client.get(f"/v1/ui/{token}")
     assert resp.status_code == 200
-    # Full documents opt out of theme/kit/auto-height: served byte-identical,
-    # no head/body splicing (that would be the route's riskiest code).
-    assert resp.text == doc
+    body = resp.text
+    # Full documents keep their own markup and head (no tokens CSS — the
+    # only splice is the BYTE-STATIC runtime before </body>): without it a
+    # full-document artifact silently loses theme sync, auto-height,
+    # actions, feeds and links.
+    assert body.startswith("<!DOCTYPE html>")
+    assert "standalone" in body
+    assert "otodock-artifact" in body  # the injected runtime
+    assert "/ui-kit/otodock-tokens.css" not in body
+    assert body.rstrip().endswith("</body></html>")
+    assert body.index("otodock-artifact") < body.index("</body>")
     _assert_sandbox_headers(resp)
+
+
+def test_inject_runtime_placement():
+    from api.media.ui import UI_RUNTIME, inject_runtime
+    out = inject_runtime("<html><body><p>a</p></body></html>")
+    assert out.index(UI_RUNTIME) < out.index("</body>")
+    # An author who omitted </body> still gets an executing trailing script.
+    assert inject_runtime("<html><p>a</p></html>").endswith(UI_RUNTIME)
+
+
+def test_serve_ui_runtime_carries_open_url_bridge(agent_tree, tmp_path):
+    # The click bridge gates on the AUTHORED href attribute (a.href is
+    # DOM-absolutized) and posts open_url up; the host answers open_url_ack.
+    f = tmp_path / "frag.html"
+    f.write_text("<a href='https://example.com'>x</a>")
+    token = _mint_ui_token(str(f))
+    body = client.get(f"/v1/ui/{token}").text
+    assert "type:'open_url'" in body
+    assert "open_url_ack" in body
+    assert "getAttribute('href')" in body
+    # In-page anchors and non-http schemes are left alone; PATH hrefs are
+    # intercepted only to CANCEL them (a relative navigation can't load
+    # under this CSP and replaced the artifact with the browser's
+    # "refused to connect" page — verified live on T1 2026-07-26).
+    assert "raw.charAt(0) === '#'" in body
+    assert r"/^[a-z][a-z0-9+.\-]*:/i" in body
 
 
 def test_serve_ui_unknown_token_is_sandboxed_404(agent_tree):

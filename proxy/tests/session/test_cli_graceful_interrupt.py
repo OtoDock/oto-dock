@@ -62,7 +62,7 @@ def _mk_session(sid: str | None = None, *, broken_stdin: bool = False) -> Persis
         session_id=sid or f"sess-{uuid.uuid4().hex[:12]}",
         agent_prompt=None,
         mcp_config_path=None,
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         agent_name="agent",
     )
     s.proc = _FakeProc(broken_stdin=broken_stdin)

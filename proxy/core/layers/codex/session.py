@@ -24,12 +24,16 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 import config as app_config
+from core.events.bg_command_state import (
+    get_bg_command_registry, reset_bg_command_registry,
+)
 from core.layers.codex.app_server_client import AppServerClient, AppServerError
 from core.layers.codex.codex_approvals import (
     approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
 )
 from core.session.session_state import (
-    clear_session_liveness, get_session_user_tz, resolve_session_permissions,
+    clear_session_liveness, get_session_user_tz, resolve_bg_command,
+    resolve_session_permissions,
 )
 
 logger = logging.getLogger("codex-session")
@@ -125,6 +129,10 @@ class CodexAppServerSession:
         self._default_consumer: asyncio.Queue | None = None      # active main turn
         self._thread_consumers: dict[str, asyncio.Queue] = {}    # sub_tid → buffer
         self._bg_supervisors: dict[str, asyncio.Task] = {}       # sub_tid → supervisor
+        # Monotonic stamp of the last thread/backgroundTerminals/list RPC —
+        # drain_bg_commands self-paces to ≥1s between RPCs (the bg-command
+        # monitor retries every 0.3s on no-progress).
+        self._last_bg_terminals_list: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -223,6 +231,12 @@ class CodexAppServerSession:
             sibling_line = await sibling_awareness.prelude_line(self.session_id)
             if sibling_line:
                 prompt = f"{sibling_line}\n\n{prompt}"
+
+        # Per-turn background-command registry prune (CLI parity — the CLI
+        # session resets both registries at turn start): PRESERVES still-running
+        # terminals so one spawned in a prior turn keeps its badge + completion
+        # wait across follow-up turns.
+        reset_bg_command_registry(self.session_id)
 
         # Register this turn's MAIN-thread consumer; the router (the sole
         # notif_queue consumer) feeds it. No pre-turn drain is needed — the router
@@ -444,6 +458,63 @@ class CodexAppServerSession:
         finally:
             self._default_consumer = None
 
+    async def drain_bg_commands(self, budget: float = 2.0) -> bool:
+        """Between turns, reconcile pending background-terminal registry entries
+        against ``thread/backgroundTerminals/list`` and resolve any whose PTY is
+        gone (badge clear + registry). Returns True if at least one resolved.
+
+        A terminal's ``item/completed`` is systematically lossy between turns
+        (idle router windows, manual-compaction consumer discards, re-warm queue
+        drops), so the bg-command monitor polls this pull API as the backstop.
+        Timeout-acquires ``self.lock`` (the same lock layer.session_lock wraps):
+        if a turn is in flight, back off — its own translator resolves
+        completions. RPC failure / daemon-dead is NO progress (never
+        resolve-on-error), and calls self-pace to one list RPC per second (the
+        monitor retries every 0.3s)."""
+        reg = get_bg_command_registry(self.session_id)
+        if not reg.has_pending:
+            return False
+        if self._closed or self._client is None or not self.is_alive:
+            return False
+        if time.monotonic() - self._last_bg_terminals_list < 1.0:
+            return False
+        try:
+            await asyncio.wait_for(self.lock.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return False  # a turn is in flight — retry next poll
+        try:
+            self._last_bg_terminals_list = time.monotonic()
+            try:
+                res = await self._client.request(
+                    "thread/backgroundTerminals/list",
+                    {"threadId": self.thread_id},
+                    timeout=min(budget, 5.0),
+                )
+            except (AppServerError, asyncio.TimeoutError):
+                return False  # daemon busy/dead — no progress, nothing resolved
+            # Registry keys are itemIds; list rows carry BOTH itemId and
+            # processId — match on either (the approval-path item/started
+            # omits processId, so an entry's pid may never become known).
+            rows = [t for t in (res.get("data") or []) if isinstance(t, dict)]
+            live_items = {t.get("itemId") for t in rows}
+            live_pids = {t.get("processId") for t in rows}
+            pid_by_item: dict[str, str] = {}
+            if self.translator is not None:
+                pid_by_item = {p["item_id"]: p["process_id"]
+                               for p in self.translator.pending_bg_commands()}
+            progressed = False
+            for iid in reg.spawned - reg.completed:
+                pid = pid_by_item.get(iid)
+                if iid in live_items or (pid and pid in live_pids):
+                    continue  # still running — its exit resolves it later
+                if resolve_bg_command(self.session_id, iid, "completed"):
+                    progressed = True
+                if self.translator is not None:
+                    self.translator._bg_commands.pop(iid, None)
+            return progressed
+        finally:
+            self.lock.release()
+
     async def close(self) -> None:
         """Terminate the daemon (it is long-lived, not ephemeral)."""
         self._closed = True
@@ -629,6 +700,12 @@ class CodexAppServerSession:
                 # between turns, with no consumer. Goal state is chat-durable:
                 # apply it out-of-band instead of dropping it.
                 self._apply_goal_oob(method, params)
+            elif (method == "item/completed" and self.translator is not None
+                    and self.translator.tracks_bg_command(params)):
+                # A background terminal's exit (its item/completed, tagged with
+                # the ORIGINAL turn id) landed between turns — the badge gate
+                # must still resolve. Apply it out-of-band instead of dropping.
+                self._apply_bg_command_oob(method, params)
             # else: between turns with no active main turn — drop main-thread
             # stragglers (the daemon is idle on the main thread between turns).
 
@@ -645,6 +722,20 @@ class CodexAppServerSession:
         except Exception:
             logger.exception(
                 f"Codex [{self.session_id[:8]}] out-of-band goal apply failed")
+
+    def _apply_bg_command_oob(self, method: str, params: dict) -> None:
+        """Translate a between-turns background-terminal completion so the
+        BackgroundCommandRegistry is marked done (the bg-command monitor awaits
+        it). The returned events are dropped — no pump is attached between
+        turns; the monitor's ``bg_commands_complete`` nudge is the visible
+        clear. Guarded — a failure here must never kill the router."""
+        if self.translator is None:
+            return
+        try:
+            self.translator.translate(CodexEvent(type=method, data=params))
+        except Exception:
+            logger.exception(
+                f"Codex [{self.session_id[:8]}] out-of-band bg-command apply failed")
 
     def _handoff_bg_subagents(self) -> None:
         """At main-turn end (from ``send_message``'s ``finally``, synchronously so
@@ -754,6 +845,16 @@ class CodexAppServerSession:
             # A cancelled supervisor's own ``finally`` already resolved it; this
             # is the idempotent backstop for one that never reached its finally.
             self._resolve_bg_subagent(sub_tid)
+        # Background terminals died with their daemon (thread close kills
+        # unified_exec PTYs, and a fresh daemon knows nothing of old
+        # processIds) — resolve their registry entries + badges as killed.
+        if self.translator is not None:
+            pending_cmds: list[dict] = []
+            with contextlib.suppress(Exception):
+                pending_cmds = self.translator.pending_bg_commands()
+            for cmd in pending_cmds:
+                resolve_bg_command(self.session_id, cmd["item_id"], "killed")
+                self.translator._bg_commands.pop(cmd["item_id"], None)
         self._thread_consumers.clear()
         self._default_consumer = None
         if sups:

@@ -47,6 +47,8 @@ def _write_template(
     triggers: list[dict] | None = None,
     notifications: list[dict] | None = None,
     setup_md: str | None = None,
+    user_setup_md: str | None = None,
+    skills: list[dict] | None = None,
     context_files: dict[str, str] | None = None,
 ) -> Path:
     """Write a minimal valid template directory under tmp_path/<slug>/."""
@@ -62,7 +64,7 @@ def _write_template(
         "version": "1.0.0",
     }
     (template_dir / "agent.json").write_text(json.dumps(agent_json))
-    (template_dir / "prompt.md").write_text("# Test Prompt\n")
+    (template_dir / "agent.md").write_text("# Test Prompt\n")
     (template_dir / "mcps.json").write_text(
         json.dumps({"required": mcps or []})
     )
@@ -77,6 +79,10 @@ def _write_template(
         )
     if setup_md is not None:
         (template_dir / "setup.md").write_text(setup_md)
+    if user_setup_md is not None:
+        (template_dir / "user-setup.md").write_text(user_setup_md)
+    if skills is not None:
+        (template_dir / "skills.json").write_text(json.dumps({"required": skills}))
     if context_files:
         context_dir = template_dir / "context"
         context_dir.mkdir()
@@ -599,7 +605,7 @@ class TestUserJoinHook:
         db.add_user_agent("user-bob", agent_slug, "viewer", "system")
 
         counts = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
-        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1}
+        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1, "user_setup": 0}
 
         # bob owns: the user-task itself + the trigger's paired task
         # (trigger model spawns a dynamic_tasks row with
@@ -625,8 +631,8 @@ class TestUserJoinHook:
         second = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
         # First call seeds, second call sees the unique-index conflict and
         # returns 0 across the board.
-        assert first == {"tasks": 1, "triggers": 1, "notifications": 1}
-        assert second == {"tasks": 0, "triggers": 0, "notifications": 0}
+        assert first == {"tasks": 1, "triggers": 1, "notifications": 1, "user_setup": 0}
+        assert second == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
 
     def test_hook_respects_role_filter(self, tmp_path, temp_db):
         """Item with ``roles: ["manager"]`` is NOT seeded for a viewer."""
@@ -656,7 +662,7 @@ class TestUserJoinHook:
         _make_user("user-viewer", "viewer@example.com")
         db.add_user_agent("user-viewer", "role-agent", "viewer", "system")
         counts = on_user_added_to_agent("role-agent", "user-viewer", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
 
         _make_user("user-mgr", "mgr@example.com")
         db.add_user_agent("user-mgr", "role-agent", "manager", "system")
@@ -671,7 +677,7 @@ class TestUserJoinHook:
 
         agent_store.create_agent("native-agent", "Native Agent")
         counts = on_user_added_to_agent("native-agent", "user-anon", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
 
     def test_hook_skips_auto_create_for_new_users_false(self, tmp_path, temp_db):
         """Items where ``auto_create_for_new_users=False`` are NOT seeded for
@@ -731,3 +737,136 @@ class TestUserJoinHook:
         agent_json_path.write_text(json.dumps(existing))
         with pytest.raises(TemplateValidationError, match="default_for_new_users"):
             load_template_from_dir(tdir)
+
+    def test_core_mcps_field_parses_and_validates(self, tmp_path, temp_db):
+        """``core_mcps``: absent → "all" (the default install behavior);
+        "none" round-trips; anything else is a schema violation."""
+        from storage.community_agent_template_store import (
+            load_template_from_dir, TemplateValidationError,
+        )
+        tdir = _write_template(tmp_path, slug="coreopt")
+        assert load_template_from_dir(tdir).core_mcps == "all"
+
+        agent_json_path = tdir / "agent.json"
+        existing = json.loads(agent_json_path.read_text())
+        existing["core_mcps"] = "none"
+        agent_json_path.write_text(json.dumps(existing))
+        assert load_template_from_dir(tdir).core_mcps == "none"
+
+        existing["core_mcps"] = "most"
+        agent_json_path.write_text(json.dumps(existing))
+        with pytest.raises(TemplateValidationError, match="core_mcps"):
+            load_template_from_dir(tdir)
+
+
+# ---------------------------------------------------------------------------
+# Skill packages (skills.json)
+# ---------------------------------------------------------------------------
+
+class TestSkillPackages:
+    def test_skills_json_validation(self, tmp_path, temp_db):
+        from storage.community_agent_template_store import (
+            load_template_from_dir, TemplateValidationError,
+        )
+        tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
+        template = load_template_from_dir(tdir)
+        assert [r.name for r in template.skill_packages] == ["theme-factory"]
+        assert template.skill_packages[0].skills == []
+
+        bad = _write_template(tmp_path, slug="bad-skills")
+        (bad / "skills.json").write_text(json.dumps({"required": [{"skills": []}]}))
+        with pytest.raises(TemplateValidationError, match="name"):
+            load_template_from_dir(bad)
+
+    def test_preflight_unknown_package_fails(self, tmp_path, temp_db):
+        from fastapi import HTTPException
+        tdir = _write_template(tmp_path, skills=[{"name": "no-such-package"}])
+        with patch(
+            "services.community.community_catalog.fetch_skills_registry",
+            new=AsyncMock(return_value={"skills": []}),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                _install_admin(tdir)
+        assert exc.value.status_code == 400
+        assert exc.value.detail["error"] == "missing_skills"
+
+    def test_preflight_manager_blocked_when_uninstalled(self, tmp_path, temp_db):
+        """Standalone skill-package installs are admin-only: a manager
+        installing a template whose package is only in the catalog gets an
+        explicit ask-an-admin error, not a half-functional agent."""
+        from fastapi import HTTPException
+        tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
+        with patch(
+            "services.community.community_catalog.fetch_skills_registry",
+            new=AsyncMock(return_value={"skills": [{"name": "theme-factory"}]}),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                _install_admin(tdir, installer_sub="user-manager",
+                               installer_role="manager")
+        assert exc.value.status_code == 400
+        assert exc.value.detail["error"] == "skills_require_admin"
+
+    def test_admin_cascade_installs_assigns_and_seeds(self, tmp_path, temp_db):
+        from types import SimpleNamespace
+        from storage import mcp_store
+        tdir = _write_template(
+            tmp_path, skills=[{"name": "theme-factory", "skills": ["theme-factory"]}],
+        )
+        skill = SimpleNamespace(
+            id="theme-factory", default_exclude_from=[],
+        )
+        pkg_manifest = SimpleNamespace(
+            name="theme-factory", skills=[skill],
+            server=SimpleNamespace(runtime="none"),
+        )
+        install_mock = AsyncMock(return_value={"status": "installed"})
+        # get_manifest: None on the cascade's first probe (not installed),
+        # the package manifest afterwards (post-install seeding).
+        calls = {"n": 0}
+        def _get_manifest(name):
+            if name != "theme-factory":
+                return None
+            calls["n"] += 1
+            return None if calls["n"] == 1 else pkg_manifest
+        with patch(
+            "services.community.community_catalog.fetch_skills_registry",
+            new=AsyncMock(return_value={"skills": [{"name": "theme-factory"}]}),
+        ), patch(
+            "services.community.skills_installer.install_skill_package_from_catalog",
+            new=install_mock,
+        ), patch(
+            "services.mcp.mcp_registry.get_manifest", side_effect=_get_manifest,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            result = _install_admin(tdir, target_slug="skills-agent")
+        install_mock.assert_awaited_once()
+        assert result["skill_packages"]["ready"] == ["theme-factory"]
+        assert result["skill_packages"]["failed"] == []
+        # Assignment is what surfaces the package's skills in sessions.
+        assert "theme-factory" in mcp_store.get_manager_enabled_mcps("skills-agent")
+        rows = mcp_store.get_agent_skills("skills-agent")
+        assert any(r["skill_id"] == "theme-factory" for r in rows)
+
+    def test_skill_install_failure_never_aborts_agent(self, tmp_path, temp_db):
+        from fastapi import HTTPException as HX
+        from storage import agent_store
+        tdir = _write_template(
+            tmp_path, slug="resilient", skills=[{"name": "theme-factory"}],
+        )
+        with patch(
+            "services.community.community_catalog.fetch_skills_registry",
+            new=AsyncMock(return_value={"skills": [{"name": "theme-factory"}]}),
+        ), patch(
+            "services.community.skills_installer.install_skill_package_from_catalog",
+            new=AsyncMock(side_effect=HX(502, "tarball fetch failed")),
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            result = _install_admin(tdir, target_slug="resilient-agent")
+        # Agent exists and works; the failure is captured, not fatal.
+        assert agent_store.agent_exists("resilient-agent")
+        assert result["skill_packages"]["ready"] == []
+        assert result["skill_packages"]["failed"][0]["name"] == "theme-factory"

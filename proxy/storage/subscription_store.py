@@ -686,6 +686,36 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
         conn.commit()
 
 
+def remap_retired_model(old_id: str, new_id: str) -> int:
+    """One-time remap of a retired builtin model id onto its successor.
+
+    Rewrites every persisted pin of ``old_id`` to ``new_id``:
+    ``agents.default_model`` (per-agent pin) and ``chats.model`` (per-chat
+    override). Task lanes need no third UPDATE — delegate-spawn
+    ``override_model`` is in-memory only, never persisted on dynamic_tasks
+    (see services/scheduler/scheduler.py), so a restart re-resolves agent
+    defaults which this remap already covers. Plain UPDATEs are idempotent:
+    after the first boot both match zero rows. ``updated_at`` is deliberately
+    NOT bumped (an administrative rewrite must not reorder chat lists).
+    Returns the total number of rows remapped.
+    """
+    with get_conn() as conn:
+        remapped: dict[str, int] = {}
+        for table, col in (("agents", "default_model"), ("chats", "model")):
+            cur = conn.execute(
+                f"UPDATE {table} SET {col} = %s WHERE {col} = %s",  # noqa: S608 — table/col are literals above
+                (new_id, old_id),
+            )
+            if cur.rowcount:
+                remapped[f"{table}.{col}"] = cur.rowcount
+        conn.commit()
+    total = sum(remapped.values())
+    if total:
+        detail = ", ".join(f"{k}={v}" for k, v in remapped.items())
+        logger.info(f"Startup: remapped retired model {old_id} -> {new_id} ({detail})")
+    return total
+
+
 def seed_hosted_llm_subscriptions() -> None:
     """Default-on hosted LLM: ensure a relay platform subscription exists for each
     relay-backed provider on the direct-llm layer, ONCE.

@@ -398,7 +398,7 @@ async def handle_write_xlsx(args: dict) -> str:
     from openpyxl.worksheet.datavalidation import DataValidation
     from openpyxl.worksheet.table import Table, TableStyleInfo
 
-    path = _resolve_path(args["path"], writing=True)
+    path = await _resolve_path(args["path"], writing=True)
     ops, dropped = _normalize_operations(args.get("operations"))
     create_new = args.get("create_new", False)
 
@@ -1025,7 +1025,7 @@ async def handle_write_xlsx(args: dict) -> str:
 
             elif ot == "add_image":
                 ws = _get_sheet(wb, op)
-                img_path = _resolve_path(
+                img_path = await _resolve_path(
                     op.get("image_path") or op.get("path") or op.get("image", "")
                 )
                 img = XlImage(img_path)

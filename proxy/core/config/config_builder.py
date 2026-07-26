@@ -105,12 +105,19 @@ async def build_agent_config(
         _display_name = ""
         _email = ""
         _scope_override: str | None = task_identity.scope
+        # Platform role follows the task's creds user, not the viewer who
+        # reopened it; empty for agent-scope tasks (no human identity).
+        _platform_role = ""
+        if task_identity.creds_user_sub:
+            _creds_row = task_store.get_user(task_identity.creds_user_sub) or {}
+            _platform_role = _creds_row.get("role") or ""
     else:
         username = user.get("username") or None
         creds_sub = user_sub
         _display_name = user.get("display_name", "")
         _email = user.get("email", "")
         _scope_override = None
+        _platform_role = user.get("role") or ""
 
     # Resolve delegation targets: DB targets ∩ the session identity's agents.
     # Task re-warm mirrors the scheduler (user-scope → creator's agents;
@@ -325,6 +332,7 @@ async def build_agent_config(
         username=vis.mount_username,        # MOUNT username ("" for agent scope)
         user_sub=creds_sub or "",          # REAL sub — attribution
         user_role=user_role or "",
+        platform_role=_platform_role,
         session_id=session_id or "",
         memory_user_enabled=vis.memory_user_enabled,
         memory_agent_enabled=vis.memory_agent_enabled,

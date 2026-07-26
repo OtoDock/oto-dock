@@ -30,6 +30,7 @@ export interface InteractiveWs {
   sendPtyInput: (chatId: string, dataB64: string, composer?: boolean) => void
   sendPtyResize: (chatId: string, rows: number, cols: number) => void
   sendPermission: (requestId: string, approved: boolean) => void
+  sendPtyTakeover: (chatId: string) => void
 }
 
 export interface PtyPermission {
@@ -105,7 +106,7 @@ function strToB64(s: string): string {
 export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit?: () => void) {
   // Destructure the STABLE methods so the effect's deps don't churn with the
   // bundle's identity (which changes on streaming toggles).
-  const { subscribe, sendPtyAttach, sendPtyInput, sendPtyResize, sendPermission } = ws
+  const { subscribe, sendPtyAttach, sendPtyInput, sendPtyResize, sendPermission, sendPtyTakeover } = ws
 
   // Latest onExit in a ref so the terminal-init effect (which must NOT re-run
   // when this changes) can fire it on a real pty_exit without listing it as a dep.
@@ -121,6 +122,11 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
   // dashboard input server-side while a local terminal controls; this is the UX
   // half (don't emit dead frames + match "reload to take over").
   const exitedRef = useRef(false)
+  // Shared-only agents put several users on one chat, but a terminal runs under
+  // the identity of whoever warmed it — so only that user may drive it. Someone
+  // else mirrors it read-only until they explicitly take over. Held in a ref for
+  // the onData closure (which never re-runs) as well as state for the banner.
+  const readOnlyRef = useRef(false)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -128,6 +134,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
   const [exited, setExited] = useState(false)
   const [exitReason, setExitReason] = useState('')
   const [reconnecting, setReconnecting] = useState(false)
+  const [readOnly, setReadOnly] = useState(false)
+  const [controller, setController] = useState('')
 
   // Click-to-focus: xterm only sends keystrokes while its hidden textarea has
   // focus, so the wrapper forwards a click anywhere in the padded area to it
@@ -144,6 +152,14 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     [sendPermission],
   )
 
+  // Claim a terminal another user is running. The session ends and re-warms
+  // under this user on the next send — so the banner clears via pty_exit, not
+  // here.
+  const takeOver = useCallback(() => {
+    if (!chatId) return
+    sendPtyTakeover(chatId)
+  }, [chatId, sendPtyTakeover])
+
   useEffect(() => {
     const el = containerRef.current
     if (!chatId || !el) return
@@ -153,6 +169,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     setReconnecting(false)
     reconnectingRef.current = false
     exitedRef.current = false  // a fresh (re)attach re-claims control
+    setReadOnly(false)
+    setController('')
+    readOnlyRef.current = false  // the server re-asserts it on attach if so
 
     const mode = pickMode()
     const term = new Terminal({
@@ -268,6 +287,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       // Dual-control: drop keystrokes after this viewer was evicted / the
       // session exited — this terminal is no longer the controller.
       if (exitedRef.current) return
+      // Mirroring another user's session: the proxy refuses these anyway, this
+      // just avoids emitting frames that can only be rejected.
+      if (readOnlyRef.current) return
       // Control bar's one-shot Ctrl: the next typed key becomes its control byte.
       sendPtyInput(chatId, strToB64(applyCtrlHold(d)))
     })
@@ -397,6 +419,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       setExited(true)
       exitedRef.current = true
       setExitReason(reason)
+      // Control question is settled either way once the session ends.
+      readOnlyRef.current = false
+      setReadOnly(false)
       // A TAKE-OVER (the session is NOT dead — it is alive elsewhere): another
       // dashboard tab/device ("superseded") OR a local `otodock` terminal
       // ("superseded_otodock", dual-control) claimed it. Anything else = the
@@ -410,6 +435,11 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
           ? '\r\n\x1b[2m[opened on another device — reload to take over]\x1b[0m\r\n'
           : reason === 'superseded_otodock'
             ? '\r\n\x1b[2m[opened in a local terminal — reload to take over]\x1b[0m\r\n'
+            // Requested by THIS user: the previous owner's session ended so the
+            // next send can start one under their own account, resuming the
+            // same conversation. A real exit — onExit fires and drives that.
+            : reason === 'taken_over'
+            ? '\r\n\x1b[2m[control taken — send a message to continue this conversation]\x1b[0m\r\n'
             : exitCode !== null && exitCode !== 0
               ? `\r\n\x1b[31m[process exited unexpectedly (code ${exitCode}) — any error output is above]\x1b[0m\r\n`
               : '\r\n\x1b[2m[session ended]\x1b[0m\r\n'
@@ -448,6 +478,14 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         brand = createPtyBrandFilter(t)
       }
       const st = m.state || ''
+      if (st === 'read_only') {
+        // Another user warmed this terminal — it runs under THEIR account and
+        // platform role, so input is refused until an explicit take-over.
+        readOnlyRef.current = true
+        setReadOnly(true)
+        setController(m.controller || '')
+        return
+      }
       if (st === 'attached') {
         // Attach acknowledged — if this was a re-warm re-attach, the fresh
         // process answered: stop polling and pin the replay to the bottom.
@@ -638,5 +676,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     }
   }, [chatId, subscribe, sendPtyAttach, sendPtyInput, sendPtyResize])
 
-  return { containerRef, pendingPermission, respondPermission, exited, exitReason, reconnecting, focus }
+  return {
+    containerRef, pendingPermission, respondPermission, exited, exitReason,
+    reconnecting, focus, readOnly, controller, takeOver,
+  }
 }

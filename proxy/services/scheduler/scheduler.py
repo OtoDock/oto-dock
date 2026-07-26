@@ -2210,11 +2210,40 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
         raise _TaskTurnStalled(f"reaped by platform: {reason}")
 
 
+@contextlib.asynccontextmanager
+async def _admitted_slot(session_id: str, target: str, run_id: str):
+    """``task_slot`` admission that stamps a still-``pending`` run terminal on
+    cancellation. A cancel while PARKED on the slot escapes ``_run_task``'s
+    inner CancelledError handler (it lives inside the slot body), leaving the
+    row 'pending' forever — invisible to recovery until restart, and it
+    409-blocks deleting the run chat's history. The status guard keeps every
+    in-body cancel path (already stamped by the inner handler, or the
+    shutdown path that deliberately leaves the run 'running') intact."""
+    from core.concurrency import task_slot
+    try:
+        async with task_slot(session_id, target=target):
+            yield
+    except asyncio.CancelledError:
+        try:
+            run = await asyncio.to_thread(task_store.get_run, run_id)
+            if run and run.get("status") == "pending":
+                user_stop = run_id in _user_cancelled_runs
+                await asyncio.to_thread(
+                    task_store.update_run, run_id,
+                    status="cancelled" if user_stop else "failed",
+                    error_message="Interrupted by user" if user_stop
+                    else "Cancelled while queued",
+                    completed_at=now_iso(),
+                )
+        except Exception:
+            logger.exception(f"pending-cancel stamp failed for run {run_id}")
+        raise
+
+
 async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: str,
                     trigger_type: str, trigger_source: str | None, attempt: int,
                     trigger_payload: dict | None = None) -> None:
     from core.session import session_state as _state
-    from core.concurrency import task_slot
     from core.session.session_manager import get_execution_layer
     from core.config.task_config_builder import build_task_agent_config, resolve_task_identity
     from core.events.task_producer import task_produce
@@ -2244,7 +2273,7 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
     except Exception:
         _slot_target = "local"
 
-    async with task_slot(session_id, target=_slot_target):
+    async with _admitted_slot(session_id, _slot_target, run_id):
         await asyncio.to_thread(
             task_store.update_run, run_id,
             status="running",

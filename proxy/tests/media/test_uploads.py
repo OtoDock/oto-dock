@@ -340,3 +340,80 @@ def test_upload_skips_push_scheduling_without_candidates(app_with_router, monkey
     )
     assert resp.status_code == 200, resp.text
     assert tracked == []
+
+
+# ---------------------------------------------------------------------------
+# Universal cap + atomic .partial staging (Feature D, 1.4.0)
+# ---------------------------------------------------------------------------
+
+
+def _no_partials(root):
+    return [p for p in root.rglob("*.partial")]
+
+
+def test_upload_cap_reads_config_live_and_413_leaves_no_partial(
+    app_with_router, monkeypatch,
+):
+    import config
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    monkeypatch.setattr(config, "MAX_UPLOAD_SIZE_BYTES", 10)
+
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("big.bin", BytesIO(b"x" * 11), "application/octet-stream")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 413
+    # Neither the final file nor a torn .partial may exist after a 413.
+    agent_root = agents_dir / "test-agent"
+    assert not (agent_root / "users/alice/workspace/uploads/files/big.bin").exists()
+    assert _no_partials(agents_dir) == []
+
+
+def test_upload_success_leaves_no_partial(app_with_router):
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("ok.bin", BytesIO(b"data!"), "application/octet-stream")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _no_partials(agents_dir) == []
+    saved = agents_dir / "test-agent" / "users/alice/workspace/uploads/files/ok.bin"
+    assert saved.read_bytes() == b"data!"
+
+
+def test_upload_at_cap_boundary_succeeds(app_with_router, monkeypatch):
+    import config
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    monkeypatch.setattr(config, "MAX_UPLOAD_SIZE_BYTES", 10)
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("edge.bin", BytesIO(b"x" * 10), "application/octet-stream")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Upload → transfer correlation (Feature E, 1.4.0)
+# ---------------------------------------------------------------------------
+
+
+def test_upload_response_carries_transfer_id_and_remote_push(app_with_router):
+    """No connected satellite in the fixture → remote_push False; transfer_id
+    is always minted so the client can correlate if phase 2 ever starts."""
+    app, agents_dir = app_with_router
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/upload",
+        files={"file": ("doc.pdf", BytesIO(b"PDF data"), "application/pdf")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["transfer_id"]
+    assert body["remote_push"] is False  # has_fanout_candidates → none in tests

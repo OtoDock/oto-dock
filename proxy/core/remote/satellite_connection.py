@@ -93,6 +93,20 @@ _FILE_STAT_MIN_VERSION = (0, 5, 95)
 # caller degrades instantly (compact → "not supported", steer → queue).
 _CODEX_THREAD_OPS_MIN_VERSION = (0, 5, 98)
 
+# Minimum SATELLITE_VERSION that honours the config-driven sync file cap
+# delivered in the auth_result policy handshake (``sync_max_file_bytes``).
+# Older satellites hard-reject inbound files above the legacy 100MB in
+# apply_file_push — the proxy must never send them one (effective_sync_cap).
+_CONFIG_SYNC_CAP_MIN_VERSION = (0, 5, 103)
+
+# Minimum SATELLITE_VERSION that handles `codex_bg_terminals` (the remote
+# bg-command drain's pull of `thread/backgroundTerminals/list`). Older
+# satellites would silently drop the frame and every drain poll would burn
+# its ack timeout — gate BEFORE sending so the drain stays a no-op there
+# (the router's OOB hook still resolves live completions; only the
+# loss-window backstop is missing).
+_CODEX_BG_TERMINALS_MIN_VERSION = (0, 5, 105)
+
 
 @dataclass
 class SatelliteConnection:
@@ -856,12 +870,36 @@ class SatelliteConnectionManager(
         an ack timeout on a silently-dropped frame."""
         return self._satellite_at_least(machine_id, _CODEX_THREAD_OPS_MIN_VERSION)
 
+    def satellite_supports_config_sync_cap(self, machine_id: str) -> bool:
+        """True if the connected satellite honours the handshake-delivered
+        sync file cap (SATELLITE_VERSION 0.5.103)."""
+        return self._satellite_at_least(machine_id, _CONFIG_SYNC_CAP_MIN_VERSION)
+
+    def supports_codex_bg_terminals(self, machine_id: str) -> bool:
+        """True if the connected satellite handles ``codex_bg_terminals``
+        (SATELLITE_VERSION 0.5.105). When False the remote bg-command drain
+        stays a no-op instead of burning an ack timeout on a silently-dropped
+        frame — the router's OOB hook covers live completions either way."""
+        return self._satellite_at_least(machine_id, _CODEX_BG_TERMINALS_MIN_VERSION)
+
+    def effective_sync_cap(self, machine_id: str) -> int:
+        """Largest file (bytes) the proxy may send this satellite: the
+        config-driven cap for 0.5.103+ machines, else the legacy 100MB their
+        ``apply_file_push`` hard-rejects above. Used by ``push_file``'s send
+        gate and as ``compute_manifest(max_file_size=...)`` so an old
+        machine's merge plan never contains a file it would reject."""
+        from core.remote.file_sync import LEGACY_SYNC_MAX_FILE_BYTES, MAX_FILE_SIZE
+        if self.satellite_supports_config_sync_cap(machine_id):
+            return MAX_FILE_SIZE
+        return min(MAX_FILE_SIZE, LEGACY_SYNC_MAX_FILE_BYTES)
+
     def _satellite_at_least(self, machine_id: str, version: tuple) -> bool:
         conn = self._connections.get(machine_id)
-        if not conn or not conn.satellite_version:
+        sat_version = getattr(conn, "satellite_version", "") if conn else ""
+        if not sat_version:
             return False
         try:
-            parts = tuple(int(p) for p in conn.satellite_version.split(".")[:3])
+            parts = tuple(int(p) for p in sat_version.split(".")[:3])
         except (ValueError, AttributeError):
             return False
         return parts >= version
@@ -1008,16 +1046,21 @@ class SatelliteConnectionManager(
 
     def create_session_queue(
         self, machine_id: str, session_id: str, execution_path: str,
-        *, maxsize: int = 1000,
+        *, maxsize: int | None = None,
     ) -> asyncio.Queue:
         """Create an event queue for a remote session.
 
         ``maxsize`` is raised by the run-recovery adoption path (the replay
         of a retained turn buffer arrives as one burst larger than the
-        default cap; session_event dispatch silently drops on full)."""
+        default cap; session_event dispatch silently drops on full). Codex
+        sessions default deeper: the router's between-turns OOB delivery
+        makes a QueueFull drop correctness-bearing (a lost item/completed
+        leaves a badge only the 0.5.105 drain backstop can clear)."""
         conn = self._connections.get(machine_id)
         if not conn:
             raise RuntimeError(f"Satellite {machine_id[:8]} not connected")
+        if maxsize is None:
+            maxsize = 4096 if execution_path == "codex-cli" else 1000
         queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         conn.session_queues[session_id] = queue
         conn.session_execution_paths[session_id] = execution_path

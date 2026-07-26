@@ -35,6 +35,16 @@ logger = logging.getLogger("title_generator")
 # send-time recognizer; both must keep matching the injected shape).
 _TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)")
 
+# Early-fire thresholds — the canonical values shared by BOTH trigger surfaces
+# (the headless pump's TEXT/TOOL_USE handlers and the interactive funnel's
+# tail-batch counters): fire the one-time upgrade once the first response
+# crosses this many characters (~70 tokens — enough signal for a good title,
+# early enough to feel instant), or — for tool-heavy agentic turns with little
+# prose — once this many tool calls have happened. Shorter first turns title
+# at turn end instead.
+TITLE_CHAR_THRESHOLD = 280
+TITLE_TOOL_THRESHOLD = 5
+
 
 def deterministic_title(text: str) -> str:
     """Stable chat title from a first user message — first ~6 words / 48 chars,
@@ -315,30 +325,44 @@ async def request_chat_title(chat_id: str, *, assistant_excerpt: str = "") -> No
         if not resolved:
             return  # disabled / no provider → keep the deterministic title
         provider, model, api_key, base_url = resolved
-        # Once-only: the first caller to flip the flag wins; the rest no-op.
-        if not await asyncio.to_thread(task_store.claim_title_generation, chat_id):
-            return
         chat = await asyncio.to_thread(task_store.get_chat, chat_id)
         if not chat:
             return
+        # Validate BEFORE claiming: a fire with no persisted user prompt yet
+        # (e.g. an artifact-framed first turn, or an early trigger racing the
+        # prompt persist) must leave the claim intact so a later real turn can
+        # still title the chat — a claim burned here would be permanent.
         user_prompt, db_assistant = await asyncio.to_thread(_first_turn_texts, chat_id)
         if not user_prompt:
             return  # nothing to title from yet
+        # Once-only: the first caller to flip the flag wins; the rest no-op.
+        # The winner also gets the claim-time title — the CAS baseline below.
+        claimed, baseline_title = await asyncio.to_thread(
+            task_store.claim_title_generation, chat_id,
+        )
+        if not claimed:
+            return
         assistant_text = (assistant_excerpt or "").strip() or db_assistant
         title, usage = await generate_title(
             user_prompt, assistant_text, provider, model, api_key, base_url,
         )
         if not title:
             return  # keep deterministic; flag stays claimed (no retry storm)
-        await asyncio.to_thread(task_store.update_chat, chat_id, title=title)
-        try:
-            from services.notifications import notification_manager
-            notification_manager.broadcast_chat_title(
-                chat.get("user_sub") or "", chat_id, title,
-                agent=chat.get("agent") or "",
-            )
-        except Exception:
-            logger.debug("title-gen: title broadcast failed for %s", chat_id, exc_info=True)
+        # CAS on the claim-time title: a manual rename that landed after the
+        # claim wins — never overwrite it, never broadcast the stale title.
+        # The generation cost is metered either way (the tokens were spent).
+        wrote = await asyncio.to_thread(
+            task_store.update_chat_title_cas, chat_id, title, baseline_title,
+        )
+        if wrote:
+            try:
+                from services.notifications import notification_manager
+                notification_manager.broadcast_chat_title(
+                    chat.get("user_sub") or "", chat_id, title,
+                    agent=chat.get("agent") or "",
+                )
+            except Exception:
+                logger.debug("title-gen: title broadcast failed for %s", chat_id, exc_info=True)
         _record_cost(chat, provider, model, usage)
     except Exception:
         logger.exception("title-gen: request_chat_title failed for %s", chat_id)

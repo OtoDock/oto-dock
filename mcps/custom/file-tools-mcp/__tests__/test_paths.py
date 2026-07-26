@@ -3,6 +3,7 @@ and `shared._unicode_match_on_disk` (NFC/NFD fallback for non-ASCII
 filenames written by Drive/macOS/Slack/etc.).
 """
 
+import asyncio
 import os
 import sys
 import unicodedata
@@ -170,15 +171,25 @@ class _Resp:
 
 
 def _wire_proxy(monkeypatch, captured):
-    def fake_post(url, json=None, headers=None, timeout=None):
-        captured["json"] = json
-        return _Resp()
+    class _FakeClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            captured["json"] = json
+            return _Resp()
 
     monkeypatch.setattr(
         shared, "_current_session", lambda: ("sess-1", "Bearer t"),
     )
     monkeypatch.setattr(shared, "PROXY_URL", "http://proxy:8000")
-    monkeypatch.setattr(shared.httpx, "post", fake_post)
+    monkeypatch.setattr(shared.httpx, "AsyncClient", _FakeClient)
 
 
 def test_resolve_via_proxy_posts_writing_flag(monkeypatch):
@@ -186,9 +197,9 @@ def test_resolve_via_proxy_posts_writing_flag(monkeypatch):
     creation path on remote sessions instead of failing the lazy pull."""
     captured = {}
     _wire_proxy(monkeypatch, captured)
-    rel, reason = shared._resolve_via_proxy(
+    rel, reason = asyncio.run(shared._resolve_via_proxy(
         "/users/u/workspace/f.png", writing=True,
-    )
+    ))
     assert rel == "agent/users/u/workspace/f.png"
     assert captured["json"]["writing"] is True
 
@@ -196,7 +207,7 @@ def test_resolve_via_proxy_posts_writing_flag(monkeypatch):
 def test_resolve_via_proxy_defaults_to_read(monkeypatch):
     captured = {}
     _wire_proxy(monkeypatch, captured)
-    rel, reason = shared._resolve_via_proxy("/users/u/workspace/f.png")
+    rel, reason = asyncio.run(shared._resolve_via_proxy("/users/u/workspace/f.png"))
     assert rel == "agent/users/u/workspace/f.png"
     assert captured["json"]["writing"] is False
 
@@ -207,13 +218,11 @@ def test_resolve_via_proxy_defaults_to_read(monkeypatch):
 # The explicit-output shape keeps the input as a read.
 # ---------------------------------------------------------------------------
 
-import asyncio
-
 
 def _capture_resolve(monkeypatch, module):
     calls = []
 
-    def fake_resolve(p, writing=False):
+    async def fake_resolve(p, writing=False):
         calls.append((p, writing))
         return "/nonexistent/target"
 

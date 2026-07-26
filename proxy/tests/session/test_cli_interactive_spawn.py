@@ -14,7 +14,7 @@ def _mk(interactive: bool) -> PersistentSession:
         session_id="sess-abcdef123456",
         agent_prompt=None,
         mcp_config_path=None,
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         effort="high",
         agent_name="agent",
         interactive=interactive,
@@ -27,7 +27,7 @@ def _mk_task(permission_mode: str = "auto") -> PersistentSession:
         session_id="sess-task00112233",
         agent_prompt=None,
         mcp_config_path=None,
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         effort="high",
         agent_name="agent",
         interactive=True,
@@ -43,7 +43,7 @@ def test_headless_argv_has_p_and_stream_json():
     assert "--input-format" in cmd
     assert "--include-partial-messages" in cmd
     # Shared flags present.
-    assert "--model" in cmd and "claude-opus-4-8" in cmd
+    assert "--model" in cmd and "claude-opus-5" in cmd
     assert "--session-id" in cmd
     assert "--dangerously-skip-permissions" in cmd
     # Bypass headless also carries the stdio prompt tool — its PRESENCE is
@@ -85,7 +85,7 @@ def test_interactive_argv_drops_headless_flags_keeps_shared():
     assert "--include-partial-messages" not in cmd
     # Shared flags still present — same parser, just no -p framing.
     assert cmd[0].endswith("claude") or "claude" in cmd[0]
-    assert "--model" in cmd and "claude-opus-4-8" in cmd
+    assert "--model" in cmd and "claude-opus-5" in cmd
     assert "--effort" in cmd and "high" in cmd
     assert "--session-id" in cmd
     # Interactive uses a real --permission-mode, NOT --dangerously-skip-permissions:
@@ -176,7 +176,7 @@ async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_pat
     cfg = AgentConfig(
         agent_name="agent",
         user_sub="u1",
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         effort="high",
         chat_id="chat-xyz",
         client_type="interactive_cli",
@@ -191,6 +191,6 @@ async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_pat
     assert captured.get("agent_name") == "agent"
     argv = captured["argv"]
     assert "-p" not in argv and "stream-json" not in argv
-    assert "--model" in argv and "claude-opus-4-8" in argv
+    assert "--model" in argv and "claude-opus-5" in argv
     assert "--session-id" in argv
     assert captured["env"].get("TERM") == "xterm-256color"

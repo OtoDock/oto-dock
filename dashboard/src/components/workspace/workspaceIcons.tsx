@@ -1,6 +1,7 @@
 export type IconName =
   | 'open' | 'pencil' | 'download' | 'link' | 'trash'
   | 'scissors' | 'copy' | 'clipboard' | 'folder' | 'upload'
+  | 'refresh' | 'search'
 
 export function Icon({ name }: { name: IconName }) {
   const common = 'w-3.5 h-3.5'
@@ -45,6 +46,19 @@ export function Icon({ name }: { name: IconName }) {
       return (
         <svg className={common} fill="currentColor" viewBox="0 0 24 24">
           <path d="M3 7a2 2 0 012-2h4l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
+        </svg>
+      )
+    case 'refresh':
+      return (
+        <svg className={common} fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+        </svg>
+      )
+    case 'search':
+      return (
+        <svg className={common} fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+          <circle cx="11" cy="11" r="7" />
+          <path strokeLinecap="round" d="m21 21-4.35-4.35" />
         </svg>
       )
     case 'upload':

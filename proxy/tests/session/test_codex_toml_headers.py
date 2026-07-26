@@ -141,6 +141,16 @@ def test_config_toml_question_flag_dashboard_and_interactive(tmp_path):
     assert interactive["features"]["hooks"] is True
 
 
+def test_config_toml_local_endpoint_wire_api_responses(tmp_path):
+    # codex-rs removed wire_api="chat" (deserializing it is a hard serde error
+    # since <=0.144.1) — a "chat" value makes the daemon reject the entire
+    # config.toml, breaking every local-endpoint session. Pin "responses".
+    cfg = _written_config(tmp_path, local_endpoint="http://127.0.0.1:11434/v1")
+    prov = cfg["model_providers"]["oto_local"]
+    assert prov["base_url"] == "http://127.0.0.1:11434/v1"
+    assert prov["wire_api"] == "responses"
+
+
 def test_config_toml_is_owner_only(tmp_path):
     # config.toml can carry an inline MCP bearer — must be locked 0600 like
     # auth.json, not world/group readable.

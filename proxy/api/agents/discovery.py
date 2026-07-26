@@ -54,6 +54,10 @@ def _safe_model(name: str) -> str:
 
 class CompleteSetupBody(BaseModel):
     summary: str = ""
+    # "agent" | "user" | None. None resolves from which setup file applies:
+    # exactly one → that one; both → 400 asking for the argument; neither →
+    # agent (legacy no-op semantics).
+    scope: str | None = None
 
 
 class DelegationTargetsRequest(BaseModel):
@@ -65,7 +69,7 @@ class BrowserOriginsRequest(BaseModel):
 
 
 @router.get("/v1/execution-layers")
-async def list_execution_layers():
+async def list_execution_layers(user: UserContext = Depends(get_current_user)):
     """Return capabilities for all registered execution layers.
 
     Used by the frontend to dynamically populate model selectors,
@@ -73,14 +77,24 @@ async def list_execution_layers():
 
     Merges admin-managed custom models (enabled only) into each layer's
     model list. Custom models appear after builtin models.
+
+    Authenticated (cookie or session token): the per-layer ``configured``
+    flag reveals which AI vendors the platform has subscriptions for — every
+    consumer (dashboard pages, config-MCP, satellite tunnel) already carries
+    credentials, so nothing legitimate is anonymous here.
     """
+    require_auth(user)
     from core.session.session_manager import get_all_capabilities
+    from services.engines import subscription_pool
     from storage import subscription_store
 
     caps = get_all_capabilities()
     result = {}
     for path, layer_dict in caps.items():
         layer = dict(layer_dict)
+        # Platform-level availability: drives the AgentConfig engine-card
+        # enable gate (mirror of the PATCH /v1/agents server gate).
+        layer["configured"] = subscription_pool.layer_platform_configured(path)
         # Merge enabled custom models from admin DB
         subscription_store.sync_builtin_models(path, layer.get("models", []))
         db_models = subscription_store.list_models(layer=path)
@@ -296,48 +310,144 @@ async def get_agent_target_status(
     return _status_payload(target, "admin")
 
 
+async def _remove_synced_setup_file(
+    agent_slug: str, abs_path, rel_path: str, repo_dir,
+) -> bool:
+    """Delete a setup file WITH the sync + audit bookkeeping every
+    platform-side delete needs: tombstone (an idle satellite APPLIES the
+    delete at next merge instead of resurrecting its copy — user context and
+    owner-tier config write back), author clear, live-delete fan-out, and a
+    commit in the owning git repo when the file is tracked (so the dashboard
+    revert button can't silently resurrect a completed setup)."""
+    if abs_path is None or not abs_path.is_file():
+        return False
+    try:
+        await asyncio.to_thread(abs_path.unlink)
+    except Exception:
+        logger.exception(
+            "complete-setup: failed to remove %s for %s", rel_path, agent_slug,
+        )
+        return False
+    import time as _time
+    from storage import file_author_store, file_tombstones_store
+    await asyncio.to_thread(
+        file_tombstones_store.record, agent_slug, rel_path, _time.time(),
+        origin="complete-setup",
+    )
+    await asyncio.to_thread(file_author_store.clear, agent_slug, rel_path)
+    try:
+        from services.remote import workspace_fanout
+        await workspace_fanout.fan_out_delete(
+            agent_slug, rel_path, include_idle=True,
+        )
+    except Exception:
+        logger.exception(
+            "complete-setup: delete fan-out failed for %s", rel_path,
+        )
+    try:
+        from services.infra import git_writer
+        rel_in_repo = str(abs_path.relative_to(repo_dir))
+        if git_writer.is_tracked(repo_dir, rel_in_repo):
+            await asyncio.to_thread(
+                git_writer.commit_paths, repo_dir, [abs_path],
+                f"Complete setup: remove {abs_path.name}",
+            )
+    except Exception:
+        logger.exception("complete-setup: git commit failed for %s", rel_path)
+    return True
+
+
 @router.post("/v1/agents/{name}/complete-setup")
 async def complete_agent_setup(
     name: str,
     body: CompleteSetupBody,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Mark an agent's post-install setup complete.
+    """Mark an agent's post-install setup complete — agent-wide or per-user.
 
-    Three side effects, all idempotent:
+    Two scopes, resolved from ``body.scope`` or from which setup file applies
+    (exactly one present → that one; both → 400 asking for the argument;
+    neither → agent, preserving the legacy idempotent no-op):
 
-    1. **Delete ``config/context/setup.md``** from the agent's folder if present
-       — so it stops auto-loading into context on future turns. Done from the
-       proxy process (which has direct host-FS access), not from the
-       sandboxed MCP. Re-running this endpoint after the file is already
-       gone is a no-op (no error). Even when the agent's row already shows
-       ``setup_completed_at`` set, we still attempt the file delete so a
-       stale on-disk ``setup.md`` (e.g. left over after a manual stamp via
-       SQL, or after a partial earlier call) gets cleaned up.
-    2. **Stamp ``agents.setup_completed_at``** on the row if not already set.
-    3. **Notify the installer** (``created_by``) — only on the first
-       transition from "incomplete" → "complete" (not on already-complete
-       re-runs, to avoid notification spam).
+    **scope=agent** — the original semantics, manager/admin (or the agent
+    principal) only: delete ``config/context/setup.md`` if present, stamp
+    ``agents.setup_completed_at`` if not already set, notify the installer on
+    the first incomplete→complete transition. Re-runs return
+    ``already_complete`` — never an error.
 
-    Authorization: any user with access to the agent. The chat-side guard
-    is the MCP's own permission matrix (viewers see no tools).
+    **scope=user** — per-user onboarding: delete the CALLER's own
+    ``users/{u}/context/user-setup.md``. The username comes from the session
+    identity, never from the request body — a user cannot complete another
+    user's setup. Any attached user may call it (viewers included: the seeded
+    onboarding targets exactly the default-attach audience). File already
+    absent → idempotent success.
+
+    All file deletes carry tombstone + git + fan-out bookkeeping — a bare
+    unlink would be resurrected by the next satellite sync.
     """
     u = require_auth(user)
     require_agent_access(u, name)
     agent = agent_store.get_agent(name)
     if not agent:
         raise HTTPException(404, f"Agent '{name}' not found")
+    if body.scope not in (None, "agent", "user"):
+        raise HTTPException(400, "scope must be 'agent' or 'user'")
+
+    agent_dir = _get_agent_dir(name)
+    username = ""
+    if u.acting_sub is not None:
+        username = task_store.get_username_by_sub(u.sub) or ""
+
+    setup_path = agent_dir / "config" / "context" / "setup.md"
+    user_setup_path = (
+        agent_dir / "users" / username / "context" / "user-setup.md"
+        if username else None
+    )
+
+    scope = body.scope
+    if scope is None:
+        agent_file = setup_path.is_file()
+        user_file = user_setup_path is not None and user_setup_path.is_file()
+        if agent_file and user_file:
+            raise HTTPException(
+                400,
+                "Both agent-wide setup.md and your user-setup.md are present "
+                "— pass scope='agent' or scope='user' to say which one is "
+                "complete.",
+            )
+        scope = "user" if user_file else "agent"
+
+    if scope == "user":
+        if not username:
+            raise HTTPException(
+                400,
+                "scope='user' requires a user session (agent-scoped sessions "
+                "have no per-user setup).",
+            )
+        removed = await _remove_synced_setup_file(
+            name, user_setup_path,
+            f"users/{username}/context/user-setup.md",
+            agent_dir / "users" / username / "context",
+        )
+        return {
+            "status": "user_setup_complete",
+            "user_setup_removed": removed,
+        }
+
+    # scope == "agent" — completing setup FOR THE WHOLE AGENT is a
+    # config-level act: manager/admin, or the agent principal (agent-scoped
+    # sessions act as the agent itself). Viewers/editors could previously
+    # reach this by direct POST; the seeded per-user flow is scope=user.
+    if not (u.is_admin or u.can_manage_agent(name) or u.acting_sub is None):
+        raise HTTPException(
+            403, "Completing agent-wide setup requires manager access.",
+        )
 
     # File delete — runs whether or not the stamp is already set, so the
     # tool stays useful for cleaning up a leftover setup.md on a stale agent.
-    setup_path = _get_agent_dir(name) / "config" / "context" / "setup.md"
-    setup_md_removed = False
-    if setup_path.is_file():
-        try:
-            await asyncio.to_thread(setup_path.unlink)
-            setup_md_removed = True
-        except Exception:
-            logger.exception("complete-setup: failed to remove setup.md for %s", name)
+    setup_md_removed = await _remove_synced_setup_file(
+        name, setup_path, "config/context/setup.md", agent_dir / "config",
+    )
 
     if agent.get("setup_completed_at"):
         return {

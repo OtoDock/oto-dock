@@ -368,7 +368,13 @@ TOOLS = [
             "OPTIMIZATION: compress (garbage collection + deflation, reports size reduction).\n"
             "METADATA: set_metadata (title, author, subject, keywords).\n"
             "EXTRACTION: extract_images (pull embedded images to files), "
-            "ocr (OCR scanned pages via tesseract, makes PDF searchable).\n\n"
+            "ocr ({language?, pages?, dpi?, output_path?} — OCR scanned pages "
+            "via tesseract, makes the PDF searchable. Set language to the "
+            "document's language(s) — e.g. 'ell', 'ell+eng' for Greek; "
+            "default 'eng' misreads other alphabets. Pages are re-rasterized "
+            "at dpi capped to the scan's own resolution (default 300 "
+            "ceiling) — printed text only; for handwriting read the pages "
+            "visually via screenshot_document instead).\n\n"
             "Auto-previews in dashboard after saving."
         ),
         inputSchema={
@@ -663,7 +669,7 @@ TOOLS = [
 
 
 async def _handle_read_document(args: dict) -> str:
-    path = _resolve_path(args["path"])
+    path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
@@ -703,7 +709,7 @@ async def _handle_read_document(args: dict) -> str:
 
 
 async def _handle_preview_document(args: dict) -> str:
-    path = _resolve_path(args["path"])
+    path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
     await _push_preview(path)

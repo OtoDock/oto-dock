@@ -11,6 +11,7 @@ satellite_connection.py. `PUSH_WINDOW_CHUNKS` stays in satellite_connection
 import asyncio
 import base64
 import hashlib
+import inspect
 import logging
 import os
 import time
@@ -60,12 +61,20 @@ class SatelliteFileTransferMixin:
         self,
         machine_id: str,
         ref: "PathRef",
-        content: bytes,
+        source: "bytes | Path",
         *,
         agent_slug: str = "",
         timeout: float = 30.0,
+        progress_cb=None,
     ) -> bool:
         """Push a file to the satellite and wait for its ack.
+
+        ``source`` is either the file's bytes (small payloads already in
+        memory) or a filesystem ``Path`` — the streaming mode: chunks are
+        read from disk per window, so memory stays O(window) regardless of
+        file size. Callers should pass a Path whenever the bytes live on
+        disk; ``push_file`` picks the inline fast path internally for small
+        files either way.
 
         ``ref.kind == "agent_tree"`` — writes under the agent's tree at
         ``{satellite_agents_dir}/{agent_slug}/{ref.value}``. The
@@ -79,9 +88,14 @@ class SatelliteFileTransferMixin:
         the satellite re-validates ``..`` / NUL defensively before
         writing.
 
+        ``progress_cb(bytes_sent, bytes_total)`` — optional, sync or async;
+        invoked after each acked window boundary and once terminally with
+        ``(size, size)``. Fully fenced: a raising/broken callback never
+        aborts the transfer.
+
         Handles ≤ 512KB payloads in a single message; larger files are
         chunked. Returns True on success, False on timeout / error /
-        disconnect.
+        disconnect / cap-exceeded / source-vanished.
         """
         # PUSH_WINDOW_CHUNKS stays in satellite_connection (monkeypatched by
         # tests) — read it live each call.
@@ -94,7 +108,46 @@ class SatelliteFileTransferMixin:
         if ref.kind == "agent_tree" and not agent_slug:
             raise ValueError("push_file(agent_tree) requires agent_slug")
 
+        from core.remote import file_sync
         from core.remote.file_sync import MAX_CHUNK_SIZE
+
+        async def _notify(sent: int, total: int) -> None:
+            if progress_cb is None:
+                return
+            try:
+                res = progress_cb(sent, total)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                logger.debug("push_file progress_cb failed", exc_info=True)
+
+        # Resolve (size, content_hash) without ever holding a big file in
+        # memory: Path sources are stat'd + stream-hashed off the event loop.
+        from_path = not isinstance(source, (bytes, bytearray))
+        if from_path:
+            path = Path(source)
+            try:
+                st = await asyncio.to_thread(os.stat, path)
+                size = st.st_size
+                content_hash = await asyncio.to_thread(file_sync._hash_file, path)
+            except OSError as e:
+                logger.warning("push_file: cannot read %s: %s", path, e)
+                return False
+        else:
+            size = len(source)
+            content_hash = f"sha256:{_hashlib.sha256(source).hexdigest()}"
+
+        # Never send a satellite a file above what it accepts: the config cap
+        # for 0.5.103+, the legacy 100MB for older machines (their
+        # apply_file_push hard-rejects above it — the transfer would only
+        # burn bandwidth and fail at commit).
+        cap = self.effective_sync_cap(machine_id)
+        if size > cap:
+            logger.warning(
+                "push_file: %s is %.1f MB > %d MB cap for machine %s — skipped",
+                ref.value, size / 1024 / 1024, cap // 1024 // 1024, machine_id[:8],
+            )
+            return False
 
         def _base_msg(action: str) -> dict:
             return {
@@ -105,8 +158,15 @@ class SatelliteFileTransferMixin:
                 "path": ref.value,
             }
 
-        content_hash = f"sha256:{_hashlib.sha256(content).hexdigest()}"
-        if len(content) <= MAX_CHUNK_SIZE:
+        if size <= MAX_CHUNK_SIZE:
+            if from_path:
+                try:
+                    content = await asyncio.to_thread(path.read_bytes)
+                except OSError as e:
+                    logger.warning("push_file: cannot read %s: %s", path, e)
+                    return False
+            else:
+                content = bytes(source)
             command_id = str(uuid.uuid4())
             future: asyncio.Future = asyncio.get_event_loop().create_future()
             self._pending_acks[command_id] = (machine_id, future)
@@ -118,12 +178,15 @@ class SatelliteFileTransferMixin:
                 await conn.enqueue_send(msg, bulk=True)
                 try:
                     ack = await asyncio.wait_for(future, timeout=timeout)
-                    return ack.get("status") == "ok"
+                    ok = ack.get("status") == "ok"
                 except asyncio.TimeoutError:
                     return False
                 except RuntimeError:
                     # Future rejected by deregister (WS dead).
                     return False
+                if ok:
+                    await _notify(size, size)
+                return ok
             finally:
                 self._pending_acks.pop(command_id, None)
 
@@ -135,44 +198,89 @@ class SatelliteFileTransferMixin:
         # (non-empty hash); intermediate window-boundary chunks just append and
         # ack "ok". A non-ok / timed-out / WS-dropped window aborts the whole
         # transfer (returns False) instead of blasting the remaining chunks.
-        total_chunks = (len(content) + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
-        offset = 0
-        chunk_idx = 0
-        while offset < len(content):
-            chunk = content[offset:offset + MAX_CHUNK_SIZE]
-            is_last = offset + MAX_CHUNK_SIZE >= len(content)
-            # Flush (await an ack) at every window boundary and at the final chunk.
-            is_flush = is_last or ((chunk_idx + 1) % PUSH_WINDOW_CHUNKS == 0)
-            command_id = str(uuid.uuid4()) if is_flush else ""
-            future: asyncio.Future | None = None
-            if command_id:
-                future = asyncio.get_event_loop().create_future()
-                self._pending_acks[command_id] = (machine_id, future)
+        #
+        # total_chunks and the hash are captured at start: a Path source that
+        # SHRINKS mid-push (short read) aborts immediately — never send a
+        # truncated stream under a stale total_chunks. A same-size content
+        # mutation is caught by the satellite's final-chunk sha256 verify
+        # against the pre-computed hash (error ack → False → retried by the
+        # next sync cycle).
+        total_chunks = (size + MAX_CHUNK_SIZE - 1) // MAX_CHUNK_SIZE
+        fh = None
+        if from_path:
             try:
-                msg = _base_msg("write_chunk")
-                msg["chunk_index"] = chunk_idx
-                msg["total_chunks"] = total_chunks
-                msg["content_b64"] = _b64.b64encode(chunk).decode()
-                msg["hash"] = content_hash if is_last else ""
+                # Unbuffered: sequential 512KB reads need no readahead layer,
+                # and a buffered reader could mask a mid-push truncation by
+                # serving pre-buffered bytes.
+                fh = await asyncio.to_thread(open, path, "rb", 0)
+            except OSError as e:
+                logger.warning("push_file: cannot open %s: %s", path, e)
+                return False
+
+        def _read_exact(n: int) -> bytes:
+            # Retry mid-file partial reads (raw IO may return short); only a
+            # true EOF — the file shrank — yields fewer than n bytes.
+            buf = b""
+            while len(buf) < n:
+                block = fh.read(n - len(buf))
+                if not block:
+                    break
+                buf += block
+            return buf
+
+        try:
+            offset = 0
+            chunk_idx = 0
+            while offset < size:
+                expected = min(MAX_CHUNK_SIZE, size - offset)
+                if from_path:
+                    chunk = await asyncio.to_thread(_read_exact, expected)
+                else:
+                    chunk = source[offset:offset + MAX_CHUNK_SIZE]
+                if len(chunk) != expected:
+                    logger.warning(
+                        "push_file: %s changed size mid-push (expected %d-byte "
+                        "chunk, got %d) — aborted", ref.value, expected, len(chunk),
+                    )
+                    return False
+                is_last = offset + MAX_CHUNK_SIZE >= size
+                # Flush (await an ack) at every window boundary and at the final chunk.
+                is_flush = is_last or ((chunk_idx + 1) % PUSH_WINDOW_CHUNKS == 0)
+                command_id = str(uuid.uuid4()) if is_flush else ""
+                future: asyncio.Future | None = None
                 if command_id:
-                    msg["command_id"] = command_id
-                await conn.enqueue_send(msg, bulk=True)
-                if command_id:
-                    try:
-                        ack = await asyncio.wait_for(future, timeout=timeout)
-                    except asyncio.TimeoutError:
-                        return False
-                    except RuntimeError:
-                        # Future rejected by deregister (WS dead).
-                        return False
-                    if ack.get("status") != "ok":
-                        return False  # early abort — stop sending the rest
-            finally:
-                if command_id:
-                    self._pending_acks.pop(command_id, None)
-            offset += MAX_CHUNK_SIZE
-            chunk_idx += 1
-        return True
+                    future = asyncio.get_event_loop().create_future()
+                    self._pending_acks[command_id] = (machine_id, future)
+                try:
+                    msg = _base_msg("write_chunk")
+                    msg["chunk_index"] = chunk_idx
+                    msg["total_chunks"] = total_chunks
+                    msg["content_b64"] = _b64.b64encode(chunk).decode()
+                    msg["hash"] = content_hash if is_last else ""
+                    if command_id:
+                        msg["command_id"] = command_id
+                    await conn.enqueue_send(msg, bulk=True)
+                    if command_id:
+                        try:
+                            ack = await asyncio.wait_for(future, timeout=timeout)
+                        except asyncio.TimeoutError:
+                            return False
+                        except RuntimeError:
+                            # Future rejected by deregister (WS dead).
+                            return False
+                        if ack.get("status") != "ok":
+                            return False  # early abort — stop sending the rest
+                        await _notify(min(offset + len(chunk), size), size)
+                finally:
+                    if command_id:
+                        self._pending_acks.pop(command_id, None)
+                offset += MAX_CHUNK_SIZE
+                chunk_idx += 1
+            return True
+        finally:
+            if fh is not None:
+                with contextlib.suppress(Exception):
+                    fh.close()
 
     async def stat_file(
         self,
@@ -335,6 +443,11 @@ class SatelliteFileTransferMixin:
             if not st.future.done():
                 st.future.set_result(False)
             return
+        # The sha256 of these bytes was just verified — prime the manifest
+        # hash cache so the next sync cycle never re-hashes a big pull.
+        if actual:
+            from core.remote.file_sync import prime_hash_cache
+            prime_hash_cache(st.dest_path, actual)
         if not st.future.done():
             st.future.set_result(True)
 
@@ -532,12 +645,12 @@ class SatelliteFileTransferMixin:
                 elif workspace_fanout.fanout_targets(
                     agent_slug, rel_path, exclude_machine_id=machine_id,
                 ):
-                    # Only re-read the file from disk when there's somewhere to
-                    # send it (the common single-session case skips the read).
-                    content = await self._read_workspace_bytes(agent_dir, rel_path)
-                    if content is not None:
+                    # Pass the PATH, not bytes — push_file streams from disk
+                    # (memory stays O(window) even for a 1GB file).
+                    src = await self._workspace_path_checked(agent_dir, rel_path)
+                    if src is not None:
                         await workspace_fanout.fan_out_write(
-                            agent_slug, rel_path, content,
+                            agent_slug, rel_path, src,
                             exclude_machine_id=machine_id,
                         )
         except Exception:
@@ -585,10 +698,10 @@ class SatelliteFileTransferMixin:
             return (data, "sha256:" + hashlib.sha256(data).hexdigest())
         return await asyncio.to_thread(_read)
 
-    async def _read_workspace_bytes(self, agent_dir, rel_path: str) -> bytes | None:
-        """Re-read the current platform bytes of a workspace file (post-apply) for
-        fan-out. Returns None on missing / unreadable / path-traversal."""
-        def _read() -> bytes | None:
+    async def _workspace_path_checked(self, agent_dir, rel_path: str) -> Path | None:
+        """Resolve a workspace file's on-disk Path (post-apply) for streaming
+        fan-out. Returns None on missing / not-a-file / path-traversal."""
+        def _check() -> Path | None:
             try:
                 base = Path(agent_dir).resolve()
                 dest = (base / rel_path).resolve()
@@ -596,10 +709,10 @@ class SatelliteFileTransferMixin:
             except (ValueError, OSError):
                 return None
             try:
-                return dest.read_bytes()
+                return dest if dest.is_file() else None
             except OSError:
                 return None
-        return await asyncio.to_thread(_read)
+        return await asyncio.to_thread(_check)
 
     def _mtime_of(self, agent_dir, rel_path: str) -> float:
         """Current mtime of a platform file (epoch seconds), or 0.0 — used to stamp
@@ -678,7 +791,9 @@ class SatelliteFileTransferMixin:
                 PathRef("agent_tree", msg["path"]),
                 dest,
                 agent_slug=agent_slug,
-                timeout=180.0,
+                timeout=core_file_sync.pull_timeout_for_size(
+                    int(msg.get("size", 0) or 0)
+                ),
             )
             if not ok:
                 logger.warning(

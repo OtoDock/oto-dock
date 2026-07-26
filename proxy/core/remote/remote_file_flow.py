@@ -303,19 +303,16 @@ async def push_back_host_path(session_id: str, cache_path: str) -> bool:
     abs_path = meta.get("abs_path", "")
     if not machine_id or not abs_path:
         return False
-    try:
-        content = cp.read_bytes()
-    except OSError as e:
-        logger.warning("push_back_host_path: cannot read %s: %s", cache_path, e)
-        return False
 
     lock = await _acquire_machine_host_lock(machine_id, abs_path)
     async with lock:
         from core.remote.satellite_connection import get_connection_manager
         from services.path_policy_v2 import PathRef
         cm = get_connection_manager()
+        # Pass the PATH — push_file streams from disk (a vanished/unreadable
+        # cache file returns False with its own warning log).
         ok = await cm.push_file(
-            machine_id, PathRef("satellite_host", abs_path), content,
+            machine_id, PathRef("satellite_host", abs_path), cp,
         )
         if ok and "stat" in meta:
             # The write changed the satellite file's mtime — the recorded
@@ -546,11 +543,19 @@ async def pull_through(session_id: str, rel_path: str) -> Path | None:
                 and _stats_match(_pull_stat_records.get(key), fresh)):
             return host_path
 
+        # Size-aware deadline when the probe told us the size — a large file
+        # over a slow link must not die at the flat 180 s default.
+        pull_kwargs: dict = {}
+        _size = (fresh or {}).get("size")
+        if isinstance(_size, (int, float)) and _size > 0:
+            from core.remote.file_sync import pull_timeout_for_size
+            pull_kwargs["timeout"] = pull_timeout_for_size(int(_size))
         ok = await cm.pull_file_to_path(
             info.machine_id,
             ref,
             host_path,
             agent_slug=info.agent_name,
+            **pull_kwargs,
         )
         if not ok:
             # Serve the platform mirror when the satellite can't provide the
@@ -614,21 +619,15 @@ async def push_back(session_id: str, rel_path: str) -> bool:
     event.clear()  # block readers until set() in the finally
     try:
         async with lock:
-            try:
-                content = host_path.read_bytes()
-            except OSError as e:
-                logger.warning(
-                    "push_back: cannot read %s: %s", host_path, e,
-                )
-                return False
-
             from core.remote.satellite_connection import get_connection_manager
             from services.path_policy_v2 import PathRef
             cm = get_connection_manager()
+            # Pass the PATH — push_file streams from disk (memory O(window)
+            # even for 1GB files; unreadable → False with its own warning).
             ok = await cm.push_file(
                 info.machine_id,
                 PathRef("agent_tree", rel_path),
-                content,
+                host_path,
                 agent_slug=info.agent_name,
             )
             if ok:
@@ -651,7 +650,7 @@ async def push_back(session_id: str, rel_path: str) -> bool:
             # recovery stays on the file_changed path (which pre-captures).
             from services.remote import workspace_fanout
             await workspace_fanout.fan_out_write(
-                info.agent_name, rel_path, content,
+                info.agent_name, rel_path, host_path,
                 exclude_machine_id=info.machine_id,
             )
             return ok

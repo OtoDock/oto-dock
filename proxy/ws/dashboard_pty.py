@@ -9,16 +9,75 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 import asyncio
 import base64
 import logging
+import time
 from services.notifications import notification_manager
 from core.session import interactive_session
 from core.events.artifact_events import artifact_event_from_perm_item
 
 logger = logging.getLogger("claude-proxy")
 
+# Minimum gap between two ``read_only`` explanations to one socket. A refused
+# keystroke must SAY why (a silently dead terminal is the worse failure), but a
+# user leaning on a key would otherwise flood the socket with one frame per
+# byte.
+_READ_ONLY_NOTICE_GAP_S = 2.0
+
 
 class PtyViewerController:
     """Interactive (PTY) viewer attach/detach: mirrors a live TUI session to
     this socket and forwards its prompts/artifacts/exit."""
+
+    async def _send_pty_read_only(self, sess) -> None:
+        """Tell this socket its input was refused: the session belongs to
+        another user (Shared-only agents put several users on one chat).
+
+        Carries the controller's username so the terminal can name them and
+        offer the take-over. Rate-limited per connection."""
+        now = time.monotonic()
+        last = getattr(self, "_read_only_notice_at", 0.0)
+        if now - last < _READ_ONLY_NOTICE_GAP_S:
+            return
+        self._read_only_notice_at = now
+        await self._send({
+            "type": "pty_status", "chat_id": sess.chat_id,
+            "session_id": sess.session_id, "state": "read_only",
+            "controller": sess.username or "",
+        })
+
+    async def _handle_pty_takeover(self, msg: dict) -> None:
+        """Explicit hand-over of a live interactive session to THIS user.
+
+        A PTY carries live TUI state, so it never changes hands implicitly the
+        way a ``-p`` session does — the read-only viewer asks for it. Closing is
+        the whole mechanism: the terminal already treats a dead session by
+        falling back to the DB view and re-warming with ``--resume`` on the next
+        send, and that re-warm binds this user's identity and subscription. A
+        take-over that merely re-labelled the controller would leave the running
+        process holding the previous user's JWT, role and account.
+        """
+        sess = interactive_session.get(self.session_id) if self.session_id else None
+        if sess is None or not sess.alive or sess.chat_id != msg.get("chat_id"):
+            return
+        if sess.may_drive(self.user_sub):
+            return  # already the controller — nothing to take
+        # A viewer may watch a shared terminal but never drive one. The
+        # PER-AGENT role is what governs (a platform member can be an editor on
+        # one agent and a viewer on another), read live so a just-revoked role
+        # takes effect immediately.
+        from ws.dashboard import _effective_agent_role
+        if _effective_agent_role(
+            self.user_sub, sess.agent_name, fallback_user=self.user,
+        ) == "viewer":
+            await self._send_error("Viewers cannot take over a terminal session")
+            return
+        logger.info(
+            "WS dashboard: PTY take-over chat=%s session=%s from=%s to=%s",
+            sess.chat_id, sess.session_id[:8], sess.username or "?",
+            self.user.get("username") or "?",
+        )
+        await interactive_session.close_session(
+            sess.session_id, reason="taken_over",
+        )
 
     async def _attach_pty_viewer(self, sess) -> None:
         """Mirror an interactive session's PTY to this socket: stream output as
@@ -37,7 +96,12 @@ class PtyViewerController:
         # here / to FCM, exactly like the -p send path does. Raw PTY keystrokes
         # never set this otherwise, so without it fire_ephemeral falls to the
         # legacy rule and an actively-connected user gets no ping.
-        if vcid:
+        #
+        # Only the CONTROLLER's device claims the origin: on a Shared-only agent
+        # a read-only viewer attaching would otherwise re-point the controller's
+        # own turn-complete ping at themselves.
+        can_drive = sess.may_drive(self.user_sub)
+        if vcid and can_drive:
             notification_manager.set_chat_turn_origin(self.user_sub, vcid, self.notify_connection_id)
 
         async def _on_pty_output(data: bytes) -> None:
@@ -156,6 +220,12 @@ class PtyViewerController:
             "type": "pty_status", "chat_id": vcid, "session_id": vsid,
             "state": "attached", "tui_theme": sess.tui_theme,
         })
+        if not can_drive:
+            # Mirroring someone else's session: watch freely, drive nothing
+            # until an explicit take-over. Announced right after "attached" so
+            # the banner is up before the scrollback replay draws.
+            self._read_only_notice_at = 0.0
+            await self._send_pty_read_only(sess)
         if scrollback:
             await self._send({
                 "type": "pty_output", "chat_id": vcid, "session_id": vsid,

@@ -17,12 +17,18 @@ def build_feature_flags() -> dict:
     allow_user_paired = task_store.get_platform_setting(
         "allow_user_paired_machines",
     )
+    import config
     return {
         "allow_user_paired_machines": (allow_user_paired or "") != "0",
         "remote_machines_available": satellite_source_available(),
         # Mirrors the global interactive kill-switch so the dashboard hides
         # the interactive-terminal toggles when sessions always run headless.
         "interactive_terminal_enabled": execution_mode.is_interactive_enabled(),
+        # Operator-tunable size caps (OTODOCK_MAX_FILE_MB / RECOVER_BIN_MAX_MB)
+        # so upload pickers and delete warnings reflect THIS install's limits;
+        # the client falls back to the shipped defaults when absent.
+        "upload_max_bytes": config.MAX_UPLOAD_SIZE_BYTES,
+        "recover_bin_max_bytes": config.RECOVER_BIN_MAX_BYTES,
     }
 
 

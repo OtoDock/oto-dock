@@ -169,6 +169,7 @@ def test_all_keys_always_present():
     """Every call returns the full set of OTO_* keys, even if some are empty."""
     expected_keys = {
         "OTO_AGENT_NAME", "OTO_USERNAME", "OTO_SCOPE", "OTO_ROLE",
+        "OTO_PLATFORM_ROLE",
         "OTO_SESSION_ID",
         "OTO_USER_SUB",
         "OTO_WORKSPACE_DIR", "OTO_USER_ROOT",
@@ -192,6 +193,24 @@ def test_all_keys_always_present():
             agent_name="b", username=username, user_role=role, session_id="s",
         )
         assert set(env.keys()) == expected_keys
+
+
+def test_platform_role_is_independent_of_agent_role():
+    """OTO_PLATFORM_ROLE carries admin/creator/member; OTO_ROLE stays per-agent.
+
+    Agent creation gates on the PLATFORM role, which the per-agent role can't
+    express (a per-agent manager may be a platform member).
+    """
+    env = build_oto_env(
+        agent_name="bot", username="alice", user_role="manager",
+        platform_role="creator", session_id="s",
+    )
+    assert env["OTO_PLATFORM_ROLE"] == "creator"
+    assert env["OTO_ROLE"] == "manager"
+
+    # Agent-scope service sessions have no human identity → empty.
+    env = build_oto_env(agent_name="bot", username="", user_role="manager", session_id="s")
+    assert env["OTO_PLATFORM_ROLE"] == ""
 
 
 def test_memory_env_resolution():

@@ -286,6 +286,29 @@ export function useChatStream(options: UseChatStreamOptions) {
       options.onChatMoved?.(data)
     },
 
+    onEngineSwitched: (data) => {
+      // Same staleness rule as onChatMoved — the frame also arrives via a
+      // per-user broadcast, so a sibling tab viewing another chat drops it.
+      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
+        return
+      }
+      options.onEngineSwitched?.(data)
+    },
+
+    onSwitchEngineDenied: (data) => {
+      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
+        return
+      }
+      options.onSwitchEngineDenied?.(data)
+    },
+
+    onLiveness: (data) => {
+      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
+        return
+      }
+      options.onLiveness?.(data)
+    },
+
     onChatHistory: (data) => {
       // Discard stale chat_history events from a previously-resumed chat/run.
       if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {

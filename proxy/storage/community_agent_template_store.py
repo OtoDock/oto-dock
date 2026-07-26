@@ -86,6 +86,16 @@ class McpRequirement:
 
 
 @dataclass
+class SkillPackageRequirement:
+    """One standalone community skill package the template needs
+    (``skills.json`` → ``required[]``). ``skills`` selects ids within the
+    package; empty = all of the package's skills default-on — mirroring
+    ``McpRequirement.skills`` for MCP-bundled skills."""
+    name: str
+    skills: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CommunityAgentTemplate:
     """Parsed + validated template directory."""
 
@@ -111,6 +121,13 @@ class CommunityAgentTemplate:
     # v3: per-agent default scope for memory / tasks / notifications /
     # triggers / meetings. Reads from manifest's optional ``default_scope``
     # field; defaults to "user" if unset.
+    # Per-user onboarding file (user-setup.md): seeded into each user's
+    # context/ on attach; completed (deleted) per user via
+    # complete_setup(scope="user"). May coexist with the agent-scope setup.md.
+    user_setup_md: str | None = None
+    # Standalone skill packages (skills.json) — installed from the skills
+    # catalog and assigned to the agent at install time.
+    skill_packages: list[SkillPackageRequirement] = field(default_factory=list)
     default_scope: str = "user"
     # Visibility-modes: with ``default_scope`` selects the agent's mode
     # (Personal+shared / Shared+personal / Personal only / Shared only).
@@ -123,6 +140,15 @@ class CommunityAgentTemplate:
     # persisted column ``agents.default_for_new_users_role`` is the active
     # value at runtime.
     default_for_new_users: dict = field(default_factory=dict)
+    # Core-MCP opt-out. "all" (default): the installer assigns the platform's
+    # full core set on top of ``mcps.json`` — templates never LIST core MCPs,
+    # so each platform fills in ITS OWN core set (a private install carries
+    # core MCPs the public catalog couldn't even name). "none": the agent
+    # gets ONLY what ``mcps.json`` lists (possibly nothing) — for
+    # single-purpose agents like a phone caller persona. Platforms ≤1.4.0
+    # ignore the field (their loader drops unknown keys), so a "none"
+    # template installs there with the old behavior.
+    core_mcps: str = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +158,10 @@ class CommunityAgentTemplate:
 def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
     """Parse, validate, and return one template.
 
-    Required files: ``agent.json``, ``prompt.md``, ``mcps.json``, ``README.md``.
-    Optional: ``tasks.json``, ``triggers.json``, ``notifications.json``,
-    ``setup.md``, ``context/``.
+    Required files: ``agent.json``, the persona (``agent.md``, or its pre-1.4
+    name ``prompt.md`` — ``agent.md`` wins when both exist), ``mcps.json``,
+    ``README.md``. Optional: ``tasks.json``, ``triggers.json``,
+    ``notifications.json``, ``skills.json``, ``setup.md``, ``user-setup.md``, ``context/``.
 
     Raises ``TemplateValidationError`` on any schema violation.
     """
@@ -142,7 +169,15 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
         raise TemplateValidationError(f"Template dir not found: {template_dir}")
 
     agent_json = _load_required_json(template_dir / "agent.json")
-    prompt_md = _load_required_text(template_dir / "prompt.md")
+    persona_path = template_dir / "agent.md"
+    if not persona_path.is_file():
+        persona_path = template_dir / "prompt.md"
+    if not persona_path.is_file():
+        raise TemplateValidationError(
+            f"Missing required file: {template_dir / 'agent.md'} "
+            "(or its pre-1.4 name prompt.md)"
+        )
+    prompt_md = _load_required_text(persona_path)
     mcps_json = _load_required_json(template_dir / "mcps.json")
     readme_md = _load_required_text(template_dir / "README.md")
 
@@ -155,6 +190,12 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
     triggers_path = template_dir / "triggers.json"
     triggers = _parse_triggers_json(_load_optional_json(triggers_path)) if triggers_path.is_file() else []
 
+    skills_path = template_dir / "skills.json"
+    skill_packages = (
+        _parse_skills_json(_load_optional_json(skills_path))
+        if skills_path.is_file() else []
+    )
+
     notifications_path = template_dir / "notifications.json"
     notifications = (
         _parse_notifications_json(_load_optional_json(notifications_path))
@@ -164,6 +205,16 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
 
     setup_path = template_dir / "setup.md"
     setup_md = setup_path.read_text(encoding="utf-8") if setup_path.is_file() else None
+
+    # Per-user onboarding: seeded into each user's context/ on attach and
+    # completed (deleted) per user via complete_setup(scope="user"). May
+    # coexist with the agent-scope setup.md (its presence IS the declaration
+    # — no manifest flag).
+    user_setup_path = template_dir / "user-setup.md"
+    user_setup_md = (
+        user_setup_path.read_text(encoding="utf-8")
+        if user_setup_path.is_file() else None
+    )
 
     context_dir = template_dir / "context"
     context_files: dict[str, str] = {}
@@ -177,6 +228,12 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
     if raw_default_scope not in ("user", "agent"):
         raise TemplateValidationError(
             f"default_scope must be 'user' or 'agent', got {raw_default_scope!r}"
+        )
+
+    raw_core_mcps = agent_json.get("core_mcps", "all") or "all"
+    if raw_core_mcps not in ("all", "none"):
+        raise TemplateValidationError(
+            f"core_mcps must be 'all' or 'none', got {raw_core_mcps!r}"
         )
 
     default_for_new_users = _parse_default_for_new_users(
@@ -196,11 +253,14 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
         triggers=triggers,
         notifications=notifications,
         setup_md=setup_md,
+        user_setup_md=user_setup_md,
+        skill_packages=skill_packages,
         context_files=context_files,
         source_dir=template_dir.resolve(),
         default_scope=raw_default_scope,
         collaborative=bool(agent_json.get("collaborative", True)),
         default_for_new_users=default_for_new_users,
+        core_mcps=raw_core_mcps,
     )
 
 
@@ -445,6 +505,35 @@ def _parse_mcps_json(data: dict[str, Any]) -> list[McpRequirement]:
         result.append(McpRequirement(
             name=name,
             min_version=raw.get("min_version"),
+            skills=[str(s) for s in skills],
+        ))
+    return result
+
+
+def _parse_skills_json(data: dict[str, Any]) -> list[SkillPackageRequirement]:
+    if not isinstance(data, dict):
+        raise TemplateValidationError("skills.json: top-level must be an object")
+    required = data.get("required") or []
+    if not isinstance(required, list):
+        raise TemplateValidationError("skills.json: 'required' must be a list")
+    result: list[SkillPackageRequirement] = []
+    for idx, raw in enumerate(required):
+        if not isinstance(raw, dict):
+            raise TemplateValidationError(
+                f"skills.json: required[{idx}] must be an object"
+            )
+        name = raw.get("name")
+        if not name or not isinstance(name, str):
+            raise TemplateValidationError(
+                f"skills.json: required[{idx}].name must be a non-empty string"
+            )
+        skills = raw.get("skills") or []
+        if not isinstance(skills, list):
+            raise TemplateValidationError(
+                f"skills.json: required[{idx}].skills must be a list"
+            )
+        result.append(SkillPackageRequirement(
+            name=name,
             skills=[str(s) for s in skills],
         ))
     return result

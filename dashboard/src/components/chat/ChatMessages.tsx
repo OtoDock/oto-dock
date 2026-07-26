@@ -9,6 +9,10 @@ import ErrorBoundary from '../ErrorBoundary'
 interface Props {
   messages: DisplayMessage[]
   agentName?: string
+  // The page agent's CURRENT display name (from AgentChat's already-loaded
+  // agent record) — useAgents() is undefined during the cold-load round-trip,
+  // so resolving it here from the hook would paint the slug-cased name first.
+  agentDisplayName?: string
   agentColor?: string
   chatId?: string
   onPermissionRespond: (requestId: string, approved: boolean) => void
@@ -50,6 +54,10 @@ const SCROLL_SETTLE_MS = 120
 // content churn during streaming (reseeds, image loads) can transiently clamp
 // scrollTop near 0 and must never yank a reading viewport back to the bottom.
 const GESTURE_RESTICK_WINDOW_MS = 3000
+// A pointer interaction this recent means a Collabora focus grab was
+// user-initiated (refresh/fullscreen click, tap on the preview) — the
+// focus-steal guard must not fight it.
+const FOCUS_GUARD_POINTER_MS = 1500
 
 // --- Helpers ---
 
@@ -126,6 +134,7 @@ function ScrollToBottomButton({ onClick }: { onClick: () => void }) {
 export default function ChatMessages({
   messages,
   agentName,
+  agentDisplayName,
   agentColor,
   chatId,
   onPermissionRespond,
@@ -196,6 +205,12 @@ export default function ChatMessages({
   const upIntentRef = useRef(0)
   const lastGestureAtRef = useRef(0)
   const lastTouchYRef = useRef<number | null>(null)
+  // Collabora focus-steal guard state. lastPointerAtRef is deliberately
+  // SEPARATE from lastGestureAtRef: the gesture ref feeds the streaming
+  // re-stick window and must stay wheel/touch-move only.
+  const lastPointerAtRef = useRef(0)
+  const lastPointerTargetRef = useRef<EventTarget | null>(null)
+  const lastSettledScrollTopRef = useRef(0)
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -280,6 +295,7 @@ export default function ChatMessages({
     const onSettle = () => {
       const c = containerRef.current
       if (!c) return
+      lastSettledScrollTopRef.current = c.scrollTop
       const st = Math.abs(c.scrollTop)
       setShowScrollBtn(st >= SCROLL_BTN_SHOW_PX)
       const gestureRecent = Date.now() - lastGestureAtRef.current < GESTURE_RESTICK_WINDOW_MS
@@ -318,12 +334,48 @@ export default function ChatMessages({
     }
   }, [])
 
+  // Collabora focus-steal guard: COOL focuses its editing surface when its
+  // iframe boots, and the browser then scrolls every ancestor to reveal the
+  // frame — in flex-col-reverse that yanks the viewport UP to a preview,
+  // seconds after opening a history page (frames boot lazily). By the time
+  // focusin fires the scroll has already happened, so the guard restores the
+  // tracked settled position — unless a pointer interaction preceded the
+  // focus (a deliberate click must win; slow boots after a refresh click are
+  // covered by the same-host check). Only `[data-collabora-frame]` is
+  // guarded: inline UiArtifact iframes carry legitimate interactive content.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onPointer = (e: Event) => {
+      lastPointerAtRef.current = Date.now()
+      lastPointerTargetRef.current = e.target
+    }
+    const onFocusIn = (e: FocusEvent) => {
+      const target = e.target
+      if (!(target instanceof Element) || !target.matches('[data-collabora-frame]')) return
+      if (Date.now() - lastPointerAtRef.current < FOCUS_GUARD_POINTER_MS) return
+      const host = target.closest('[data-collabora-host]')
+      const pointerTarget = lastPointerTargetRef.current
+      if (host && pointerTarget instanceof Node && host.contains(pointerTarget)) return
+      el.scrollTop = lastSettledScrollTopRef.current
+    }
+    el.addEventListener('pointerdown', onPointer, { capture: true })
+    el.addEventListener('touchstart', onPointer, { capture: true, passive: true })
+    el.addEventListener('focusin', onFocusIn)
+    return () => {
+      el.removeEventListener('pointerdown', onPointer, { capture: true })
+      el.removeEventListener('touchstart', onPointer, { capture: true })
+      el.removeEventListener('focusin', onFocusIn)
+    }
+  }, [])
+
   // onScroll: only used for scroll button visibility when NOT streaming.
   // During streaming, the wheel/touch handlers + settle detection above manage
   // everything (content growth fires spurious scroll events here).
   const handleScroll = useCallback(() => {
     const el = containerRef.current
     if (!el) return
+    lastSettledScrollTopRef.current = el.scrollTop
     if (streamingRef.current) return  // Skip — gesture + settle handlers own streaming
     const atBottom = Math.abs(el.scrollTop) < NEAR_BOTTOM_IDLE_PX
     if (atBottom) {
@@ -473,6 +525,7 @@ export default function ChatMessages({
           const { hiddenToolIdx, bgPairs } = pairBgCommandBlocks(msg.blocks)
           const msgSlug = msg.agentSlug || agentName
           const displayName = msg.agentDisplayName
+            || (msgSlug === agentName ? agentDisplayName : undefined)
             || (msgSlug ? msgSlug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'Assistant')
           const initial = (msgSlug || 'A').charAt(0).toUpperCase()
           const avatarBg = msg.agentColor || agentColor || ''

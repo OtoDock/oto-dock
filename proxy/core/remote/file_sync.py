@@ -10,8 +10,12 @@ import fnmatch
 import hashlib
 import logging
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+
+import config
 
 logger = logging.getLogger("claude-proxy.file-sync")
 
@@ -21,7 +25,15 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", ".cache", ".mypy_ca
 # specially (see the delete-attribution guard in _resolve_merge).
 _EMPTY_CONTENT_HASH = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 MAX_CHUNK_SIZE = 512 * 1024  # 512KB per chunk
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB cap on individual files (chunked push/pull handles large media)
+# Cap on individual files entering sync (manifest + push/pull legs). Config-
+# driven (OTODOCK_MAX_FILE_MB); satellites receive the same value in the
+# auth_result policy handshake. Pre-0.5.103 satellites are hard-capped at
+# LEGACY_SYNC_MAX_FILE_BYTES — the per-machine gate lives in
+# satellite_connection.effective_sync_cap, and compute_manifest takes a
+# max_file_size override so old machines' merge plans never contain files
+# they would reject.
+LEGACY_SYNC_MAX_FILE_BYTES = 100 * 1024 * 1024
+MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 
 # Dotted directories that ARE included in the manifest despite starting
 # with ``.``. The default ``not d.startswith(".")`` filter would drop
@@ -301,6 +313,7 @@ def compute_manifest(
     target_username: str | None = None,
     target_role: str = "",
     exclude_user_dirs: bool = False,
+    max_file_size: int | None = None,
 ) -> list[FileEntry]:
     """Compute file manifest for an agent directory.
 
@@ -324,10 +337,15 @@ def compute_manifest(
             for editor/viewer sessions. ``""`` = no role filter (default;
             agent-scope sessions inherit this behavior — config is not
             relevant to them either).
+        max_file_size: Per-file byte cap override. Pass the target machine's
+            ``effective_sync_cap`` so a pre-0.5.103 satellite's merge plan
+            never contains a file it would reject at 100MB. None = the
+            config-driven ``MAX_FILE_SIZE``.
     """
     entries = []
     if not agent_dir.exists():
         return entries
+    size_cap = max_file_size or MAX_FILE_SIZE
 
     for root, dirs, files in os.walk(agent_dir):
         # Skip heavy / unwanted dirs. Hidden dirs are skipped UNLESS in
@@ -393,14 +411,14 @@ def compute_manifest(
                 if file_path.is_symlink():
                     continue
                 stat = file_path.stat()
-                # Skip very large files (> MAX_FILE_SIZE).
-                if stat.st_size > MAX_FILE_SIZE:
+                # Skip very large files (> the effective per-file cap).
+                if stat.st_size > size_cap:
                     logger.warning(
                         "Skipping %s in manifest: %.1f MB exceeds %d MB limit",
-                        rel_path, stat.st_size / 1024 / 1024, MAX_FILE_SIZE // 1024 // 1024,
+                        rel_path, stat.st_size / 1024 / 1024, size_cap // 1024 // 1024,
                     )
                     continue
-                file_hash = _hash_file(file_path)
+                file_hash = _hash_file_cached(file_path, stat)
                 entries.append(FileEntry(
                     path=rel_path,
                     hash=file_hash,
@@ -451,7 +469,7 @@ def _is_other_user_or_sensitive(rel_path: str, target_username: str) -> bool:
 
 
 # Default platform-authoritative dir PREFIX (matched via str.startswith).
-# `config/` is owner-authored agent behaviour (prompt.md, context/ docs)
+# `config/` is owner-authored agent behaviour (agent.md, context/ docs)
 # — STATIC: written at install + owner edits, NOT regenerated per
 # session. (Memory lives under knowledge/ + users/, not here.) By default it's pushed DOWN to satellites (and satellite-only
 # extras scrubbed), but an owner-tier session (manager/admin WITH a username —
@@ -1086,10 +1104,76 @@ def apply_incoming_file(
             raise
 
 
+def pull_timeout_for_size(size_bytes: int) -> float:
+    """Overall pull deadline scaled to the file size (256KB/s floor): a 1GB
+    pull on a slow link must not die at the old fixed 180s. Callers pass this
+    when the remote side told them the size (file_changed msg / manifest)."""
+    return max(180.0, size_bytes / (256 * 1024))
+
+
 def _hash_file(path: Path) -> str:
-    """Compute sha256 hash of a file."""
+    """Compute sha256 hash of a file (streamed — memory-bounded at any size)."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        while chunk := f.read(8192):
+        while chunk := f.read(1024 * 1024):
             h.update(chunk)
     return f"sha256:{h.hexdigest()}"
+
+
+# (path → (size, mtime_ns, hash)) LRU so repeated manifest passes never re-hash
+# unchanged files — at the 1GB cap a single re-hash is seconds of CPU+IO, and
+# manifests run every sync cycle. Thread-safe: compute_manifest runs inside
+# asyncio.to_thread, potentially concurrently for several machines.
+_HASH_CACHE: OrderedDict[str, tuple[int, int, str]] = OrderedDict()
+_HASH_CACHE_MAX = 50_000
+_hash_cache_lock = threading.Lock()
+# Git's "racily clean" rule: filesystem mtime granularity is the kernel tick
+# (can be milliseconds), so two same-size writes inside one tick are
+# indistinguishable by (size, mtime_ns). Never TRUST a cache hit for a file
+# modified within this window — re-hash it; entries older than the window are
+# provably keyed by a settled mtime.
+_HASH_CACHE_RACY_WINDOW_S = 2.0
+
+
+def _hash_file_cached(path: Path, st: os.stat_result) -> str:
+    """``_hash_file`` with a (size, mtime_ns) validity check against the LRU."""
+    import time as _time
+    key = str(path)
+    racy = (_time.time() - st.st_mtime) < _HASH_CACHE_RACY_WINDOW_S
+    if not racy:
+        with _hash_cache_lock:
+            hit = _HASH_CACHE.get(key)
+            if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+                _HASH_CACHE.move_to_end(key)
+                return hit[2]
+    file_hash = _hash_file(path)
+    try:
+        st2 = os.stat(path)
+    except OSError:
+        return file_hash
+    # TOCTOU guard: only cache when the file provably didn't change under the
+    # streaming read — otherwise the hash may be of a torn intermediate state.
+    # (Caching a racy-fresh entry is fine — reads inside the racy window
+    # bypass the cache anyway.)
+    if st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns:
+        with _hash_cache_lock:
+            _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, file_hash)
+            _HASH_CACHE.move_to_end(key)
+            while len(_HASH_CACHE) > _HASH_CACHE_MAX:
+                _HASH_CACHE.popitem(last=False)
+    return file_hash
+
+
+def prime_hash_cache(path: Path, file_hash: str) -> None:
+    """Record a KNOWN-good hash for a file the caller just wrote (e.g. a
+    committed pull whose sha256 was verified) so the next manifest pass never
+    re-hashes it. Best-effort: a failed stat simply skips the prime."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    with _hash_cache_lock:
+        _HASH_CACHE[str(path)] = (st.st_size, st.st_mtime_ns, file_hash)
+        _HASH_CACHE.move_to_end(str(path))
+        while len(_HASH_CACHE) > _HASH_CACHE_MAX:
+            _HASH_CACHE.popitem(last=False)

@@ -613,12 +613,24 @@ class WarmupController:
             # (returns '','') when nothing is pending.
             seed_digest = ""
             seed_notice = ""
+            # The reason we claimed, for restore-on-failure: the claim happens
+            # BEFORE the spawn try-block, so a failed spawn (offline satellite,
+            # missing CLI after an engine switch, config error) would otherwise
+            # BURN the seed — the eventual successful warmup then starts the
+            # fresh session with no history digest at all. Captured pre-claim
+            # (the claim clears the column and doesn't return the raw reason).
+            seed_reason_claimed = ""
             if wants_interactive:
+                _pre_claim_reason = (
+                    (task_store.get_chat(wcid) or {}).get("pending_history_seed") or ""
+                )
                 # Smaller cap than the -p path (48k): the digest is bracketed-pasted
                 # into the live TUI, so keep it light to render fast (well under the
                 # Enter backstop) — build_history_seed is newest-biased, so this
                 # keeps the most recent context.
                 seed_digest, seed_notice = consume_pending_seed_digest(wcid, max_chars=16_000)
+                if seed_notice:
+                    seed_reason_claimed = _pre_claim_reason
             # A reseeded prompt's digest is multi-line → keep it off Codex's launch
             # argv (Windows cmdline limit + structure loss); it's pasted via the PTY.
             argv_first_prompt = "" if seed_digest else msg.get("text", "")
@@ -869,6 +881,9 @@ class WarmupController:
                 # admin OAuth in the pool). Surface the friendly message + a
                 # machine-readable reason — it's a configuration state, not a crash.
                 logger.info(f"WS dashboard warmup blocked (no subscription, reason={e.reason}) chat={wcid}")
+                if seed_reason_claimed:
+                    task_store.update_chat(
+                        wcid, pending_history_seed=seed_reason_claimed)
                 await warmup_registry.emit(wcid, {
                     "type": "warmup_failed",
                     "chat_id": wcid,
@@ -877,6 +892,14 @@ class WarmupController:
                 })
             except Exception as e:
                 logger.error(f"WS dashboard warmup failed: {e}", exc_info=True)
+                # Failed spawn — un-burn the claimed history seed so the next
+                # (successful) warmup still restores context. The claim already
+                # persisted its "Continued with a fresh session" card; a rare
+                # second card on the retry is accepted (two restart attempts).
+                if seed_reason_claimed:
+                    with contextlib.suppress(Exception):
+                        task_store.update_chat(
+                            wcid, pending_history_seed=seed_reason_claimed)
                 # Classify so the UI distinguishes a genuinely-offline/unreachable
                 # remote target ("Remote machine unavailable") from a session that
                 # FAILED TO START on a reachable machine (a config/spawn error,

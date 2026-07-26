@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useTheme } from '../../../contexts/ThemeContext'
 import { onFileUpdate } from '../../../lib/fileUpdates'
 import { emitIframeSwipe } from '../../../lib/iframeGestures'
+import { hasUserActivation, openExternalUrl, validateBridgedUrl } from '../../../lib/openExternal'
 import FilePreviewPortal from '../../workspace/FilePreviewPortal'
 
 /**
@@ -44,6 +45,18 @@ function consentKey(path: string | undefined, token: string): string {
   return `otodock-artifact-consent:${path || token}`
 }
 
+// open_url consent is stored separately from the backchannel consent — a
+// user happy to receive chat interactions has said nothing about opening
+// external tabs (and vice versa).
+function openUrlConsentKey(path: string | undefined, token: string): string {
+  return `otodock-artifact-openurl:${path || token}`
+}
+
+// Per-frame open_url burst guard (secondary to the activation requirement —
+// postMessage carries no gesture signal, so this stays unconditional).
+const OPEN_URL_BURST = 3
+const OPEN_URL_WINDOW_MS = 10_000
+
 function readConsent(key: string): Consent {
   try {
     const v = localStorage.getItem(key)
@@ -84,10 +97,14 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   const rafRef = useRef(0)
   const pendingHRef = useRef<number | null>(null)
 
-  // --- Backchannel (otodock.send → chat) ---
-  const [consentPrompt, setConsentPrompt] = useState(false)
+  // --- Backchannel (otodock.send → chat) + open_url bridge ---
+  const [consentPrompt, setConsentPrompt] = useState<
+    null | { kind: 'action' } | { kind: 'open_url'; origin: string }
+  >(null)
   const chipRef = useRef<HTMLDivElement | null>(null)
   const pendingActionRef = useRef<{ win: Window; payload: unknown } | null>(null)
+  const pendingOpenRef = useRef<{ win: Window; url: string } | null>(null)
+  const openTimesRef = useRef<number[]>([])
   const lastSendAtRef = useRef(0)
   const onInteractionRef = useRef(onInteraction)
   onInteractionRef.current = onInteraction
@@ -99,6 +116,21 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
         '*',
       )
     } catch { /* frame gone */ }
+  }
+
+  const openAck = (win: Window, status: string, reason?: string) => {
+    try {
+      win.postMessage(
+        { source: 'otodock-host', type: 'open_url_ack', status, ...(reason ? { reason } : {}) },
+        '*',
+      )
+    } catch { /* frame gone */ }
+  }
+
+  const deliverOpen = async (win: Window, url: string) => {
+    const r = await openExternalUrl(url)
+    if (r === 'opened') openAck(win, 'opened')
+    else openAck(win, 'blocked', 'popup blocked — try again')
   }
 
   const deliverAction = async (win: Window, payload: unknown) => {
@@ -137,16 +169,36 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
         }
         return
       }
+      if (d.type === 'open_url') {
+        // Links bridged out of the sandbox: validate (http(s), never
+        // same-origin), require a real user gesture (activation propagates
+        // from the child's click and cannot be forged by the page), burst-
+        // guard, then first-use consent showing the destination ORIGIN.
+        const v = validateBridgedUrl(d.url)
+        if ('error' in v) return openAck(win!, 'denied', v.error)
+        if (!hasUserActivation()) return openAck(win!, 'denied', 'no user gesture')
+        const now = Date.now()
+        const times = openTimesRef.current.filter((t) => now - t < OPEN_URL_WINDOW_MS)
+        openTimesRef.current = times
+        if (times.length >= OPEN_URL_BURST) return openAck(win!, 'denied', 'rate limited')
+        times.push(now)
+        const urlConsent = readConsent(openUrlConsentKey(path, token))
+        if (urlConsent === 'blocked') return openAck(win!, 'blocked')
+        if (urlConsent === 'allowed') { void deliverOpen(win!, v.url); return }
+        pendingOpenRef.current = { win: win!, url: v.url }
+        setConsentPrompt({ kind: 'open_url', origin: v.origin })
+        return
+      }
       if (d.type !== 'action') return
       if (!onInteractionRef.current) return ackTo(win!, 'unavailable', 'not available in this view')
       // Consent is read per interaction, not cached at mount — a grant or
       // block from another tab/instance of the same artifact is honored here.
       const consent = readConsent(consentKey(path, token))
-      if (consent === 'blocked') { setConsentPrompt(false); return ackTo(win!, 'blocked') }
-      if (consent === 'allowed') { setConsentPrompt(false); void deliverAction(win!, d.payload); return }
+      if (consent === 'blocked') { setConsentPrompt(null); return ackTo(win!, 'blocked') }
+      if (consent === 'allowed') { setConsentPrompt(null); void deliverAction(win!, d.payload); return }
       // First use: hold the LATEST payload behind the consent chip.
       pendingActionRef.current = { win: win!, payload: d.payload }
-      setConsentPrompt(true)
+      setConsentPrompt({ kind: 'action' })
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
@@ -154,9 +206,22 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   }, [token, path])
 
   const resolveConsent = (allow: boolean) => {
+    const ask = consentPrompt
+    if (!ask) return
     const consent: Consent = allow ? 'allowed' : 'blocked'
-    try { localStorage.setItem(consentKey(path, token), consent) } catch { /* private mode */ }
-    setConsentPrompt(false)
+    const key = ask.kind === 'open_url'
+      ? openUrlConsentKey(path, token)
+      : consentKey(path, token)
+    try { localStorage.setItem(key, consent) } catch { /* private mode */ }
+    setConsentPrompt(null)
+    if (ask.kind === 'open_url') {
+      const pending = pendingOpenRef.current
+      pendingOpenRef.current = null
+      if (!pending) return
+      if (allow) void deliverOpen(pending.win, pending.url)
+      else openAck(pending.win, 'blocked')
+      return
+    }
     const pending = pendingActionRef.current
     pendingActionRef.current = null
     if (!pending) return
@@ -181,7 +246,11 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
     <div className="sticky top-2 z-10 mx-2 h-0" data-testid="ui-consent-chip">
       <div ref={chipRef} className="flex flex-wrap items-center gap-2 rounded-lg border border-p-border-light/60 bg-white/95 px-3 py-2 text-xs shadow-md backdrop-blur-sm dark:bg-p-surface/95">
         <span className="text-p-text-secondary">
-          This artifact wants to send an interaction to the chat.
+          {consentPrompt?.kind === 'open_url' ? (
+            <>This artifact wants to open <span className="font-medium text-p-text">{consentPrompt.origin}</span> in a new tab.</>
+          ) : (
+            'This artifact wants to send an interaction to the chat.'
+          )}
         </span>
         <span className="ml-auto flex gap-1.5">
           <button

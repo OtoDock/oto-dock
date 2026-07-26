@@ -117,3 +117,57 @@ async def test_failed_start_tears_down_in_owner_task(monkeypatch):
     assert streams_cm.exit_task is streams_cm.enter_task
     assert session_cm.exit_task is session_cm.enter_task
     assert conn.tools == []
+
+
+@pytest.mark.asyncio
+async def test_http_type_alias_uses_streamable_transport(monkeypatch):
+    # The registry's Claude-JSON format spells streamable HTTP as "http" —
+    # the connection must treat it as the same transport, not an unknown type.
+    streams_cm = _RecordingCM((object(), object(), object()))
+    session_cm = _RecordingCM(_FakeSession())
+    monkeypatch.setattr(mcpmod, "streamablehttp_client", lambda url, headers=None: streams_cm)
+    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
+
+    conn = mcpmod.MCPServerConnection(
+        "sidecar", {"type": "http", "url": "http://example.invalid/mcp"},
+        session_id="s4",
+    )
+    await conn.start()
+    assert conn.session is not None
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_http_servers_gated_to_opted_in_managers(tmp_path, monkeypatch):
+    # Sidecar HTTP MCPs are app-exec-only: a default manager (Direct-LLM chat)
+    # skips them; a manager that opted in (headless_exec) starts them.
+    import json as _json
+
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(_json.dumps({"mcpServers": {
+        "sidecar": {"type": "http", "url": "http://example.invalid/mcp"},
+        "local": {"command": "true"},
+    }}))
+
+    class _FakeConn:
+        def __init__(self, name, config, **kw):
+            self.name = name
+            self.config = config
+            self.tools = []
+            self.dead = False
+
+        async def start(self):
+            pass
+
+    monkeypatch.setattr(mcpmod, "MCPServerConnection", _FakeConn)
+
+    mgr = mcpmod.AgentMCPManager(
+        "agent-x", session_id="s-gate", prebuilt_config=(cfg, {}))
+    await mgr._start_impl()
+    assert set(mgr.servers) == {"local"}
+
+    mgr2 = mcpmod.AgentMCPManager(
+        "agent-x", session_id="s-gate2", prebuilt_config=(cfg, {}),
+        enable_http_transport=True)
+    await mgr2._start_impl()
+    assert set(mgr2.servers) == {"sidecar", "local"}

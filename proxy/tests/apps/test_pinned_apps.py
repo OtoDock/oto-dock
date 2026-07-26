@@ -291,11 +291,19 @@ def test_serve_app_wraps_with_app_runtime(agent_tree):
     assert "window.otodock.action = function" in r.text  # app extension
 
 
-def test_serve_app_full_document_verbatim(agent_tree):
+def test_serve_app_full_document_gets_runtime_injected(agent_tree):
+    # Full-document mini-apps keep their own markup but the byte-static
+    # runtime (incl. the APP action extension) lands before </body> — a
+    # full-document app otherwise silently loses actions, feeds and links.
     doc = "<!doctype html><html><body>raw</body></html>"
     app_id = _pin({"slug": "raw", "html": doc}).json()["app_id"]
     r = client.get(f"/v1/apps/{app_id}/html")
-    assert r.status_code == 200 and r.text == doc
+    assert r.status_code == 200
+    assert "raw" in r.text
+    assert "window.otodock = { send:" in r.text          # base runtime
+    assert "window.otodock.action = function" in r.text  # app extension
+    assert "otodock-tokens.css" not in r.text            # still opts out of kit
+    assert r.text.index("window.otodock") < r.text.index("</body>")
     _csp_ok(r)
 
 

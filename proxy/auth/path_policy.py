@@ -232,6 +232,59 @@ def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
     return raw_path
 
 
+def _session_cwd_anchor(ctx: SecurityContext) -> Path:
+    """Host equivalent of the sandbox session cwd — ``/users/{u}`` for user
+    mounts, ``/workspace`` for agent-scope (sandbox.get_cwd pins these)."""
+    agent_dir = _AGENTS_DIR / ctx.agent
+    if ctx.mount_username:
+        return agent_dir / "users" / ctx.mount_username
+    return agent_dir / "workspace"
+
+
+def _resolve_candidates(raw_path: str, ctx: SecurityContext) -> list[Path]:
+    """Host-path candidates for one tool path argument.
+
+    A RELATIVE path is what the tool will resolve against the sandbox
+    session cwd — ``base64 'workspace/downloads/x'`` in local Bash reads
+    ``/users/{u}/workspace/downloads/x`` — so that anchor comes first. The
+    historical agents-relative anchor stays as the second candidate: it is
+    what resolves the display form ("<slug>/users/…") and must not break.
+    Each candidate is checked independently by the caller; the sandbox
+    mount, not this hook, is the hard local boundary.
+    """
+    translated = _translate_sandbox_path(raw_path, ctx)
+    primary = _resolve_path(translated)
+    if (
+        translated != raw_path
+        or raw_path.startswith("~")
+        or Path(raw_path).is_absolute()
+    ):
+        return [primary]
+    cwd_anchored = (_session_cwd_anchor(ctx) / raw_path).resolve()
+    if cwd_anchored == primary:
+        return [primary]
+    return [cwd_anchored, primary]
+
+
+def _check_path_arg(
+    raw_path: str, ctx: SecurityContext, *, writing: bool,
+) -> PathDecision:
+    """Role-check one tool path argument across its resolution candidates.
+    Allows when any candidate passes; a denial reports the cwd-anchored
+    interpretation (the one the tool actually accesses)."""
+    first: PathDecision | None = None
+    for cand in _resolve_candidates(raw_path, ctx):
+        decision = (
+            _check_write_path(cand, ctx) if writing
+            else _check_read_path(cand, ctx)
+        )
+        if decision.allowed:
+            return decision
+        if first is None:
+            first = decision
+    return first or PathDecision(False, "path could not be resolved")
+
+
 def _is_other_users_dir(resolved: Path, username: str) -> bool:
     """Return True if path is inside another user's directory.
 
@@ -771,18 +824,15 @@ def check_tool_access(
             return _ALLOW, new_plan
 
         if tool_name in _READ_TOOLS:
-            return _check_read_path(resolved, ctx), None
-        return _check_write_path(resolved, ctx), None
+            return _check_path_arg(raw_path, ctx, writing=False), None
+        return _check_path_arg(raw_path, ctx, writing=True), None
 
     # Search tools (Glob, Grep) — use 'path' key, optional
     if tool_name in _SEARCH_PATH_TOOLS:
         raw_path = tool_input.get("path", "")
         if not raw_path:
             return _ALLOW, None  # defaults to cwd, within scope
-        translated = _translate_sandbox_path(raw_path, ctx)
-        resolved = _resolve_path(translated)
-
-        return _check_read_path(resolved, ctx), None
+        return _check_path_arg(raw_path, ctx, writing=False), None
 
     # All other tools (Agent, TaskGet, TodoWrite, ToolSearch, etc.): allow. A
     # genuinely-unknown command-execution tool (not in the known structured set)

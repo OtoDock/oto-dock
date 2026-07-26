@@ -40,6 +40,19 @@ def test_permission_default_maps_to_workspace_write():
         assert permission_to_sandbox(mode) == "workspace-write"
 
 
+def test_full_fs_pairing_lifts_default_tier_only():
+    # A full-filesystem pairing removes Codex's own workspace confinement for
+    # the modes that would otherwise re-confine what the admin granted —
+    # matching Claude's unsandboxed behaviour on the same pairing. Plan stays
+    # read-only; the already-full tiers are unchanged.
+    for mode in ("default", "", "unknown", "acceptEdits"):
+        assert permission_to_sandbox(mode, allow_full_fs=True) == "danger-full-access"
+        assert permission_to_sandbox(mode, allow_full_fs=False) == "workspace-write"
+    assert permission_to_sandbox("plan", allow_full_fs=True) == "read-only"
+    assert permission_to_sandbox("dontAsk", allow_full_fs=True) == "danger-full-access"
+    assert permission_to_sandbox("auto", allow_full_fs=True) == "danger-full-access"
+
+
 # ---------------------------------------------------------------------------
 # map_effort_to_codex
 # ---------------------------------------------------------------------------
@@ -182,7 +195,7 @@ def test_supports_ultra_flags_match_openai_manifest():
     assert app_config.get_model_supports_ultra("gpt-5.6-sol") is True
     assert app_config.get_model_supports_ultra("gpt-5.6-terra") is True
     assert app_config.get_model_supports_ultra("gpt-5.6-luna") is False
-    assert app_config.get_model_supports_ultra("claude-opus-4-8[1m]") is False
+    assert app_config.get_model_supports_ultra("claude-opus-5") is False
     assert app_config.get_model_supports_ultra("no-such-model") is False
 
 

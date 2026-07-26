@@ -120,6 +120,16 @@ export interface WsCallbacks {
   // the chat so the fresh warmup runs there and the "moved" history card
   // arrives. Failures come as standard error frames (toasts), not this.
   onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
+  // switch_engine ack — the chat now runs on a different execution engine
+  // (cross-engine resume). Arrives on the acting socket AND via a per-user
+  // broadcast to sibling tabs — handlers must be idempotent.
+  onEngineSwitched?: (data: { chat_id: string; execution_path: string; model: string }) => void
+  // switch_engine refusal — dedicated frame (the generic error rail only
+  // renders into an open stream bubble, invisible on idle dead chats).
+  // process_alive, when present, resyncs the client's liveness belief.
+  onSwitchEngineDenied?: (data: { chat_id: string; message: string; process_alive?: boolean }) => void
+  // probe_liveness answer — lazy process_alive refresh for the bound chat.
+  onLiveness?: (data: { chat_id: string; process_alive: boolean }) => void
   // Auto-update: satellite lifecycle events broadcast to every
   // dashboard with access to the affected machine. Dispatched into
   // machineUpdateStore so the banner survives chat navigation.
@@ -145,7 +155,7 @@ export interface WsCallbacks {
   onModeChanged?: (mode: string) => void
   onModelChanged?: (model: string) => void
   onThinkingChanged?: (max_tokens: number | null) => void
-  onChatHistory?: (data: { chat_id?: string; messages: any[]; has_more?: boolean; restore?: { todos?: any[]; meeting?: { active?: boolean; participants?: any[]; max_turns?: number } | null; goal?: ThreadGoal | null }; plans?: any[]; total_cost?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; output_tokens?: number; execution_path?: string; execution_mode?: string; model?: string }) => void
+  onChatHistory?: (data: { chat_id?: string; messages: any[]; has_more?: boolean; restore?: { todos?: any[]; meeting?: { active?: boolean; participants?: any[]; max_turns?: number } | null; goal?: ThreadGoal | null }; plans?: any[]; total_cost?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; output_tokens?: number; execution_path?: string; execution_mode?: string; model?: string; process_alive?: boolean }) => void
   onQueued?: (data: { index: number; text: string }) => void
   onQueueRemoved?: (data: { index: number }) => void
   onQueueSent?: (data: { text: string }) => void

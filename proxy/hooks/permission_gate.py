@@ -60,11 +60,27 @@ def _path_note(tool_input, updated_input):
     return ""
 
 
+def _log_failure():
+    """Best-effort breadcrumb for a hook crash (see __main__ handler)."""
+    try:
+        import traceback
+        path = os.environ.get("OTO_HOOK_LOG") or os.path.join(
+            os.path.expanduser("~"), ".oto-dock", "hook-error.log"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()}\n")
+            traceback.print_exc(file=fh)
+    except Exception:
+        pass
+
+
 def main():
-    # Read hook input from stdin
+    # Read hook input from stdin. OSError: Windows pipe edge cases — treat an
+    # unreadable stdin like an empty payload rather than crashing the hook.
     try:
         inp = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, ValueError):
+    except (OSError, ValueError):
         inp = {}
 
     session_id = os.environ.get("OTO_SESSION_ID", "")
@@ -106,6 +122,14 @@ def main():
         reason = result.get("reason", "")
         updated_input = result.get("updated_input")
 
+    # "defer" = the platform has NO OPINION (interactive residual tier):
+    # emit nothing, so the CLI's own permission engine — the live Shift+Tab
+    # mode the human actually chose — governs the call. Distinct from
+    # "allow", which is a hard override that would SUPPRESS the CLI's own
+    # prompt. Denies, asks and allows still emit below.
+    if decision == "defer":
+        return
+
     # Codex's PreToolUse hook supports a DENY decision but REJECTS
     # permissionDecision:"allow" ("unsupported permissionDecision:allow"). Under
     # Codex (OTO_HOOK_DENY_ONLY=1, set on the interactive spawn) emit JSON only to
@@ -140,4 +164,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # A hook crash enforces nothing: both CLIs treat a non-zero exit as a
+        # non-blocking error and run the tool anyway, so dying loudly only adds
+        # "hook exited with code 1" noise (seen on a Windows satellite) while
+        # silently dropping the deny floor for that call. Leave a breadcrumb
+        # and exit 0. The fail-closed properties live in the JSON path — proxy
+        # unreachable still emits a deny — and are unaffected.
+        _log_failure()
+        sys.exit(0)

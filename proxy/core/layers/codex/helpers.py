@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 # Permission mode → Codex sandbox mode
 # ---------------------------------------------------------------------------
 
-def permission_to_sandbox(permission_mode: str) -> str:
+def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> str:
     """Map a platform permission mode to the Codex app-server ``SandboxMode`` enum.
 
     Valid values are exactly ``"read-only" | "workspace-write" |
@@ -27,12 +27,19 @@ def permission_to_sandbox(permission_mode: str) -> str:
     - ``plan``               → ``read-only`` (planning — reads only)
     - everything else        → ``workspace-write`` (default / acceptEdits — Codex
       has no separate auto-edit tier; in-workspace edits run, escapes prompt)
+
+    ``allow_full_fs`` is the machine pairing's full-filesystem grant
+    (``security_context.target_allow_full_fs`` — remote targets only). It
+    lifts default/acceptEdits to ``danger-full-access``: Claude runs
+    unsandboxed on such pairings and Codex's own workspace-write boundary
+    would re-confine what the admin already granted (OtoDock's permission
+    floor + path policy still gate every call). ``plan`` stays read-only.
     """
     if permission_mode in ("dontAsk", "auto"):
         return "danger-full-access"
     if permission_mode == "plan":
         return "read-only"
-    return "workspace-write"
+    return "danger-full-access" if allow_full_fs else "workspace-write"
 
 
 # The approval policy + structured turn/start sandboxPolicy live in

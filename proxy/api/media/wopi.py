@@ -16,6 +16,7 @@ from pathlib import Path
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import config
@@ -243,8 +244,11 @@ async def wopi_get_file(
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return Response(
-        content=file_path.read_bytes(),
+    # Streamed (sendfile) — Collabora re-fetches on every retry, and holding
+    # a large document (a 536MB preview, once) fully in proxy memory per
+    # fetch is what a range-capable FileResponse exists to avoid.
+    return FileResponse(
+        file_path,
         media_type="application/octet-stream",
         headers={"X-WOPI-ItemVersion": str(int(file_path.stat().st_mtime))},
     )

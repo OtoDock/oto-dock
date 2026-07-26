@@ -118,6 +118,7 @@ class TestPtyViewer:
             "context_max": 0, "cache_read": 0, "cache_write": 0,
             "output_tokens": 0, "execution_path": "claude-code-cli",
             "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+            "process_alive": True,   # live PTY in the harness
         })
         await ws.expect({
             "type": "warmup_ready", "session_id": sid, "chat_id": cid,

@@ -78,6 +78,39 @@ describe('meeting speaker identity on event rows', () => {
     expect(group.badge).toBe('meeting')
   })
 
+  it('a renamed agent shows its CURRENT name on meeting turns', () => {
+    // The persisted row froze the name at meeting time; the agents list has
+    // since been renamed — current name wins.
+    const msgs = dbMessagesToDisplay(
+      [
+        row('event', '', 'system', {
+          subtype: 'meeting_turn_start', agent: 'writer',
+          agent_display_name: 'Old Writer', agent_color: '#673a97',
+        }),
+        row('assistant', 'draft ready'),
+      ],
+      AGENTS,
+    )
+    const group = msgs[msgs.length - 1]
+    expect(group.agentDisplayName).toBe('Writer')
+  })
+
+  it('an assistant row with frozen identity resolves to the current name', () => {
+    const msgs = dbMessagesToDisplay(
+      [row('assistant', 'hello', '', { agent_slug: 'writer', agent_display_name: 'Old Writer' })],
+      AGENTS,
+    )
+    expect(msgs[0].agentDisplayName).toBe('Writer')
+  })
+
+  it('a deleted agent keeps its frozen name', () => {
+    const msgs = dbMessagesToDisplay(
+      [row('assistant', 'hello', '', { agent_slug: 'ghost', agent_display_name: 'Ghost Writer' })],
+      AGENTS,
+    )
+    expect(msgs[0].agentDisplayName).toBe('Ghost Writer')
+  })
+
   it('meeting_failed keeps its reason through the history rebuild', () => {
     // Pre-turn meeting failure (admission denial) — the persisted banner must
     // still carry the orchestrator's reason after a page reload.

@@ -109,9 +109,18 @@ class PathPolicyContext:
     session_allowed_roots: tuple = ()
     # otodock-CLI: the session's actual working directory (satellite-host
     # absolute). When set, RELATIVE tool-arg paths anchor here instead of
-    # the sandbox /workspace convention — the collapsed absolute target then
+    # the sandbox-virtual session cwd — the collapsed absolute target then
     # flows through the normal admission chain (no new reach for `..`).
     work_cwd: str = ""
+    # Every OTHER session's anchor for RELATIVE tool-arg paths: the
+    # sandbox-virtual session cwd ("/users/{u}" or "/workspace" — what
+    # sandbox.get_cwd pins, and what the satellite PTY spawn mirrors).
+    # ALWAYS sandbox-virtual, never a host path (a real ``C:\…`` value
+    # would be mangled by the posix join in the relative branch). Distinct
+    # from work_cwd on purpose: work_cwd feeds ``session_allowed_roots``
+    # (an RBAC-exempt satellite root) and the PTY spawn cwd — reusing it
+    # would widen remote file access and break satellite session spawn.
+    relative_anchor: str = ""
     # Claude-CLI runtime-tree carve inputs: the satellite's reported
     # ``<tempdir>/claude-<uid>`` root + THIS session's CLI session id.
     # Both non-empty → the session's own runtime subtree
@@ -539,9 +548,9 @@ def resolve_path_for_session(
         # posixpath.normpath collapses the dots; the absolute result flows
         # through the normal admission chain (session root → home / full-fs
         # matrix → RBAC), so `..` gains no new reach — it just stops lying
-        # about its base. (A hypothetical local-session work_cwd resolves to
-        # a host-absolute path, which the local branch below rejects —
-        # fail closed.)
+        # about its base. work_cwd is only ever set for otodock-CLI
+        # sessions (cwd provenance); every other session takes the
+        # sandbox-virtual anchor below.
         if ctx.work_cwd:
             anchored = posixpath.normpath(
                 ctx.work_cwd.rstrip("/") + "/" + normalized)
@@ -549,21 +558,24 @@ def resolve_path_for_session(
                 ctx, anchored, writing=writing,
                 realpath_verify=realpath_verify,
             )
-        # A leading `..` escapes the workspace anchor below, and the policy
-        # can't know the caller's real cwd — any resolution we pick is a
-        # guess (`../x` used to silently resolve to `/x` and deny with a
-        # baffling error, or worse, land on a real sandbox path the author
-        # never meant). Deny deterministically and say what to do instead.
+        # A leading `..` would escape the virtual anchor below, and the
+        # policy can't know the caller's real cwd — any resolution we pick
+        # is a guess (`../x` used to silently resolve to `/x` and deny with
+        # a baffling error, or worse, land on a real sandbox path the
+        # author never meant). Deny deterministically and say what to do.
         if normalized == ".." or normalized.startswith("../"):
             return _reject(
-                "relative '..' paths resolve against the workspace root "
-                "here, not your shell's working directory — state the "
-                "absolute path instead"
+                "relative '..' paths resolve against the session's own "
+                "root here, not your shell's working directory — state "
+                "the absolute path instead"
             )
-        # Anchor at sandbox-virtual workspace (OTO_WORKSPACE_DIR
-        # convention). The MCP / native tool already resolves these
-        # locally — we just emit the same form back.
-        anchored = "/workspace/" + normalized
+        # Anchor at the sandbox-virtual session cwd (/users/{u} for user
+        # mounts, /workspace for agent scope — sandbox.get_cwd pins these,
+        # and the satellite PTY spawn mirrors them), so the policy judges
+        # the path the tool will actually touch. The result re-enters as
+        # sandbox_virtual and flows through the normal RBAC.
+        anchor = (ctx.relative_anchor or "/workspace").rstrip("/")
+        anchored = anchor + "/" + normalized
         return resolve_path_for_session(
             ctx, anchored, writing=writing, realpath_verify=realpath_verify,
         )
@@ -724,6 +736,8 @@ def context_from_security(security_ctx: object) -> PathPolicyContext:
         getattr(security_ctx, "session_allowed_roots", ()) or ()
     )
     work_cwd = normalize_path(getattr(security_ctx, "work_cwd", "") or "")
+    mount_username = getattr(security_ctx, "mount_username", "") or ""
+    relative_anchor = f"/users/{mount_username}" if mount_username else "/workspace"
     return PathPolicyContext(
         target_kind=target_kind or "local",
         machine_id=target_machine_id or "",
@@ -736,6 +750,7 @@ def context_from_security(security_ctx: object) -> PathPolicyContext:
         role=role,
         session_allowed_roots=session_allowed_roots,
         work_cwd=work_cwd,
+        relative_anchor=relative_anchor,
         claude_runtime_root=getattr(
             security_ctx, "target_claude_runtime_root", "") or "",
         cli_session_id=getattr(security_ctx, "cli_session_id", "") or "",

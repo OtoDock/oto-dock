@@ -57,6 +57,12 @@ def snapshot_path(chat_id: str, snapshot_id: str) -> Path | None:
     return p if p.is_file() else None
 
 
+# Pinning a version copies the whole document; past this size the copy's disk
+# I/O costs more than losing the pin (a 536MB OCR artifact once helped drive
+# an 8-minute io-wait storm). Mirrors the recover-bin capture cap.
+_MAX_SNAPSHOT_BYTES = 100 * 1024 * 1024
+
+
 def create_snapshot(chat_id: str, source: Path) -> str | None:
     """Copy ``source`` into the chat's snapshot dir. Returns the new snapshot
     id, or None on any failure (the preview then simply has no pinned version
@@ -68,6 +74,12 @@ def create_snapshot(chat_id: str, source: Path) -> str | None:
     dest = dest_dir / snapshot_id
     tmp = dest_dir / f"{snapshot_id}.tmp"
     try:
+        if source.stat().st_size > _MAX_SNAPSHOT_BYTES:
+            logger.info(
+                "preview snapshot skipped for chat %s: %s exceeds %d MB",
+                chat_id, source.name, _MAX_SNAPSHOT_BYTES // (1024 * 1024),
+            )
+            return None
         dest_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, tmp)
         os.replace(tmp, dest)

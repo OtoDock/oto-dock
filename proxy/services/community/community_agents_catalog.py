@@ -34,16 +34,19 @@ import httpx
 logger = logging.getLogger("claude-proxy.community-agents-catalog")
 
 
-REGISTRY_RAW_URL = (
+# Env-overridable for DEV/TEST only (staging catalog / local static server).
+import os as _os
+
+REGISTRY_RAW_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_REGISTRY_URL") or (
     "https://raw.githubusercontent.com/OtoDock/community-agents/main/registry.json"
 )
-TEMPLATE_RAW_BASE = (
+TEMPLATE_RAW_BASE = _os.environ.get("OTODOCK_AGENTS_CATALOG_RAW_BASE") or (
     "https://raw.githubusercontent.com/OtoDock/community-agents/main"
 )
-TARBALL_URL = (
+TARBALL_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_TARBALL_URL") or (
     "https://codeload.github.com/OtoDock/community-agents/tar.gz/main"
 )
-TARBALL_FALLBACK_URL = (
+TARBALL_FALLBACK_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_TARBALL_URL") or (
     "https://github.com/OtoDock/community-agents/tarball/main"
 )
 
@@ -275,10 +278,14 @@ def augment_entry(
     ``installed_as`` is the inverse of the agent's ``community_template``
     column — built from a single SQL query in the API layer.
     """
+    from services.community import community_catalog
     name = entry.get("slug") or entry.get("name")
     return {
         **entry,
         "installed_as": sorted(installed_as.get(name, [])),
+        "platform_compat_ok": community_catalog.platform_version_ok(
+            entry.get("platform_min_version"),
+        ),
     }
 
 

@@ -178,6 +178,10 @@ async def build_task_agent_config(
     task_username = identity.username
     task_role = identity.role
     user_sub_for_creds = identity.creds_user_sub  # None for agent scope
+    # Platform role of the task's creds user; "" for agent-scope runs.
+    task_platform_role = ""
+    if user_sub_for_creds:
+        task_platform_role = (task_store.get_user(user_sub_for_creds) or {}).get("role") or ""
 
     # Resolve delegation targets: user-scope filters to the creator's
     # accessible agents; agent-scope keeps all configured targets.
@@ -319,6 +323,7 @@ async def build_task_agent_config(
         username=vis.mount_username,        # MOUNT username ("" for agent scope)
         user_sub=user_sub_for_creds or "",  # REAL creator sub — attribution
         user_role=task_role or "",
+        platform_role=task_platform_role,
         session_id=session_id or "",
         memory_user_enabled=vis.memory_user_enabled,
         memory_agent_enabled=vis.memory_agent_enabled,

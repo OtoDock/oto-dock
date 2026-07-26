@@ -33,6 +33,10 @@ export interface User {
     // Mirrors the platform-wide interactive kill-switch: when off, the
     // interactive-terminal toggles are hidden (sessions always run headless).
     interactive_terminal_enabled?: boolean
+    // Operator-tunable size caps (OTODOCK_MAX_FILE_MB / RECOVER_BIN_MAX_MB);
+    // clients fall back to the shipped defaults when absent.
+    upload_max_bytes?: number
+    recover_bin_max_bytes?: number
   }
 }
 

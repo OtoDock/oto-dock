@@ -380,12 +380,16 @@ export default function VideoPlayer({
       <div className="my-2 max-w-2xl">
         {title && <div className="mb-1 text-sm font-medium text-p-text">{title}</div>}
         <div className="relative overflow-hidden rounded-xl bg-black" style={{ aspectRatio: '16 / 9' }}>
+          {/* The app-wide Referrer-Policy is same-origin, which sends NO Referer
+              to youtube.com — YouTube rejects referrer-less embeds with player
+              error 153. Override for this iframe only. */}
           <iframe
             src={embedUrl}
             title={title || caption || 'video'}
             className="absolute inset-0 h-full w-full"
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
             allowFullScreen
+            referrerPolicy="strict-origin-when-cross-origin"
           />
         </div>
         {caption && <div className="mt-1 text-xs text-p-text-secondary">{caption}</div>}

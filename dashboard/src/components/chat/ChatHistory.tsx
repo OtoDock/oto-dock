@@ -1,8 +1,13 @@
 import { useState, useMemo, useEffect, useRef, useCallback, type JSX } from 'react'
 import { createPortal } from 'react-dom'
-import { Chat, TaskChat, useDeleteChat, useSearchChats, useTaskChats } from '../../api/chats'
+import {
+  Chat, TaskChat, useDeleteChat, useRenameChat, useRenameTask,
+  useSearchChats, useTaskChats,
+} from '../../api/chats'
 import { useChatSlice } from '../../store/chatStore'
 import { useActiveChats } from '../../hooks/useActiveChats'
+import { pushEscHandler } from '../../lib/escStack'
+import TitleTooltip from '../ui/TitleTooltip'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
 import MoveChatConfirm from './MoveChatConfirm'
@@ -61,6 +66,90 @@ interface Props {
       so the kebab's move action renders only on the active row (other rows
       with mismatch data get a plain "Runs on <target>" info row). */
   onMoveChat?: () => void
+  /** True while an inline rename input is open — the page pauses the chat
+      list's poll (a poll-driven reorder moves the row's DOM node, which
+      blurs the input and silently discards the user's in-progress edit). */
+  onRenameEditingChange?: (editing: boolean) => void
+}
+
+/** The inline rename editor — swapped in place of a row's title block.
+ * Uncontrolled (the row's edit lifecycle is keyed in ChatHistory, not the
+ * row, so a row remount can't drop keystrokes). SAVING is explicit — the ✓
+ * button or Enter; Esc, clicking/tapping anywhere else, and any blur all
+ * CANCEL. The asymmetry is deliberate (operator-hit on mobile 2026-07-25):
+ * the select-all prefill puts an accidental wipe one keystroke away, and a
+ * committed rename also stamps `title_generated` (auto-titling off for that
+ * chat forever) — the destructive outcome must never ride the ambient
+ * gesture. The ✓ saves on POINTERDOWN with preventDefault: pointerdown
+ * fires before the input's blur on both mouse and touch (blur-then-click
+ * would cancel the edit before the save could land) and keeps focus in the
+ * input; `doneRef` collapses the follow-up click/blur into a no-op. An
+ * unchanged/empty commit is a cancel — an unchanged commit would still
+ * stamp `title_generated` server-side. */
+function RenameInput({ initial, onCommit, onCancel }: {
+  initial: string
+  onCommit: (value: string) => void
+  onCancel: () => void
+}) {
+  const ref = useRef<HTMLInputElement>(null)
+  const doneRef = useRef(false)
+  const cancelRef = useRef(onCancel)
+  cancelRef.current = onCancel
+  useEffect(() => {
+    ref.current?.focus()
+    ref.current?.select()
+    // LIFO above the drawer's Escape handler — Esc must cancel the edit,
+    // not also collapse the sidebar/drawer (the input's own keydown stops
+    // propagation; this stack entry covers focus-lost edge cases).
+    return pushEscHandler(() => cancelRef.current())
+  }, [])
+  const finish = (commit: boolean) => {
+    if (doneRef.current) return
+    doneRef.current = true
+    const v = (ref.current?.value ?? '').trim()
+    if (commit && v && v !== initial.trim()) onCommit(v)
+    else onCancel()
+  }
+  return (
+    <div className="flex items-center gap-1 my-0.5">
+      <input
+        ref={ref}
+        defaultValue={initial}
+        maxLength={160}
+        data-testid="rename-input"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          e.stopPropagation()
+          if (e.key === 'Enter') finish(true)
+          else if (e.key === 'Escape') finish(false)
+        }}
+        onBlur={() => finish(false)}
+        className="min-w-0 flex-1 text-xs font-medium bg-white dark:bg-p-surface text-p-text
+                   rounded-sm border border-brand/50 px-1.5 py-1
+                   focus:outline-hidden focus:ring-1 focus:ring-brand/40"
+      />
+      <button
+        data-testid="rename-save"
+        aria-label="Save name"
+        title="Save"
+        onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); finish(true) }}
+        onClick={(e) => { e.stopPropagation(); finish(true) }}
+        className="shrink-0 w-7 h-7 rounded-md bg-brand text-white flex items-center
+                   justify-center hover:bg-brand-hover transition-colors"
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+        </svg>
+      </button>
+    </div>
+  )
+}
+
+/** The active inline edit, threaded to the row being renamed. */
+interface RowEdit {
+  initial: string
+  onCommit: (value: string) => void
+  onCancel: () => void
 }
 
 function timeAgo(dateStr: string): string {
@@ -153,13 +242,20 @@ function highlightTitle(title: string, query: string): JSX.Element {
 // alone blend into the sidebar (especially age-faded unread), and the ring
 // stays constant while the background pulses/fades so the row keeps a crisp
 // edge. Ring, not border — border-l is the project accent rail.
-function ChatRow({ chat, active, title, onClick, onDelete, onMoveChat }: {
+function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveChat,
+                   onRename, canDelete, edit }: {
   chat: Chat
   active: boolean
   title: string | JSX.Element
+  /** The row's full label as plain text — the hover/long-press tooltip body
+      (the `title` prop can be a search-highlight JSX element). */
+  plainTitle: string
   onClick: () => void
   onDelete: (id: string) => void
   onMoveChat?: () => void
+  onRename?: () => void
+  canDelete: boolean
+  edit: RowEdit | null
 }) {
   const slice = useChatSlice(chat.id)
   const streaming = slice?.status === 'streaming'
@@ -187,26 +283,40 @@ function ChatRow({ chat, active, title, onClick, onDelete, onMoveChat }: {
   const unreadDot = !active && !streaming && unread
   return (
     <div
-      onClick={onClick}
-      title={stateTitle}
+      onClick={edit ? undefined : onClick}
+      // aria-label, NOT title: the full-title tooltip owns hover — a native
+      // OS tooltip on the row would double up next to it.
+      aria-label={stateTitle}
       className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm mb-0.5 cursor-pointer transition-colors border-l-2 border-r-2 border-r-transparent ${
         rowAccentClass(chat, { active }) || 'border-l-transparent'
       } ${stateClass}`}
     >
       <div className="min-w-0 flex-1">
-        <p className="truncate text-xs font-medium flex items-center">
-          <ChatStatusDot chatId={chat.id} />
-          {unreadDot && (
-            <span
-              title="New response — not opened yet"
-              className="inline-block w-1.5 h-1.5 rounded-full bg-brand mr-1.5 shrink-0"
-            />
-          )}
-          <span className="truncate">{title}</span>
-        </p>
-        <p className={`text-[10px] mt-[2px] ${active ? 'text-white/70' : 'text-p-text-light'}`}>{timeAgo(chat.updated_at)}</p>
+        {edit ? (
+          <RenameInput initial={edit.initial} onCommit={edit.onCommit} onCancel={edit.onCancel} />
+        ) : (
+          <>
+            <p className="truncate text-xs font-medium flex items-center">
+              <ChatStatusDot chatId={chat.id} />
+              {unreadDot && (
+                <span
+                  title="New response — not opened yet"
+                  className="inline-block w-1.5 h-1.5 rounded-full bg-brand mr-1.5 shrink-0"
+                />
+              )}
+              <TitleTooltip text={plainTitle} className="truncate">{title}</TitleTooltip>
+            </p>
+            <p className={`text-[10px] mt-[2px] ${active ? 'text-white/70' : 'text-p-text-light'}`}>{timeAgo(chat.updated_at)}</p>
+          </>
+        )}
       </div>
-      <ChatItemMenu chatId={chat.id} onDelete={onDelete} onBrand={active} isOpen={active} onMoveChat={onMoveChat} />
+      {!edit && (onRename || canDelete) && (
+        <ChatItemMenu
+          chatId={chat.id} onDelete={onDelete} onBrand={active} isOpen={active}
+          onMoveChat={onMoveChat} onRename={onRename} canDelete={canDelete}
+          fullTitle={plainTitle}
+        />
+      )}
     </div>
   )
 }
@@ -216,13 +326,20 @@ function ChatRow({ chat, active, title, onClick, onDelete, onMoveChat }: {
 // generating, solid purple inversion when active. The left accent rail is
 // the SAME role-based rule as chat rows (rowAccentClass): violet only for
 // delegated workers, amber for orchestrators — plain scheduled tasks get
-// none. Deliberately NO unread dot/tint and NO delete menu — tasks are
-// fire-and-forget (notifications cover completion; the admin History audits).
-function TaskRow({ chat, active, title, onClick }: {
+// none. No unread dot/tint (notifications cover completion). The kebab
+// renders Rename/Delete from the server-computed can_* flags — the task
+// role matrix lives backend-side; a row with neither right shows no kebab.
+function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
+                   onRename, canDelete, edit }: {
   chat: TaskChat
   active: boolean
   title: string | JSX.Element
+  plainTitle: string
   onClick: () => void
+  onDelete: (id: string) => void
+  onRename?: () => void
+  canDelete: boolean
+  edit: RowEdit | null
 }) {
   const slice = useChatSlice(chat.id)
   // Between chat_status frames the joined run status seeds the live state
@@ -244,8 +361,8 @@ function TaskRow({ chat, active, title, onClick }: {
   }
   return (
     <div
-      onClick={onClick}
-      title={stateTitle}
+      onClick={edit ? undefined : onClick}
+      aria-label={stateTitle}
       className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm mb-0.5 cursor-pointer transition-colors border-l-2 border-r-2 border-r-transparent ${
         rowAccentClass(chat, { active }) || 'border-l-transparent'
       } ${stateClass}`}
@@ -254,12 +371,31 @@ function TaskRow({ chat, active, title, onClick }: {
         {/* Rows are titled by the task's NAME; the chat title (prompt first
             line / LLM upgrade) drops to the subtitle as per-run context, and
             stays the title for runs whose task row is gone (one-time tasks
-            hard-delete after firing → task_name is null). */}
-        <p className="truncate text-xs font-medium">{chat.task_name || title}</p>
-        <p className={`text-[10px] mt-[2px] truncate ${active ? 'text-white/70' : 'text-p-text-light'}`}>
-          {chat.task_name && chat.title ? `${chat.title} · ` : ''}{timeAgo(chat.updated_at)}
-        </p>
+            hard-delete after firing → task_name is null). Rename follows the
+            label ("rename what you see"): name-labeled rows rename the task
+            definition, title-labeled rows rename this run's chat. */}
+        {edit ? (
+          <RenameInput initial={edit.initial} onCommit={edit.onCommit} onCancel={edit.onCancel} />
+        ) : (
+          <>
+            <p className="text-xs font-medium">
+              <TitleTooltip text={plainTitle} className="block truncate">
+                {chat.task_name || title}
+              </TitleTooltip>
+            </p>
+            <p className={`text-[10px] mt-[2px] truncate ${active ? 'text-white/70' : 'text-p-text-light'}`}>
+              {chat.task_name && chat.title ? `${chat.title} · ` : ''}{timeAgo(chat.updated_at)}
+            </p>
+          </>
+        )}
       </div>
+      {!edit && (onRename || canDelete) && (
+        <ChatItemMenu
+          chatId={chat.id} onDelete={onDelete} onBrand={active}
+          onRename={onRename} canDelete={canDelete} taskKind
+          fullTitle={plainTitle}
+        />
+      )}
     </div>
   )
 }
@@ -268,12 +404,24 @@ function TaskRow({ chat, active, title, onClick }: {
 // the gray trigger colors for white ones so the dots stay visible on blue.
 // `isOpen`: this row is the OPEN chat — the move_chat op acts on the
 // connection's open chat, so only then is the target-mismatch row actionable.
-function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMoveChat }: {
+function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
+                        onMoveChat, onRename, canDelete = true,
+                        taskKind = false, fullTitle }: {
   chatId: string
   onDelete: (id: string) => void
   onBrand?: boolean
   isOpen?: boolean
   onMoveChat?: () => void
+  /** Present → a "Rename" row above Delete (server-flag gated at the call site). */
+  onRename?: () => void
+  /** False hides the Delete row (e.g. an editor on another user's task run). */
+  canDelete?: boolean
+  /** Task-history wording for the delete confirmation. */
+  taskKind?: boolean
+  /** Full row label — shown as the menu header on mobile, where there is no
+      hover tooltip path to reveal a clipped title (the long-press tooltip
+      exists too; the header costs nothing and is always discoverable). */
+  fullTitle?: string
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -355,7 +503,14 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMov
 
         {/* Dropdown menu */}
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 z-30 bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1 min-w-[120px]">
+          <div className="absolute right-0 top-full mt-1 z-30 bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1 min-w-[120px] max-w-[240px]">
+            {/* Mobile full-title header — no hover on touch, so the menu is
+                where a clipped title is guaranteed readable. */}
+            {fullTitle && (
+              <div className="md:hidden px-3 py-1.5 text-xs font-medium text-p-text break-words border-b border-p-border-light mb-1">
+                {fullTitle}
+              </div>
+            )}
             {/* Target-mismatch row — the banner's permanent home after
                 dismissal. Actionable only for the OPEN chat (the move op
                 acts on the connection's open chat); other rows just state
@@ -374,15 +529,28 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMov
                 Runs on {mismatch.pinnedLabel}
               </div>
             ))}
-            <button
-              onClick={handleDeleteClick}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-accent-red hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
-            >
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-              </svg>
-              Delete
-            </button>
+            {onRename && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onRename() }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                </svg>
+                Rename
+              </button>
+            )}
+            {canDelete && (
+              <button
+                onClick={handleDeleteClick}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-accent-red hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Delete
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -397,9 +565,13 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMov
             className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light shadow-xl p-6 max-w-sm mx-4"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 className="text-sm font-semibold text-p-text mb-2">Delete Chat</h3>
+            <h3 className="text-sm font-semibold text-p-text mb-2">
+              {taskKind ? 'Delete task run' : 'Delete Chat'}
+            </h3>
             <p className="text-sm text-p-text-secondary mb-5">
-              Are you sure you want to delete this chat? This action cannot be undone.
+              {taskKind
+                ? 'Removes this run from the task history. The scheduled task itself is not deleted. This action cannot be undone.'
+                : 'Are you sure you want to delete this chat? This action cannot be undone.'}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -437,18 +609,30 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false, onMov
 
 export default function ChatHistory({
   chats, activeChatId, agentName, onSelect, onNew, onNavigate,
-  tasksMode = false, onTasksModeChange, onMoveChat,
+  tasksMode = false, onTasksModeChange, onMoveChat, onRenameEditingChange,
 }: Props) {
   const deleteChat = useDeleteChat()
+  const renameChat = useRenameChat()
+  const renameTask = useRenameTask()
   const [searchInput, setSearchInput] = useState('')
   const debouncedQuery = useDebounce(searchInput, 300)
   const inputRef = useRef<HTMLInputElement>(null)
+
+  // The row being inline-renamed. taskId set = the rename targets the task
+  // DEFINITION (name-labeled task rows — "rename what you see"); null = the
+  // chat/run title. Keyed here (not row-local) so a row remount — e.g.
+  // crossing a day-group boundary on refetch — can't drop the edit.
+  const [editing, setEditing] = useState<
+    { id: string; taskId: string | null; initial: string } | null>(null)
+  useEffect(() => {
+    onRenameEditingChange?.(editing !== null)
+  }, [editing, onRenameEditingChange])
 
   // Search follows the mode: chat search over the history owner's chats,
   // task search over the agent's task-run chats (run-permission gated).
   const { data: searchResults, isFetching: isSearching } =
     useSearchChats(agentName, debouncedQuery, tasksMode ? 'tasks' : 'chats')
-  const { data: taskChats } = useTaskChats(agentName, tasksMode)
+  const { data: taskChats } = useTaskChats(agentName, tasksMode, editing !== null)
 
   // The tasks toggle pulses purple while this agent has a task generating and
   // the toggle is off — the task rows aren't visible to carry the pulse.
@@ -465,23 +649,50 @@ export default function ChatHistory({
   const displayChats = isSearchActive && searchResults ? searchResults : modeChats
   const groups = useMemo(() => groupChats(displayChats), [displayChats])
 
-  // A failed DELETE otherwise vanishes (the confirm popover already closed
-  // and the list never refetches) — surface it inline above the list.
-  const [deleteError, setDeleteError] = useState<string | null>(null)
-  const deleteErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // A failed DELETE/RENAME otherwise vanishes (the confirm popover / inline
+  // input already closed and the list never refetches) — surface it inline
+  // above the list. Server 403/409 details are user-phrased.
+  const [actionError, setActionError] = useState<string | null>(null)
+  const actionErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => () => {
-    if (deleteErrorTimer.current) clearTimeout(deleteErrorTimer.current)
+    if (actionErrorTimer.current) clearTimeout(actionErrorTimer.current)
+  }, [])
+  const surfaceError = useCallback((message: string) => {
+    setActionError(message)
+    if (actionErrorTimer.current) clearTimeout(actionErrorTimer.current)
+    actionErrorTimer.current = setTimeout(() => setActionError(null), 8000)
   }, [])
 
   const handleDelete = useCallback((chatId: string) => {
     deleteChat.mutate(chatId, {
-      onError: (e) => {
-        setDeleteError((e as Error)?.message || 'Failed to delete chat')
-        if (deleteErrorTimer.current) clearTimeout(deleteErrorTimer.current)
-        deleteErrorTimer.current = setTimeout(() => setDeleteError(null), 8000)
-      },
+      onError: (e) => surfaceError((e as Error)?.message || 'Failed to delete chat'),
     })
-  }, [deleteChat])
+  }, [deleteChat, surfaceError])
+
+  const startRename = useCallback((chat: Chat | TaskChat) => {
+    const tc = chat as TaskChat
+    const nameLabeled = tasksMode && !!tc.task_name && !!tc.task_id
+    setEditing({
+      id: chat.id,
+      taskId: nameLabeled ? (tc.task_id as string) : null,
+      // Prefill from DATA, never the rendered title prop (search mode passes
+      // a JSX highlight element) and never the 'New Chat' placeholder.
+      initial: nameLabeled ? (tc.task_name as string) : (chat.title || ''),
+    })
+  }, [tasksMode])
+
+  const cancelRename = useCallback(() => setEditing(null), [])
+  const commitRename = useCallback((value: string) => {
+    if (!editing) return
+    const onError = (e: unknown) =>
+      surfaceError((e as Error)?.message || 'Failed to rename')
+    if (editing.taskId) {
+      renameTask.mutate({ taskId: editing.taskId, name: value }, { onError })
+    } else {
+      renameChat.mutate({ chatId: editing.id, title: value }, { onError })
+    }
+    setEditing(null)
+  }, [editing, renameChat, renameTask, surfaceError])
 
   return (
     <div className="w-full border-r border-p-border-light bg-p-bg flex flex-col h-full">
@@ -536,11 +747,11 @@ export default function ChatHistory({
           )}
         </div>
 
-        {deleteError && (
+        {actionError && (
           <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-sm border border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
-            <span className="min-w-0 break-words">{deleteError}</span>
+            <span className="min-w-0 break-words">{actionError}</span>
             <button
-              onClick={() => setDeleteError(null)}
+              onClick={() => setActionError(null)}
               className="ml-auto shrink-0 hover:text-red-700 dark:hover:text-red-300"
               aria-label="Dismiss"
             >
@@ -620,13 +831,25 @@ export default function ChatHistory({
                 onSelect(chat.id, isSearchActive ? debouncedQuery : undefined)
                 closeMobileDrawer(onNavigate)
               }
+              // Server-computed flags; absent (older-proxy cache) → chats keep
+              // their historical owner rights, task rows stay menu-less.
+              const canRename = chat.can_rename ?? !tasksMode
+              const canDelete = chat.can_delete ?? !tasksMode
+              const edit = editing?.id === chat.id
+                ? { initial: editing.initial, onCommit: commitRename, onCancel: cancelRename }
+                : null
               return tasksMode ? (
                 <TaskRow
                   key={chat.id}
                   chat={chat as TaskChat}
                   active={chat.id === activeChatId}
                   title={title}
+                  plainTitle={(chat as TaskChat).task_name || chat.title || 'New Chat'}
                   onClick={open}
+                  onDelete={handleDelete}
+                  onRename={canRename ? () => startRename(chat) : undefined}
+                  canDelete={canDelete}
+                  edit={edit}
                 />
               ) : (
                 <ChatRow
@@ -634,9 +857,13 @@ export default function ChatHistory({
                   chat={chat}
                   active={chat.id === activeChatId}
                   title={title}
+                  plainTitle={chat.title || 'New Chat'}
                   onClick={open}
                   onDelete={handleDelete}
                   onMoveChat={onMoveChat}
+                  onRename={canRename ? () => startRename(chat) : undefined}
+                  canDelete={canDelete}
+                  edit={edit}
                 />
               )
             })}

@@ -17,6 +17,7 @@ directly under ``asyncio.run`` via ``run_ws_scenario``.
 import asyncio
 import contextlib
 import json
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -257,6 +258,8 @@ class FakeInteractiveSession:
         self.alive = True
         self._turn_open = False  # read by streaming_chat_ids (connect snapshot)
         self.target = "local"
+        # read by find_live_for_chat's newest-alive sort (chat_process_alive)
+        self.created_at = time.time()
         self.tui_theme = tui_theme
         self.pty = None
         self.otodock_attached = False
@@ -291,10 +294,18 @@ class FakeInteractiveSession:
     def write_input(self, data: bytes) -> None:
         self.inputs.append(data)
 
-    def deliver_dashboard_input(self, data: bytes, composer: bool = False) -> None:
+    def may_drive(self, sender_sub: str) -> bool:
+        # The fake records no owner → open, matching the real class's fail-open
+        # rule. The identity gate itself is unit-tested against the real class
+        # in test_pty_identity_gate.
+        return True
+
+    def deliver_dashboard_input(self, data: bytes, composer: bool = False,
+                                sender_sub: str = "") -> bool:
         # Mirror the real router's pass-through shape (the composer hold is
         # unit-tested on the real class in test_interactive_session).
         self.write_input(data)
+        return True
 
     def resize(self, rows: int, cols: int) -> None:
         self.resizes.append((rows, cols))
@@ -353,10 +364,11 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     monkeypatch.setattr(scd, "ensure_persistent_claude_dir", _fake_persistent_dir)
     monkeypatch.setattr(scd, "ensure_persistent_codex_dir", _fake_persistent_dir)
 
-    # The cross-layer model guard consults the layer's served models.
+    # The cross-layer model guard consults the layer's served models; the
+    # switch_engine gate additionally requires `enabled` (admin disables).
     from storage import subscription_store
     monkeypatch.setattr(subscription_store, "list_models",
-                        lambda path: [{"model_id": TEST_MODEL}])
+                        lambda path: [{"model_id": TEST_MODEL, "enabled": True}])
 
     # Turn-start token guard: no subscription bound to fake sessions.
     from services.engines import subscription_pool as sub_pool

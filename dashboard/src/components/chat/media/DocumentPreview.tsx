@@ -66,6 +66,34 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
   const [refreshTs, setRefreshTs] = useState<number | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
 
+  // Lazy mount: the iframe (and its WOPI-token mint) waits until the preview
+  // nears the viewport — a long history would otherwise boot every Collabora
+  // frame at open, and each boot steals focus (see the ChatMessages focusin
+  // guard). Embedded (PiP) hosts have no scroller and jsdom has no
+  // IntersectionObserver — both latch immediately. Latch and the freshness
+  // decision (below) flip together, batched, so the stale persisted URL never
+  // mounts for the one frame before the fresh-mint decision lands.
+  const initialLatch = !!embedded || typeof IntersectionObserver === 'undefined'
+  const [latched, setLatched] = useState(initialLatch)
+  const latchedRef = useRef(initialLatch)
+  const [needsFreshUrl, setNeedsFreshUrl] = useState(
+    () => initialLatch && !!chatId && !!fileId &&
+      (generation == null || Date.now() - generation > LIVE_URL_TRUST_MS),
+  )
+  const latch = useCallback(() => {
+    if (latchedRef.current) return
+    latchedRef.current = true
+    // Freshness is decided ONCE, at latch time — deciding at mount would let
+    // a block judged "fresh" load half an hour later with a token Collabora
+    // rejects; re-deciding later would reload a long-open (possibly mid-edit)
+    // iframe out from under the user.
+    setNeedsFreshUrl(
+      !!chatId && !!fileId &&
+        (generation == null || Date.now() - generation > LIVE_URL_TRUST_MS),
+    )
+    setLatched(true)
+  }, [chatId, fileId, generation])
+
   // Chain target vs rendered state: the chain says what this block SHOULD be;
   // the block applies downgrades itself so it can defer them while the user
   // is engaged (per instance — a new live block's visibility never postpones
@@ -97,16 +125,30 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
   }, [embedded, renderedMode])
   const engaged = visible || fullscreen
 
-  // Stale live render: the persisted URL's token is only trusted briefly
-  // after push — decided ONCE at mount, so a long-open iframe (possibly
-  // mid-edit) is never reloaded out from under the user when it ages past
-  // the threshold. A fresh URL is minted through the chat-scoped endpoint
-  // (never persisted); any failure falls back to the persisted URL, which
-  // is at worst what rendered before this existed.
-  const [needsFreshUrl] = useState(
-    () => !!chatId && !!fileId &&
-      (generation == null || Date.now() - generation > LIVE_URL_TRUST_MS),
-  )
+  // The latch observer proper — a SECOND, dedicated observer: adding
+  // rootMargin to the engagement observer above would make off-screen
+  // previews report engaged and never release the live→frozen→chip
+  // downgrade defer. Disconnects on latch; chip renders no container.
+  useEffect(() => {
+    if (latched || renderedMode === 'chip') return
+    const el = containerRef.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          latch()
+          io.disconnect()
+        }
+      },
+      { rootMargin: '200px', threshold: 0 },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [latched, renderedMode, latch])
+
+  // Stale live render: a fresh URL is minted through the chat-scoped
+  // endpoint (never persisted); any failure falls back to the persisted
+  // URL, which is at worst what rendered before this existed.
   const [liveUrl, setLiveUrl] = useState<string | null>(null)
   const [liveMintFailed, setLiveMintFailed] = useState(false)
   useEffect(() => {
@@ -138,9 +180,10 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
     : `${liveBase}&_t=${refreshTs}`
 
   const handleRefresh = useCallback(() => {
+    latch()  // an explicit refresh must boot a not-yet-latched frame
     setIframeLoaded(false)
     setRefreshTs(Date.now())
-  }, [])
+  }, [latch])
 
   // Live-reload when another user changes this same file. Live instances
   // only — a frozen block must never flash-reload on the agent's next write
@@ -186,7 +229,9 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
   const [frozenUrl, setFrozenUrl] = useState<string | null>(null)
   const [frozenFailed, setFrozenFailed] = useState(false)
   useEffect(() => {
-    if (renderedMode !== 'frozen' || embedded) return
+    // Latch-gated like the live mint: an unlatched frozen block must not
+    // fire its snapshot-token mint at history open.
+    if (!latched || renderedMode !== 'frozen' || embedded) return
     if (!chatId || !snapshotId) {
       setFrozenFailed(true)
       return
@@ -201,7 +246,7 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
       .then((j) => { if (alive) setFrozenUrl(j.wopi_url) })
       .catch(() => { if (alive) setFrozenFailed(true) })
     return () => { alive = false }
-  }, [renderedMode, embedded, chatId, snapshotId])
+  }, [latched, renderedMode, embedded, chatId, snapshotId])
 
   const handleDismiss = useCallback(async () => {
     // A frozen block dismisses only itself (its snapshot/row); the live block
@@ -279,6 +324,7 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
     <>
       <div
         ref={containerRef}
+        data-collabora-host=""
         data-preview-anchor={!embedded && targetMode === 'live' ? fileId : undefined}
         className={embedded
           ? 'flex h-full flex-col overflow-hidden bg-white dark:bg-p-surface'
@@ -328,9 +374,10 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
                 </svg>
               </button>
             )}
-            {/* Fullscreen button */}
+            {/* Fullscreen button (force-latches: it renders pre-latch, and the
+                portal shows an empty shell until a frame source exists) */}
             <button
-              onClick={() => setFullscreen(true)}
+              onClick={() => { latch(); setFullscreen(true) }}
               title="Fullscreen"
               className="p-1.5 rounded-sm hover:bg-p-surface transition-colors"
             >
@@ -390,11 +437,12 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
                   </div>
                 </div>
               )}
-              {frameSrc && (
+              {latched && frameSrc && (
                 <iframe
                   ref={iframeRef}
                   key={frameSrc}
                   src={frameSrc}
+                  data-collabora-frame=""
                   className="w-full border-0"
                   style={{ height: '100%' }}
                   sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
@@ -419,6 +467,7 @@ export default function DocumentPreview({ wopiUrl, filename, fileId, downloadUrl
           {originMismatch && !frozen ? mismatchNotice : frameSrc ? (
             <iframe
               src={frameSrc}
+              data-collabora-frame=""
               className="w-full h-full border-0"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
               allow="clipboard-read; clipboard-write; fullscreen"

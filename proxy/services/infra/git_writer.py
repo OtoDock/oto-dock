@@ -1,7 +1,7 @@
 """Git-based audit trail for agent config, knowledge, + per-user context.
 
 Three repo classes per agent:
-  - ``agents/{slug}/config/``                    (prompt.md, context/ docs)
+  - ``agents/{slug}/config/``                    (agent.md, context/ docs)
   - ``agents/{slug}/knowledge/``                 (incl. memory/ topic files)
   - ``agents/{slug}/users/{username}/context/``  (user docs + memory/)
 
@@ -89,6 +89,23 @@ def commit_file(repo_dir: Path, file_path: Path, message: str) -> str | None:
                        file_path, repo_dir)
         return None
     return _commit_file(repo_dir, str(rel), message)
+
+
+def is_tracked(repo_dir: Path, rel_path: str) -> bool:
+    """True when ``rel_path`` is tracked in ``repo_dir``'s index. Needed
+    before staging a deletion: ``git add -- <gone-and-untracked>`` fails the
+    whole pathspec, and most config repos only get their first commit on the
+    first dashboard edit."""
+    if not (repo_dir / ".git").exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", rel_path],
+            cwd=repo_dir, capture_output=True, timeout=_SUBPROC_TIMEOUT,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def commit_paths(repo_dir: Path, paths: list[Path | str], message: str) -> str | None:

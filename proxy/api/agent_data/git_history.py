@@ -42,6 +42,10 @@ def _resolve_repo(scope: str, agent: str, user_sub: str | None) -> Path:
     agent_dir = app_config.get_agent_dir(agent)
     if scope == "agent":
         return agent_dir / "config"
+    if scope == "knowledge":
+        # Agent-scope memory lives under knowledge/ — without this scope a
+        # memory-tool delete there is unrecoverable through any UI.
+        return agent_dir / "knowledge"
     if scope == "user":
         if not user_sub:
             raise HTTPException(400, "user-scope git requires user_sub")

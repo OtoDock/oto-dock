@@ -9,6 +9,7 @@ write_pdf: HTML/Markdown → PDF via WeasyPrint.
 convert_document: LibreOffice headless format conversion.
 """
 
+import contextlib
 import os
 import re
 from pathlib import Path
@@ -61,6 +62,28 @@ def _parse_pages(pages_str, total: int) -> list[int]:
             if 0 <= idx < total:
                 result.append(idx)
     return result
+
+
+def _ocr_raster_dpi(page, requested) -> int:
+    """Raster resolution for the OCR page swap: never upsample past the scan.
+
+    The swap re-rasterizes the page, so dpi drives output size — a 300 dpi
+    re-raster of a 150 dpi scan is several times the bytes for zero OCR gain
+    (an 84-page scan once ballooned to 536MB and stalled the host on disk
+    I/O). Cap the requested dpi (default 300) at the source image's own
+    resolution, inferred from the widest embedded image; text-only pages
+    keep the requested value.
+    """
+    cap = int(requested) if requested else 300
+    try:
+        images = page.get_images(full=True)
+        if images:
+            width_px = max(img[2] for img in images)
+            src_dpi = width_px * 72.0 / max(page.rect.width, 1.0)
+            cap = min(cap, max(72, round(src_dpi)))
+    except Exception:
+        pass
+    return max(72, min(cap, 600))
 
 
 def _text_style_at(page, rect):
@@ -191,20 +214,55 @@ def read_pdf(path: str, pages: str | None) -> str:
 
     result.append("")
 
-    # Text extraction
+    # Text extraction. Pages without a text layer (scans) are surfaced as
+    # collapsed range markers so mixed documents stay readable, capped by a
+    # guidance line instead of silence — the agent can SEE scanned pages via
+    # screenshot_document, which OCR can never match on handwriting.
     start, end = 0, total
     if pages:
         parts = pages.split("-")
         start = max(0, int(parts[0]) - 1)
         end = min(total, int(parts[-1]))
+    scanned_run: list[int] | None = None
+    scanned_any = False
+
+    def _flush_run() -> None:
+        nonlocal scanned_run
+        if scanned_run is None:
+            return
+        a, b = scanned_run
+        if a == b:
+            result.append(f"--- Page {a + 1}: scanned image, no text layer ---")
+        else:
+            result.append(f"--- Pages {a + 1}-{b + 1}: scanned images, no text layer ---")
+        result.append("")
+        scanned_run = None
+
     for i in range(start, end):
         text = doc[i].get_text().strip()
         if text:
+            _flush_run()
             result.append(f"--- Page {i + 1} ---")
             result.append(text)
             result.append("")
-    if not any(doc[i].get_text().strip() for i in range(start, end)):
-        result.append("(PDF appears to be scanned — no extractable text. Use edit_pdf with ocr operation.)")
+        else:
+            scanned_any = True
+            if scanned_run is None:
+                scanned_run = [i, i]
+            else:
+                scanned_run[1] = i
+    _flush_run()
+    if scanned_any:
+        result.append(
+            "(Scanned pages have no extractable text. To READ them, call "
+            "screenshot_document on this file in batches of up to 10 pages "
+            "(dpi 300 for handwriting or fine print) and read the page images "
+            "directly — that also works for handwriting, which OCR cannot "
+            "handle. To make the file searchable, use edit_pdf with an ocr "
+            "operation and the document's language(s), e.g. language "
+            "'ell+eng' for Greek — OCR rewrites the pages, so large documents "
+            "take minutes and produce large output files.)"
+        )
 
     doc.close()
     return "\n".join(result)
@@ -295,7 +353,7 @@ async def handle_write_pdf(args: dict) -> str:
     import markdown as md
     from weasyprint import HTML
 
-    path = _resolve_path(args["path"], writing=True)
+    path = await _resolve_path(args["path"], writing=True)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     content = args.get("content", "")
@@ -315,13 +373,15 @@ async def handle_write_pdf(args: dict) -> str:
     else:
         html_body = content
 
+    # Pre-resolve img srcs — a re.sub callback can't await.
+    src_map: dict[str, str] = {}
+    for src in set(re.findall(r'src="([^"]+)"', html_body)):
+        with contextlib.suppress(Exception):
+            src_map[src] = await _resolve_path(src)
+
     def resolve_img_src(match):
-        src = match.group(1)
-        try:
-            resolved = _resolve_path(src)
-            return f'src="file://{resolved}"'
-        except Exception:
-            return match.group(0)
+        resolved = src_map.get(match.group(1))
+        return f'src="file://{resolved}"' if resolved else match.group(0)
 
     html_body = re.sub(r'src="([^"]+)"', resolve_img_src, html_body)
 
@@ -377,7 +437,7 @@ async def handle_edit_pdf(args: dict) -> str:
     # extraction-only op sets go through the save→os.replace tail), so the
     # input is a write target — resolve it as one so the proxy's write-RBAC
     # fires instead of the read check.
-    path = _resolve_path(args["path"], writing=True)
+    path = await _resolve_path(args["path"], writing=True)
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
@@ -397,7 +457,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 files = op.get("files", [])
                 position = op.get("position", "end")
                 for f in files:
-                    src_path = _resolve_path(f)
+                    src_path = await _resolve_path(f)
                     if not Path(src_path).exists():
                         errors.append(f"Op #{idx} merge: file not found: {f}")
                         continue
@@ -416,7 +476,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 if not output_path:
                     errors.append(f"Op #{idx} split: output_path required")
                     continue
-                out = _resolve_path(output_path, writing=True)
+                out = await _resolve_path(output_path, writing=True)
                 Path(out).parent.mkdir(parents=True, exist_ok=True)
                 page_indices = _parse_pages(page_spec, doc.page_count)
                 new_doc = fitz.open()
@@ -497,7 +557,7 @@ async def handle_edit_pdf(args: dict) -> str:
                     errors.append(f"Op #{idx} add_image: page {pi} out of range")
                     continue
                 page = doc[pi]
-                img_path = _resolve_path(
+                img_path = await _resolve_path(
                     op.get("image_path") or op.get("path") or op.get("image", "")
                 )
                 rect = op.get("rect", [50, 50, 200, 200])
@@ -739,7 +799,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 output_dir = op.get("output_dir")
                 if not output_dir:
                     output_dir = str(Path(path).parent / (Path(path).stem + "_images"))
-                out_dir = _resolve_path(output_dir, writing=True) if output_dir.startswith("/") else output_dir
+                out_dir = await _resolve_path(output_dir, writing=True) if output_dir.startswith("/") else output_dir
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
 
                 extracted = []
@@ -765,6 +825,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 language = op.get("language", "eng")
                 page_spec = op.get("pages", "all")
                 output_path = op.get("output_path")
+                requested_dpi = op.get("dpi")
 
                 for pi in _parse_pages(page_spec, doc.page_count):
                     page = doc[pi]
@@ -773,10 +834,14 @@ async def handle_edit_pdf(args: dict) -> str:
                         # PDF with an invisible text layer, then swap it in.
                         # (A TextPage from get_textpage_ocr() is extraction-
                         # only — it never modifies the document, so the saved
-                        # PDF would stay unsearchable.) The swap rasterizes
-                        # the page at 300 dpi, which is a no-op in practice:
-                        # the op targets scanned (already-raster) pages.
-                        pix = page.get_pixmap(dpi=300)
+                        # PDF would stay unsearchable.) The raster must stay
+                        # RGB — a csGRAY pixmap makes pdfocr_tobytes return
+                        # an EMPTY text layer (pymupdf 1.27) — so output size
+                        # is controlled by capping dpi at the scan's own
+                        # resolution instead of upsampling to 300.
+                        pix = page.get_pixmap(
+                            dpi=_ocr_raster_dpi(page, requested_dpi),
+                        )
                         ocr_pdf = fitz.open(
                             "pdf", pix.pdfocr_tobytes(language=language)
                         )
@@ -789,7 +854,7 @@ async def handle_edit_pdf(args: dict) -> str:
                         errors.append(f"Op #{idx} ocr: page {pi} failed: {e}")
 
                 if output_path:
-                    out = _resolve_path(output_path, writing=True)
+                    out = await _resolve_path(output_path, writing=True)
                     Path(out).parent.mkdir(parents=True, exist_ok=True)
                     doc.save(out)
 
@@ -865,14 +930,14 @@ async def handle_edit_pdf(args: dict) -> str:
 async def handle_pdf_to_images(args: dict) -> str:
     import fitz
 
-    path = _resolve_path(args["path"])
+    path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
     output_dir = args.get("output_dir")
     if not output_dir:
         output_dir = str(Path(path).parent / (Path(path).stem + "_pages"))
-    out_dir = _resolve_path(output_dir, writing=True)
+    out_dir = await _resolve_path(output_dir, writing=True)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     page_spec = args.get("pages", "all")
@@ -897,14 +962,17 @@ async def handle_pdf_to_images(args: dict) -> str:
             pix.save(str(out_path), jpg_quality=95)
         else:
             pix.save(str(out_path))
-        saved.append({"path": _to_agents_relative(str(out_path)), "width": pix.width, "height": pix.height})
+        # _abs = the resolved container path for INTERNAL re-opens; the
+        # display form ("<agent>/users/...") does not survive a _resolve_path
+        # round-trip (the proxy anchors slash-less paths at /workspace and
+        # 403s on the doubled slug). Display strings only ever reach text.
+        saved.append({"path": _to_agents_relative(str(out_path)), "_abs": str(out_path), "width": pix.width, "height": pix.height})
 
     doc.close()
 
     # Push first page inline for preview
     if saved:
-        first_path = _resolve_path(saved[0]["path"])
-        img_bytes = Path(first_path).read_bytes()
+        img_bytes = Path(saved[0]["_abs"]).read_bytes()
         mime = "image/png" if fmt == "png" else "image/jpeg"
         await _push_image_preview(img_bytes, mime, f"Page 1 of {Path(path).name}")
 
@@ -923,6 +991,14 @@ async def handle_pdf_to_images(args: dict) -> str:
 _SCREENSHOT_EXTS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
                     ".odt", ".ods", ".odp", ".csv", ".rtf", ".html"}
 _MAX_INLINE_PAGES = 10
+# Payload caps (see handle_screenshot_document): long-edge px per page
+# (dpi-aware — the high cap keeps A4@300 ≈ 3508 px untouched, the skill's
+# documented handwriting remedy), PNG→JPEG size fallback, and the per-call
+# total across all pages (truncates with a note, never silently).
+_SCREENSHOT_LONG_EDGE_STD = 2000
+_SCREENSHOT_LONG_EDGE_HIGH = 3600
+_SCREENSHOT_PNG_FALLBACK_BYTES = int(1.5 * 1024 * 1024)
+_SCREENSHOT_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 async def handle_screenshot_document(args: dict) -> list:
@@ -937,7 +1013,7 @@ async def handle_screenshot_document(args: dict) -> list:
     import fitz
     from mcp.types import ImageContent, TextContent
 
-    path = _resolve_path(args.get("path", ""))
+    path = await _resolve_path(args.get("path", ""))
     if not os.path.isfile(path):
         return [TextContent(type="text", text=f"Error: file not found: {_to_agents_relative(path)}")]
 
@@ -998,19 +1074,49 @@ async def handle_screenshot_document(args: dict) -> list:
             page_indices = page_indices[:_MAX_INLINE_PAGES]
             capped = True
 
-        # Render pages as ImageContent (visible to LLM via vision, NOT pushed to dashboard)
+        # Render pages as ImageContent (visible to LLM via vision, NOT pushed
+        # to dashboard). Vision-sized payloads: the 300 s timeouts this tool
+        # hit were the RESPONSE path for multi-MB base64, never rendering
+        # (the same page renders in under a second) — so cap pixels and bytes
+        # here. The long-edge cap is dpi-aware: a flat cap would bite exactly
+        # on the explicit dpi:300 calls the skill mandates for handwriting
+        # (A4@300 ≈ 3508 px passes untouched). Encoding follows CONTENT:
+        # pages with a text layer stay PNG (JPEG ringing is worst on crisp
+        # text) with a byte-size JPEG fallback; scanned pages go straight to
+        # JPEG q85. A total budget truncates the batch with a note.
+        long_edge_cap = (
+            _SCREENSHOT_LONG_EDGE_STD if dpi <= 200 else _SCREENSHOT_LONG_EDGE_HIGH
+        )
         content_items: list = []
         rendered = []
-        mat = fitz.Matrix(zoom, zoom)
+        total_bytes = 0
+        truncated_at = None
         for pi in page_indices:
             page = doc[pi]
-            pix = page.get_pixmap(matrix=mat)
-            png_bytes = pix.tobytes("png")
-            b64 = base64.b64encode(png_bytes).decode()
+            long_edge = max(page.rect.width, page.rect.height) * zoom
+            eff_zoom = zoom if long_edge <= long_edge_cap else (
+                zoom * (long_edge_cap / long_edge)
+            )
+            pix = page.get_pixmap(matrix=fitz.Matrix(eff_zoom, eff_zoom))
+            scanned = not page.get_text().strip()
+            if scanned:
+                img_bytes = pix.tobytes("jpg", jpg_quality=85)
+                mime = "image/jpeg"
+            else:
+                img_bytes = pix.tobytes("png")
+                mime = "image/png"
+                if len(img_bytes) > _SCREENSHOT_PNG_FALLBACK_BYTES:
+                    img_bytes = pix.tobytes("jpg", jpg_quality=85)
+                    mime = "image/jpeg"
+            if content_items and total_bytes + len(img_bytes) > _SCREENSHOT_TOTAL_BYTES:
+                truncated_at = pi + 1
+                break
+            total_bytes += len(img_bytes)
+            b64 = base64.b64encode(img_bytes).decode()
             w_in = round(page.rect.width / 72, 2)
             h_in = round(page.rect.height / 72, 2)
             content_items.append(ImageContent(
-                type="image", data=b64, mimeType="image/png",
+                type="image", data=b64, mimeType=mime,
             ))
             rendered.append({"page": pi + 1, "width_in": w_in, "height_in": h_in})
 
@@ -1023,6 +1129,11 @@ async def handle_screenshot_document(args: dict) -> list:
             lines.append(f"  Page {r['page']}: {r['width_in']} x {r['height_in']} inches")
         if capped:
             lines.append(f"  (capped at {_MAX_INLINE_PAGES} pages — use specific page ranges for more)")
+        if truncated_at is not None:
+            lines.append(
+                f"  (stopped before page {truncated_at}: inline image budget "
+                "reached — request the remaining pages in a follow-up call)"
+            )
         content_items.append(TextContent(type="text", text="\n".join(lines)))
         return content_items
 
@@ -1098,7 +1209,7 @@ async def handle_images_to_pdf(args: dict) -> str:
     if not images:
         return "Error: images list is empty"
 
-    out = _resolve_path(output_path, writing=True)
+    out = await _resolve_path(output_path, writing=True)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
     page_size = args.get("page_size", "a4").lower()
@@ -1114,7 +1225,7 @@ async def handle_images_to_pdf(args: dict) -> str:
     doc = fitz.open()
 
     for img_input in images:
-        img_path = _resolve_path(img_input)
+        img_path = await _resolve_path(img_input)
         if not Path(img_path).exists():
             logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
             continue
@@ -1168,7 +1279,7 @@ async def handle_images_to_pdf(args: dict) -> str:
 
 
 async def handle_convert_document(args: dict) -> str:
-    input_path = _resolve_path(args["input_path"])
+    input_path = await _resolve_path(args["input_path"])
     if not Path(input_path).exists():
         return f"Error: File not found: {args['input_path']}"
 
@@ -1176,7 +1287,7 @@ async def handle_convert_document(args: dict) -> str:
     output_path = args.get("output_path")
 
     if output_path:
-        output_dir = str(Path(_resolve_path(output_path, writing=True)).parent)
+        output_dir = str(Path(await _resolve_path(output_path, writing=True)).parent)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
     else:
         output_dir = str(Path(input_path).parent)
@@ -1187,8 +1298,10 @@ async def handle_convert_document(args: dict) -> str:
     if ext in (".md", ".markdown") and output_format == "pdf":
         content = Path(input_path).read_text(encoding="utf-8")
         out = str(Path(output_dir) / (Path(input_path).stem + ".pdf"))
+        # Internal handler calls pass CONTAINER-ABSOLUTE paths — the display
+        # form does not survive a _resolve_path round-trip (see pdf_to_images).
         await handle_write_pdf({
-            "path": _to_agents_relative(out),
+            "path": out,
             "content": content,
             "content_type": "markdown",
         })
@@ -1198,8 +1311,8 @@ async def handle_convert_document(args: dict) -> str:
     if ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp") and output_format == "pdf":
         out = str(Path(output_dir) / (Path(input_path).stem + ".pdf"))
         await handle_images_to_pdf({
-            "images": [_to_agents_relative(input_path)],
-            "output_path": _to_agents_relative(out),
+            "images": [input_path],
+            "output_path": out,
             "page_size": "original",
         })
         return f"Converted: {_to_agents_relative(out)}"
@@ -1208,8 +1321,8 @@ async def handle_convert_document(args: dict) -> str:
     if ext == ".pdf" and output_format in ("png", "jpg", "jpeg"):
         out_dir = str(Path(output_dir) / Path(input_path).stem)
         await handle_pdf_to_images({
-            "path": _to_agents_relative(input_path),
-            "output_dir": _to_agents_relative(out_dir),
+            "path": input_path,
+            "output_dir": out_dir,
             "format": output_format,
             "dpi": 150,
         })
@@ -1222,7 +1335,7 @@ async def handle_convert_document(args: dict) -> str:
         return f"Conversion error: {exc}"
 
     if output_path:
-        final = _resolve_path(output_path, writing=True)
+        final = await _resolve_path(output_path, writing=True)
         Path(out).rename(final)
         out = final
 

@@ -6,7 +6,7 @@ vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => isNativ
 const browserOpen = vi.fn(async () => {})
 vi.mock('@capacitor/browser', () => ({ Browser: { open: browserOpen } }))
 
-import { openExternalUrl, openTerminalLink } from '@/lib/openExternal'
+import { openExternalUrl, openTerminalLink, validateBridgedUrl } from '@/lib/openExternal'
 
 beforeEach(() => {
   isNative.mockReturnValue(false)
@@ -51,5 +51,24 @@ describe('openTerminalLink', () => {
     isNative.mockReturnValue(true)
     openTerminalLink(new MouseEvent('click'), 'https://example.com')
     await vi.waitFor(() => expect(browserOpen).toHaveBeenCalledWith({ url: 'https://example.com' }))
+  })
+})
+
+describe('validateBridgedUrl', () => {
+  it('accepts absolute external http(s) and returns the origin', () => {
+    const r = validateBridgedUrl('https://docs.example.com/a?b=1')
+    expect(r).toEqual({ url: 'https://docs.example.com/a?b=1', origin: 'https://docs.example.com' })
+  })
+
+  it('rejects non-strings, relative paths and non-http schemes', () => {
+    expect('error' in validateBridgedUrl(42)).toBe(true)
+    expect('error' in validateBridgedUrl('/settings')).toBe(true)
+    expect('error' in validateBridgedUrl('javascript:alert(1)')).toBe(true)
+    expect('error' in validateBridgedUrl('data:text/html,x')).toBe(true)
+  })
+
+  it('rejects same-origin URLs (cookie-carrying top-level GET)', () => {
+    const r = validateBridgedUrl(`${window.location.origin}/v1/agents`)
+    expect(r).toEqual({ error: 'platform links cannot be opened from generated content' })
   })
 })

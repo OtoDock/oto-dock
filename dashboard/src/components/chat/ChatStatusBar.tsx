@@ -84,6 +84,11 @@ interface Props {
   onModeChange: (mode: string) => void
   onModelChange: (model: string) => void
   onCompactContext?: () => void
+  /** Fired when the Model dropdown opens — the chat page uses it to lazily
+   * re-probe session liveness (headless idle-reap emits no frame, so the
+   * cross-engine options would otherwise stay hidden on a chat that died
+   * while being viewed). */
+  onModelMenuOpen?: () => void
 }
 
 // --- Permission mode config ---
@@ -115,7 +120,8 @@ const MODE_OPTIONS = Object.entries(MODE_CONFIG).map(([value, c]) => ({ value, l
 // --- Model config (fallback for known models) ---
 const MODEL_LETTERS: Record<string, string> = {
   'claude-fable-5': 'F',
-  'claude-opus-4-8[1m]': 'O',
+  'claude-opus-5': 'O',
+  'claude-opus-4-8[1m]': 'O',  // retired builtin — grandfathered history keeps its 'O'
   'claude-sonnet-5': 'S',
   'claude-haiku-4-5': 'H',
   'gpt-5': 'G',
@@ -132,7 +138,7 @@ function getModelLetter(model: string): string {
 // Default fallback options (used when modelOptions prop not provided)
 const DEFAULT_MODEL_OPTIONS = [
   { value: 'claude-fable-5', label: 'Fable 5 (1M)' },
-  { value: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M)' },
+  { value: 'claude-opus-5', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5 (1M)' },
 ]
 
@@ -140,7 +146,7 @@ const DEFAULT_MODEL_OPTIONS = [
 interface ModelOption { value: string; label: string }
 interface ModelGroup { layer: string; layerLabel: string; models: ModelOption[] }
 
-function IconDropdown({ label, value, options, groups, trigger, onChange, topSlot }: {
+function IconDropdown({ label, value, options, groups, trigger, onChange, topSlot, onOpen }: {
   label: string
   value: string
   options?: ModelOption[]           // flat list (legacy)
@@ -151,6 +157,9 @@ function IconDropdown({ label, value, options, groups, trigger, onChange, topSlo
    * (e.g. the interactive-terminal switch on the Model dropdown). Lives inside
    * the dropdown ref, so interacting with it does NOT close the popup. */
   topSlot?: JSX.Element
+  /** Fired on each closed→open transition (the Model dropdown uses it to
+   * lazily re-probe the chat's session liveness). */
+  onOpen?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -185,7 +194,7 @@ function IconDropdown({ label, value, options, groups, trigger, onChange, topSlo
 
   return (
     <div className="relative" ref={ref}>
-      <button onClick={() => setOpen(!open)}>
+      <button onClick={() => { if (!open) onOpen?.(); setOpen(!open) }}>
         {trigger}
       </button>
 
@@ -283,6 +292,7 @@ export default function ChatStatusBar({
   onModeChange,
   onModelChange,
   onCompactContext,
+  onModelMenuOpen,
 }: Props) {
   const resolvedModelOptions = modelOptionsProp && modelOptionsProp.length > 0
     ? modelOptionsProp.filter(m => m.value !== '')  // exclude "System Default" from runtime dropdown
@@ -567,6 +577,7 @@ export default function ChatStatusBar({
               options={modelLocked ? undefined : (!modelGroups ? resolvedModelOptions : undefined)}
               groups={lockedGroups}
               onChange={modelLocked ? () => {} : onModelChange}
+              onOpen={onModelMenuOpen}
               topSlot={interactiveAvailable
                 ? <InteractiveToggle on={!!interactiveOn} disabled={!!interactiveDisabled} onToggle={onInteractiveToggle} />
                 : undefined}

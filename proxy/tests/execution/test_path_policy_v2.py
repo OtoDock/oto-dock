@@ -747,3 +747,66 @@ class TestCredentialDenylist:
         ])
         assert results[0].allowed
         assert not results[1].allowed
+
+
+# ---------------------------------------------------------------------------
+# Relative session anchor (threaded by context_from_security)
+# ---------------------------------------------------------------------------
+
+class TestRelativeSessionAnchor:
+    """RELATIVE tool-arg paths anchor at the sandbox-virtual session cwd
+    (/users/{u} for user mounts, /workspace for agent scope — what
+    sandbox.get_cwd pins and the satellite PTY spawn mirrors). The anchor is
+    a DISTINCT field from work_cwd: work_cwd feeds session_allowed_roots (an
+    RBAC-exempt satellite root) and the PTY spawn cwd, so reusing it would
+    widen remote file access and break satellite session spawn."""
+
+    def _sec(self, username: str):
+        from auth.path_policy import SecurityContext
+        return SecurityContext(
+            role="manager", username=username, agent="my-agent",
+            is_admin_agent=False,
+        )
+
+    def test_context_threads_user_anchor_and_no_allowed_roots(self):
+        from services.path_policy_v2 import context_from_security
+        ctx = context_from_security(self._sec("alice"))
+        assert ctx.relative_anchor == "/users/alice"
+        # A dashboard chat must gain NO RBAC-exempt roots from this.
+        assert ctx.session_allowed_roots == ()
+        assert ctx.work_cwd == ""
+
+    def test_context_threads_workspace_anchor_for_agent_scope(self):
+        from services.path_policy_v2 import context_from_security
+        ctx = context_from_security(self._sec(""))
+        assert ctx.relative_anchor == "/workspace"
+
+    def test_user_anchor_resolves_relative_into_own_dir(self):
+        from dataclasses import replace
+        ctx = replace(_local_ctx(), relative_anchor="/users/alice")
+        r = resolve_path_for_session(ctx, "workspace/downloads/x.png")
+        assert r.allowed
+        assert r.sandbox_relative == "/users/alice/workspace/downloads/x.png"
+
+    def test_windows_remote_relative_resolves_through_virtual_anchor(self):
+        # Windows satellite (the efpolis shape): the relative path anchors
+        # at the VIRTUAL session cwd and translates to the satellite host
+        # form — never a direct join onto a C:\ path.
+        from dataclasses import replace
+        ctx = replace(
+            _user_remote_ctx(
+                home_dir="C:/Users/erin", target_os="windows",
+            ),
+            relative_anchor="/users/alice",
+        )
+        r = resolve_path_for_session(ctx, "workspace/downloads/x.png")
+        assert r.allowed
+        assert r.sandbox_relative == "/users/alice/workspace/downloads/x.png"
+        assert r.access_path.startswith("C:/Users/erin/.oto-dock/agents/my-agent")
+
+    def test_leading_dotdot_still_denied_with_user_anchor(self):
+        from dataclasses import replace
+        ctx = replace(_local_ctx(), relative_anchor="/users/alice")
+        r = resolve_path_for_session(ctx, "../bob/workspace/secret.png")
+        assert not r.allowed
+        assert "absolute path" in r.error

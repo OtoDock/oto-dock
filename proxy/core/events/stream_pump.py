@@ -46,11 +46,18 @@ from core.events.common_events import (
 # frame and WORKFLOW_END always go through.
 _WORKFLOW_PROGRESS_MIN_INTERVAL = 0.3
 
-# LLM chat-title generation: fire the one-time title upgrade once the first
-# assistant response crosses this many characters on the first turn (~70 tokens
-# — enough signal for a good title, early enough to feel instant). A shorter
-# first response titles at PRODUCER_DONE instead. See services/title_generator.py.
-_TITLE_CHAR_THRESHOLD = 280
+# LLM chat-title early-fire thresholds — canonical values live in
+# services/title_generator.py (shared with the interactive funnel). Chars:
+# fire once the first response crosses the length threshold. Tools: a
+# tool-heavy first turn (agentic work, little prose) can run for minutes
+# without crossing it — fire at the tool-call count instead; subagent/
+# delegate spawns count too (they equally signal a long working turn), and
+# the fire is effectively prompt-only-titled (pending text flushes per
+# event; no assistant rows are persisted mid-turn) — intended cap behavior.
+from services.title_generator import (
+    TITLE_CHAR_THRESHOLD as _TITLE_CHAR_THRESHOLD,
+    TITLE_TOOL_THRESHOLD as _TITLE_TOOL_THRESHOLD,
+)
 
 logger = logging.getLogger("claude-proxy")
 
@@ -162,15 +169,17 @@ class ChatStreamPump:
         # LLM chat-title generation (services/title_generator.py): arm the
         # one-time title upgrade for chats not yet LLM-titled. Fired in the
         # TEXT handler once the first response crosses _TITLE_CHAR_THRESHOLD,
-        # or at PRODUCER_DONE for a short first response. Task chats title
-        # like every chat (they live in the sidebar's Task history view);
-        # only meetings are excluded. The atomic claim guarantees
-        # exactly-once across both fire points and any later turn.
+        # in the TOOL_USE handler at _TITLE_TOOL_THRESHOLD tool calls, or at
+        # PRODUCER_DONE for a short first response. Task chats title like
+        # every chat (they live in the sidebar's Task history view); only
+        # meetings are excluded. The atomic claim guarantees exactly-once
+        # across all fire points and any later turn.
         _title_chat = task_store.get_chat(chat_id) or {}
         self._title_armed = (
             not chat_id.startswith("meeting-")
             and not _title_chat.get("title_generated")
         )
+        self._tool_seen = 0  # tool calls this pump — the title tool-count trigger
         self._active_tools: dict[str, dict] = {}
         self._pending_previews: dict[str, dict] = {}  # file_id -> latest preview (flushed at turn end)
         # Armed by a preview flush; _save_turn_blocks then prunes this chat's
@@ -1041,6 +1050,15 @@ class ChatStreamPump:
                 {"pump_type": "ws_event", "event": {"type": "tool_start", **ed}},
             )
             tool_name = ed.get("name", "")
+            # LLM chat-title: tool-count early trigger. Counted at branch top —
+            # before _SKIP_TOOL_PERSIST — so Agent/Task/delegate spawns count.
+            self._tool_seen += 1
+            if self._title_armed and self._tool_seen >= _TITLE_TOOL_THRESHOLD:
+                self._title_armed = False
+                from services import title_generator
+                asyncio.create_task(title_generator.request_chat_title(
+                    self.chat_id, assistant_excerpt="".join(self._pending_text),
+                ))
             # A memory tool call resets this session's capture-nudge counter
             # (services/memory_nudge). Name shapes: mcp__memory-mcp__memory
             # (CLI/Codex) or bare "memory" (Direct LLM).

@@ -5,6 +5,7 @@ Files are saved to the agent's per-user workspace directory.
 """
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -19,11 +20,14 @@ from storage import database as task_store
 logger = logging.getLogger("claude-proxy.uploads")
 router = APIRouter()
 
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB (everything but audio/video)
-MAX_MEDIA_UPLOAD_SIZE = 250 * 1024 * 1024  # 250 MB (audio + video)
+# The per-file cap is the UNIVERSAL config.MAX_UPLOAD_SIZE_BYTES
+# (OTODOCK_MAX_FILE_MB, default 1GB) — read live in the endpoint so tests and
+# per-install overrides apply without an import-order dance. The old
+# generic-vs-media split collapsed when the universal cap landed.
 
-# Audio/video extensions get the larger cap. Kept in sync with the frontend
-# AUDIO_EXTENSIONS/VIDEO_EXTENSIONS in dashboard/src/lib/fileTypes.ts.
+# Audio/video extensions (still used for labels/routing decisions elsewhere).
+# Kept in sync with the frontend AUDIO_EXTENSIONS/VIDEO_EXTENSIONS in
+# dashboard/src/lib/fileTypes.ts.
 MEDIA_EXTENSIONS = {
     # audio
     ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac",
@@ -148,8 +152,8 @@ async def upload_file(
     original_name = file.filename or "unnamed"
     ext = Path(original_name).suffix.lower()
 
-    # Audio/video get the larger cap; everything else stays at 100 MB.
-    size_cap = MAX_MEDIA_UPLOAD_SIZE if ext in MEDIA_EXTENSIONS else MAX_UPLOAD_SIZE
+    # Universal per-file cap (OTODOCK_MAX_FILE_MB) — same for every file type.
+    size_cap = config.MAX_UPLOAD_SIZE_BYTES
     cap_mb = size_cap // (1024 * 1024)
 
     # Quick size check via Content-Length header
@@ -205,24 +209,32 @@ async def upload_file(
 
     target = _resolve_conflict(upload_dir / safe_name)
 
-    # Stream file to disk with size enforcement
+    # Stream to a `.partial` sibling, then atomic-rename into place: a big
+    # upload has a long failure window, and a torn final file must never be
+    # visible. `.partial` is symmetrically excluded from sync manifests and
+    # fan-out, so a half-received upload is sync-invisible by construction.
+    tmp = target.with_name(target.name + ".partial")
     total_bytes = 0
     try:
-        with open(target, "wb") as f:
+        with open(tmp, "wb") as f:
             while True:
                 chunk = await file.read(65536)
                 if not chunk:
                     break
                 total_bytes += len(chunk)
                 if total_bytes > size_cap:
-                    f.close()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(status_code=413, detail=f"File too large (max {cap_mb} MB)")
+                    raise HTTPException(
+                        status_code=413, detail=f"File too large (max {cap_mb} MB)"
+                    )
                 f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
     except HTTPException:
+        tmp.unlink(missing_ok=True)
         raise
     except Exception as e:
-        target.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         logger.error(f"Upload failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Upload failed")
 
@@ -237,19 +249,37 @@ async def upload_file(
     # barriers on in-flight pushes (``core/remote/upload_inflight``).
     # Best-effort like the old synchronous push — on failure the periodic
     # fingerprint sweep / next session-start sync reconciles.
-    _schedule_upload_push(agent, rel_path, target)
+    #
+    # transfer_id is minted HERE so the response and the phase-2 progress
+    # events (transfer registry, Feature E) share one id — the uploading tab
+    # links its local phase-1 item to the server-side machine rows by it.
+    import uuid as _uuid
+    transfer_id = str(_uuid.uuid4())
+    pushed = _schedule_upload_push(
+        agent, rel_path, target,
+        transfer_id=transfer_id, origin_user_sub=user.sub,
+    )
 
     return {
         "path": rel_path,
         "filename": target.name,
         "size": total_bytes,
+        "transfer_id": transfer_id,
+        # False → no connected machine will receive this upload; the client
+        # completes its progress item at upload end instead of waiting for
+        # phase-2 events that will never come.
+        "remote_push": pushed,
     }
 
 
-def _schedule_upload_push(agent_slug: str, rel_path: str, host_path: Path) -> None:
+def _schedule_upload_push(
+    agent_slug: str, rel_path: str, host_path: Path, *,
+    transfer_id: str | None = None, origin_user_sub: str = "",
+) -> bool:
     """Background ``_push_upload_to_active_remote_sessions`` for a fresh
     upload, registered with the turn-start barrier
-    (``core/remote/upload_inflight``). Never raises, never blocks.
+    (``core/remote/upload_inflight``). Never raises, never blocks. Returns
+    True iff a push was actually scheduled (fan-out candidates exist).
 
     The cheap in-memory candidate gate runs HERE (synchronously) so
     local-only installs — no connected satellite — schedule nothing at all.
@@ -259,13 +289,14 @@ def _schedule_upload_push(agent_slug: str, rel_path: str, host_path: Path) -> No
         if not workspace_fanout.has_fanout_candidates(
             agent_slug, rel_path, include_idle=True,
         ):
-            return
+            return False
         from core.remote import upload_inflight
 
         async def _push() -> None:
             try:
                 await _push_upload_to_active_remote_sessions(
                     agent_slug, rel_path, host_path,
+                    transfer_id=transfer_id, origin_user_sub=origin_user_sub,
                 )
             except Exception:
                 logger.exception(
@@ -273,12 +304,15 @@ def _schedule_upload_push(agent_slug: str, rel_path: str, host_path: Path) -> No
                 )
 
         upload_inflight.track(agent_slug, _push())
+        return True
     except Exception:
         logger.exception("Failed to schedule upload push: %s", rel_path)
+        return False
 
 
 async def _push_upload_to_active_remote_sessions(
-    agent_slug: str, rel_path: str, host_path: "Path",
+    agent_slug: str, rel_path: str, host_path: "Path", *,
+    transfer_id: str | None = None, origin_user_sub: str = "",
 ) -> None:
     """Push a freshly-uploaded file to active remote sessions of this agent, via
     the isolation-aware fan-out.
@@ -300,9 +334,10 @@ async def _push_upload_to_active_remote_sessions(
     from services.remote import workspace_fanout
     if not workspace_fanout.has_fanout_candidates(agent_slug, rel_path, include_idle=True):
         return
-    try:
-        content = host_path.read_bytes()
-    except OSError as e:
-        logger.warning("Cannot read upload %s for satellite push: %s", host_path, e)
-        return
-    await workspace_fanout.fan_out_write(agent_slug, rel_path, content, include_idle=True)
+    # Pass the PATH — push_file streams from disk, so a 1GB upload fanning out
+    # to N machines never holds the file in memory.
+    await workspace_fanout.fan_out_write(
+        agent_slug, rel_path, host_path, include_idle=True,
+        transfer_kind="upload", transfer_id=transfer_id,
+        origin_user_sub=origin_user_sub,
+    )

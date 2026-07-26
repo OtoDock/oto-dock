@@ -25,7 +25,7 @@ def _seed_agent(slug: str, *, default_scope: str = "user") -> Path:
         )
     agent_dir = app_config.AGENTS_DIR / slug
     (agent_dir / "config").mkdir(parents=True, exist_ok=True)
-    (agent_dir / "config" / "prompt.md").write_text("You are a test agent.")
+    (agent_dir / "config" / "agent.md").write_text("You are a test agent.")
     return agent_dir
 
 

@@ -4,19 +4,17 @@ import { Capacitor } from '@capacitor/core'
 export type { PendingImage, PendingFile } from '../../store/types'
 import type { PendingImage, PendingFile } from '../../store/types'
 
-import { AUDIO_EXTENSIONS, VIDEO_EXTENSIONS } from '../../lib/fileTypes'
 import { MicIcon } from './MicIcon'
 import { VoiceControl } from './VoiceControl'
 import { useCoarsePointer } from '../../hooks/useCoarsePointer'
+import { useAuth } from '../../contexts/AuthContext'
 
 // Any file type is accepted (no extension allowlist — see lib/fileTypes);
-// caps mirror proxy/api/media/uploads.py.
-const MAX_FILE_SIZE = 100 * 1024 * 1024 // 100 MB (everything but audio/video)
-const MAX_MEDIA_FILE_SIZE = 250 * 1024 * 1024 // 250 MB (audio + video)
-
-function isMediaExt(ext: string): boolean {
-  return AUDIO_EXTENSIONS.has(ext) || VIDEO_EXTENSIONS.has(ext)
-}
+// the universal cap mirrors proxy config OTODOCK_MAX_FILE_MB (default 1GB) —
+// one number for every file type, sync + upload.
+// Shipped default; the per-install override rides user.feature_flags
+// (upload_max_bytes) — see useUploadCap below.
+const MAX_FILE_SIZE = 1024 * 1024 * 1024 // 1 GB (universal)
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -37,6 +35,10 @@ interface Props {
    * pre-warm for non-favorite agents. NOT fired on focus or on mount. */
   onEngage?: () => void
   disabled?: boolean
+  /** Blocks ONLY sending (button + Enter) while keeping the composer
+   * typeable — the user can keep drafting. Used while a cross-engine switch
+   * awaits its confirmation (prompting is not allowed until it resolves). */
+  sendDisabled?: boolean
   streaming?: boolean
   aborting?: boolean
   placeholder?: string
@@ -94,6 +96,7 @@ export default function ChatInput({
   onEditQueued,
   onEngage,
   disabled,
+  sendDisabled,
   streaming,
   aborting,
   placeholder,
@@ -116,6 +119,10 @@ export default function ChatInput({
 }: Props) {
   const text = value
   const setText = onChange
+  // Per-install universal upload cap (OTODOCK_MAX_FILE_MB) with the shipped
+  // default as fallback.
+  const { user } = useAuth()
+  const uploadCap = user?.feature_flags?.upload_max_bytes ?? MAX_FILE_SIZE
   // Live mirror of the controlled value — the STT session's onFinal closure is
   // created once (when the mic starts) and would otherwise capture a stale
   // value, making each dictated phrase REPLACE the input instead of append.
@@ -171,7 +178,7 @@ export default function ChatInput({
   const removeBtnVisibility = coarse ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
 
   const handleSend = useCallback(() => {
-    if (anyFileUploading) return
+    if (anyFileUploading || sendDisabled) return
     const trimmed = text.trim()
     if (!trimmed && pendingImages.length === 0 && pendingFiles.length === 0) return
     onSend(trimmed)
@@ -184,7 +191,7 @@ export default function ChatInput({
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
-  }, [text, pendingImages, pendingFiles, onSend, anyFileUploading])
+  }, [text, pendingImages, pendingFiles, onSend, anyFileUploading, sendDisabled])
 
   // First genuine interaction with the composer → fire onEngage once. Guarded
   // by a ref so it never re-fires; bound to keydown/pointerdown (NOT focus or
@@ -282,9 +289,7 @@ export default function ChatInput({
     if (!selected?.length) return
     const newFiles: PendingFile[] = []
     for (const file of Array.from(selected)) {
-      const ext = '.' + file.name.split('.').pop()?.toLowerCase()
-      const cap = isMediaExt(ext) ? MAX_MEDIA_FILE_SIZE : MAX_FILE_SIZE
-      if (file.size > cap) continue
+      if (file.size > uploadCap) continue
       newFiles.push({ id: generateId(), name: file.name, size: file.size, file })
     }
     if (newFiles.length) onAddFiles(newFiles)
@@ -313,6 +318,7 @@ export default function ChatInput({
 
   const canSend =
     !disabled &&
+    !sendDisabled &&
     !anyFileUploading &&
     !anyFileErrored &&
     (text.trim().length > 0 || pendingImages.length > 0 || pendingFiles.length > 0)

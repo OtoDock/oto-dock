@@ -16,9 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import powerpoint as ppt_mod  # noqa: E402
 
 
+async def _async_ident(p, writing=False, **kw):
+    return p
+
+
 @pytest.fixture(autouse=True)
 def _bypass_platform(monkeypatch):
-    monkeypatch.setattr(ppt_mod, "_resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr(ppt_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(ppt_mod, "_to_agents_relative", lambda p: p)
 
     async def _noop_preview(path):

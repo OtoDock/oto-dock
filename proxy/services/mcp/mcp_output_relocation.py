@@ -304,16 +304,13 @@ async def push_relocated_to_satellite(
         except ValueError:
             logger.warning("Skipping push (path outside agent_dir): %s", dst)
             continue
-        try:
-            content = dst.read_bytes()
-        except OSError as e:
-            logger.warning("Cannot read %s for push: %s", dst, e)
-            continue
         from services.path_policy_v2 import PathRef
+        # Pass the PATH — push_file streams from disk (unreadable → False
+        # with its own warning log).
         ok = await cm.push_file(
             info.machine_id,
             PathRef("agent_tree", rel_path),
-            content,
+            dst,
             agent_slug=info.agent_name,
         )
         if not ok:

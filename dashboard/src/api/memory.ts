@@ -18,6 +18,13 @@ export interface AgentMemorySettings {
   agent: string
   user_memory_enabled: boolean
   agent_memory_enabled: boolean
+  // Platform master switches, GET-only rider under a distinct key (the
+  // per-agent toggles reuse the same field names). Lets agent managers grey
+  // the UI without the admin-only /settings endpoint.
+  master?: {
+    user_memory_enabled: boolean
+    agent_memory_enabled: boolean
+  }
 }
 
 // ---------------------------------------------------------------------------

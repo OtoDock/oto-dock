@@ -304,16 +304,16 @@ class TestSpawnOverrides:
     def test_overrides_ride_the_task_and_chat_pins(self, client, monkeypatch):
         from storage import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "claude-opus-4-8", "enabled": True}])
-        r = _spawn(client, surface="chat", model="claude-opus-4-8",
+                            lambda p: [{"model_id": "claude-opus-5", "enabled": True}])
+        r = _spawn(client, surface="chat", model="claude-opus-5",
                    layer="claude-code-cli", mode="interactive")
         assert r.status_code == 200
         task = client.fired[0]["task"]
-        assert task.override_model == "claude-opus-4-8"
+        assert task.override_model == "claude-opus-5"
         assert task.override_execution_path == "claude-code-cli"
         assert task.override_execution_mode == "interactive"
         chat = task_store.get_chat(r.json()["chat_id"])
-        assert chat["model"] == "claude-opus-4-8"
+        assert chat["model"] == "claude-opus-5"
         assert chat["execution_path"] == "claude-code-cli"
         assert chat["execution_mode"] == "interactive"
 
@@ -370,14 +370,14 @@ class TestSpawnOverrides:
                                origin="delegated",
                                parent_chat_id=client.parent_chat_id,
                                delegate_role="worker",
-                               model="claude-opus-4-8",
+                               model="claude-opus-5",
                                execution_path="claude-code-cli",
                                execution_mode="interactive")
         task_store.update_chat(worker, session_id=str(uuid.uuid4()))
         r = _spawn(client, surface="chat", continue_id=worker)
         assert r.status_code == 200
         task = client.fired[0]["task"]
-        assert task.override_model == "claude-opus-4-8"
+        assert task.override_model == "claude-opus-5"
         assert task.override_execution_path == "claude-code-cli"
         assert task.override_execution_mode == "interactive"
 

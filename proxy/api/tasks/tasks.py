@@ -733,6 +733,29 @@ async def _edit_task_impl(
         raise HTTPException(status_code=400, detail=err)
     if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
+    if (fields.get("name") or "").strip():
+        # Task-history rows AND the Active-now widget label task rows by the
+        # task's NAME — re-label the chats of live (running|pending) runs
+        # everywhere now via title_updated; idle rows refresh on the next
+        # list poll. Best-effort, sanitized like a chat rename (the frame
+        # reaches OTHER users' sidebars).
+        try:
+            from api.agents.chats import _sanitize_title
+            new_name = _sanitize_title(str(fields["name"]))
+            chat_ids = await asyncio.to_thread(
+                task_store.list_live_run_chats, task_id) if new_name else []
+            if chat_ids:
+                from services.notifications import notification_manager
+                for cid in chat_ids:
+                    row = await asyncio.to_thread(task_store.get_chat, cid)
+                    if row:
+                        notification_manager.broadcast_chat_title(
+                            row.get("user_sub") or "", cid, new_name,
+                            agent=row.get("agent") or "",
+                        )
+        except Exception:
+            logger.debug("task-rename title broadcast failed for %s",
+                         task_id, exc_info=True)
     return {"status": "updated", "task_id": task_id}
 
 

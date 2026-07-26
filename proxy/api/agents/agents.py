@@ -25,6 +25,14 @@ from api.agents._router import router
 
 logger = logging.getLogger("claude-proxy.agents")
 
+# Human labels for the engine-enablement gate's 403s (capabilities aren't
+# imported here to keep this module free of layer machinery).
+_ENGINE_LABELS = {
+    "claude-code-cli": "Claude Code",
+    "codex-cli": "Codex",
+    "direct-llm": "Direct LLM",
+}
+
 # Section route modules — imported for their ``@router`` registrations. ORDER
 # MATTERS: discovery -> files -> user-context, then the CRUD routes below, to
 # reproduce the original route-declaration order.
@@ -148,6 +156,20 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     if req.execution_path:
         if req.execution_path not in valid_paths:
             raise HTTPException(400, f"Invalid execution_path. Valid: {valid_paths}")
+        # Same platform-configured gate as PATCH (cookie-admin bypass; see
+        # update_agent). The no-picker auto-default below is deliberately NOT
+        # gated — it may fall back to claude-code-cli on a bare platform so a
+        # fresh install can always create its first agent.
+        if not (u.role == "admin" and not u.is_api_key):
+            from services.engines import subscription_pool
+            if not await asyncio.to_thread(
+                subscription_pool.layer_platform_configured, req.execution_path
+            ):
+                raise HTTPException(
+                    403,
+                    f"No {_ENGINE_LABELS.get(req.execution_path, req.execution_path)} "
+                    "subscription is connected on this platform",
+                )
         execution_path = req.execution_path
     else:
         from services.engines import subscription_pool
@@ -165,8 +187,8 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
         (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
         (agent_dir / "users").mkdir(parents=True, exist_ok=True)
 
-        prompt_file = agent_dir / "config" / "prompt.md"
-        prompt_file.write_text(f"# {req.display_name}\n\n")
+        persona_file = agent_dir / "config" / "agent.md"
+        persona_file.write_text(f"# {req.display_name}\n\n")
     except Exception as e:
         # Clean up on failure
         if agent_dir.exists():
@@ -195,29 +217,12 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     # Auto-assign core MCPs. ``exclude_from`` values (``phone``, ``task``) are
     # session-time filters and don't affect assignment — they're handled in
     # mcp_registry.get_agent_mcps() at session config time.
-    from storage import mcp_store
     from services.mcp import mcp_registry
-    core_mcps = [
-        name for name, m in mcp_registry.get_all_manifests().items()
-        if m.category == "core"
-        and m.assignment_mode != "explicit"
-    ]
-    if core_mcps:
-        try:
-            await asyncio.to_thread(mcp_store.set_manager_enabled_mcps, slug, core_mcps)
-            # Seed skill entries for assigned MCPs
-            for mcp_name in core_mcps:
-                m = mcp_registry.get_manifest(mcp_name)
-                if m:
-                    for skill in m.skills:
-                        await asyncio.to_thread(
-                            mcp_store.ensure_agent_skill, slug, skill.id,
-                            default_enabled=True,
-                            default_exclude_from=skill.default_exclude_from,
-                        )
-        except Exception as exc:
-            # Non-critical
-            logger.debug(f"Seeding core MCPs/skills for new agent {slug} failed: {exc}")
+    try:
+        await asyncio.to_thread(mcp_registry.assign_core_mcps, slug)
+    except Exception as exc:
+        # Non-critical
+        logger.debug(f"Seeding core MCPs/skills for new agent {slug} failed: {exc}")
 
     # Assign creator as manager of the new agent (preserve existing assignments)
     from storage import database as task_store
@@ -239,10 +244,11 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
 @router.patch("/v1/agents/{name}")
 async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = Depends(get_current_user)):
     """Update agent configuration."""
-    # Editing an agent's config requires manager authority OVER THIS AGENT, not
-    # merely platform creator-tier + any access — otherwise a creator who is only
-    # a viewer of someone else's agent could rewrite its configuration.
-    u = _require_manage(user)
+    # Editing an agent's config requires manager authority OVER THIS AGENT and
+    # nothing more: the platform role is deliberately not consulted — a platform
+    # member who manages this agent may configure it, while a platform creator
+    # who is only a viewer of someone else's agent may not.
+    u = require_auth(user)
     if not u.can_manage_agent(name):
         raise HTTPException(403, "Manager or admin access required for this agent")
 
@@ -260,6 +266,28 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                 raise HTTPException(400, f"Invalid execution path: {p}. Valid: {valid_paths}")
         if len(req.execution_paths) == 0:
             raise HTTPException(400, "At least one execution path required")
+        # Platform-configured gate on NEWLY-ADDED engines only (set difference
+        # vs the stored set — reorders and removals always pass, and an engine
+        # whose platform subscription has since vanished stays grandfathered so
+        # a saved config can never become unsavable). Bypass is COOKIE admins
+        # only: the config-MCP authenticates with a session token carrying the
+        # session owner's sub, so an admin-created task/trigger session would
+        # otherwise hand the bypass to a prompt-injectable LLM turn.
+        if not (u.role == "admin" and not u.is_api_key):
+            from services.engines import subscription_pool
+            _stored = agent_store.get_agent(name) or {}
+            _current_set = set(_get_execution_paths(_stored))
+            for p in req.execution_paths:
+                if p in _current_set:
+                    continue
+                if not await asyncio.to_thread(
+                    subscription_pool.layer_platform_configured, p
+                ):
+                    raise HTTPException(
+                        403,
+                        f"No {_ENGINE_LABELS.get(p, p)} subscription is "
+                        "connected on this platform",
+                    )
 
     # ``getattr`` defends against test mocks that don't declare every
     # optional field on their ``_Req`` subclass.

@@ -569,4 +569,8 @@ def test_manifest_declares_expected_shape():
     assert manifest["name"] == "mcps-mcp"
     assert manifest["category"] == "core"
     assert manifest["server"]["transport"] == "stdio"
-    assert manifest["exclude_from"] == []
+    # Not in scheduled tasks or meetings: browsing/requesting marketplace
+    # MCPs is a human management flow — a background task would fill the
+    # request queue with nobody asking, and every meeting participant would
+    # pay the tool-schema cost each turn.
+    assert manifest["exclude_from"] == ["task", "meeting"]

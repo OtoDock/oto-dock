@@ -122,3 +122,184 @@ async def test_push_returns_false_when_not_connected():
         "missing", PathRef("agent_tree", "workspace/x.txt"), b"x", agent_slug="a1",
     )
     assert ok is False
+
+
+# --- Path-source streaming (Feature D) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_path_source_small_uses_inline_write(tmp_path):
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+
+    data = b"tiny payload"
+    src = tmp_path / "x.txt"
+    src.write_bytes(data)
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.txt"), src, agent_slug="a1",
+    )
+    assert ok is True
+    assert len(conn.frames) == 1
+    f = conn.frames[0]
+    assert f["action"] == "write"
+    assert f["hash"] == _h(data)
+    assert base64.b64decode(f["content_b64"]) == data
+
+
+@pytest.mark.asyncio
+async def test_path_source_chunked_reassembles_and_hashes(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
+    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+
+    data = b"abcdefghij"  # 3 chunks of 4
+    src = tmp_path / "x.bin"
+    src.write_bytes(data)
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), src, agent_slug="a1",
+    )
+    assert ok is True
+    fr = conn.frames
+    assert [c["action"] for c in fr] == ["write_chunk"] * 3
+    assert b"".join(base64.b64decode(c["content_b64"]) for c in fr) == data
+    assert fr[2]["hash"] == _h(data)  # streamed pre-hash == content hash
+
+
+@pytest.mark.asyncio
+async def test_path_source_missing_file_returns_false(tmp_path):
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), tmp_path / "nope.bin",
+        agent_slug="a1",
+    )
+    assert ok is False
+    assert conn.frames == []
+
+
+@pytest.mark.asyncio
+async def test_path_source_shrink_mid_push_aborts(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
+    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
+    mgr = SatelliteConnectionManager()
+    src = tmp_path / "x.bin"
+    src.write_bytes(b"abcdefghijklmnop")  # 4 chunks
+
+    def _truncate_on_first_flush(idx, frame):
+        # After the first window ack the file shrinks under the reader.
+        src.write_bytes(b"abcd")
+        return "ok"
+
+    conn = _AckingConn(mgr, "m1", status_for=_truncate_on_first_flush)
+    mgr._connections["m1"] = conn
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), src, agent_slug="a1",
+    )
+    assert ok is False
+    # First window (chunks 0,1) went out; the short read aborted before any
+    # further frame — never a truncated stream under a stale total_chunks.
+    assert [c["chunk_index"] for c in conn.frames] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_progress_cb_flush_points_and_terminal(monkeypatch):
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
+    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+
+    ticks: list[tuple[int, int]] = []
+    data = b"abcdefghijklmnopqr"  # 18 bytes → 5 chunks; flush at idx 1, 3, 4
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "w.bin"), data, agent_slug="a1",
+        progress_cb=lambda s, t: ticks.append((s, t)),
+    )
+    assert ok is True
+    assert ticks == [(8, 18), (16, 18), (18, 18)]  # window acks + terminal
+
+
+@pytest.mark.asyncio
+async def test_progress_cb_async_and_raising(monkeypatch):
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4, raising=True)
+    monkeypatch.setattr(sc, "PUSH_WINDOW_CHUNKS", 2, raising=True)
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+
+    seen: list[tuple[int, int]] = []
+
+    async def _async_cb(s, t):
+        seen.append((s, t))
+        raise RuntimeError("broken callback")
+
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "w.bin"), b"abcdefghij", agent_slug="a1",
+        progress_cb=_async_cb,
+    )
+    assert ok is True          # a raising callback never aborts the transfer
+    assert seen[-1] == (10, 10)  # async cb was awaited
+
+
+@pytest.mark.asyncio
+async def test_inline_push_progress_terminal():
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    mgr._connections["m1"] = conn
+    ticks: list[tuple[int, int]] = []
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "w.txt"), b"hi", agent_slug="a1",
+        progress_cb=lambda s, t: ticks.append((s, t)),
+    )
+    assert ok is True
+    assert ticks == [(2, 2)]
+
+
+# --- Per-satellite cap gate (Feature D) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_old_satellite_capped_at_legacy(monkeypatch):
+    """A pre-0.5.103 satellite must never be sent a file above the legacy cap
+    even when the config cap is higher."""
+    monkeypatch.setattr("core.remote.file_sync.MAX_FILE_SIZE", 1000, raising=True)
+    monkeypatch.setattr(
+        "core.remote.file_sync.LEGACY_SYNC_MAX_FILE_BYTES", 10, raising=True,
+    )
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    conn.satellite_version = "0.5.102"
+    mgr._connections["m1"] = conn
+
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "w.bin"), b"x" * 11, agent_slug="a1",
+    )
+    assert ok is False
+    assert conn.frames == []  # gated BEFORE any frame goes out
+
+    # Same payload to a 0.5.103 satellite proceeds (config cap applies).
+    conn2 = _AckingConn(mgr, "m2")
+    conn2.satellite_version = "0.5.103"
+    mgr._connections["m2"] = conn2
+    ok2 = await mgr.push_file(
+        "m2", PathRef("agent_tree", "w.bin"), b"x" * 11, agent_slug="a1",
+    )
+    assert ok2 is True
+
+
+@pytest.mark.asyncio
+async def test_config_cap_enforced_for_new_satellite(monkeypatch):
+    monkeypatch.setattr("core.remote.file_sync.MAX_FILE_SIZE", 8, raising=True)
+    mgr = SatelliteConnectionManager()
+    conn = _AckingConn(mgr, "m1")
+    conn.satellite_version = "0.5.103"
+    mgr._connections["m1"] = conn
+    ok = await mgr.push_file(
+        "m1", PathRef("agent_tree", "w.bin"), b"x" * 9, agent_slug="a1",
+    )
+    assert ok is False
+    assert conn.frames == []

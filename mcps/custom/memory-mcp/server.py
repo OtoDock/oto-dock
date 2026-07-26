@@ -38,8 +38,10 @@ Environment variables (set in per-agent mcp-config.json via manifest
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
 from typing import Any
 
 import httpx
@@ -120,9 +122,17 @@ def _available_scopes() -> list[str]:
     return scopes
 
 
+def _default_scope() -> str:
+    """The scope the tool description advertises as the default. Bare-filename
+    ``view`` inference must agree with it — the two resolving differently
+    would read one scope while advertising another."""
+    scopes = _available_scopes()
+    return DEFAULT_SCOPE if DEFAULT_SCOPE in scopes else (scopes[0] if scopes else "agent")
+
+
 def _memory_tool() -> Tool:
     scopes = _available_scopes()
-    default = DEFAULT_SCOPE if DEFAULT_SCOPE in scopes else (scopes[0] if scopes else "agent")
+    default = _default_scope()
     scope_lines = []
     if "agent" in scopes:
         scope_lines.append(
@@ -241,6 +251,82 @@ async def list_tools() -> list[Tool]:
 # declared schema is loaded), passing JSON-ish strings for typed args — the
 # same fragility the meetings tools hit. Coerce instead of bouncing.
 
+class ToolArgError(Exception):
+    """Self-correcting argument error — returned as the tool-result text."""
+
+
+_CANONICAL_COMMANDS = {"view", "create", "str_replace", "insert", "delete", "rename"}
+# Near-miss command names map onto the contract by TOKEN, never substring —
+# substring matching would send `reformat` to delete (contains "rm") and
+# `truncate`/`locate` to view (contains "cat"). The destructive buckets
+# (delete/rename) match only these exact tokens. Order matters: str_replace
+# outranks create so editor-flavoured names never create files, and the
+# non-destructive buckets outrank the destructive ones so an ambiguous name
+# can never delete.
+_COMMAND_TOKEN_MAP: tuple[tuple[str, frozenset[str]], ...] = (
+    ("str_replace", frozenset({"replace", "edit"})),
+    ("create", frozenset({"create", "write"})),
+    ("view", frozenset({"view", "read", "cat", "list", "ls", "show"})),
+    ("insert", frozenset({"insert", "append"})),
+    ("delete", frozenset({"delete", "del", "rm", "remove", "unlink"})),
+    ("rename", frozenset({"rename", "move", "mv"})),
+)
+_WRITE_PAYLOAD_KEYS = (
+    "file_text", "content", "old_str", "old_string",
+    "new_str", "new_string", "insert_text",
+)
+
+
+def _normalize_command(arguments: dict[str, Any]) -> str | None:
+    """Map a near-miss command onto its canonical contract name.
+
+    ``str_replace_based_edit_20250124`` → str_replace, ``remove_topic`` →
+    delete. A missing command with a path and no write payload infers
+    ``view``; anything unrecognised passes through so the proxy's
+    self-correcting error (which lists the valid commands) reaches the model.
+    """
+    command = arguments.get("command")
+    if not command or not isinstance(command, str):
+        if arguments.get("path") and not any(
+            arguments.get(k) for k in _WRITE_PAYLOAD_KEYS
+        ):
+            return "view"
+        return command if isinstance(command, str) and command else None
+    if command in _CANONICAL_COMMANDS:
+        return command
+    tokens = set(re.split(r"[^a-z]+", command.lower())) - {""}
+    for canonical, wanted in _COMMAND_TOKEN_MAP:
+        if tokens & wanted:
+            return canonical
+    return command
+
+
+def _normalize_path(command: str | None, path: Any) -> Any:
+    """Root sentinels + bare-filename policy.
+
+    ``view``: missing/``""``/``"/"`` list the /memories root, and a bare
+    filename reads from the advertised default scope (a wrong guess is a
+    harmless "does not exist"). Writes never scope-guess: the fixed scope
+    order would land a bare-filename personal note in the SHARED agent
+    scope, so they are refused with an error naming both scopes instead.
+    """
+    p = path.strip() if isinstance(path, str) else path
+    bare = isinstance(p, str) and p and "/" not in p and p != "memories"
+    if command == "view":
+        if p is None or p == "" or p == "/":
+            return "/memories"
+        if bare:
+            return f"/memories/{_default_scope()}/{p}"
+        return p
+    if bare:
+        raise ToolArgError(
+            f"Ambiguous path {p!r}: specify the scope — /memories/agent/{p} "
+            f"(shared with every user of this agent) or /memories/user/{p} "
+            "(private to the current user)."
+        )
+    return p
+
+
 def _coerce_view_range(v: Any) -> list[int] | None:
     if v is None:
         return None
@@ -271,14 +357,19 @@ def _coerce_int(v: Any) -> int | None:
 
 
 def build_op_body(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Map tool arguments onto the /op request body (pure, testable)."""
-    command = arguments.get("command")
+    """Map tool arguments onto the /op request body (pure, testable).
+
+    Normalizes the command FIRST so a missing command with a path can still
+    infer ``view``; raises ToolArgError for the bare-filename write refusal.
+    """
+    command = _normalize_command(arguments)
     body: dict[str, Any] = {"command": command}
     if command == "rename":
-        body["old_path"] = arguments.get("old_path") or arguments.get("path")
-        body["new_path"] = arguments.get("new_path")
+        body["old_path"] = _normalize_path(
+            command, arguments.get("old_path") or arguments.get("path"))
+        body["new_path"] = _normalize_path(command, arguments.get("new_path"))
     else:
-        body["path"] = arguments.get("path")
+        body["path"] = _normalize_path(command, arguments.get("path"))
     if command == "view":
         vr = _coerce_view_range(arguments.get("view_range"))
         if vr is not None:
@@ -318,9 +409,18 @@ def format_result(data: dict[str, Any]) -> str:
 # Tool dispatch
 # ---------------------------------------------------------------------------
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+@server.call_tool(validate_input=False)
+async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     try:
+        # validate_input=False also drops the SDK's dict guarantee — a blind
+        # caller can pass a JSON string (or junk); coerce rather than crash.
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (ValueError, TypeError):
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
         if name != "memory":
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
         if not _available_scopes():
@@ -328,17 +428,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 type="text",
                 text="memory is not enabled for this session.",
             )]
-        command = arguments.get("command")
-        if not command:
-            return [TextContent(type="text", text="command required")]
         body = build_op_body(name, arguments)
+        if not body.get("command"):
+            return [TextContent(type="text", text="command required")]
         data = await _post_op(body)
         return [TextContent(type="text", text=format_result(data))]
 
+    except ToolArgError as e:
+        return [TextContent(type="text", text=str(e))]
     except httpx.HTTPStatusError as e:
+        # Unwrap FastAPI's {"detail": ...} so the model reads the actual
+        # message, not a JSON blob.
+        detail = None
+        with contextlib.suppress(Exception):
+            detail = e.response.json().get("detail")
+        text = detail if isinstance(detail, str) else e.response.text
         return [TextContent(
             type="text",
-            text=f"API error {e.response.status_code}: {e.response.text}",
+            text=f"API error {e.response.status_code}: {text}",
         )]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {e}")]

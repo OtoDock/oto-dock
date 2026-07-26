@@ -18,10 +18,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pdf as pdf_mod  # noqa: E402
 
 
+async def _async_ident(p, writing=False, **kw):
+    return p
+
+
 @pytest.fixture(autouse=True)
 def _bypass_platform(monkeypatch):
     """Identity path resolution + swallowed preview push."""
-    monkeypatch.setattr(pdf_mod, "_resolve_path", lambda p, writing=False: p)
+    monkeypatch.setattr(pdf_mod, "_resolve_path", _async_ident)
     monkeypatch.setattr(pdf_mod, "_to_agents_relative", lambda p: p)
 
     async def _noop_preview(path):
@@ -146,3 +150,93 @@ def test_watermark_single_run_diagonal(tmp_path):
     assert len(spans) == 1  # one straight run, not per-glyph fragments
     dx, dy = dirs[0]
     assert dx > 0.5 and dy < -0.5  # reads upward left→right (↗)
+
+
+# --- scanned-page handling (read markers + OCR raster policy) ----------------
+
+def _make_scanned_pdf(path: Path, n_pages: int, dpi: int = 150,
+                      text_pages: dict[int, list[str]] | None = None):
+    """PDF where each page is a full-page raster (like a scanner's output),
+    except indices in ``text_pages`` which get a real text layer."""
+    text_pages = text_pages or {}
+    doc = fitz.open()
+    for i in range(n_pages):
+        if i in text_pages:
+            page = doc.new_page()
+            y = 100
+            for t in text_pages[i]:
+                page.insert_text(fitz.Point(72, y), t, fontsize=12, fontname="helv")
+                y += 30
+        else:
+            src = fitz.open()
+            p = src.new_page()
+            p.insert_text(fitz.Point(72, 100), f"raster page {i + 1}",
+                          fontsize=14, fontname="helv")
+            pix = p.get_pixmap(dpi=dpi)
+            page = doc.new_page(width=p.rect.width, height=p.rect.height)
+            page.insert_image(page.rect, stream=pix.tobytes("jpeg", jpg_quality=70))
+            src.close()
+    doc.save(str(path))
+    doc.close()
+
+
+def test_read_pdf_marks_scanned_ranges(tmp_path):
+    f = tmp_path / "mixed.pdf"
+    _make_scanned_pdf(f, 4, text_pages={0: ["intro text"], 3: ["closing text"]})
+    out = pdf_mod.read_pdf(str(f), None)
+    assert "--- Page 1 ---" in out and "intro text" in out
+    assert "--- Pages 2-3: scanned images, no text layer ---" in out
+    assert "--- Page 4 ---" in out and "closing text" in out
+    assert "screenshot_document" in out  # vision-first guidance
+
+
+def test_read_pdf_all_scanned_hint(tmp_path):
+    f = tmp_path / "scan.pdf"
+    _make_scanned_pdf(f, 3)
+    out = pdf_mod.read_pdf(str(f), None)
+    assert "--- Pages 1-3: scanned images, no text layer ---" in out
+    assert "screenshot_document" in out
+    assert "edit_pdf" in out and "'ell+eng'" in out  # OCR + language steer
+
+
+def test_ocr_raster_dpi_caps_at_source(tmp_path):
+    f = tmp_path / "cap.pdf"
+    _make_scanned_pdf(f, 1, dpi=150)
+    doc = fitz.open(str(f))
+    page = doc[0]
+    # Auto (None) caps the 300 default at the ~150 dpi source raster.
+    assert abs(pdf_mod._ocr_raster_dpi(page, None) - 150) <= 2
+    # An explicit request below the source is honored as-is.
+    assert pdf_mod._ocr_raster_dpi(page, 100) == 100
+    # Absurd requests clamp to the 600 ceiling (then the source cap).
+    assert pdf_mod._ocr_raster_dpi(page, 10_000) <= 600
+    doc.close()
+    # A text-only page has no source raster — the default stays 300.
+    t = tmp_path / "txt.pdf"
+    _make_pdf(t, [["plain text"]])
+    doc = fitz.open(str(t))
+    assert pdf_mod._ocr_raster_dpi(doc[0], None) == 300
+    doc.close()
+
+
+def _tessdata_available() -> bool:
+    try:
+        return bool(fitz.get_tessdata())
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _tessdata_available(), reason="no tessdata installed")
+def test_ocr_op_capped_output_keeps_text_layer(tmp_path):
+    f = tmp_path / "scan2.pdf"
+    _make_scanned_pdf(f, 2, dpi=150)
+    out_path = tmp_path / "scan2_ocr.pdf"
+    res = _edit(f, [{"type": "ocr", "language": "eng",
+                     "output_path": str(out_path)}])
+    assert "failed" not in res
+    assert out_path.exists()
+    text = _text(out_path)
+    assert "raster page" in text  # OCR produced a searchable layer
+    # RGB raster capped at the 150 dpi source: the old unconditional 300 dpi
+    # swap quadrupled the pixel count for zero OCR gain (536MB incident).
+    assert out_path.stat().st_size < f.stat().st_size * 6

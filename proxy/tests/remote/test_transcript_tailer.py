@@ -63,7 +63,7 @@ def _capture(monkeypatch):
     rows.order = []
     import storage.database as db
 
-    def _add(chat_id, role, content="", event_type="", event_data=""):
+    def _add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
         if role == "event":
             rows.events.append((event_type, json.loads(event_data)))
             rows.order.append(("event", event_type))
@@ -101,6 +101,9 @@ def test_persists_user_and_assistant_text(tmp_path, _capture):
     stats = T.tail_transcript("s1", "c1", path)
     assert stats["persisted"] == 2
     assert _capture == [("user", "hello there"), ("assistant", "hi back")]
+    # Early-title counters: assistant text chars only (never the user row).
+    assert stats["assistant_chars"] == len("hi back")
+    assert stats["tool_rows"] == 0
 
 
 def test_server_submitted_first_prompt_not_duplicated(tmp_path, _capture):
@@ -133,7 +136,9 @@ def test_skips_tool_result_user_messages(tmp_path, _capture):
                      "input": {"file_path": "/tmp/x.py"}}]),
         _tool_result("toolu_w", "File created"),
     )
-    T.tail_transcript("s2", "c2", path)
+    stats = T.tail_transcript("s2", "c2", path)
+    # Early-title counters: one result-paired tool row, no assistant text.
+    assert stats["tool_rows"] == 1 and stats["assistant_chars"] == 0
     assert _capture == []  # no text rows; Write isn't a Task so no registry entry either
     assert _capture.events == [("tool", {
         "type": "tool", "name": "Write", "tool_id": "toolu_w", "summary": "x.py",
@@ -754,7 +759,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     release = threading.Event()
     rows = []
 
-    def _slow_add(chat_id, role, content="", event_type="", event_data=""):
+    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
         rows.append((role, content))
         entered.set()
         release.wait(timeout=5)

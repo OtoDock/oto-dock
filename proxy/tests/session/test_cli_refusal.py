@@ -27,7 +27,7 @@ def test_refusal_emits_visible_error():
     assert "declined" in c.text
     assert "cyber" in c.text
     assert "Request flagged by safety classifiers." in c.text
-    assert "Opus 4.8" in c.text
+    assert "Opus 5" in c.text
 
 
 def test_refusal_without_details_still_surfaces():

@@ -81,6 +81,7 @@ from api.mcp import credentials as credentials_router
 from api.auth import oauth as oauth_router
 from api.mcp import mcps as mcps_router
 from api.mcp import community as community_router
+from api.mcp import local_templates as local_templates_router
 from api.media import uploads as uploads_router
 from api.media import images as images_router
 from api.media import media as media_router
@@ -138,6 +139,7 @@ app.include_router(openai_oauth_router.router)
 app.include_router(oauth_router.router)
 app.include_router(mcps_router.router)
 app.include_router(community_router.router)
+app.include_router(local_templates_router.router)
 app.include_router(execution_layers_router.router)
 app.include_router(uploads_router.router)
 app.include_router(images_router.router)

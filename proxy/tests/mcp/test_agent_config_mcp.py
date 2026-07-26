@@ -6,7 +6,7 @@ tests. What we lock down here is:
 
 - ``_resolve_tool_set()`` returns the right set for each session shape.
 - The manifest fields match the framework's expectations (category=core,
-  assignment_mode auto-resolved, empty exclude_from).
+  assignment_mode auto-resolved, meeting-excluded).
 - Tool schemas + handler map are coherent (every schema has a handler and
   vice versa).
 """
@@ -43,13 +43,16 @@ def _load_server(env: dict[str, str]):
 
 
 class TestPermissionMatrix:
-    def test_viewer_user_scope_has_no_tools(self):
+    def test_viewer_user_scope_has_only_complete_setup(self):
+        # Viewers get exactly complete_setup: per-user onboarding
+        # (user-setup.md) targets the default-attach audience, who join as
+        # viewers. Everything else stays manager-tier.
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant-lite",
             "OTO_ROLE": "viewer",
             "OTO_SCOPE": "user",
         })
-        assert mod.ENABLED_TOOLS == set()
+        assert mod.ENABLED_TOOLS == {"complete_setup"}
 
     def test_manager_user_scope_has_all_tools(self):
         mod = _load_server({
@@ -69,9 +72,19 @@ class TestPermissionMatrix:
         })
         assert "update_default_model" in mod.ENABLED_TOOLS
 
+    def test_viewer_agent_scope_has_only_complete_setup(self):
+        """A Shared-only agent mounts agent-scope for HUMAN chats too, so the
+        viewer clamp can't key on scope — a real viewer drives that session."""
+        mod = _load_server({
+            "OTO_AGENT_NAME": "shared-service",
+            "OTO_ROLE": "viewer",
+            "OTO_SCOPE": "agent",
+        })
+        assert mod.ENABLED_TOOLS == {"complete_setup"}
+
     def test_agent_scope_session_has_all_tools(self):
         """Agent-scope (task / phone / trigger / Shared-only agent) can
-        self-modify. Role is empty in agent-scope sessions."""
+        self-modify. Role is empty in agent-scope service sessions."""
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant-lite",
             "OTO_ROLE": "",
@@ -94,7 +107,12 @@ class TestManifestSanity:
         assert manifest["category"] == "core"
         assert manifest["server"]["runtime"] == "python"
         assert manifest["server"]["transport"] == "stdio"
-        assert manifest["exclude_from"] == []
+        # Only where a HUMAN is present and asking (chat, terminal, phone):
+        # excluded from scheduled tasks (an agent silently reconfiguring
+        # itself with nobody watching) and meetings (self-reconfiguration
+        # mid-discussion, possibly on another participant's suggestion —
+        # and meetings multiply tool-schema cost per turn).
+        assert manifest["exclude_from"] == ["task", "meeting"]
 
     def test_schema_handler_coherence(self):
         mod = _load_server({

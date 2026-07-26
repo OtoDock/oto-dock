@@ -412,7 +412,8 @@ async def test_restore_admin_keeps_manager_tier_on_config(_fanout_calls):
     res = await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
     )
-    assert [r["rel_path"] for r in res["restored"]] == ["config/prompt.md"]
+    # Pre-1.4 persona entries restore under the current filename.
+    assert [r["rel_path"] for r in res["restored"]] == ["config/agent.md"]
     assert rb.get(e["entry_id"]) is None
 
 
@@ -479,4 +480,5 @@ async def test_restore_manager_can_restore_config(_fanout_calls):
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]),
         _manager_with_agent(),
     )
-    assert [r["rel_path"] for r in res["restored"]] == ["config/prompt.md"]
+    # Pre-1.4 persona entries restore under the current filename.
+    assert [r["rel_path"] for r in res["restored"]] == ["config/agent.md"]

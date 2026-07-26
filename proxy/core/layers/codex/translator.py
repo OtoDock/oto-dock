@@ -9,10 +9,11 @@ re-exports CodexEventTranslator (and _codex_tool_summary) for back-compat.
 import logging
 
 import config as app_config
+from core.events.bg_command_state import get_bg_command_registry
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
-    SUBAGENT_START, SUBAGENT_END, METADATA, DONE, ERROR, TODO_UPDATE,
-    GOAL_UPDATE, CONTEXT_COMPACT,
+    SUBAGENT_START, SUBAGENT_END, BG_COMMAND_START, BG_COMMAND_END,
+    METADATA, DONE, ERROR, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
 )
 from core.layers.codex.session import CodexEvent
 
@@ -101,12 +102,15 @@ _COLLAB_TERMINAL = frozenset(
     {"completed", "errored", "shutdown", "interrupted", "notFound"})
 
 # ServerNotification methods that carry no pump-visible signal (suppressed).
+# turn/started and item/commandExecution/terminalInteraction are handled in
+# translate() (turn-start hygiene / background-terminal yield detection);
+# outputDelta stays suppressed — the pill shows final output, CLI parity.
 _SUPPRESSED_METHODS = frozenset({
-    "thread/started", "turn/started", "thread/status/changed",
+    "thread/started", "thread/status/changed",
     "mcpServer/startupStatus/updated", "mcpServer/oauthLogin/completed",
     "item/mcpToolCall/progress", "item/commandExecution/outputDelta",
     "command/exec/outputDelta", "item/fileChange/outputDelta",
-    "item/commandExecution/terminalInteraction", "turn/diff/updated",
+    "turn/diff/updated",
     "serverRequest/resolved", "hook/started", "hook/completed",
     "model/rerouted", "account/updated", "account/rateLimits/updated",
     "app/list/updated", "fs/changed", "item/plan/delta",
@@ -126,15 +130,33 @@ class CodexEventTranslator:
     ``params`` (see :class:`CodexEvent`).
     """
 
-    def __init__(self, model: str = "", *, supervised_bg: bool = False) -> None:
+    def __init__(self, model: str = "", *, supervised_bg: bool = False,
+                 session_id: str = "", supervised_bg_commands: bool = False) -> None:
         self._model = model
-        # When True (the LOCAL Codex layer, whose session runs a per-thread bg
-        # supervisor), background sub-agents still active at main-turn end are NOT
-        # swept — the supervisor emits each one's SUBAGENT_END on real completion.
-        # When False (the REMOTE path — the satellite has no bg supervisor yet),
-        # keep the original behavior: sweep still-active sub-agents at turn end so
-        # their badges can't hang. Remote bg-subagent supervision is a follow-up.
+        # When True (local layer always; remote when the satellite forwards
+        # past main-turn end, ≥0.5.18), background sub-agents still active at
+        # main-turn end are NOT swept — a per-thread supervisor emits each
+        # one's SUBAGENT_END on real completion. When False (legacy
+        # satellites), sweep still-active sub-agents at turn end so their
+        # badges can't hang.
         self._supervised_bg = supervised_bg
+        # Keys the per-session BackgroundCommandRegistry (badge gate + monitor
+        # wait); empty (back-compat default) disables registry feeding.
+        self._session_id = session_id
+        # When True (local layer always; remote when the satellite forwards
+        # past main-turn end, ≥0.5.18): a background terminal still open at
+        # turn end stays tracked — its real item/completed (cross-turn via the
+        # pump, idle via the session/remote router's OOB hook, lost-event via
+        # the drain reconciliation) emits BG_COMMAND_END. When False (legacy
+        # satellites — no idle delivery), still-open terminals are resolved to
+        # "completed" at every turn end so a badge can never dangle.
+        self._supervised_bg_commands = supervised_bg_commands
+        # Open commandExecution items with a non-null ``processId`` (the
+        # unified_exec session id; non-null ⟺ PTY-backed, background-capable).
+        # itemId → {process_id, command, started, swept}: ``started`` once
+        # BG_COMMAND_START was emitted, ``swept`` once a turn/completed passed
+        # while the item was still open (its completion is then cross-turn).
+        self._bg_commands: dict[str, dict] = {}
         # Per-turn latest token breakdown (``tokenUsage.last`` is already
         # per-turn — no cumulative diffing needed, unlike the exec model).
         self._last_usage: dict = {}
@@ -198,7 +220,11 @@ class CodexEventTranslator:
             delta = params.get("delta", "")
             if delta:
                 self._streamed_text.add(item_id)
-                return [CommonEvent(type=TEXT, data={"content": delta})]
+                # Text streaming while a background-capable command is still
+                # open ⇒ the model yielded past it (unified_exec yield window):
+                # light its badge now, not at the turn-end sweep.
+                return self._start_open_bg_commands() + [
+                    CommonEvent(type=TEXT, data={"content": delta})]
             return []
 
         if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
@@ -206,7 +232,22 @@ class CodexEventTranslator:
             delta = params.get("delta", "")
             if delta:
                 self._streamed_reasoning.add(item_id)
-                return [CommonEvent(type=THINKING, data={"phase": "delta", "text": delta})]
+                return self._start_open_bg_commands() + [
+                    CommonEvent(type=THINKING, data={"phase": "delta", "text": delta})]
+            return []
+
+        if method == "item/commandExecution/terminalInteraction":
+            # The model polled/wrote to a background terminal — proof it
+            # yielded past that command. Idempotent: START once per item. Also
+            # the first place the unified_exec ``processId`` reliably appears
+            # on this wire (the approval-path ``item/started`` is synthesized
+            # with ``processId: null`` — observed live on 0.145.0): bind it for
+            # the drain's backgroundTerminals/list reconciliation.
+            rec = self._bg_commands.get(params.get("itemId", ""))
+            if rec is not None:
+                rec["process_id"] = params.get("processId") or rec["process_id"]
+                if not rec["started"]:
+                    return [self._bg_command_start_event(params["itemId"], rec)]
             return []
 
         if method == "item/started":
@@ -257,6 +298,20 @@ class CodexEventTranslator:
             return [CommonEvent(type=CONTEXT_COMPACT, data={
                 "phase": "completed", "trigger": "auto",
             })]
+
+        if method == "turn/started":
+            # Turn-start hygiene: drop background-terminal candidates the drain
+            # already resolved out-of-band (no longer pending in the registry)
+            # while keeping cross-turn pending ones — a background terminal
+            # routinely outlives the turn that spawned it.
+            if self._bg_commands and self._session_id:
+                reg = get_bg_command_registry(self._session_id)
+                live = reg.spawned - reg.completed
+                self._bg_commands = {
+                    iid: rec for iid, rec in self._bg_commands.items()
+                    if not rec["started"] or iid in live
+                }
+            return []
 
         if method == "turn/completed":
             return self._on_turn_completed(params.get("turn", {}))
@@ -336,6 +391,24 @@ class CodexEventTranslator:
                 events.append(CommonEvent(type=TOOL_INPUT, data={
                     "name": tool_name, "summary": summary, "tool_input": item,
                 }))
+            if item_type == "commandExecution":
+                # EVERY command item is a background candidate. The protocol
+                # source says unified_exec items carry ``processId`` from
+                # item/started — but on this wire the approval-path started
+                # item is SYNTHESIZED with ``processId: null`` and the
+                # canonical one is deduped away (observed live, 0.145.0), so
+                # a null processId proves nothing. No badge yet either way:
+                # most commands finish inside the yield window and stay a
+                # plain Bash card; BG_COMMAND_START fires only on yield
+                # evidence (delta / terminalInteraction / turn-end sweep).
+                # processId, when it becomes known (terminalInteraction /
+                # backgroundTerminals/list), is bound into the rec for drain
+                # matching; the registry keys on itemId throughout.
+                self._bg_commands[item_id] = {
+                    "process_id": item.get("processId"),
+                    "command": item.get("command", ""),
+                    "started": False, "swept": False,
+                }
             return events
 
         if item_type == "mcpToolCall":
@@ -407,7 +480,25 @@ class CodexEventTranslator:
             output = _completed_tool_output(item_type, item)
             if output is not None:
                 data["result_content"], data["is_error"] = output
-            return [CommonEvent(type=TOOL_RESULT, data=data)]
+            events = [CommonEvent(type=TOOL_RESULT, data=data)]
+            rec = (self._bg_commands.pop(item_id, None)
+                   if item_type == "commandExecution" else None)
+            if rec is None or not rec["started"]:
+                # Untracked, or the PTY exited inside the yield window (never
+                # backgrounded) — today's plain Bash card path, no BG events.
+                return events
+            status = ("failed" if item.get("status") == "failed"
+                      or (item.get("exitCode") or 0) != 0 else "completed")
+            if self._session_id:
+                get_bg_command_registry(self._session_id).mark_done(
+                    item_id, surfaced=not rec["swept"])
+            end = CommonEvent(type=BG_COMMAND_END, data={
+                "tool_use_id": item_id, "status": status})
+            # Cross-turn (swept) arrival: BG_COMMAND_END only — a TOOL_RESULT
+            # here would hit the pump's unknown-id fallback, which name-matches
+            # "Bash" and attaches the old transcript to a DIFFERENT live Bash
+            # card in the later turn.
+            return [end] if rec["swept"] else events + [end]
 
         if item_type == "mcpToolCall":
             server, tool = item.get("server", ""), item.get("tool", "")
@@ -565,6 +656,25 @@ class CodexEventTranslator:
                     sweep.append(CommonEvent(type=SUBAGENT_END, data={"tool_use_id": aid}))
             self._subagents = {}
 
+        # Background terminals (unified_exec) still open at turn end have
+        # definitely yielded — START any the mid-turn triggers missed. Runs on
+        # every status (turn/interrupt does NOT kill background terminals).
+        # Supervised (local + ≥0.5.18 remote): keep them tracked — the real
+        # item/completed emits BG_COMMAND_END. Unsupervised (legacy remote
+        # satellite): resolve to "completed" now — no idle delivery exists
+        # there, so a held badge could never clear.
+        for iid, rec in list(self._bg_commands.items()):
+            if not rec["started"]:
+                sweep.append(self._bg_command_start_event(iid, rec))
+            if self._supervised_bg_commands:
+                rec["swept"] = True
+            else:
+                if self._session_id:
+                    get_bg_command_registry(self._session_id).mark_done(iid)
+                sweep.append(CommonEvent(type=BG_COMMAND_END, data={
+                    "tool_use_id": iid, "status": "completed"}))
+                del self._bg_commands[iid]
+
         status = turn.get("status", "completed")
         if status == "failed":
             err = turn.get("error", {}) or {}
@@ -577,29 +687,28 @@ class CodexEventTranslator:
             return sweep + [CommonEvent(type=DONE)]
 
         # Success: per-turn token breakdown is tokenUsage.last (already per-turn).
-        # cache_write stays 0 BY NECESSITY, not choice: the OpenAI API reports
-        # cache-write tokens on gpt-5.6+ (usage.input_tokens_details.
-        # cache_write_tokens, billed at 1.25x input for implicit AND explicit
-        # caching), but codex-rs 0.144.1 drops the field at deserialization —
-        # its TokenUsage carries only input/cached/output/reasoning/total
-        # (codex-api/src/sse/responses.rs). Until the pinned CLI surfaces it,
-        # gpt-5.6 codex costs slightly UNDERCOUNT the true bill (by 0.25x the
-        # input rate on however many non-cached tokens were written — bounded
-        # by the non-cached input line, usually the smallest turn component).
-        # We record what the provider-side CLI reports rather than fabricate
-        # counts. Re-check on every codex pin bump (VERSIONS.md runbook).
+        # cacheWriteInputTokens landed in codex-rs 0.145.0's TokenUsage
+        # (serde-defaulted — older daemons simply omit it and the split below
+        # degrades to the historical undercount). OpenAI semantics:
+        # inputTokens INCLUDES cachedInputTokens; cache-WRITTEN tokens are a
+        # subset of the non-cached remainder, billed at the cache_write rate
+        # (1.25x input on gpt-5.6+) INSTEAD of the plain input rate.
         u = self._last_usage
         input_tokens = int(u.get("inputTokens", 0) or 0)
         cached = int(u.get("cachedInputTokens", 0) or 0)
+        cache_write = int(u.get("cacheWriteInputTokens", 0) or 0)
         output_tokens = int(u.get("outputTokens", 0) or 0)
         non_cached = max(0, input_tokens - cached)
+        cache_write = min(cache_write, non_cached)
+        plain_input = non_cached - cache_write
 
         cost = 0.0
         if self._model:
             provider = app_config.get_model_provider(self._model)
-            p_in, p_out, _p_cw, p_cr = app_config.get_model_pricing(self._model, provider)
+            p_in, p_out, p_cw, p_cr = app_config.get_model_pricing(self._model, provider)
             cost = (
-                non_cached * p_in / 1_000_000
+                plain_input * p_in / 1_000_000
+                + cache_write * p_cw / 1_000_000
                 + cached * p_cr / 1_000_000
                 + output_tokens * p_out / 1_000_000
             )
@@ -612,10 +721,10 @@ class CodexEventTranslator:
         meta = {
             "cost_usd": cost,
             "cost_is_delta": True,
-            "input_tokens": non_cached,
+            "input_tokens": plain_input,
             "output_tokens": output_tokens,
             "cache_read": cached,
-            "cache_write": 0,
+            "cache_write": cache_write,
             "context_used": ctx_used,
             "context_max": ctx_max,
         }
@@ -648,6 +757,48 @@ class CodexEventTranslator:
             rec["ended"] = True
         self._resolved_subagents.add(agent_id)
         return [CommonEvent(type=SUBAGENT_END, data={"tool_use_id": agent_id})]
+
+    def _bg_command_start_event(self, item_id: str, rec: dict) -> CommonEvent:
+        """BG_COMMAND_START for one candidate: marks it started and registers
+        the spawn so the pump/monitors gate on its completion. Payload mirrors
+        the CLI's bg_command_start; ``tool_use_id`` is the itemId — the same key
+        as the Bash card and BG_COMMAND_END. The registry task key is ALSO the
+        itemId (not the unified_exec processId, which the approval-path
+        item/started omits — it may never become known; when it does, it lives
+        in the rec for backgroundTerminals/list matching only)."""
+        rec["started"] = True
+        if self._session_id:
+            get_bg_command_registry(self._session_id).register_spawn(
+                item_id, item_id)
+        return CommonEvent(type=BG_COMMAND_START, data={
+            "tool_use_id": item_id,
+            "command": rec.get("command", ""),
+            "description": "background terminal",
+        })
+
+    def _start_open_bg_commands(self) -> list[CommonEvent]:
+        """BG_COMMAND_START for every candidate not yet started — called when
+        the stream proves the model yielded past them (text/reasoning delta)."""
+        return [self._bg_command_start_event(iid, rec)
+                for iid, rec in self._bg_commands.items() if not rec["started"]]
+
+    def pending_bg_commands(self) -> list[dict]:
+        """Background terminals started (badge live) but not yet ended. The
+        session's drain reconciles these against thread/backgroundTerminals/
+        list; _teardown_bg resolves them as killed (a fresh daemon knows
+        nothing of old processIds)."""
+        return [
+            {"process_id": rec["process_id"], "item_id": iid,
+             "command": rec.get("command", "")}
+            for iid, rec in self._bg_commands.items() if rec["started"]
+        ]
+
+    def tracks_bg_command(self, params: dict) -> bool:
+        """True when a notification's params carry a completion for a TRACKED
+        background terminal — the router's cheap between-turns OOB gate."""
+        item = (params.get("item") if isinstance(params, dict) else None) or {}
+        return (item.get("type") == "commandExecution"
+                and item.get("id") in self._bg_commands)
 
     def thread_id_metadata(self, thread_id: str) -> list[CommonEvent]:
         """Emit codex_thread_id once for DB persistence (called by the session)."""

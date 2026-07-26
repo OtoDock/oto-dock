@@ -385,3 +385,14 @@ def test_scope_total_bytes_and_iter_skip_hidden(root):
     files = memory_file.iter_topic_files(root)
     assert [f.name for f in files] == ["a.md"]
     assert memory_file.scope_total_bytes(root) == 5
+
+
+def test_git_repo_root_never_resolves_to_user_dir_root(tmp_path):
+    # A bare pre-created users/{u}/.git (the codex inner-sandbox mountpoint)
+    # must never be adopted as a repo by the memory-commit path: both scopes
+    # resolve to dedicated subdirectory repos, not the user dir root.
+    from services.memory.memory_file import git_repo_root
+    agent_dir = tmp_path / "agents" / "a1"
+    assert git_repo_root(agent_dir, "agent") == agent_dir / "knowledge"
+    assert git_repo_root(agent_dir, "user", "alice") == \
+        agent_dir / "users" / "alice" / "context"

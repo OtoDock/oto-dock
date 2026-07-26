@@ -351,3 +351,87 @@ describe('AppFrame', () => {
     expect(container.querySelector('iframe')!.getAttribute('src')).not.toBe(before)
   })
 })
+
+describe('AppFrame open_url bridge', () => {
+  const openUrl = (f: HTMLIFrameElement, url: unknown) =>
+    window.dispatchEvent(new MessageEvent('message', {
+      data: { source: 'otodock-artifact', v: 1, type: 'open_url', url },
+      source: f.contentWindow,
+    }))
+
+  beforeEach(() => {
+    localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  it('denies open_url when the app is not approved', async () => {
+    const { container } = render(
+      <AppFrame app={mkApp({ actions_approved: false })} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { openUrl(f, 'https://example.com/x') })
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'open_url_ack', status: 'denied', reason: 'actions not approved' }), '*',
+    )
+  })
+
+  it('denies same-origin URLs (cookie-carrying dashboard routes)', async () => {
+    const { container } = render(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { openUrl(f, `${window.location.origin}/v1/agents`) })
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'open_url_ack', status: 'denied' }), '*',
+    )
+    expect(container.querySelector('[data-testid="app-openurl-chip"]')).toBeNull()
+  })
+
+  it('first open shows the origin consent chip; Allow opens the tab', async () => {
+    const winOpen = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const { container } = render(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { openUrl(f, 'https://docs.example.com/page?x=1') })
+    const chip = container.querySelector('[data-testid="app-openurl-chip"]')
+    expect(chip).not.toBeNull()
+    expect(chip!.textContent).toContain('https://docs.example.com')
+    expect(chip!.textContent).not.toContain('/page')  // origin only, never the full URL
+    expect(winOpen).not.toHaveBeenCalled()
+    const allow = Array.from(chip!.querySelectorAll('button'))
+      .find((b) => b.textContent === 'Allow')!
+    await act(async () => { allow.click() })
+    expect(winOpen).toHaveBeenCalledWith(
+      'https://docs.example.com/page?x=1', '_blank', 'noopener,noreferrer')
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'open_url_ack', status: 'opened' }), '*',
+    )
+  })
+
+  it('a stored allow opens without the chip; popup-block is acked back', async () => {
+    localStorage.setItem('otodock-app-openurl:app-1', 'allowed')
+    const winOpen = vi.spyOn(window, 'open').mockReturnValue(null)
+    const { container } = render(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => { openUrl(f, 'https://example.com/a') })
+    expect(container.querySelector('[data-testid="app-openurl-chip"]')).toBeNull()
+    expect(winOpen).toHaveBeenCalled()
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'open_url_ack', status: 'blocked' }), '*',
+    )
+  })
+
+  it('burst-guards rapid opens', async () => {
+    localStorage.setItem('otodock-app-openurl:app-1', 'allowed')
+    vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const { container } = render(<AppFrame app={mkApp()} agent="a1" />)
+    const f = getFrame(container)
+    const spy = ackSpy(f)
+    await act(async () => {
+      for (let i = 0; i < 4; i++) openUrl(f, `https://example.com/${i}`)
+    })
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'open_url_ack', status: 'denied', reason: 'rate limited' }), '*',
+    )
+  })
+})

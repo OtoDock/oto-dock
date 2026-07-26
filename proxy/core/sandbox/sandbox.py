@@ -680,6 +680,17 @@ class SandboxBuilder:
         # silent stray. Mirrored by the path-policy write allowlist
         # (auth/path_policy.py::_USER_DIR_WRITABLE_SUBDIRS).
         user_dir = agent_dir_path / "users" / username
+        # Codex's own Linux sandbox (a nested bwrap) mounts read-only tmpfs
+        # over <writable-root>/{.git,.agents,.codex} for every writable root,
+        # cwd included — and bwrap must CREATE a missing mountpoint, which
+        # this deliberately read-only root refuses ("Can't mkdir
+        # /users/<u>/.git: Read-only file system"; the helper dies and codex
+        # surfaces tool failures like view_image's "unable to locate image").
+        # Pre-create the two codex doesn't make itself as EMPTY dirs — git
+        # treats a bare .git dir as "not a git repository" and walks past;
+        # .codex is session_config_dir's job and is RW-bound below.
+        for sub in (".git", ".agents"):
+            (user_dir / sub).mkdir(parents=True, exist_ok=True)
         args.extend(["--ro-bind", str(user_dir), f"/users/{username}"])
         for sub in ("workspace", "context"):
             (user_dir / sub).mkdir(parents=True, exist_ok=True)

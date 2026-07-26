@@ -29,7 +29,7 @@ def test_foreign_model_refused():
 
 
 def test_claude_layer_refuses_codex_model():
-    with patch("storage.subscription_store.list_models", return_value=_models("claude-fable-5", "claude-opus-4-8[1m]")):
+    with patch("storage.subscription_store.list_models", return_value=_models("claude-fable-5", "claude-opus-5")):
         assert _model_allowed_for_path("gpt-5.5", "claude-code-cli") is False
 
 

@@ -62,6 +62,7 @@ import os
 import re
 
 from core.session.history_seed import strip_seed_prefix
+from core.session.transcript_tailer import author_sub_for
 from core.session.transcript_tool_events import (
     TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
     persist_event, record_batch_usage,
@@ -608,12 +609,12 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     events it newly consumed (claimed per line so overlapping deliveries can't
     double-count) and flushes one ``usage_records`` row via
     ``record_batch_usage`` — headless parity split: ``input_tokens`` column =
-    non-cached input, ``cache_read`` = cached, ``cache_write`` = 0. The zero is
-    forced by the CLI, not a shortcut: gpt-5.6+ bills cache writes (1.25x
-    input) and the API reports them, but codex-rs 0.144.1's TokenUsage drops
-    the field at deserialization — so no rollout event can ever carry it and
-    5.6 costs undercount by the unreported write premium (see the translator's
-    METADATA comment; re-check on pin bumps). ``calibrate_usage=True`` (a
+    non-cached non-written input, ``cache_read`` = cached, ``cache_write`` =
+    ``cache_write_input_tokens`` (codex-rs 0.145.0 added it to TokenUsage,
+    serde-defaulted — an older daemon's rollout simply omits the field and the
+    column stays 0, the historical undercount). Cache-written tokens are a
+    subset of the non-cached remainder, billed at 1.25x input on gpt-5.6+ (see
+    the translator's METADATA comment). ``calibrate_usage=True`` (a
     post-restart re-read from line 0) claims the events but records NOTHING —
     their usage was recorded pre-restart; recording the replay would
     double-count the whole session."""
@@ -622,6 +623,13 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     buf = _tool_events.setdefault(session_id, ToolEventBuffer())
     ptr = 0
     persisted = 0
+    # Early-title counters (interactive_session accumulates them across
+    # batches and fires the LLM title upgrade mid-turn at char/tool
+    # thresholds). Incremented ONLY at actual persist sites, after the
+    # prefix/known_events dedup guards, so re-read history never counts;
+    # question/thinking/system rows are excluded (tool rows only).
+    assistant_chars = 0
+    tool_rows = 0
     first_user_text: str | None = None
     # Turn-end signal for the interactive completion watcher: Codex writes one
     # ``event_msg``/``task_complete`` per turn (with the
@@ -691,8 +699,12 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             if last and buf.claim(key) and not calibrate_usage:
                 inp = int(last.get("input_tokens") or 0)
                 cached = int(last.get("cached_input_tokens") or 0)
-                usage_acc["input_tokens"] += max(0, inp - cached)
+                cw = int(last.get("cache_write_input_tokens") or 0)
+                non_cached = max(0, inp - cached)
+                cw = min(cw, non_cached)
+                usage_acc["input_tokens"] += non_cached - cw
                 usage_acc["cache_read"] += cached
+                usage_acc["cache_write"] += cw
                 usage_acc["output_tokens"] += int(last.get("output_tokens") or 0)
             continue
 
@@ -743,9 +755,14 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             continue
         ptype = payload.get("type")
         if ptype in ("function_call", "custom_tool_call"):
-            persisted += _on_rollout_tool_call(buf, task_store, chat_id,
-                                               payload, known_events,
-                                               open_questions)
+            rows = _on_rollout_tool_call(buf, task_store, chat_id,
+                                         payload, known_events,
+                                         open_questions)
+            persisted += rows
+            # A persisted row here is a tool card (update_plan snapshot /
+            # id-less input-only) — EXCEPT the question row.
+            if payload.get("name") != "request_user_input":
+                tool_rows += rows
             if payload.get("name") == "request_user_input":
                 # Turn-relevant: codex tool calls otherwise don't move the
                 # signal, but the question fold below keys on "tool_use"
@@ -754,9 +771,11 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             continue
         if ptype in ("function_call_output", "custom_tool_call_output"):
             open_questions.discard(payload.get("call_id") or "")
-            persisted += _on_rollout_tool_output(
+            rows = _on_rollout_tool_output(
                 buf, task_store, chat_id, payload.get("call_id") or "",
                 payload.get("output"), known_events)
+            persisted += rows
+            tool_rows += rows
             continue
         if ptype == "tool_search_call":
             args = payload.get("arguments") \
@@ -770,9 +789,11 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 }
             continue
         if ptype == "tool_search_output":
-            persisted += _on_rollout_tool_output(
+            rows = _on_rollout_tool_output(
                 buf, task_store, chat_id, payload.get("call_id") or "",
                 json.dumps(payload.get("tools") or []), known_events)
+            persisted += rows
+            tool_rows += rows
             continue
         if ptype == "web_search_call":
             # Server-side tool — no output item pairs with it; the results ride
@@ -782,11 +803,13 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             query = (action.get("query") or "") if isinstance(action, dict) else ""
             if wid and not buf.claim(wid):
                 continue
-            persisted += _persist_block(task_store, chat_id, {
+            rows = _persist_block(task_store, chat_id, {
                 "type": "tool", "name": "web_search", "tool_id": wid or "web_search",
                 "summary": query, "active": False,
                 "tool_input": {"query": query} if query else None,
             }, known_events)
+            persisted += rows
+            tool_rows += rows
             continue
         if ptype == "reasoning":
             # Headless parity: the summary text is what streams as THINKING
@@ -839,8 +862,15 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         if role == "user" and consume_sent_prompt(chat_id, text):
             continue
 
-        task_store.add_chat_message(chat_id, role, text)
+        task_store.add_chat_message(
+            chat_id, role, text,
+            # Attribution is a property of the HUMAN turn (twin of the Claude
+            # tailer's author_sub stamp); assistant rows carry none.
+            author_sub=(author_sub_for(session_id) if role == "user" else ""),
+        )
         persisted += 1
+        if role == "assistant":
+            assistant_chars += len(text)
 
     # Question fold: a request_user_input still unanswered at batch end means
     # the TUI is blocked on the picker — close the turn (headless parity: the
@@ -879,6 +909,9 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         "compacted": compacted,
         # usage_records rows written for this batch (0 = no new usage events).
         "usage_rows": usage_rows,
+        # Early-title counters (see the init comment above).
+        "assistant_chars": assistant_chars,
+        "tool_rows": tool_rows,
     }
 
 

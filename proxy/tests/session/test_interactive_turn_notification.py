@@ -105,7 +105,11 @@ def _new_session(*, chat_id="chat-1", on_turn_complete=None, old=True,
         asyncio.get_running_loop().time() - (MIN_TURN_S + 5) if old
         else asyncio.get_running_loop().time()
     )
-    s._title_fired = False
+    s._title_armed = True
+    s._title_timer = None
+    s._title_timer_spent = False
+    s._title_chars = 0
+    s._title_tools = 0
     s._turn_complete_fired = False
     s.on_turn_complete = on_turn_complete
     # Server-prompt injection state read by _maybe_fire_turn_complete's drain.

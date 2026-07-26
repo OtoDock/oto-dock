@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -77,6 +78,18 @@ FAKE_INSTALL_RESULT = {
     "runtime": "node",
     "install_log": "npm install ok",
 }
+
+
+def _docker_manifest_stub(name: str, runtime: str = "docker"):
+    """Minimal manifest for the approval-convergence path (server.runtime is
+    the only attribute ensure_enabled_and_running dereferences)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(name=name, server=SimpleNamespace(runtime=runtime))
+
+
+def _patchable_mock(**kwargs):
+    from unittest.mock import MagicMock
+    return MagicMock(**kwargs)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -341,18 +354,36 @@ class TestApprove:
 
     def test_approve_skips_install_when_already_installed(self, temp_db):
         """When the local manifest registry already has the MCP, we shouldn't
-        re-fetch from GitHub — just flip the request through to installed."""
+        re-fetch from GitHub — but the platform state must still CONVERGE:
+        enabled + container started. "Manifest on disk" (repo-shipped
+        mcps/community/*, a rolled-back attempt) is not "enabled and running",
+        and this path used to mark the request installed while the MCP stayed
+        invisible at runtime."""
         _seed_agent()
         row = _create_request()
         from services.community import community_installer
+        from core.config import deployment
+        from storage import mcp_store
 
         install_mock = AsyncMock(return_value=FAKE_INSTALL_RESULT)
-        # Truthy manifest = "already installed"
+        manifest_stub = _docker_manifest_stub("nextcloud")
+        start_mock = _patchable_mock(return_value=True)
         with patch.object(
             community_installer, "install_from_catalog", new=install_mock,
         ), patch(
             "services.community.community_installer.mcp_registry.get_manifest",
-            return_value=object(),
+            return_value=manifest_stub,
+        ), patch(
+            "services.mcp.docker_manager._inject_mcp_env", return_value=True,
+        ), patch(
+            "services.mcp.compose_rewrite.ensure_pull_compose",
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="stopped",
+        ), patch(
+            "services.mcp.docker_manager.start_container", new=start_mock,
+        ), patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
         ), patch(
             "services.notifications.notification_manager.fire_notification",
             new=AsyncMock(),
@@ -363,6 +394,128 @@ class TestApprove:
         install_mock.assert_not_awaited()
         assert updated["status"] == "installed"
         assert "Already installed" in (updated["install_log"] or "")
+        # Convergence: platform-enabled and container started.
+        state = mcp_store.get_mcp_state("nextcloud")
+        assert state and state.get("enabled") is True
+        start_mock.assert_called_once()
+
+    def test_approve_surfaces_reenable_of_disabled_mcp(self, temp_db):
+        """Approving an MCP an admin had disabled platform-wide re-enables it
+        (approval = explicit make-usable decision) but says so in the log —
+        never a silent kill-switch reversal."""
+        _seed_agent()
+        row = _create_request()
+        from services.community import community_installer
+        from core.config import deployment
+        from storage import mcp_store
+
+        mcp_store.set_mcp_enabled("nextcloud", False)
+        with patch(
+            "services.community.community_installer.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager._inject_mcp_env", return_value=True,
+        ), patch(
+            "services.mcp.compose_rewrite.ensure_pull_compose",
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="running",
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+        ) as start_mock, patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            updated = asyncio.run(
+                community_installer.approve_request(row["id"], ADMIN_SUB),
+            )
+        assert updated["status"] == "installed"
+        assert "Re-enabled platform-wide" in (updated["install_log"] or "")
+        state = mcp_store.get_mcp_state("nextcloud")
+        assert state and state.get("enabled") is True
+        # Already running → no restart.
+        start_mock.assert_not_called()
+
+    def test_approve_external_pool_never_starts_locally(self, temp_db):
+        _seed_agent()
+        row = _create_request()
+        from services.community import community_installer
+        from core.config import deployment
+
+        with patch(
+            "services.community.community_installer.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+        ) as start_mock, patch.object(
+            deployment, "current_mode", return_value=deployment.EXTERNAL_POOL,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            updated = asyncio.run(
+                community_installer.approve_request(row["id"], ADMIN_SUB),
+            )
+        assert updated["status"] == "installed"
+        start_mock.assert_not_called()
+
+    def test_approve_nondocker_runtime_no_container_calls(self, temp_db):
+        _seed_agent()
+        row = _create_request()
+        from services.community import community_installer
+        from core.config import deployment
+
+        with patch(
+            "services.community.community_installer.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud", runtime="node"),
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+        ) as start_mock, patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            updated = asyncio.run(
+                community_installer.approve_request(row["id"], ADMIN_SUB),
+            )
+        assert updated["status"] == "installed"
+        start_mock.assert_not_called()
+
+    def test_approve_start_failure_still_installs_with_warning(self, temp_db):
+        """A container that won't come up must not fail the approval — the
+        request lands installed with the warning recorded in install_log."""
+        _seed_agent()
+        row = _create_request()
+        from services.community import community_installer
+        from core.config import deployment
+
+        with patch(
+            "services.community.community_installer.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager._inject_mcp_env", return_value=True,
+        ), patch(
+            "services.mcp.compose_rewrite.ensure_pull_compose",
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="not_found",
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+            side_effect=RuntimeError("pull timeout"),
+        ), patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            updated = asyncio.run(
+                community_installer.approve_request(row["id"], ADMIN_SUB),
+            )
+        assert updated["status"] == "installed"
+        assert "Container start failed" in (updated["install_log"] or "")
 
     def test_approve_install_failure_lands_in_install_failed(self, temp_db):
         _seed_agent()
@@ -504,10 +657,12 @@ class TestCancel:
 
 class _StubExplicitManifest:
     assignment_mode = "explicit"
+    server = SimpleNamespace(runtime="node")
 
 
 class _StubAutoManifest:
     assignment_mode = "auto"
+    server = SimpleNamespace(runtime="node")
 
 
 class TestExplicitInstanceAuthorization:
@@ -1034,6 +1189,7 @@ class TestAdminAutoApprove:
 
         class _Explicit:
             assignment_mode = "explicit"
+            server = SimpleNamespace(runtime="node")
 
         with self._mock_catalog(("prometheus",)), patch.object(
             community_installer, "install_from_catalog",
@@ -1132,6 +1288,97 @@ class TestInstanceUpdateById:
         assert rows[0]["field_values"]["PROMETHEUS_URL"] == "http://new:9090"
 
 
+class TestInstanceSaveContainerRefresh:
+    """``_refresh_container_after_instance_change`` applies changed instance
+    values to a RUNNING Docker container (env re-inject + force-recreate) and
+    deliberately does nothing for non-docker runtimes, disabled MCPs, or
+    stopped containers (admin owns that state — next start picks up .env)."""
+
+    def test_running_container_is_recreated(self, temp_db):
+        from api.mcp.mcps import _refresh_container_after_instance_change
+        from core.config import deployment
+        from storage import mcp_store
+        mcp_store.set_mcp_enabled("nextcloud", True)
+        start_mock = _patchable_mock(return_value=True)
+        with patch(
+            "api.mcp.mcps.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager._inject_mcp_env", return_value=True,
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="running",
+        ), patch(
+            "services.mcp.docker_manager.start_container", new=start_mock,
+        ), patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ):
+            refreshed = asyncio.run(
+                _refresh_container_after_instance_change("nextcloud"),
+            )
+        assert refreshed is True
+        start_mock.assert_called_once()
+        assert start_mock.call_args.kwargs.get("force_recreate") is True
+
+    def test_stopped_container_gets_env_only(self, temp_db):
+        from api.mcp.mcps import _refresh_container_after_instance_change
+        from core.config import deployment
+        from storage import mcp_store
+        mcp_store.set_mcp_enabled("nextcloud", True)
+        inject_mock = _patchable_mock(return_value=True)
+        start_mock = _patchable_mock(return_value=True)
+        with patch(
+            "api.mcp.mcps.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager._inject_mcp_env", new=inject_mock,
+        ), patch(
+            "services.mcp.docker_manager.get_container_status",
+            return_value="stopped",
+        ), patch(
+            "services.mcp.docker_manager.start_container", new=start_mock,
+        ), patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ):
+            refreshed = asyncio.run(
+                _refresh_container_after_instance_change("nextcloud"),
+            )
+        assert refreshed is False
+        inject_mock.assert_called_once()
+        start_mock.assert_not_called()
+
+    def test_disabled_or_nondocker_untouched(self, temp_db):
+        from api.mcp.mcps import _refresh_container_after_instance_change
+        from core.config import deployment
+        from storage import mcp_store
+        # Disabled docker MCP → no action.
+        mcp_store.set_mcp_enabled("nextcloud", False)
+        with patch(
+            "api.mcp.mcps.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud"),
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+        ) as start_mock, patch.object(
+            deployment, "current_mode", return_value=deployment.MANAGED_LOCAL,
+        ):
+            assert asyncio.run(
+                _refresh_container_after_instance_change("nextcloud"),
+            ) is False
+            start_mock.assert_not_called()
+        # Non-docker runtime → no action, regardless of enabled state.
+        mcp_store.set_mcp_enabled("nextcloud", True)
+        with patch(
+            "api.mcp.mcps.mcp_registry.get_manifest",
+            return_value=_docker_manifest_stub("nextcloud", runtime="node"),
+        ), patch(
+            "services.mcp.docker_manager.start_container",
+        ) as start_mock:
+            assert asyncio.run(
+                _refresh_container_after_instance_change("nextcloud"),
+            ) is False
+            start_mock.assert_not_called()
+
+
 class TestInstanceSaveAutoRetry:
     """``POST/PUT /v1/admin/mcps/{name}/instances`` sweeps install_failed
     requests for this MCP and auto-retries the ones whose agent is now
@@ -1174,6 +1421,7 @@ class TestInstanceSaveAutoRetry:
         # branches correctly.
         class _Explicit:
             assignment_mode = "explicit"
+            server = SimpleNamespace(runtime="node")
 
         # Configure an instance with the agent already attached.
         from api.mcp.mcps import _retry_install_failed_for_instance
@@ -1225,6 +1473,7 @@ class TestInstanceSaveAutoRetry:
 
         class _Explicit:
             assignment_mode = "explicit"
+            server = SimpleNamespace(runtime="node")
 
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "shared",

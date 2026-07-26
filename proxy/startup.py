@@ -170,6 +170,12 @@ async def lifespan(app: FastAPI):
     load_session_security()
 
     from storage import agent_store
+    # Converge pre-1.4 agents on the agent.md persona filename before any
+    # session builds a prompt (readers accept both names; this makes disk,
+    # git and satellite sync agree on the new one).
+    migrated = await asyncio.to_thread(agent_store.migrate_persona_filenames)
+    if migrated:
+        logger.info("Persona filename migration: %d agent(s) converged", migrated)
     # Managed/cloud installs: seed the bootstrap license key ONCE (when the DB
     # has none). The license_check_worker then owns updates via the relay
     # re-issue (adopt-on-check) — a worker-adopted key is never overwritten.
@@ -214,30 +220,16 @@ async def lifespan(app: FastAPI):
             logger.exception("Docker MCP bring-up failed (non-fatal)")
 
     _bg_tasks.append(asyncio.create_task(_docker_mcp_bringup()))
-    # Bootstrap core-MCP assignments for pre-existing agents.
-    # ``api/agents/agents.py:create_agent`` auto-assigns core MCPs on agent
-    # creation, but adding a new core MCP later (e.g. memory-mcp on
-    # platform upgrade) needs a one-shot backfill. Idempotent — the
-    # underlying ``ON CONFLICT DO NOTHING`` insert means re-running is
-    # cheap.
-    try:
-        from storage import mcp_store
-        for _manifest_name, _manifest in mcp_registry.get_all_manifests().items():
-            if _manifest.category != "core":
-                continue
-            if _manifest.assignment_mode == "explicit":
-                continue
-            for _agent in agent_store.get_all_agents():
-                mcp_store.add_agent_mcp(_agent["slug"], _manifest_name)
-                # Also ensure skill rows so they auto-load.
-                for _skill in _manifest.skills:
-                    mcp_store.ensure_agent_skill(
-                        _agent["slug"], _skill.id,
-                        default_enabled=True,
-                        default_exclude_from=_skill.default_exclude_from,
-                    )
-    except Exception:
-        logger.exception("core-MCP bootstrap-assign failed (non-fatal)")
+    # NOTE: there is deliberately NO boot backfill of core MCPs onto existing
+    # agents (removed 2026-07-26; it ran every boot until then). Core MCPs are
+    # assigned at exactly two moments — agent creation
+    # (``api/agents/agents.py:create_agent``) and template install
+    # (``community_agent_installer`` step 4c) — so a per-agent removal or a
+    # template's ``core_mcps: "none"`` opt-out sticks across restarts. The
+    # trade-off, accepted with the core set considered complete: a core MCP
+    # introduced by a FUTURE version reaches only agents created after the
+    # upgrade; pre-existing agents pick it up via re-install or a release-note
+    # instruction, never silently.
     # Create/remove the platform-managed ("Hosted by OtoDock") system
     # instances to match the hosted-relay state — relay usable AND the master
     # toggle on AND connected (relay_client.system_relay_active()). Extracted so
@@ -278,6 +270,16 @@ async def lifespan(app: FastAPI):
     _caps = get_all_capabilities()
     for _path, _layer_caps in _caps.items():
         subscription_store.sync_builtin_models(_path, _layer_caps.get("models", []))
+    # One-time lossless remap of the retired Opus 4.8 builtin onto Opus 5:
+    # pricing is identical ($5/$25/$6.25/$0.50 per 1M), so moving pinned
+    # agents/chats over loses nothing — and without it a 4.8-pinned agent's
+    # NEW chats would silently fall back to the first enabled layer model
+    # (Fable 5, at 2x the price) because the retired builtin row no longer
+    # passes the model-allowed check. Idempotent; must never kill boot.
+    try:
+        subscription_store.remap_retired_model("claude-opus-4-8[1m]", "claude-opus-5")
+    except Exception:
+        logger.exception("retired-model remap failed (non-fatal)")
     logger.info(f"Synced builtin models for {len(_caps)} execution layer(s)")
     # Initialize concurrency control (reads limits from DB)
     from core import concurrency
@@ -365,6 +367,11 @@ async def lifespan(app: FastAPI):
     from ws.satellite import push_install_event as _push_install_event
     _install_registry.set_broadcaster(_push_install_event)
 
+    # Workspace transfer progress (Feature E) rides the same delivery model.
+    from core.remote import transfer_registry as _transfer_registry
+    from ws.satellite import push_transfer_event as _push_transfer_event
+    _transfer_registry.set_broadcaster(_push_transfer_event)
+
     async def _registry_sweep_loop():
         while True:
             await asyncio.sleep(60)
@@ -376,6 +383,10 @@ async def lifespan(app: FastAPI):
                 await _install_registry.sweep_stale()
             except Exception:
                 logger.exception("install_registry sweep failed")
+            try:
+                await _transfer_registry.sweep_stale()
+            except Exception:
+                logger.exception("transfer_registry sweep failed")
             try:
                 from core.credentials import catalog_install_registry as _catalog_install_registry
                 await _catalog_install_registry.sweep_stale()

@@ -6,8 +6,11 @@ CLI/Codex session that held the conversation context is unrecoverable. The
 chat row is flagged via ``chats.pending_history_seed`` (set by
 ``remote_store.delete_remote_machine`` with ``'machine_removed:<name>'``;
 the retention sweep with ``'retention'``; the warmup fresh branch with
-``'resume_failed'``). The next turn — any turn: user send, TaskRunView send,
-server nudge — consumes the flag at the ``_start_new_stream`` chokepoint and
+``'resume_failed'``; the user's explicit move with ``'moved:<from>'``; the
+cross-engine switch — WS ``switch_engine`` — with
+``'engine_switch:<old_layer>'``). The next turn — any turn: user send,
+TaskRunView send, server nudge — consumes the flag at the
+``_start_new_stream`` chokepoint and
 prepends a compact digest of the prior conversation, rebuilt from
 ``chat_messages``, to the outgoing prompt, so the fresh session continues
 with real context.
@@ -41,6 +44,26 @@ _PREAMBLE = (
     "before assuming they exist.]"
 )
 _FOOTER = "[End of restored conversation digest. The latest message follows.]"
+
+# Display labels for the ``engine_switch:<old_layer>`` reason detail.
+_ENGINE_LABELS = {
+    "claude-code-cli": "Claude Code",
+    "codex-cli": "Codex",
+    "direct-llm": "Direct LLM",
+}
+
+
+def engine_switch_notice(old_path: str) -> str:
+    """The ``session_reseeded`` card text for a cross-engine switch. Shared by
+    the seed-consume branch below and the ``switch_engine`` handler's
+    direct-llm-target path (which persists the card at switch time — direct
+    sessions never consume seeds, so the branch below would never run)."""
+    old_label = _ENGINE_LABELS.get(old_path, old_path or "the previous engine")
+    return (
+        f"Continued on a different AI engine — chat history was restored "
+        f"from the database (previous engine: {old_label}). The old "
+        "session file and its working state stay behind."
+    )
 
 
 def _truncate(text: str, cap: int) -> str:
@@ -173,6 +196,10 @@ def consume_pending_seed_digest(
             "from history; the previous session's working files may no "
             "longer be available."
         )
+    elif kind == "engine_switch":
+        # The user's explicit cross-engine switch (switch_engine WS op);
+        # detail carries the OLD layer id — mapped to a display label.
+        notice = engine_switch_notice(detail)
     else:
         # 'retention' and any unknown reason payloads.
         notice = (

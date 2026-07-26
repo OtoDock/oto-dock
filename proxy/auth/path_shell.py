@@ -18,11 +18,8 @@ from auth.path_policy import (
     PathDecision,
     SecurityContext,
     _ALLOW,
-    _check_read_path,
+    _check_path_arg,
     _check_remote_bash_path,
-    _check_write_path,
-    _resolve_path,
-    _translate_sandbox_path,
 )
 
 # Hostnames always treated as private (no DNS resolution needed)
@@ -1044,8 +1041,7 @@ def _classify_segment(
     def _bash_path_decision(rp: str, *, writing: bool) -> PathDecision:
         if is_remote:
             return _check_remote_bash_path(rp, ctx, writing=writing)
-        resolved = _resolve_path(_translate_sandbox_path(rp, ctx))
-        return _check_write_path(resolved, ctx) if writing else _check_read_path(resolved, ctx)
+        return _check_path_arg(rp, ctx, writing=writing)
 
     # 1. Command substitutions — recurse the inner (carries the dangerous scan); a
     #    present substitution makes the OUTER command unanalyzable (the substituted
@@ -1725,8 +1721,7 @@ def _classify_powershell_segment(
     def _ps_path_decision(rp: str, *, writing: bool) -> PathDecision:
         if is_remote:
             return _check_remote_bash_path(rp, ctx, writing=writing)
-        resolved = _resolve_path(_translate_sandbox_path(rp, ctx))
-        return _check_write_path(resolved, ctx) if writing else _check_read_path(resolved, ctx)
+        return _check_path_arg(rp, ctx, writing=writing)
 
     cmdlet = _ps_cmdlet_name(segment)
     if cmdlet is None:

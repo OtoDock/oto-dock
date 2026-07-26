@@ -78,6 +78,7 @@ class TestMidTurnReattach:
                     "output_tokens": 0,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+                    "process_alive": True,  # active pump mid-turn
                 })
                 assert [(m["role"], m["content"])
                         for m in history["messages"]] == [
@@ -293,6 +294,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "model": TEST_MODEL,
                     "mode": "default",
+                    "process_alive": True,  # active pump mid-turn
                 })
                 # BOTH user rows survive the cutoff; the in-flight assistant
                 # tail stays withheld (it rides live_state).

@@ -290,3 +290,326 @@ def test_remote_interrupted_plan_turn_emits_no_card():
         {"type": "_turn_ended", "command_id": ""},
     ])
     assert not [e for e in events if e.type == PLAN_MODE]
+
+
+# ---------------------------------------------------------------------------
+# Background terminals (unified_exec bg commands): live cross-turn completion.
+# Same design as bg sub-agents — the satellite's persistent forwarder streams a
+# terminal's late item/completed between turns; the router's OOB hook resolves
+# it, _teardown_remote_bg sweeps survivors, and the drain's codex branch pulls
+# the satellite's codex_bg_terminals RPC as the loss-window backstop.
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock
+
+from core.events.bg_command_state import (
+    _bg_command_registries, get_bg_command_registry,
+)
+
+
+def _bg_cmd_tr(sid="s1"):
+    tr = CodexEventTranslator(
+        model="gpt-5.6-sol", supervised_bg=True,
+        session_id=sid, supervised_bg_commands=True,
+    )
+    tr._main_thread_id = MAIN
+    return tr
+
+
+def _swept_bg_candidate(tr, *, pid=None):
+    """One background terminal past its turn-end sweep (badge live, pending).
+    ``pid`` optionally binds the unified_exec processId via terminalInteraction
+    (the only place it reliably appears on this wire)."""
+    tr.translate(CodexEvent("item/started", {"threadId": MAIN, "item": {
+        "type": "commandExecution", "id": "i1", "command": "sleep 40",
+        "processId": None}}))
+    if pid:
+        tr.translate(CodexEvent("item/commandExecution/terminalInteraction", {
+            "threadId": MAIN, "itemId": "i1", "processId": pid, "stdin": ""}))
+    tr.translate(CodexEvent("turn/completed",
+                            {"threadId": MAIN, "turn": {"status": "completed"}}))
+
+
+def test_router_oob_resolves_tracked_bg_command_completion():
+    async def run():
+        tr = _bg_cmd_tr()
+        _swept_bg_candidate(tr)
+        layer, info = _make_layer_info(tr)
+        router = asyncio.create_task(layer._route_remote_notifications(info))
+        try:
+            assert get_bg_command_registry("s1").has_pending
+            # Idle (no default_consumer): the exit's item/completed lands on
+            # the router and must resolve via the OOB hook, not be dropped.
+            info.event_queue.put_nowait(_ev(
+                "item/completed", MAIN, type="commandExecution", id="i1",
+                command="sleep 40", status="completed", exitCode=0,
+                aggregatedOutput="done"))
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if not get_bg_command_registry("s1").has_pending:
+                    break
+            assert get_bg_command_registry("s1").completed == {"i1"}
+            assert tr.pending_bg_commands() == []
+            # The translated events were discarded, not routed anywhere.
+            assert info.thread_consumers == {}
+            assert info.default_consumer is None
+            assert not router.done()  # a guarded apply never kills the router
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop("s1", None)
+
+
+def test_router_untracked_item_completed_still_dropped():
+    async def run():
+        tr = _bg_cmd_tr()
+        layer, info = _make_layer_info(tr)
+        router = asyncio.create_task(layer._route_remote_notifications(info))
+        try:
+            # Between turns, a completion for an item the translator never
+            # tracked is a plain main-thread straggler — dropped.
+            info.event_queue.put_nowait(_ev(
+                "item/completed", MAIN, type="commandExecution", id="ghost",
+                status="completed", exitCode=0))
+            await asyncio.sleep(0.05)
+            assert get_bg_command_registry("s1").spawned == set()
+            assert info.thread_consumers == {}
+            assert not router.done()
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop("s1", None)
+
+
+def test_remote_teardown_sweeps_pending_terminals_as_killed():
+    async def run():
+        tr = _bg_cmd_tr()
+        _swept_bg_candidate(tr)
+        layer, info = _make_layer_info(tr)
+        await layer._teardown_remote_bg(info)
+        assert get_bg_command_registry("s1").completed == {"i1"}
+        assert tr.pending_bg_commands() == []
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop("s1", None)
+
+
+def test_codex_send_message_prunes_registry_preserving_pending():
+    # The per-turn prune (reset_bg_command_registry) must run for remote codex
+    # too: reset() PRESERVES still-pending terminals but clears resolved +
+    # unsurfaced state, so the cohort math can't fire spurious review turns.
+    async def run():
+        layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
+        layer._cm = MagicMock()
+        layer._cm.wait_abort_acked = AsyncMock(return_value=True)
+        layer._cm.is_session_in_grace = MagicMock(return_value=False)
+        info = RemoteSessionInfo(
+            session_id="s1", machine_id="m1", agent_name="a",
+            execution_path="codex-cli", event_queue=asyncio.Queue(),
+            codex_thread_id=MAIN, bg_supervised=False,
+        )
+        layer._sessions = {"s1": info}
+
+        async def _send(machine_id, msg, **kw):
+            if msg.get("type") == "send_message":
+                info.event_queue.put_nowait(
+                    {"type": "_turn_ended", "command_id": ""})
+            return {}
+
+        layer._cm.send_command = AsyncMock(side_effect=_send)
+        reg = get_bg_command_registry("s1")
+        reg.register_spawn("pending-i", "pending-i")
+        reg.register_spawn("done-i", "done-i")
+        reg.mark_done("done-i", surfaced=False)
+
+        events = [e async for e in layer.send_message("s1", "hi")]
+        assert events[-1].type == DONE
+        assert reg.spawned == {"pending-i"}   # still-running preserved
+        assert reg.completed == set()
+        assert reg.unsurfaced_count == 0
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop("s1", None)
+
+
+# ---------------------------------------------------------------------------
+# Drain backstop (codex branch of RemoteExecutionLayer.drain_bg_commands)
+# ---------------------------------------------------------------------------
+
+def _drain_layer(sid, *, version="0.5.105", translator=None):
+    cm = SatelliteConnectionManager()
+    cm._connections["m1"] = SatelliteConnection(
+        machine_id="m1", ws=None, satellite_version=version,
+    )
+    layer = RemoteExecutionLayer(cm)
+    info = RemoteSessionInfo(
+        session_id=sid, machine_id="m1", agent_name="a",
+        execution_path="codex-cli", event_queue=asyncio.Queue(),
+        codex_translator=translator, codex_thread_id=MAIN, bg_supervised=True,
+    )
+    layer._sessions[sid] = info
+    return layer, info, cm
+
+
+def _scripted_send(calls, ack):
+    async def _send(machine_id, msg, *, timeout=30.0, command_id=None):
+        calls.append(msg)
+        if isinstance(ack, Exception):
+            raise ack
+        return ack
+    return _send
+
+
+def test_drain_codex_version_gate_off_is_noop():
+    sid = "s-rbg-gate"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, version="0.5.104", translator=tr)
+        calls: list = []
+        cm.send_command = _scripted_send(calls, {"ok": True, "terminals": []})
+        assert await layer.drain_bg_commands(sid) is False
+        assert calls == []      # gated BEFORE sending — no burnt ack timeout
+        assert get_bg_command_registry(sid).pending_count == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_drain_codex_keeps_item_present_in_list():
+    sid = "s-rbg-item"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        calls: list = []
+        cm.send_command = _scripted_send(calls, {"ok": True, "terminals": [
+            {"itemId": "i1", "processId": "p-1", "command": "sleep 40"}]})
+        assert await layer.drain_bg_commands(sid) is False
+        assert calls == [{"type": "codex_bg_terminals", "session_id": sid}]
+        assert get_bg_command_registry(sid).pending_count == 1
+        assert tr.pending_bg_commands() != []
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_drain_codex_keeps_item_matched_by_process_id_only():
+    # The list may name the CANONICAL itemId (ours is the synthesized
+    # approval-path one) — the pid learned via terminalInteraction must still
+    # match the row, keeping the entry pending.
+    sid = "s-rbg-pid"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr, pid="p-1")
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        cm.send_command = _scripted_send([], {"ok": True, "terminals": [
+            {"itemId": "item-canonical-9", "processId": "p-1"}]})
+        assert await layer.drain_bg_commands(sid) is False
+        assert get_bg_command_registry(sid).pending_count == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_drain_codex_resolves_item_missing_from_list():
+    sid = "s-rbg-gone"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        calls: list = []
+        cm.send_command = _scripted_send(calls, {"ok": True, "terminals": []})
+        # The router owns event_queue — the drain must never touch it.
+        info.event_queue.put_nowait({"method": "x", "params": {}})
+        assert await layer.drain_bg_commands(sid) is True
+        assert get_bg_command_registry(sid).completed == {"i1"}
+        assert tr.pending_bg_commands() == []
+        assert info.event_queue.qsize() == 1
+        assert not info.lock.locked()
+        # Self-paced: an immediate re-poll (monitor retries every 0.3s) makes
+        # no second RPC. (No pending would fast-path anyway — re-arm one.)
+        get_bg_command_registry(sid).register_spawn("i9", "i9")
+        assert await layer.drain_bg_commands(sid) is False
+        assert len(calls) == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_drain_codex_rpc_failure_is_no_progress():
+    sid = "s-rbg-fail"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        cm.send_command = _scripted_send([], RuntimeError("ack timeout"))
+        assert await layer.drain_bg_commands(sid) is False
+        # Never resolve-on-error: the entry stays pending for the next poll.
+        assert get_bg_command_registry(sid).pending_count == 1
+        assert tr.pending_bg_commands() != []
+        assert not info.lock.locked()
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_drain_codex_satellite_refusal_is_no_progress():
+    sid = "s-rbg-refuse"
+
+    async def run():
+        tr = _bg_cmd_tr(sid)
+        _swept_bg_candidate(tr)
+        layer, info, cm = _drain_layer(sid, translator=tr)
+        cm.send_command = _scripted_send(
+            [], {"ok": False, "terminals": None, "reason": "session not found"})
+        assert await layer.drain_bg_commands(sid) is False
+        assert get_bg_command_registry(sid).pending_count == 1
+
+    try:
+        asyncio.run(run())
+    finally:
+        _bg_command_registries.pop(sid, None)
+
+
+def test_supports_codex_bg_terminals_version_gate():
+    cm = SatelliteConnectionManager()
+    for mid, ver in [("new", "0.5.105"), ("old", "0.5.104"),
+                     ("future", "0.6.0"), ("blank", "")]:
+        cm._connections[mid] = SatelliteConnection(
+            machine_id=mid, ws=None, satellite_version=ver,
+        )
+    assert cm.supports_codex_bg_terminals("new") is True
+    assert cm.supports_codex_bg_terminals("future") is True
+    assert cm.supports_codex_bg_terminals("old") is False
+    assert cm.supports_codex_bg_terminals("blank") is False
+    assert cm.supports_codex_bg_terminals("absent") is False

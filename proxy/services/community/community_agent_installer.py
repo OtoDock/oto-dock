@@ -78,7 +78,24 @@ async def install_from_catalog(
     dashboard-driven installs. The ``| None`` is defensive — live callers
     always pass a real sub.
     """
-    from services.community import community_agents_catalog
+    from services.community import community_agents_catalog, community_catalog
+
+    # Reject templates that need a newer platform BEFORE fetching the
+    # tarball — best-effort: an unreachable registry falls through to the
+    # tarball fetch (which fails with its own clearer error when offline).
+    try:
+        registry = await community_agents_catalog.fetch_registry()
+        entry = next(
+            (e for e in registry.get("agents", [])
+             if e.get("slug") == template_slug),
+            None,
+        )
+    except Exception:
+        entry = None
+    if entry is not None:
+        community_catalog.require_platform_compat(
+            template_slug, entry.get("platform_min_version"),
+        )
 
     extracted = await community_agents_catalog.fetch_and_extract_template(
         template_slug,
@@ -111,8 +128,22 @@ async def install_from_extracted_template(
     installer_user_sub: str | None,
     installer_role: str,
     source_label: str,
+    template_ref: str | None = None,
+    allow_default_for_new_users: bool = True,
 ) -> dict:
     """Install a parsed template into an agent.
+
+    ``template_ref`` overrides what lands in the agent's
+    ``community_template`` column. Catalog installs leave it unset (the
+    template slug), locally authored templates pass ``local:<slug>`` so the
+    Browse catalog's installed-as matching can't confuse a local agent with
+    the catalog entry that happens to share its slug.
+
+    ``allow_default_for_new_users`` gates the manifest's
+    ``default_for_new_users`` block. Attaching every future platform user to
+    an agent is an admin decision everywhere else on the platform, so the
+    local-template route passes ``False`` for non-admins and reports the
+    field as ignored.
 
     Returns an install envelope::
 
@@ -135,8 +166,9 @@ async def install_from_extracted_template(
     """
     from storage import agent_store
 
-    # Pre-flight: every required MCP must be resolvable.
+    # Pre-flight: every required MCP + skill package must be resolvable.
     await _preflight_check_mcps(template.mcps)
+    await _preflight_check_skill_packages(template.skill_packages, installer_role)
 
     # Slug collision check (don't try to "find a free slug" automatically —
     # the dashboard supplies the user-confirmed target_slug and the unified
@@ -199,7 +231,7 @@ async def install_from_extracted_template(
             created_by=installer_user_sub or "",
             color=template.color,
             description=template.description,
-            community_template=template.slug,
+            community_template=template_ref or template.slug,
             community_template_version=template.version,
             default_scope=template.default_scope,
             collaborative=template.collaborative,
@@ -217,11 +249,15 @@ async def install_from_extracted_template(
     # Copy the manifest's default_for_new_users.role into the agent's own
     # admin-editable column. Empty when the manifest doesn't declare the
     # block (or declares it disabled).
+    ignored_fields: list[str] = []
     if template.default_for_new_users.get("enabled"):
-        await asyncio.to_thread(
-            agent_store.set_default_for_new_users_role,
-            target_slug, template.default_for_new_users["role"],
-        )
+        if allow_default_for_new_users:
+            await asyncio.to_thread(
+                agent_store.set_default_for_new_users_role,
+                target_slug, template.default_for_new_users["role"],
+            )
+        else:
+            ignored_fields.append("default_for_new_users")
 
     # 3. Assign installer as manager.
     if installer_user_sub:
@@ -245,6 +281,34 @@ async def install_from_extracted_template(
     if not cascade["created_requests"]:
         batch_id = None
 
+    # 4b. Skill packages: install (admin-only reaches an uninstalled one —
+    # preflight blocks managers there), assign to the agent, seed skill rows.
+    # Per-package failures never abort the agent install.
+    skill_results = await _cascade_skill_packages(template, target_slug)
+
+    # 4c. Core MCPs. The manifest only declares what the agent SPECIFICALLY
+    # needs; core MCPs (memory, schedules, display…) belong to every agent
+    # and the plain create-agent path assigns them too. Additive, so it
+    # unions with the cascade above instead of replacing it. This
+    # install-time assign (with the create-agent path) IS the core-assignment
+    # mechanism — there is no boot backfill — which is also what lets each
+    # platform fill in its OWN core set regardless of what the (possibly
+    # public) template could name.
+    #
+    # ``core_mcps: "none"`` (agent.json) opts a single-purpose agent out: it
+    # gets ONLY what mcps.json lists, and with no backfill the choice sticks.
+    from services.mcp import mcp_registry
+    if template.core_mcps == "none":
+        logger.info(
+            "install %s: core_mcps='none' — skipping core-MCP assignment",
+            target_slug,
+        )
+    else:
+        try:
+            await asyncio.to_thread(mcp_registry.assign_core_mcps, target_slug)
+        except Exception:
+            logger.exception("core-MCP assign failed for %s", target_slug)
+
     # 5. Seed tasks / triggers / notifications.
     seeded_tasks = await asyncio.to_thread(
         _seed_tasks, target_slug, template, installer_user_sub,
@@ -262,6 +326,10 @@ async def install_from_extracted_template(
     copied_context, setup_copied = await asyncio.to_thread(
         _copy_template_context, agent_dir, template, target_slug,
     )
+    if template.user_setup_md is not None and installer_user_sub:
+        await asyncio.to_thread(
+            seed_user_setup_file, target_slug, installer_user_sub,
+        )
 
     # 7. Notifications.
     if batch_id and installer_user_sub:
@@ -292,6 +360,8 @@ async def install_from_extracted_template(
         "seeded_notifications": seeded_notifs,
         "copied_context": copied_context,
         "setup_md_copied": setup_copied,
+        "skill_packages": skill_results,
+        "ignored_fields": ignored_fields,
         "agent": agent,
     }
 
@@ -343,6 +413,112 @@ async def _preflight_check_mcps(required: list) -> None:
         )
 
 
+async def _preflight_check_skill_packages(
+    required: list, installer_role: str,
+) -> None:
+    '''Raise 400 when a required skill package can't be satisfied.
+
+    Two failure modes, checked before any agent state exists:
+    - not installed AND not in the skills catalog → ``missing_skills``;
+    - not installed AND the installer is not admin → standalone skill
+      package installs are admin-only, so the manager gets an explicit
+      "ask an admin to install X first" instead of a half-functional agent
+      (request-flow parity with MCPs is a deliberate non-goal for now).
+    '''
+    if not required:
+        return
+    from services.community import community_catalog
+    from services.mcp import mcp_registry
+
+    installed = await asyncio.to_thread(mcp_registry.get_all_manifests)
+    installed_names = set(installed.keys())
+
+    catalog_names: set[str] = set()
+    try:
+        registry = await community_catalog.fetch_skills_registry()
+        for entry in (registry or {}).get("skills", []):
+            if entry.get("name"):
+                catalog_names.add(entry["name"])
+    except Exception:
+        logger.warning(
+            "preflight: skills catalog fetch failed — relying on "
+            "local-installed packages only"
+        )
+
+    missing = [
+        r.name for r in required
+        if r.name not in installed_names and r.name not in catalog_names
+    ]
+    if missing:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "missing_skills",
+                "missing": missing,
+                "message": (
+                    f"Template requires skill package"
+                    f"{'s' if len(missing) != 1 else ''} not in the platform "
+                    f"OR the skills catalog: {', '.join(missing)}"
+                ),
+            },
+        )
+
+    if installer_role != "admin":
+        needs_install = [
+            r.name for r in required if r.name not in installed_names
+        ]
+        if needs_install:
+            raise HTTPException(
+                400,
+                detail={
+                    "error": "skills_require_admin",
+                    "missing": needs_install,
+                    "message": (
+                        "Skill package installs are admin-only. Ask an admin "
+                        "to install from Browse Community Skills first: "
+                        + ", ".join(needs_install)
+                    ),
+                },
+            )
+
+
+async def _cascade_skill_packages(template, target_slug: str) -> dict:
+    '''Install-if-missing + assign + seed each required skill package.
+
+    Assignment (``add_agent_mcp``) is what makes the package's skills reach
+    the session prompt — ``get_skills_for_agent`` only surfaces skills of
+    ASSIGNED packages; ``ensure_agent_skill`` alone has zero prompt effect.
+    Failures are captured per package (``failed``) and never abort the agent
+    install — the agent works, minus that package.
+    '''
+    from services.mcp import mcp_registry
+    from storage import mcp_store
+
+    ready: list[str] = []
+    failed: list[dict] = []
+    for req in template.skill_packages:
+        try:
+            manifest = await asyncio.to_thread(mcp_registry.get_manifest, req.name)
+            if manifest is None:
+                from services.community import skills_installer
+                await skills_installer.install_skill_package_from_catalog(req.name)
+            await asyncio.to_thread(mcp_store.add_agent_mcp, target_slug, req.name)
+            await _seed_skills_for_mcp(target_slug, req.name, req.skills)
+            ready.append(req.name)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            logger.warning(
+                "skill package %s failed for %s: %s", req.name, target_slug, detail,
+            )
+            failed.append({"name": req.name, "error": detail})
+        except Exception as exc:
+            logger.exception(
+                "skill package %s failed for %s", req.name, target_slug,
+            )
+            failed.append({"name": req.name, "error": f"{type(exc).__name__}: {exc}"})
+    return {"ready": ready, "failed": failed}
+
+
 # ---------------------------------------------------------------------------
 # Folder + slug helpers
 # ---------------------------------------------------------------------------
@@ -364,8 +540,10 @@ def _create_agent_folder(agent_dir: Path, template: CommunityAgentTemplate) -> N
     (agent_dir / "config" / "context").mkdir(parents=True, exist_ok=True)
     (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
     (agent_dir / "users").mkdir(parents=True, exist_ok=True)
-    prompt_file = agent_dir / "config" / "prompt.md"
-    prompt_file.write_text(template.prompt_md, encoding="utf-8")
+    # Always write the current persona filename regardless of which name the
+    # template tarball carried (legacy catalogs still ship prompt.md).
+    persona_file = agent_dir / "config" / "agent.md"
+    persona_file.write_text(template.prompt_md, encoding="utf-8")
 
 
 def _copy_template_context(
@@ -397,6 +575,14 @@ def _copy_template_context(
             encoding="utf-8",
         )
         setup_copied = True
+    # Per-user onboarding: the canonical copy lives at config ROOT — NOT in
+    # context/, so it never auto-loads agent-wide. Substituted once here;
+    # per-user seeds are plain copies of this file.
+    if template.user_setup_md is not None:
+        (agent_dir / "config" / _USER_SETUP_FILENAME).write_text(
+            _substitute_template_vars(template.user_setup_md, target_slug),
+            encoding="utf-8",
+        )
     return count, setup_copied
 
 
@@ -905,11 +1091,58 @@ def _seed_notifs_for_user(
 
 
 # ---------------------------------------------------------------------------
+# Per-user setup seeding
+# ---------------------------------------------------------------------------
+
+_USER_SETUP_FILENAME = "user-setup.md"
+
+
+def seed_user_setup_file(agent_slug: str, user_sub: str) -> int:
+    '''Copy ``config/user-setup.md`` into ``users/{u}/context/`` on attach.
+
+    Presence semantics: the canonical file at config root is the onboarding
+    source; the per-user copy auto-loads only into that user's sessions, and
+    its deletion (``complete_setup(scope="user")``) means completed — so this
+    copies only when the user has no copy, and only on genuine attach (the
+    admin reseed endpoint opts out: recovery must not resurrect onboarding
+    for users who completed it). Deliberately independent of
+    ``community_template_data`` — a manually created agent gets the mechanism
+    by dropping ``config/user-setup.md``. Returns 1 when a copy was seeded.
+    '''
+    from storage import database as user_db
+    from storage import file_tombstones_store
+
+    username = user_db.get_username_by_sub(user_sub) or ""
+    if not username:
+        return 0
+    agent_dir = config.AGENTS_DIR / agent_slug
+    canonical = agent_dir / "config" / _USER_SETUP_FILENAME
+    if not canonical.is_file():
+        return 0
+    rel = f"users/{username}/context/{_USER_SETUP_FILENAME}"
+    dest = agent_dir / "users" / username / "context" / _USER_SETUP_FILENAME
+    if dest.exists():
+        return 0
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(canonical.read_text(encoding="utf-8"), encoding="utf-8")
+    except OSError:
+        logger.exception(
+            "user-setup seed failed for (%s, %s)", agent_slug, username,
+        )
+        return 0
+    # A completed-then-re-attached user has a live delete tombstone for this
+    # path — drop it, or the next sync merge would delete the fresh seed.
+    file_tombstones_store.drop(agent_slug, rel)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # User-join hook
 # ---------------------------------------------------------------------------
 
 def on_user_added_to_agent(
-    agent_slug: str, user_sub: str, role: str,
+    agent_slug: str, user_sub: str, role: str, *, seed_user_setup: bool = True,
 ) -> dict[str, int]:
     """Seed per-user template items when a user joins a community-agent template.
 
@@ -926,7 +1159,13 @@ def on_user_added_to_agent(
     """
     from storage import agent_store
 
-    empty = {"tasks": 0, "triggers": 0, "notifications": 0}
+    # user-setup seeding runs BEFORE the community-template guard: it keys on
+    # the canonical file's presence, not on template data, so manually
+    # created agents participate too.
+    user_setup = seed_user_setup_file(agent_slug, user_sub) if seed_user_setup else 0
+
+    empty = {"tasks": 0, "triggers": 0, "notifications": 0,
+             "user_setup": user_setup}
     agent = agent_store.get_agent(agent_slug)
     if not agent or not agent.get("community_template"):
         return empty
@@ -945,6 +1184,7 @@ def on_user_added_to_agent(
         "tasks": _seed_tasks_for_user(agent_slug, template, user_sub, role),
         "triggers": _seed_triggers_for_user(agent_slug, template, user_sub, role),
         "notifications": _seed_notifs_for_user(agent_slug, template, user_sub, role),
+        "user_setup": user_setup,
     }
 
 
@@ -961,7 +1201,9 @@ async def _notify_setup_needed(
         body=(
             f"Your new agent **{agent_slug}** needs configuration. "
             f"Chat with it to walk through `setup.md` — the agent will "
-            f"mark setup complete via its `complete_setup` tool."
+            f"mark setup complete via its `complete_setup` tool. (Per-user "
+            f"onboarding, when the template ships one, loads automatically "
+            f"in each user's own chats — no action needed here.)"
         ),
         severity="info",
         scope="user",

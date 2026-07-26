@@ -68,6 +68,16 @@ describe('delegate_result history replay', () => {
     expect(spawnBlock.status).toBe('completed')
   })
 
+  it('a deleted delegate agent keeps its slug (no display name resolved)', () => {
+    const msgs = dbMessagesToDisplay(
+      [row('assistant', 'Delegating now.'), delegateResultRow({ agent: 'ghost-agent' })],
+      AGENTS,
+    )
+    const delegateMsg = msgs.find((m) => m.badge === 'delegate response')!
+    expect(delegateMsg.agentSlug).toBe('ghost-agent')
+    expect(delegateMsg.agentDisplayName).toBeUndefined()
+  })
+
   it('a no-output delegate_result still opens a fresh turn for what follows', () => {
     const msgs = dbMessagesToDisplay(
       [

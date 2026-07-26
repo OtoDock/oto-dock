@@ -194,7 +194,10 @@ RECOVER_BIN_DIR = PLATFORM_DATA_DIR / "recover-bin"
 PREVIEW_SNAPSHOT_DIR = PLATFORM_DATA_DIR / "preview-snapshots"
 # Files larger than this are NOT backed up to the recover-bin (the delete /
 # overwrite still proceeds) — a safety net shouldn't copy huge build artifacts.
-RECOVER_BIN_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+# Deliberately much smaller than OTODOCK_MAX_FILE_MB (Windows-Recycle-Bin-style:
+# big files bypass the bin) so a couple of video-sized deletions can't evict the
+# small-file undo history everyone actually needs. Raise per-install if desired.
+RECOVER_BIN_MAX_BYTES = int(_cfg("RECOVER_BIN_MAX_MB", "100")) * 1024 * 1024
 # Per-agent aggregate ceiling on live recover-bin captures. The recover-bin sits
 # OUTSIDE the agent quota tree (sibling of agents/), so without this an overwrite
 # loop could grow it unbounded and fill the backing filesystem even while the
@@ -256,11 +259,34 @@ if not PHONE_API_SECRET:
 # honoured ONLY from those hops.
 TRUSTED_PROXIES = [s.strip() for s in _cfg("TRUSTED_PROXY", "").split(",") if s.strip()]
 
+# Universal per-file size cap: ONE knob for the satellite sync engine (manifest
+# + push/pull legs) AND every dashboard/chat upload (both hit POST /v1/upload).
+# Satellites learn the sync cap via the auth_result policy handshake — the proxy
+# config is the single source of truth; pre-0.5.103 satellites are pinned to the
+# legacy 100MB by the per-machine gate in satellite_connection.effective_sync_cap.
+MAX_FILE_MB = int(_cfg("OTODOCK_MAX_FILE_MB", "1024"))
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+SYNC_MAX_FILE_BYTES = MAX_FILE_BYTES  # alias read by core/remote/file_sync.py
+MAX_UPLOAD_SIZE_BYTES = MAX_FILE_BYTES  # alias read live by api/media/uploads.py
+
+# Global cap on CONCURRENT LARGE outbound (proxy→satellite) workspace pushes,
+# across ALL machines and both push paths (live fan-out + initial-sync push
+# branch). Per-machine pacing already exists (windowed acks + the two-lane
+# writer); this bounds the AGGREGATE — default 3 ≈ max 24MB in-flight
+# regardless of machine count. 0 = unlimited (gate disabled).
+SYNC_FANOUT_CONCURRENCY = int(_cfg("OTODOCK_SYNC_FANOUT_CONCURRENCY", "3"))
+# Pushes SMALLER than this bypass the gate entirely (no slot, no queued row):
+# a small file is a handful of 512KB frames already bounded by the bulk queue,
+# and gating it would head-of-line-block live edits behind bulk transfers.
+SYNC_FANOUT_MIN_MB = int(_cfg("OTODOCK_SYNC_FANOUT_MIN_MB", "4"))
+
 # Global BACKSTOP cap on request body size (bytes), enforced by an ASGI
-# middleware via Content-Length. Set ABOVE the largest legitimate upload (media
-# uploads self-limit to 250 MB in api/media/uploads.py) so it only rejects abusive
-# oversized bodies (→ 413); finer per-endpoint caps still apply underneath.
-MAX_REQUEST_BODY_BYTES = int(_cfg("MAX_REQUEST_BODY_BYTES", str(300 * 1024 * 1024)))
+# middleware via Content-Length. Defaults to the universal file cap plus margin
+# (multipart framing overhead) so it only rejects abusive oversized bodies
+# (→ 413); finer per-endpoint caps still apply underneath.
+MAX_REQUEST_BODY_BYTES = int(
+    _cfg("MAX_REQUEST_BODY_BYTES", str(MAX_FILE_BYTES + 64 * 1024 * 1024))
+)
 
 # Hard ceiling for any paginated list endpoint's page size.
 MAX_PAGE_SIZE = int(_cfg("MAX_PAGE_SIZE", "500"))
@@ -370,7 +396,12 @@ _MAX_TOTAL_DOC_BYTES = 5 * 1024 * 1024  # 5 MB total per agent
 
 
 def _read_agent_files(model: str) -> list[tuple[str, str]]:
-    """Read an agent's prompt.md and every doc under config/context/.
+    """Read an agent's persona (config/agent.md) and every doc under config/context/.
+
+    ``agent.md`` is the persona file; ``prompt.md`` is its pre-1.4 name and
+    stays readable so a restored old backup keeps working until the startup
+    sweep (``agent_store.migrate_persona_filenames``) converges it. When both
+    exist (e.g. a stale satellite pushed the old file back), ``agent.md`` wins.
 
     All files under config/context/ matching `.md`/`.txt`/`.markdown` auto-load
     as context. Files over 1 MB and the tail past a 5 MB total cap are skipped;
@@ -382,11 +413,23 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
     if not is_safe_agent_name(model):
         return []
     agent_dir = AGENTS_DIR / model
-    prompt_path = agent_dir / "config" / "prompt.md"
-    if not prompt_path.exists():
+    config_dir = agent_dir / "config"
+    persona_text: str | None = None
+    # Two passes: a concurrent rename/restore can remove the probed file
+    # between exists() and read_text() — re-probe both names before giving up.
+    for _attempt in range(2):
+        for candidate in (config_dir / "agent.md", config_dir / "prompt.md"):
+            try:
+                persona_text = candidate.read_text()
+                break
+            except OSError:
+                continue
+        if persona_text is not None:
+            break
+    if persona_text is None:
         return []
 
-    files: list[tuple[str, str]] = [("prompt.md", prompt_path.read_text())]
+    files: list[tuple[str, str]] = [("agent.md", persona_text)]
 
     context_dir = agent_dir / "config" / "context"
     if not context_dir.is_dir():
@@ -712,7 +755,7 @@ def build_agent_prompt(model: str, *,
 
     Section order:
 
-      1. Agent's own ``config/prompt.md``
+      1. Agent's own ``config/agent.md`` (the persona)
       2. Platform company context (DB) + universal language rule
       3. ``# Auto-Loaded Documentation`` — ``config/context/*`` knowledge files
       4. ``# Available Tools (MCPs)`` — catalog of enabled MCPs (one-liners)
@@ -757,7 +800,7 @@ def build_agent_prompt(model: str, *,
 
     parts = []
 
-    # Agent's own prompt.md (always first)
+    # Agent's own persona (agent.md — always first)
     parts.append(own_files[0][1])
 
     # Platform company context (from DB — admin-configured) + universal
@@ -1022,7 +1065,7 @@ MCP_AUTO_INSTALL_SYSTEM_DEPS = _cfg("MCP_AUTO_INSTALL_SYSTEM_DEPS", "").lower() 
 #     and mapped in core/layers/codex/helpers.map_effort_to_codex; every other
 #     layer/model clamps a stored "ultra" to its own ceiling ("max"/"xhigh")
 #     so it can never reach a CLI or API that rejects it.
-#   - "ultracode" (Opus 4.8) is deliberately NOT in this list. It is a Claude
+#   - "ultracode" (Opus 5) is deliberately NOT in this list. It is a Claude
 #     Code *session setting* (`"ultracode": true` via --settings), not a wire
 #     effort value: it sends "xhigh" to the model AND turns on dynamic
 #     multi-agent workflow orchestration in the CLI harness. Modelling it would
@@ -1072,21 +1115,27 @@ MODEL_REGISTRY: dict[str, dict] = {
         # CLI-only: Fable's pricing is above Opus-tier, so keeping it off
         # direct-llm bounds accidental spend on the hosted (credit-metered) path.
         # Fable's safety classifiers can refuse a request mid-run; Claude Code
-        # ships a built-in automatic fallback to Opus 4.8 for that case.
+        # ships a built-in automatic fallback to Opus 5 for that case
+        # (Claude Code >=2.1.219 makes Opus 5 the default Opus).
         "layers": ["claude-code-cli"],
         "server_tools": True,   # supports Anthropic web_search/web_fetch
         "supports_reasoning": True,   # thinking is ALWAYS on for Fable (adaptive)
         "supports_xhigh": True,
     },
-    "claude-opus-4-8[1m]": {
-        "label": "Opus 4.8",
+    # Opus 5 (2026-07-24) replaces the retired Opus 4.8 builtin at the SAME
+    # price, so the swap is lossless: a one-time boot remap moves 4.8-pinned
+    # agents/tasks/chats to claude-opus-5 (remap_retired_model, see startup);
+    # sync_builtin_models retires the builtin row so pickers stop offering
+    # 4.8. Admins can re-add claude-opus-4-8[1m] as a custom model.
+    "claude-opus-5": {
+        "label": "Opus 5",
         "provider": "anthropic",
-        "context_window": 1_000_000,   # [1m] suffix selects the 1M window in Claude Code CLI
-        "pricing": (5.0, 25.0, 6.25, 0.50),  # cache = 1.25x input / 0.1x input
+        "context_window": 1_000_000,   # native 1M window (no [1m] suffix needed)
+        "pricing": (5.0, 25.0, 6.25, 0.50),  # identical to Opus 4.8's tuple — announced "same as Opus 4.8" (2026-07-24)
         "layers": ["claude-code-cli"],
         "server_tools": True,   # supports Anthropic web_search/web_fetch
         "supports_reasoning": True,
-        "supports_xhigh": True,   # 4.8 keeps the xhigh level (low/medium/high/xhigh/max). NOTE: "ultracode" is NOT an effort level — it's a CLI session setting that pairs xhigh with workflow orchestration; see get_model_supports_xhigh() and DEFAULT_EFFORT_LEVEL.
+        "supports_xhigh": True,   # keeps the xhigh level (low/medium/high/xhigh/max). NOTE: "ultracode" is NOT an effort level — it's a CLI session setting that pairs xhigh with workflow orchestration; see get_model_supports_xhigh() and DEFAULT_EFFORT_LEVEL.
     },
     "claude-sonnet-5": {
         "label": "Sonnet 5",
@@ -1122,6 +1171,11 @@ MODEL_REGISTRY: dict[str, dict] = {
     # half the cost, Luna = fast/cheap tier. New prompt-caching billing:
     # cache WRITES cost 1.25x the uncached input rate (previously $0) and
     # cache reads keep the 90% discount — reflected in the pricing tuples.
+    # Context: upstream corrected the 5.6 family window to 272k tokens
+    # (codex 0.144.6 release notes). codex-cli reads the LIVE
+    # modelContextWindow at runtime (headless gauges self-correct); this
+    # registry number drives the direct-llm layer's context management and
+    # the capability display.
     # Sol first: registry insertion order makes it the codex-cli "Auto"
     # default (flagship-first, as gpt-5.5 was). Agents still PINNED to
     # gpt-5.5 keep running (the CLI supports it; pricing falls back to the
@@ -1130,7 +1184,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-5.6-sol": {
         "label": "GPT-5.6 Sol",
         "provider": "openai",
-        "context_window": 1_000_000,
+        "context_window": 272_000,   # corrected from 1M — see the family window note above
         "pricing": (5.0, 30.0, 6.25, 0.50),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli"],
         "supports_reasoning": True,
@@ -1140,7 +1194,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-5.6-terra": {
         "label": "GPT-5.6 Terra",
         "provider": "openai",
-        "context_window": 1_000_000,
+        "context_window": 272_000,   # corrected from 1M — see the family window note above
         "pricing": (2.50, 15.0, 3.125, 0.25),
         "layers": ["codex-cli", "direct-llm"],
         "supports_reasoning": True,
@@ -1151,7 +1205,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     "gpt-5.6-luna": {
         "label": "GPT-5.6 Luna",
         "provider": "openai",
-        "context_window": 1_000_000,
+        "context_window": 272_000,   # corrected from 1M — see the family window note above
         "pricing": (1.0, 6.0, 1.25, 0.10),
         "layers": ["codex-cli", "direct-llm"],
         "supports_reasoning": True,
@@ -1395,7 +1449,7 @@ def get_layer_models(layer: str) -> list[dict]:
 
 # Precomputed once at module load: model_id → index in MODEL_REGISTRY order.
 # Used to sort the DB fallback so builtins surface in the order they appear
-# in MODEL_REGISTRY.keys() (e.g. Fable 5 before Opus 4.8 before Sonnet 5). Python
+# in MODEL_REGISTRY.keys() (e.g. Fable 5 before Opus 5 before Sonnet 5). Python
 # 3.7+ guarantees dict insertion order, so this is stable.
 _MODEL_REGISTRY_ORDER: dict[str, int] = {
     model_id: i for i, model_id in enumerate(MODEL_REGISTRY.keys())

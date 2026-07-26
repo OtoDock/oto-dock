@@ -966,6 +966,40 @@ async def _retry_install_failed_for_instance(
     return retried
 
 
+async def _refresh_container_after_instance_change(name: str) -> bool:
+    """Apply changed instance values to a running Docker container.
+
+    Re-injects ``.env`` and force-recreates the container so new credentials
+    take effect without a manual restart (compose leaves a running container
+    untouched when only env changes). A stopped container is left stopped —
+    the admin owns that state; the refreshed ``.env`` applies on next start.
+    Best-effort: a refresh failure never fails the instance save.
+    """
+    manifest = mcp_registry.get_manifest(name)
+    if not manifest or manifest.server.runtime != "docker":
+        return False
+    from core.config import deployment
+    if deployment.current_mode() == deployment.EXTERNAL_POOL:
+        return False
+    state = await asyncio.to_thread(mcp_store.get_mcp_state, name)
+    if not (state and state.get("enabled")):
+        return False
+    from services.mcp import docker_manager
+    try:
+        await asyncio.to_thread(docker_manager._inject_mcp_env, manifest)
+        status = await asyncio.to_thread(
+            docker_manager.get_container_status, manifest,
+        )
+        if status in ("running", "starting", "unhealthy"):
+            await asyncio.to_thread(
+                docker_manager.start_container, manifest, force_recreate=True,
+            )
+            return True
+    except Exception:
+        logger.exception("Post-save container refresh failed for %s", name)
+    return False
+
+
 @router.post("/v1/admin/mcps/{name}/instances")
 async def create_mcp_instance(
     name: str, req: McpInstanceRequest,
@@ -999,10 +1033,20 @@ async def create_mcp_instance(
         },
     )
 
+    # Refresh BEFORE the retry sweep: if the container was already running
+    # it restarts here with the new values, and the sweep's convergence sees
+    # it running and leaves it alone — no double restart either way.
+    refreshed = False
+    if any(v for v in req.field_values.values()):
+        refreshed = await _refresh_container_after_instance_change(name)
+
     retried = await _retry_install_failed_for_instance(
         name, req.agents, req.assigned_to_all, user.sub,
     )
-    return {"status": "created", "id": instance_id, "retried_request_ids": retried}
+    return {
+        "status": "created", "id": instance_id,
+        "retried_request_ids": retried, "container_refreshed": refreshed,
+    }
 
 
 @router.put("/v1/admin/mcps/{name}/instances/{instance_id}")
@@ -1071,10 +1115,25 @@ async def update_mcp_instance(
             404, f"Instance {instance_id} not found for MCP '{name}'",
         )
 
+    # Restart only on a REAL value change (post secret-merge) — a blind
+    # force-recreate on every save would kill in-flight tool calls for every
+    # agent sharing the container. Rename/agents/assigned_to_all changes
+    # don't touch delivered env and never trigger a restart.
+    changed = existing_inst is not None and (
+        req.field_values != existing_inst.get("field_values")
+        or req.hosted_mode != existing_inst.get("hosted_mode")
+    )
+    refreshed = False
+    if changed:
+        refreshed = await _refresh_container_after_instance_change(name)
+
     retried = await _retry_install_failed_for_instance(
         name, req.agents, req.assigned_to_all, user.sub,
     )
-    return {"status": "updated", "id": instance_id, "retried_request_ids": retried}
+    return {
+        "status": "updated", "id": instance_id,
+        "retried_request_ids": retried, "container_refreshed": refreshed,
+    }
 
 
 @router.delete("/v1/admin/mcps/{name}/instances/{instance_id}")

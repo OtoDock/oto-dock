@@ -7,12 +7,14 @@
  * that DO stand alone were already extracted (ChatMessages, TopBar, ChatInput…).
  */
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { SearchProvider } from '../../contexts/SearchContext'
 import { useChatStream } from '../../hooks/useChatStream'
 import { useAgents, useExecutionLayers, useAgentTargetStatus } from '../../api/agents'
+import { useUserExecutionLayers } from '../../api/executionLayers'
 import { useChats, useTaskChats, fetchChatPage } from '../../api/chats'
+import { computeModelGroups, visibleAgentPaths } from '../../lib/modelGroups'
 import { useRunByChat } from '../../api/runs'
 import TaskMetadata from '../../components/chat/TaskMetadata'
 import ChatMessages from '../../components/chat/ChatMessages'
@@ -32,6 +34,7 @@ import InstallProgressBar from '../../components/chat/InstallProgressBar'
 import MachineUpdateBanner from '../../components/chat/MachineUpdateBanner'
 import RemoteFallbackBanner from '../../components/chat/RemoteFallbackBanner'
 import ChatTargetBanner from '../../components/chat/ChatTargetBanner'
+import EngineSwitchBanner from '../../components/chat/EngineSwitchBanner'
 import ChatStatusBar from '../../components/chat/ChatStatusBar'
 import PlanPanel from '../../components/chat/plan/PlanPanel'
 import TodoPanel from '../../components/chat/plan/TodoPanel'
@@ -101,6 +104,32 @@ export default function AgentChat() {
   const agentDisplayName = currentAgent?.display_name
   const agentColor = currentAgent?.color || ''
 
+  // Per-user engine access (server-computed `can_run` on
+  // /v1/users/me/execution-layers) — drives the engine/model filtering. A
+  // layer absent from the map (older proxy / loading) counts as runnable.
+  const { data: userLayers } = useUserExecutionLayers()
+  const canRunLayer = useMemo(() => {
+    const m: Record<string, boolean> = {}
+    for (const l of userLayers ?? []) m[l.name] = l.can_run !== false
+    return m
+  }, [userLayers])
+  // The agent's enabled engines this user can run — unfiltered fallback when
+  // that would be empty (an empty selector is a dead-end; the inline notice
+  // below explains instead).
+  const visiblePaths = useMemo(
+    () => visibleAgentPaths(agentExecutionPaths, canRunLayer),
+    [agentExecutionPaths, canRunLayer],
+  )
+  const zeroAccessible =
+    (userLayers?.length ?? 0) > 0
+    && agentExecutionPaths.every(p => canRunLayer[p] === false)
+  // Pre-warms target the primary engine unless this user can't run it — then
+  // the first accessible one (a doomed pre-warm burns a spawn and fails
+  // silently server-side).
+  const preWarmPath = (canRunLayer[agentExecutionPath] ?? true)
+    ? agentExecutionPath
+    : (visiblePaths[0] ?? agentExecutionPath)
+
   // The execution layer the chat has COMMITTED to. null until the chat actually
   // starts (warmup_ready) or is restored from DB (chat_history) — only then does
   // the model dropdown lock to a single layer. While null (a fresh, unsent chat)
@@ -111,30 +140,24 @@ export default function AgentChat() {
   // highlight + the warmup layer WITHOUT collapsing the dropdown — that's what
   // keeps "all layers visible before the first prompt" working.
   const [selectedLayer, setSelectedLayer] = useState<string | null>(null)
-
-  // Build model groups with layer-prefixed values (layer::model_id) to avoid duplicates
-  const modelGroups = useMemo(() => {
-    if (!layers) return undefined
-    const groups: { layer: string; layerLabel: string; models: { value: string; label: string }[] }[] = []
-    const pathsToShow = chatActiveLayer ? [chatActiveLayer] : agentExecutionPaths
-
-    for (const path of pathsToShow) {
-      const cap = layers[path]
-      if (cap) {
-        const models = (cap.models || [])
-          .filter((m: { value: string }) => m.value !== '')
-          .map((m: { value: string; label: string }) => ({
-            value: `${path}::${m.value}`,
-            label: m.label,
-          }))
-        if (models.length > 0) {
-          groups.push({ layer: path, layerLabel: cap.display_name, models })
-        }
-      }
-    }
-
-    return groups.length > 0 ? groups : undefined
-  }, [layers, chatActiveLayer, agentExecutionPaths])
+  // Best-effort liveness of the chat's session process. Set from the
+  // chat_history meta, warmup_ready (alive), engine_switched (dead) and the
+  // probe_liveness answer (fired when the model dropdown opens — headless
+  // idle-reap emits no frame). While true the dropdown stays locked to the
+  // chat's engine; a DEAD chat additionally offers the agent's other
+  // accessible engines (the cross-engine switch flow). The backend re-checks
+  // authoritatively — this only shapes the dropdown.
+  const [processAlive, setProcessAlive] = useState(true)
+  // Provisional cross-engine pick (banner + confirm flow). Invariant: never
+  // coexists with chatActiveLayer === null; cleared centrally on chat/agent
+  // change, on every chat_history arrival, and when the chat revives.
+  const [pendingEngineSwitch, setPendingEngineSwitch] =
+    useState<{ layer: string; model: string } | null>(null)
+  const [engineSwitchBusy, setEngineSwitchBusy] = useState(false)
+  const [engineSwitchError, setEngineSwitchError] = useState<string | null>(null)
+  // (modelGroups — the layer::model_id dropdown groups — is declared further
+  // down, after the viewedStreaming/warming state it depends on; the math
+  // itself lives in lib/modelGroups.)
 
   // Helper: parse layer::model compound value
   const parseModelValue = useCallback((compound: string): { layer: string; model: string } => {
@@ -309,6 +332,30 @@ export default function AgentChat() {
       interactive.resetSession()  // the old session (interactive included) was closed server-side
       ws.resumeChat(cid)
     },
+    onEngineSwitched: (data) => {
+      // switch_engine ack (direct + per-user broadcast — idempotent): the
+      // chat row now carries the new engine+model; re-home the local lock so
+      // the next prompt warms up there with the DB-history digest.
+      setChatActiveLayer(data.execution_path)
+      setModel(data.model)
+      setProcessAlive(false)
+      setSessionId(null)
+      setPendingEngineSwitch(null)
+      setEngineSwitchBusy(false)
+      setEngineSwitchError(null)
+      refetchChats()
+    },
+    onSwitchEngineDenied: (data) => {
+      // Rendered inside the switch dialog — the generic error rail only
+      // renders into an open stream bubble, invisible on idle dead chats.
+      setEngineSwitchBusy(false)
+      setEngineSwitchError(data.message)
+      if (typeof data.process_alive === 'boolean') setProcessAlive(data.process_alive)
+    },
+    onLiveness: (data) => {
+      // probe_liveness answer (fired when the model dropdown opens).
+      setProcessAlive(data.process_alive)
+    },
     // Live rich view: new interactive-history rows persisted while the
     // terminal ⇄ transcript toggle shows the transcript → refetch the newest
     // page (same seed path as the toggle). Trailing debounce coalesces the
@@ -339,6 +386,14 @@ export default function AgentChat() {
       // Restore execution layer + model from chat data (for resumed chats).
       if (data.execution_path) setChatActiveLayer(data.execution_path)
       if (data.model) setModel(data.model)
+      // Best-effort session-process liveness (drives the cross-engine model
+      // options). Absent (older proxy) reads alive → locked, the pre-feature
+      // behavior. Any history (re)load also invalidates a provisional
+      // engine-switch pick — the state it was judged against just reloaded.
+      setProcessAlive(data.process_alive !== false)
+      setPendingEngineSwitch(null)
+      setEngineSwitchBusy(false)
+      setEngineSwitchError(null)
       // Task chats store permission_mode 'auto' (the scheduler's posture) —
       // restore it so the status bar reflects the run's real mode (rendered
       // as Don't Ask) instead of this page's 'default' seed.
@@ -472,6 +527,41 @@ export default function AgentChat() {
   // state so the sidebar kebab reads the exact same fact — and the slice is
   // cleared by the first mismatch-free warmup_ready, e.g. after a move.
   const targetMismatch = useChatStore((s) => (chatId ? s.byChat[chatId]?.targetMismatch ?? null : null))
+
+  // Model dropdown groups — locked to the chat's engine while its session
+  // process is alive/streaming/warming; a DEAD chat's dropdown adds the
+  // agent's other engines this user can run (cross-engine switch flow).
+  const modelGroups = useMemo(() => computeModelGroups({
+    layers,
+    agentPaths: agentExecutionPaths,
+    chatActiveLayer,
+    processAlive,
+    canRun: canRunLayer,
+    streaming: viewedStreaming,
+    warming,
+  }), [layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming])
+
+  // Centralized pendingEngineSwitch reset — the ONLY chat-exit clear. The
+  // sidebar select path (handleSelectChat) pre-stamps lastResumedChatIdRef
+  // and SKIPS the URL-effect reset, so per-path sprinkles would leak the
+  // banner + disabled composer onto the next chat.
+  useEffect(() => {
+    setPendingEngineSwitch(null)
+    setEngineSwitchBusy(false)
+    setEngineSwitchError(null)
+  }, [chatId, agentName])
+  // A second tab / server-initiated turn revived the chat under an open
+  // banner — the dropdown collapses back to the active engine; drop the
+  // provisional pick instead of deadlocking send against a hidden group.
+  useEffect(() => {
+    if (viewedStreaming || warming) {
+      setPendingEngineSwitch(null)
+      setEngineSwitchBusy(false)
+      setEngineSwitchError(null)
+    }
+  }, [viewedStreaming, warming])
+  // warmup_ready adopted a session — the process is alive again.
+  useEffect(() => { if (sessionId) setProcessAlive(true) }, [sessionId])
 
   // Read tracking for the sidebar unread dot: the viewer has SEEN this chat
   // whenever it is open in a visible tab — on open, when the viewed turn
@@ -621,7 +711,10 @@ export default function AgentChat() {
   // phantom "generating" UI on the NEXT chat's resume. Cleared on chat switch.
   const serverKickPendingRef = useRef<false | { chatId: string | null }>(false)
 
-  const { data: chats, refetch: refetchChats } = useChats(agentName)
+  // Poll paused while the sidebar's inline rename is open (a reorder from a
+  // refetch blurs the input into a half-typed commit — see useChats).
+  const [renameEditing, setRenameEditing] = useState(false)
+  const { data: chats, refetch: refetchChats } = useChats(agentName, renameEditing)
 
   // ---- Task mode ----
   // Task runs render on this page: a `task-…` chat id marks the open chat as
@@ -844,7 +937,7 @@ export default function AgentChat() {
     if (urlChatId) return               // existing chat — resume path handles it
     if (warmingUp || sessionId) return   // already active
     if (preWarmedRef.current) return     // already pre-warmed
-    ws.preWarmup(agentName, model, mode, agentExecutionPath)
+    ws.preWarmup(agentName, model, mode, preWarmPath)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws.connected, agentName, urlChatId, isFavoriteAgent])
 
@@ -1167,9 +1260,9 @@ export default function AgentChat() {
       (stickyInteractive || (currentAgent?.default_execution_mode || '')) === 'interactive'
     // Eager only for the favorite — others warm lazily on first interaction.
     if (ws.connected && !willBeInteractive && isFavoriteAgent) {
-      ws.preWarmup(agentName, agentDefaultModel, nextMode, agentExecutionPath)
+      ws.preWarmup(agentName, agentDefaultModel, nextMode, preWarmPath)
     }
-  }, [agentName, agentDefaultModel, agentExecutionPath, navigate, ws, workspace, currentAgent?.default_execution_mode, interactive.seedExecMode, interactive.resetSession, isFavoriteAgent])
+  }, [agentName, agentDefaultModel, preWarmPath, navigate, ws, workspace, currentAgent?.default_execution_mode, interactive.seedExecMode, interactive.resetSession, isFavoriteAgent])
 
   // Lazy pre-warm: a non-favorite agent's new-chat page warms the moment the
   // user genuinely engages the composer (first keydown/pointerdown). Deduped by
@@ -1181,8 +1274,8 @@ export default function AgentChat() {
     if (urlChatId) return               // existing chat — resume path owns it
     if (warmingUp || sessionId) return   // already active
     if (preWarmedRef.current) return     // already pre-warmed / warming
-    ws.preWarmup(agentName, model, mode, agentExecutionPath)
-  }, [ws, agentName, urlChatId, warmingUp, sessionId, model, mode, agentExecutionPath])
+    ws.preWarmup(agentName, model, mode, preWarmPath)
+  }, [ws, agentName, urlChatId, warmingUp, sessionId, model, mode, preWarmPath])
 
   const handleSelectChat = useCallback(
     (selectedChatId: string, searchQuery?: string) => {
@@ -1326,6 +1419,20 @@ export default function AgentChat() {
   }, [handleModeChange, handleSendMessage])
   const handleModelChange = useCallback((compound: string) => {
     const { layer, model: modelId } = parseModelValue(compound)
+    // Cross-engine pick on a committed chat → the provisional switch flow
+    // (banner + confirm), NEVER an immediate model_change (the backend
+    // rightly refuses foreign models and its refusal echo would snap the
+    // selector around), no sticky write (chat-scoped decision, not a
+    // preference), and no setSelectedLayer (a cancelled switch must not
+    // poison later warmup-layer fallbacks). Gate on the PER-CHAT streaming
+    // flag — ws.streaming is connection-global.
+    if (chatActiveLayer && layer !== chatActiveLayer) {
+      if (viewedStreaming || warming) return  // stale expansion — chat revived
+      setEngineSwitchBusy(false)
+      setEngineSwitchError(null)
+      setPendingEngineSwitch({ layer, model: modelId })
+      return
+    }
     ws.changeModel(modelId)
     setModel(modelId)
     // Sticky for the same agent's next new chat.
@@ -1336,7 +1443,20 @@ export default function AgentChat() {
     if (!ws.streaming) {
       setSelectedLayer(layer)
     }
-  }, [ws, parseModelValue, agentName])
+  }, [ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming])
+
+  // Cross-engine switch confirm/cancel (EngineSwitchBanner + its dialog).
+  const handleEngineSwitchConfirm = useCallback(() => {
+    if (!pendingEngineSwitch) return
+    setEngineSwitchBusy(true)
+    setEngineSwitchError(null)
+    ws.switchEngine(pendingEngineSwitch.layer, pendingEngineSwitch.model)
+  }, [ws, pendingEngineSwitch])
+  const handleEngineSwitchCancel = useCallback(() => {
+    setPendingEngineSwitch(null)
+    setEngineSwitchBusy(false)
+    setEngineSwitchError(null)
+  }, [])
 
   // Interactive CLI toggle. No live session:
   // set the per-chat intent + persist it (the next send spawns the chosen mode).
@@ -1427,6 +1547,7 @@ export default function AgentChat() {
     <ChatMessages
       messages={messages}
       agentName={agentName}
+      agentDisplayName={agentDisplayName}
       agentColor={agentColor}
       chatId={chatId || undefined}
       onPermissionRespond={handlePermissionRespond}
@@ -1468,12 +1589,23 @@ export default function AgentChat() {
           tasksMode={tasksMode}
           onTasksModeChange={setTasksMode}
           onMoveChat={() => ws.moveChat()}
+          onRenameEditingChange={setRenameEditing}
         />
       </ResponsiveDrawer>
 
       <SearchProvider query={findBarOpen ? findQuery : ''}>
-      <div className="flex-1 flex flex-col min-w-0 relative">
-        <SetupBanner />
+      <div className="flex-1 flex flex-col min-w-0">
+      {/* The banner sits ABOVE the positioning context: the floating TopBar
+          and side panels anchor to the inner relative div, so a visible
+          banner pushes them down instead of covering them (the z-50 banner
+          used to bury the z-20 TopBar and swallow its clicks). */}
+      <SetupBanner />
+      {/* min-h-0 is load-bearing: as a COLUMN flex item this div's
+          min-height:auto tracks its content, so a long chat blows the
+          100dvh root open and the DOCUMENT becomes the scroller (input +
+          sidebar drift off-screen; the rich view opens at the top). The
+          chat must always scroll inside ChatMessages, never the page. */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 relative">
         {/* Floating top bar */}
         <TopBar
           agentName={agentName || ''}
@@ -1646,9 +1778,26 @@ export default function AgentChat() {
           machineName={offlineMachineName}
         />
 
+        {zeroAccessible && (
+          <div
+            role="status"
+            data-testid="no-engine-access-notice"
+            className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-amber-300/40 bg-amber-50/40 text-amber-900 dark:bg-amber-500/10 dark:text-amber-200"
+          >
+            You can't run any of this agent's AI engines —{' '}
+            <Link to="/user-settings?tab=ai-engines" className="underline hover:no-underline">
+              connect one in your AI-engine settings
+            </Link>{' '}
+            or ask an admin.
+          </div>
+        )}
+
+        {/* Suppressed while an engine switch is pending — a dead chat pinned
+            to an offline machine would otherwise stack two competing
+            "restart from DB history" offers (move vs switch). */}
         <ChatTargetBanner
           chatId={chatId}
-          mismatch={targetMismatch}
+          mismatch={pendingEngineSwitch ? null : targetMismatch}
           moveDisabled={viewedStreaming || warming}
           onMove={() => ws.moveChat()}
         />
@@ -1673,9 +1822,27 @@ export default function AgentChat() {
               // New-chat page (no chatId yet) — re-fire pre-warmup. Reset
               // the guard so the eager useEffect picks it up.
               preWarmedRef.current = null
-              ws.preWarmup(agentName, model, mode, agentExecutionPath)
+              ws.preWarmup(agentName, model, mode, preWarmPath)
             }
           }}
+        />
+
+        {/* Cross-engine switch: provisional pick banner + confirm (closest
+            to the composer — the switch blocks sending until resolved). */}
+        <EngineSwitchBanner
+          chatId={chatId}
+          pending={pendingEngineSwitch ? {
+            layer: pendingEngineSwitch.layer,
+            model: pendingEngineSwitch.model,
+            layerLabel: layers?.[pendingEngineSwitch.layer]?.display_name || pendingEngineSwitch.layer,
+            modelLabel: agentLayerModels.find(m => m.value === pendingEngineSwitch.model)?.label
+              || pendingEngineSwitch.model,
+          } : null}
+          fromLabel={(chatActiveLayer && layers?.[chatActiveLayer]?.display_name) || chatActiveLayer || ''}
+          busy={engineSwitchBusy}
+          error={engineSwitchError}
+          onConfirm={handleEngineSwitchConfirm}
+          onCancel={handleEngineSwitchCancel}
         />
 
         {/* Floating bottom bar — status + input */}
@@ -1691,8 +1858,14 @@ export default function AgentChat() {
               compressingActive={compressingActive}
               activeAgents={activeAgents}
               mode={mode === 'auto' ? 'dontAsk' : mode}
-              model={model}
-              modelValue={modelCompound}
+              // While a cross-engine pick is pending these are DISPLAY-ONLY
+              // overrides — the real `model` state stays on the chat's
+              // engine (it feeds handleSend/pre-warm; mutating it would warm
+              // the wrong engine if the switch is cancelled).
+              model={pendingEngineSwitch ? pendingEngineSwitch.model : model}
+              modelValue={pendingEngineSwitch
+                ? `${pendingEngineSwitch.layer}::${pendingEngineSwitch.model}`
+                : modelCompound}
               costUsd={totalCost}
               contextUsed={contextUsed}
               contextMax={contextMax}
@@ -1721,6 +1894,13 @@ export default function AgentChat() {
                 : undefined}
               onModeChange={handleModeChange}
               onModelChange={handleModelChange}
+              // Lazy liveness re-probe on dropdown open (committed chats
+              // only): headless idle-reap emits no frame, so without this
+              // the cross-engine options never appear on a chat that died
+              // while being viewed.
+              onModelMenuOpen={chatId && chatActiveLayer
+                ? () => ws.probeLiveness()
+                : undefined}
               onCompactContext={
                 // Manual compaction is Codex-only (thread/compact/start) and
                 // headless-only (interactive users type /compact in the TUI);
@@ -1766,9 +1946,12 @@ export default function AgentChat() {
             onEditQueued={handleEditQueued}
             onEngage={handleEngage}
             disabled={!ws.connected || limitReached}
+            sendDisabled={!!pendingEngineSwitch}
             streaming={(viewedStreaming && !permissionPending) || warmingUp}
             aborting={aborting}
-            placeholder={limitReached ? 'Usage limit reached' : viewedStreaming ? 'Type to queue a message...' : 'Type a message...'}
+            placeholder={pendingEngineSwitch
+              ? 'Confirm or cancel the engine switch first…'
+              : limitReached ? 'Usage limit reached' : viewedStreaming ? 'Type to queue a message...' : 'Type a message...'}
             queuedCount={queuedMessages.length}
             editText={editText}
             onClearEditText={() => setEditText(null)}
@@ -1792,6 +1975,7 @@ export default function AgentChat() {
             }}
           />
         </div>
+      </div>
       </div>
       </SearchProvider>
 

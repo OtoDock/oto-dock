@@ -268,19 +268,32 @@ async def idle_connected_targets(
 
 
 async def fan_out_write(
-    agent_slug: str, rel_path: str, content: bytes, *,
+    agent_slug: str, rel_path: str, source: "bytes | Path", *,
     exclude_machine_id: str | None = None, include_idle: bool = False,
+    transfer_kind: str = "sync", transfer_id: str | None = None,
+    origin_user_sub: str = "",
 ) -> None:
-    """Push ``content`` for ``rel_path`` to every OTHER machine running ``agent_slug``
+    """Push a file at ``rel_path`` to every OTHER machine running ``agent_slug``
     that is allowed to receive it. Best-effort; never raises.
+
+    ``source`` is either the file's bytes (small in-memory payloads — WOPI,
+    hooks) or its platform filesystem ``Path`` — the streaming mode all
+    large-file callers use: ``push_file`` reads per-window from disk, so a
+    1GB file fanning out to N machines costs O(N × window) memory, never
+    N × the file.
 
     Targets active-session machines (``fanout_targets``); when ``include_idle`` is set
     — platform-origin dashboard/upload writes — ALSO connected-but-idle machines that
     hold the agent (``idle_connected_targets``), so a dashboard edit reaches a
     connected satellite even with no live session and its next session start stays
-    light. The caller supplies the current platform bytes (e.g. re-read post-apply) so
-    large-file writes fan out the complete file. Pushes run concurrently; per-push
-    failures are logged, not raised.
+    light. Pushes run concurrently; per-push failures are logged, not raised.
+
+    Progress tracking (Feature E): when ``transfer_id`` is supplied (dashboard
+    uploads — always tracked) or the payload exceeds one chunk, the transfer
+    is registered in ``core/remote/transfer_registry`` with one row per
+    target machine and live byte progress (``push_file``'s progress_cb), so
+    the workspace toolbar popup shows per-machine state. Registry calls are
+    best-effort — a registry failure never affects the push.
     """
     machines = fanout_targets(
         agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
@@ -297,10 +310,69 @@ async def fan_out_write(
     from services.path_policy_v2 import PathRef
     cm = get_connection_manager()
     ref = PathRef("agent_tree", rel_path)
+
+    from core.remote import transfer_registry
+    from core.remote.file_sync import MAX_CHUNK_SIZE
+    if isinstance(source, (bytes, bytearray)):
+        size = len(source)
+    else:
+        try:
+            size = source.stat().st_size
+        except OSError:
+            size = 0
+    tid: str | None = None
+    if transfer_id is not None or size > MAX_CHUNK_SIZE:
+        tid = await transfer_registry.begin(
+            agent_slug, rel_path, kind=transfer_kind, bytes_total=size,
+            machine_ids=list(machines), transfer_id=transfer_id,
+            origin_user_sub=origin_user_sub,
+        )
+
+    from core.remote import transfer_gate
+
+    async def _push_one(mid: str) -> bool:
+        cb = None
+        on_state = None
+        if tid:
+            async def cb(sent: int, total: int, _mid=mid):
+                await transfer_registry.progress(tid, _mid, sent, total)
+
+            # The gate drives the queued→active lifecycle for tracked rows
+            # (rows are born 'queued' in the registry).
+            async def on_state(state: str, _mid=mid):
+                await transfer_registry.set_state(tid, _mid, state)
+
+        # Global outbound gate (Feature F): only ≥threshold pushes contend;
+        # a machine waiting on a slot shows 'queued' in the progress popup.
+        async with transfer_gate.slot(
+            mid, agent_slug, rel_path, size, on_state=on_state,
+        ):
+            ok = await cm.push_file(
+                mid, ref, source, agent_slug=agent_slug, progress_cb=cb,
+            )
+        if tid:
+            if ok:
+                await transfer_registry.progress(tid, mid, size, size)
+                await transfer_registry.set_state(tid, mid, "done")
+            else:
+                await transfer_registry.set_state(
+                    tid, mid, "failed",
+                    error="push failed (machine offline?) — retries at next sync",
+                )
+        return ok
+
     results = await asyncio.gather(
-        *(cm.push_file(mid, ref, content, agent_slug=agent_slug) for mid in machines),
+        *(_push_one(mid) for mid in machines),
         return_exceptions=True,
     )
+    if tid:
+        # A raised (not returned-False) push never hit _push_one's outcome
+        # code — close its row defensively so the item can complete.
+        for mid, res in zip(machines, results):
+            if isinstance(res, Exception):
+                await transfer_registry.set_state(
+                    tid, mid, "failed", error=f"push error: {res}",
+                )
     # Advance each successfully-pushed machine's merge base so it stays converged:
     # a later live edit there isn't mis-flagged as clobbering an unseen change, and
     # the next session-start merge sees in-sync. Hash/stat computed once,
@@ -312,20 +384,28 @@ async def fan_out_write(
     if acked:
         import hashlib
         import config as _cfg
+        from core.remote import file_sync as _file_sync
         from storage import sync_state_store
-        content_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+        if isinstance(source, (bytes, bytearray)):
+            content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
+        else:
+            try:
+                content_hash = await asyncio.to_thread(_file_sync._hash_file, source)
+            except OSError:
+                content_hash = ""
         try:
             base_mtime = (_cfg.AGENTS_DIR / agent_slug / rel_path).stat().st_mtime
         except OSError:
             base_mtime = 0.0
-        for mid in acked:
-            try:
-                await asyncio.to_thread(
-                    sync_state_store.record_one, mid, agent_slug, rel_path,
-                    content_hash, base_mtime,
-                )
-            except Exception:
-                logger.debug("fan_out_write base-advance failed for %s", mid[:8])
+        if content_hash:
+            for mid in acked:
+                try:
+                    await asyncio.to_thread(
+                        sync_state_store.record_one, mid, agent_slug, rel_path,
+                        content_hash, base_mtime,
+                    )
+                except Exception:
+                    logger.debug("fan_out_write base-advance failed for %s", mid[:8])
     for mid, res in zip(machines, results):
         if isinstance(res, Exception):
             logger.warning(

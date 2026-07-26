@@ -25,8 +25,6 @@ export default function AgentCard({ agent, isDefault, onSetDefault }: Props) {
       ? machines?.find(m => m.id === agent.execution_target) ?? null
       : null
 
-  // Visibility mode. Badge only the three non-default modes — the common
-  // Personal + shared needs no annotation.
   const mode = modeOfAgent(agent)
 
   const handleStarClick = (e: React.MouseEvent) => {
@@ -89,11 +87,9 @@ export default function AgentCard({ agent, isDefault, onSetDefault }: Props) {
           {agent.display_name && agent.display_name !== agent.name && (
             <span className="text-xs text-p-text-light truncate block">{agent.name}</span>
           )}
-          {mode !== 'personal_shared' && (
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs text-p-text-secondary bg-p-surface">
-              {MODE_LABEL[mode]}
-            </span>
-          )}
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs text-p-text-secondary bg-p-surface">
+            {MODE_LABEL[mode]}
+          </span>
         </div>
       </div>
 

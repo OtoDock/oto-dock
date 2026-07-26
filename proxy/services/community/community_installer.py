@@ -530,6 +530,20 @@ async def install_from_catalog(
         # callable into this function gets the same check.
         raise HTTPException(400, f"Invalid MCP name: {name!r}")
 
+    from services.community import community_catalog
+    try:
+        registry = await community_catalog.fetch_registry()
+        _entry = next(
+            (e for e in registry.get("mcps", []) if e.get("name") == name),
+            None,
+        )
+    except Exception:
+        _entry = None
+    if _entry is not None:
+        community_catalog.require_platform_compat(
+            name, _entry.get("platform_min_version"),
+        )
+
     await _emit(progress_cb, "fetch", 5, "Downloading from catalog")
     tarball = await _fetch_catalog_tarball()
 
@@ -676,6 +690,80 @@ def _folder_for_manifest_name(
 # Request orchestration — approve / reject / cancel
 # ---------------------------------------------------------------------------
 
+async def ensure_enabled_and_running(mcp_name: str) -> str:
+    """Converge platform state after an approval: enabled + (Docker) running.
+
+    ``approve_request`` marks a request ``installed`` even when the fetch was
+    skipped because the manifest folder already existed on disk (repo-shipped
+    ``mcps/community/*``, a previously disabled MCP, a rolled-back attempt).
+    ``scan_manifests`` seeds community MCPs at ``enabled=False`` and nothing
+    on that path enabled the MCP or started its container — the request
+    landed ``installed`` while the MCP stayed invisible at runtime. An
+    approval (queue approve, admin auto-approve, the instance-save retry
+    sweep, the community-agent template cascade) is an explicit "make this
+    usable" decision, so converge unconditionally; a platform-wide re-enable
+    of a deliberately disabled MCP is surfaced in the returned note, never
+    silent.
+
+    Returns an annotation for the request's ``install_log`` ("" when there
+    is nothing noteworthy). Never raises — start problems are recorded, not
+    fatal, matching the installer's best-effort auto-start. Idempotent after
+    a fresh ``install_from_catalog`` (env re-inject is idempotent and a
+    running container is left alone).
+    """
+    from storage import mcp_store
+
+    notes: list[str] = []
+    prior = _existing_enabled_state(mcp_name)
+    if prior is not True:
+        await asyncio.to_thread(mcp_store.set_mcp_enabled, mcp_name, True)
+        if prior is False:
+            notes.append("Re-enabled platform-wide (was disabled).")
+
+    manifest = mcp_registry.get_manifest(mcp_name)
+    from core.config import deployment
+    if (
+        manifest is not None
+        and manifest.server.runtime == "docker"
+        and deployment.current_mode() != deployment.EXTERNAL_POOL
+    ):
+        from services.mcp import docker_manager
+        try:
+            await asyncio.to_thread(docker_manager._inject_mcp_env, manifest)
+        except Exception as exc:
+            logger.warning(".env refresh failed for %s: %s", mcp_name, exc)
+        try:
+            from services.mcp import compose_rewrite
+            await asyncio.to_thread(compose_rewrite.ensure_pull_compose, manifest)
+        except ValueError as exc:
+            # Approval context records the problem instead of failing the
+            # request; the direct-install route keeps its hard 400.
+            notes.append(f"Compose rewrite failed: {exc}")
+        except Exception as exc:
+            logger.warning("Compose pre-rewrite skipped for %s: %s", mcp_name, exc)
+        status = await asyncio.to_thread(
+            docker_manager.get_container_status, manifest,
+        )
+        if status not in ("running", "starting"):
+            try:
+                started = await asyncio.to_thread(
+                    docker_manager.start_container, manifest,
+                )
+                logger.info(
+                    "Auto-start %s after approval: ok=%s", mcp_name, started,
+                )
+                if not started:
+                    notes.append(
+                        "Container did not start — check Admin → MCP Servers.",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Auto-start of %s after approval failed: %s", mcp_name, exc,
+                )
+                notes.append(f"Container start failed: {exc}")
+    return "\n".join(notes)
+
+
 async def approve_request(request_id: int, admin_sub: str, admin_note: str = "") -> dict:
     """Approve an assignment request: install if needed + enable for agent.
 
@@ -755,8 +843,16 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
         await _notify_request_failed(updated)
         return updated
 
-    # Install OK → assign the MCP to the agent. ``add_agent_mcp`` is
-    # idempotent so a re-request after a previous installed state is safe.
+    # Install OK → converge platform state. The skip branch above never
+    # enabled the MCP or started its container ("manifest on disk" is not
+    # "enabled and running"), so an approved repo-shipped or previously
+    # disabled MCP would otherwise stay invisible at runtime.
+    converge_note = await ensure_enabled_and_running(mcp_name)
+    if converge_note:
+        install_log = (install_log + "\n" if install_log else "") + converge_note
+
+    # Assign the MCP to the agent. ``add_agent_mcp`` is idempotent so a
+    # re-request after a previous installed state is safe.
     await asyncio.to_thread(mcp_store.add_agent_mcp, agent_slug, mcp_name)
 
     # Seed agent_skills rows for the assignment (idempotent), mirroring the

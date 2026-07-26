@@ -5,12 +5,15 @@ Uses an in-memory cache for hot-path reads (agent lookups on every request).
 """
 
 import json
+import logging
 import re
 import threading
 from datetime import datetime, timezone
 
 import config
 from storage.pg import get_conn
+
+logger = logging.getLogger(__name__)
 
 # In-memory cache: slug -> agent dict. Invalidated on every write.
 _cache: dict[str, dict] | None = None
@@ -214,7 +217,7 @@ def create_agent(
         row = conn.execute("SELECT * FROM agents WHERE slug = %s", (slug,)).fetchone()
         result = _row_to_dict(row)
     _invalidate_cache()
-    # Initialize git repo for the agent's config dir so prompt.md /
+    # Initialize git repo for the agent's config dir so agent.md /
     # context files have an audit trail from day one.
     # Also create the knowledge/ dir up front — bwrap mounts fail if the
     # source path doesn't exist, and the SandboxBuilder defensively mkdirs
@@ -490,6 +493,71 @@ def delete_agent(slug: str) -> bool:
         except Exception:
             pass
     return deleted
+
+
+# ---------------------------------------------------------------------------
+# Persona filename migration (prompt.md → agent.md, pre-1.4 installs)
+# ---------------------------------------------------------------------------
+
+def migrate_persona_filenames() -> int:
+    """One-shot startup sweep: converge every agent on ``config/agent.md``.
+
+    ``prompt.md`` is the pre-1.4 persona filename. Per agent: only
+    ``prompt.md`` → git-committed rename to ``agent.md``; both present and
+    byte-identical → drop the duplicate ``prompt.md``; both and divergent →
+    keep both (readers prefer ``agent.md``) and warn. Every removal records
+    a sync tombstone so an idle satellite APPLIES the delete at next merge
+    instead of resurrecting the old file, and the change is committed to the
+    config audit repo so revert-from-history keeps a coherent trail.
+
+    Runs in the lifespan before the app serves traffic (single process, no
+    readers racing). Best-effort per agent — a failure leaves that agent on
+    ``prompt.md``, which every reader still accepts. Returns the number of
+    agents changed.
+    """
+    import time as _time
+
+    from services.infra import git_writer
+    from storage import file_author_store, file_tombstones_store
+
+    migrated = 0
+    for slug in get_agent_slugs():
+        config_dir = config.AGENTS_DIR / slug / "config"
+        old = config_dir / "prompt.md"
+        new = config_dir / "agent.md"
+        try:
+            if not old.is_file():
+                continue
+            if new.is_file():
+                if new.read_bytes() != old.read_bytes():
+                    logger.warning(
+                        "Agent %s has both agent.md and prompt.md with "
+                        "different content — keeping both; agent.md wins at "
+                        "read time", slug,
+                    )
+                    continue
+                old.unlink()
+                action = "removed duplicate config/prompt.md"
+            else:
+                old.rename(new)
+                action = "renamed config/prompt.md to agent.md"
+            file_tombstones_store.record(
+                slug, "config/prompt.md", _time.time(),
+                origin="persona-migration",
+            )
+            file_author_store.clear(slug, "config/prompt.md")
+            file_tombstones_store.drop(slug, "config/agent.md")
+            commit_targets = [new]
+            if git_writer.is_tracked(config_dir, "prompt.md"):
+                commit_targets.append(old)
+            git_writer.commit_paths(
+                config_dir, commit_targets, "Rename persona file to agent.md",
+            )
+            logger.info("Agent %s: %s", slug, action)
+            migrated += 1
+        except OSError as exc:
+            logger.warning("Persona migration skipped for %s: %s", slug, exc)
+    return migrated
 
 
 # ---------------------------------------------------------------------------

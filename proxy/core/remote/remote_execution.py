@@ -36,9 +36,12 @@ from core.session.session_state import (
     cleanup_session_permission_state, get_session_user_tz,
     resolve_session_permissions,
     reset_subagent_registry,
+    resolve_bg_command,
     resolve_bg_command_frame,
 )
-from core.events.bg_command_state import reset_bg_command_registry
+from core.events.bg_command_state import (
+    get_bg_command_registry, reset_bg_command_registry,
+)
 import config
 
 logger = logging.getLogger("remote-layer")
@@ -114,6 +117,9 @@ class RemoteSessionInfo:
     cli_settle: SettleController | None = None
     # Permission-mode tracking (native vs hook-based permissions)
     use_native_permissions: bool = False
+    # Machine pairing's full-filesystem grant — feeds Codex sandbox-mode
+    # re-resolution on mode toggles (must match the spawn-time resolution).
+    allow_full_fs: bool = False
     model: str = ""
     mode: str = "default"
     last_activity: float = field(default_factory=time.monotonic)
@@ -151,6 +157,9 @@ class RemoteSessionInfo:
     default_consumer: asyncio.Queue | None = None      # active main turn (router → here)
     thread_consumers: dict[str, asyncio.Queue] = field(default_factory=dict)  # sub_tid → buffer
     bg_supervisors: dict[str, asyncio.Task] = field(default_factory=dict)     # sub_tid → supervisor
+    # Self-pacing for the codex bg-command drain: at most one satellite
+    # codex_bg_terminals RPC per second (the monitor retries every 0.3s).
+    _last_bg_terminals_list: float = 0.0
 
 
 from core.remote.remote_bg_subagent import RemoteBgSubagentMixin
@@ -622,6 +631,9 @@ class RemoteExecutionLayer(
             execution_path=execution_path,
             event_queue=queue,
             use_native_permissions=config.use_native_permissions,
+            allow_full_fs=bool(
+                getattr(config.security_context, "target_allow_full_fs", False)
+            ),
             model=config.model,
             mode=config.permission_mode,
             used_mcps=set(assigned_mcps),
@@ -637,8 +649,15 @@ class RemoteExecutionLayer(
             # supervised_bg=True; the only difference is the version gate.
             bg_on = self._cm.satellite_supports_bg(machine_id)
             info.bg_supervised = bg_on
+            # supervised_bg_commands rides the SAME >=0.5.18 gate: that version
+            # means exactly "the forwarder streams past main-turn end", which is
+            # all live cross-turn terminal completion needs — the router's OOB
+            # hook resolves a between-turns item/completed; the 0.5.105-gated
+            # codex_bg_terminals drain is only the loss-window backstop. Older
+            # satellites keep the turn-end sweep (badge resolves at turn end).
             info.codex_translator = CodexEventTranslator(
                 model=config.model, supervised_bg=bg_on,
+                session_id=session_id, supervised_bg_commands=bg_on,
             )
             info.codex_thread_id = config.codex_thread_id
             if bg_on:
@@ -978,6 +997,12 @@ class RemoteExecutionLayer(
             info.cli_settle = SettleController(
                 session_id, settle_after_result, info.cli_translator,
             )
+        else:
+            # Codex: per-turn bg-command registry prune (mirrors the LOCAL
+            # session's send_message). reset() PRESERVES still-pending
+            # terminals; without it `unsurfaced` never clears remotely and
+            # task_producer's cohort math fires spurious review turns.
+            reset_bg_command_registry(session_id)
 
         # Pre-mint the command_id so we can correlate the satellite's
         # eventual ``turn_ended`` back to THIS send_message. A previous turn's
@@ -1718,7 +1743,9 @@ class RemoteExecutionLayer(
                 "type": "control_request",
                 "session_id": session_id,
                 "subtype": "set_permission_mode",
-                "kwargs": {"sandbox_mode": permission_to_sandbox(mode)},
+                "kwargs": {"sandbox_mode": permission_to_sandbox(
+                    mode, allow_full_fs=info.allow_full_fs,
+                )},
             })
 
     async def send_control_request(
@@ -1786,14 +1813,20 @@ class RemoteExecutionLayer(
         resolved. The post-turn bg-command monitor (stream_pump.py) polls this —
         bg bash has no completion hook, so this active read is the only signal.
 
-        CLI-ONLY: a Codex session's ``event_queue`` is owned by the bg-subagent
-        router (``_route_remote_notifications``); draining it here would steal its
-        frames, and Codex has no background bash. Acquires the session lock with a
-        short timeout so it never races an in-flight turn (the lock blocks the
-        next turn's send_message, so we only ever see idle post-turn frames)."""
+        CODEX: a Codex session's ``event_queue`` is owned by the router
+        (``_route_remote_notifications``), whose OOB hook already resolves a
+        between-turns ``item/completed`` — so the codex branch never reads the
+        queue; it reconciles the registry against the satellite's
+        ``codex_bg_terminals`` pull RPC instead (the loss-window backstop,
+        mirroring the local session's drain).
+        Acquires the session lock with a short timeout so it never races an
+        in-flight turn (the lock blocks the next turn's send_message, so we only
+        ever see idle post-turn frames)."""
         info = self._sessions.get(session_id)
-        if info is None or info.execution_path != "claude-code-cli":
+        if info is None:
             return False
+        if info.execution_path == "codex-cli":
+            return await self._drain_codex_bg_commands(info, budget=budget)
         try:
             await asyncio.wait_for(info.lock.acquire(), timeout=0.1)
         except asyncio.TimeoutError:
@@ -1814,6 +1847,66 @@ class RemoteExecutionLayer(
             info.lock.release()
         return progressed
 
+    async def _drain_codex_bg_commands(
+        self, info: "RemoteSessionInfo", *, budget: float,
+    ) -> bool:
+        """Between turns, reconcile pending background-terminal registry entries
+        against the satellite's ``codex_bg_terminals`` RPC (which proxies
+        ``thread/backgroundTerminals/list``) and resolve any whose PTY is gone.
+        Remote twin of ``CodexAppServerSession.drain_bg_commands`` — same
+        matching (itemId OR the late-bound processId), same fail-closed contract
+        (RPC failure / satellite refusal is NO progress, never resolve-on-error),
+        same >=1s self-pacing and 0.1s lock timeout. No-op below the 0.5.105
+        gate: an older satellite would silently drop the frame and every poll
+        would burn its ack timeout (the router's OOB hook still resolves live
+        completions there). NEVER touches info.event_queue — the router owns it."""
+        if not (info.bg_supervised
+                and self._cm.supports_codex_bg_terminals(info.machine_id)):
+            return False
+        reg = get_bg_command_registry(info.session_id)
+        if not reg.has_pending:
+            return False
+        if not info.alive or info.cli_dead:
+            return False
+        if time.monotonic() - info._last_bg_terminals_list < 1.0:
+            return False
+        try:
+            await asyncio.wait_for(info.lock.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return False  # a turn is in flight — its translator resolves these
+        try:
+            info._last_bg_terminals_list = time.monotonic()
+            try:
+                ack = await self._cm.send_command(info.machine_id, {
+                    "type": "codex_bg_terminals",
+                    "session_id": info.session_id,
+                }, timeout=min(budget, 5.0))
+            except Exception:
+                return False  # satellite unreachable/slow — nothing resolved
+            if not ack.get("ok"):
+                return False  # satellite couldn't list — fail-closed
+            rows = [t for t in (ack.get("terminals") or []) if isinstance(t, dict)]
+            live_items = {t.get("itemId") for t in rows}
+            live_pids = {t.get("processId") for t in rows}
+            pid_by_item: dict[str, str] = {}
+            if info.codex_translator is not None:
+                pid_by_item = {
+                    p["item_id"]: p["process_id"]
+                    for p in info.codex_translator.pending_bg_commands()
+                }
+            progressed = False
+            for iid in reg.spawned - reg.completed:
+                pid = pid_by_item.get(iid)
+                if iid in live_items or (pid and pid in live_pids):
+                    continue  # still running — its exit resolves it later
+                if resolve_bg_command(info.session_id, iid, "completed"):
+                    progressed = True
+                if info.codex_translator is not None:
+                    info.codex_translator._bg_commands.pop(iid, None)
+            return progressed
+        finally:
+            info.lock.release()
+
     async def is_session_process_dead(self, session_id: str) -> bool:
         info = self._sessions.get(session_id)
         if not info:
@@ -1821,6 +1914,18 @@ class RemoteExecutionLayer(
         if info.cli_dead:
             return True
         return not self._cm.is_connected(info.machine_id)
+
+    def is_session_grace_held(self, session_id: str) -> bool:
+        """True while the session's satellite dropped but the reconnect-grace
+        window is still open — 'reconnecting', not dead. ``is_session_alive``
+        reads False in that window (the machine is deregistered), so callers
+        deciding whether a session is truly abandonable (cross-engine switch,
+        ``process_alive`` reporting) must OR this in — a 10-second WS blip
+        must not read as a dead session."""
+        info = self._sessions.get(session_id)
+        return bool(
+            info and self._cm.is_session_in_grace(info.machine_id, session_id)
+        )
 
     async def probe_session_process_dead(self, session_id: str) -> bool:
         """RPC the satellite for actual process liveness before a reap.
@@ -2226,8 +2331,14 @@ class RemoteExecutionLayer(
             payload["interactive_first_prompt"] = config.interactive_first_prompt or ""
             # Effort mapping must happen on the proxy (single source of truth)
             payload["effort"] = map_effort_to_codex(config.effort, config.model)
-            # Sandbox mode is the same resolution the local layer uses
-            payload["sandbox_mode"] = permission_to_sandbox(config.permission_mode)
+            # Same resolution as the local layer, plus the pairing's full-FS
+            # grant (remote-only; local bwrap sessions never set it).
+            payload["sandbox_mode"] = permission_to_sandbox(
+                config.permission_mode,
+                allow_full_fs=bool(
+                    getattr(config.security_context, "target_allow_full_fs", False)
+                ),
+            )
             # Construct auth.json from OAuth env vars (pops them from env)
             auth_json = build_auth_json_from_env(env)
             if auth_json is not None:

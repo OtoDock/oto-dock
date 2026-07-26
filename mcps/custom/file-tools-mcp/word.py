@@ -386,7 +386,7 @@ async def handle_write_docx(args: dict) -> str:
     from docx.oxml.ns import qn
     from docx.shared import Inches, Pt, RGBColor
 
-    path = _resolve_path(args["path"], writing=True)
+    path = await _resolve_path(args["path"], writing=True)
     ops, dropped = _normalize_operations(args.get("operations"))
     create_new = args.get("create_new", False)
 
@@ -670,7 +670,7 @@ async def handle_write_docx(args: dict) -> str:
             # =============================================================
 
             elif ot == "add_image":
-                img_path = _resolve_path(
+                img_path = await _resolve_path(
                     op.get("image_path") or op.get("path") or op.get("image", "")
                 )
                 width = Inches(float(op.get("width_inches", 4.0)))

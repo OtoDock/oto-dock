@@ -12,6 +12,7 @@ update_available); the admin/manager actions live under
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -843,7 +844,9 @@ async def preview_community_agent_install(
         "will_create_tasks_agent_scope": sum(
             1 for t in (entry.get("tasks_agent_scope") or [])
         ),
-        "platform_compat_ok": True,  # platform_min_version check deferred
+        "platform_compat_ok": community_catalog.platform_version_ok(
+            entry.get("platform_min_version"),
+        ),
     }
 
 
@@ -894,8 +897,12 @@ async def admin_reseed_template_items(
         role = pair["agent_role"]
         try:
             counts = await asyncio.to_thread(
-                community_agent_installer.on_user_added_to_agent,
-                slug, sub, role,
+                # Recovery must not resurrect per-user onboarding: a missing
+                # user-setup copy means that user COMPLETED it.
+                functools.partial(
+                    community_agent_installer.on_user_added_to_agent,
+                    slug, sub, role, seed_user_setup=False,
+                ),
             )
         except Exception as exc:
             logger.exception("reseed failed for (%s, %s)", slug, sub)

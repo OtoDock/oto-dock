@@ -483,7 +483,7 @@ async def handle_create_chart(args: dict) -> str:
     saved_msg = ""
     if save_path:
         try:
-            out = _resolve_path(save_path, writing=True)
+            out = await _resolve_path(save_path, writing=True)
             Path(out).parent.mkdir(parents=True, exist_ok=True)
             Path(out).write_bytes(png_bytes)
             saved_msg = f" Saved to: {_to_agents_relative(out)}"

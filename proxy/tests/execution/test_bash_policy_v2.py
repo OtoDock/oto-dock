@@ -369,3 +369,33 @@ class TestHeredocBodies:
             "rm -rf /"
         )
         assert not _d(cmd, self._mgr()).allowed
+
+
+# ===== Session-cwd relative anchor (local sessions) =====
+
+class TestRelativePathSessionAnchor:
+    """Relative Bash path args resolve like the TOOL will — against the
+    sandbox session cwd (/users/{u}, or /workspace for agent scope) — while
+    the historical agents-relative anchor keeps display-form paths working.
+    The old sole AGENTS_DIR anchor denied every honest workspace-relative
+    read (`base64 workspace/downloads/x` — the efpolis repro)."""
+
+    def test_user_scope_workspace_relative_read_allowed(self):
+        d = _d("base64 workspace/downloads/invoice.png")
+        assert d.allowed, d.reason
+
+    def test_agent_scope_workspace_relative_read_allowed(self):
+        d = _d("base64 downloads/invoice.png", _ctx(username=""))
+        assert d.allowed, d.reason
+
+    def test_agents_relative_display_form_still_resolves(self):
+        d = _d("base64 personal-assistant/users/alice/workspace/x.png")
+        assert d.allowed, d.reason
+
+    def test_relative_cross_user_denied(self):
+        d = _d("cat ../bob/workspace/secret.txt")
+        assert not d.allowed
+
+    def test_absolute_escape_still_denied(self):
+        d = _d("cat /etc/sudoers")
+        assert not d.allowed

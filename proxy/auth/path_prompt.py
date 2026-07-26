@@ -496,7 +496,7 @@ def _build_folders_section(
             )
             srows.append(
                 "- `/config/` (RW) — The agent's configuration. Holds "
-                "`prompt.md` (the persona) and `context/` (auto-loaded every "
+                "`agent.md` (the persona) and `context/` (auto-loaded every "
                 "session). Only managers see this folder.\n"
             )
         else:
@@ -552,7 +552,7 @@ def _build_folders_section(
     if ctx.role in ("manager", "admin"):
         rows.append(
             "- `/config/` (RW) — The agent's configuration. Holds "
-            "`prompt.md` (the agent persona) and `context/` (files that "
+            "`agent.md` (the agent persona) and `context/` (files that "
             "auto-load into every session of this agent). Only managers "
             "see this folder.\n"
         )
@@ -618,6 +618,7 @@ def _build_building_agents_section(
     enabled = set(assigned_mcp_names or ())
     has_config = "agent-config-mcp" in enabled
     has_mcps = "mcps-mcp" in enabled
+    has_creator = "agent-creator-mcp" in enabled
 
     # Build the "tools you can use from chat" lines — only mention tools
     # that are actually enabled. When neither is, fall back to the dashboard.
@@ -632,6 +633,13 @@ def _build_building_agents_section(
         tool_lines.append(
             "- `mcps-mcp` — browse the community catalog and request "
             "additional MCPs (tools)."
+        )
+    if has_creator:
+        # The MCP itself shows zero tools to platform members, so the line
+        # is a pointer, not a promise — it says who can act on it.
+        tool_lines.append(
+            "- `agent-creator-mcp` — create a NEW agent from a template "
+            "folder you write (platform creators/admins only)."
         )
     if not tool_lines:
         tool_lines.append(
@@ -660,7 +668,11 @@ def _build_building_agents_section(
     # Folder bullets adapt to the agent's mode: Personal-only has no shared
     # /knowledge or /workspace; Shared-only has no per-user dirs.
     folder_bullets = [
-        "- Edit the persona: `/config/prompt.md` (loaded first every session).\n",
+        "- Edit the persona: `/config/agent.md` (loaded first every session). "
+        "The persona is the agent's role and soul — its job, working style "
+        "and judgment. Never write capability lists into it: tools bring "
+        "their own instructions when added (MCP skills), and day-to-day "
+        "facts belong in memory, not the persona.\n",
         "- Add always-loaded knowledge: drop markdown files in "
         + "`/config/context/*` (operational rules, business context, vocabulary; "
         + "1MB per file, 5MB total cap, loaded EVERY session).\n",

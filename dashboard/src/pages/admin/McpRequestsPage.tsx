@@ -309,10 +309,14 @@ function Row({
               <span className="text-p-text-light">Admin note:</span> {req.admin_note}
             </p>
           )}
-          {isFailed && req.install_log && (
+          {(isFailed || req.status === 'installed') && req.install_log && (
             <details className="mt-1.5">
               <summary className="text-[11px] text-p-text-light cursor-pointer">Install log</summary>
-              <pre className="mt-1 text-[10px] text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20 rounded-sm p-2 overflow-x-auto max-h-40 whitespace-pre-wrap">{req.install_log}</pre>
+              <pre className={`mt-1 text-[10px] rounded-sm p-2 overflow-x-auto max-h-40 whitespace-pre-wrap ${
+                isFailed
+                  ? 'text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20'
+                  : 'text-p-text-secondary bg-p-surface-hover'
+              }`}>{req.install_log}</pre>
             </details>
           )}
         </div>

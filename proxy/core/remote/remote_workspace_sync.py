@@ -356,9 +356,15 @@ class RemoteWorkspaceSyncMixin:
         # double-apply and race the base.
         async with self._cm.get_sync_lock(machine_id, agent_slug):
             local_entries = await _asyncio.to_thread(
-                file_sync.compute_manifest, agent_dir,
-                target_username=target_username, target_role=target_role,
-                exclude_user_dirs=exclude_users,
+                lambda: file_sync.compute_manifest(
+                    agent_dir,
+                    target_username=target_username, target_role=target_role,
+                    exclude_user_dirs=exclude_users,
+                    # Cap the plan at what THIS machine accepts: pre-0.5.103
+                    # satellites hard-reject >100MB, so bigger files must never
+                    # enter their merge plan (doomed pushes / permanent churn).
+                    max_file_size=self._cm.effective_sync_cap(machine_id),
+                ),
             )
             try:
                 ack = await self._cm.send_command(
@@ -440,6 +446,7 @@ class RemoteWorkspaceSyncMixin:
             )
 
             local_mtime = {e.path: e.mtime for e in local_entries}
+            local_size = {e.path: e.size for e in local_entries}
             # Created EAGERLY (not lazily on first capture): the windowed
             # apply below runs actions concurrently, and a lazy nonlocal
             # create could double-mkdtemp and leak the loser.
@@ -528,15 +535,26 @@ class RemoteWorkspaceSyncMixin:
                     if action.op == "push":
                         if action.capture_side:
                             await _capture_loser(action)
-                        try:
-                            content = (agent_dir / rp).read_bytes()
-                        except OSError as e:
-                            logger.warning("Cannot read %s for sync: %s", rp, e)
-                            return
-                        ok = await self._cm.push_file(
-                            machine_id, PathRef("agent_tree", rp), content,
-                            agent_slug=agent_slug,
-                        )
+                        # Pass the PATH — push_file streams from disk (memory
+                        # O(window) even at 1GB; a vanished file returns False
+                        # into the existing failure path). 60s window timeout:
+                        # 30s/8MB window needs ≥364KB/s on the b64 wire — too
+                        # tight for big files on slow links. The global
+                        # transfer gate (innermost — see its lock-order
+                        # invariant) bounds concurrent LARGE pushes across
+                        # machines; sub-threshold files bypass it so a
+                        # tiny-file warmup storm never queues behind a big
+                        # fan-out.
+                        from core.remote import transfer_gate
+                        async with transfer_gate.slot(
+                            machine_id, agent_slug, rp,
+                            local_size.get(rp, 0),
+                        ):
+                            ok = await self._cm.push_file(
+                                machine_id, PathRef("agent_tree", rp),
+                                agent_dir / rp,
+                                agent_slug=agent_slug, timeout=60.0,
+                            )
                         if not ok:
                             logger.warning("Push failed during initial sync: %s", rp)
                             return
@@ -561,6 +579,9 @@ class RemoteWorkspaceSyncMixin:
                         ok = await self._cm.pull_file_to_path(
                             machine_id, PathRef("agent_tree", rp), dest,
                             agent_slug=agent_slug,
+                            timeout=file_sync.pull_timeout_for_size(
+                                remote_size.get(rp, 0)
+                            ),
                         )
                         if not ok:
                             logger.warning("Pull failed during initial sync: %s", rp)

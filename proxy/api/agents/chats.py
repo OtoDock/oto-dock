@@ -5,6 +5,8 @@ CRUD endpoints for chats and messages, authenticated via JWT session cookie.
 
 import asyncio
 import logging
+import re
+import unicodedata
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,6 +17,18 @@ from auth.providers import UserContext, get_current_user, require_auth, require_
 
 logger = logging.getLogger("claude-proxy.chat-api")
 router = APIRouter()
+
+# Manual-rename titles fan out to OTHER users' sidebars (title_updated), so
+# sanitization is a spoofing defense, not cosmetics: strip C0/C1 controls,
+# bidi embeddings/overrides/isolates, zero-width + word-joiner + BOM. ZWNJ/ZWJ
+# (200c/200d) are deliberately KEPT — composite emoji and Persian/Indic text
+# need them. Whitespace is collapsed separately (before this strip, so a
+# newline separates words instead of gluing them).
+_TITLE_STRIP_RE = re.compile(
+    "[\u0000-\u001f\u007f-\u009f\u200b\u200e\u200f"
+    "\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+_TITLE_MAX_LEN = 160  # code points, matching the client input's maxLength
 
 
 # --- Request models ---
@@ -32,13 +46,57 @@ class UpdateChatRequest(BaseModel):
 # --- Endpoints ---
 
 
+def _sanitize_title(raw: str) -> str:
+    """Normalize + defang a manual rename: NFC, collapse whitespace, strip
+    the hostile invisibles (``_TITLE_STRIP_RE``), re-collapse, clip. Returns
+    '' for a title that was nothing but whitespace/invisibles — the handler
+    rejects that with a 400."""
+    t = unicodedata.normalize("NFC", raw or "")
+    t = " ".join(t.split())
+    t = _TITLE_STRIP_RE.sub("", t)
+    t = " ".join(t.split())
+    return t[:_TITLE_MAX_LEN].rstrip()
+
+
+def _run_for_chat(chat: dict) -> dict | None:
+    """The task run governing this chat's task-history permissions, or None
+    for a plain chat. Keys on run-row EXISTENCE, never the id prefix — a
+    chat-surface delegate worker has a plain-uuid chat id WITH a run row.
+    Falls back to deriving the run id from a ``task-`` id for the create→
+    stamp window (run row exists, ``chat_id`` not yet pointing at it)."""
+    chat_id = chat.get("id", "")
+    run = task_store.get_run_for_chat(chat_id)
+    if run is None and chat_id.startswith("task-"):
+        run = task_store.get_run(chat_id.removeprefix("task-"))
+    return run
+
+
+def _task_mutation_allowed(role: str, acting: str, scope: str,
+                           created_by: str) -> bool:
+    """The task mutation matrix (mirrors ``api/tasks``' ``_check_task_permission``):
+    user-scope → creator only; agent-scope → admin/manager any, editor only
+    their own, viewer never."""
+    if role == "admin":
+        return True
+    if (scope or "agent") == "user":
+        return bool(acting) and created_by == acting
+    if role == "manager":
+        return True
+    if role == "editor":
+        return bool(acting) and created_by == acting
+    return False
+
+
 def can_access_chat(u: UserContext, chat: dict) -> bool:
-    """May this user view/manage this dashboard chat?
+    """May this user view this dashboard chat?
 
     Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
-    synthetic-owner chat — any user assigned to the agent. The shared history
-    is visible to every assigned user; write/role gating happens at the agent
-    layer when they actually send a message.
+    synthetic-owner chat — any user assigned to the agent OR — for a task-run
+    chat (synthetic ``task::`` owner) — the task listing's run rule:
+    agent-scoped runs for anyone with agent access, user-scoped runs only for
+    their creator. Without that branch the REST surface denies rows the
+    ``kind=tasks`` listing itself shows. Mutations layer ``can_mutate_chat``
+    on top.
     """
     from core.session.visibility import is_shared_chat_owner
     if u.is_admin:
@@ -48,7 +106,44 @@ def can_access_chat(u: UserContext, chat: dict) -> bool:
         return True
     if is_shared_chat_owner(owner):
         return u.can_access_agent(chat.get("agent", ""))
+    if owner.startswith("task::") or chat.get("id", "").startswith("task-"):
+        run = _run_for_chat(chat)
+        if run is not None:
+            if (run.get("scope") or "agent") == "user":
+                return run.get("created_by") == (u.acting_sub or "")
+            return u.can_access_agent(chat.get("agent", ""))
     return False
+
+
+def can_mutate_chat(u: UserContext, chat: dict, run: dict | None = None,
+                    *, run_resolved: bool = False) -> bool:
+    """May this user RENAME or DELETE this chat? Stricter than view:
+
+    - admin — any chat.
+    - Task-history chats (a ``task_runs`` row exists: ``task-`` ids AND
+      chat-surface delegate workers with uuid ids) — the task matrix
+      (``_task_mutation_allowed``) judged on the RUN row.
+    - Shared-only chats (synthetic ``agent::`` owner, no run row) — editor+.
+      Viewers keep read access but no longer mutate shared history.
+    - Everything else (per-user chats; phone's synthetic owner) — owner only.
+
+    ``run``/``run_resolved`` let listing endpoints pass a batch-resolved run
+    (or its absence) so the flags they stamp use EXACTLY this logic without a
+    per-row query."""
+    from core.session.visibility import is_shared_chat_owner
+    if u.is_admin:
+        return True
+    if not run_resolved:
+        run = _run_for_chat(chat)
+    if run is not None:
+        return _task_mutation_allowed(
+            u.get_agent_role(chat.get("agent", "")), u.acting_sub or "",
+            run.get("scope") or "agent", run.get("created_by") or "",
+        )
+    owner = chat.get("user_sub", "")
+    if is_shared_chat_owner(owner):
+        return u.can_edit_agent(chat.get("agent", ""))
+    return owner == u.sub
 
 
 def _task_scope_sub(u: UserContext) -> str | None:
@@ -75,13 +170,48 @@ async def list_chats(
             raise HTTPException(status_code=400, detail="agent parameter required")
         require_agent_access(u, agent)
         chats = task_store.list_task_chats(agent, _task_scope_sub(u), limit=limit)
+        _stamp_mutation_flags(u, chats)
         return {"chats": chats}
     # Shared-only agents have ONE shared chat list (synthetic owner); every
     # other mode lists the user's own. A global (no-agent) list stays per-user.
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub) if agent else u.sub
     chats = task_store.list_chats(owner, agent=agent, limit=limit)
+    _stamp_mutation_flags(u, chats)
     return {"chats": chats}
+
+
+def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
+    """Server-computed per-row ``can_rename``/``can_delete`` — the client
+    renders menu options from these and NEVER re-implements the role matrix,
+    so the flags must judge exactly what the mutation endpoints will.
+
+    Task-listing rows carry their run/definition columns inline
+    (``_TASK_RUN_COLS``); plain chat rows batch-resolve runs in ONE query
+    (uuid delegate-worker chats live in plain lists). ``can_delete`` always
+    judges the RUN (delete removes the chat's history entry); ``can_rename``
+    judges what rename actually hits — the DYNAMIC TASK row for name-labeled
+    task rows (that rename goes to ``PATCH /v1/tasks``, judged on the
+    definition's scope/creator), else the chat/run."""
+    if not rows:
+        return
+    need_lookup = [r.get("id", "") for r in rows if "run_id" not in r]
+    runs_by_chat = task_store.get_runs_for_chats(need_lookup) if need_lookup else {}
+    for r in rows:
+        if "run_id" in r:
+            run = ({"scope": r.get("run_scope"),
+                    "created_by": r.get("run_created_by")}
+                   if r.get("run_id") else None)
+        else:
+            run = runs_by_chat.get(r.get("id", ""))
+        r["can_delete"] = can_mutate_chat(u, r, run, run_resolved=True)
+        if r.get("task_name") and r.get("task_id"):
+            r["can_rename"] = _task_mutation_allowed(
+                u.get_agent_role(r.get("agent", "")), u.acting_sub or "",
+                r.get("task_scope") or "agent", r.get("task_created_by") or "",
+            )
+        else:
+            r["can_rename"] = r["can_delete"]
 
 
 def _widget_shows_agent(u: UserContext, agent: str) -> bool:
@@ -223,9 +353,11 @@ async def search_chats(
     if kind == "tasks":
         require_agent_access(u, agent)
         results = task_store.search_task_chats(agent, q, _task_scope_sub(u), limit=limit)
+        _stamp_mutation_flags(u, results)
         return {"chats": results}
     from core.session.visibility import chat_history_owner
     results = task_store.search_chats(chat_history_owner(agent, u.sub), agent, q, limit=limit)
+    _stamp_mutation_flags(u, results)
     return {"chats": results}
 
 
@@ -383,17 +515,37 @@ async def update_chat(
     chat = task_store.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
-        raise HTTPException(status_code=403, detail="Access denied")
-    updates = {}
+    if not can_access_chat(u, chat) or not can_mutate_chat(u, chat):
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to rename this chat")
+    updates: dict = {}
     if req.title is not None:
-        updates["title"] = req.title
+        title = _sanitize_title(req.title)
+        if not title:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        updates["title"] = title
         # A manual rename finalizes the title — mark it generated so the one-time
         # LLM title upgrade (services/title_generator.py) never overwrites it.
         updates["title_generated"] = True
     if updates:
         task_store.update_chat(chat_id, **updates)
-    return {"status": "ok"}
+        if "title" in updates:
+            # Fan out to every viewer's sidebar + Active-now widget NOW — a
+            # rename must not wait for the next navigation refetch. Pass the
+            # ROW's owner (chat_status_targets resolves agent::/task:: owners
+            # to the agent's assigned users).
+            try:
+                from services.notifications import notification_manager
+                notification_manager.broadcast_chat_title(
+                    chat.get("user_sub") or "", chat_id, updates["title"],
+                    agent=chat.get("agent") or "",
+                )
+            except Exception:
+                logger.debug("rename broadcast failed for %s", chat_id,
+                             exc_info=True)
+    # Echo the sanitized title so the client renders what was stored.
+    return {"status": "ok", "title": updates.get("title")}
 
 
 async def _close_chat_session(chat: dict) -> None:
@@ -444,8 +596,19 @@ async def delete_chat(
     chat = task_store.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not can_access_chat(u, chat) or not can_mutate_chat(u, chat):
+        raise HTTPException(
+            status_code=403,
+            detail="You don't have permission to delete this chat")
+    # A live/queued run would keep writing rows (and holding a session)
+    # against a deleted chat — deliberately an EXISTS over ALL the chat's
+    # runs, never "the latest run's status" (a pending run has no started_at
+    # and sorts last on a multi-run worker chat).
+    if await asyncio.to_thread(task_store.has_live_run, chat_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A task run is still active on this chat — cancel it "
+                   "first, then delete the history entry.")
     # A deleted chat must never be woken — cancel its pending continuations
     # (row + APScheduler job) before the row goes.
     from services.scheduler import scheduler

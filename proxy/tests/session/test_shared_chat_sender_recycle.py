@@ -62,6 +62,15 @@ def _setup(monkeypatch):
     live_sid = str(uuid.uuid4())
     layer.alive.add(live_sid)
     set_session_mode(live_sid, "default")
+    # Every real warm registers the session's security context, and the
+    # recycle reads it to tell WHO the live session is bound to. Register
+    # admin's so this fixture matches production; without it the identity is
+    # unprovable and the recycle correctly fires for every sender.
+    from auth.path_policy import SecurityContext
+    from core.session.session_state import set_session_security
+    set_session_security(live_sid, SecurityContext(
+        role="manager", username="admin", agent=slug, is_admin_agent=False,
+    ))
     cid = _make_shared_chat(slug, session_id=live_sid,
                             messages=(("user", "hi", "user-admin"),
                                       ("assistant", "hello", "")))
@@ -119,6 +128,55 @@ class TestSenderChangeRecycle:
         assert sent_sid == new_sids[-1]
         assert "Manager User" in prompt
         assert "hello from B" in prompt
+
+    def test_pool_paid_handover_still_recycles(self, temp_db, monkeypatch):
+        """The payer is empty when the platform/agent pool paid, so the
+        billing check alone can't see a handover — the session's identity
+        (JWT, OTO_* env, platform role) would silently stay user A's."""
+        layer, slug, live_sid, cid = _setup(monkeypatch)
+        from services.engines import subscription_pool as sp
+        sp.bind_session(live_sid, "sub-pool", layer="claude-code-cli", user_sub="")
+
+        async def scenario():
+            cookie = session_cookie(sub="user-manager", email="manager@test.com",
+                                    name="Manager User", role="creator")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "queue_snapshot")
+                ws.client_send({"type": "chat", "text": "hello from B"})
+                await _drain_until(ws, "done")
+
+        run_ws_scenario(scenario)
+        _clear_pool_maps()
+
+        assert sp.get_session_payer_sub(live_sid) == ""
+        assert live_sid in layer.closed_sessions
+        assert [sid for sid, _ in layer.started if sid != live_sid]
+
+    def test_unprovable_identity_recycles(self, temp_db, monkeypatch):
+        """No security context (e.g. a satellite session that outlived a proxy
+        restart) means the live session's owner can't be established — fail
+        closed: a needless respawn beats running as the previous sender."""
+        layer, slug, live_sid, cid = _setup(monkeypatch)
+        from core.session import session_state
+        session_state._session_security.pop(live_sid, None)
+        monkeypatch.setattr(
+            session_state, "get_session_security", lambda sid: None,
+        )
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:  # user-admin
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "queue_snapshot")
+                ws.client_send({"type": "chat", "text": "still me"})
+                await _drain_until(ws, "done")
+
+        run_ws_scenario(scenario)
+        _clear_pool_maps()
+
+        assert live_sid in layer.closed_sessions
 
     def test_same_payer_keeps_live_session(self, temp_db, monkeypatch):
         layer, slug, live_sid, cid = _setup(monkeypatch)

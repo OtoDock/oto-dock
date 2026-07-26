@@ -294,6 +294,25 @@ def _is_harness_injected_user_line(obj: dict, text: str) -> bool:
     )
 
 
+def author_sub_for(session_id: str) -> str:
+    """The user to credit for a user row this tailer persists.
+
+    Interactive (PTY) turns are typed straight into the CLI, so they never pass
+    the ``-p`` send path that stamps ``chat_messages.author_sub``. On a
+    Shared-only agent the chat row is owned by the synthetic ``agent::<slug>``,
+    so without this every interactive prompt lands unattributed. The session's
+    controller IS the author: input from anyone else is refused
+    (``InteractiveSession.may_drive``), and a take-over replaces the session, so
+    the owner can never drift from who actually typed.
+
+    Returns "" for headless sessions (not in the interactive registry) — their
+    rows are already stamped at send time.
+    """
+    from core.session import interactive_session  # lazy: it imports the tailers
+    sess = interactive_session.get(session_id)
+    return sess.user_sub if sess is not None else ""
+
+
 def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
                  block: dict, open_questions: set[str]) -> int:
     """Dispatch one assistant ``tool_use`` block; returns rows persisted now.
@@ -433,6 +452,13 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     buf = _tool_events.setdefault(session_id, ToolEventBuffer())
 
     persisted = 0
+    # Early-title counters (interactive_session accumulates them across
+    # batches and fires the LLM title upgrade mid-turn at char/tool
+    # thresholds — the interactive twin of the pump's early triggers).
+    # Incremented ONLY at actual persist sites, after every resume/replay/
+    # dedup guard, so pre-existing history never counts.
+    assistant_chars = 0
+    tool_rows = 0  # persisted "tool"/"task_spawn" event rows (result-paired)
     first_user_text: str | None = None  # for the chat-title backfill (below)
     # Turn-end signal for the interactive completion watcher: an assistant
     # message with stop_reason=="end_turn" is the turn
@@ -575,6 +601,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                                       is_error=bool(rb.get("is_error")))
                     persist_event(task_store, chat_id, blk)
                     persisted += 1
+                    tool_rows += 1  # blocks in the buffer are tool/task_spawn
                 continue
             if obj.get("isMeta"):
                 continue  # local-command caveat / CLI meta — never user text
@@ -619,7 +646,10 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                     # The dashboard warmup already persisted this exact prompt
                     # at send-time — skip the row, keep the turn signal/title.
                     continue
-                task_store.add_chat_message(chat_id, "user", cleaned)
+                task_store.add_chat_message(
+                    chat_id, "user", cleaned,
+                    author_sub=author_sub_for(session_id),
+                )
                 persisted += 1
 
         elif kind == "assistant" and isinstance(content, list):
@@ -661,6 +691,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                             continue
                         task_store.add_chat_message(chat_id, "assistant", text)
                         persisted += 1
+                        assistant_chars += len(text)
                         msg_text_parts.append(text)
                 elif btype == "thinking":
                     # Headless parity: the pump persists a thinking block per
@@ -751,4 +782,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
         "compact_trigger": compact_trigger,
         # usage_records rows written for this batch (0 = no new usage lines).
         "usage_rows": usage_rows,
+        # Early-title counters (see the init comment above).
+        "assistant_chars": assistant_chars,
+        "tool_rows": tool_rows,
     }

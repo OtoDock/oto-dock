@@ -100,14 +100,32 @@ def test_status_shape(temp_db, monkeypatch):
 def test_claim_title_generation_once(temp_db):
     from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
-    assert db.claim_title_generation("c1") is True
-    assert db.claim_title_generation("c1") is False
+    db.update_chat("c1", title="pre-claim title")
+    # The winner also receives the claim-time title — the CAS baseline.
+    assert db.claim_title_generation("c1") == (True, "pre-claim title")
+    assert db.claim_title_generation("c1") == (False, None)
     assert db.get_chat("c1")["title_generated"] is True
 
 
 def test_claim_missing_chat_false(temp_db):
     from storage import database as db
-    assert db.claim_title_generation("nope") is False
+    assert db.claim_title_generation("nope") == (False, None)
+
+
+def test_title_cas_write(temp_db):
+    from storage import database as db
+    db.create_chat("c2", "user-1", "agent-x")
+    db.update_chat("c2", title="deterministic")
+    claimed, baseline = db.claim_title_generation("c2")
+    assert claimed
+    # Baseline unchanged → the generated title lands.
+    assert db.update_chat_title_cas("c2", "🎯 Generated", baseline) is True
+    assert db.get_chat("c2")["title"] == "🎯 Generated"
+    # A manual rename after the claim → a late CAS with the stale baseline
+    # must NOT overwrite the human title.
+    db.update_chat("c2", title="Human title", title_generated=True)
+    assert db.update_chat_title_cas("c2", "🤖 Late gen", "deterministic") is False
+    assert db.get_chat("c2")["title"] == "Human title"
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +206,47 @@ def test_request_is_exactly_once(temp_db, monkeypatch):
 
     assert db.get_chat("c1")["title"] == "🎯 First Title"
     assert len(cap["usage"]) == 1  # generated only once
+
+
+def test_request_without_user_prompt_keeps_claim(temp_db, monkeypatch):
+    """A fire before any user row is persisted (artifact-framed first turn /
+    an early trigger racing the prompt persist) must NOT burn the claim — a
+    later real turn can still title the chat."""
+    from storage import database as db
+    from services import title_generator as tg
+    db.create_chat("c1", "user-1", "agent-x")
+    cap = _patch_provider(monkeypatch, "🎯 Later Title")
+
+    asyncio.run(tg.request_chat_title("c1"))
+    assert db.get_chat("c1")["title_generated"] is False  # claim intact
+    assert cap["usage"] == [] and cap["broadcast"] == []
+
+    db.add_chat_message("c1", "user", "the real first question")
+    asyncio.run(tg.request_chat_title("c1"))
+    assert db.get_chat("c1")["title"] == "🎯 Later Title"
+
+
+def test_rename_landing_mid_generation_wins(temp_db, monkeypatch):
+    """A manual rename between the claim and the final write must win: the
+    CAS (baselined on the claim-time title) discards the generated title and
+    suppresses the broadcast — never announce a title that lost."""
+    from storage import database as db
+    from services import title_generator as tg
+    db.create_chat("c1", "user-1", "agent-x")
+    db.update_chat("c1", title="deterministic")
+    db.add_chat_message("c1", "user", "first question")
+    db.add_chat_message("c1", "assistant", "first answer")
+    cap = _patch_provider(monkeypatch)
+
+    async def _rename_then_generate(*a, **k):
+        # Simulates PATCH /v1/chats landing while the model is generating.
+        db.update_chat("c1", title="Human title", title_generated=True)
+        return "🤖 Late generated", ProviderUsage(input_tokens=10, output_tokens=5)
+    monkeypatch.setattr(tg, "generate_title", _rename_then_generate)
+
+    asyncio.run(tg.request_chat_title("c1"))
+    assert db.get_chat("c1")["title"] == "Human title"
+    assert cap["broadcast"] == []  # the stale title was never announced
 
 
 def test_request_disabled_keeps_deterministic_and_does_not_claim(temp_db, monkeypatch):

@@ -61,7 +61,8 @@ async def test_pull_through_writes_to_workspace(temp_db, reset_flow, tmp_path, m
 
     mock_cm = MagicMock()
 
-    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug=""):
+    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug="",
+                                timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"hello-" + ref.value.encode())
@@ -95,7 +96,8 @@ async def test_pull_through_returns_none_when_satellite_fails(
 
     mock_cm = MagicMock()
 
-    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug=""):
+    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug="",
+                                timeout=180.0):
         return False
 
     mock_cm.pull_file_to_path.side_effect = fake_pull_to_path
@@ -174,7 +176,10 @@ async def test_push_back_uses_workspace_file(
         assert ok is True
         assert len(pushed) == 1
         assert pushed[0][2] == "workspace/out.png"
-        assert pushed[0][3] == b"edited-bytes"
+        # Streaming refactor (1.4.0): push_back passes the workspace PATH —
+        # push_file streams from disk. Verify the path resolves to the bytes.
+        from pathlib import Path as _P
+        assert _P(pushed[0][3]).read_bytes() == b"edited-bytes"
 
 
 @pytest.mark.asyncio
@@ -232,7 +237,10 @@ async def test_push_back_fans_out_excluding_own_machine(
 
     assert ok is True
     fo.assert_awaited_once()
-    assert fo.await_args.args[:3] == ("agent-1", "workspace/out.md", b"v2")
+    assert fo.await_args.args[:2] == ("agent-1", "workspace/out.md")
+    # Fan-out receives the platform PATH (streaming), not bytes.
+    from pathlib import Path as _P
+    assert _P(fo.await_args.args[2]).read_bytes() == b"v2"
     assert fo.await_args.kwargs.get("exclude_machine_id") == "m-own"
 
 
@@ -285,7 +293,8 @@ async def test_write_barrier_blocks_reads_during_push(
         await release_push.wait()
         return True
 
-    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug=""):
+    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug="",
+                                timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"fetched")
@@ -508,7 +517,8 @@ async def test_pull_through_via_fallback_after_restart(
 
     mock_cm = MagicMock()
 
-    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug=""):
+    async def fake_pull_to_path(machine_id, ref, dest_path, *, agent_slug="",
+                                timeout=180.0):
         assert machine_id == "m-7"
         assert agent_slug == "agent-1"
         p = Path(dest_path)
@@ -540,7 +550,8 @@ def _mock_cm(*, supports_stat, stat=None, pulled=b"content-v1"):
     cm.satellite_supports_file_stat.return_value = supports_stat
     cm.stat_file = AsyncMock(return_value=stat)
 
-    async def fake_pull(machine_id, ref, dest_path, *, agent_slug=""):
+    async def fake_pull(machine_id, ref, dest_path, *, agent_slug="",
+                        timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(pulled)

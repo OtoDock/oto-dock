@@ -129,7 +129,9 @@ def split_virtual_path(path: str) -> tuple[str, str]:
     if not p.startswith("/"):
         p = "/" + p
     parts = [seg for seg in p.split("/") if seg not in ("",)]
-    if not parts or parts[0] != "memories":
+    if not parts:
+        return "", ""  # bare "/" or "" — the /memories root itself (view-only)
+    if parts[0] != "memories":
         raise MemoryOpError(
             f"The path {path} does not exist. Please provide a valid path "
             "(all memory paths live under /memories)."

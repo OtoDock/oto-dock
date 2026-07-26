@@ -27,9 +27,12 @@ Security model (full checklist in proxy/docs and the feature plan):
 The stored file is the agent's RAW content; fragments are wrapped at serve
 time (doctype + tokens CSS + runtime), so agents Read/Edit their artifact
 cleanly and historical artifacts pick up wrapper improvements automatically.
-A full document (leading ``<!doctype``/``<html``) is served verbatim —
-documented as opting out of auto theme/kit/auto-height, NOT an injection
-path (no splicing into agent markup).
+A full document (leading ``<!doctype``/``<html``) keeps its own markup and
+head (it opts out of the tokens CSS), but the BYTE-STATIC runtime script is
+injected before its closing ``</body>`` — without it a full-document
+artifact or mini-app silently loses theme sync, auto-height, actions, feeds
+AND links, the exact trap the efpolis field test hit. This is not a splice
+of agent markup: the runtime carries no per-request interpolation.
 """
 
 import html as html_escape
@@ -79,7 +82,40 @@ UI_RUNTIME = """<script>
         }));
       } catch (err) {}
     }
+    if (e.data.type === 'open_url_ack'){
+      try {
+        window.dispatchEvent(new CustomEvent('otodock:open-url-ack', {
+          detail: {status: String(e.data.status || ''), reason: String(e.data.reason || '')}
+        }));
+      } catch (err) {}
+    }
   });
+  // Links: the sandbox (allow-scripts only) makes every <a href> silently
+  // dead. Bridge ABSOLUTE http(s) links to the host, which validates and
+  // opens them in a new tab behind consent. Gate on the AUTHORED attribute —
+  // a.href is DOM-absolutized, so href="/settings" would read as a real
+  // dashboard URL. preventDefault ONLY, never stopPropagation: the dominant
+  // generated pattern is <a href="#" onclick="otodock.action(...)"> whose
+  // handler runs in the bubble phase.
+  //
+  // PATH hrefs (relative / root-relative) are also intercepted, but only to
+  // CANCEL them: nothing relative can load under this CSP, so letting the
+  // click through replaced the whole artifact with the browser's
+  // "refused to connect" error page (verified live on T1). Cancelling keeps
+  // the artifact alive and the host's ack tells the page why. In-page
+  // anchors ('#…') and other schemes (mailto:, tel:, data:, blob:) are left
+  // completely alone, as is any [download] link.
+  addEventListener('click', function(e){
+    var t = e.target;
+    var a = t && t.closest ? t.closest('a[href]') : null;
+    if (!a || a.hasAttribute('download')) return;
+    var raw = a.getAttribute('href') || '';
+    if (!raw || raw.charAt(0) === '#') return;
+    var scheme = /^[a-z][a-z0-9+.\\-]*:/i.test(raw);
+    if (scheme && !/^https?:\\/\\//i.test(raw)) return;
+    e.preventDefault();
+    parent.postMessage({source:'otodock-artifact', v:1, type:'open_url', url:raw}, '*');
+  }, true);
   var last = 0;
   function postH(){
     var h = document.documentElement.scrollHeight;
@@ -220,6 +256,19 @@ def wrap_fragment(content: str, runtime_extra: str = "") -> str:
     )
 
 
+def inject_runtime(content: str, runtime_extra: str = "") -> str:
+    """Runtime injection for FULL documents (fragments get the runtime via
+    ``wrap_fragment``). The script is byte-static — ``runtime_extra`` must
+    never carry per-row interpolation — and lands before the LAST
+    ``</body>`` (appended when the author omitted one; browsers still
+    execute trailing scripts)."""
+    runtime = f"{UI_RUNTIME}{runtime_extra}"
+    idx = content.lower().rfind("</body>")
+    if idx < 0:
+        return content + runtime
+    return content[:idx] + runtime + content[idx:]
+
+
 def _placeholder(message: str) -> str:
     """Styled in-frame notice (tokens-CSS look, theme-aware via the wrapper).
     Callers pass PRE-ESCAPED text only."""
@@ -264,5 +313,5 @@ async def serve_ui(
         )
     content = path.read_text(encoding="utf-8", errors="replace")
     if is_full_document(content):
-        return _ui_response(content, origin)
+        return _ui_response(inject_runtime(content), origin)
     return _ui_response(wrap_fragment(content), origin)

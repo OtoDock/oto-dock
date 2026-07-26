@@ -194,6 +194,10 @@ export function dbMessagesToDisplay(
   agents: Array<{ name: string; display_name?: string; color?: string }> | undefined,
 ): DisplayMessage[] {
   const displayMsgs: DisplayMessage[] = []
+  // Current-name-wins: a renamed agent shows its new name on historical rows;
+  // the frozen event_data name is the fallback so deleted agents keep a label.
+  const currentName = (slug?: string) =>
+    slug ? agents?.find(a => a.name === slug)?.display_name : undefined
   // Events that signal a new LLM turn (delegate result delivery, bg agent nudge)
   let newTurnNext = false
   for (const m of dbMessages) {
@@ -232,7 +236,7 @@ export function dbMessagesToDisplay(
         createdAt: m.created_at,
         ...(agentMeta.agent_slug ? {
           agentSlug: agentMeta.agent_slug,
-          agentDisplayName: agentMeta.agent_display_name,
+          agentDisplayName: currentName(agentMeta.agent_slug) ?? agentMeta.agent_display_name,
           agentColor: agentMeta.agent_color,
           badge: agentMeta.badge,
         } : {}),
@@ -269,7 +273,7 @@ export function dbMessagesToDisplay(
           blocks: m.content ? [{ type: 'text', content: m.content }] : [],
           createdAt: m.created_at,
           agentSlug: msgAgentSlug,
-          agentDisplayName: msgAgentDisplayName,
+          agentDisplayName: currentName(msgAgentSlug) ?? msgAgentDisplayName,
           agentColor: msgAgentColor,
           badge: msgBadge,
         })
@@ -289,7 +293,7 @@ export function dbMessagesToDisplay(
             newTurnNext = true
             meetingTurnAgent = {
               slug: sysEd.agent || '',
-              displayName: sysEd.agent_display_name || sysEd.agent || '',
+              displayName: currentName(sysEd.agent) ?? (sysEd.agent_display_name || sysEd.agent || ''),
               color: sysEd.agent_color || '',
             }
           }

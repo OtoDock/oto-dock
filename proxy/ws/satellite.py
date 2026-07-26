@@ -369,6 +369,11 @@ async def ws_satellite_handler(websocket: WebSocket):
             "device_grants": sorted(
                 remote_store._parse_device_grants(machine.get("device_grants"))
             ),
+            # Universal per-file sync cap (OTODOCK_MAX_FILE_MB) — the proxy
+            # config is the single source of truth; 0.5.103+ satellites apply
+            # it to their manifests + inbound writes. Handshake-only delivery:
+            # the cap changes only on proxy restart, which re-auths every WS.
+            "sync_max_file_bytes": app_config.SYNC_MAX_FILE_BYTES,
         },
         # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
         # claude/codex to these on auth, so the fleet runs the EXACT versions the
@@ -526,6 +531,32 @@ async def push_install_event(
     dead ``_send`` attached for the whole install while the live tab never
     attached, so the install bar stayed invisible until a manual refresh.
     """
+    from services.notifications import notification_manager
+    for sub in recipients:
+        if not sub:
+            continue
+        for conn in notification_manager.get_all_connections(sub):
+            try:
+                conn.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "notify queue full for %s — dropping %s",
+                    sub[:8], event.get("type"),
+                )
+            except Exception:
+                logger.exception("queue put failed")
+
+
+async def push_transfer_event(event: dict, recipients: list[str]) -> None:
+    """Per-user delivery hook for ``core/remote/transfer_registry``
+    (workspace upload/sync progress — Feature E, 1.4.0).
+
+    Registered at startup via ``transfer_registry.set_broadcaster``. Fans a
+    transfer lifecycle event (transfer_started / transfer_machine_state /
+    transfer_progress / transfer_done / transfer_state) out to ``recipients``
+    — resolved ONCE at item creation with the same per-user isolation
+    predicate the workspace fan-out itself applies (``should_sync_to_target``)
+    — through the same per-user notify channel install events use."""
     from services.notifications import notification_manager
     for sub in recipients:
         if not sub:

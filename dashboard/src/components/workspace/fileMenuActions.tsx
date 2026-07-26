@@ -28,6 +28,8 @@ interface BuildEmptyActionsArgs {
   handleNewFolder: () => Promise<void>
   handlePaste: (destDir: string) => Promise<void>
   emptyUploadInputRef: RefObject<HTMLInputElement | null>
+  /** Re-fetch the workspace tree (and recover-bin list) on demand. */
+  onRefresh: () => void
 }
 
 export function buildActions(
@@ -151,6 +153,7 @@ export function buildEmptyActions({
   handleNewFolder,
   handlePaste,
   emptyUploadInputRef,
+  onRefresh,
 }: BuildEmptyActionsArgs): MenuAction[] {
   if (!activeSection) return []
   const dir = state.path || activeSection.pathPrefix
@@ -184,5 +187,14 @@ export function buildEmptyActions({
       onClick: () => void handlePaste(dir),
     })
   }
+  // Available to every role (read-only viewers included) — re-fetches the
+  // tree on demand, e.g. after out-of-band changes the live file_updated
+  // events didn't cover.
+  acts.push({
+    key: 'refresh',
+    label: 'Refresh',
+    icon: <Icon name="refresh" />,
+    onClick: onRefresh,
+  })
   return acts
 }

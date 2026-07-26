@@ -1,0 +1,46 @@
+{
+  "name": "agent-creator-mcp",
+  "label": "Agent Creator",
+  "description": "Create new agents from a template folder. Author the template (persona, MCPs, skills, schedules, onboarding), validate it, then install it as a new agent on the platform.",
+  "version": "1.0.0",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {},
+
+  "exclude_from": ["phone", "task", "meeting"],
+
+  "skills": [
+    {
+      "id": "agent-creation",
+      "file": "skills/agent-creation/SKILL.md",
+      "description": "How to author an agent template folder and install it as a new agent: folder layout, manifest fields, persona rules, and the scaffold-validate-create flow.",
+      "loading": "on_demand",
+      "default_exclude_from": ["phone", "task", "meeting"]
+    }
+  ],
+
+  "permissions": {
+    "default_tier": "sensitive",
+    "rules": [
+      {"tool": "list_building_blocks", "tier": "open"},
+      {"tool": "validate_agent_template", "tier": "standard"}
+    ]
+  },
+
+  "patched": false,
+  "patch_note": null
+}

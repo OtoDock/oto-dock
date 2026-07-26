@@ -61,6 +61,7 @@ from ws.dashboard import (
     _model_allowed_for_path,
     _save_base64_image,
     _task_continue_allowed,
+    chat_process_alive,
 )
 
 logger = logging.getLogger("claude-proxy")
@@ -263,15 +264,42 @@ class ChatController:
                 # the previous sender's account. A message that lands while a
                 # turn is streaming keeps the running turn's session (steer /
                 # queue semantics unchanged — that turn stays on its starter).
+                #
+                # The payer check alone is not enough: when the platform or
+                # agent pool paid, ``get_session_payer_sub`` returns "" and the
+                # handover would silently keep the previous sender's JWT,
+                # ``OTO_*`` env and platform role — an identity carry-over, not
+                # just a billing one. So ALSO compare the session's warmed
+                # identity, and fail CLOSED when it can't be proven: a needless
+                # recycle costs one respawn + JSONL resume, a skipped one lets
+                # this turn act as the previous sender.
                 from services.engines import subscription_pool
+                from core.session import session_state
+                # Interactive sessions never recycle implicitly: a PTY holds
+                # live TUI state, and this branch is reachable WITHOUT the other
+                # user typing anything (an idle artifact-backchannel send or a
+                # mini-app action routes here), so recycling would kill a
+                # colleague's terminal mid-work. Refuse and let them take it over
+                # deliberately.
+                _isess = interactive_session.get(self.session_id)
+                if _isess is not None and not _isess.may_drive(self.user_sub):
+                    await self._send_pty_read_only(_isess)
+                    return
                 pump = _active_pumps.get(self.chat_id)
                 turn_in_flight = bool(pump and not pump.is_done)
                 payer = subscription_pool.get_session_payer_sub(self.session_id)
-                if not turn_in_flight and payer and payer != self.user_sub:
+                warmed = session_state.get_session_security(self.session_id)
+                identity_stale = (
+                    warmed is None
+                    or (warmed.username or "") != (self.user.get("username") or "")
+                )
+                if not turn_in_flight and (
+                    (payer and payer != self.user_sub) or identity_stale
+                ):
                     logger.info(
                         f"WS dashboard _handle_chat: shared-only chat={self.chat_id} "
                         f"changed sender — recycling session {self.session_id} to "
-                        f"bind the new sender's subscription"
+                        f"bind the new sender's subscription + identity"
                     )
                     try:
                         # close_session releases the slot + subscription; the
@@ -682,6 +710,9 @@ class ChatController:
                 "execution_mode": chat.get("execution_mode", ""),
                 "model": chat.get("model", ""),
                 "mode": chat.get("permission_mode", "default"),
+                # A warmup is mid-spawn — the session is coming up; never
+                # offer cross-engine options against it.
+                "process_alive": True,
             })
             for past_ev in list(inflight.event_history):
                 await self._send(past_ev)
@@ -915,7 +946,15 @@ class ChatController:
                      # it for task-run chats (the scheduler's 'auto' posture)
                      # so the permission chip reflects the RUN's real mode,
                      # not the viewer's sticky selection.
-                     "mode": chat.get("permission_mode", "default")})
+                     "mode": chat.get("permission_mode", "default"),
+                     # Best-effort process liveness (in-memory only, no RPC) —
+                     # gates the cross-engine model options client-side. An
+                     # active pump also means alive (the attach below streams
+                     # it). The switch op re-checks authoritatively.
+                     "process_alive": (
+                         bool(pump and not pump.is_done)
+                         or await chat_process_alive(chat)
+                     )})
 
         if view_only_external:
             # Read-only view of a live external session: history is sent, but we
@@ -2286,6 +2325,14 @@ class ChatController:
             )
             return False
         if await self._deny_task_continue(self.chat_id):
+            return False
+        # Interactive identity gate: answering a prompt EXECUTES a tool under
+        # the session controller's identity, so a read-only viewer of someone
+        # else's terminal must not be able to approve one. Blocking keystrokes
+        # while allowing a click on "Allow" would be no boundary at all.
+        isess = interactive_session.get(self.session_id) if self.session_id else None
+        if isess is not None and not isess.may_drive(self.user_sub):
+            await self._send_pty_read_only(isess)
             return False
         return True
 

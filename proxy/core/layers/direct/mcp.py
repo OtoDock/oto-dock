@@ -28,6 +28,12 @@ logger = logging.getLogger("mcp-manager")
 # Timeout for individual tool calls (seconds)
 TOOL_CALL_TIMEOUT = 60
 
+# The registry's Claude-JSON config format spells streamable HTTP as "http"
+# (the CLI's alias for it) — both spellings are the same transport here. The
+# two dispatch sites below must share this set: they have different type
+# defaults ("stdio" vs "sse") and would drift apart with inline literals.
+_REMOTE_STREAMABLE = {"streamable-http", "http"}
+
 # --- Dedicated MCP I/O thread ---
 # All MCP server subprocess I/O (start, tool calls, close) runs on this
 # thread's event loop so it doesn't contend with the proxy's main HTTP loop.
@@ -149,7 +155,7 @@ class MCPServerConnection:
         try:
             if server_type == "stdio":
                 await self._start_stdio()
-            elif server_type in ("sse", "streamable-http"):
+            elif server_type == "sse" or server_type in _REMOTE_STREAMABLE:
                 await self._start_remote()
             else:
                 logger.warning(f"Unknown MCP server type '{server_type}' for {self.name}")
@@ -299,7 +305,7 @@ class MCPServerConnection:
 
         server_type = self.config.get("type", "sse")
 
-        if server_type == "streamable-http":
+        if server_type in _REMOTE_STREAMABLE:
             cm = streamablehttp_client(url, headers=headers)
             streams = await cm.__aenter__()
             self._cm_stack.append(cm)
@@ -373,12 +379,18 @@ class AgentMCPManager:
                  excluded_mcps: set[str] | None = None,
                  session_id: str = "",
                  sandbox_builder=None,
-                 prebuilt_config: tuple | None = None):
+                 prebuilt_config: tuple | None = None,
+                 enable_http_transport: bool = False):
         self.agent_name = agent_name
         self.phone_mode = phone_mode
         self.credential_env = credential_env
         self.excluded_mcps = excluded_mcps or set()
         self.session_id = session_id
+        # Sidecar HTTP MCPs (registry Claude-JSON ``type: "http"``) are opt-in
+        # per manager: the app-action executor enables them; Direct-LLM chats
+        # keep them off — connecting would grow every chat's tool schema and
+        # put heavy tools behind the 60 s call cap.
+        self.enable_http_transport = enable_http_transport
         self.sandbox_builder = sandbox_builder  # SandboxBuilder or None
         # Optional (config_path, secret_bundles) built by the CALLER — used by
         # the headless app-action executor, whose identity (personal-app owner
@@ -439,6 +451,12 @@ class AgentMCPManager:
         for name, srv_config in servers_config.items():
             if name in self.excluded_mcps:
                 logger.info(f"Skipping credential-excluded MCP: {name}")
+                continue
+            if srv_config.get("type") == "http" and not self.enable_http_transport:
+                logger.info(
+                    f"Skipping http-transport MCP '{name}' "
+                    f"(not enabled for this manager)"
+                )
                 continue
 
             conn = MCPServerConnection(name, srv_config,

@@ -170,7 +170,7 @@ async def create_direct_session(
     Args:
         system_prompt: Pre-built prompt from config_builder (includes user context,
             permissions, MCP skills, dynamic context, etc.). If empty, falls back
-            to building a basic prompt from the agent's prompt.md.
+            to building a basic prompt from the agent's agent.md persona.
     """
     if not system_prompt:
         # Fallback: basic prompt without user/permission context (phone path, etc.)

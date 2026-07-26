@@ -52,6 +52,14 @@ export interface UseChatStreamOptions {
    * the page re-resumes it so the fresh warmup runs on the new target and
    * the "moved" history card arrives. */
   onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
+  /** switch_engine ack for the VIEWED chat (stale-guarded like onChatMoved).
+   * Arrives on the acting socket AND via per-user broadcast — idempotent. */
+  onEngineSwitched?: (data: { chat_id: string; execution_path: string; model: string }) => void
+  /** switch_engine refusal for the VIEWED chat — rendered inside the switch
+   * dialog (the generic error rail is invisible on idle dead chats). */
+  onSwitchEngineDenied?: (data: { chat_id: string; message: string; process_alive?: boolean }) => void
+  /** probe_liveness answer for the VIEWED chat — lazy process_alive refresh. */
+  onLiveness?: (data: { chat_id: string; process_alive: boolean }) => void
   /** New interactive-history rows persisted (transcript tail batch) — pages
    *  use it to live-refresh an open rich-history (transcript) view. */
   onChatRows?: (data: { chat_id: string; agent?: string }) => void

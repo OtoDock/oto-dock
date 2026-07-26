@@ -160,6 +160,9 @@ export default function FileTile({
 
   return (
     <div
+      data-ta-name={node.name}
+      data-ta-path={node.path}
+      data-ta-dir={node.type === 'dir' ? '1' : undefined}
       draggable={isDesktop && !renaming}
       onDragStart={handleDragStart}
       onDragEnter={handleDragEnter}

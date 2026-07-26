@@ -107,6 +107,74 @@ def get_run(run_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+def get_run_for_chat(chat_id: str) -> dict | None:
+    """The chat's run row, for chat-level permission resolution. Covers BOTH
+    id shapes: ``task-{run_id}`` chats and chat-surface delegate workers
+    (plain-uuid ids with ``target_chat_id`` runs). ``scope``/``created_by``
+    are stable across a multi-run worker chat, so any row serves — newest by
+    start for determinism."""
+    if not chat_id:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT * FROM task_runs WHERE chat_id=%s
+               ORDER BY COALESCE(started_at, '') DESC LIMIT 1""",
+            (chat_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_runs_for_chats(chat_ids: list[str]) -> dict[str, dict]:
+    """``chat_id → permission-relevant run row`` (newest by start), one query.
+    Listing endpoints stamp per-row mutation flags with EXACTLY the logic the
+    mutation endpoints enforce (``can_mutate_chat``), so a plain chat list
+    containing uuid delegate-worker chats resolves their runs here instead of
+    one query per row."""
+    ids = [c for c in chat_ids if c]
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT ON (chat_id)
+                      chat_id, id, task_id, scope, created_by, status
+                 FROM task_runs WHERE chat_id = ANY(%s)
+                ORDER BY chat_id, COALESCE(started_at, '') DESC""",
+            (ids,),
+        ).fetchall()
+        return {r["chat_id"]: dict(r) for r in rows}
+
+
+def list_live_run_chats(task_id: str) -> list[str]:
+    """chat_ids of the task's running|pending runs — the definition-rename
+    broadcast targets (live rows re-label instantly; idle rows poll)."""
+    if not task_id:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT chat_id FROM task_runs
+                WHERE task_id=%s AND status IN ('running','pending')
+                  AND chat_id IS NOT NULL AND chat_id <> ''""",
+            (task_id,),
+        ).fetchall()
+        return [r["chat_id"] for r in rows]
+
+
+def has_live_run(chat_id: str) -> bool:
+    """True when ANY of the chat's runs is running or pending — the guard
+    against deleting a run chat out from under a live/queued run. Deliberately
+    an EXISTS over all runs, never "the latest run's status": a pending run
+    has no ``started_at`` and sorts LAST on a multi-run worker chat."""
+    if not chat_id:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 AS live FROM task_runs
+                WHERE chat_id=%s AND status IN ('running','pending') LIMIT 1""",
+            (chat_id,),
+        ).fetchone()
+        return row is not None
+
+
 def get_session_cost(session_id: str) -> tuple[float, int]:
     """Return (total_cost_usd, turn_count) for all runs in a session."""
     with get_conn() as conn:

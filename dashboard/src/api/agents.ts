@@ -99,6 +99,11 @@ export interface LayerCapabilities {
   permission_modes: string[]
   control_commands: string[]
   models: { value: string; label: string; provider?: string; supports_xhigh?: boolean; supports_ultra?: boolean }[]
+  // Platform-level availability: some subscription for this engine is
+  // connected anywhere on the platform (pool or any user's personal). Drives
+  // the AgentConfig engine-card enable gate (server mirror: PATCH /v1/agents).
+  // Optional: absent on stale caches from an older proxy → treat as true.
+  configured?: boolean
   effort_levels: string[]
   effort_changeable_mid_session: boolean
   compression_threshold_pct: number | null

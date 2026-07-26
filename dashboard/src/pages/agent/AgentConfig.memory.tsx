@@ -8,7 +8,6 @@ import {
   MODE_LABEL,
 } from '../../lib/visibility'
 import {
-  useMemorySettings,
   useAgentMemorySettings,
   useSetAgentMemoryToggle,
   useClearAgentMemory,
@@ -28,18 +27,19 @@ export function MemorySection({ name, mode }: { name: string; mode: VisibilityMo
 }
 
 function MemorySectionInner({ name, mode }: { name: string; mode: VisibilityMode }) {
-  const { data: master } = useMemorySettings()
   const { data: agentMem } = useAgentMemorySettings(name)
   const setToggle = useSetAgentMemoryToggle(name)
   const clearAgent = useClearAgentMemory(name)
   const [confirmingClear, setConfirmingClear] = useState(false)
 
-  if (!master || !agentMem) {
+  if (!agentMem) {
     return null
   }
-  const masterOff = !master.user_memory_enabled && !master.agent_memory_enabled
-  const userGreyed = !master.user_memory_enabled
-  const agentGreyed = !master.agent_memory_enabled
+  // Platform master switches ride on the agent-settings response (`master`) —
+  // absent (PATCH-shaped cache) means "don't grey".
+  const userGreyed = agentMem.master ? !agentMem.master.user_memory_enabled : false
+  const agentGreyed = agentMem.master ? !agentMem.master.agent_memory_enabled : false
+  const masterOff = userGreyed && agentGreyed
   // The mode decides whether each scope exists at all. Personal only has no
   // shared agent memory; Shared only has no per-user memory. Hide the row the
   // mode can't use (the backend zeroes it regardless).

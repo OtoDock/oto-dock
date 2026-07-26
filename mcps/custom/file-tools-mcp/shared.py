@@ -111,7 +111,7 @@ def _to_agents_relative(container_path: str) -> str:
     return container_path  # already agents-relative or out-of-tree
 
 
-def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, str]:
+async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, str]:
     """Ask the proxy to translate a path to an agents-relative path.
 
     Returns ``(agents_relative, "")`` on success (the agents-relative path is
@@ -125,6 +125,10 @@ def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, st
     ``writing`` marks a WRITE target (output/save path): the proxy then
     tolerates a missing file — on remote sessions a not-yet-existing output
     resolves to the platform creation path instead of failing the lazy pull.
+
+    Async on purpose: this container serves EVERY session; a blocking
+    httpx.post here (a remote pull can take minutes) stalls the shared
+    event loop for all of them.
     """
     session_id, auth = _current_session()
     logger.info(f"_resolve_via_proxy: path={path}, session_id={session_id[:12] if session_id else '(empty)'}, PROXY_URL={PROXY_URL}")
@@ -132,12 +136,12 @@ def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, st
         logger.warning(f"_resolve_via_proxy: skipping — session_id={'empty' if not session_id else 'set'}, PROXY_URL={'empty' if not PROXY_URL else 'set'}, auth={'empty' if not auth else 'set'}")
         return None, "file-tools is not session-bound (missing session_id/PROXY_URL/auth)"
     try:
-        resp = httpx.post(
-            f"{PROXY_URL}/v1/hooks/resolve-path",
-            json={"session_id": session_id, "path": path, "writing": writing},
-            headers={"Authorization": auth},
-            timeout=HOOK_TIMEOUT,
-        )
+        async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
+            resp = await client.post(
+                f"{PROXY_URL}/v1/hooks/resolve-path",
+                json={"session_id": session_id, "path": path, "writing": writing},
+                headers={"Authorization": auth},
+            )
         if resp.status_code == 200:
             data = resp.json()
             agents_rel = data.get("agents_relative", "")
@@ -194,7 +198,7 @@ def _unicode_match_on_disk(path: str) -> str:
     return path
 
 
-def _resolve_path(path: str, writing: bool = False) -> str:
+async def _resolve_path(path: str, writing: bool = False) -> str:
     """Resolve a tool-input path to a container-local path, validate it.
 
     Always uses the proxy's resolve-path API: the LLM's path string may be
@@ -219,7 +223,7 @@ def _resolve_path(path: str, writing: bool = False) -> str:
             return _unicode_match_on_disk(resolved)
 
     # Otherwise ask the proxy to translate.
-    agents_rel, reason = _resolve_via_proxy(path, writing=writing)
+    agents_rel, reason = await _resolve_via_proxy(path, writing=writing)
     if agents_rel:
         cp = MOUNT_AGENTS_DIR + ("/" + agents_rel.lstrip("/"))
         resolved = str(Path(cp).resolve())
@@ -389,6 +393,12 @@ async def _push_preview(file_path: str, filename: str | None = None):
         logger.warning(f"Preview push failed (non-fatal): {exc}")
 
 
+# Dashboard previews never need print resolution — a multi-MB base64 body
+# just slows the hook hop (same payload discipline as screenshot_document).
+_PREVIEW_MAX_BYTES = int(1.5 * 1024 * 1024)
+_PREVIEW_LONG_EDGE = 2000
+
+
 async def _push_image_preview(
     image_bytes: bytes, mime: str, caption: str = ""
 ):
@@ -396,6 +406,19 @@ async def _push_image_preview(
     session_id, auth = _current_session()
     if not PROXY_URL or not session_id or not auth:
         return
+    if len(image_bytes) > _PREVIEW_MAX_BYTES:
+        try:
+            import io
+
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(image_bytes))
+            img.thumbnail((_PREVIEW_LONG_EDGE, _PREVIEW_LONG_EDGE))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=85)
+            image_bytes, mime = buf.getvalue(), "image/jpeg"
+        except Exception:
+            pass  # best-effort — an oversized preview beats none
     b64 = base64.b64encode(image_bytes).decode()
     # Posts a 1-item gallery — the unified /v1/hooks/images endpoint renders
     # single images identically to the old /v1/hooks/image flow.

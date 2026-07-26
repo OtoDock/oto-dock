@@ -501,6 +501,10 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
             "user_subscriptions": user_subs,
             "platform_available": platform_available,
             "allow_platform_auth": allow_platform,
+            # Server-computed "can this user run this engine" — the single
+            # predicate behind the chat-page engine/model filtering and the
+            # cross-engine switch options. Never re-derive client-side.
+            "can_run": subscription_pool.user_can_run(path, user.sub),
         })
 
     return {"layers": layers}

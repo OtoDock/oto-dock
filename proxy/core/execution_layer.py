@@ -331,10 +331,14 @@ class ExecutionLayer(ABC):
         return n
 
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
-        """Read a session's stdout to resolve background-command completions
-        between turns; return True if any were resolved. Default no-op — only the
-        CLI layer backgrounds bash commands (Codex/remote/direct don't), and the
-        bg-command monitor only arms for sessions with pending commands."""
+        """Resolve background-command completions between turns; return True if
+        any were resolved. The CLI layer reads stdout for task_updated frames;
+        the Codex layers reconcile against thread/backgroundTerminals/list —
+        locally by direct RPC, remotely through the satellite's
+        codex_bg_terminals RPC (≥0.5.105; a legacy satellite's translator
+        resolves still-open terminals at turn end instead). Direct has no
+        background primitive. Default no-op — the bg-command monitor only arms
+        for sessions with pending commands."""
         return False
 
     # --- Session lock + lifecycle for multi-turn producers ---

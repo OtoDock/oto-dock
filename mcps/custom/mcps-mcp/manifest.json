@@ -21,7 +21,7 @@
   "env": {},
   "agent_env": {},
 
-  "exclude_from": [],
+  "exclude_from": ["task", "meeting"],
 
   "skills": [],
 

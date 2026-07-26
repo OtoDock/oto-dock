@@ -14,6 +14,92 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-07-26
+
+### Added
+- **Agents can create agents.** Ask an agent to build you a new one — it
+  interviews you, writes the new agent's persona, tools, schedules and
+  onboarding into a template, and installs it with you as its manager.
+  For platform creators and admins; tools the new agent needs that aren't
+  installed yet go through the usual approval queue. On upgraded installs,
+  agents created before 1.4.0 don't get the new tool automatically —
+  enable it per agent from Agent Settings (new agents have it).
+- **1GB file uploads and sync.** One per-file cap (`OTODOCK_MAX_FILE_MB`,
+  default 1024, was 100MB) governs workspace/chat uploads and file sync to
+  remote machines, streamed with bounded memory and written atomically. A
+  new workspace popup shows live upload and per-machine sync progress.
+  Satellites below 0.5.103 keep the old cap until they auto-update.
+- **Claude Opus 5** replaces Opus 4.8 on the Claude Code engine (same
+  price); chats and tasks still pinned to Opus 4.8 are remapped once at
+  startup.
+- **Continue a finished chat on a different AI engine.** Once a chat's
+  session has ended, the model picker offers the agent's other engines —
+  pick one and the chat restarts from its saved history.
+- The model picker offers only AI engines you can actually use, and
+  enabling an engine on an agent now requires a platform subscription
+  for it.
+- Live "Commands" badges for Codex background terminal commands, matching
+  Claude chats — on remote machines too.
+- Rename chats and task runs from the sidebar (task runs can also be
+  deleted, role-gated); clipped titles show in full on hover/long-press.
+- Community agent templates can bundle Agent Skills, and any agent can
+  ship a per-user onboarding guide (`config/user-setup.md`) that loads
+  into each new user's chats until that user completes it.
+- Workspace quality-of-life: type-ahead selection, per-section recursive
+  search, right-click Refresh, and a clear warning when deleting files
+  too large for the Recover bin.
+
+### Changed
+- The agent persona file is now `config/agent.md` (was `prompt.md`) —
+  existing agents migrate automatically at startup. Rolling back to 1.3.x
+  afterwards needs `cp config/agent.md config/prompt.md` per agent.
+- Interactive terminals follow the CLI's own permission modes (Shift+Tab)
+  instead of the platform's generic approval prompt; the platform still
+  enforces file-access rules and prompts for the highest-risk actions.
+  Headless and "Don't ask" chats are unchanged — see UPGRADING.md.
+- Core tools are granted when an agent is created or installed, and no
+  longer silently re-added on every start — removing one now sticks.
+  Templates can opt out entirely with `"core_mcps": "none"`.
+- Agent-settings and MCP-marketplace tools no longer load in scheduled
+  tasks or meetings — only where a person is present and asking.
+- AI engine CLIs upgraded (Claude Code 2.1.220, Codex 0.145.0). Codex
+  costs now include prompt-cache write tokens (previously undercounted),
+  and GPT-5.6 context windows are corrected to 272k.
+- Codex sessions on machines paired with full filesystem access are no
+  longer confined to the workspace by Codex's own sandbox; the platform's
+  permission prompts and path policy still apply.
+- Task-history deletion follows the task role matrix, and on shared-only
+  agents viewers can no longer delete shared chats.
+- AI chat titles appear much sooner on long, tool-heavy first turns.
+
+### Fixed
+- Chat stability: no more self-scrolling when document previews load,
+  long chats scroll inside the chat again, and the "Connect an AI engine"
+  banner no longer covers the top bar.
+- Mini-apps and artifacts: action buttons can call every platform tool,
+  external links open properly (after a one-time consent), and apps
+  written as complete HTML documents regain theming, actions and live
+  data.
+- Tools approved from Agent Settings now start automatically, and saving
+  changed tool credentials restarts the tool's container by itself.
+- Document tools: page screenshots return in seconds instead of timing
+  out, scanned PDFs are read with vision (OCR gains a language option and
+  much smaller output), and PDF page export no longer fails on files it
+  just wrote.
+- Codex: sandboxed commands work in personal chats, local model endpoints
+  (Ollama/LM Studio) connect again, and permission hooks run on Windows.
+- Also fixed: relative paths in terminal commands, opening a freshly
+  granted agent without a page reload, agent managers without a platform
+  role saving configuration, agent renames showing in chat, YouTube links
+  embedding again, and the memory tool recovering from malformed calls.
+
+### Security
+- On a shared agent, a colleague's live terminal now opens read-only with
+  a **Take over** button instead of accepting your input into a session
+  running under their account and permissions; terminal messages are
+  attributed to whoever typed them.
+- Updated `pyasn1` to 0.6.4 (two denial-of-service advisories).
+
 ## [1.3.2] — 2026-07-23
 
 ### Added
@@ -341,7 +427,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/OtoDock/oto-dock/compare/v1.2.0...v1.3.0

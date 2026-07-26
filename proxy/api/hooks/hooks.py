@@ -120,6 +120,41 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
     raw = req.path
     agent_dir = config.AGENTS_DIR / ctx.agent
 
+    # Model-echoed DISPLAY paths: tool results print agents-relative forms
+    # ("<slug>/users/<u>/workspace/x.png") and models echo them back as
+    # inputs; classified as "relative" they anchor at /workspace/<display>,
+    # double the slug and 403. A slash-less path whose FIRST segment EQUALS
+    # this session's agent slug (never merely "a known slug" — that would
+    # admit cross-agent display paths) and which resolves to an existing
+    # file CONTAINED in this agent's tree (the containment check is what
+    # stops <slug>/../other-agent/… and <slug>/../../etc/passwd) is
+    # admitted as agents-relative — READS ONLY: a write target would
+    # silently create an agents/<slug>/<slug>/ tree. RBAC rides on the
+    # FINAL host path via check_host_path_access — NOT
+    # enforce_agent_tree_rbac, whose _translate_sandbox_path re-anchoring
+    # would validate a different path than the one returned.
+    if (
+        not req.writing
+        and raw
+        and "\x00" not in raw
+        and not raw.startswith("/")
+        and raw.split("/", 1)[0] == ctx.agent
+    ):
+        candidate = (config.AGENTS_DIR / raw).resolve()
+        try:
+            contained = candidate.is_relative_to(agent_dir.resolve())
+        except (OSError, ValueError):
+            contained = False
+        if contained and candidate.is_file():
+            acc = check_host_path_access(candidate, ctx, writing=False)
+            if not acc.allowed:
+                raise HTTPException(status_code=403, detail=acc.reason or "access denied")
+            host_path = str(candidate)
+            return {
+                "host_path": host_path,
+                "agents_relative": _to_agents_relative(host_path),
+            }
+
     from core.remote import remote_file_flow
     is_remote = remote_file_flow.is_remote_session(req.session_id)
 
@@ -1167,17 +1202,49 @@ async def _decide_tool_permission(
                 ):
                     return {"decision": "allow"}
 
-        # Interactive TUI: return an explicit "ask" — the hook emits
-        # permissionDecision:"ask" and Claude renders its native in-terminal
-        # prompt. This CANNOT be left to hook silence: the CLI treats the
-        # session workspace as a trusted directory (the platform seeds the
-        # trust dialog), and a trusted-dir Write/Edit runs WITHOUT any native
-        # prompt in default mode — so the old "defer" (exit 0, no decision)
-        # silently allowed the whole ask-tier (verified live on CLI 2.1.215).
-        # Shift+Tab still works: the live mode the hook reports overrode
-        # `mode` above, so acceptEdits/bypass chosen in the TUI auto-allow
-        # before reaching here. The dashboard block-and-wait is headless-only.
+        # Interactive TUI with a human at the keyboard: DEFER — the platform
+        # has no opinion on the residual ask-tier, so the CLI's own
+        # permission engine (the live Shift+Tab mode) governs, exactly like
+        # Claude Code outside the platform. Consequences, accepted and
+        # documented (PERMISSIONS.md + UPGRADING): trusted-dir Write/Edit
+        # run without a prompt in default mode (native CLI behavior,
+        # verified 2.1.215/changelog-reviewed to 2.1.220), and the old
+        # generic "OtoDock '<mode>' mode" prompt spam is gone. Hard denies
+        # (Pass-1) and the carve-outs below are unaffected; stored dontAsk
+        # still hard-allowed above (an explicit silence choice the TUI
+        # cannot express). Operator decision 2026-07-26.
+        if _is_interactive_session(session_id) and client_type != "task":
+            # Carve-outs keep the platform "ask" — it feeds the CLI's ONE
+            # native prompt (never a second dialog), so this is pure floor:
+            # critical-tier MCP tools (contract: prompt in EVERY mode),
+            # high-risk device tools (pinned per-call even when the
+            # capability is granted), and destructive Bash (must never ride
+            # a permissive CLI mode).
+            _high_risk = False
+            if tool_name.startswith("mcp__"):
+                from services.mcp import mcp_registry as _reg
+                _high_risk = _reg.is_high_risk_device_tool(mcp_server, mcp_tool_only)
+            if (
+                mcp_tier == "critical"
+                or _high_risk
+                or bool(getattr(path_decision, "destructive", False))
+            ):
+                return {
+                    "decision": "ask",
+                    "reason": "OtoDock: this action always needs your approval",
+                }
+            # A satellite path rewrite only rides "allow"/"ask" — never lose
+            # it to silence (the tool would run against the sandbox-virtual
+            # path and fail). Write/Edit run promptless on allow, which
+            # matches their trusted-dir native behavior anyway.
+            if _pass1_out.get("updated_input") is not None:
+                return {"decision": "allow"}
+            return {"decision": "defer"}
         if _is_interactive_session(session_id):
+            # An interactive session with NO human (client_type "task")
+            # normally never reaches here (tasks run permission_mode "auto",
+            # which allowed above) — if one does, ask via the TUI rather
+            # than auto-approving every ask-tier tool unattended.
             return {
                 "decision": "ask",
                 "reason": f"OtoDock '{mode}' mode: this action needs your approval",
@@ -2408,22 +2475,14 @@ async def hook_tool_result(req: HookToolResultRequest, authorization: str | None
     """Called by PostToolUse hook to push a tool result summary to the chat."""
     verify_session_match(authorization, req.session_id)
 
-    # Interactive TUI parity with the headless block-and-wait: an ask-tier
-    # mcp__ tool that RAN means the user clicked Allow in the native prompt
-    # (the hook has no channel for the dialog outcome, but execution is the
-    # outcome). Feed the session allow-memory so one Allow covers the tool's
-    # later calls — same one-click semantics as the dashboard. High-risk
-    # device tools and critical-tier tools are excluded there and re-prompt
-    # per call by design; already-allowed/granted tools make this a no-op.
-    if (not req.is_error and req.tool_name.startswith("mcp__")
-            and _is_interactive_session(req.session_id)):
-        from services.mcp import mcp_permissions, mcp_registry
-        parts = req.tool_name.split("__", 2)
-        server = parts[1] if len(parts) >= 2 else ""
-        tool_only = parts[2] if len(parts) >= 3 else ""
-        if (not mcp_registry.is_high_risk_device_tool(server, tool_only)
-                and mcp_permissions.resolve_tool_tier(server, tool_only) != "critical"):
-            remember_session_tool_allow(req.session_id, req.tool_name)
+    # (Removed: the interactive allow-memory inference. It seeded
+    # remember_session_tool_allow for any mcp__ tool that RAN in an
+    # interactive session, on the premise that execution proved the user
+    # clicked Allow in a PLATFORM prompt. Post-flip the platform defers the
+    # residual tier to the CLI, so a tool that ran may reflect a native
+    # "allow once" — feeding OUR memory from it would hard-allow every later
+    # call and suppress the CLI's own re-prompt. The CLI's own allow-memory
+    # ("don't ask again") now owns interactive persistence.)
     if req.memory_only:
         return {"status": "ok"}
 

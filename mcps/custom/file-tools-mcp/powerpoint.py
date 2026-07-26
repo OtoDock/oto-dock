@@ -234,7 +234,7 @@ async def handle_write_pptx(args: dict) -> str:
     from pptx.oxml.ns import qn
     from pptx.util import Inches, Pt
 
-    path = _resolve_path(args["path"], writing=True)
+    path = await _resolve_path(args["path"], writing=True)
     ops, dropped = _normalize_operations(args.get("operations"))
     create_new = args.get("create_new", False)
 
@@ -608,7 +608,7 @@ async def handle_write_pptx(args: dict) -> str:
 
             elif ot == "add_image":
                 slide = _get_slide(prs, op)
-                img_path = _resolve_path(
+                img_path = await _resolve_path(
                     op.get("image_path") or op.get("path") or op.get("image", "")
                 )
                 left = Inches(float(op.get("left", 1)))

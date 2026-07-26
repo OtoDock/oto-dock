@@ -105,8 +105,31 @@ class RemoteBgSubagentMixin:
                         "Remote session %s: out-of-band goal apply failed",
                         info.session_id[:8],
                     )
+            elif (raw.get("method") == "item/completed"
+                    and info.codex_translator is not None
+                    and info.codex_translator.tracks_bg_command(params)):
+                # A background terminal's exit (its item/completed, tagged with
+                # the ORIGINAL turn id) landed between turns — the badge gate
+                # must still resolve. Apply it out-of-band instead of dropping.
+                # Twin of the LOCAL router's _apply_bg_command_oob.
+                self._apply_remote_bg_command_oob(info, raw)
             # else: between turns, a main-thread straggler with no active
             # consumer — drop it (the daemon is idle on the main thread).
+
+    def _apply_remote_bg_command_oob(self, info: "RemoteSessionInfo", raw: dict) -> None:
+        """Translate a between-turns background-terminal completion so the
+        BackgroundCommandRegistry is marked done (the bg-command monitor awaits
+        it). The returned events are discarded — no pump is attached between
+        turns; the monitor's ``bg_commands_complete`` nudge is the visible
+        clear. Guarded — a failure here must never kill the router. Twin of
+        the LOCAL _apply_bg_command_oob."""
+        try:
+            self._translate_codex_event(info, raw)
+        except Exception:
+            logger.exception(
+                "Remote session %s: out-of-band bg-command apply failed",
+                info.session_id[:8],
+            )
 
     def _handoff_remote_bg_subagents(self, info: "RemoteSessionInfo") -> None:
         """At main-turn end: register + arm a supervisor for each background
@@ -215,5 +238,17 @@ class RemoteBgSubagentMixin:
             # A cancelled supervisor's own finally already resolved it; this is
             # the idempotent backstop for one that never reached its finally.
             self._resolve_remote_bg_subagent(info, sub_tid)
+        # Background terminals died with their satellite session (thread close
+        # kills unified_exec PTYs, and a resumed thread knows nothing of old
+        # processIds) — resolve their registry entries + badges as killed.
+        # Mirrors the LOCAL _teardown_bg sweep; covers close AND prepare_resume.
+        if info.codex_translator is not None:
+            from core.session.session_state import resolve_bg_command
+            pending_cmds: list[dict] = []
+            with contextlib.suppress(Exception):
+                pending_cmds = info.codex_translator.pending_bg_commands()
+            for cmd in pending_cmds:
+                resolve_bg_command(info.session_id, cmd["item_id"], "killed")
+                info.codex_translator._bg_commands.pop(cmd["item_id"], None)
         info.thread_consumers.clear()
         info.default_consumer = None

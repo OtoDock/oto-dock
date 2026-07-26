@@ -13,11 +13,12 @@ Permission resolution lives in :func:`_resolve_tool_set` and runs once at
 module load using the auto-injected ``OTO_*`` env vars (mirror of
 ``mcps-mcp/server.py``):
 
-- ``scope=user`` × ``viewer`` → empty (viewers don't manage agents).
-- ``scope=user`` × ``manager``/``admin`` → all 10 tools.
-- ``scope=agent`` (task / phone / trigger session) → all 10 tools (the
-  agent is editing its own row; nothing escalates beyond the platform's
-  per-endpoint role checks).
+- ``viewer`` (any scope) → ``complete_setup`` only; viewers don't manage
+  agents, but they do walk their own per-user onboarding.
+- ``manager``/``admin`` → the full tool set.
+- ``scope=agent`` service sessions (task / phone / trigger, ``ROLE==""``)
+  → the full tool set (the agent is editing its own row; nothing escalates
+  beyond the platform's per-endpoint role checks).
 
 All HTTP calls go through ``PROXY_URL`` + ``PROXY_API_KEY`` (auto-injected,
 session-scoped JWT) so the platform applies the calling user's role server
@@ -70,8 +71,17 @@ _WRITE_TOOLS = {
 
 
 def _resolve_tool_set() -> set[str]:
-    if SCOPE == "user" and ROLE == "viewer":
-        return set()
+    if ROLE == "viewer":
+        # Viewers get exactly complete_setup: per-user onboarding
+        # (user-setup.md) targets the default-attach audience, who join as
+        # viewers — the endpoint's user scope only ever touches the caller's
+        # own file. Everything else stays manager-tier.
+        #
+        # Scope-independent on purpose: a Shared-only agent mounts agent-scope
+        # for HUMAN chats too (OTO_SCOPE=="agent" with a real viewer driving),
+        # so keying on scope advertised a surface every endpoint then refused.
+        # Service sessions carry ROLE=="" and are unaffected.
+        return {"complete_setup"}
     if SCOPE in ("user", "agent"):
         return _READ_TOOLS | _WRITE_TOOLS
     return set()
@@ -623,7 +633,7 @@ async def _tool_update_agent_memory_enabled(enabled: bool) -> str:
     )
 
 
-async def _tool_complete_setup(summary: str = "") -> str:
+async def _tool_complete_setup(summary: str = "", scope: str = "") -> str:
     """Mark this agent's post-install setup complete.
 
     Single HTTP call to ``POST /v1/agents/{slug}/complete-setup`` which (in
@@ -641,10 +651,14 @@ async def _tool_complete_setup(summary: str = "") -> str:
     Idempotent — calling again after the stamp is set re-tries the file
     delete (in case it failed earlier) but is otherwise a no-op."""
     summary = (summary or "").strip()
+    scope = (scope or "").strip()
+    payload: dict = {"summary": summary}
+    if scope:
+        payload["scope"] = scope
     try:
         result = await _request(
             "POST", f"/v1/agents/{AGENT_NAME}/complete-setup",
-            json={"summary": summary},
+            json=payload,
         )
     except _ApiError as exc:
         return f"❌ Error: {exc}"
@@ -655,6 +669,17 @@ async def _tool_complete_setup(summary: str = "") -> str:
     status = result.get("status")
     removed = bool(result.get("setup_md_removed"))
     summary_tail = f" — {summary}" if summary else ""
+
+    if status == "user_setup_complete":
+        if result.get("user_setup_removed"):
+            return (
+                f"✅ Your setup marked complete — `user-setup.md` removed "
+                f"from your context.{summary_tail}"
+            )
+        return (
+            f"ℹ️ Your setup was already complete (no `user-setup.md` in "
+            f"your context).{summary_tail}"
+        )
 
     if status == "already_complete":
         if removed:
@@ -899,10 +924,13 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "complete_setup": {
         "description": (
-            "Mark this agent's post-install setup complete. Deletes "
-            "`config/context/setup.md` so it stops auto-loading into context. "
-            "Call ONLY when every checklist item in `setup.md` is verified "
-            "done — the file is the agent's setup guide."
+            "Mark this agent's post-install setup complete. Two scopes: "
+            "'agent' removes the agent-wide `config/context/setup.md` "
+            "(manager-level; call ONLY when every checklist item in setup.md "
+            "is verified done), 'user' removes the current user's own "
+            "`user-setup.md` onboarding from their context (call when their "
+            "personal onboarding is finished or they decline it). Omit scope "
+            "when only one applies — it is resolved automatically."
         ),
         "inputSchema": {
             "type": "object",
@@ -910,6 +938,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "summary": {
                     "type": "string",
                     "description": "Optional one-line summary of what was configured (for the audit trail).",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["agent", "user"],
+                    "description": "Which setup to complete; omit to auto-resolve when only one applies.",
                 },
             },
             "additionalProperties": False,
@@ -934,7 +967,9 @@ _TOOL_HANDLERS = {
     "get_memory_settings": lambda args: _tool_get_memory_settings(),
     "update_user_memory_enabled": lambda args: _tool_update_user_memory_enabled(args.get("enabled")),
     "update_agent_memory_enabled": lambda args: _tool_update_agent_memory_enabled(args.get("enabled")),
-    "complete_setup": lambda args: _tool_complete_setup(args.get("summary", "")),
+    "complete_setup": lambda args: _tool_complete_setup(
+        args.get("summary", ""), args.get("scope", ""),
+    ),
 }
 
 

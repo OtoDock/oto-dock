@@ -813,3 +813,94 @@ class TestFileChangedInnerRouting:
             tmp_path, msg, "m1", "agent-x", "write"))
         assert pulls == []
         assert not (tmp_path / "workspace/mystery").exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-machine manifest cap override + hash cache (Feature D, 1.4.0)
+# ---------------------------------------------------------------------------
+
+
+class TestManifestCapAndHashCache:
+    def _tree(self, tmp_path):
+        import os as _os
+        import time as _time
+        d = tmp_path / "agent"
+        (d / "workspace").mkdir(parents=True)
+        (d / "workspace" / "small.txt").write_bytes(b"x" * 10)
+        (d / "workspace" / "big.bin").write_bytes(b"y" * 100)
+        # Backdate mtimes past the racily-clean window so cache hits are
+        # trusted (fresh files are deliberately always re-hashed).
+        old = _time.time() - 60
+        for f in (d / "workspace").iterdir():
+            _os.utime(f, (old, old))
+        return d
+
+    def test_max_file_size_override_excludes(self, tmp_path):
+        d = self._tree(tmp_path)
+        paths_all = {e.path for e in compute_manifest(d)}
+        assert {"workspace/small.txt", "workspace/big.bin"} <= paths_all
+        # The per-machine override (old satellite) drops the big file even
+        # though the config-driven MAX_FILE_SIZE would include it.
+        paths_capped = {e.path for e in compute_manifest(d, max_file_size=50)}
+        assert "workspace/small.txt" in paths_capped
+        assert "workspace/big.bin" not in paths_capped
+
+    def test_hash_cache_skips_rehash_and_invalidates_on_mtime(
+        self, tmp_path, monkeypatch,
+    ):
+        import os as _os
+        from core.remote import file_sync as fs
+
+        d = self._tree(tmp_path)
+        calls = {"n": 0}
+        real = fs._hash_file
+
+        def _counting(path):
+            calls["n"] += 1
+            return real(path)
+
+        monkeypatch.setattr(fs, "_hash_file", _counting)
+        fs._HASH_CACHE.clear()
+
+        first = compute_manifest(d)
+        n_files = len(first)
+        assert calls["n"] == n_files  # cold: every file hashed
+
+        second = compute_manifest(d)
+        assert calls["n"] == n_files  # warm: zero re-hashes
+        assert {(e.path, e.hash) for e in second} == {(e.path, e.hash) for e in first}
+
+        # Touch ONE file's mtime → exactly one re-hash.
+        target = d / "workspace" / "small.txt"
+        st = target.stat()
+        _os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        compute_manifest(d)
+        assert calls["n"] == n_files + 1
+
+    def test_prime_hash_cache_prevents_first_hash(self, tmp_path, monkeypatch):
+        from core.remote import file_sync as fs
+
+        d = tmp_path / "agent"
+        (d / "workspace").mkdir(parents=True)
+        f = d / "workspace" / "pulled.bin"
+        f.write_bytes(b"pulled-bytes")
+        import os as _os
+        import time as _time
+        old = _time.time() - 60
+        _os.utime(f, (old, old))  # settle past the racily-clean window
+        expected = fs._hash_file(f)
+
+        fs._HASH_CACHE.clear()
+        fs.prime_hash_cache(f, expected)
+
+        calls = {"n": 0}
+        real = fs._hash_file
+
+        def _counting(path):
+            calls["n"] += 1
+            return real(path)
+
+        monkeypatch.setattr(fs, "_hash_file", _counting)
+        entries = compute_manifest(d)
+        assert [e.hash for e in entries] == [expected]
+        assert calls["n"] == 0  # primed — never re-hashed

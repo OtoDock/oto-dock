@@ -126,6 +126,14 @@ _POST_OUTPUT_TAIL_S = getattr(config, "INTERACTIVE_POST_OUTPUT_TAIL_S", 3.0)
 # waiting out the starved post-output debounce.
 _RESUME_TAIL_S = getattr(config, "INTERACTIVE_RESUME_TAIL_S", 1.5)
 
+# LLM chat-title latency cap: if the FIRST turn is still running this long
+# after it opened and no tail batch has crossed the char/tool thresholds
+# (the LOCAL TUI's spinner starves the post-output debounce, so long local
+# turns produce no mid-turn batches), force one tail and fire the title
+# upgrade with whatever partial first turn is persisted — a prompt-only
+# title beats waiting minutes for turn end. One-shot per session.
+_TITLE_EARLY_TIMER_S = getattr(config, "INTERACTIVE_TITLE_EARLY_TIMER_S", 30.0)
+
 # Interactive TASK completion: the turn-end signal
 # (Claude end_turn / Codex task_complete, surfaced by the tailer) fires the
 # task's ``on_turn_complete`` callback — but only after the session is at least
@@ -296,11 +304,30 @@ class InteractiveSession:
         # SubagentRegistry empty + min-turn-time elapsed.
         self.on_turn_complete: Optional[TurnCompleteCb] = None
         self._turn_complete_fired = False
-        # LLM chat-title generation: fired ONCE on the first completed turn, when
-        # the transcript (first prompt + first assistant response) is in the DB.
-        # Independent of on_turn_complete above (only autonomous TASKS set that) —
-        # title-gen is dashboard-chats-only; the service skips task-/meeting-.
-        self._title_fired = False
+        # LLM chat-title generation (services/title_generator.py): armed for
+        # chats not yet LLM-titled (mirrors the pump's _title_armed — resumed
+        # already-titled chats arm False and skip everything, timer included).
+        # Fired ONCE from whichever trigger lands first — tail-batch char/tool
+        # thresholds (_maybe_fire_title_early), the one-shot early timer, or
+        # the turn-complete funnel — then disarmed; exactly-once across
+        # sessions/fire points is the DB claim's job. Task chats title like
+        # every chat; only meeting- is excluded (here and in the service).
+        armed = bool(chat_id) and not chat_id.startswith("meeting-")
+        if armed:
+            try:
+                from storage import database as task_store
+                armed = not (task_store.get_chat(chat_id) or {}).get("title_generated")
+            except Exception:
+                logger.debug("interactive %s: title-arm lookup failed",
+                             session_id[:8], exc_info=True)
+        self._title_armed = armed
+        self._title_chars = 0   # accumulated tail-batch counters (first turn)
+        self._title_tools = 0
+        self._title_timer: Optional[asyncio.TimerHandle] = None
+        # Once-only across the session — an interrupted first turn leaves
+        # _title_armed set, and the SECOND turn's open transition must not
+        # re-arm the timer (the cap is on the first wait, not every turn).
+        self._title_timer_spent = False
 
         self._loop = asyncio.get_running_loop()
         self._drainer: Optional[asyncio.Task] = None
@@ -484,6 +511,37 @@ class InteractiveSession:
     def alive(self) -> bool:
         return not self._closed and self.pty is not None and not self.pty.closed
 
+    def may_drive(self, sender_sub: str) -> bool:
+        """Whether ``sender_sub`` may DRIVE this session (type, paste, answer a
+        permission prompt, abort a turn).
+
+        The session runs the CLI under the identity of whoever warmed it — its
+        JWT, ``OTO_*`` env, platform role and subscription. On a Shared-only
+        agent every assigned user can open the same chat, so a second user's
+        keystrokes would otherwise act as the warmer: spending their
+        subscription and inheriting their platform role (which
+        ``agent-creator-mcp``'s endpoint gates on). Input from anyone else is
+        refused; changing hands is an explicit take-over, never implicit.
+
+        Exemptions, in order:
+
+        * no owner recorded (phone/legacy sessions) — nothing to compare against
+        * no sender (server-injected prompts: scheduler wakes, cold submits)
+        * ``task-`` / ``meeting-`` chats — governed by their OWN authorization
+          models (``_task_continue_allowed`` is role-based on purpose, so
+          delegate lanes stay steerable by whoever holds the role); an ownership
+          gate on top would break live lane steering.
+
+        Fails OPEN on an unprovable owner, unlike the ``-p`` recycle in
+        ``ws/dashboard_chat.py`` which fails closed: there a wrong guess costs
+        one respawn, here it would silently swallow a keystroke.
+        """
+        if not self.user_sub or not sender_sub:
+            return True
+        if self.chat_id.startswith(("task-", "meeting-")):
+            return True
+        return sender_sub == self.user_sub
+
     # -- viewers (output fan-out) --------------------------------------------
     def add_output_listener(
         self, cb: OutputListener,
@@ -631,7 +689,8 @@ class InteractiveSession:
                 logger.exception("interactive %s: output listener failed", self.session_id[:8])
 
     # -- input / resize (proxy → PTY) ----------------------------------------
-    def deliver_dashboard_input(self, data: bytes, composer: bool = False) -> None:
+    def deliver_dashboard_input(self, data: bytes, composer: bool = False,
+                                sender_sub: str = "") -> bool:
         """Dashboard input router. ``composer=True`` marks a discrete chat-box
         send (the FE flags it; raw terminal keystrokes are never flagged):
         while the turn is question-parked, typing it through would land the
@@ -639,15 +698,34 @@ class InteractiveSession:
         submit the recommended option — so the text is HELD in the server
         prompt queue instead and injects via the normal drain once the
         question is answered and that turn completes. Everything else funnels
-        straight to :meth:`write_input` (answering in the TUI keeps working)."""
+        straight to :meth:`write_input` (answering in the TUI keeps working).
+
+        ``sender_sub`` is the user whose socket this input arrived on. Input
+        from anyone but the session's controller is DROPPED (:meth:`may_drive`)
+        — the identity gate for Shared-only chats. Returns False when the input
+        was refused for that reason, so the caller can tell the sender why;
+        every other outcome (delivered, queued, buffered) returns True.
+
+        This is the right chokepoint precisely because it is the HUMAN dashboard
+        funnel (``pty_input`` + ``pty_attachments``). The gate must not sink to
+        ``write_input``, which also carries ``submit_prompt`` — scheduler wakes
+        and cold submits legitimately have no human sender.
+        """
+        if not self.may_drive(sender_sub):
+            logger.info(
+                "interactive %s: dropped %d input byte(s) from a non-controller",
+                self.session_id[:8], len(data),
+            )
+            return False
         if composer and self._question_parked:
             text = data.decode("utf-8", errors="replace")
             if text.startswith("\x1b[200~") and text.endswith("\x1b[201~\r"):
                 text = text[6:-7]
             text = text.rstrip("\r\n")
             if text and self.queue_prompt(text, source="dashboard"):
-                return
+                return True
         self.write_input(data)
+        return True
 
     def write_input(self, data: bytes) -> None:
         if not self.alive:
@@ -1024,6 +1102,12 @@ class InteractiveSession:
                 logger.exception(
                     "interactive %s: turn-status broadcast failed", self.session_id[:8]
                 )
+            # Early-title latency cap: one-shot timer armed at the FIRST open
+            # transition of an untitled chat (see _TITLE_EARLY_TIMER_S).
+            if self._title_armed and not self._title_timer_spent:
+                self._title_timer_spent = True
+                self._title_timer = self._loop.call_later(
+                    _TITLE_EARLY_TIMER_S, self._fire_title_timer)
         else:
             self._turn_end_effects()
 
@@ -1411,6 +1495,7 @@ class InteractiveSession:
 
         Both best-effort; the boundary line is read once (tail cursors), so
         the compaction ping can't double-fire."""
+        self._maybe_fire_title_early(result)
         try:
             if result.get("persisted", 0) > 0 and self.chat_id \
                     and not self.chat_id.startswith("meeting-"):
@@ -1435,6 +1520,66 @@ class InteractiveSession:
                     and result.get("last_signal") not in ("user", "tool_use")):
                 self._set_turn_open(False)  # runs the turn-end effects
                 self._fire_turn_notification(compacted=True)
+
+    # -- early LLM chat-title (interactive twin of the pump's triggers) ------
+    def _maybe_fire_title_early(self, result: dict) -> None:
+        """Accumulate a tail batch's first-turn counters and fire the title
+        upgrade once either threshold is crossed. Remote sessions cross them
+        naturally (the satellite forwards lines all through the turn); long
+        LOCAL turns are covered by the one-shot timer instead (the starved
+        debounce yields no mid-turn batches). Counters only ever grow while
+        armed, so a resumed/titled chat costs nothing here."""
+        if not self._title_armed or not self.chat_id:
+            return
+        self._title_chars += int(result.get("assistant_chars") or 0)
+        self._title_tools += int(result.get("tool_rows") or 0)
+        from services.title_generator import (TITLE_CHAR_THRESHOLD,
+                                              TITLE_TOOL_THRESHOLD)
+        if (self._title_chars >= TITLE_CHAR_THRESHOLD
+                or self._title_tools >= TITLE_TOOL_THRESHOLD):
+            self._fire_title()
+
+    def _fire_title(self, assistant_excerpt: str = "") -> None:
+        """Disarm + schedule the one-time LLM title upgrade. The local flag
+        only stops wasted calls; exactly-once across sessions and fire points
+        is the DB claim's job (services/title_generator.py). No excerpt is
+        needed from the batch paths — the tailer has already persisted the
+        partial first turn, so the service's DB read sees it."""
+        if not self._title_armed:
+            return
+        self._title_armed = False
+        if self._title_timer is not None:
+            self._title_timer.cancel()
+            self._title_timer = None
+        try:
+            from services import title_generator
+            self._loop.create_task(title_generator.request_chat_title(
+                self.chat_id, assistant_excerpt=assistant_excerpt,
+            ))
+        except Exception:
+            logger.exception(
+                "interactive %s: title request failed to schedule",
+                self.session_id[:8],
+            )
+
+    def _fire_title_timer(self) -> None:
+        """The early-title latency cap fired (loop-affine callback)."""
+        self._title_timer = None
+        if self._closing or self._closed or not self._title_armed:
+            return
+        self._loop.create_task(self._title_timer_task())
+
+    async def _title_timer_task(self) -> None:
+        """Force one full tail pass (so the locally-starved transcript catches
+        up AND its turn signals apply — a raw tail here would advance the
+        cursor past turn-relevant lines the normal tails then never see), then
+        fire with whatever partial first turn is persisted. A batch-threshold
+        fire during that tail wins harmlessly (_fire_title no-ops disarmed)."""
+        if self._closing or self._closed or not self._title_armed or not self.chat_id:
+            return
+        await self._tail_and_maybe_complete()
+        if not self._closing and not self._closed:
+            self._fire_title()
 
     # -- remote transcript forwarding ----------------------------------------
     def feed_transcript_lines(self, lines: list[str]) -> None:
@@ -1479,10 +1624,11 @@ class InteractiveSession:
                                   compacted: bool = False) -> None:
         """A tailer saw a turn-end signal. Three independent reactions, in order:
 
-        1. **LLM chat-title generation** — fired ONCE on the first completed turn
-           (the transcript is now in the DB). Dashboard-chats-only (the service
-           skips task-/meeting- and atomically claims, so exactly once); chats
-           never set ``on_turn_complete``.
+        1. **LLM chat-title generation** — the FALLBACK fire for first turns
+           the early triggers (tail-batch thresholds / the one-shot timer)
+           never reached; disarms ``_title_armed``. Task chats title like any
+           chat — the service skips only ``meeting-`` and atomically claims,
+           so exactly once across every fire point.
         2. **End-of-turn USER notification + audio** — fired once PER TURN (chats
            only — an autonomous task run's completion alert is its
            ``notification_mode`` contract), local AND remote, giving interactive
@@ -1508,19 +1654,10 @@ class InteractiveSession:
         unanswered AskUserQuestion — (2) words the ping as needs-input and (3)
         is skipped (a question is not a task completion; hooks deny the tool
         for autonomous tasks anyway, this is defense in depth)."""
-        # (1) one-time chat-title upgrade.
-        if not self._title_fired and self.chat_id:
-            self._title_fired = True
-            try:
-                from services import title_generator
-                self._loop.create_task(title_generator.request_chat_title(
-                    self.chat_id, assistant_excerpt=last_message,
-                ))
-            except Exception:
-                logger.exception(
-                    "interactive %s: title request failed to schedule",
-                    self.session_id[:8],
-                )
+        # (1) one-time chat-title upgrade — the fallback fire for first turns
+        # the early triggers (batch thresholds / timer) never reached.
+        if self._title_armed and self.chat_id:
+            self._fire_title(assistant_excerpt=last_message)
 
         # Shared gates for the notification (2) + the task callback (3).
         if (time.monotonic() - self.created_at) < MIN_TURN_S:
@@ -1711,11 +1848,13 @@ class InteractiveSession:
         self._closing = True
 
         for h in (self._settle_handle, self._ready_max_handle, self._tail_handle,
-                  self._inject_backstop_handle, self._resume_tail_handle):
+                  self._inject_backstop_handle, self._resume_tail_handle,
+                  self._title_timer):
             if h is not None:
                 h.cancel()
         self._settle_handle = self._ready_max_handle = self._tail_handle = None
         self._inject_backstop_handle = self._resume_tail_handle = None
+        self._title_timer = None
         for _h in self._submit_tail_handles:
             with contextlib.suppress(Exception):
                 _h.cancel()

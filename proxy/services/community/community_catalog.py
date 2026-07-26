@@ -30,22 +30,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import re
+
 import httpx
 
 logger = logging.getLogger("claude-proxy.community-catalog")
 
 
-REGISTRY_RAW_URL = (
+# Catalog URLs are env-overridable for DEV/TEST only (point an install at a
+# staging catalog or a local static server); production installs use the
+# defaults. Not documented in config.env.
+import os as _os
+
+REGISTRY_RAW_URL = _os.environ.get("OTODOCK_MCPS_CATALOG_REGISTRY_URL") or (
     "https://raw.githubusercontent.com/OtoDock/community-mcps/main/registry.json"
 )
-MCP_RAW_BASE = "https://raw.githubusercontent.com/OtoDock/community-mcps/main"
+MCP_RAW_BASE = _os.environ.get("OTODOCK_MCPS_CATALOG_RAW_BASE") or (
+    "https://raw.githubusercontent.com/OtoDock/community-mcps/main"
+)
 
 # Standalone skill packages live in their own catalog repo (same layout:
 # registry.json + one folder per package). Entries sit under a "skills" key.
-SKILLS_REGISTRY_RAW_URL = (
+SKILLS_REGISTRY_RAW_URL = _os.environ.get("OTODOCK_SKILLS_CATALOG_REGISTRY_URL") or (
     "https://raw.githubusercontent.com/OtoDock/community-skills/main/registry.json"
 )
-SKILLS_RAW_BASE = "https://raw.githubusercontent.com/OtoDock/community-skills/main"
+SKILLS_RAW_BASE = _os.environ.get("OTODOCK_SKILLS_CATALOG_RAW_BASE") or (
+    "https://raw.githubusercontent.com/OtoDock/community-skills/main"
+)
 
 # Short TTL keeps the dashboard snappy on repeated opens but lets a registry
 # bump propagate within a minute. Long enough that an admin clicking around
@@ -58,6 +69,42 @@ README_CACHE_TTL_SECONDS = 300
 # rarely > 10KB). A 10s timeout is generous; anything slower means GitHub
 # itself is degraded and we should fall back to the stale cached entry.
 HTTP_TIMEOUT_SECONDS = 10.0
+
+
+def platform_version_ok(required: str | None) -> bool:
+    """True when this platform satisfies a catalog entry's ``platform_min_version``.
+
+    Missing/unparseable values are COMPATIBLE — most registry entries predate
+    enforcement. Compare is semver-prefix ``>=`` (a ``1.4.0``-pinned template
+    must pass on a 1.4.0 platform: the first-boot default-assistant install
+    depends on the equality case). Dev suffixes (``1.4.0-dev``) compare by
+    their numeric prefix.
+    """
+    if not required:
+        return True
+    import config as app_config
+    current = (getattr(app_config, "PINNED_OTODOCK_VERSION", "") or "").strip()
+    def _parse(v: str) -> tuple[int, int, int] | None:
+        m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v.strip())
+        return tuple(int(x) for x in m.groups()) if m else None  # type: ignore[return-value]
+    req = _parse(required)
+    cur = _parse(current)
+    if req is None or cur is None:
+        return True
+    return cur >= req
+
+
+def require_platform_compat(name: str, required: str | None) -> None:
+    """Raise a clear 400 when a catalog entry needs a newer platform."""
+    if platform_version_ok(required):
+        return
+    from fastapi import HTTPException
+    import config as app_config
+    raise HTTPException(
+        400,
+        f"'{name}' requires OtoDock {required} or newer (this install is "
+        f"{app_config.PINNED_OTODOCK_VERSION}). Upgrade the platform first.",
+    )
 
 
 @dataclass
@@ -406,6 +453,7 @@ def augment_entry(
         "enabled_for_agents": sorted(enabled_for_agents.get(name, [])),
         "pending_request": pending_request,
         "pending_request_count": pending_request_count,
+        "platform_compat_ok": platform_version_ok(entry.get("platform_min_version")),
     }
 
 

@@ -31,8 +31,10 @@ interface Props {
 }
 
 export default function TerminalView({ ws, chatId, className, agent, artifacts, onExit }: Props) {
-  const { containerRef, pendingPermission, respondPermission, exited, exitReason, reconnecting, focus } =
-    useInteractiveTerminal(ws, chatId, onExit)
+  const {
+    containerRef, pendingPermission, respondPermission, exited, exitReason,
+    reconnecting, focus, readOnly, controller, takeOver,
+  } = useInteractiveTerminal(ws, chatId, onExit)
 
   // Backchannel for PiP artifacts: interactive chats deliver by TYPING the
   // framed interaction into the terminal — the composer's own rail (bracketed
@@ -77,6 +79,23 @@ export default function TerminalView({ ws, chatId, className, agent, artifacts, 
             : exitReason === 'superseded_otodock'
               ? 'opened in a local terminal'
               : 'session ended'}
+        </div>
+      )}
+
+      {/* Another user's terminal (Shared-only agents share one chat): it runs
+          under THEIR account and platform role, so it can be watched but not
+          driven. Taking over ends their session and continues the same
+          conversation under this user on the next send. */}
+      {readOnly && !exited && (
+        <div className="absolute top-2 right-3 z-10 flex items-center gap-2 text-xs font-medium text-white/90 bg-black/70 px-2 py-1 rounded-md shadow-xs">
+          <span>{controller ? `${controller} is driving` : 'read-only'}</span>
+          <button
+            type="button"
+            onClick={takeOver}
+            className="rounded-sm bg-white/15 hover:bg-white/25 px-1.5 py-0.5 transition-colors"
+          >
+            Take over
+          </button>
         </div>
       )}
 

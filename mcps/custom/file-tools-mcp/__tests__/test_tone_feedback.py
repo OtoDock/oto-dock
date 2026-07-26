@@ -13,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import images
 
 
+async def _async_ident(p, writing=False, **kw):
+    return p
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -40,7 +44,7 @@ def _mean_luma(path):
 
 
 def test_tone_check_line_present_for_tonal_ops(tmp_path, monkeypatch):
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = _gradient(tmp_path)
     out = str(tmp_path / "out.png")
     result = _run(images.handle_edit_image({
@@ -52,7 +56,7 @@ def test_tone_check_line_present_for_tonal_ops(tmp_path, monkeypatch):
 
 
 def test_no_tone_check_for_geometry_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = _gradient(tmp_path)
     out = str(tmp_path / "out.png")
     result = _run(images.handle_edit_image({
@@ -65,7 +69,7 @@ def test_no_tone_check_for_geometry_only(tmp_path, monkeypatch):
 
 def test_exposure_gamma_direction_matches_docs(tmp_path, monkeypatch):
     """gamma > 1 BRIGHTENS, < 1 DARKENS — the documented contract."""
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = _gradient(tmp_path)
     before = _mean_luma(src)
 
@@ -89,7 +93,7 @@ def test_color_temperature_direction_matches_docs(tmp_path, monkeypatch):
     import numpy as np
     from PIL import Image
 
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = tmp_path / "gray.png"
     Image.new("RGB", (64, 64), (128, 128, 128)).save(src)
     out = str(tmp_path / "warm.png")
@@ -115,7 +119,7 @@ def test_tone_stats_values_sane():
 
 
 def test_analyze_image_reports_clipping(tmp_path, monkeypatch):
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = _gradient(tmp_path)
     result = _run(images.handle_analyze_image({"path": src}))
     assert "Clipped: blacks ≤5" in result
@@ -124,7 +128,7 @@ def test_analyze_image_reports_clipping(tmp_path, monkeypatch):
 
 def test_blacks_level_direction_matches_docs(tmp_path, monkeypatch):
     """blacks level is RELATIVE: negative deepens, positive lifts, 0 no-op."""
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     from PIL import Image
 
     src = tmp_path / "veiled.png"
@@ -157,7 +161,7 @@ def test_dehaze_runs_and_lowers_mean(tmp_path, monkeypatch):
     """dehaze imports scipy (a container dep — this guards the requirement)
     and darkens a veiled image, per the documented side effect."""
     pytest.importorskip("scipy")
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     from PIL import Image
 
     src = tmp_path / "hazy.png"
@@ -174,7 +178,7 @@ def test_dehaze_runs_and_lowers_mean(tmp_path, monkeypatch):
 
 def test_analyze_flags_hard_clipping(tmp_path, monkeypatch):
     """>3% pixels at the rails → explicit unrecoverable-detail suggestions."""
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     from PIL import Image
 
     blown = tmp_path / "blown.png"
@@ -195,7 +199,7 @@ def test_analyze_flags_hard_clipping(tmp_path, monkeypatch):
 def test_unparseable_operations_error_not_silent_copy(tmp_path, monkeypatch):
     """A non-empty operations arg that normalizes to nothing must FAIL, not
     save an unchanged copy that reads as success."""
-    monkeypatch.setattr(images, "_resolve_path", lambda p, **kw: p)
+    monkeypatch.setattr(images, "_resolve_path", _async_ident)
     src = _gradient(tmp_path)
     out = str(tmp_path / "out.png")
     result = _run(images.handle_edit_image({

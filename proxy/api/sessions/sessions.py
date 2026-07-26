@@ -228,7 +228,7 @@ async def change_session_mode(
 
 
 class ModelChangeRequest(BaseModel):
-    model: str  # e.g., "claude-sonnet-5", "claude-opus-4-8[1m]"
+    model: str  # e.g., "claude-sonnet-5", "claude-opus-5"
 
 
 @router.patch("/v1/sessions/{session_id}/model")

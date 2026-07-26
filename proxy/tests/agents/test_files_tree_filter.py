@@ -31,7 +31,7 @@ def _file(name: str, path: str) -> dict:
 
 def _tree() -> list[dict]:
     return [
-        _dir("config", "config", [_file("prompt.md", "config/prompt.md")]),
+        _dir("config", "config", [_file("agent.md", "config/agent.md")]),
         _dir("knowledge", "knowledge"),
         _dir("users", "users", [
             _dir("alex", "users/alex"),

@@ -56,13 +56,84 @@ _test_url = os.environ.get(
 
 # Under pytest-xdist each worker gets its OWN database (…_gw0, …_gw1, …) so
 # parallel workers never share rows or block each other on the per-test wipe.
-# Serial runs (no xdist) use the base name unchanged.
+#
+# Concurrent pytest RUNS on one machine must not share state either — the
+# per-test wipe (temp_db) deletes a sibling run's rows/files mid-test when
+# two runs land on the same _gwN names (observed as the "ws-dashboard
+# flake": the longest-lived, most DB-heavy tests died first, different
+# modules each run, always green in isolation). So the name also carries a
+# per-RUN id, minted ONCE by the first process of the run (serial run or
+# xdist controller) and inherited by workers through the environment. The
+# id embeds the run's start epoch (hex) so the stale-sweep below can
+# age-gate: connection-count alone is NOT enough protection — a sibling
+# run that is starting RIGHT NOW has a created-but-not-yet-pooled window
+# in which its DBs look droppable (that exact race hung a proof run).
+import time  # noqa: E402
+
 _xdist_worker = os.environ.get("PYTEST_XDIST_WORKER")
-if _xdist_worker:
-    _pr = _urlparse(_test_url)
-    _test_url = _urlunparse(
-        _pr._replace(path=f"/{_pr.path.lstrip('/')}_{_xdist_worker}")
-    )
+_run_uid = os.environ.get("OTO_TEST_RUN_ID")
+if not _run_uid:
+    _run_uid = f"{int(time.time()):08x}{os.getpid():x}"
+    os.environ["OTO_TEST_RUN_ID"] = _run_uid
+_pr = _urlparse(_test_url)
+_db_suffix = f"_{_run_uid}" + (f"_{_xdist_worker}" if _xdist_worker else "")
+_test_url = _urlunparse(
+    _pr._replace(path=f"/{_pr.path.lstrip('/')}{_db_suffix}")
+)
+
+# A run's DBs are dropped at ITS OWN session end (pytest_sessionfinish
+# below); the startup sweep only reaps what a killed run leaked.
+_SWEEP_MIN_AGE_S = 2 * 3600
+
+
+def _run_id_age_s(run_id: str) -> float | None:
+    """Age of a run id whose first 8 chars are the start epoch in hex.
+    None = unparseable (pre-epoch-format leftovers → treat as stale)."""
+    try:
+        started = int(run_id[:8], 16)
+    except ValueError:
+        return None
+    if not (1_500_000_000 < started < time.time() + 3600):
+        return None
+    return time.time() - started
+
+
+def _drop_run_databases(url: str, run_pat: str, min_age_s: float) -> None:
+    """Drop per-run test DBs matching ``run_pat`` (a regex on the run-id
+    part). Age-gated via the epoch embedded in the run id; a DB with live
+    connections additionally refuses DROP and is skipped."""
+    import contextlib
+    import re
+
+    import psycopg
+
+    p = _urlparse(url)
+    base = re.sub(r"_[0-9a-f]+(_gw\d+)?$", "", p.path.lstrip("/"))
+    assert "test" in base, f"refusing to sweep non-test databases {base!r}"
+    pat = re.compile(rf"^{re.escape(base)}_({run_pat})(_gw\d+)?$")
+    admin_url = _urlunparse(p._replace(path="/postgres"))
+    try:
+        with psycopg.connect(admin_url, autocommit=True) as c:
+            rows = c.execute(
+                "SELECT datname FROM pg_database WHERE datname LIKE %s",
+                (f"{base}_%",),
+            ).fetchall()
+            for (name,) in rows:
+                m = pat.match(name)
+                if not m:
+                    continue
+                age = _run_id_age_s(m.group(1))
+                if age is not None and age < min_age_s:
+                    continue  # possibly a run that is starting/running now
+                with contextlib.suppress(Exception):
+                    # in-use by a live run → DROP refuses → leave it
+                    c.execute(f'DROP DATABASE "{name}"')
+    except Exception:
+        pass  # locked-down maintenance role — CI provisions out of band
+
+
+if not _xdist_worker:
+    _drop_run_databases(_test_url, r"[0-9a-f]+", _SWEEP_MIN_AGE_S)
 
 _ensure_test_database(_test_url)
 
@@ -93,14 +164,26 @@ os.environ["DATABASE_URL"] = _test_url
 # Redirect AGENTS_DIR to a temp scratch path so tests that exercise the
 # real filesystem (community-agent installer, agent-create endpoint) don't
 # pollute the dev install. Tests that don't touch the FS aren't affected.
-# Per-worker under xdist so parallel workers don't wipe each other's files
-# (the temp_db fixture clears this dir every test).
+# Per-worker under xdist AND per-run (same collision story as the DB names
+# above — the per-test wipe deleted a concurrent run's files mid-rename).
+# Stale dirs from finished/killed runs are reaped by age; the 24h grace
+# can never touch a live run.
+import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
-_agents_dir_name = "otodock-test-agents"
+_agents_dir_name = f"otodock-test-agents-{_run_uid}"
 if _xdist_worker:
     _agents_dir_name += f"-{_xdist_worker}"
 _test_agents_root = Path(tempfile.gettempdir()) / _agents_dir_name
+
+if not _xdist_worker:
+    for _stale in Path(tempfile.gettempdir()).glob("otodock-test-agents-*"):
+        try:
+            if _stale.is_dir() and time.time() - _stale.stat().st_mtime > 86400:
+                shutil.rmtree(_stale, ignore_errors=True)
+        except OSError:
+            pass
+
 _test_agents_root.mkdir(parents=True, exist_ok=True)
 
 # Override config.AGENTS_DIR directly — relying on PLATFORM_DATA_DIR alone
@@ -108,6 +191,21 @@ _test_agents_root.mkdir(parents=True, exist_ok=True)
 # side-effect (e.g. via pre-conftest registration in pytest collection).
 import config as _config  # noqa: E402
 _config.AGENTS_DIR = _test_agents_root
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Controller/serial only: drop this run's own databases + scratch dirs.
+
+    Best-effort — a worker whose pool hasn't closed yet makes its DROP fail
+    (skipped); the next run's age-gated startup sweep reaps any leftovers.
+    """
+    if _xdist_worker:
+        return
+    import re
+
+    _drop_run_databases(_test_url, re.escape(_run_uid), min_age_s=0.0)
+    for _d in Path(tempfile.gettempdir()).glob(f"otodock-test-agents-{_run_uid}*"):
+        shutil.rmtree(_d, ignore_errors=True)
 
 
 def _truncate_all_tables(conn):
@@ -164,6 +262,16 @@ def temp_db():
     try:
         from storage import agent_store as _agent_store
         _agent_store._invalidate_cache()
+    except Exception:
+        pass
+
+    # The transfer registry is module-global and nothing in tests runs its
+    # sweep, so a finished transfer from an earlier test in this process
+    # would replay as a ``transfer_state`` frame into the next dashboard
+    # connect (ws_dashboard golden-master tests see an unexpected frame).
+    try:
+        from core.remote import transfer_registry as _transfer_registry
+        _transfer_registry._items.clear()
     except Exception:
         pass
 

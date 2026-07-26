@@ -64,14 +64,19 @@ def build_session_env(
     # If the caller doesn't pass ``user_sub`` and we have ``username``,
     # look up the user_sub by username — most local-session call sites
     # don't have user_sub on hand but always have username.
+    platform_role = ""
     if not user_sub and username:
         from storage.pg import get_conn
         with get_conn() as conn:
             row = conn.execute(
-                "SELECT sub FROM users WHERE username = %s", (username,),
+                "SELECT sub, role FROM users WHERE username = %s", (username,),
             ).fetchone()
         if row:
             user_sub = row["sub"]
+            platform_role = row["role"] or ""
+    elif user_sub:
+        from storage import database as _env_db
+        platform_role = (_env_db.get_user(user_sub) or {}).get("role") or ""
     env["PROXY_URL"] = f"http://127.0.0.1:{config.PORT}"
     env["PROXY_API_KEY"] = create_session_token(session_id, agent_name, user_sub)
 
@@ -98,6 +103,14 @@ def build_session_env(
     # CLI spawns (cli_session/pty_session).
     env["CLAUDE_CODE_DISABLE_BUNDLED_SKILLS"] = "1"
 
+    # Claude Code 2.1.219 made subagents spawn NESTED subagents (depth 3) by
+    # default. Depth-2+ agents are invisible to the platform (stream-json only
+    # surfaces them under --forward-subagent-text, which we don't pass) — so
+    # they'd burn tokens with no badge/widget/task accounting. Freeze at depth
+    # 1 (the pre-2.1.219 behavior) until nested visibility lands (ROADMAP:
+    # "Engines / CLI upgrades — follow-ups").
+    env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "1"
+
     # Standard OTO_* platform env vars (incl. OTO_SESSION_ID) — community MCPs
     # read these for scope-aware paths without per-manifest declarations.
     from core.sandbox.oto_env import build_oto_env, resolve_memory_and_scope
@@ -109,6 +122,7 @@ def build_session_env(
         username=username,
         user_sub=user_sub,
         user_role=user_role,
+        platform_role=platform_role,
         session_id=session_id,
         memory_user_enabled=memory_user,
         memory_agent_enabled=memory_agent,

@@ -35,6 +35,7 @@ from api.apps import manifest as _mf
 from api.media.ui import (
     _placeholder,
     _ui_response,
+    inject_runtime,
     is_full_document,
     request_origin,
     wrap_fragment,
@@ -177,7 +178,7 @@ async def serve_app(
         )
     content = await asyncio.to_thread(path.read_text, "utf-8", "replace")
     if is_full_document(content):
-        return _ui_response(content, origin)
+        return _ui_response(inject_runtime(content, runtime_extra=APP_RUNTIME), origin)
     return _ui_response(wrap_fragment(content, runtime_extra=APP_RUNTIME), origin)
 
 

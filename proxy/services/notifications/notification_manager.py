@@ -181,6 +181,29 @@ def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
                 logger.debug("chat_read broadcast: %s", e)
 
 
+def broadcast_engine_switched(
+    owner_sub: str, chat_id: str, execution_path: str, model: str,
+    agent: str = "",
+) -> None:
+    """Tell every dashboard connection that should see ``chat_id`` that it now
+    runs on a different execution engine (the cross-engine resume switch), so
+    a second tab's locked model dropdown re-homes instead of lying about the
+    old engine. Same fan-out as ``broadcast_chat_status``; the acting socket
+    also gets a direct ack, so receivers must treat the frame as idempotent.
+    Best-effort."""
+    if not chat_id:
+        return
+    for sub in chat_status_targets(owner_sub, agent):
+        for c in _user_connections.get(sub, []):
+            try:
+                c.queue.put_nowait({
+                    "type": "engine_switched", "chat_id": chat_id,
+                    "execution_path": execution_path, "model": model,
+                })
+            except Exception as e:
+                logger.debug("engine_switched broadcast: %s", e)
+
+
 def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> None:
     """Tell ALL of a user's dashboard connections that ``chat_id``'s codex
     thread goal changed OUTSIDE a turn (codex accounts goal progress at turn

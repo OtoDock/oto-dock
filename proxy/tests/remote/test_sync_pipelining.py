@@ -43,7 +43,7 @@ def _make_cm(push_delays: dict):
     cm.get_clock_offset = MagicMock(return_value=0.0)
     cm.send_command = AsyncMock(return_value={"files": []})
 
-    async def _push_file(machine_id, ref, content, agent_slug=""):
+    async def _push_file(machine_id, ref, content, agent_slug="", **kw):
         state["active"] += 1
         state["max_active"] = max(state["max_active"], state["active"])
         await asyncio.sleep(push_delays.get(ref.value, 0.01))
@@ -114,7 +114,7 @@ async def test_failed_push_logs_and_continues(tmp_path, monkeypatch):
     cm, state = _make_cm({})
     real_push = cm.push_file
 
-    async def _flaky(machine_id, ref, content, agent_slug=""):
+    async def _flaky(machine_id, ref, content, agent_slug="", **kw):
         if ref.value.endswith("g2.txt"):
             return False  # ack'd failure — must not abort the rest
         if ref.value.endswith("g3.txt"):
@@ -150,3 +150,109 @@ async def test_presync_machine_agent_runs_with_pairing_identity():
     layer._initial_workspace_sync.assert_awaited_once_with(
         "m1", "agent-x", target_username="alice", target_role="editor",
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_respects_global_transfer_gate(tmp_path, monkeypatch):
+    """The initial sync's per-machine window (8) is further bounded by the
+    GLOBAL transfer gate for above-threshold files (Feature F)."""
+    import config
+    from core.remote import transfer_gate
+    monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 2, raising=False)
+    monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 0, raising=False)
+    transfer_gate.reset_for_tests()
+    try:
+        actions = [_push_action(f"workspace/f{i}.txt") for i in range(12)]
+        cm, state = _make_cm({f"workspace/f{i}.txt": 0.01 for i in range(12)})
+        await _run_sync(tmp_path, monkeypatch, actions, cm)
+        assert sorted(state["pushed"]) == sorted(a.rel_path for a in actions)
+        assert state["max_active"] <= 2  # was ≤ 8 (the per-machine window)
+    finally:
+        transfer_gate.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_tiny_files_bypass_gate_held_by_large_fanout(tmp_path, monkeypatch):
+    """A parked large fan-out holding the ONLY slot must not block a
+    below-threshold warmup storm (the 4MB bypass)."""
+    import asyncio
+    import config
+    from core.remote import transfer_gate
+    monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
+    monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 4, raising=False)
+    transfer_gate.reset_for_tests()
+    release = asyncio.Event()
+    parked = asyncio.Event()
+
+    async def _park():
+        async with transfer_gate.slot("m-big", "agent-x", "big.bin", 100 * 1024 * 1024):
+            parked.set()
+            await release.wait()
+
+    park_task = asyncio.create_task(_park())
+    await parked.wait()
+    try:
+        # 30 small sync pushes complete while the slot is held.
+        actions = [_push_action(f"workspace/s{i}.txt") for i in range(30)]
+        cm, state = _make_cm({})
+        async with asyncio.timeout(5):
+            await _run_sync(tmp_path, monkeypatch, actions, cm)
+        assert len(state["pushed"]) == 30
+    finally:
+        release.set()
+        await park_task
+        transfer_gate.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_no_deadlock_sync_plus_live_fanout_share_gate(tmp_path, monkeypatch):
+    """Constructed cross-path scenario: initial sync (machine-1) + live
+    fan-out (machines 2,3) contend on ONE gate slot — everything completes,
+    combined concurrency never exceeds the limit, no deadlock across
+    sync-lock/_window/path-lock/gate."""
+    import asyncio
+    import config
+    from core.remote import transfer_gate
+    from services.remote import workspace_fanout
+    from core.remote import satellite_connection as sc
+    monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
+    monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 0, raising=False)
+    transfer_gate.reset_for_tests()
+    try:
+        combined = {"active": 0, "max_active": 0}
+
+        # Shared fake cm: the sync harness's cm records into `state`; wrap it
+        # so BOTH paths count into `combined`.
+        actions = [_push_action(f"workspace/f{i}.txt") for i in range(6)]
+        cm, state = _make_cm({f"workspace/f{i}.txt": 0.01 for i in range(6)})
+        inner_push = cm.push_file
+
+        async def _counted(mid, ref, source, **kw):
+            combined["active"] += 1
+            combined["max_active"] = max(combined["max_active"], combined["active"])
+            try:
+                await asyncio.sleep(0.01)
+                if mid == "machine-1":
+                    return await inner_push(mid, ref, source, **kw)
+                return True
+            finally:
+                combined["active"] -= 1
+
+        cm.push_file = _counted
+        monkeypatch.setattr(
+            workspace_fanout, "fanout_targets",
+            lambda a, r, *, exclude_machine_id=None: ["m2", "m3"],
+        )
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: cm)
+
+        async with asyncio.timeout(10):
+            await asyncio.gather(
+                _run_sync(tmp_path, monkeypatch, actions, cm),
+                workspace_fanout.fan_out_write(
+                    "agent-live", "workspace/big.bin", b"x" * (600 * 1024),
+                ),
+            )
+        assert len(state["pushed"]) == 6
+        assert combined["max_active"] == 1
+    finally:
+        transfer_gate.reset_for_tests()

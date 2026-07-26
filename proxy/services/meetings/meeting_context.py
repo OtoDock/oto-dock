@@ -136,6 +136,10 @@ async def build_meeting_agent_config(
             agent_name,
             user_sub_for_creds,
             task_mode=True,
+            # ALSO match "meeting" in exclude_from (union with "task") — keeps
+            # the tool config in step with the prompt catalog, which filters by
+            # client_type "meeting".
+            meeting_mode=True,
             task_scope=identity.scope,
             delegation_targets=resolved_targets,
             extra_mcps=["meetings-mcp"],

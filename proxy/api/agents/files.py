@@ -921,6 +921,11 @@ async def restore_recover_bin(
             continue
 
         rel_path = entry["rel_path"]
+        # A binned pre-1.4 persona restores under the current filename so it
+        # is actually read again (readers prefer agent.md; a bare prompt.md
+        # would sit ignored next to the live persona).
+        if rel_path == "config/prompt.md":
+            rel_path = "config/agent.md"
         dest = (agent_dir / rel_path).resolve()
         try:
             dest.relative_to(agent_root)
@@ -1103,21 +1108,34 @@ async def delete_agent_path(
     if target.is_file():
         rel = target.relative_to(agent_dir.resolve()).as_posix()
         # Recover-bin: keep a copy of the deleted bytes (best-effort; a manual
-        # dashboard delete is voluntary → no notification). Read before unlink.
+        # dashboard delete is voluntary → no notification). Files above the bin
+        # cap are NOT captured (Windows-Recycle-Bin-style) — don't even read
+        # them, and tell the dashboard so it can warn "cannot be undone".
+        bin_skipped = False
         try:
-            _content = target.read_bytes()
+            _size = target.stat().st_size
         except OSError:
-            _content = b""
-        if _content:
-            from storage import recover_bin_store
-            await asyncio.to_thread(
-                recover_bin_store.capture, name, rel, _content, "deleted",
-            )
+            _size = 0
+        if _size > config.RECOVER_BIN_MAX_BYTES:
+            bin_skipped = True
+        else:
+            try:
+                _content = target.read_bytes()
+            except OSError:
+                _content = b""
+            if _content:
+                from storage import recover_bin_store
+                await asyncio.to_thread(
+                    recover_bin_store.capture, name, rel, _content, "deleted",
+                )
         target.unlink()
         logger.info(f"Deleted file: {target}")
         await _tombstone_path(name, rel)  # idle satellites apply the delete
         await _push_file_delete_to_remote(name, rel)
-        return {"status": "deleted", "path": req.path, "type": "file"}
+        return {
+            "status": "deleted", "path": req.path, "type": "file",
+            "recover_bin_skipped": bin_skipped,
+        }
 
     if target.is_dir():
         if not any(target.iterdir()):
@@ -1165,25 +1183,40 @@ async def delete_agent_path(
         # enforces the size cap internally.
         from storage import recover_bin_store
         _root_resolved = agent_dir.resolve()
+        _bin_skipped = 0
         for _child in target.rglob("*"):
             if not _child.is_file() or _child.is_symlink():
                 continue
             try:
                 _crel = _child.resolve().relative_to(_root_resolved).as_posix()
-                _cbytes = _child.read_bytes()
             except (OSError, ValueError):
                 continue
-            if _cbytes:
-                await asyncio.to_thread(
-                    recover_bin_store.capture, name, _crel, _cbytes, "deleted",
-                )
+            try:
+                _csize = _child.stat().st_size
+            except OSError:
+                _csize = 0
+            if _csize > config.RECOVER_BIN_MAX_BYTES:
+                # Above the bin cap → not captured (don't even read it).
+                _bin_skipped += 1
+            else:
+                try:
+                    _cbytes = _child.read_bytes()
+                except OSError:
+                    _cbytes = b""
+                if _cbytes:
+                    await asyncio.to_thread(
+                        recover_bin_store.capture, name, _crel, _cbytes, "deleted",
+                    )
             # Per-file tombstone so an idle satellite removes each path (a dir has
             # no file hash, so the merge can't key a delete on the folder itself).
             await _tombstone_path(name, _crel)
         shutil.rmtree(target)
         logger.info(f"Recursively deleted directory: {target}")
         await _push_file_delete_to_remote(name, rel)
-        return {"status": "deleted", "path": req.path, "type": "dir", "recursive": True}
+        return {
+            "status": "deleted", "path": req.path, "type": "dir",
+            "recursive": True, "recover_bin_skipped": _bin_skipped,
+        }
 
     raise HTTPException(status_code=400, detail="Unknown path type")
 

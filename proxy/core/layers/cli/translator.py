@@ -455,7 +455,7 @@ class ClaudeCLIEventTranslator:
 
         Fable 5's safety classifiers can decline a request (``stop_reason:
         "refusal"``, HTTP 200). In non-interactive stream-json Claude Code does
-        NOT auto-fall-back to Opus 4.8 (only the interactive TUI switches
+        NOT auto-fall-back to Opus 5 (only the interactive TUI switches
         models itself) — the turn just ends, which without this handler renders
         as a silently empty assistant reply. Emit a clear user-visible error
         instead, with the classifier category/explanation when present.
@@ -473,7 +473,7 @@ class ClaudeCLIEventTranslator:
             parts.append(f" {explanation}")
         parts.append(
             " You can rephrase the request, or switch this chat to another"
-            " model (e.g. Opus 4.8) and retry."
+            " model (e.g. Opus 5) and retry."
         )
         return [ClaudeStreamChunk(
             text="".join(parts),

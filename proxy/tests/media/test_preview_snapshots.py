@@ -75,6 +75,18 @@ def test_malformed_ids_never_resolve(temp_db, tmp_path, snap_root):
         assert ps.create_snapshot(bad_chat, src) is None
 
 
+def test_oversized_source_skips_snapshot(temp_db, tmp_path, snap_root, monkeypatch):
+    # Pinning copies the whole document — past the cap the preview degrades
+    # to no pinned version instead of a giant disk copy (536MB incident).
+    from services.media import preview_snapshots as ps
+    monkeypatch.setattr(ps, "_MAX_SNAPSHOT_BYTES", 64)
+    big = _seed_source(tmp_path, b"x" * 65)
+    assert ps.create_snapshot("chat-1", big) is None
+    assert not (snap_root / "chat-1").exists()  # no dir, no .tmp residue
+    small = _seed_source(tmp_path, b"x" * 64)
+    assert ps.create_snapshot("chat-1", small) is not None
+
+
 def test_gc_keeps_referenced_drops_unreferenced(temp_db, tmp_path, snap_root):
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")

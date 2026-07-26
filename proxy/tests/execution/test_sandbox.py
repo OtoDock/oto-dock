@@ -218,6 +218,29 @@ class TestSandboxBuilderEditor:
         ws_idx = cmd.index(f"{agent_dir}/users/alice/workspace")
         assert root_idx < ws_idx
 
+    def test_codex_inner_sandbox_mountpoints_precreated(self, tmp_agents):
+        """Codex's nested bwrap tmpfs-mounts <cwd>/{.git,.agents,.codex};
+        the RO user-dir root refuses mountpoint creation, so the build must
+        pre-create .git and .agents as EMPTY dirs (.codex is
+        session_config_dir's job). An empty .git must read as "not a git
+        repository" — a bare .git dir must never make git (or
+        init_if_missing) treat the user dir root as a repo."""
+        import subprocess
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir, role="manager")
+        SandboxBuilder(cfg).build_command_prefix(["codex"])
+        user_dir = agents_dir / "personal-assistant" / "users" / "alice"
+        for sub in (".git", ".agents"):
+            assert (user_dir / sub).is_dir(), f"{sub} mountpoint missing"
+            assert not any((user_dir / sub).iterdir()), f"{sub} must be empty"
+        r = subprocess.run(
+            ["git", "-C", str(user_dir), "rev-parse", "--git-dir"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode != 0
+        assert "not a git repository" in r.stderr.lower()
+        assert "invalid gitfile" not in r.stderr.lower()
+
 
 class TestSandboxBuilderManager:
     def test_cwd(self, tmp_agents):
