@@ -129,7 +129,7 @@ def _resolve_wopi_path(file_id: str, claims: dict) -> Path:
 
     # Security: ensure path is within AGENTS_DIR (no traversal)
     agents_resolved = config.AGENTS_DIR.resolve()
-    if not str(full_path).startswith(str(agents_resolved)):
+    if full_path != agents_resolved and not full_path.is_relative_to(agents_resolved):
         raise HTTPException(status_code=403, detail="Path traversal blocked")
 
     return full_path
@@ -474,7 +474,9 @@ async def generate_wopi_url(
     users_dir = (agent_root / "users").resolve()
 
     # Security: must be within agent workspace or users directory
-    if not (str(full_path).startswith(str(workspace)) or str(full_path).startswith(str(users_dir))):
+    def _within(p, root):
+        return p == root or p.is_relative_to(root)
+    if not (_within(full_path, workspace) or _within(full_path, users_dir)):
         raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory")
 
     if not full_path.is_file():
@@ -506,14 +508,19 @@ async def generate_wopi_url(
     if user.acting_sub is None:
         can_edit = req.edit
     else:
-        from core.remote.file_sync import can_write_back
+        from core.remote.file_sync import can_write_back, library_mirror_source
         from storage import database as _db
         _uname = _db.get_username_by_sub(user.sub) or ""
         # Authorize the RESOLVED agent-relative path (== req.file_path for a
         # well-formed request) so a '..'-laundered body can't flip the verdict.
         _rel = full_path.relative_to(agent_root).as_posix()
+        _wl = None
+        if library_mirror_source(_rel) is not None:
+            from storage import db_knowledge_libraries
+            _wl = db_knowledge_libraries.writable_pairs_for(req.agent)
         can_edit = req.edit and can_write_back(
             _rel, user.get_agent_role(req.agent), _uname,
+            writable_libraries=_wl,
         )
     permissions = "edit" if can_edit else "view"
     token, token_ttl = create_wopi_token(
@@ -626,7 +633,7 @@ async def generate_preview_wopi_url(
         raise HTTPException(status_code=404, detail="Preview not found")
 
     agent = chat.get("agent") or ""
-    from core.remote.file_sync import can_write_back
+    from core.remote.file_sync import can_write_back, library_mirror_source
     from storage import database as _db
     role = u.get_agent_role(agent)
     username = _db.get_username_by_sub(u.sub) or ""
@@ -644,8 +651,14 @@ async def generate_preview_wopi_url(
         # the satellite's own host write policy is the authoritative gate.
         if role in ("editor", "manager", "admin"):
             permissions = "edit"
-    elif can_write_back(rel_path.partition("/")[2], role, username):
-        permissions = "edit"
+    else:
+        _tree_rel = rel_path.partition("/")[2]
+        _wl = None
+        if library_mirror_source(_tree_rel) is not None:
+            from storage import db_knowledge_libraries
+            _wl = db_knowledge_libraries.writable_pairs_for(agent)
+        if can_write_back(_tree_rel, role, username, writable_libraries=_wl):
+            permissions = "edit"
 
     token, token_ttl = create_wopi_token(rel_path, u.sub, u.name, permissions, agent)
     return {

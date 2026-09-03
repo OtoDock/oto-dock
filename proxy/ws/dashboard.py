@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import NamedTuple
@@ -27,13 +28,21 @@ from fastapi import WebSocket, WebSocketDisconnect
 from storage import database as task_store
 from storage import notification_store
 from services.notifications import notification_manager
-from auth.providers import validate_session_jwt
+from auth.providers import validate_session_jwt, session_iat_after_password_change
+
+# A dashboard socket outlives a single request; re-validate its session +
+# re-read the user's role/agents at most this often (on client activity) so a
+# demotion, logout, password change, or expiry takes effect within the window
+# instead of persisting until the browser reconnects.
+_AUTHZ_REVALIDATE_S = 60
 from core.session.session_state import (
     _dashboard_notify_queues,
 )
 from core.execution_layer import ExecutionLayer
 from core.session.session_manager import get_execution_layer
-from core.config.task_config_builder import resolve_task_identity
+from core.config.task_config_builder import (
+    resolve_task_identity, task_allows_knowledge_rw,
+)
 from core.events.stream_pump import (
     _active_pumps,
 )
@@ -280,8 +289,13 @@ def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
     it waits in the per-connection queue while the viewed chat's turn occupies
     the main loop, and the queue dies with the connection — a refresh or
     network blip mid-turn silently dropped it ("my first message never got
-    answered"). Everything else in the queue is live-push-only state that a
-    reconnect re-derives; it is dropped exactly as a dead queue always did.
+    answered").
+
+    An undrained `task_result_prompt` is NOT re-derivable state — it is the
+    one-shot carrier of a delegate result routed via this socket. Park it as a
+    durable wake on its chat so the next warmup/turn replays it. Everything
+    else in the queue is live-push-only state that a reconnect re-derives; it
+    is dropped exactly as a dead queue always did.
     """
     kicks: list[dict] = []
     while True:
@@ -289,8 +303,37 @@ def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
             item = queue.get_nowait()
         except asyncio.QueueEmpty:
             break
-        if isinstance(item, dict) and item.get("type") == "_server_kick":
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "_server_kick":
             kicks.append(item)
+        elif item.get("type") == "task_result_prompt":
+            _cid = item.get("chat_id") or ""
+            _prompt = item.get("result_prompt") or ""
+            if _cid and _prompt:
+                try:
+                    # The WS route leaves event persistence to the handler —
+                    # which never ran for this item. Persist the bubble row
+                    # here, then park the prompt for replay.
+                    task_store.add_chat_message(_cid, "event", "",
+                        event_type="delegate_result",
+                        event_data=json.dumps({
+                            "task_id": item.get("task_id", ""),
+                            "task_name": item.get("task_name", ""),
+                            "agent": item.get("delegate_agent", ""),
+                            "output_text": item.get("output_text", ""),
+                            "status": item.get("status", "completed"),
+                        }))
+                    stored = task_store.append_pending_delegate_wake(_cid, _prompt)
+                    logger.info(
+                        f"WS dashboard close-rescue: delegate result for "
+                        f"chat={_cid[:8]} {'parked as wake' if stored else 'NOT parked'}"
+                    )
+                except Exception:
+                    logger.warning(
+                        f"WS dashboard close-rescue: failed to park delegate "
+                        f"result for chat={_cid[:8]}", exc_info=True,
+                    )
     return kicks
 
 
@@ -303,22 +346,39 @@ def _resolve_session_interactive(agent_cfg, chat_exec_mode: str = "") -> bool:
     ``interactive_pty`` capability (else -p); any other remote layer is -p.
     Single source of truth for BOTH the spawn gate (``_create_or_resume_session``)
     and the pre-warm skip (``_handle_pre_warmup``).
+
+    Resolved step-by-step (same precedence + result as ``execution_mode.
+    resolve_execution_mode``, then the path/target gates) so the log names the
+    step that DECIDED — the 2026-08-06 incident's key fact (why a chat spawned
+    headless) was invisible in the logs.
     """
+    _valid = (execution_mode.INTERACTIVE, execution_mode.HEADLESS)
+    if chat_exec_mode in _valid:
+        step, interactive = "chat-override", chat_exec_mode == execution_mode.INTERACTIVE
+    elif (agent_cfg.default_execution_mode or "") in _valid:
+        step, interactive = ("agent-default",
+                             agent_cfg.default_execution_mode == execution_mode.INTERACTIVE)
+    else:
+        step, interactive = "platform-default", False
+    # The kill-switch outranks both overrides but only ever forces -p, so the
+    # settings read is needed only when the tentative answer is interactive.
+    if interactive and not execution_mode.is_interactive_enabled():
+        step, interactive = "kill-switch", False
+    exec_path = agent_cfg.execution_path or ""
     exec_target = agent_cfg.execution_target or "local"
-    remote_ok = False
-    if exec_target != "local" and (agent_cfg.execution_path or "") in (
-        "claude-code-cli", "codex-cli",
-    ):
+    if interactive and exec_path not in ("claude-code-cli", "codex-cli"):
+        step, interactive = "path", False
+    if interactive and exec_target != "local":
         from core.remote.satellite_connection import get_connection_manager
-        remote_ok = get_connection_manager().satellite_supports_pty(exec_target)
-    return (
-        execution_mode.is_interactive(
-            chat_override=chat_exec_mode or None,
-            agent_default=agent_cfg.default_execution_mode or "",
-        )
-        and (agent_cfg.execution_path or "") in ("claude-code-cli", "codex-cli")
-        and (exec_target == "local" or remote_ok)
+        if not get_connection_manager().satellite_supports_pty(exec_target):
+            step, interactive = "satellite-pty", False
+    logger.info(
+        "WS dashboard interactive resolution: %s (decided by %s) agent=%s "
+        "path=%s target=%s",
+        "interactive" if interactive else "-p", step,
+        agent_cfg.agent_name, exec_path, exec_target,
     )
+    return interactive
 
 
 def _model_allowed_for_path(model: str, exec_path: str) -> bool:
@@ -401,6 +461,28 @@ async def chat_process_alive(chat: dict) -> bool:
     return False
 
 
+def task_run_active(chat_id: str) -> bool:
+    """True when a ``task-`` chat's run row is still pending/running — run
+    lifecycle a session-registry probe can't see: a PARKED run pre-admission
+    (the chat row exists before the slot), the SPAWN window (session_id
+    stamped minutes before any registry entry), and restart-recovery parking.
+    The model/engine-switch surfaces must treat all of these as ALIVE — a
+    rebind there would corrupt the run's usage attribution (the pump reads
+    ``chats.model`` at record time) and can kill a launching run. Non-task
+    chats and lookup errors return False (this augments, never replaces,
+    ``chat_process_alive``)."""
+    if not chat_id.startswith("task-"):
+        return False
+    try:
+        run = (task_store.get_run(chat_id.removeprefix("task-"))
+               or task_store.get_run_for_chat(chat_id))
+        return bool(run) and (run.get("status") or "") in ("pending", "running")
+    except Exception:
+        logger.debug("task_run_active: lookup failed for %s", chat_id,
+                     exc_info=True)
+        return False
+
+
 def _resume_username_for_chat(
     cid_for_resume: str, agent_for_resume: str, viewer_username: str,
 ) -> str:
@@ -419,6 +501,8 @@ def _resume_username_for_chat(
         if trun:
             tident = resolve_task_identity(
                 agent_for_resume, trun.get("scope") or "agent", trun.get("created_by"),
+                allow_knowledge_rw=task_allows_knowledge_rw(
+                    trun.get("task_type")),
             )
             return tident.username or ""
     if _vis.is_shared_only(agent_for_resume):
@@ -541,6 +625,7 @@ class DashboardConnection(
         self.agent_roles = task_store.get_user_agent_roles(self.user_sub)
         self.user_agents = list(self.agent_roles.keys())
         self.user_role = self.user["role"]
+        self._last_authz_check = time.time()
 
         await self.websocket.accept()
         logger.info(f"WebSocket dashboard connection accepted for user={self.user_sub}")
@@ -569,6 +654,7 @@ class DashboardConnection(
         self._pre_warmed_exec_path: str = ""      # execution path of pre-warmed session
         self._pre_warmed_model: str = ""          # model the pre-warmed session was spawned with
         self._pre_warmed_role: str = ""           # per-agent role at pre-warm time — invalidates if user reassigns role
+        self._pre_warmed_at: float = 0.0          # monotonic pre-warm time — logged as the reuse delta
         # Background task handle for an in-flight pre_warmup. Kept so resume_chat
         # / warmup / future pre_warmups can interact correctly even though
         # pre_warmup itself runs off the WS dispatcher loop (so a 5–10s remote
@@ -763,6 +849,23 @@ class DashboardConnection(
                         except json.JSONDecodeError:
                             await self._send_error("Invalid JSON")
                             continue
+                        # A client message must be a JSON object — a list/scalar
+                        # would make the handlers' `.get(...)`/`msg["..."]` raise
+                        # and tear down the socket. Reject cleanly instead.
+                        if not isinstance(msg, dict):
+                            await self._send_error("Invalid message")
+                            continue
+                        # Periodically re-validate the session + refresh role
+                        # (demotion / logout / password change / expiry) before
+                        # acting on a client message on this long-lived socket.
+                        _now = time.time()
+                        if _now - self._last_authz_check >= _AUTHZ_REVALIDATE_S:
+                            self._last_authz_check = _now
+                            if not await asyncio.to_thread(self._revalidate_session):
+                                await self._send_error(
+                                    "Session expired — please sign in again")
+                                ws_closing = True
+                                break
                         try:
                             result = await self._dispatch_client_message(msg)
                         except RuntimeError as e:
@@ -913,6 +1016,29 @@ class DashboardConnection(
 
     def _can_access_agent(self, name: str) -> bool:
         return self.user_role == "admin" or name in self.user_agents
+
+    def _revalidate_session(self) -> bool:
+        """Re-check the session cookie and refresh cached role/agents.
+
+        Returns False (→ close the socket) when the session is no longer
+        valid: cookie expired/invalid, user deleted, or the cookie predates a
+        password change (logout-all / reset). Otherwise refreshes
+        ``user_role``/``agent_roles``/``user_agents`` from the DB so a mid-
+        connection role or roster change is honored by the view/read gates
+        instead of the connect-time snapshot. Throttled by the caller.
+        """
+        cookie = self.websocket.cookies.get("session")
+        payload = validate_session_jwt(cookie) if cookie else None
+        if not payload or payload.get("sub") != self.user_sub:
+            return False
+        user = task_store.get_user(self.user_sub)
+        if not user or not session_iat_after_password_change(user, payload):
+            return False
+        self.user = user
+        self.user_role = user["role"]
+        self.agent_roles = task_store.get_user_agent_roles(self.user_sub)
+        self.user_agents = list(self.agent_roles.keys())
+        return True
 
     def _register_notify_queue(self, *, replaces: str = ""):
         """Register/update the notification queue for the current session_id.

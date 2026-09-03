@@ -1,9 +1,13 @@
 import { useEffect, useState } from 'react'
 import type { ToastItem } from '../../../hooks/useNotifications'
+import type { AgentSummary } from '../../../api/agents'
 import NotificationBody from './NotificationBody'
+import NotificationAgentHeader from './NotificationAgentHeader'
 
 interface Props {
   toasts: ToastItem[]
+  /** Cached agents list — resolves each toast's `agent_slug` to its avatar + name. */
+  agents?: AgentSummary[]
   onDismiss: (id: string) => void
   onStopAlarm?: () => void
   onNavigate?: (agentSlug: string, chatId: string) => void
@@ -23,7 +27,7 @@ const SEVERITY_TITLE_COLOR: Record<string, string> = {
   danger: 'text-p-accent-red',
 }
 
-function ToastCard({ toast, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string) => void }) {
+function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; agents?: AgentSummary[]; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string) => void }) {
   const [visible, setVisible] = useState(false)
   const { delivery } = toast
   const hasLink = !!(delivery.agent_slug && delivery.chat_id)
@@ -58,6 +62,9 @@ function ToastCard({ toast, onDismiss, onStopAlarm, onNavigate }: { toast: Toast
     >
       <div className="flex items-start gap-2 p-3">
         <div className="flex-1 min-w-0">
+          <div className="mb-0.5">
+            <NotificationAgentHeader agentSlug={delivery.agent_slug} agents={agents} />
+          </div>
           <p className={`text-sm font-semibold ${SEVERITY_TITLE_COLOR[delivery.severity] || 'text-p-text'}`}>
             {delivery.title}
           </p>
@@ -76,7 +83,7 @@ function ToastCard({ toast, onDismiss, onStopAlarm, onNavigate }: { toast: Toast
   )
 }
 
-export default function NotificationToast({ toasts, onDismiss, onStopAlarm, onNavigate }: Props) {
+export default function NotificationToast({ toasts, agents, onDismiss, onStopAlarm, onNavigate }: Props) {
   if (toasts.length === 0) return null
 
   return (
@@ -85,6 +92,7 @@ export default function NotificationToast({ toasts, onDismiss, onStopAlarm, onNa
         <ToastCard
           key={toast.id}
           toast={toast}
+          agents={agents}
           onDismiss={onDismiss}
           onStopAlarm={onStopAlarm}
           onNavigate={onNavigate}

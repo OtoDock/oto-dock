@@ -15,13 +15,13 @@ import logging
 import time
 
 from core.events.common_events import (
-    CommonEvent, SUBAGENT_START, BG_COMMAND_START, TEXT, TOOL_USE, TOOL_RESULT,
+    CommonEvent, SUBAGENT_START, TEXT, TOOL_USE, TOOL_RESULT,
     DONE, ERROR, QUEUE_TURN, PRODUCER_DONE,
 )
 from core.execution_layer import ExecutionLayer
 from core.session.session_state import get_subagent_registry
 from core.events.bg_command_state import get_bg_command_registry
-from core.events.pump_bg_monitors import hold_bg_monitors
+from core.events.pump_bg_monitors import format_job_list, hold_bg_monitors
 
 logger = logging.getLogger("claude-proxy")
 
@@ -110,7 +110,6 @@ async def task_produce(
             completions or new spawns; real workflows use 1-3).
     """
     bg_count = 0
-    bgcmd_count = 0
 
     async def _broadcast(event: CommonEvent):
         """Forward event to SSE subscribers if broadcast_fn provided."""
@@ -151,8 +150,6 @@ async def task_produce(
                     if (event.type == SUBAGENT_START
                             and event.data.get("run_in_background")):
                         bg_count += 1
-                    elif event.type == BG_COMMAND_START:
-                        bgcmd_count += 1
 
             # Background work — the delegation contract REQUIRES a delegated
             # agent's result return only after its bg sub-agents AND bg shell
@@ -282,11 +279,22 @@ async def task_produce(
                 bits = []
                 # Agents join the nudge only once EVERY one of them finished
                 # (their reports are per-cohort); commands join per completion.
+                # Each fragment names WHICH jobs finished (labels captured at
+                # spawn) — the count-only wording let the model read a
+                # still-running sibling's output as final (2026-08-27 find).
                 if bg_count and reg.pending_count == 0:
-                    bits.append(f"{bg_count} background agent(s)")
-                bash_unseen = bgreg.unsurfaced_count
-                if bash_unseen:
-                    bits.append(f"{bash_unseen} background command(s)")
+                    listed = format_job_list(
+                        [reg.label_for(t) for t in sorted(reg.completed)])
+                    bits.append(f"{bg_count} background agent(s)"
+                                + (f" ({listed})" if listed else ""))
+                # Snapshot the unsurfaced ids NOW — clear_unsurfaced() below
+                # destroys the set right after this nudge is composed.
+                bash_unseen_ids = sorted(bgreg.unsurfaced)
+                if bash_unseen_ids:
+                    listed = format_job_list(
+                        [bgreg.label_for(t) for t in bash_unseen_ids])
+                    bits.append(f"{len(bash_unseen_ids)} background command(s)"
+                                + (f" ({listed})" if listed else ""))
                 if not bits:
                     # Nothing completed-but-unseen — only abandoned/pending
                     # work remains. Never nudge for that: the message would
@@ -298,11 +306,44 @@ async def task_produce(
                             f"commands={bgreg.pending_count}) — no nudge"
                         )
                     break
+                # The CLI's own self-wake review turn (≥2.1.243) may already
+                # have covered this cohort — inline during the settle read
+                # (the session loop notes an in-settle init) or via a drain
+                # capture in the wait above. A second review would double the
+                # cost and re-tell the model what it just reviewed.
+                from core.events import wake_capture
+                if wake_capture.recently_captured(session_id, within_s=120.0):
+                    logger.info(
+                        f"Task {run_id[:8]}: self-wake turn covered the bg "
+                        f"cohort — skipping the review nudge"
+                    )
+                    bgreg.clear_unsurfaced()
+                    bg_count = 0
+                    now = time.monotonic()
+                    sub_deadline = now + bg_sub_ceiling
+                    cmd_deadline = now + bg_cmd_ceiling
+                    cohort = (
+                        (0 if abandoned_subs else reg.pending_count)
+                        + (0 if abandoned_cmds else bgreg.pending_count)
+                        + bgreg.unsurfaced_count
+                    )
+                    continue
+
                 what = " and ".join(bits)
                 nudge = (
                     f"Your {what} have completed their work. "
                     f"Please review the output and continue with the task."
                 )
+                # The stall-nudge path legitimately fires while siblings still
+                # run — say so, or the model treats a mid-write output file as
+                # final (THE dogfooding bug this round fixes). Abandoned work
+                # is still running too, so use the raw pending counts.
+                still_running = reg.pending_count + bgreg.pending_count
+                if still_running:
+                    nudge += (
+                        f" Note: {still_running} background job(s) are still "
+                        f"running — do not treat their output as final."
+                    )
                 logger.info(f"Task {run_id[:8]}: sending bg completion nudge ({what})")
                 # The review turn we are about to send surfaces them.
                 bgreg.clear_unsurfaced()
@@ -322,8 +363,6 @@ async def task_produce(
                         if (event.type == SUBAGENT_START
                                 and event.data.get("run_in_background")):
                             bg_count += 1
-                        elif event.type == BG_COMMAND_START:
-                            bgcmd_count += 1
 
                 # A nudge is progress — re-arm the horizons for work the
                 # review turn itself spawned.

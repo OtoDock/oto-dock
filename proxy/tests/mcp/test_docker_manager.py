@@ -245,10 +245,12 @@ def test_run_compose_streaming_timeout_kills_process(file_tools_manifest):
         )
 
 
-def test_compose_up_overlap_retry_preserved(file_tools_manifest, monkeypatch):
+def test_compose_up_overlap_retry_preserved(file_tools_manifest, tmp_path, monkeypatch):
     """The T1 subnet-TOCTOU retry survives the streaming rewrite."""
     from services.mcp import compose_rewrite
 
+    # Success now records the compose hash — keep it out of the real mcp dir.
+    monkeypatch.setattr(file_tools_manifest, "mcp_dir", tmp_path)
     results = iter([(1, "failed to create network: pool overlaps ..."), (0, "")])
     monkeypatch.setattr(
         docker_manager, "_run_compose_streaming",
@@ -306,10 +308,11 @@ def test_container_status_perm_denied_logs_hint(
     assert any("docker' group" in r.message for r in caplog.records)
 
 
-def test_compose_up_name_conflict_self_heal(file_tools_manifest, monkeypatch):
+def test_compose_up_name_conflict_self_heal(file_tools_manifest, tmp_path, monkeypatch):
     """A 'name already in use' collision on OUR exact container name (a
     previous deployment generation's container) is removed and retried."""
     import config as _config
+    monkeypatch.setattr(file_tools_manifest, "mcp_dir", tmp_path)
     expected = f"otodock-{_config.INSTALL_ID}-mcp-{file_tools_manifest.name}"
     conflict = (
         f'Error response from daemon: Conflict. The container name '
@@ -355,3 +358,177 @@ def test_compose_up_no_removal_for_foreign_name(file_tools_manifest, monkeypatch
         file_tools_manifest, ["up", "-d"], timeout=10,
     ) is False
     assert ran["rm"] is False
+
+
+# ── T1 compose-config recreate trigger ───────────────────────────────────────
+#
+# The running-container skip path historically ran NOTHING, so base-compose /
+# override changes never reached a standing T1 install. Startup now hashes
+# the on-disk config (pre-refresh baseline → ensure_t1_override → post),
+# compares against the recorded hash, and force-recreates on drift; any
+# failure degrades to the plain skip.
+
+
+from types import SimpleNamespace
+
+
+@pytest.fixture
+def fake_docker_manifest(tmp_path):
+    (tmp_path / "docker-compose.yml").write_text("services:\n  fake: {}\n")
+    return SimpleNamespace(
+        name="fake",
+        mcp_dir=tmp_path,
+        server=SimpleNamespace(
+            runtime="docker", docker_compose="docker-compose.yml",
+            image="", service_name="fake", port=9999,
+        ),
+        env={}, agent_env={},
+        credentials=SimpleNamespace(type="none"),
+        tool_filter=None,
+    )
+
+
+def _drive_startup(monkeypatch, manifest, *, env_changed=False,
+                   override_writer=None, status="running"):
+    """Run startup_docker_mcps against one fake running docker MCP."""
+    from core.config import deployment
+    from services.mcp import compose_rewrite, mcp_registry
+    from storage import mcp_store
+
+    monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_LOCAL)
+    monkeypatch.setattr(docker_manager, "_warn_foreign_mcp_leftovers", lambda: None)
+    monkeypatch.setattr(mcp_store, "get_all_mcp_states", lambda: {manifest.name: True})
+    monkeypatch.setattr(mcp_registry, "get_all_manifests", lambda: {manifest.name: manifest})
+    monkeypatch.setattr(docker_manager, "_inject_mcp_env", lambda m: env_changed)
+    monkeypatch.setattr(docker_manager, "get_container_status", lambda m: status)
+    monkeypatch.setattr(
+        compose_rewrite, "ensure_t1_override",
+        override_writer or (lambda m, **kw: None),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        docker_manager, "start_container",
+        lambda m, force_recreate=False: calls.append(force_recreate) or True,
+    )
+    docker_manager.startup_docker_mcps()
+    return calls
+
+
+def test_compose_hash_stable_and_sensitive(fake_docker_manifest):
+    m = fake_docker_manifest
+    h1 = docker_manager._compose_config_hash(m)
+    assert h1 == docker_manager._compose_config_hash(m)
+
+    (m.mcp_dir / "docker-compose.yml").write_text("services:\n  fake: {}\n# c\n")
+    h2 = docker_manager._compose_config_hash(m)
+    assert h2 != h1
+
+    (m.mcp_dir / "docker-compose.override.yml").write_text("services: {}\n")
+    h3 = docker_manager._compose_config_hash(m)
+    assert h3 != h2
+
+    (m.mcp_dir / "docker-compose.yml").unlink()
+    assert docker_manager._compose_config_hash(m) is None
+
+
+def test_startup_recreates_on_recorded_hash_drift(fake_docker_manifest, monkeypatch):
+    m = fake_docker_manifest
+    (m.mcp_dir / docker_manager._COMPOSE_HASH_NAME).write_text("stale-recorded-hash\n")
+    calls = _drive_startup(monkeypatch, m)
+    assert calls == [True], "changed compose config must force-recreate"
+
+
+def test_startup_skips_on_equal_hash(fake_docker_manifest, monkeypatch):
+    m = fake_docker_manifest
+    digest = docker_manager._compose_config_hash(m)
+    (m.mcp_dir / docker_manager._COMPOSE_HASH_NAME).write_text(digest + "\n")
+    calls = _drive_startup(monkeypatch, m)
+    assert calls == [], "unchanged config must keep the plain skip"
+
+
+def test_startup_seeds_quietly_without_pending_drift(fake_docker_manifest, monkeypatch):
+    """First boot with the feature, override refresh changes nothing:
+    seed the hash, do NOT recreate (no storm on unchanged installs)."""
+    m = fake_docker_manifest
+    calls = _drive_startup(monkeypatch, m)
+    assert calls == []
+    recorded = (m.mcp_dir / docker_manager._COMPOSE_HASH_NAME).read_text().strip()
+    assert recorded == docker_manager._compose_config_hash(m)
+
+
+def test_startup_first_boot_delivers_pending_override_drift(
+    fake_docker_manifest, monkeypatch,
+):
+    """THE acceptance case: no recorded hash, and the startup override
+    refresh materializes a pending change (e.g. the shipped mem_limit
+    default) — the pre-refresh baseline must trigger one recreate."""
+    m = fake_docker_manifest
+
+    def _refresh(manifest, **kw):
+        (manifest.mcp_dir / "docker-compose.override.yml").write_text(
+            "services:\n  fake:\n    mem_limit: 2g\n"
+        )
+
+    calls = _drive_startup(monkeypatch, m, override_writer=_refresh)
+    assert calls == [True], "pending drift on first boot must recreate"
+
+
+def test_startup_env_trigger_unaffected(fake_docker_manifest, monkeypatch):
+    m = fake_docker_manifest
+    digest = docker_manager._compose_config_hash(m)
+    (m.mcp_dir / docker_manager._COMPOSE_HASH_NAME).write_text(digest + "\n")
+    calls = _drive_startup(monkeypatch, m, env_changed=True)
+    assert calls == [True], ".env changes must keep force-recreating"
+
+
+def test_startup_drift_check_failure_degrades_to_skip(
+    fake_docker_manifest, monkeypatch, caplog,
+):
+    """The skip path must stay bulletproof: an exploding override refresh
+    logs a warning and skips — never raises, never recreates."""
+    m = fake_docker_manifest
+
+    def _boom(manifest, **kw):
+        raise OSError("disk on fire")
+
+    calls = _drive_startup(monkeypatch, m, override_writer=_boom)
+    assert calls == []
+
+
+def test_record_compose_hash_gated_to_t1(fake_docker_manifest, monkeypatch):
+    from core.config import deployment
+
+    monkeypatch.setattr(
+        deployment, "current_mode", lambda: deployment.MANAGED_SOCKPROX)
+    docker_manager._record_compose_hash(fake_docker_manifest)
+    assert not (fake_docker_manifest.mcp_dir / docker_manager._COMPOSE_HASH_NAME).exists(), \
+        "T2 must never grow hash files (start_container runs there too)"
+
+
+def test_compose_up_success_records_hash_from_disk(
+    fake_docker_manifest, monkeypatch,
+):
+    from core.config import deployment
+
+    monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_LOCAL)
+    monkeypatch.setattr(docker_manager, "_run_compose_streaming", lambda *a, **k: (0, ""))
+    assert docker_manager._compose_up(fake_docker_manifest, ["up", "-d"], timeout=10) is True
+    recorded = (
+        fake_docker_manifest.mcp_dir / docker_manager._COMPOSE_HASH_NAME
+    ).read_text().strip()
+    assert recorded == docker_manager._compose_config_hash(fake_docker_manifest)
+
+
+def test_record_failure_never_breaks_a_successful_start(
+    fake_docker_manifest, monkeypatch,
+):
+    from core.config import deployment
+
+    monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_LOCAL)
+    monkeypatch.setattr(docker_manager, "_run_compose_streaming", lambda *a, **k: (0, ""))
+    monkeypatch.setattr(
+        docker_manager, "_compose_config_hash",
+        lambda m: (_ for _ in ()).throw(OSError("disk on fire")),
+    )
+    assert docker_manager._compose_up(fake_docker_manifest, ["up", "-d"], timeout=10) is True

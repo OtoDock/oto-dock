@@ -29,6 +29,7 @@ import contextlib
 import json
 import logging
 import math
+import time
 from urllib.parse import urlencode
 
 import httpx
@@ -139,6 +140,7 @@ class ElevenLabsSTT(STTProvider):
         self._active_rate = sample_rate
         self._interim_results = False
         self._endpointing_override: int | None = None
+        self._send_skips = 0  # closed-connection sends since last open (one WARNING per incident)
 
     # ── Factory / metadata ─────────────────────────────────────────
 
@@ -292,6 +294,7 @@ class ElevenLabsSTT(STTProvider):
             max_size=2 ** 23,
         )
         self._is_open = True
+        self._send_skips = 0
         self._reader_task = asyncio.get_running_loop().create_task(self._read_loop(self._ws))
         logger.info("ElevenLabs STT connection opened")
 
@@ -310,6 +313,7 @@ class ElevenLabsSTT(STTProvider):
                     # invented — never surface it (the chat composer previews
                     # partials live and keeps the last one if no final follows).
                     if text and self._voiced_since_commit:
+                        self._last_result_at = time.monotonic()
                         self._latest_interim = text
                 elif mtype in ("committed_transcript", "committed_transcript_with_timestamps"):
                     text = (msg.get("text") or "").strip()
@@ -323,11 +327,13 @@ class ElevenLabsSTT(STTProvider):
                                     "transcript (hallucination guard)")
                         self._log_transcript("Scribe dropped", text)
                     elif text:
+                        self._last_result_at = time.monotonic()
                         self._log_transcript("Scribe final", text)
                         self._latest_interim = ""
                         self._last_interim_sent = ""
                         self._transcript_queue.put_nowait(text)
                         self._transcript_ready.set()
+                        self._emit_partial_final(text)
                 elif mtype == "session_started":
                     logger.debug("Scribe session started")
                 elif mtype:
@@ -349,7 +355,13 @@ class ElevenLabsSTT(STTProvider):
     async def _send_chunk(self, audio_bytes: bytes, *, commit: bool) -> None:
         if not self._ws or not self._is_open:
             if self._ws:
-                logger.warning("ElevenLabs STT send skipped — connection closed")
+                # One WARNING per death incident, not one per 20 ms frame (a
+                # dead 35 s call tail used to log 1,700+ of these). The guard
+                # task owns recovery; the counter reports on reconnect.
+                self._send_skips += 1
+                if self._send_skips == 1:
+                    logger.warning("ElevenLabs STT send skipped — connection "
+                                   "closed (suppressing repeats until reconnect)")
             return
         frame = {
             "message_type": "input_audio_chunk",
@@ -438,6 +450,12 @@ class ElevenLabsSTT(STTProvider):
     def latest_interim(self) -> str:
         return self._latest_interim
 
+    @property
+    def has_pending_finals(self) -> bool:
+        """Finalized transcript(s) queued and undrained — barge-in evidence
+        (same contract as the Deepgram provider)."""
+        return not self._transcript_queue.empty()
+
     def pop_fatal_error(self) -> str | None:
         err, self._fatal_error = self._fatal_error, None
         return err
@@ -457,6 +475,10 @@ class ElevenLabsSTT(STTProvider):
             except asyncio.QueueEmpty:
                 break
         self._transcript_ready.clear()
+        # A discarded utterance's live partial must go with it — a stale
+        # interim that never finalizes reads as permanent speech "evidence"
+        # to the barge-in pause monitor (audit A5, 2026-08-24).
+        self._latest_interim = ""
         if discarded:
             logger.info(f"STT queue cleared ({discarded} items discarded)")
 
@@ -489,12 +511,30 @@ class ElevenLabsSTT(STTProvider):
 
     # ── Lifecycle hooks ────────────────────────────────────────────
 
-    async def recover_after_opening(self, language: str) -> bool:
-        """Reconnect if the socket died during a long opening TTS — the base
-        no-op would report healthy over a dead mic."""
+    async def keepalive(self) -> None:
+        """Guard-task keepalive: ~100 ms of zeros sent DIRECTLY via
+        ``_send_chunk`` (never ``send_audio``) so it bypasses ``_gate_silence``
+        entirely — through the gate, a zeros chunk with ``silence_gate_rms: 0``
+        counts as voiced and arms ``_voiced_since_commit``, unlocking the
+        silence-only commit the hallucination guard exists to block (audit
+        F9). Zeros keep the stream's audio timeline warm; partials stay
+        suppressed while nothing voiced is buffered and silence-only commits
+        are dropped, so this can never surface phantom text."""
         if self._is_open:
-            self.clear_queue()
+            zeros = b"\x00" * (int(self._active_rate * 0.1) * 2)
+            await self._send_chunk(zeros, commit=False)
+
+    async def ensure_alive(self, language: str, *, clear_queue: bool = False) -> bool:
+        """Health probe + reconnect with the ACTIVE params (rate/interims/
+        endpointing stored from the last start()). ``clear_queue`` only
+        applies to the healthy path — True after an opening (echo artifacts),
+        False after a barged-in playback / from the guard task (the queue may
+        hold the interrupting utterance's finals — audit F6)."""
+        if self._is_open:
+            if clear_queue:
+                self.clear_queue()
             return True
+        skipped = self._send_skips
         with contextlib.suppress(Exception):
             await self.close()
         try:
@@ -503,10 +543,13 @@ class ElevenLabsSTT(STTProvider):
                 interim_results=self._interim_results,
                 endpointing_ms=self._endpointing_override,
             )
-            logger.info("ElevenLabs STT reconnected after opening TTS")
+            logger.info(
+                "ElevenLabs STT reconnected mid-call"
+                + (f" ({skipped} frames dropped while dead)" if skipped else "")
+            )
             return True
         except Exception as e:
-            logger.warning(f"ElevenLabs STT reconnect after opening failed: {e}")
+            logger.warning(f"ElevenLabs STT reconnect failed: {e}")
             return False
 
     @property

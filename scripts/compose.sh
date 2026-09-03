@@ -6,6 +6,8 @@
 #
 #   docker-compose.yml        the pull-only base (what end users run standalone)
 #   docker-compose.build.yml  build contexts + VERSIONS.md-pinned base images
+#   docker-compose.phone.yml  optional telephony daemon — included automatically
+#                             when the file is present; OTODOCK_PHONE=0 skips it
 #
 # This is the single entry point that keeps the IMAGE BUILD in
 # lockstep with VERSIONS.md: bumping PYTHON_IMAGE / NODE_IMAGE there flows into

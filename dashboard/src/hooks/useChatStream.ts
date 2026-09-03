@@ -20,6 +20,24 @@ const SKIP_TOOL_EVENTS = new Set(['EnterPlanMode', 'ExitPlanMode', 'mcp__delegat
 // Tools that have dedicated subagent blocks — skip tool block but keep tracking logic
 const AGENT_TOOL_NAMES = new Set(['Agent', 'Task'])
 
+// Reasons the backend's NoSubscriptionError classifier emits — all of them are
+// "connect/reconnect an account" prompts and render the amber setup card, not
+// the red crash card. 'throttled' is deliberately absent (a transient rest is
+// not a setup problem) and falls through to session_error with the backend's
+// try-again message.
+const SUBSCRIPTION_REASONS = new Set([
+  'no_subscription', 'auth_off', 'admin_oauth_only', 'no_pool', 'none',
+  'own_sub_expired',
+])
+
+export function warmupFailSubtype(
+  reason: string | undefined,
+): 'no_subscription' | 'target_unavailable' | 'session_error' {
+  if (reason && SUBSCRIPTION_REASONS.has(reason)) return 'no_subscription'
+  if (reason === 'target_unavailable') return 'target_unavailable'
+  return 'session_error'
+}
+
 /**
  * The shared `/ws/dashboard` streaming state machine — the single source of
  * truth for AgentChat (live chats and task chats alike). Owns the
@@ -660,13 +678,21 @@ export function useChatStream(options: UseChatStreamOptions) {
         })),
       )
 
-      // Insert delegate result as inline agent message
+      // Insert delegate result as inline agent message. One delivery can reach
+      // this socket as TWO frames (the ladder's pump push + the WS handler's
+      // own send) — dedupe on task_id + identical content so the bubble
+      // renders once (a recurring task's later round has different output and
+      // still renders).
       if (data.output_text) {
         const delegateAgent = agents?.find(a => a.name === data.agent)
-        setMessages((prev) => [
+        const dedupPrefix = `delegate-result-${data.task_id || data.task_name}-`
+        const isDup = (m: { id: string, blocks: MessageBlock[] }) =>
+          m.id.startsWith(dedupPrefix)
+          && m.blocks.some((b) => b.type === 'text' && b.content === data.output_text)
+        setMessages((prev) => prev.some(isDup) ? prev : [
           ...prev,
           {
-            id: `delegate-result-${data.task_id || data.task_name}-${Date.now()}`,
+            id: `${dedupPrefix}${Date.now()}`,
             role: 'assistant' as const,
             blocks: [{ type: 'text' as const, content: data.output_text || '' }],
             createdAt: new Date().toISOString(),
@@ -722,9 +748,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     onBgAgentsComplete: (_msg) => {
       if (discardingRef.current) return
       // All background agents completed (sent by bg_nudge before auto-response).
-      // Mark ALL remaining bg subagent blocks as done.
-      setMessages((prev) =>
-        prev.map((msg) => {
+      // Mark ALL remaining bg subagent blocks as done. Array identity is
+      // preserved when nothing matched (same rationale as onDone's map).
+      setMessages((prev) => {
+        let changed = false
+        const next = prev.map((msg) => {
           if (msg.role !== 'assistant') return msg
           const hasBg = msg.blocks.some(
             (b) => b.type === 'subagent' && b.isActive && (b as any)._background,
@@ -737,9 +765,11 @@ export function useChatStream(options: UseChatStreamOptions) {
           )
           const updatedMsg = { ...msg, blocks }
           if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
+          changed = true
           return updatedMsg
-        }),
-      )
+        })
+        return changed ? next : prev
+      })
     },
 
     onBgCommandsComplete: (_msg) => {
@@ -748,8 +778,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       // review turn). The per-command bg_command_done can't deliver post-turn
       // (the turn's pump is gone), so this is the reliable clear — mark ALL
       // active bgcommand blocks done. Mirror of onBgAgentsComplete.
-      setMessages((prev) =>
-        prev.map((msg) => {
+      setMessages((prev) => {
+        let changed = false
+        const next = prev.map((msg) => {
           if (msg.role !== 'assistant') return msg
           const hasCmd = msg.blocks.some(
             (b) => b.type === 'bgcommand' && b.isActive,
@@ -762,9 +793,11 @@ export function useChatStream(options: UseChatStreamOptions) {
           )
           const updatedMsg = { ...msg, blocks }
           if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
+          changed = true
           return updatedMsg
-        }),
-      )
+        })
+        return changed ? next : prev
+      })
     },
 
     onServerTurnStart: () => {
@@ -1162,11 +1195,18 @@ export function useChatStream(options: UseChatStreamOptions) {
         setContextUsed(data.context_used)
         setContextMax(data.context_max)
       }
-      setCacheStats({
-        cacheRead: data.cache_read ?? 0,
-        cacheWrite: data.cache_write ?? 0,
-        inputTokens: data.input_tokens ?? 0,
-        outputTokens: data.output_tokens ?? 0,
+      setCacheStats((prev) => {
+        const next = {
+          cacheRead: data.cache_read ?? 0,
+          cacheWrite: data.cache_write ?? 0,
+          inputTokens: data.input_tokens ?? 0,
+          outputTokens: data.output_tokens ?? 0,
+        }
+        return prev &&
+          prev.cacheRead === next.cacheRead && prev.cacheWrite === next.cacheWrite &&
+          prev.inputTokens === next.inputTokens && prev.outputTokens === next.outputTokens
+          ? prev
+          : next
       })
     },
 
@@ -1212,7 +1252,11 @@ export function useChatStream(options: UseChatStreamOptions) {
       // turn-complete ping. Derived from the blocks (the badge's source).
       const bgStillRunning = messagesRef.current.some((m) =>
         m.role === 'assistant' && m.blocks.some(
-          (b) => b.type === 'subagent' && b.isActive && b._background,
+          (b) => (b.type === 'subagent' && b.isActive && b._background)
+            // A live Commands badge gates the refetch too: history
+            // rehydrates bg_command_spawn rows isActive:false, so a
+            // refetch would clobber a still-running command's badge.
+            || (b.type === 'bgcommand' && b.isActive),
         ),
       )
       options.onTurnDone?.({ meetingActive, bgStillRunning })
@@ -1228,9 +1272,15 @@ export function useChatStream(options: UseChatStreamOptions) {
       setThinkingActive(false)
       setCompressingActive(false)
       setAborting(false)
-      // Mark foreground subagent blocks as done (bg agents keep spinning)
-      setMessages((prev) =>
-        prev.map((msg) => {
+      // Mark foreground subagent blocks as done (bg agents keep spinning).
+      // Return `prev` UNCHANGED when no message carried one: the common
+      // turn has no fg subagent, and a fresh array here forces a full
+      // list re-render in the exact tick the turn-end burst competes with
+      // TTS scheduling (per-message identity was already preserved; the
+      // array identity is what lets React bail out entirely).
+      setMessages((prev) => {
+        let changed = false
+        const next = prev.map((msg) => {
           if (msg.role !== 'assistant') return msg
           const hasFg = msg.blocks.some(
             (b) => b.type === 'subagent' && b.isActive && !(b as any)._background,
@@ -1243,9 +1293,11 @@ export function useChatStream(options: UseChatStreamOptions) {
           )
           const updatedMsg = { ...msg, blocks }
           if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
+          changed = true
           return updatedMsg
-        }),
-      )
+        })
+        return changed ? next : prev
+      })
       // Background subagents + running delegates stay in the badge because onDone
       // leaves their blocks active/running (only fg is marked done above).
       setTurnStartTime(null)
@@ -1286,7 +1338,14 @@ export function useChatStream(options: UseChatStreamOptions) {
         if (!hasContent || seededMidTurn) {
           setTimeout(() => {
             const cid = chatIdRef.current
-            if (cid) { try { ws.resumeChat(cid) } catch { /* ignore */ } }
+            if (!cid) return
+            const refetch = () => { try { ws.resumeChat(cid) } catch { /* ignore */ } }
+            // The refetch rebuilds every message id → full remount — a
+            // hard cut for any playing audio. Route through the caller's
+            // defer hook so it waits out live TTS (runs immediately when
+            // nothing is speaking).
+            if (options.deferHeavy) options.deferHeavy(refetch)
+            else refetch()
           }, 400)
         }
       }
@@ -1327,22 +1386,20 @@ export function useChatStream(options: UseChatStreamOptions) {
       // Page tail: clear warmup state so input re-enables (chat); unblock the
       // loading spinner (task).
       options.onWarmupFailedReset?.()
-      // The backend tags warmup_failed with a `reason`: 'no_subscription' (setup
-      // card), 'target_unavailable' (the remote machine is offline/unreachable),
-      // or 'session_error' (the session failed to START on a reachable machine —
-      // a config/spawn error, NOT an availability problem). Anything unrecognized
-      // (incl. a reason-less local failure) falls back to 'session_error' rather
-      // than the misleading "Remote machine unavailable". Convert the empty
-      // assistant placeholder into that system block carrying the backend's
-      // human-readable message; the user's bubble stays. If no placeholder is
-      // present (resume path / task), append one.
+      // The backend tags warmup_failed with a `reason`. Subscription-block
+      // reasons (the NoSubscriptionError classifier: auth_off,
+      // admin_oauth_only, no_pool, none, own_sub_expired) render the amber
+      // setup card — they are "connect/reconnect an account" prompts, not
+      // crashes. 'target_unavailable' means the remote machine is
+      // offline/unreachable. Anything unrecognized (incl. a reason-less local
+      // failure, and 'throttled' — a transient rest, not a setup problem)
+      // falls back to 'session_error' rather than the misleading "Remote
+      // machine unavailable". Convert the empty assistant placeholder into
+      // that system block carrying the backend's human-readable message; the
+      // user's bubble stays. If no placeholder is present (resume path /
+      // task), append one.
       const reason = (data as { reason?: string }).reason
-      const subtype: 'no_subscription' | 'target_unavailable' | 'session_error' =
-        reason === 'no_subscription'
-          ? 'no_subscription'
-          : reason === 'target_unavailable'
-            ? 'target_unavailable'
-            : 'session_error'
+      const subtype = warmupFailSubtype(reason)
       setMessages((prev) => {
         if (prev.length === 0) {
           // chat: leave the empty chat untouched. task: append the error inline.

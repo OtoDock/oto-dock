@@ -267,7 +267,24 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
   applyDone: (msg) =>
     set((s) => {
       const t = s.byId[msg.transfer_id]
-      if (!t) return s
+      if (!t) {
+        // transfer_done can land BEFORE the POST /v1/upload response links
+        // the local item to this id (a zero-target push completes at birth).
+        // Keep a section-less stub carrying the stamp so linkUpload merges
+        // `early.doneAt`; an orphan stub renders nowhere and is pruned.
+        const now = Date.now()
+        return {
+          byId: {
+            ...s.byId,
+            [msg.transfer_id]: {
+              id: msg.transfer_id, agent: msg.agent_slug, relPath: '', filename: '',
+              kind: 'upload', phase: 2, uploadSent: 0, uploadTotal: 0,
+              uploadFailed: false, machines: {}, startedAt: now, lastEventAt: now,
+              doneAt: now,
+            },
+          },
+        }
+      }
       return {
         byId: {
           ...s.byId,

@@ -281,7 +281,8 @@ async def _tick() -> None:
         await asyncio.to_thread(pool.rebalance_scopes)
     except Exception:
         logger.exception("scope rebalance pass failed")
-    for sub_id in pool.bound_oauth_subscription_ids():
+    bound = set(pool.bound_oauth_subscription_ids())
+    for sub_id in bound:
         try:
             await asyncio.to_thread(
                 pool.ensure_fresh_and_fan_out, sub_id,
@@ -289,6 +290,35 @@ async def _tick() -> None:
             )
         except Exception:
             logger.exception("freshness tick failed for sub %s", sub_id[:8])
+    # Idle rows too: an OAuth account nobody is running would otherwise only
+    # discover a dead login grant at the owner's next chat, and its stored
+    # grant-expiry field would go stale. Guards: never during the post-restart
+    # boot grace (a surviving satellite session's row LOOKS unbound until it
+    # re-announces), and rows with a persisted session binding count as bound
+    # (their fan-out target may be live but unannounced). Refresh only when
+    # the access token is inside the same runway; ensure_fresh_and_fan_out
+    # no-ops otherwise and its status short-circuit skips expired rows.
+    if pool.within_boot_grace():
+        return
+    try:
+        from storage import subscription_store as _store
+        persisted = await asyncio.to_thread(_store.list_persisted_binding_sub_ids)
+        rows = await asyncio.to_thread(_store.list_subscriptions)
+    except Exception:
+        logger.exception("unbound freshness enumeration failed")
+        return
+    for sub in rows:
+        sub_id = sub.get("id") or ""
+        if (sub.get("auth_type") != "oauth" or sub.get("status") != "active"
+                or sub_id in bound or sub_id in persisted):
+            continue
+        try:
+            await asyncio.to_thread(
+                pool.ensure_fresh_and_fan_out, sub_id,
+                pool.TURN_MIN_TOKEN_RUNWAY_MS,
+            )
+        except Exception:
+            logger.exception("unbound freshness tick failed for sub %s", sub_id[:8])
 
 
 async def _worker_loop() -> None:

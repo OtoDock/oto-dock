@@ -3,7 +3,10 @@ import { SoundIcon } from './SoundIcon'
 import { useSearch } from '../../contexts/SearchContext'
 import type { DisplayMessage, MessageBlock } from './types'
 import { pairBgCommandBlocks, previewChainModes, supersededUiBlocks, uiTitlesByPath } from '../../lib/messageBlocks'
+import { deriveActivityRuns, type ActivityRun } from '../../lib/activityGroups'
+import { useActivityDisplay } from '../../hooks/useActivityDisplay'
 import BlockRenderer from './ChatBlockRenderer'
+import ActivityGroup from './ActivityGroup'
 import ErrorBoundary from '../ErrorBoundary'
 
 interface Props {
@@ -173,6 +176,30 @@ export default function ChatMessages({
   // chain per fileId over the loaded block list (each block applies/defers
   // its own transition — see DocumentPreview).
   const previewModes = useMemo(() => previewChainModes(messages), [messages])
+
+  // Compact activity view: runs of tool/thinking/subagent/bgcommand blocks
+  // collapse into one chip each (ActivityGroup). Derived per message here,
+  // alongside the other per-list memos; in Detailed mode the map stays empty
+  // and the block loop below renders exactly the historical flat layout.
+  const activityDisplay = useActivityDisplay()
+  const activityRunsByMsg = useMemo(() => {
+    const map = new Map<string, { byStart: Map<number, ActivityRun>; grouped: Set<number> }>()
+    if (activityDisplay !== 'compact') return map
+    for (const msg of messages) {
+      if (msg.role === 'user' && !msg.agentSlug) continue
+      const { hiddenToolIdx } = pairBgCommandBlocks(msg.blocks)
+      const runs = deriveActivityRuns(msg.blocks, hiddenToolIdx)
+      if (runs.length === 0) continue
+      const byStart = new Map<number, ActivityRun>()
+      const grouped = new Set<number>()
+      for (const r of runs) {
+        byStart.set(r.start, r)
+        for (let i = r.start; i <= r.end; i++) grouped.add(i)
+      }
+      map.set(msg.id, { byStart, grouped })
+    }
+    return map
+  }, [messages, activityDisplay])
 
   // Auto-scroll during streaming: column-reverse handles initial load positioning,
   // but during streaming we need to keep the user at the bottom as new content arrives.
@@ -567,6 +594,29 @@ export default function ChatMessages({
               <div className="space-y-3">
                 {msg.blocks.map((block, i) => {
                   if (block.type === 'metadata') return null
+                  // Compact activity view: a run's start index renders the
+                  // whole span as one chip; the rest of the span is skipped
+                  // (composes with the hiddenToolIdx skip below — hidden
+                  // indices inside dropped runs still fall through to it).
+                  const runInfo = activityRunsByMsg.get(msg.id)
+                  const run = runInfo?.byStart.get(i)
+                  if (run) {
+                    return (
+                      <ActivityGroup
+                        key={`${msg.id}:${run.start}`}
+                        run={run}
+                        blocks={msg.blocks}
+                        msgId={msg.id}
+                        msgIdx={msgIdx}
+                        hiddenToolIdx={hiddenToolIdx}
+                        bgPairs={bgPairs}
+                        chatId={chatId}
+                        agentName={msgSlug || agentName}
+                        onPermissionRespond={onPermissionRespond}
+                      />
+                    )
+                  }
+                  if (runInfo?.grouped.has(i)) return null
                   if (hiddenToolIdx.has(i)) return null
                   return (
                     <BlockRenderer

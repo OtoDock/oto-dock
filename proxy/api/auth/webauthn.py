@@ -185,7 +185,15 @@ class PasskeyNativeExchangeRequest(BaseModel):
 
 
 async def _confirm_password(u: UserContext, password: str) -> dict:
-    """Password-confirm a passkey management action. Returns the DB user row."""
+    """Password-confirm a passkey management action. Returns the DB user row.
+
+    Rate-limited per user (``confirm`` bucket): this re-verifies the account
+    password on an already-authed session, so an unbounded loop would be an
+    online password oracle for a hijacked session."""
+    ok, retry_after = rate_limit_hit("confirm", u.sub)
+    if not ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
+                            headers={"Retry-After": str(retry_after)})
     db_user = await asyncio.to_thread(task_store.get_user, u.sub)
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "Passkey management requires a password-backed local account")
@@ -266,6 +274,13 @@ async def passkey_register_verify(
             expected_challenge=popped[0],
             expected_rp_id=_rp_id(),
             expected_origin=_expected_origin(),
+            # Enforce UV at registration so the comment above is TRUE at the
+            # point it claims: the AuthenticatorSelectionCriteria UV=REQUIRED
+            # is only a client-side hint. Login verify already requires UV, so
+            # a no-UV credential could never mint a session anyway — but
+            # rejecting it here keeps the "passkey = possession + UV ≥ 2
+            # factors" invariant enforced end-to-end, not just at login.
+            require_user_verification=True,
         )
     except WebAuthnException as e:
         # Base class: parse errors (InvalidJSONStructure etc.) and verification
@@ -276,15 +291,18 @@ async def passkey_register_verify(
     count = await asyncio.to_thread(webauthn_store.count_credentials, u.sub)
     name = req.name.strip() or f"Passkey {count + 1}"
     transports = (req.credential.get("response") or {}).get("transports") or []
-    await asyncio.to_thread(
-        webauthn_store.add_credential,
-        bytes_to_base64url(verification.credential_id),
-        u.sub,
-        bytes_to_base64url(verification.credential_public_key),
-        verification.sign_count,
-        name,
-        [str(t) for t in transports],
-    )
+    try:
+        await asyncio.to_thread(
+            webauthn_store.add_credential,
+            bytes_to_base64url(verification.credential_id),
+            u.sub,
+            bytes_to_base64url(verification.credential_public_key),
+            verification.sign_count,
+            name,
+            [str(t) for t in transports],
+        )
+    except webauthn_store.CredentialAlreadyRegistered:
+        raise HTTPException(400, "This passkey is already registered")
     logger.info(f"Passkey registered for {mask_email(u.email)} ({name})")
     return {"status": "registered", "name": name}
 

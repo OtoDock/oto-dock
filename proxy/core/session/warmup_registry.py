@@ -136,6 +136,16 @@ def get(chat_id: str) -> InflightWarmup | None:
     return _inflight.get(chat_id)
 
 
+def inflight_chat_ids() -> list[str]:
+    """Chat ids with a warmup in flight right now — the warming set for the
+    ``/v1/chats/active`` widget seed. Synchronous snapshot (same contract as
+    ``get()``: a stale read only costs one transient row). Callers must
+    re-derive per-viewer visibility from the CHAT ROW — ``user_sub`` on the
+    entry is the WARMER, not the audience (a shared-agent chat warmed by one
+    user must surface for every assigned user)."""
+    return list(_inflight.keys())
+
+
 async def sweep_stale() -> int:
     """Remove entries that are completed or older than _SWEEP_AGE_SECONDS.
 

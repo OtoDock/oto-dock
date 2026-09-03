@@ -415,9 +415,36 @@ class TestUserScopeBlockReason:
         mock_store.list_platform_pool.return_value = [{"auth_type": "api_key"}]
         assert user_scope_block_reason("claude-code-cli", "u") == "none"
 
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_own_expired_row_classifies_as_own_sub_expired(self, mock_store):
+        """A dead own account must say "reconnect", never the generic
+        connect-an-account copy (the incident: expired row reported
+        admin_oauth_only)."""
+        from services.engines.subscription_pool import user_scope_block_reason
+
+        def _personal(layer, user_sub, provider=None, *, any_status=False):
+            return [{"id": "s1", "status": "expired"}] if any_status else []
+
+        mock_store.list_personal.side_effect = _personal
+        assert user_scope_block_reason("claude-code-cli", "u") == "own_sub_expired"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_disabled_only_row_does_not_say_reconnect(self, mock_store):
+        """An admin-DISABLED row is not a dead grant — telling the user to
+        reconnect would be false AND point at the revive-a-disabled-row hole."""
+        from services.engines.subscription_pool import user_scope_block_reason
+
+        def _personal(layer, user_sub, provider=None, *, any_status=False):
+            return [{"id": "s1", "status": "disabled"}] if any_status else []
+
+        mock_store.list_personal.side_effect = _personal
+        mock_store.get_user_allow_platform_auth.return_value = False
+        assert user_scope_block_reason("claude-code-cli", "u") == "auth_off"
+
     def test_error_carries_reason_and_friendly_message(self):
         from services.engines.subscription_pool import NoSubscriptionError
-        for reason in ("auth_off", "admin_oauth_only", "no_pool", "none"):
+        for reason in ("auth_off", "admin_oauth_only", "no_pool", "none",
+                       "own_sub_expired"):
             err = NoSubscriptionError(reason)
             assert err.reason == reason
             assert "Settings" in str(err)
@@ -952,6 +979,259 @@ class TestTokenRefresh:
         handle = sp._build_handle(sub)
         assert handle.oauth_access_token is None
         sp._refresh_backoff.clear()
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_invalid_grant_expires_immediately(self, mock_store, mock_post):
+        """A provider-confirmed dead grant (400 invalid_grant) expires the row
+        on the FIRST failure — no counter, no hours of silent retries — while
+        the still-valid stored token keeps serving."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        soon_ms = int((time.time() + 7200) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-2h-left",
+                "refreshToken": "sk-ant-ort01-dead",
+                "expiresAt": soon_ms,
+            }
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.json.return_value = {"error": "invalid_grant"}
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-grantdead", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-2h-left"
+        mock_store.update_subscription.assert_called_once_with(
+            "s-grantdead", status="expired",
+        )
+        assert "s-grantdead" not in sp._refresh_backoff
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_non_grant_400_stays_transient(self, mock_store, mock_post):
+        """A 400 that is NOT invalid_grant (e.g. our own invalid_scope request
+        bug) must never expire the row — a blanket status-code rule would
+        mass-expire every healthy account over one request fault."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        soon_ms = int((time.time() + 7200) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-2h-left",
+                "refreshToken": "sk-ant-ort01-refresh",
+                "expiresAt": soon_ms,
+            }
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.json.return_value = {"error": "invalid_scope"}
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-scopebug", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-2h-left"
+        mock_store.update_subscription.assert_not_called()
+        assert sp._refresh_backoff["s-scopebug"][1] == 1
+        sp._refresh_backoff.clear()
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_non_json_401_stays_transient(self, mock_store, mock_post):
+        """A WAF/challenge page (non-JSON body) can never be a terminal
+        verdict — the classifier must survive resp.json() raising."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        soon_ms = int((time.time() + 7200) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-2h-left",
+                "refreshToken": "sk-ant-ort01-refresh",
+                "expiresAt": soon_ms,
+            }
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.json.side_effect = ValueError("not json")
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-waf", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-2h-left"
+        mock_store.update_subscription.assert_not_called()
+        assert sp._refresh_backoff["s-waf"][1] == 1
+        sp._refresh_backoff.clear()
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_refresh_429_sets_selection_cooldown(self, mock_store, mock_post):
+        """A token-endpoint 429 steers new selections away briefly (transient
+        cooldown) — and never expires the row."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        sp._throttled_until.pop("s-ratelimited", None)
+        soon_ms = int((time.time() + 7200) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-2h-left",
+                "refreshToken": "sk-ant-ort01-refresh",
+                "expiresAt": soon_ms,
+            }
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+        mock_resp.json.return_value = {"error": "rate_limited"}
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-ratelimited", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-2h-left"
+        mock_store.update_subscription.assert_not_called()
+        assert sp._throttled_until.get("s-ratelimited", 0) > time.time()
+        assert "s-ratelimited" not in sp._throttled_hard
+        sp._refresh_backoff.clear()
+        sp._throttled_until.pop("s-ratelimited", None)
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_failure_discarded_when_credential_replaced_mid_attempt(self, mock_store, mock_post):
+        """A reconnect landing while a refresh of the OLD token is in flight
+        must not inherit the dead token's verdict — the failure is discarded
+        and the fresh credential served."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        soon_ms = int((time.time() + 7200) * 1000)
+        fresh_ms = int((time.time() + 8 * 3600) * 1000)
+        old_blob = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-old",
+                "refreshToken": "sk-ant-ort01-dead",
+                "expiresAt": soon_ms,
+            }
+        }
+        fresh_blob = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-reconnected",
+                "refreshToken": "sk-ant-ort01-fresh",
+                "expiresAt": fresh_ms,
+            }
+        }
+        # build-handle read, under-lock re-read, then the post-failure guard
+        # read sees the reconnect's replacement.
+        mock_store.get_credential_data.side_effect = [old_blob, old_blob, fresh_blob]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.json.return_value = {"error": "invalid_grant"}
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-race", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-reconnected"
+        mock_store.update_subscription.assert_not_called()
+        assert "s-race" not in sp._refresh_backoff
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_non_active_row_never_hits_token_endpoint(self, mock_store, mock_post):
+        """An expired/disabled row must not spend a doomed refresh POST every
+        freshness tick — it fails soft on the stored token until reconnect."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        past_ms = int((time.time() - 60) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-dead",
+                "refreshToken": "sk-ant-ort01-dead",
+                "expiresAt": past_ms,
+            }
+        }
+        mock_store.get_subscription.return_value = {
+            "id": "s-expired", "provider": "anthropic", "status": "expired",
+        }
+        assert sp.ensure_fresh_and_fan_out("s-expired") is False
+        mock_post.assert_not_called()
+
+    @patch("httpx.post")
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_refresh_persists_and_carries_grant_expiry(self, mock_store, mock_post):
+        """`refresh_token_expires_in` is stored as refreshTokenExpiresAt; a
+        later response WITHOUT the field carries the stored value forward
+        (the grant expiry belongs to the grant, not the rotated token) —
+        and the healthAlerts dedup stamps ride along."""
+        from services.engines import subscription_pool as sp
+
+        sp._refresh_backoff.clear()
+        soon_ms = int((time.time() + 60) * 1000)
+        grant_ms = int((time.time() + 14 * 86400) * 1000)
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {
+                "accessToken": "sk-ant-oat01-old",
+                "refreshToken": "sk-ant-ort01-refresh",
+                "expiresAt": soon_ms,
+                "refreshTokenExpiresAt": grant_ms,
+                "healthAlerts": {"72h": grant_ms},
+            }
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "access_token": "sk-ant-oat01-new",
+            "refresh_token": "sk-ant-ort01-new",
+            "expires_in": 28800,
+            "subscriptionType": "max",
+        }
+        mock_post.return_value = mock_resp
+
+        sub = {
+            "id": "s-carry", "layer": "claude-code-cli", "provider": "anthropic",
+            "auth_type": "oauth", "owner_type": "platform",
+        }
+        handle = sp._build_handle(sub)
+        assert handle.oauth_access_token == "sk-ant-oat01-new"
+        written = mock_store.update_credential_data.call_args.args[1]["oauth_token"]
+        assert written["refreshTokenExpiresAt"] == grant_ms
+        assert written["healthAlerts"] == {"72h": grant_ms}
+
+        # A response that DOES carry the field overrides the stored value.
+        mock_resp.json.return_value["refresh_token_expires_in"] = 3600
+        mock_store.update_credential_data.reset_mock()
+        handle = sp._build_handle(sub)
+        written = mock_store.update_credential_data.call_args.args[1]["oauth_token"]
+        assert abs(written["refreshTokenExpiresAt"] - (time.time() + 3600) * 1000) < 5000
+
+    def test_claude_file_blob_passes_grant_expiry_when_present(self):
+        from services.engines.subscription_pool import _claude_file_blob
+
+        with_field = _claude_file_blob({
+            "accessToken": "at", "expiresAt": 1, "refreshTokenExpiresAt": 123456,
+        })
+        assert with_field["refreshTokenExpiresAt"] == 123456
+        without = _claude_file_blob({"accessToken": "at", "expiresAt": 1})
+        # Absent (not zero) — a 0 would read as an epoch-expired login.
+        assert "refreshTokenExpiresAt" not in without
 
     @patch("httpx.post")
     @patch("services.engines.subscription_pool.subscription_store")

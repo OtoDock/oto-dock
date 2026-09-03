@@ -1,10 +1,14 @@
 import { useRef, useEffect, useState, useCallback } from 'react'
 import type { NotificationDelivery } from '../../../api/notifications'
+import type { AgentSummary } from '../../../api/agents'
 import NotificationBody from './NotificationBody'
+import NotificationAgentHeader from './NotificationAgentHeader'
 
 interface Props {
   deliveries: NotificationDelivery[]
   loading: boolean
+  /** Cached agents list — resolves each row's `agent_slug` to its avatar + name. */
+  agents?: AgentSummary[]
   onMarkRead: (id: string) => void
   onMarkAllRead: () => void
   onDismiss: (id: string) => void
@@ -140,7 +144,7 @@ function SwipeableRow({ onSwipeDismiss, children }: { onSwipeDismiss: () => void
   )
 }
 
-export default function NotificationPanel({ deliveries, loading, onMarkRead, onMarkAllRead, onDismiss, onAcknowledge, onNavigate, onClose }: Props) {
+export default function NotificationPanel({ deliveries, loading, agents, onMarkRead, onMarkAllRead, onDismiss, onAcknowledge, onNavigate, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -198,6 +202,11 @@ export default function NotificationPanel({ deliveries, loading, onMarkRead, onM
                     onClick={() => { onAcknowledge(d.id); if (!d.read) onMarkRead(d.id) }}
                   >
                     <div className="flex-1 min-w-0">
+                      {/* Sender header (agent avatar + name), aligned with the
+                          title text below the unread dot. */}
+                      <div className="ml-3 mb-0.5">
+                        <NotificationAgentHeader agentSlug={d.agent_slug} agents={agents} />
+                      </div>
                       <div className="flex items-center gap-1.5">
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${!d.read ? 'bg-brand' : 'bg-transparent'}`} />
                         <span className="text-sm font-medium text-p-text truncate">{d.title}</span>

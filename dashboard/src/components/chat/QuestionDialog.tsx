@@ -3,6 +3,10 @@ import { useState } from 'react'
 interface QuestionOption {
   label: string
   description?: string
+  // Long-form option content (Claude AskUserQuestion options[].preview — e.g.
+  // full text versions to choose between). Rendered verbatim; the TUI shows it
+  // in a side pane on focus, the chat card inlines it under the option.
+  preview?: string
 }
 
 interface QuestionItem {
@@ -195,10 +199,15 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
                         </span>
                       )}
                     </span>
-                    <div>
+                    <div className="min-w-0 flex-1">
                       <span className="font-medium">{opt.label}</span>
                       {opt.description && (
                         <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{opt.description}</p>
+                      )}
+                      {opt.preview && (
+                        <pre className="mt-1.5 px-2.5 py-2 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-p-surface-hover text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">
+                          {opt.preview}
+                        </pre>
                       )}
                     </div>
                   </div>

@@ -245,3 +245,48 @@ class TestWorkerTick:
                           side_effect=RuntimeError("boom")), \
              patch.object(pool, "bound_oauth_subscription_ids", return_value=set()):
             asyncio.run(tf._tick())  # must not raise
+
+    def _run_unbound_tick(self, *, boot_grace, rows, persisted, bound=frozenset()):
+        import asyncio
+        from unittest.mock import patch
+        from services.engines import subscription_pool as pool
+
+        freshened = []
+        with patch.object(pool, "rebind_delisted_sessions", return_value=0), \
+             patch.object(pool, "rebalance_scopes", return_value=None), \
+             patch.object(pool, "bound_oauth_subscription_ids",
+                          return_value=set(bound)), \
+             patch.object(pool, "within_boot_grace", return_value=boot_grace), \
+             patch.object(pool, "ensure_fresh_and_fan_out",
+                          side_effect=lambda sid, *a, **k: freshened.append(sid) or True), \
+             patch("storage.subscription_store.list_persisted_binding_sub_ids",
+                   return_value=set(persisted)), \
+             patch("storage.subscription_store.list_subscriptions",
+                   return_value=rows):
+            asyncio.run(tf._tick())
+        return freshened
+
+    def test_unbound_active_oauth_rows_get_freshened(self):
+        """An idle account must not discover a dead grant at the owner's next
+        chat — the tick freshens unbound ACTIVE OAuth rows too."""
+        rows = [
+            {"id": "idle", "auth_type": "oauth", "status": "active"},
+            {"id": "apikey", "auth_type": "api_key", "status": "active"},
+            {"id": "dead", "auth_type": "oauth", "status": "expired"},
+            {"id": "held", "auth_type": "oauth", "status": "active"},
+            {"id": "livebound", "auth_type": "oauth", "status": "active"},
+        ]
+        freshened = self._run_unbound_tick(
+            boot_grace=False, rows=rows, persisted={"held"}, bound={"livebound"},
+        )
+        # 'livebound' via the bound loop; the unbound pass adds ONLY 'idle' —
+        # persisted-binding rows count as bound (their session may be live but
+        # unannounced), non-oauth and non-active rows are skipped.
+        assert freshened == ["livebound", "idle"]
+
+    def test_unbound_pass_stands_down_during_boot_grace(self):
+        rows = [{"id": "idle", "auth_type": "oauth", "status": "active"}]
+        freshened = self._run_unbound_tick(
+            boot_grace=True, rows=rows, persisted=set(),
+        )
+        assert freshened == []

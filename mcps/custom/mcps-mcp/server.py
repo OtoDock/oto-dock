@@ -1,12 +1,15 @@
-"""MCPs-MCP — agents browse + request MCPs from chat.
+"""MCPs-MCP — agents browse + request MCPs and skill packages from chat.
 
 Stdio MCP server that lets an agent inspect the platform's MCP state
-(``list_enabled_mcps``, ``list_available_mcps``) and the community
-catalog (``list_community_mcps``), and act on that state via:
+(``list_enabled_mcps``, ``list_available_mcps``), the community MCP
+catalog (``list_community_mcps``), and the community SKILLS catalog
+(``list_community_skills``), and act on that state via:
 
 - ``request_mcp_install`` / ``request_mcp_access`` (smart-routed: direct
   enable if the MCP is already visible to this agent; admin queue
   otherwise)
+- ``request_skill_install`` (the skills twin: Skills-PATCH direct enable
+  when the package is installed; ``kind: "skill"`` admin request when not)
 - ``disable_mcp_for_agent`` (manager + admin user-scope only — agent-scope
   is gated out to avoid scheduled tasks turning off MCPs they'll need)
 - ``get_request_status`` / ``cancel_my_request`` (request lifecycle helpers)
@@ -23,6 +26,16 @@ Permission gating is resolved ONCE at module load using the auto-injected
 (viewers) end up with an empty tool list — the MCP starts cleanly but exposes
 nothing, which is friendlier to the MCP launcher than ``sys.exit(0)`` would be
 (no spurious failure logs).
+
+This MCP also carries the platform's BUILT-IN skills (``skills/`` +
+manifest ``skills[]``): ``otodock-platform`` (the platform guide) and
+``skill-creator`` (Anthropic's authoring/evals meta-skill, Apache-2.0 —
+see its LICENSE.txt). Riding the core MCP means every agent — existing
+and new, viewers included — gets them materialized on-demand with zero
+assignment logic: skill materialization is role- and context-free, and
+the tool gating above never touches it. They are deliberately NOT
+published to the community catalog (flat skill-id namespace — one
+provider per id) and version-lock to the platform build.
 
 All API calls use ``PROXY_URL`` + ``PROXY_API_KEY`` (auto-injected,
 session-scoped JWT) so the platform applies the calling user's role to
@@ -76,7 +89,8 @@ def _resolve_tool_set() -> set[str]:
     if SCOPE == "user" and ROLE == "viewer":
         return set()
 
-    read = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps"}
+    read = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps",
+            "list_community_skills"}
     if SCOPE == "agent":
         return read
 
@@ -87,6 +101,7 @@ def _resolve_tool_set() -> set[str]:
     manager = read | {
         "request_mcp_install",
         "request_mcp_access",
+        "request_skill_install",
         "disable_mcp_for_agent",
         "get_request_status",
         "cancel_my_request",
@@ -177,6 +192,10 @@ async def _put(path: str, body: dict[str, Any] | None = None) -> Any:
     return await _request("PUT", path, body=body or {})
 
 
+async def _patch(path: str, body: dict[str, Any] | None = None) -> Any:
+    return await _request("PATCH", path, body=body or {})
+
+
 # ---------------------------------------------------------------------------
 # 60s in-process cache for catalog reads
 # ---------------------------------------------------------------------------
@@ -251,8 +270,13 @@ _ALL_TOOLS: dict[str, Tool] = {
         name="list_available_mcps",
         description=(
             "List MCPs installed on the platform that are NOT yet enabled "
-            "for this agent. Useful before calling request_mcp_access. "
-            "Returns a markdown table (name | description | category)."
+            "for this agent, in two sections: those request_mcp_access "
+            "enables DIRECTLY (auto-mode, or already authorized by the "
+            "admin — no approval involved), and those where it files a "
+            "request the admin must approve (explicit-mode without an "
+            "instance covering this agent). Covers every install route — "
+            "community catalog, zip upload, repo-shipped. For MCPs not "
+            "installed at all, browse list_community_mcps instead."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
@@ -281,6 +305,61 @@ _ALL_TOOLS: dict[str, Tool] = {
                     ),
                 },
             },
+        },
+    ),
+    "list_community_skills": Tool(
+        name="list_community_skills",
+        description=(
+            "Browse the community SKILLS catalog (standalone Agent Skills "
+            "packages — instruction/reference/script folders, not MCP "
+            "servers) PLUS any skill packages installed on this platform "
+            "outside the catalog (zip installs — marked '(platform)'). "
+            "Filter by substring search. Returns a markdown table "
+            "(name | description | scripts | install_status). scripts=yes "
+            "means the package bundles executable helper scripts the agent "
+            "can run. install_status ∈ {not_installed, "
+            "installed_not_enabled, enabled_for_agent}. Use "
+            "request_skill_install to get one enabled for this agent."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "Optional case-insensitive substring search over "
+                        "name + description."
+                    ),
+                },
+            },
+        },
+    ),
+    "request_skill_install": Tool(
+        name="request_skill_install",
+        description=(
+            "Get a community SKILL PACKAGE enabled for this agent. Smart-"
+            "routes: if the package is already installed on the platform, "
+            "its skills are enabled for this agent directly (manager-level, "
+            "no admin). Only when the package isn't installed does this "
+            "file a request the admin must approve (they see your reason). "
+            "Use skill names from list_community_skills."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "Skill package slug (see list_community_skills).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Short justification shown to the admin (~100 chars) "
+                        "when a request is filed."
+                    ),
+                },
+            },
+            "required": ["skill_name", "reason"],
         },
     ),
     "request_mcp_install": Tool(
@@ -427,46 +506,65 @@ async def _handle_list_enabled_mcps(_args: dict) -> str:
 
 
 async def _handle_list_available_mcps(_args: dict) -> str:
-    """Installed-on-platform but NOT enabled for this agent.
+    """Installed-on-platform but NOT enabled for this agent, split by what
+    ``request_mcp_access`` will do about it.
 
-    Sourced from the community catalog with ``?agent=`` scoping — that's the
-    same endpoint the Browse drawer uses, and it already tags
-    ``installed`` + ``enabled_for_agents`` per row.
+    Sourced from the agent MCPs endpoint (registry-backed) with
+    ``include_unauthorized=true`` — NOT from the community catalog, which
+    only knows published MCPs and is blind to zip/manual installs. Rows with
+    ``authorized: true`` are one ``request_mcp_access`` call away (direct
+    enable, no admin); ``authorized: false`` rows are explicit-mode MCPs the
+    admin still has to put on an instance (the same call files the request).
     """
     if not AGENT_NAME:
         return "❌ Error: agent context unavailable"
-    cache_key = f"catalog:{AGENT_NAME}"
+    cache_key = f"available:{AGENT_NAME}"
     cached = _cache_get(cache_key)
     if cached is None:
-        data = await _get("/v1/community/mcps", params={"agent": AGENT_NAME})
+        data = await _get(
+            f"/v1/agents/{AGENT_NAME}/mcps",
+            params={"include_unauthorized": "true"},
+        )
         _cache_put(cache_key, data)
     else:
         data = cached
 
-    rows = []
+    direct: list[dict] = []
+    needs_admin: list[dict] = []
     for m in (data or {}).get("mcps", []):
-        if not m.get("installed"):
+        if m.get("enabled"):
             continue
-        if AGENT_NAME in (m.get("enabled_for_agents") or []):
-            continue
-        rows.append(m)
+        (direct if m.get("authorized", True) else needs_admin).append(m)
 
-    if not rows:
+    if not direct and not needs_admin:
         return (
-            "No community MCPs are installed on the platform but missing "
-            f"from **{AGENT_NAME}**."
+            f"Every MCP installed on the platform is already enabled for "
+            f"**{AGENT_NAME}**. For MCPs not installed at all, browse "
+            f"`list_community_mcps`."
         )
-    body = _md_table(
-        ["name", "category", "description"],
-        [
-            [m.get("name", ""), m.get("category", ""), _truncate(m.get("description", ""))]
-            for m in sorted(rows, key=lambda r: r.get("name", ""))
-        ],
-    )
-    return (
-        f"Installed-but-not-enabled MCPs ({len(rows)}). Call "
-        f"`request_mcp_access` to ask the admin to enable one:\n\n{body}"
-    )
+
+    def _table(rows: list[dict]) -> str:
+        return _md_table(
+            ["name", "category", "description"],
+            [
+                [m.get("name", ""), m.get("category", ""), _truncate(m.get("description", ""))]
+                for m in sorted(rows, key=lambda r: r.get("name", ""))
+            ],
+        )
+
+    parts = [f"MCPs available to **{AGENT_NAME}** but not enabled:"]
+    if direct:
+        parts.append(
+            f"\n## Enable directly ({len(direct)}) — `request_mcp_access` "
+            f"enables these immediately, no admin approval\n\n{_table(direct)}"
+        )
+    if needs_admin:
+        parts.append(
+            f"\n## Requires admin authorization ({len(needs_admin)}) — "
+            f"`request_mcp_access` files a request; the admin attaches this "
+            f"agent to an instance on approval\n\n{_table(needs_admin)}"
+        )
+    return "\n".join(parts)
 
 
 async def _handle_list_community_mcps(args: dict) -> str:
@@ -514,6 +612,137 @@ async def _handle_list_community_mcps(args: dict) -> str:
         rows,
     )
     return f"Community catalog matches ({len(rows)}):\n\n{body}"
+
+
+async def _handle_list_community_skills(args: dict) -> str:
+    if not AGENT_NAME:
+        return "❌ Error: agent context unavailable"
+    search = (args.get("search") or "").strip().lower()
+
+    cache_key = f"skills-catalog:{AGENT_NAME}"
+    cached = _cache_get(cache_key)
+    if cached is None:
+        data = await _get("/v1/community/skills", params={"agent": AGENT_NAME})
+        _cache_put(cache_key, data)
+    else:
+        data = cached
+
+    if (data or {}).get("catalog_unreachable"):
+        return "⚠️ The skills catalog is currently unreachable — try again later."
+    entries = (data or {}).get("skills", [])
+    if search:
+        def _hit(e: dict) -> bool:
+            hay = f"{e.get('name') or ''} {e.get('description') or ''}".lower()
+            return search in hay
+        entries = [e for e in entries if _hit(e)]
+
+    # Platform-installed standalone packages OUTSIDE the catalog (zip
+    # installs) — the agent should see everything it could enable, not just
+    # the published catalog.
+    catalog_names = {e.get("name") for e in (data or {}).get("skills", [])}
+    extra: dict[str, dict] = {}
+    try:
+        ag = await _get(f"/v1/agents/{AGENT_NAME}/skills")
+        for s in (ag or {}).get("skills", []):
+            if not s.get("standalone") or s.get("mcp_name") in catalog_names:
+                continue
+            rec = extra.setdefault(s["mcp_name"], {
+                "descs": [], "enabled": False, "scripts": False})
+            rec["descs"].append(s.get("description") or "")
+            rec["enabled"] = rec["enabled"] or bool(s.get("enabled"))
+            rec["scripts"] = rec["scripts"] or bool(s.get("has_scripts"))
+    except _ApiError:
+        pass  # listing degrades to catalog-only
+    if search:
+        extra = {n: r for n, r in extra.items()
+                 if search in f"{n} {' '.join(r['descs'])}".lower()}
+
+    if not entries and not extra:
+        return "No community skills match those filters."
+
+    rows = []
+    for e in sorted(entries, key=lambda x: x.get("name", "")):
+        rows.append([
+            e.get("name", ""),
+            _truncate(e.get("description", "")),
+            "yes" if e.get("has_scripts") else "no",
+            _install_status_for(e),
+        ])
+    for name in sorted(extra):
+        rec = extra[name]
+        rows.append([
+            name,
+            _truncate("; ".join(d for d in rec["descs"] if d)),
+            "yes" if rec["scripts"] else "no",
+            ("enabled_for_agent" if rec["enabled"]
+             else "installed_not_enabled") + " (platform)",
+        ])
+    body = _md_table(["name", "description", "scripts", "install_status"], rows)
+    return f"Community skills matches ({len(rows)}):\n\n{body}"
+
+
+async def _try_enable_skill_directly(skill_name: str) -> tuple[str, str | None]:
+    """If the package is installed and visible to this agent, enable its
+    skills via the Skills PATCH (manager-level; enabling auto-assigns the
+    package — the same route as the dashboard's Skills tab).
+
+    Returns ``(status, message)``: ``"enabled"`` / ``"already_enabled"``
+    with a confirmation, or ``("not_installed", None)`` — the caller falls
+    through to the admin request flow."""
+    data = await _get(f"/v1/agents/{AGENT_NAME}/skills")
+    rows = [s for s in (data or {}).get("skills", [])
+            if s.get("standalone") and s.get("mcp_name") == skill_name]
+    if not rows:
+        return "not_installed", None
+    if all(s.get("enabled") for s in rows):
+        return "already_enabled", (
+            f"ℹ️ Skill package `{skill_name}` is already enabled for "
+            f"**{AGENT_NAME}** ({len(rows)} skill(s)). No action needed."
+        )
+    for s in rows:
+        if not s.get("enabled"):
+            await _patch(
+                f"/v1/agents/{AGENT_NAME}/skills/{s['id']}",
+                {"enabled": True, "exclude_from": s.get("exclude_from") or []},
+            )
+    _cache_invalidate()
+    names = ", ".join(f"`{s['id']}`" for s in rows)
+    return "enabled", (
+        f"✅ Skill package `{skill_name}` enabled for **{AGENT_NAME}** "
+        f"directly ({names}) — it was already installed on the platform "
+        f"(no admin approval needed). New sessions pick the skills up."
+    )
+
+
+async def _handle_request_skill_install(args: dict) -> str:
+    """Smart-route for skill packages: direct enable when installed,
+    admin request (``kind: "skill"``) when not."""
+    if not AGENT_NAME:
+        return "❌ Error: agent context unavailable"
+    skill_name = (args.get("skill_name") or "").strip()
+    reason = (args.get("reason") or "").strip()
+    if not skill_name:
+        return "❌ Error: skill_name is required"
+    if not reason:
+        return "❌ Error: reason is required (the admin will see it)"
+
+    status, msg = await _try_enable_skill_directly(skill_name)
+    if status in ("enabled", "already_enabled"):
+        return msg or "ok"
+
+    result = await _post(
+        f"/v1/agents/{AGENT_NAME}/mcp-requests",
+        {"mcp_name": skill_name, "reason": reason, "kind": "skill"},
+    )
+    _cache_invalidate()
+    rid = (result or {}).get("id")
+    req_status = (result or {}).get("status") or "pending"
+    return (
+        f"✅ Request #{rid} submitted (skill=`{skill_name}`, "
+        f"status={req_status}). The admin will be notified — this skill "
+        f"package isn't installed on the platform yet. Track it with "
+        f"get_request_status."
+    )
 
 
 async def _try_enable_directly(mcp_name: str) -> tuple[str, str | None]:
@@ -707,6 +936,8 @@ _DISPATCH = {
     "list_enabled_mcps": _handle_list_enabled_mcps,
     "list_available_mcps": _handle_list_available_mcps,
     "list_community_mcps": _handle_list_community_mcps,
+    "list_community_skills": _handle_list_community_skills,
+    "request_skill_install": _handle_request_skill_install,
     "request_mcp_install": _handle_request_install,
     "request_mcp_access": _handle_request_access,
     "disable_mcp_for_agent": _handle_disable_mcp,

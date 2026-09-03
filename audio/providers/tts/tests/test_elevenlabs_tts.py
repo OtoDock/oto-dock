@@ -51,6 +51,10 @@ def test_validate_advanced():
          "chunk_length_schedule": [50, 120]},
     )
     assert ok == {}
+    # Lower bound is 20 (latency tuning: the phone bridge flushes ~20-char
+    # chunks — the first generation threshold may drop to match them).
+    assert ElevenLabsTTS.validate_advanced(
+        {"chunk_length_schedule": [20, 120]}) == {}
     bad = ElevenLabsTTS.validate_advanced(
         {"model_id": "sonic-3.5", "stability": 2.0, "speed": "fast",
          "chunk_length_schedule": [10]},
@@ -120,6 +124,8 @@ class FakeElevenWS:
         self.prefix_wrong_context = False        # send a stale-context frame first
         self.drop_is_final = False               # simulate a lost final marker
         self.close_next_connection = False       # kill the socket on first frame
+        self.close_on_flush = False              # die at flush with NO audio sent
+        self.error_on_flush: dict | None = None  # one-shot: answer flush with an error frame
         self.server = None
         self.port = 0
 
@@ -145,6 +151,14 @@ class FakeElevenWS:
                 return
             if msg.get("flush") and msg.get("context_id"):
                 cid = msg["context_id"]
+                if self.close_on_flush:
+                    self.close_on_flush = False
+                    await ws.close()
+                    return
+                if self.error_on_flush is not None:
+                    frame, self.error_on_flush = self.error_on_flush, None
+                    await ws.send(json.dumps({**frame, "contextId": cid}))
+                    continue
                 if self.prefix_wrong_context:
                     await ws.send(json.dumps(
                         {"audio": base64.b64encode(b"BAD!").decode(), "contextId": "someone-else"}
@@ -234,6 +248,17 @@ async def test_rate_rebind_reconnects(fake_ws):
     assert "output_format=pcm_24000" in fake_ws.paths[1]
 
 
+async def test_connect_at_session_rate_avoids_rebind(fake_ws):
+    """A session that streams 24 kHz (duplex) prewarms its REAL binding —
+    the first utterance reuses the socket instead of paying a reconnect."""
+    tts = _provider()
+    await tts.connect(output_sample_rate=24000)
+    await _drive_utterance(tts, rate=24000)
+    await tts.close()
+    assert len(fake_ws.paths) == 1
+    assert "output_format=pcm_24000" in fake_ws.paths[0]
+
+
 async def test_voice_rebind_reconnects(fake_ws):
     tts = _provider()
     await tts.connect()
@@ -261,6 +286,34 @@ async def test_reconnect_after_socket_death(fake_ws):
     assert len(fake_ws.paths) == 2
     conn2 = fake_ws.frames[1]
     assert conn2[0]["text"] == " "           # re-sent InitialiseContext
+    assert conn2[-1].get("flush") is True
+
+
+async def test_zero_audio_socket_death_resynthesizes(fake_ws):
+    """The socket dies at flush with NO audio sent (live-hit 2026-08-10:
+    the whole reply played 0 bytes and the session went silently back to
+    listening). Nothing played, so the receive loop must reconnect once
+    and replay the utterance — the reply is spoken, not lost."""
+    fake_ws.close_on_flush = True
+    tts = _provider()
+    await tts.connect()
+    tts.start_streaming_context()
+
+    async def _collect():
+        return [c async for c in tts.receive_audio()]
+
+    recv = asyncio.create_task(_collect())     # recv attached to conn 1
+    await asyncio.sleep(0.05)
+    await tts.send_text_chunk("Hello there")
+    await tts.send_text_chunk("", is_last=True)
+    chunks = await asyncio.wait_for(recv, 5)
+    await tts.close()
+
+    assert chunks == AUDIO_CHUNKS              # the reply survived the death
+    assert len(fake_ws.paths) == 2             # exactly one reconnect
+    conn2 = fake_ws.frames[1]
+    assert conn2[0]["text"] == " "             # re-init on the new socket
+    assert conn2[1]["text"] == "Hello there "  # the utterance replayed
     assert conn2[-1].get("flush") is True
 
 
@@ -295,6 +348,60 @@ async def test_no_frames_after_flush_keeps_long_guard(fake_ws, monkeypatch):
     await tts.close()
     assert chunks == []
     assert elapsed >= el_mod._POST_FLUSH_TAIL_STALL_S + 0.5  # tail guard did NOT fire
+
+
+async def test_natural_end_without_is_final_closes_context(fake_ws):
+    """The multi-context server keeps a flush-drained context REGISTERED
+    (no isFinal ever comes) — five drained utterances used to hit the
+    5-context connection cap and every later reply played as silence
+    (live-hit 2026-08-24). A tail-guard end must fire close_context."""
+    fake_ws.drop_is_final = True
+    tts = _provider()
+    await tts.connect()
+    chunks = await asyncio.wait_for(_drive_utterance(tts), timeout=10)
+    assert chunks == AUDIO_CHUNKS
+    await asyncio.sleep(0.2)   # fire-and-forget close frame
+    flat = [f for conn in fake_ws.frames for f in conn]
+    assert any(f.get("close_context") for f in flat)
+    # The same provider keeps working on the (still live) socket.
+    fake_ws.drop_is_final = True
+    chunks2 = await asyncio.wait_for(_drive_utterance(tts, "Next turn"), timeout=10)
+    await tts.close()
+    assert chunks2 == AUDIO_CHUNKS
+
+
+async def test_context_cap_error_recycles_socket_and_replays(fake_ws):
+    """`max_active_conversations` (code 1008) with zero audio yielded: the
+    connection is saturated with leftover contexts — recycle to a FRESH
+    socket and replay, so the reply is spoken instead of dropped."""
+    fake_ws.error_on_flush = {
+        "error": "max_active_conversations", "code": 1008,
+        "message": "Maximum simultaneous contexts per WebSocket connection exceeded (5).",
+    }
+    tts = _provider()
+    await tts.connect()
+    chunks = await asyncio.wait_for(_drive_utterance(tts), timeout=10)
+    await tts.close()
+    assert chunks == AUDIO_CHUNKS              # the reply survived the cap
+    assert len(fake_ws.paths) == 2             # exactly one fresh socket
+    conn2 = fake_ws.frames[1]
+    assert conn2[0]["text"] == " "             # re-init on the new socket
+    assert conn2[1]["text"] == "Hello there "  # the utterance replayed
+    assert conn2[-1].get("flush") is True
+
+
+async def test_generic_error_frame_ends_and_closes_context(fake_ws):
+    """A non-recoverable error frame still ends the utterance AND retires
+    the context (it never got a server isFinal)."""
+    fake_ws.error_on_flush = {"error": "quota_exceeded", "code": 1008}
+    tts = _provider()
+    await tts.connect()
+    chunks = await asyncio.wait_for(_drive_utterance(tts), timeout=10)
+    await asyncio.sleep(0.2)
+    flat = [f for conn in fake_ws.frames for f in conn]
+    await tts.close()
+    assert chunks == []
+    assert any(f.get("close_context") for f in flat)
 
 
 async def test_cancel_then_immediate_close(fake_ws):

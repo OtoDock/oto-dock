@@ -9,7 +9,7 @@ re-exports CodexEventTranslator (and _codex_tool_summary) for back-compat.
 import logging
 
 import config as app_config
-from core.events.bg_command_state import get_bg_command_registry
+from core.events.bg_command_state import get_bg_command_registry, shorten_label
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
     SUBAGENT_START, SUBAGENT_END, BG_COMMAND_START, BG_COMMAND_END,
@@ -768,8 +768,11 @@ class CodexEventTranslator:
         in the rec for backgroundTerminals/list matching only)."""
         rec["started"] = True
         if self._session_id:
+            # Nudge label: bare command text — the itemId is an app-server
+            # internal the model never sees, so it would only confuse it.
             get_bg_command_registry(self._session_id).register_spawn(
-                item_id, item_id)
+                item_id, item_id,
+                label=shorten_label(rec.get("command", "")))
         return CommonEvent(type=BG_COMMAND_START, data={
             "tool_use_id": item_id,
             "command": rec.get("command", ""),

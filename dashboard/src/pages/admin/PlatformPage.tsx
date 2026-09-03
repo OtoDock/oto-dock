@@ -5,6 +5,7 @@ import ExecutionLayersTab from './ExecutionLayersTab'
 import OtodockTab from './OtodockTab'
 import SystemSettingsTab from './SystemSettingsTab'
 import AudioTab from './AudioTab'
+import PhoneServersTab from './PhoneServersTab'
 import SecurityTab from './SecurityTab'
 
 // ---------------------------------------------------------------------------
@@ -18,6 +19,7 @@ const SETUP_TABS: { id: Tab; label: string }[] = [
   { id: 'execution-layers', label: 'AI Engines' },
   { id: 'otodock', label: 'OtoDock' },
   { id: 'audio', label: 'Audio' },
+  { id: 'phone-servers', label: 'Phone' },
   { id: 'security', label: 'Security' },
   { id: 'system', label: 'System Settings' },
 ]
@@ -43,6 +45,7 @@ export default function PlatformPage() {
       {tab === 'otodock' && <OtodockTab />}
       {tab === 'system' && <SystemSettingsTab />}
       {tab === 'audio' && <AudioTab />}
+      {tab === 'phone-servers' && <PhoneServersTab />}
       {tab === 'security' && <SecurityTab />}
     </div>
   )

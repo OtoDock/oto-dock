@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import AgentLayout from './components/AgentLayout'
@@ -7,7 +7,6 @@ import RequireRole from './components/RequireRole'
 import PlatformSetupGuard from './components/PlatformSetupGuard'
 import AgentGuard from './components/AgentGuard'
 import DefaultAgentRedirect from './components/DefaultAgentRedirect'
-import AgentGrid from './pages/AgentGrid'
 import AuthCallback from './pages/AuthCallback'
 import Overview from './pages/Overview'
 import Schedules from './pages/Schedules'
@@ -40,6 +39,11 @@ import ResetPassword from './pages/ResetPassword'
 import AcceptInvite from './pages/AcceptInvite'
 import Setup2FA from './pages/Setup2FA'
 import NativePasskey from './pages/NativePasskey'
+
+// The agents page carries three.js (the 3D company map) — the app's first
+// lazy route, so the 3D chunk never taxes the initial load. Stale-chunk
+// recovery already exists (vite:preloadError handler in main.tsx).
+const AgentsPage = lazy(() => import('./pages/AgentsPage'))
 
 /**
  * Ensures back button works on secondary pages (settings, agents, admin).
@@ -113,7 +117,14 @@ export default function App() {
           <Route path="user-settings" element={<UserSettings />} />
 
           {/* Agent selector */}
-          <Route path="agents" element={<AgentGrid />} />
+          <Route
+            path="agents"
+            element={
+              <Suspense fallback={<div className="min-h-screen bg-p-bg" />}>
+                <AgentsPage />
+              </Suspense>
+            }
+          />
 
           {/* Per-agent management (no Chat tab) */}
           <Route path="agents/:name" element={<AgentGuard />}>

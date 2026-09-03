@@ -23,6 +23,7 @@ const AUDIO_ADV_DEFAULTS: Record<string, string> = {
 const PHONE_ADV_DEFAULTS: Record<string, string> = {
   bargein_threshold: '0.35', bargein_debounce_ms: '300', bargein_chunk_ratio: '0.5',
   bargein_silence_duration_ms: '500', bargein_timer_s: '0.6',
+  bargein_confirm_timeout_s: '3.0', bargein_resume_grace_s: '1.0',
   turn_complete_timeout_s: '1.0', turn_incomplete_timeout_s: '2.0', turn_classifier_grace_s: '0.0',
   tts_buffer_chars: '20', tts_response_gap_s: '0.4',
   backchannel_min_segments: '1', backchannel_min_gap_s: '0.4',
@@ -90,7 +91,9 @@ function AdvancedSection() {
           {numField('phone', 'bargein_debounce_ms', 'Debounce (ms)', 'Sliding window size')}
           {numField('phone', 'bargein_chunk_ratio', 'Chunk Ratio', 'Required speech ratio in window')}
           {numField('phone', 'bargein_silence_duration_ms', 'Silence Duration (ms)', 'Silence before SPEECH_END during barge-in')}
-          {numField('phone', 'bargein_timer_s', 'Timer (s)', 'Min speech before TTS cancel')}
+          {numField('phone', 'bargein_timer_s', 'Min Speech (s)', 'Shorter speech over playback is ignored (acks, coughs)')}
+          {numField('phone', 'bargein_confirm_timeout_s', 'Confirm Timeout (s)', 'Paused playback resumes if no transcript by then')}
+          {numField('phone', 'bargein_resume_grace_s', 'Resume Grace (s)', 'Wait for the final transcript after speech ends')}
         </div>
       </div>
       <div>

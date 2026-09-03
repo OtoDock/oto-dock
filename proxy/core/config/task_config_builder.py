@@ -37,10 +37,56 @@ class TaskIdentity(NamedTuple):
     role: str                 # admin | manager | viewer
     scope: str                # "agent" | "user"
     creds_user_sub: str | None  # None for agent scope; creator's sub for user scope
+    # Manager-provenance knowledge writes (agent scope only): True when the
+    # dynamic task's creator resolves to a platform admin or a per-agent
+    # MANAGER of this agent AND the caller opted in (``allow_knowledge_rw``).
+    # Re-resolved at every fire, so a demoted/deleted creator loses it at the
+    # next run. Always False for user-scope identities (their username drives
+    # the ordinary owner-tier knowledge path).
+    knowledge_rw: bool = False
+
+
+# Dynamic-task fire shapes eligible for manager-provenance knowledge writes.
+# ``delegate`` is included (operator decision 2026-08-24): a delegate
+# worker's ``created_by`` is the REAL delegating user (spawn_authz uses the
+# acting sub; no-user delegations record the source agent slug, which the
+# provenance check fails closed on), so an agent-scope worker delegated by
+# a manager of the TARGET agent runs with the same knowledge reach that
+# user's own chat on the target already has — user-scope delegate workers
+# on personal-capable targets always had it via the ordinary role path.
+# Meetings / headless apps / phone never carry a task_type and stay False
+# by default.
+_KNOWLEDGE_RW_TASK_TYPES = frozenset(
+    {"scheduled", "one_time", "trigger", "delegate"})
+
+
+def task_allows_knowledge_rw(task_type: str | None) -> bool:
+    """Whether this task shape may opt in to manager-provenance knowledge
+    writes (``resolve_task_identity(allow_knowledge_rw=...)``). Unknown /
+    empty / ``continuation`` types fail closed."""
+    return (task_type or "") in _KNOWLEDGE_RW_TASK_TYPES
+
+
+def _creator_grants_knowledge_rw(agent_name: str, created_by: str | None) -> bool:
+    """Provenance check for the agent-scope branch: the ``created_by`` column
+    is mixed-type (user sub | agent slug | ``"api"``), so the creator must
+    resolve to a REAL platform user — an agent self-scheduling a task can
+    never self-escalate. Grant only for a platform admin or a per-agent
+    MANAGER of THIS agent (per-agent roles only; editors stay False)."""
+    if not created_by:
+        return False
+    creator = task_store.get_user(created_by)
+    if not creator:
+        return False
+    if (creator.get("role") or "") == "admin":
+        return True
+    per_agent = task_store.get_user_agent_roles(created_by).get(agent_name, "")
+    return per_agent == "manager"
 
 
 def resolve_task_identity(
     agent_name: str, scope: str, created_by: str | None,
+    *, allow_knowledge_rw: bool = False,
 ) -> TaskIdentity:
     """Resolve the (username, role, scope, creds_user_sub) a task runs as.
 
@@ -59,6 +105,12 @@ def resolve_task_identity(
       Forcing it here (not just clamping the mount downstream) is what keeps the
       task's CREDENTIALS agent-scope: ``creds_user_sub`` stays ``None`` so the
       session draws on the platform pool, never the creator's subscription.
+    - **knowledge_rw** (agent scope only): computed from ``created_by``
+      provenance when ``allow_knowledge_rw`` is passed — ONLY the scheduler's
+      scheduled / one-time / trigger fire paths (and the WS re-warm of such a
+      run, which rebuilds the same fire) opt in; every other construction
+      site keeps the default False. Baked at spawn: a creator demoted
+      mid-run keeps knowledge RW until that run ends (next fire re-resolves).
     """
     if scope == "user" and created_by and not is_shared_only(agent_name):
         username = task_store.get_username_by_sub(created_by) or ""
@@ -72,9 +124,15 @@ def resolve_task_identity(
         return TaskIdentity(
             username=username, role=role, scope="user", creds_user_sub=created_by,
         )
+    knowledge_rw = (
+        allow_knowledge_rw
+        and _creator_grants_knowledge_rw(agent_name, created_by)
+    )
     if agent_store.is_admin_only(agent_name):
-        return TaskIdentity(username="", role="admin", scope="agent", creds_user_sub=None)
-    return TaskIdentity(username="", role="manager", scope="agent", creds_user_sub=None)
+        return TaskIdentity(username="", role="admin", scope="agent",
+                            creds_user_sub=None, knowledge_rw=knowledge_rw)
+    return TaskIdentity(username="", role="manager", scope="agent",
+                        creds_user_sub=None, knowledge_rw=knowledge_rw)
 
 
 # Background task rules. The subagent paragraph only ships on layers that
@@ -173,8 +231,15 @@ async def build_task_agent_config(
     # of truth (shared with the dashboard WS re-warm path) so a continued
     # task keeps its original scope — see ``resolve_task_identity``. Computed
     # BEFORE the MCP config build so instance-config transforms (e.g.
-    # ssh_hosts) get session context for scope-aware allowlists.
-    identity = resolve_task_identity(agent_name, task.scope, task.created_by)
+    # ssh_hosts) get session context for scope-aware allowlists. The
+    # knowledge-RW opt-in keys on the task SHAPE: scheduled / one-time /
+    # trigger fires only (delegate workers ride this same funnel and must
+    # stay out — see ``task_allows_knowledge_rw``).
+    identity = resolve_task_identity(
+        agent_name, task.scope, task.created_by,
+        allow_knowledge_rw=task_allows_knowledge_rw(
+            getattr(task, "task_type", "") or ""),
+    )
     task_username = identity.username
     task_role = identity.role
     user_sub_for_creds = identity.creds_user_sub  # None for agent scope
@@ -348,6 +413,17 @@ async def build_task_agent_config(
             exclude_keys=bash_env_keys,
         )
 
+    # Attached knowledge libraries — same bake-at-build contract as
+    # config_builder (fail-safe empty: policy denies mirror writes).
+    try:
+        from storage import db_knowledge_libraries as _db_kl
+        _kl_rows = await asyncio.to_thread(
+            _db_kl.attachments_for_consumer, agent_name)
+        _knowledge_libraries = tuple(
+            (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
+            for a in _kl_rows)
+    except Exception:
+        _knowledge_libraries = ()
     task_security = SecurityContext(
         role=task_role,
         username=task_username,             # REAL creator (attribution/identity)
@@ -366,6 +442,8 @@ async def build_task_agent_config(
         session_scope=vis.mount_scope,
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
+        knowledge_libraries=_knowledge_libraries,
+        knowledge_rw=identity.knowledge_rw,
     )
 
     # Resolve dynamic MCP context. Pass user_sub + user_role so manifest
@@ -384,10 +462,17 @@ async def build_task_agent_config(
         user_sub=user_sub_for_creds or "",
         user_role=task_role or "",
         delegation_targets=resolved_targets,
-        # Pre-resolved off-loop: the delegation provider is no-I/O.
+        # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
             dynamic_context.build_delegation_roster, resolved_targets,
         ),
+        meetings_access=await asyncio.to_thread(
+            dynamic_context.build_meetings_access,
+            user_sub_for_creds or "", task_role or "",
+        ),
+        # Agent-scope runs are no-user sessions — their read reach is the
+        # delegation roster (user-scope runs follow the user).
+        nouser_reads=not user_sub_for_creds,
         trigger_payload=trigger_payload,
         is_remote=is_remote,
         target_admin_paired=(task_target_kind == "admin_remote"),
@@ -421,9 +506,12 @@ async def build_task_agent_config(
 
     # Resolve model and effort from the agent's configured defaults — a
     # delegate-spawn per-lane model override beats the default (validated
-    # against the layer's model registry at spawn).
+    # against the layer's model registry at spawn). Layer-aware: when the
+    # run's layer differs from the agent's engine (override_execution_path),
+    # the agent-default model may be foreign to it and must not be stamped
+    # (the provider 400s every turn).
     resolved_model = (getattr(task, "override_model", None)
-                      or config.get_cli_model(agent_name))
+                      or config.get_cli_model(agent_name, layer=execution_path))
     resolved_effort = config.get_cli_effort(agent_name)
 
     # PROXY_TASK_OWNER/USERNAME/SCOPE are now delivered to MCPs via manifest
@@ -576,6 +664,15 @@ async def build_delivery_security_context(
         user_sub=user_sub or "",
         scope_override="user" if user_sub else "agent",
     )
+    try:
+        from storage import db_knowledge_libraries as _db_kl
+        _kl_rows = await asyncio.to_thread(
+            _db_kl.attachments_for_consumer, agent_name)
+        _knowledge_libraries = tuple(
+            (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
+            for a in _kl_rows)
+    except Exception:
+        _knowledge_libraries = ()
     return SecurityContext(
         role=role or "manager",
         username=username,
@@ -594,4 +691,5 @@ async def build_delivery_security_context(
         session_scope=vis.mount_scope,
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
+        knowledge_libraries=_knowledge_libraries,
     )

@@ -77,3 +77,61 @@ describe('QuestionDialog — codex structured answer', () => {
     expect(String(onAnswer.mock.calls[0][0])).toContain('Light')
   })
 })
+
+// The 2026-09-02 bug: long option content (options[].preview — e.g. four full
+// CTA versions to choose between) was silently dropped — the card rendered
+// only label + description, and the user had to re-ask in plain text.
+describe('QuestionDialog — option preview content', () => {
+  const LONG_PREVIEW =
+    'Version 2 — full text:\n"If you want this for your own company, ' +
+    'the code is available on GitHub — link in the description."\n' +
+    'Line three of the long preview stays intact.'
+
+  const CLAUDE_INPUT = {
+    questions: [
+      {
+        header: 'CTA',
+        question: 'Which version?',
+        options: [
+          { label: 'Version 1', description: 'short cut' },
+          { label: 'Version 2', description: 'your framing', preview: LONG_PREVIEW },
+        ],
+      },
+    ],
+  }
+
+  it('renders the full preview content for Claude questions', () => {
+    render(<QuestionDialog toolInput={CLAUDE_INPUT} onAnswer={vi.fn()} />)
+    expect(screen.getByText(/Line three of the long preview stays intact/)).toBeInTheDocument()
+    expect(screen.getByText(/available on GitHub/)).toBeInTheDocument()
+    // label + description still render alongside the preview
+    expect(screen.getByText('Version 2')).toBeInTheDocument()
+    expect(screen.getByText('your framing')).toBeInTheDocument()
+  })
+
+  it('renders previews on the codex structured path too', () => {
+    const input = {
+      questions: [{
+        id: 'q1', header: 'Pick', question: 'Choose one',
+        options: [{ label: 'A', description: 'a', preview: 'FULL BODY A' }],
+      }],
+    }
+    render(
+      <QuestionDialog
+        toolInput={input}
+        requestId="req-9"
+        onAnswer={vi.fn()}
+        onAnswerStructured={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('FULL BODY A')).toBeInTheDocument()
+  })
+
+  it('answer still round-trips the label when a preview was shown', () => {
+    const onAnswer = vi.fn()
+    render(<QuestionDialog toolInput={CLAUDE_INPUT} onAnswer={onAnswer} />)
+    fireEvent.click(screen.getByText('Version 2'))
+    fireEvent.click(screen.getByText('Submit'))
+    expect(onAnswer).toHaveBeenCalledWith('Version 2')
+  })
+})

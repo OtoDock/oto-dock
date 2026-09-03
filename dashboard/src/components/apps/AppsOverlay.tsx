@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useApps, useReorderApps, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { useApps, useHideAppForMe, useReorderApps, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
 import { onFileUpdate } from '../../lib/fileUpdates'
 import { useQueryClient } from '@tanstack/react-query'
 import AppFrame from './AppFrame'
@@ -38,6 +38,8 @@ const LONG_PRESS_MS = 450
 export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: Props) {
   const { data: apps, isLoading } = useApps(agent)
   const unpin = useUnpinApp(agent)
+  const hideForMe = useHideAppForMe(agent)
+  const unhide = useUnhideAppForMe(agent)
   const reorder = useReorderApps(agent)
   const qc = useQueryClient()
 
@@ -46,6 +48,11 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
   // The app id the X was clicked on — confirm renders only while that app
   // is STILL the active tab, so the confirm can never unpin anything else.
   const [confirmUnpinId, setConfirmUnpinId] = useState<string | null>(null)
+  const [showHidden, setShowHidden] = useState(false)
+  // The app document's own scroll offset (AppFrame's onScrollY bridge) —
+  // slides the solo-app ✕ away with the content instead of hovering
+  // permanently over it. Reset on tab switch; AppFrame resets on reload.
+  const [frameScrollY, setFrameScrollY] = useState(0)
   const dragIdRef = useRef<string | null>(null)
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
@@ -54,7 +61,10 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
   const [fadeLeft, setFadeLeft] = useState(false)
   const [fadeRight, setFadeRight] = useState(false)
 
-  const list = useMemo(() => apps ?? [], [apps])
+  // Per-user hidden shared rows stay OFF the strip but power the
+  // "+N hidden" restore affordance (S2).
+  const list = useMemo(() => (apps ?? []).filter((a) => !a.hidden_for_me), [apps])
+  const hiddenList = useMemo(() => (apps ?? []).filter((a) => a.hidden_for_me), [apps])
   const active = list.find((a) => a.id === activeId) ?? list[0] ?? null
   const activeKey = active?.id ?? ''
 
@@ -97,6 +107,9 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
       chip.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
     }
   }, [activeKey])
+
+  // Tab switch shows a fresh document at scroll 0 — snap the ✕ back.
+  useEffect(() => { setFrameScrollY(0) }, [activeKey])
 
   const applyOrder = (ids: string[]) => {
     // Optimistic tab order; the server renumbers within each scope group and
@@ -163,27 +176,55 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
           <rect x="3.75" y="13.25" width="7" height="7" rx="1.5" />
           <rect x="13.25" y="13.25" width="7" height="7" rx="1.5" />
         </svg>
-        <p className="text-sm font-medium text-p-text-secondary">No mini-apps pinned yet</p>
-        <p className="max-w-sm text-xs text-p-text-light">
-          Ask the agent to pin one — e.g. “pin a morning-brief dashboard as a
-          mini-app” — and it appears here for every visit, refreshed by tasks.
+        <p className="text-sm font-medium text-p-text-secondary">
+          {hiddenList.length ? 'All shared apps are hidden' : 'No mini-apps pinned yet'}
         </p>
+        {hiddenList.length ? (
+          <div className="flex flex-wrap items-center justify-center gap-1.5">
+            {hiddenList.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => unhide.mutate(a.id)}
+                className="rounded-full border border-dashed border-p-border px-3 py-1 text-xs text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+                title="Restore to your strip"
+              >
+                {a.title || a.slug} ↺
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="max-w-sm text-xs text-p-text-light">
+            Ask the agent to pin one — e.g. “pin a morning-brief dashboard as a
+            mini-app” — and it appears here for every visit, refreshed by tasks.
+          </p>
+        )}
       </div>
     )
   }
 
   const needsApproval = appNeedsApproval(active)
   const confirmTarget = confirmUnpinId && active?.id === confirmUnpinId ? active : null
+  const stripVisible = list.length > 1 || hiddenList.length > 0
+  // With the strip hidden, the lone app's removal entry point moves to a
+  // small overlay ✕ on the frame — REQUIRED for shared rows: the agent has
+  // no per-user hide path (unpin_app is personal-own or shared-for-everyone
+  // only), so without it a viewer could never park a team dashboard off
+  // their own strip (S2).
+  const soloRemovable =
+    !stripVisible && !!active && (active.can_manage || active.scope === 'shared')
 
   return (
     <div className={`flex flex-1 min-h-0 flex-col bg-p-bg ${topPadding ? 'pt-14' : 'pt-1'}`}>
       {/* Chip strip (ScopeChips design; scope colors match the workspace).
-          Hidden with a SINGLE app — the common shape is one agent dashboard
-          (front-page auto-open shows it clean, no tab chrome); the strip
-          returns the moment a second app is pinned. Unpinning the lone app
-          is agent-mediated (unpin_app) — an accepted trade (operator call,
-          2026-07-11). */}
-      {list.length > 1 && (
+          Hidden with a SINGLE visible app — personal OR shared alike
+          (operator call, 2026-08-15): the common shape is one agent
+          dashboard, and the front-page auto-open shows it clean, no tab
+          chrome. Removal moves to the overlay ✕ (same confirm block; shared
+          rows keep the S2 hide-for-me / unpin-for-everyone split). The
+          strip returns the moment a second app is pinned — and stays
+          whenever hidden apps exist: the "+N hidden" restore chips have no
+          other home. */}
+      {stripVisible && (
       <div className="relative border-b border-p-border-light/60">
         <div
           ref={scrollRef}
@@ -239,11 +280,12 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
                     <span className={`h-1.5 w-1.5 rounded-full ${isActive ? 'bg-white' : 'bg-amber-500'}`}
                           title="Actions pending approval" />
                   )}
-                  {isActive && a.can_manage && (
+                  {isActive && (a.can_manage || a.scope === 'shared') && (
                     <button
                       onClick={(e) => { e.stopPropagation(); setConfirmUnpinId(a.id) }}
-                      title="Unpin this app"
-                      aria-label={`Unpin ${a.title || a.slug}`}
+                      title={a.scope === 'shared' && !a.can_manage
+                        ? 'Hide this app from my strip' : 'Remove this app'}
+                      aria-label={`Remove ${a.title || a.slug}`}
                       className="-mr-1 rounded-full p-0.5 text-white/70 transition-colors hover:bg-white/20 hover:text-white"
                     >
                       <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -262,6 +304,27 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
               </div>
             )
           })}
+          {hiddenList.length > 0 && (
+            <div className="flex shrink-0 snap-start items-center gap-1.5">
+              <button
+                onClick={() => setShowHidden((v) => !v)}
+                className="whitespace-nowrap rounded-full border border-dashed border-p-border px-3 py-1 text-xs text-p-text-light transition-colors hover:bg-p-surface-hover hover:text-p-text-secondary"
+                title="Shared apps you hid from your strip"
+              >
+                +{hiddenList.length} hidden
+              </button>
+              {showHidden && hiddenList.map((a) => (
+                <button
+                  key={a.id}
+                  onClick={() => { unhide.mutate(a.id); setShowHidden(hiddenList.length > 1) }}
+                  className="whitespace-nowrap rounded-full border border-dashed border-p-accent-purple/40 px-3 py-1 text-xs text-p-accent-purple/70 transition-colors hover:bg-p-accent-purple/10 hover:text-p-accent-purple"
+                  title="Restore to your strip"
+                >
+                  {a.title || a.slug} ↺
+                </button>
+              ))}
+            </div>
+          )}
         </div>
         {fadeLeft && (
           <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-linear-to-r from-p-bg to-transparent" />
@@ -272,26 +335,48 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
       </div>
       )}
 
-      {/* Unpin confirmation — always names its target; the X only ever sits
-          on the active chip, and a tab switch cancels the pending confirm. */}
+      {/* Removal confirmation — always names its target; the X sits on the
+          active chip (or the solo-app frame overlay when the strip is
+          hidden), and a tab switch cancels the pending confirm. Shared rows
+          split (S2): "Hide for me" parks it off THIS user's strip only (any
+          role); "Unpin for everyone" is the team-wide soft-unpin (editor+,
+          can_manage). Personal rows keep the single unpin. */}
       {confirmTarget && (
         <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs">
           <span className="text-p-text">
-            Unpin “{confirmTarget.title || confirmTarget.slug}”? The workspace
-            file and the approved actions are kept — ask the agent to pin it
-            back anytime.
+            {confirmTarget.scope === 'shared'
+              ? `Remove “${confirmTarget.title || confirmTarget.slug}”? Hiding
+                 affects only your strip. Restore it anytime from the “hidden”
+                 chip, or ask your agents to pin it back later.`
+              : `Unpin “${confirmTarget.title || confirmTarget.slug}”? The
+                 workspace file and the approved actions are kept — ask the
+                 agent to pin it back anytime.`}
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            <button
-              onClick={() => {
-                setConfirmUnpinId(null)
-                setActiveId(null)
-                unpin.mutate(confirmTarget.id)
-              }}
-              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
-            >
-              Unpin
-            </button>
+            {confirmTarget.scope === 'shared' && (
+              <button
+                onClick={() => {
+                  setConfirmUnpinId(null)
+                  setActiveId(null)
+                  hideForMe.mutate(confirmTarget.id)
+                }}
+                className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+              >
+                Hide for me
+              </button>
+            )}
+            {(confirmTarget.scope !== 'shared' || confirmTarget.can_manage) && (
+              <button
+                onClick={() => {
+                  setConfirmUnpinId(null)
+                  setActiveId(null)
+                  unpin.mutate(confirmTarget.id)
+                }}
+                className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
+              >
+                {confirmTarget.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
+              </button>
+            )}
             <button
               onClick={() => setConfirmUnpinId(null)}
               className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
@@ -307,9 +392,45 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
         <AppApprovalCard key={active.id} app={active} agent={agent} />
       )}
 
-      {/* The app itself */}
-      <div className="flex-1 min-h-0 p-2">
-        {active && <AppFrame app={active} agent={agent} onSendPrompt={onSendPrompt} />}
+      {/* The app itself. `isolate` caps the internal z-layers (✕ over the
+          openurl chip) inside this subtree — without it the ✕'s z-20 ties
+          with the absolute TopBar's z-20 and DOM order painted it OVER the
+          notifications panel (whose z-50 lives INSIDE the TopBar's
+          context). `overflow-hidden` clips the ✕ as it slides away. */}
+      <div className="relative isolate overflow-hidden flex-1 min-h-0 p-2">
+        {active && (
+          <AppFrame
+            app={active}
+            agent={agent}
+            onSendPrompt={onSendPrompt}
+            onScrollY={setFrameScrollY}
+          />
+        )}
+        {/* Solo-app overlay ✕ — small, semi-transparent, INSIDE the frame's
+            top-right corner (no reserved chrome height). z-20 clears the
+            frame's own overlays (openurl consent chip is z-10). Opens the
+            same confirm block as the chip ✕. Anchored to the DOCUMENT's
+            top-right: the shim reports the app's scroll offset and the ✕
+            slides away with the content (no transition — it must track the
+            finger), going inert once mostly gone. */}
+        {soloRemovable && !confirmTarget && active && (
+          <button
+            onClick={() => setConfirmUnpinId(active.id)}
+            title={active.scope === 'shared' && !active.can_manage
+              ? 'Hide this app from my strip' : 'Remove this app'}
+            aria-label={`Remove ${active.title || active.slug}`}
+            style={{
+              transform: `translateY(${-Math.min(frameScrollY, 96)}px)`,
+              opacity: Math.max(0, 1 - frameScrollY / 56),
+              pointerEvents: frameScrollY > 40 ? 'none' : 'auto',
+            }}
+            className="absolute top-3.5 right-3.5 z-20 flex h-6 w-6 items-center justify-center rounded-full border border-p-border-light bg-p-bg/70 text-p-text-light backdrop-blur-sm transition-colors hover:bg-p-surface-hover hover:text-p-text"
+          >
+            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        )}
       </div>
     </div>
   )

@@ -12,6 +12,9 @@ export interface ChatAudioCapability {
   stt_provider_id: number | null
   reason: string
   icons_enabled: boolean
+  /** Full-duplex conversation mode (phone engine on this chat). Absent on
+   *  older proxies — absent means unavailable (fail-closed by design). */
+  duplex?: { available: boolean; reason: string }
 }
 
 export interface TTSPlayOptions {

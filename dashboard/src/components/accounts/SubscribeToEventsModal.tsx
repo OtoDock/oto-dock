@@ -10,6 +10,7 @@
  */
 
 import { useState } from 'react'
+import { safeHref } from '../../lib/safeUrl'
 import {
   useCreateSubscription,
   type WebhookEventCatalogEntry,
@@ -210,7 +211,7 @@ export function SubscribeToEventsModal({
                   <>
                     {' '}
                     <a
-                      href={manualInstructionsUrl}
+                      href={safeHref(manualInstructionsUrl)}
                       target="_blank"
                       rel="noreferrer"
                       className="text-brand hover:underline"

@@ -448,3 +448,18 @@ def test_teardown_bg_resolves_pending_commands_as_killed():
         asyncio.run(run())
     finally:
         _bg_command_registries.pop(sid, None)
+
+
+def test_bg_command_label_is_command_text_not_item_id():
+    # Codex nudge labels carry ONLY the command text — the itemId is an
+    # app-server internal the model never sees.
+    sid = "s-cx-label"
+    try:
+        tr = _tr(sid)
+        _feed(tr, "item/started",
+              item=_cmd_item("i1", command="python train.py --epochs 3"))
+        _feed(tr, "item/agentMessage/delta", itemId="m1", delta="on it")
+        assert get_bg_command_registry(sid).label_for("i1") == \
+            "python train.py --epochs 3"
+    finally:
+        _bg_command_registries.pop(sid, None)

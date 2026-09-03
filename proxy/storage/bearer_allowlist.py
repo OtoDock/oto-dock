@@ -44,6 +44,9 @@ DEFAULT_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("atlassian", "mcp.atlassian.com"),
     ("github", "localhost"),
     ("microsoft", "localhost"),
+    # Postiz Cloud's hosted MCP (postiz-mcp, remote streamable_http) — the
+    # user's Postiz API key is injected as the bearer toward api.postiz.com.
+    ("postiz", "api.postiz.com"),
 )
 
 

@@ -10,8 +10,8 @@
  * access to the community-skills browser.
  */
 
-import { useState } from 'react'
-import { useAdminMcps, useCheckMcpUpdates, useUpdateMcp, useDeleteMcp, McpServer, McpUpdateInfo } from '../../api/mcps'
+import { useRef, useState } from 'react'
+import { useAdminMcps, useCheckMcpUpdates, useUpdateMcp, useDeleteMcp, useInstallSkillZip, McpServer, McpUpdateInfo } from '../../api/mcps'
 import CommunitySkillsBrowser from '../../components/CommunitySkillsBrowser'
 
 export default function SkillsPage() {
@@ -19,6 +19,23 @@ export default function SkillsPage() {
   const [showBrowse, setShowBrowse] = useState(false)
   const { data: updateData, refetch: checkUpdates, isFetching: checkingUpdates } = useCheckMcpUpdates()
   const updates = updateData?.updates || {}
+  const installZip = useInstallSkillZip()
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [installMsg, setInstallMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const handleZipPicked = (file: File | null) => {
+    if (!file) return
+    setInstallMsg(null)
+    installZip.mutate(file, {
+      onSuccess: r => setInstallMsg({
+        ok: true,
+        text: `${r.status === 'updated' ? 'Updated' : 'Installed'} ${r.name} v${r.version}`
+          + (r.has_scripts ? ' (bundles scripts)' : ''),
+      }),
+      onError: e => setInstallMsg({ ok: false, text: (e as Error)?.message || 'Install failed' }),
+    })
+    if (fileRef.current) fileRef.current.value = ''
+  }
 
   if (isLoading) return <div className="text-sm text-p-text-light">Loading skill packages...</div>
 
@@ -49,6 +66,25 @@ export default function SkillsPage() {
           <span className="hidden sm:inline">{checkingUpdates ? 'Checking…' : 'Check Updates'}</span>
           <span className="sm:hidden">{checkingUpdates ? '…' : 'Updates'}</span>
         </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".zip"
+          className="hidden"
+          onChange={e => handleZipPicked(e.target.files?.[0] ?? null)}
+        />
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={installZip.isPending}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-40"
+          title="Upload a skill package zip (manifest.json) or a bare skill folder zip (SKILL.md is the manifest)"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M12 4v12m0-12l-4 4m4-4l4 4" />
+          </svg>
+          <span className="hidden sm:inline">{installZip.isPending ? 'Installing…' : 'Install from Zip'}</span>
+          <span className="sm:hidden">{installZip.isPending ? '…' : 'Zip'}</span>
+        </button>
         <button
           onClick={() => setShowBrowse(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
@@ -62,9 +98,21 @@ export default function SkillsPage() {
       </div>
 
       <p className="text-xs text-p-text-light mb-4">
-        Standalone skill packages installed from the community-skills catalog.
-        Skills are enabled or disabled per agent in Agent Settings → Skills.
+        Standalone skill packages installed from the community-skills catalog
+        or a zip upload (a package with manifest.json, or a bare standard skill
+        folder — SKILL.md is the manifest). Skills are enabled or disabled per
+        agent in Agent Settings → Skills.
       </p>
+
+      {installMsg && (
+        <div className={`mb-3 rounded-sm border px-2 py-1.5 ${installMsg.ok
+          ? 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20'
+          : 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20'}`}>
+          <p className={`text-[11px] whitespace-pre-wrap ${installMsg.ok
+            ? 'text-green-700 dark:text-green-400'
+            : 'text-red-700 dark:text-red-400'}`}>{installMsg.text}</p>
+        </div>
+      )}
 
       {packages.length === 0 && (
         <p className="text-sm text-p-text-light py-4">
@@ -126,6 +174,14 @@ function SkillPackageRow({ pkg, updateInfo }: { pkg: McpServer; updateInfo?: Mcp
             <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400">
               {skillCount} skill{skillCount === 1 ? '' : 's'}
             </span>
+            {pkg.has_scripts && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+                title="This package bundles executable helper scripts the agent can run"
+              >
+                bundles scripts
+              </span>
+            )}
             {agentCount > 0 && (
               <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">
                 enabled on {agentCount} agent{agentCount === 1 ? '' : 's'}

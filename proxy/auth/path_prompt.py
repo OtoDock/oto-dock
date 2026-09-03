@@ -438,6 +438,36 @@ def _get_default_scope(agent: str) -> str:
         return "user"
 
 
+def _library_rows(ctx: SecurityContext, *, session_writes_knowledge: bool) -> list[str]:
+    """Rows for attached shared knowledge libraries (``knowledge/shared/``).
+
+    A library renders RW only when the attachment is writable AND this
+    session could write knowledge anyway (``session_writes_knowledge`` —
+    owner tier, or a manager-provenance task's ``ctx.knowledge_rw``) —
+    mirroring the mount builder's composition. Personal-only mounts pass
+    False (their mirrors are always read-only)."""
+    rows: list[str] = []
+    for entry in (ctx.knowledge_libraries or ()):
+        src, subdir, writable = entry[0], entry[1] or "", bool(entry[2])
+        mount = (f"/knowledge/shared/{src}/{subdir}/" if subdir
+                 else f"/knowledge/shared/{src}/")
+        if writable and session_writes_knowledge:
+            rows.append(
+                f"- `{mount}` (RW) — Shared knowledge "
+                f"library from the **{src}** agent. Edits here flow back to "
+                "that agent's library and every other agent attached to "
+                "it, including the library's `bulletin/` note.\n"
+            )
+        else:
+            rows.append(
+                f"- `{mount}` (RO) — Shared knowledge "
+                f"library from the **{src}** agent (curated by that agent's "
+                "team; read-only here). Its `bulletin/` note is auto-loaded "
+                "into your context.\n"
+            )
+    return rows
+
+
 def _build_folders_section(
     ctx: SecurityContext,
     *,
@@ -461,16 +491,32 @@ def _build_folders_section(
     """
     if not ctx.username:
         # Block F — service session: agent-scope shared dirs only, no user dirs.
-        return (
-            "# Folders\n\n"
-            "You have access to the following folders in this session:\n\n"
+        # Knowledge renders RW only under a manager-provenance task fire
+        # (ctx.knowledge_rw) — matching the mount + hook + write-back gates.
+        frows: list[str] = [
+            "# Folders\n\n",
+            "You have access to the following folders in this session:\n\n",
             "- `/workspace/` (RW) — The agent's shared workspace. Operational "
-            "output goes here.\n"
-            "- `/knowledge/` (RO) — The agent's manager-curated reference "
-            "library. Readable but not editable in this scope.\n\n"
-            "Default workspace for this session is `/workspace/`. Read from "
+            "output goes here.\n",
+        ]
+        if ctx.knowledge_rw:
+            frows.append(
+                "- `/knowledge/` (RW) — The agent's reference library. "
+                "Writable in this run because the schedule was created by a "
+                "manager of this agent.\n"
+            )
+        else:
+            frows.append(
+                "- `/knowledge/` (RO) — The agent's manager-curated reference "
+                "library. Readable but not editable in this scope.\n"
+            )
+        frows.extend(_library_rows(
+            ctx, session_writes_knowledge=ctx.knowledge_rw))
+        frows.append(
+            "\nDefault workspace for this session is `/workspace/`. Read from "
             "`/knowledge/` when reference material is needed.\n\n"
         )
+        return "".join(frows)
 
     # Shared-only HUMAN chat (visibility-modes) — agent-scope mount, role-aware,
     # NO per-user dirs. The shared workspace IS the personal workspace here.
@@ -504,6 +550,8 @@ def _build_folders_section(
                 "- `/knowledge/` (RO) — The agent's manager-curated reference "
                 "library. Read on demand when relevant.\n"
             )
+        srows.extend(
+            _library_rows(ctx, session_writes_knowledge=ctx.effective_config_visible))
         srows.append(
             "\nDefault writes for this session go to `/workspace/` — this agent "
             "has **no personal space**; everything is shared with all its "
@@ -546,6 +594,12 @@ def _build_folders_section(
                 "- `/knowledge/` (RO) — The agent's manager-curated reference "
                 "library. Read on demand when relevant.\n"
             )
+        rows.extend(
+            _library_rows(ctx, session_writes_knowledge=ctx.role in ("manager", "admin")))
+    else:
+        # Personal-only: no shared knowledge folder, but attached libraries
+        # still mount (always read-only in this mode).
+        rows.extend(_library_rows(ctx, session_writes_knowledge=False))
 
     # Agent config — only manager/admin see it at all (incl. Personal-only:
     # managers still curate the persona even with no shared space).
@@ -625,13 +679,16 @@ def _build_building_agents_section(
     tool_lines: list[str] = []
     if has_config:
         tool_lines.append(
-            "- `agent-config-mcp` — edit identity (display name, "
+            "- `agent-config-mcp` — rewrite the persona "
+            "(`update_persona`), edit identity (display name, "
             "description, color), default model, default execution layer, "
             "default scope, and per-agent memory toggles."
         )
     if has_mcps:
         tool_lines.append(
-            "- `mcps-mcp` — browse the community catalog and request "
+            "- `mcps-mcp` — see MCPs installed on this platform but not "
+            "enabled here (`list_available_mcps` — many enable directly, "
+            "no admin needed), browse the community catalog, and request "
             "additional MCPs (tools)."
         )
     if has_creator:
@@ -667,12 +724,25 @@ def _build_building_agents_section(
 
     # Folder bullets adapt to the agent's mode: Personal-only has no shared
     # /knowledge or /workspace; Shared-only has no per-user dirs.
+    persona_write = (
+        "`agent-config-mcp.update_persona(...)`" if has_config
+        else "editing `/config/agent.md`"
+    )
     folder_bullets = [
-        "- Edit the persona: `/config/agent.md` (loaded first every session). "
-        "The persona is the agent's role and soul — its job, working style "
-        "and judgment. Never write capability lists into it: tools bring "
-        "their own instructions when added (MCP skills), and day-to-day "
-        "facts belong in memory, not the persona.\n",
+        # Agent-facing, not manager-facing: WHO the agent is belongs in the
+        # persona, and the agent is the one holding this prompt. Without this
+        # split stated plainly, everything lands in memory instead — memory
+        # has an imperative directive, worked examples and a no-approval
+        # tool, so it wins every ambiguity by default.
+        "- The persona is `/config/agent.md` (loaded first in every "
+        "session) — this agent's role and soul: its job, working style, "
+        "standards and judgment. When this user tells you WHO this agent "
+        f"should be or HOW it should work, write it there via "
+        f"{persona_write}; when they tell you a FACT (people, projects, "
+        "state, preferences), that goes to memory instead. Never write "
+        "capability lists into the persona: tools bring their own "
+        "instructions when added (MCP skills). Persona edits take effect "
+        "in the next new session.\n",
         "- Add always-loaded knowledge: drop markdown files in "
         + "`/config/context/*` (operational rules, business context, vocabulary; "
         + "1MB per file, 5MB total cap, loaded EVERY session).\n",
@@ -686,18 +756,53 @@ def _build_building_agents_section(
             "- Shared collaborative output lives in `/workspace/` (writable by "
             "every user of this agent except viewers).\n"
         )
+    # NOT gated on mount_shared: personal-only agents attach libraries too
+    # (mirror reads work; only MCP file tools lack the root there).
+    folder_bullets.append(
+        "- Agents collaborate through shared knowledge libraries: a "
+        "knowledge folder promoted to a library can be attached to other "
+        "agents (mounted at `/knowledge/shared/…`, optionally writable), "
+        "and its `bulletin/` file is auto-loaded into every attached "
+        "agent's context — the channel for runtime notes every agent of "
+        "a team should see (\"this week we focus on X\", \"new video "
+        "idea landed\"). Platform admins/creators set this up from Agent "
+        "Settings → Shared Knowledge; recommend it (like departments) "
+        "when several agents need shared awareness.\n"
+    )
     if "user" in ctx.available_scopes:
         folder_bullets.append(
             "- Per-user files at `/users/{u}/` are private to each assigned "
             "user.\n"
         )
 
+    # Unconfigured persona: say so ONCE, here, where the only principals who
+    # can fix it are reading (managers/admins on a user-scope session — the
+    # only ones with /config write access). Self-erasing: the moment the
+    # persona holds anything, this line is gone. Local import — this module
+    # stays a pure renderer at import time, and config imports auth.
+    notice = ""
+    try:
+        import config as _config
+        if _config.persona_is_unconfigured(ctx.agent):
+            notice = (
+                f"**The `{ctx.agent}` agent's persona is still empty** — it "
+                "has a title and nothing else, so this agent starts every "
+                "session with no stated role. If this user describes what "
+                "the agent is for, how it should work, or what standards to "
+                f"hold, capture that in the persona via {persona_write} "
+                "rather than only in memory.\n\n"
+            )
+    except Exception:  # noqa: BLE001 — a prompt notice never breaks a session
+        notice = ""
+
     return (
         "# Building Agents\n\n"
-        f"On this platform, agents are folders. As manager you shape the "
-        f"`{ctx.agent}` agent by editing its files and config:\n\n"
+        f"On this platform, agents are folders. As manager, this user shapes "
+        f"the `{ctx.agent}` agent through its files and config — and can ask "
+        f"you to make those changes:\n\n"
+        + notice
         + "".join(folder_bullets)
-        + "\nTools you can use from chat:\n"
+        + "\nTools available from chat:\n"
         f"{tool_block}\n\n"
         f"{scope_close}\n"
     )

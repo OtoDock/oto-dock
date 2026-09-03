@@ -1,6 +1,7 @@
 import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useFcmPush } from '../hooks/useFcmPush'
+import { useWakeWord } from '../hooks/useWakeWord'
 import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
 
@@ -12,6 +13,11 @@ export default function RequireAuth() {
   // Native FCM registration, mounted once at the authenticated app root so it is
   // route-independent; gated on auth (the subscribe endpoint is auth-only).
   useFcmPush(navigate, !!user)
+
+  // Ambient "hey <agent>" listener — same route-independent mount point.
+  // Inert unless the user's wake-word opt-in (default OFF) and every other
+  // gate in the hook pass; yields the mic to duplex/dictation.
+  useWakeWord(navigate, !!user)
 
   if (loading) {
     return (

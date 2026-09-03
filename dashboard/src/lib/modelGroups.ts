@@ -35,6 +35,12 @@ export interface ComputeModelGroupsArgs {
   canRun: Record<string, boolean>
   streaming: boolean
   warming: boolean
+  /** The chat's CURRENT model id (bare, no layer prefix). When the catalog
+   * no longer lists it (retired builtin, removed custom) it is prepended to
+   * the active layer's group so the check row still renders — previously
+   * the task-chat lock path handled this case; the unlock (1.5) moved the
+   * responsibility here. */
+  activeModel?: string
 }
 
 /** The agent's enabled engines this user can run — unfiltered when that
@@ -47,7 +53,7 @@ export function visibleAgentPaths(
 }
 
 export function computeModelGroups(
-  { layers, agentPaths, chatActiveLayer, processAlive, canRun, streaming, warming }: ComputeModelGroupsArgs,
+  { layers, agentPaths, chatActiveLayer, processAlive, canRun, streaming, warming, activeModel }: ComputeModelGroupsArgs,
 ): ModelGroup[] | undefined {
   if (!layers) return undefined
 
@@ -69,6 +75,11 @@ export function computeModelGroups(
       const models = (cap.models || [])
         .filter((m) => m.value !== '')
         .map((m) => ({ value: `${path}::${m.value}`, label: m.label }))
+      if (path === chatActiveLayer && activeModel
+          && !models.some((m) => m.value === `${path}::${activeModel}`)) {
+        // Retired/unlisted current model: keep its check row renderable.
+        models.unshift({ value: `${path}::${activeModel}`, label: activeModel })
+      }
       if (models.length > 0) {
         groups.push({ layer: path, layerLabel: cap.display_name, models })
       }

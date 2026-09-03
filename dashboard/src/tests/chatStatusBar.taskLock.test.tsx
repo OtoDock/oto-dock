@@ -3,10 +3,12 @@ import { render, screen, fireEvent } from '@testing-library/react'
 
 import ChatStatusBar from '@/components/chat/ChatStatusBar'
 
-// ─── Task-run chats: the model/permission selectors show the RUN's facts
-// (agent default model, 'auto' → Don't Ask) read-only — never the viewer's
-// sticky selections, and the model renders even when the layer's current
-// catalog no longer lists it (an agent configured with a retired model id).
+// ─── Lock behaviors of the status-bar selectors.
+// modeLocked: task-run chats keep the RUN's permission posture read-only.
+// modelLocked: INTERACTIVE PTY sessions only since 1.5 — task chats now flow
+// through computeModelGroups like every chat (see modelGroups.test.ts for
+// the alive→same-engine / dead→cross-engine rule and the retired-model
+// prepend); the locked rendering pinned here still covers the PTY lock.
 
 function renderBar(over: Partial<Parameters<typeof ChatStatusBar>[0]> = {}) {
   return render(

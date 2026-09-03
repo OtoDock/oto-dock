@@ -154,6 +154,15 @@ _direct_sessions: dict[str, DirectSession] = {}
 _direct_sessions_lock = asyncio.Lock()
 
 
+async def active_agent_names() -> set[str]:
+    """Agent slugs with a pooled direct-API session (mirrors the cli/codex
+    enumerators; a DirectSession has no subprocess to die, so pool membership
+    IS liveness). Consumed by the agents-map activity pulse."""
+    async with _direct_sessions_lock:
+        return {s.agent_name for s in _direct_sessions.values()
+                if getattr(s, "agent_name", "")}
+
+
 async def create_direct_session(
     session_id: str,
     agent_name: str,

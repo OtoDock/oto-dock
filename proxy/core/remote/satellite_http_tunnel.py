@@ -83,6 +83,9 @@ _ALLOWLIST_REGEXES = [
     re.compile(r"^/v1/internal/memory(/.*)?$"),
     re.compile(r"^/v1/agents/[a-zA-Z0-9_-]+(/.*)?$"),
     re.compile(r"^/v1/community/mcps$"),
+    # mcps-mcp skills catalog listing (2026-08-27; the per-agent skills +
+    # request routes ride the /v1/agents wildcard above).
+    re.compile(r"^/v1/community/skills$"),
     re.compile(r"^/v1/execution-layers$"),
     re.compile(r"^/mcp/[a-z0-9_-]+/.*$"),
 ]
@@ -104,6 +107,17 @@ _REQUEST_QUEUE_SIZE = 64
 # get cleaned up `_STREAM_GRACE_S` past their declared timeout.
 _STREAM_SWEEP_INTERVAL = 60
 _STREAM_GRACE_S = 30
+# Ceilings on satellite-supplied stream parameters. The sweeper only reaps a
+# stream past timeout_s + grace, and request bodies buffer in proxy memory —
+# both must be bounded per stream or one compromised machine can park
+# immortal multi-GB buffers. The body cap matches the satellite-side
+# tunnel's own client_max_size (128 MB).
+_MAX_STREAM_TIMEOUT_S = 15 * 60
+_MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024
+
+
+class _BodyTooLarge(Exception):
+    """Tunneled request body exceeded _MAX_REQUEST_BODY_BYTES."""
 
 
 def _has_traversal(base: str) -> bool:
@@ -305,8 +319,10 @@ class SatelliteHttpTunnelDispatcher:
         path = msg.get("path", "")
         if not _is_allowed_path(path):
             logger.warning(
+                # strip the query string — it can carry session ids / tokens
+                # (same rule as the upstream-error log below)
                 "tunnel: rejected non-allowlisted path: %s (machine %s)",
-                path, machine_id[:8],
+                str(path).split("?", 1)[0][:200], machine_id[:8],
             )
             await self._send_response(
                 manager, machine_id, stream_id,
@@ -318,10 +334,17 @@ class SatelliteHttpTunnelDispatcher:
         # Set up stream tracking BEFORE awaiting anything — if more
         # request_chunk frames are already on the WS, they need a queue.
         key = (machine_id, stream_id)
+        # Clamp the satellite-supplied timeout: the leak sweeper only reaps a
+        # stream past timeout_s + grace, so an absurd value would make it
+        # immortal and let one machine park unbounded buffered streams.
+        try:
+            timeout_s = int(msg.get("timeout_s", 30))
+        except (TypeError, ValueError):
+            timeout_s = 30
         stream = _HttpStream(
             stream_id=stream_id,
             machine_id=machine_id,
-            timeout_s=int(msg.get("timeout_s", 30)),
+            timeout_s=max(1, min(timeout_s, _MAX_STREAM_TIMEOUT_S)),
         )
         async with self._lock:
             if key in self._streams:
@@ -420,8 +443,11 @@ class SatelliteHttpTunnelDispatcher:
             first_body = base64.b64decode(first_body_b64) if first_body_b64 else b""
             if first_msg.get("body_eof", True):
                 body_bytes = first_body
+                if len(body_bytes) > _MAX_REQUEST_BODY_BYTES:
+                    raise _BodyTooLarge()
             else:
                 body_chunks = [first_body] if first_body else []
+                body_total = len(first_body)
                 while True:
                     chunk = await asyncio.wait_for(
                         stream.request_chunks.get(),
@@ -429,7 +455,14 @@ class SatelliteHttpTunnelDispatcher:
                     )
                     chunk_b64 = chunk.get("body_b64", "")
                     if chunk_b64:
-                        body_chunks.append(base64.b64decode(chunk_b64))
+                        decoded = base64.b64decode(chunk_b64)
+                        body_total += len(decoded)
+                        # Same ceiling the satellite-side tunnel enforces —
+                        # without it a machine could drip chunks into an
+                        # unbounded proxy-side buffer (OOM from one peer).
+                        if body_total > _MAX_REQUEST_BODY_BYTES:
+                            raise _BodyTooLarge()
+                        body_chunks.append(decoded)
                     if chunk.get("body_eof"):
                         break
                 body_bytes = b"".join(body_chunks)
@@ -553,6 +586,16 @@ class SatelliteHttpTunnelDispatcher:
                 finally:
                     await resp.aclose()
 
+        except _BodyTooLarge:
+            logger.warning(
+                "tunnel: request body over %d bytes on stream %s — refused",
+                _MAX_REQUEST_BODY_BYTES, stream_id[:8],
+            )
+            await self._send_response(
+                manager, machine_id, stream_id,
+                status=413, headers={}, body=b"",
+                error="request-body-too-large", body_eof=True,
+            )
         except asyncio.TimeoutError:
             logger.warning("tunnel: timeout on stream %s", stream_id[:8])
             await self._send_response(

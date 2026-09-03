@@ -5,9 +5,16 @@
  * inline Approve / Reject actions; failed-install rows get Retry. Resolved
  * rows (installed / rejected / cancelled) are kept visible for an audit
  * trail — toggleable via the "Open only" filter.
+ *
+ * Explicit-mode MCPs: a row whose only blocker is admin instance work
+ * carries the derived `needs_instance` flag — rendered as an amber "Needs
+ * instance" chip (it was never a failure), and its approve/retry dialog
+ * offers an instance selector (or create-instance guidance when none
+ * exist). The chosen instance rides the approve call as `instance_id`.
  */
 
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   useAdminMcpRequests,
   useApproveMcpRequest,
@@ -15,6 +22,10 @@ import {
   McpRequest,
   RequestStatus,
 } from '../../api/community'
+import { useMcpInstances } from '../../api/mcps'
+
+const NEEDS_INSTANCE_TONE =
+  'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
 
 const STATUS_TONE: Record<RequestStatus, string> = {
   pending:        'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400',
@@ -41,8 +52,10 @@ export default function McpRequestsPage() {
   const { data, isLoading } = useAdminMcpRequests(openOnly)
   const approve = useApproveMcpRequest()
   const reject = useRejectMcpRequest()
-  const [resolving, setResolving] = useState<{ id: number; action: 'approve' | 'reject' } | null>(null)
+  const [resolving, setResolving] = useState<{ req: McpRequest; action: 'approve' | 'reject' } | null>(null)
   const [note, setNote] = useState('')
+  // null = "Automatic" (server picks: catch-all / already attached / lowest id)
+  const [instanceId, setInstanceId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const requests = useMemo(() => data?.requests ?? [], [data])
@@ -78,26 +91,37 @@ export default function McpRequestsPage() {
     return merged.map(m => m.group)
   }, [requests])
 
-  const openResolve = (id: number, action: 'approve' | 'reject') => {
-    setResolving({ id, action })
+  const openResolve = (req: McpRequest, action: 'approve' | 'reject') => {
+    setResolving({ req, action })
     setNote('')
+    setInstanceId(null)
     setError(null)
   }
 
   const submitResolve = () => {
     if (!resolving) return
     setError(null)
-    const args = { id: resolving.id, admin_note: note }
-    const mut = resolving.action === 'approve' ? approve : reject
-    mut.mutate(args, {
+    const opts = {
       onSuccess: () => setResolving(null),
-      onError: e => setError((e as Error)?.message || 'Action failed'),
-    })
+      onError: (e: Error) => setError(e?.message || 'Action failed'),
+    }
+    if (resolving.action === 'approve') {
+      approve.mutate({ id: resolving.req.id, admin_note: note, instance_id: instanceId }, opts)
+    } else {
+      reject.mutate({ id: resolving.req.id, admin_note: note }, opts)
+    }
   }
 
-  const onRetry = (id: number) => {
+  const onRetry = (req: McpRequest) => {
+    // A needs-instance row retried blind would just land back where it is —
+    // route it through the dialog so the selector (or the create-instance
+    // guidance) is in front of the admin. Plain failures keep 1-click retry.
+    if (req.needs_instance) {
+      openResolve(req, 'approve')
+      return
+    }
     setError(null)
-    approve.mutate({ id, admin_note: '' }, {
+    approve.mutate({ id: req.id, admin_note: '' }, {
       onError: e => setError((e as Error)?.message || 'Retry failed'),
     })
   }
@@ -140,18 +164,18 @@ export default function McpRequestsPage() {
             <BatchCard
               key={group.key}
               rows={group.rows}
-              onApprove={id => openResolve(id, 'approve')}
-              onReject={id => openResolve(id, 'reject')}
-              onRetry={id => onRetry(id)}
+              onApprove={r => openResolve(r, 'approve')}
+              onReject={r => openResolve(r, 'reject')}
+              onRetry={r => onRetry(r)}
               pending={approve.isPending || reject.isPending}
             />
           ) : (
             <Row
               key={group.key}
               req={group.rows[0]}
-              onApprove={() => openResolve(group.rows[0].id, 'approve')}
-              onReject={() => openResolve(group.rows[0].id, 'reject')}
-              onRetry={() => onRetry(group.rows[0].id)}
+              onApprove={() => openResolve(group.rows[0], 'approve')}
+              onReject={() => openResolve(group.rows[0], 'reject')}
+              onRetry={() => onRetry(group.rows[0])}
               pending={approve.isPending || reject.isPending}
             />
           ),
@@ -160,9 +184,12 @@ export default function McpRequestsPage() {
 
       {resolving && (
         <ResolveModal
+          req={resolving.req}
           action={resolving.action}
           note={note}
           onChangeNote={setNote}
+          instanceId={instanceId}
+          onChangeInstanceId={setInstanceId}
           onSubmit={submitResolve}
           onClose={() => setResolving(null)}
           submitting={approve.isPending || reject.isPending}
@@ -180,15 +207,16 @@ function BatchCard({
   rows, onApprove, onReject, onRetry, pending,
 }: {
   rows: McpRequest[]
-  onApprove: (id: number) => void
-  onReject: (id: number) => void
-  onRetry: (id: number) => void
+  onApprove: (req: McpRequest) => void
+  onReject: (req: McpRequest) => void
+  onRetry: (req: McpRequest) => void
   pending: boolean
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const total = rows.length
   const installed = rows.filter(r => r.status === 'installed').length
-  const failed = rows.filter(r => r.status === 'install_failed').length
+  const needsInst = rows.filter(r => r.status === 'install_failed' && r.needs_instance).length
+  const failed = rows.filter(r => r.status === 'install_failed' && !r.needs_instance).length
   const open = rows.filter(r => r.status === 'pending').length
   const requester = rows[0]
   const agent = rows[0].agent_slug
@@ -207,6 +235,7 @@ function BatchCard({
           <span className="text-xs text-p-text-secondary">
             ({installed}/{total} done
             {failed > 0 ? `, ${failed} failed` : ''}
+            {needsInst > 0 ? `, ${needsInst} need instance` : ''}
             {open > 0 ? `, ${open} pending` : ''})
           </span>
           <span className="text-[11px] text-p-text-light">
@@ -226,9 +255,9 @@ function BatchCard({
             <Row
               key={r.id}
               req={r}
-              onApprove={() => onApprove(r.id)}
-              onReject={() => onReject(r.id)}
-              onRetry={() => onRetry(r.id)}
+              onApprove={() => onApprove(r)}
+              onReject={() => onReject(r)}
+              onRetry={() => onRetry(r)}
               pending={pending}
             />
           ))}
@@ -253,6 +282,9 @@ function Row({
 }) {
   const isPending = req.status === 'pending'
   const isFailed = req.status === 'install_failed'
+  // install_failed + needs_instance is not a failure — the install went
+  // fine, only admin instance work remains. Present it as its own state.
+  const needsInstance = isFailed && !!req.needs_instance
   // Which catalog the request targets — rows created before the skills
   // feature have no `kind` and default to 'mcp'.
   const kind = req.kind ?? 'mcp'
@@ -274,9 +306,17 @@ function Row({
             <span className="text-sm font-medium text-p-text">{req.mcp_name}</span>
             <span className="text-xs text-p-text-light">for</span>
             <span className="text-sm font-medium text-brand">{req.agent_slug}</span>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${STATUS_TONE[req.status]}`}>
-              {STATUS_LABEL[req.status]}
+            <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${needsInstance ? NEEDS_INSTANCE_TONE : STATUS_TONE[req.status]}`}>
+              {needsInstance ? 'Needs instance' : STATUS_LABEL[req.status]}
             </span>
+            {isPending && !!req.needs_instance && (
+              <span
+                className={`text-[10px] px-1.5 py-0.5 rounded-sm ${NEEDS_INSTANCE_TONE}`}
+                title="Explicit-mode MCP with no instance covering this agent — approval will ask you to pick or create one."
+              >
+                needs instance
+              </span>
+            )}
           </div>
           <p className="text-[11px] text-p-text-light mt-1">
             Requested by{' '}
@@ -313,9 +353,11 @@ function Row({
             <details className="mt-1.5">
               <summary className="text-[11px] text-p-text-light cursor-pointer">Install log</summary>
               <pre className={`mt-1 text-[10px] rounded-sm p-2 overflow-x-auto max-h-40 whitespace-pre-wrap ${
-                isFailed
-                  ? 'text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20'
-                  : 'text-p-text-secondary bg-p-surface-hover'
+                needsInstance
+                  ? 'text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20'
+                  : isFailed
+                    ? 'text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20'
+                    : 'text-p-text-secondary bg-p-surface-hover'
               }`}>{req.install_log}</pre>
             </details>
           )}
@@ -346,7 +388,7 @@ function Row({
               disabled={pending}
               className="text-xs px-2 py-1 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 disabled:opacity-40 transition-colors"
             >
-              Retry install
+              {needsInstance ? 'Assign instance…' : 'Retry install'}
             </button>
           )}
         </div>
@@ -360,15 +402,26 @@ function Row({
 // ---------------------------------------------------------------------------
 
 function ResolveModal({
-  action, note, onChangeNote, onSubmit, onClose, submitting,
+  req, action, note, onChangeNote, instanceId, onChangeInstanceId, onSubmit, onClose, submitting,
 }: {
+  req: McpRequest
   action: 'approve' | 'reject'
   note: string
   onChangeNote: (s: string) => void
+  instanceId: number | null
+  onChangeInstanceId: (id: number | null) => void
   onSubmit: () => void
   onClose: () => void
   submitting: boolean
 }) {
+  // Explicit-mode MCPs get an instance selector on approve (or, with zero
+  // instances, guidance instead — approving anyway is allowed and holds the
+  // request as "Needs instance" until an instance covers the agent, at
+  // which point the instance-save hook auto-completes it).
+  const wantsInstanceUi =
+    action === 'approve' && (req.kind ?? 'mcp') === 'mcp' && req.assignment_mode === 'explicit'
+  const { data: instData } = useMcpInstances(wantsInstanceUi ? req.mcp_name : '')
+  const instances = instData?.instances ?? []
   const title = action === 'approve' ? 'Approve request' : 'Reject request'
   const submitLabel = action === 'approve' ? 'Approve' : 'Reject'
   const submitColor = action === 'approve'
@@ -400,10 +453,36 @@ function ResolveModal({
               placeholder={action === 'approve' ? 'e.g. Enabled — Google Maps API key is set under Integrations.' : 'e.g. Use the existing email-server instead — same functionality.'}
             />
           </label>
-          {action === 'approve' && (
+          {wantsInstanceUi && instances.length > 0 && (
+            <label className="block">
+              <span className="text-xs text-p-text-secondary">
+                Instance to authorize <span className="font-medium">{req.agent_slug}</span> on
+              </span>
+              <select
+                value={instanceId === null ? '' : String(instanceId)}
+                onChange={e => onChangeInstanceId(e.target.value === '' ? null : Number(e.target.value))}
+                className="mt-1 w-full text-sm px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-gray-900 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
+              >
+                <option value="">Automatic (catch-all or first instance)</option>
+                {instances.map(i => (
+                  <option key={i.id} value={String(i.id)}>
+                    {i.instance_name}{i.assigned_to_all ? ' · all agents' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {wantsInstanceUi && instances.length === 0 && (
+            <p className={`text-[11px] rounded-lg p-2 ${NEEDS_INSTANCE_TONE}`}>
+              <span className="font-medium">{req.mcp_name}</span> has no instances yet.
+              You can approve now — the request is held as “Needs instance” — then create one under{' '}
+              <Link to="/admin/mcp-servers" className="underline">MCP Servers</Link>{' '}
+              → {req.mcp_name} → Instances; the request completes automatically once an instance covers the agent.
+            </p>
+          )}
+          {action === 'approve' && !wantsInstanceUi && (
             <p className="text-[11px] text-p-text-light">
               Approval will install the MCP if needed and enable it for the requesting agent.
-              For MCPs that need admin instance config (URL/token), enable here and then configure the instance under MCP Servers.
             </p>
           )}
         </div>

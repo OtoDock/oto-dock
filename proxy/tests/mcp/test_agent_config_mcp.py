@@ -90,14 +90,21 @@ class TestPermissionMatrix:
             "OTO_ROLE": "",
             "OTO_SCOPE": "agent",
         })
-        # 16 tools = 4 read + 12 write
-        # Read: get_agent_config, list_available_models, list_context_files, get_memory_settings
-        # Write: update_display_name, update_description, update_color, update_default_model,
+        # 22 tools = 5 read + 17 write
+        # Read: get_agent_config, list_available_models, list_context_files,
+        #       get_memory_settings, list_knowledge_libraries
+        # Write: update_persona, update_display_name, update_description,
+        #        update_color, update_default_model,
         #        update_execution_layers, update_default_layer, update_default_scope,
         #        update_default_execution_mode, set_visibility_mode,
-        #        update_user_memory_enabled, update_agent_memory_enabled, complete_setup
+        #        update_user_memory_enabled, update_agent_memory_enabled, complete_setup,
+        #        share_knowledge_folder, attach_knowledge_library,
+        #        detach_knowledge_library, set_department (platform-role,
+        #        CRITICAL tier — proxy enforces admin/creator server-side)
+        # update_persona is ADVERTISED here but refuses at call time on any
+        # session without a user — see TestUpdatePersona.
         assert len(mod.ENABLED_TOOLS) == len(mod._READ_TOOLS | mod._WRITE_TOOLS)
-        assert len(mod.ENABLED_TOOLS) == 16
+        assert len(mod.ENABLED_TOOLS) == 22
 
 
 class TestManifestSanity:
@@ -192,6 +199,89 @@ class TestSetVisibilityMode:
         out = asyncio.run(mod._tool_set_visibility_mode("bogus"))
         assert "❌" in out
         assert called is False, "an invalid mode must not hit the API"
+
+
+class TestUpdatePersona:
+    """The persona write goes through the proxy file API (role check + git
+    commit + satellite fan-out) and is pinned to owner-tier sessions with a
+    human present — the sandbox mount table's rule, restated where the tool
+    can enforce it (the file API's service-principal path would otherwise
+    skip the role check for a no-user phone session). "Human present" is a
+    non-empty role and no task type: NOT scope, since a Shared-only agent
+    mounts agent-scope for human chats too."""
+
+    def _load(self, role="manager", scope="user", task_type=""):
+        return _load_server({
+            "OTO_AGENT_NAME": "demo", "OTO_ROLE": role, "OTO_SCOPE": scope,
+            "OTO_TASK_TYPE": task_type,
+        })
+
+    def _spy(self, mod):
+        calls: list[tuple[str, str, dict]] = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            return {}
+
+        mod._request = fake_request
+        return calls
+
+    def test_manager_writes_persona_through_file_api(self):
+        mod = self._load()
+        calls = self._spy(mod)
+        out = asyncio.run(mod._tool_update_persona("# Demo\n\nYou are calm."))
+        assert calls == [(
+            "PUT", "/v1/agents/demo/files/config/agent.md",
+            {"content": "# Demo\n\nYou are calm.\n"},
+        )]
+        assert "✅" in out
+        # The agent must be told the edit is not live in THIS session.
+        assert "next new session" in out
+
+    def test_no_user_session_refused(self):
+        # Phone / service sessions carry OTO_SCOPE=agent with no role —
+        # rewriting an agent's soul unattended is exactly what this blocks.
+        mod = self._load(role="", scope="agent")
+        calls = self._spy(mod)
+        out = asyncio.run(mod._tool_update_persona("# Demo\n\nhijacked"))
+        assert "❌" in out and not calls
+
+    def test_owner_tier_agent_scope_chat_allowed(self):
+        # A Shared-only agent mounts agent-scope for HUMAN chats too: an
+        # admin/manager driving one is a user present. Keying on scope
+        # refused every such chat (found live 2026-09-03).
+        for role in ("admin", "manager"):
+            mod = self._load(role=role, scope="agent")
+            calls = self._spy(mod)
+            out = asyncio.run(mod._tool_update_persona("# Demo\n\nYou are calm."))
+            assert "✅" in out, role
+            assert calls == [(
+                "PUT", "/v1/agents/demo/files/config/agent.md",
+                {"content": "# Demo\n\nYou are calm.\n"},
+            )]
+
+    def test_task_fire_refused_even_with_creator_role(self):
+        # Task fires carry their creator's role (manager provenance) but
+        # nobody is watching — OTO_TASK_TYPE marks them unattended.
+        for task_type in ("scheduled", "one_time", "trigger"):
+            mod = self._load(role="manager", scope="agent", task_type=task_type)
+            calls = self._spy(mod)
+            out = asyncio.run(mod._tool_update_persona("# Demo\n\nhijacked"))
+            assert "❌" in out and not calls, task_type
+
+    def test_editor_refused(self):
+        mod = self._load(role="editor")
+        calls = self._spy(mod)
+        out = asyncio.run(mod._tool_update_persona("# Demo\n\nnope"))
+        assert "❌" in out and not calls
+
+    def test_empty_and_oversized_rejected_without_call(self):
+        mod = self._load()
+        calls = self._spy(mod)
+        assert "❌" in asyncio.run(mod._tool_update_persona("   \n  "))
+        assert "❌" in asyncio.run(
+            mod._tool_update_persona("x" * (mod._PERSONA_MAX_BYTES + 1)))
+        assert not calls
 
 
 class TestListContextFiles:

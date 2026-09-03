@@ -83,6 +83,9 @@ export default function MachineUpdateBanner({ machineId }: Props) {
             {' '}failed
             {slice.error ? `: ${slice.error}` : ''}
             {slice.rolledBackTo ? ` (rolled back to ${slice.rolledBackTo})` : ''}.
+            {slice.autoUpdatePaused
+              ? ' Automatic updates are paused for this machine — retry from Platform → Remote Machines (Update now).'
+              : ''}
           </span>
         </div>
         <button

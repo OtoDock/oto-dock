@@ -43,6 +43,9 @@ export interface PinnedApp {
   approval_stale: boolean
   can_approve: boolean
   can_manage: boolean
+  /** This viewer parked the shared app off their own strip (per-user hide —
+   * the row still returns so the hidden affordance can restore it). */
+  hidden_for_me: boolean
 }
 
 /** A Dock FILE pin — a reference only: the Dock reads the content through
@@ -116,6 +119,34 @@ export const useUnpinApp = (agent: string) => {
     mutationFn: async (appId: string) => {
       const res = await apiFetch(`/v1/apps/${appId}`, { method: 'DELETE' })
       if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Unpin failed')
+    },
+    // A standing app can also surface as a Dock pin row — keep both fresh.
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['apps', agent] })
+      qc.invalidateQueries({ queryKey: ['chat-pins'] })
+    },
+  })
+}
+
+/** Per-user hide of a SHARED app (any role): parks it off MY strip only —
+ * the team's view and the row itself are untouched. */
+export const useHideAppForMe = (agent: string) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (appId: string) => {
+      const res = await apiFetch(`/v1/apps/${appId}/hide`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Hide failed')
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['apps', agent] }),
+  })
+}
+
+export const useUnhideAppForMe = (agent: string) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (appId: string) => {
+      const res = await apiFetch(`/v1/apps/${appId}/unhide`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Restore failed')
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ['apps', agent] }),
   })

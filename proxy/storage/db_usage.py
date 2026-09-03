@@ -292,6 +292,25 @@ def get_all_users_usage(start: str, end: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_agent_activity_counts(start: str, end: str) -> dict[str, dict]:
+    """Per-agent activity volume across ALL scopes for the agents-map heat:
+    {agent: {messages, records}}. usage_records is the deliberate heat
+    source — it is small (rollup rows) and indexed by (agent, scope,
+    created_at); chat_messages is the highest-cardinality table in the
+    schema and has no timestamp index, so it must NOT back this."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT agent, COALESCE(SUM(message_count),0) AS messages,"
+            " COUNT(*) AS records"
+            " FROM usage_records WHERE created_at>=%s AND created_at<%s"
+            " AND agent IS NOT NULL AND agent<>''"
+            " GROUP BY agent",
+            (start, end),
+        ).fetchall()
+        return {r["agent"]: {"messages": r["messages"], "records": r["records"]}
+                for r in rows}
+
+
 def get_all_agents_usage(start: str, end: str) -> list[dict]:
     """Agent-scoped usage aggregated per agent."""
     with get_conn() as conn:

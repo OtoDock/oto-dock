@@ -36,8 +36,11 @@ FROM ${NODE_IMAGE} AS node
 
 # --- Dashboard build stage: compile the SPA (only dist/ is copied forward) ---
 # The proxy serves the built dashboard from DASHBOARD_DIST when present (app.py).
-# node_modules (~220 MB) stays in this throwaway stage; only the ~4 MB dist/
+# node_modules (~220 MB) stays in this throwaway stage; only the ~10 MB dist/
 # lands in the final image. Uses relative API paths → no build-time env needed.
+# (The ~18 MB wake-word wasm/model bundle is NOT here — it ships inside
+# proxy/assets/kws via the `COPY proxy/` below, deliberately outside dist/ so
+# `cap sync` never copies it into the APK.)
 FROM ${NODE_IMAGE} AS dashboard
 WORKDIR /build
 COPY dashboard/package.json dashboard/package-lock.json ./
@@ -68,7 +71,7 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # `docker compose` over the socket-proxy (DOCKER_HOST=tcp://...). CLI only; no
 # daemon. Pinned to Debian bookworm's Docker apt channel.
 # (wget is a prerequisite of install-baseline-tools.sh's gh-repo step — present
-# on bare-metal hosts, absent from the slim base, so add it here.)
+# on bare-metal/satellite hosts, absent from the slim base, so add it here.)
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget gnupg \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
@@ -82,8 +85,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # Baseline agent tooling — the single shared installer (git, gh, uv, pnpm,
 # bubblewrap, poppler-utils, sqlite3, the pinned claude/codex CLIs, the git
-# credential helper, best-effort passt/iproute2). Same script the
-# bare-metal install runs, so the sandbox sees identical tools everywhere.
+# credential helper, best-effort passt/iproute2). Same script the satellite +
+# bare-metal installs run, so the sandbox sees identical tools everywhere.
 # Copied first (small, changes rarely) for layer caching. (VERSIONS.md is NOT
 # needed here — the installer carries its own pinned CLI defaults — so it's
 # copied later to keep doc edits from busting this expensive layer.)
@@ -117,6 +120,11 @@ RUN python -m venv /opt/otodock/proxy/venv \
 COPY audio/ /opt/otodock/audio/
 RUN /opt/otodock/proxy/venv/bin/pip install -e /opt/otodock/audio
 
+# Satellite source — the proxy reads its SATELLITE_VERSION at boot (ws/satellite.py)
+# and serves it as the pairing tarball (api/remote/remote_machines.py). Source only;
+# .dockerignore strips its venv/__pycache__. Should the tree ever be absent,
+# the proxy degrades gracefully — see ws/satellite.py::satellite_source_available.
+COPY satellite/ /opt/otodock/satellite/
 
 # App code + MCP manifests + VERSIONS.md (baked). Volumes/binds overlay agents/
 # + config.env at runtime. .dockerignore strips secrets, user data, venvs,

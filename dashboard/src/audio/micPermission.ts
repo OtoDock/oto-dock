@@ -28,7 +28,12 @@ export async function ensureNativeMicPermission(): Promise<void> {
 
   if (!navigator.mediaDevices?.getUserMedia) return // very old WebView → let the plugin try
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    // echoCancellation:false — a grant-only stream must not flip Android
+    // into MODE_IN_COMMUNICATION (in-call volume slider) even transiently;
+    // only hardware-AEC-attached captures trigger that mode.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false },
+    })
     // We only needed the grant — release the mic immediately.
     stream.getTracks().forEach(t => t.stop())
   } catch (e) {

@@ -76,7 +76,8 @@ async def get_user_context_file(
 
     # Validate filename
     file_path = (ctx_dir / filename).resolve()
-    if not str(file_path).startswith(str(ctx_dir)):
+    ctx_root = ctx_dir.resolve()
+    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
         raise HTTPException(403, "Path traversal not allowed")
     if file_path.suffix not in CONTEXT_ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Only {', '.join(CONTEXT_ALLOWED_EXTENSIONS)} files allowed")
@@ -106,7 +107,8 @@ async def set_user_context_file(
     if path.suffix not in CONTEXT_ALLOWED_EXTENSIONS:
         filename = filename + ".md"
     file_path = (ctx_dir / filename).resolve()
-    if not str(file_path).startswith(str(ctx_dir)):
+    ctx_root = ctx_dir.resolve()
+    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
         raise HTTPException(403, "Path traversal not allowed")
 
     file_path.write_text(body.content)
@@ -125,7 +127,8 @@ async def delete_user_context_file(
     ctx_dir = _get_user_context_dir(name, u)
 
     file_path = (ctx_dir / filename).resolve()
-    if not str(file_path).startswith(str(ctx_dir)):
+    ctx_root = ctx_dir.resolve()
+    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
         raise HTTPException(403, "Path traversal not allowed")
     if not file_path.exists():
         raise HTTPException(404, "File not found")

@@ -7,10 +7,12 @@
 import { useState, useCallback } from 'react'
 import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
+  useSetRoutePin, useDeleteRoutePin,
   usePhoneServers, useCreatePhoneServer,
   usePhoneSettings, useSavePhoneSettings,
-  type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
+  type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
 } from '../../api/phone'
+import CallLogModal from '../../components/phone/CallLogModal'
 import {
   useAudioProviders, type AudioProvider,
   useTurnClassifier,
@@ -28,11 +30,15 @@ import { LANGUAGES, baseLang } from '../../audio/lang'
 
 type AdapterType = NonNullable<PhoneServerCreate['adapter_type']>
 
+// 3CX is deliberately absent: deferred until customers ask (backend keeps a
+// graceful stub for any legacy row, but new ones can't be created).
+// Ordered easiest-first (operator decision 2026-08-14): Twilio needs zero
+// infrastructure, FreePBX auto-provisions against an existing box, manual
+// Asterisk is the expert path.
 const ADAPTER_OPTIONS: { value: AdapterType; label: string; hint: string }[] = [
+  { value: 'twilio', label: 'Twilio', hint: 'Buy a number, paste your account SID + auth token, done. Calls enter through your public dashboard URL.' },
+  { value: 'asterisk_freepbx', label: 'FreePBX (automated)', hint: 'FreePBX with GraphQL + AMI — routes auto-provision end to end.' },
   { value: 'asterisk_manual', label: 'Asterisk (manual)', hint: 'Any Asterisk. You install a one-time dialplan snippet; each route gives you the exact AstDB command. No API automation needed.' },
-  { value: 'asterisk_freepbx', label: 'FreePBX (automated)', hint: 'FreePBX with GraphQL + AMI — routes auto-provision end to end. (Coming soon.)' },
-  { value: 'twilio', label: 'Twilio', hint: 'Cloud telephony via REST + Media Streams. (Coming soon.)' },
-  { value: 'three_cx', label: '3CX', hint: '3CX PBX integration. (Coming soon.)' },
 ]
 
 function AddServerForm() {
@@ -40,12 +46,29 @@ function AddServerForm() {
   const [open, setOpen] = useState(false)
   const [name, setName] = useState('')
   const [host, setHost] = useState('')
-  const [adapter, setAdapter] = useState<AdapterType>('asterisk_manual')
+  const [adapter, setAdapter] = useState<AdapterType>('twilio')
+  const [accountSid, setAccountSid] = useState('')
+  const [authToken, setAuthToken] = useState('')
+  const isTwilio = adapter === 'twilio'
+
+  const reset = () => {
+    setName(''); setHost(''); setAdapter('twilio')
+    setAccountSid(''); setAuthToken(''); setOpen(false)
+  }
 
   const submit = () => {
     if (!name.trim()) return
-    create.mutate({ name: name.trim(), adapter_type: adapter, host: host.trim() }, {
-      onSuccess: () => { setName(''); setHost(''); setAdapter('asterisk_manual'); setOpen(false) },
+    // Twilio has no host — its coordinates are the account SID + auth token,
+    // and calls enter through the install's public dashboard URL.
+    const payload = isTwilio
+      ? {
+          name: name.trim(), adapter_type: adapter, host: '',
+          config: { account_sid: accountSid.trim() },
+          ...(authToken.trim() ? { twilio_auth_token: authToken.trim() } : {}),
+        }
+      : { name: name.trim(), adapter_type: adapter, host: host.trim() }
+    create.mutate(payload, {
+      onSuccess: reset,
       onError: (e) => alert((e as Error).message),
     })
   }
@@ -54,12 +77,6 @@ function AddServerForm() {
   const hint = ADAPTER_OPTIONS.find(o => o.value === adapter)?.hint
   return (
     <div className="p-3 border border-p-border-light rounded-lg bg-gray-50 dark:bg-gray-800/40 space-y-2">
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name (e.g. Main PBX)"
-          className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
-        <input value={host} onChange={e => setHost(e.target.value)} placeholder="Host (pbx.example.com)"
-          className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
-      </div>
       <div>
         <label className="block text-xs font-medium text-p-text mb-1">Adapter</label>
         <select value={adapter} onChange={e => setAdapter(e.target.value as AdapterType)}
@@ -68,8 +85,26 @@ function AddServerForm() {
         </select>
         {hint && <p className="text-xs text-p-text-light mt-1">{hint}</p>}
       </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <input value={name} onChange={e => setName(e.target.value)} placeholder={isTwilio ? 'Name (e.g. Twilio)' : 'Name (e.g. Main PBX)'}
+          className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+        {!isTwilio && (
+          <input value={host} onChange={e => setHost(e.target.value)} placeholder="Host (pbx.example.com)"
+            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+        )}
+        {isTwilio && (
+          <input value={accountSid} onChange={e => setAccountSid(e.target.value)} placeholder="Account SID (ACxxxxxxxx…)"
+            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" />
+        )}
+      </div>
+      {isTwilio && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <input type="password" value={authToken} onChange={e => setAuthToken(e.target.value)} placeholder="Auth token (Twilio console)"
+            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" />
+        </div>
+      )}
       <div className="flex gap-2 justify-end">
-        <button onClick={() => setOpen(false)} className="px-3 py-1 text-xs rounded-lg border border-p-border-light text-p-text-secondary">Cancel</button>
+        <button onClick={reset} className="px-3 py-1 text-xs rounded-lg border border-p-border-light text-p-text-secondary">Cancel</button>
         <button onClick={submit} disabled={!name.trim() || create.isPending}
           className="px-3 py-1 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
           {create.isPending ? 'Adding...' : 'Add'}
@@ -112,20 +147,35 @@ function ModeToggle({ value, onChange }: { value: RouteMode; onChange: (v: Route
   return <Toggle checked={value !== 'off'} onChange={v => onChange(v ? 'on' : 'off')} />
 }
 
+// The modal's PIN intent, applied by the parent AFTER the route saves (the
+// PIN travels only through its dedicated write-only endpoints, never in the
+// route payload).
+export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
+
 function RouteModal({
   route, agents, languages, servers, providers, onSave, onClose, saving,
 }: {
-  route: PhoneRouteCreate & { id?: string }
+  route: PhoneRouteCreate & { id?: string; pin_configured?: boolean }
   agents: string[]
   languages: string[]
-  servers: { id: number; name: string }[]
+  servers: { id: number; name: string; adapter_type?: string }[]
   providers: AudioProvider[]
-  onSave: (data: PhoneRouteCreate & { id?: string }) => void
+  onSave: (data: PhoneRouteCreate & { id?: string }, pin: PinIntent) => void
   onClose: () => void
   saving: boolean
 }) {
   const [form, setForm] = useState(route)
+  const selectedServerAdapter = servers.find(sv => sv.id === form.phone_server_id)?.adapter_type
   const set = (field: string, value: unknown) => setForm(prev => ({ ...prev, [field]: value }))
+  // PIN state lives OUTSIDE `form`: the value must never ride the route
+  // payload, and extra keys would false-positive the dirty-close guard.
+  const hasPin = !!route.pin_configured
+  const [pinEnabled, setPinEnabled] = useState(hasPin)
+  const [pinValue, setPinValue] = useState('')
+  const pinDirty = pinEnabled !== hasPin || pinValue !== ''
+  const pinValid =
+    form.direction !== 'inbound' || !pinEnabled
+    || /^\d{4,6}$/.test(pinValue) || (hasPin && pinValue === '')
   const { data: agentTriggers } = useTriggers({ agent: form.agent, scope: 'agent' })
   const createTrigger = useCreateTrigger()
   const [showCreateTrigger, setShowCreateTrigger] = useState(false)
@@ -147,10 +197,10 @@ function RouteModal({
     )
   }
 
-  const canSave = !saving && !!form.agent && !!form.phone_server_id
+  const canSave = !saving && !!form.agent && !!form.phone_server_id && pinValid
 
   // Backdrop click closes the modal; unsaved edits get a confirm first.
-  const dirty = JSON.stringify(form) !== JSON.stringify(route)
+  const dirty = JSON.stringify(form) !== JSON.stringify(route) || pinDirty
   const requestClose = () => {
     if (!dirty || window.confirm('Discard unsaved changes?')) onClose()
   }
@@ -245,13 +295,59 @@ function RouteModal({
                   className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text resize-y"
                   placeholder="TTS greeting text (leave empty for default)" />
               </div>
-              <div>
-                <label className="block text-xs font-medium text-p-text mb-1">AudioSocket UUID</label>
-                <input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
-                  placeholder="(auto-allocated on save)" />
-                <p className="text-xs text-p-text-light mt-1">Auto-allocated when you save — only set this to reuse an existing UUID.</p>
+              <div className="border border-p-border-light rounded-lg p-3 space-y-2">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <span className="text-sm font-medium text-p-text">
+                      Require a PIN
+                      {hasPin && <span className="text-xs text-green-600 ml-1.5">(set)</span>}
+                    </span>
+                    <p className="text-xs text-p-text-light mt-0.5">
+                      Anyone who calls this number must enter this code on the
+                      keypad before the agent answers — even people you know.
+                    </p>
+                  </div>
+                  <Toggle checked={pinEnabled} onChange={setPinEnabled} />
+                </div>
+                {pinEnabled && (
+                  <div>
+                    <input
+                      type="password" inputMode="numeric" autoComplete="off" maxLength={6}
+                      value={pinValue}
+                      onChange={e => setPinValue(e.target.value.replace(/\D/g, ''))}
+                      className="w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono tracking-widest"
+                      placeholder={hasPin ? '••••••' : '4–6 digits'}
+                    />
+                    <p className="text-xs text-p-text-light mt-1">
+                      {hasPin
+                        ? 'Leave empty to keep the current PIN, or type a new one to replace it.'
+                        : 'Enter 4–6 digits. Callers press pound (#) after the code.'}
+                    </p>
+                  </div>
+                )}
+                {!pinEnabled && hasPin && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400">The PIN will be removed when you save.</p>
+                )}
               </div>
+              {/* AudioSocket UUID is Asterisk-family plumbing: the PBX
+                  dialplan/AstDB pins it, so reusing one keeps an existing
+                  PBX config working when a route is recreated. Twilio
+                  matches by server+DID — the field is noise there, hidden
+                  entirely; for Asterisk it lives behind Advanced. */}
+              {selectedServerAdapter !== 'twilio' && (
+                <details className="group">
+                  <summary className="text-xs text-p-text-light cursor-pointer select-none hover:text-p-text">
+                    Advanced
+                  </summary>
+                  <div className="mt-2">
+                    <label className="block text-xs font-medium text-p-text mb-1">AudioSocket UUID</label>
+                    <input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
+                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                      placeholder="(auto-allocated on save)" />
+                    <p className="text-xs text-p-text-light mt-1">Auto-allocated when you save — set it only to reuse a UUID your Asterisk dialplan/AstDB already carries (recreating a route without touching the PBX).</p>
+                  </div>
+                </details>
+              )}
             </>
           )}
 
@@ -346,7 +442,9 @@ function RouteModal({
 
           <div className="flex justify-end gap-2 pt-2 border-t border-p-border-light">
             <button onClick={onClose} className="px-4 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800">Cancel</button>
-            <button onClick={() => onSave(form)} disabled={!canSave}
+            <button
+              onClick={() => onSave(form, { dirty: pinDirty, enabled: pinEnabled, value: pinValue })}
+              disabled={!canSave}
               className="px-4 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
               {saving ? 'Saving...' : 'Save'}
             </button>
@@ -367,23 +465,48 @@ function RoutesSection() {
   const updateMut = useUpdatePhoneRoute()
   const deleteMut = useDeletePhoneRoute()
   const toggleMut = useUpdatePhoneRoute()
-  const [editRoute, setEditRoute] = useState<(PhoneRouteCreate & { id?: string }) | null>(null)
+  const setPinMut = useSetRoutePin()
+  const delPinMut = useDeleteRoutePin()
+  const [editRoute, setEditRoute] = useState<(PhoneRouteCreate & { id?: string; pin_configured?: boolean }) | null>(null)
+  const [logRoute, setLogRoute] = useState<PhoneRoute | null>(null)
 
   const agentSlugs = (agents || []).map(a => a.name)
-  const serverList = (servers || []).map(s => ({ id: s.id, name: s.name }))
+  const serverList = (servers || []).map(s => ({ id: s.id, name: s.name, adapter_type: s.adapter_type }))
   const defaultServerId = (servers || []).find(s => s.is_default)?.id ?? servers?.[0]?.id ?? null
   let configuredLanguages: string[] = []
   try { configuredLanguages = Object.keys(JSON.parse(settings?.phrases || '{}')) } catch { /* empty */ }
 
   const openNew = () => setEditRoute({ ...EMPTY_ROUTE, agent: agentSlugs[0] || '', phone_server_id: defaultServerId })
 
-  const handleSave = (data: PhoneRouteCreate & { id?: string }) => {
-    if (data.id) {
-      const { id, ...rest } = data
-      updateMut.mutate({ id, data: rest }, { onSuccess: () => setEditRoute(null), onError: (e) => alert((e as Error).message) })
+  // The PIN rides its own write-only endpoints AFTER the route saves (on
+  // create the id only exists then). A PIN failure is loud — the route
+  // itself saved fine, but the admin must know the gate isn't armed.
+  const applyPin = (routeId: string, pin: PinIntent, hadPin: boolean) => {
+    if (!pin.dirty) return
+    if (pin.enabled && pin.value) {
+      setPinMut.mutate({ id: routeId, value: pin.value }, {
+        onError: (e) => alert(`Route saved, but setting the PIN failed: ${(e as Error).message}`),
+      })
+    } else if (!pin.enabled && hadPin) {
+      delPinMut.mutate(routeId, {
+        onError: (e) => alert(`Route saved, but removing the PIN failed: ${(e as Error).message}`),
+      })
+    }
+  }
+
+  const handleSave = (data: PhoneRouteCreate & { id?: string; pin_configured?: boolean }, pin: PinIntent) => {
+    // pin_configured is a server-computed flag — never send it back.
+    const { id, pin_configured, ...rest } = data
+    const hadPin = !!pin_configured
+    if (id) {
+      updateMut.mutate({ id, data: rest }, {
+        onSuccess: () => { applyPin(id, pin, hadPin); setEditRoute(null) },
+        onError: (e) => alert((e as Error).message),
+      })
     } else {
-      createMut.mutate(data as PhoneRouteCreate, {
+      createMut.mutate(rest as PhoneRouteCreate, {
         onSuccess: (created) => {
+          if (created?.id) applyPin(created.id, pin, false)
           setEditRoute(null)
           if (created?.provisioning_instructions) alert(created.provisioning_instructions)
         },
@@ -424,7 +547,15 @@ function RoutesSection() {
               {routes.map(r => (
                 <tr key={r.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30">
                   <td className="px-3 py-2 text-p-text">{r.name || r.id.slice(0, 8)}</td>
-                  <td className="px-3 py-2"><Badge variant={r.direction === 'inbound' ? 'blue' : 'amber'}>{r.direction}</Badge></td>
+                  <td className="px-3 py-2">
+                    <Badge variant={r.direction === 'inbound' ? 'blue' : 'amber'}>{r.direction}</Badge>
+                    {r.pin_configured && (
+                      <svg className="inline-block w-3 h-3 ml-1.5 text-p-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-label="PIN protected">
+                        <title>PIN protected</title>
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                      </svg>
+                    )}
+                  </td>
                   <td className="px-3 py-2 text-p-text font-mono text-xs">{r.did || <span className="text-p-text-light">—</span>}</td>
                   <td className="px-3 py-2 text-p-text font-mono text-xs">{r.agent}</td>
                   <td className="px-3 py-2 text-p-text">{r.language}</td>
@@ -432,7 +563,13 @@ function RoutesSection() {
                   <td className="px-3 py-2 text-center">
                     <Toggle checked={r.enabled} onChange={v => toggleMut.mutate({ id: r.id, data: { enabled: v } })} />
                   </td>
-                  <td className="px-3 py-2 text-right space-x-2">
+                  <td className="px-3 py-2 text-right space-x-2 whitespace-nowrap">
+                    <button onClick={() => setLogRoute(r)} title="Call log"
+                      className="text-xs text-p-text-secondary hover:text-brand transition-colors align-middle">
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                    </button>
                     <button onClick={() => setEditRoute({ ...r })} className="text-xs text-brand hover:underline">Edit</button>
                     <button onClick={() => { if (confirm('Delete this route?')) deleteMut.mutate(r.id, { onSuccess: (res) => { if (res?.warning) alert(res.warning) }, onError: (e) => alert((e as Error).message) }) }} className="text-xs text-red-500 hover:underline">Delete</button>
                   </td>
@@ -451,6 +588,7 @@ function RoutesSection() {
           saving={createMut.isPending || updateMut.isPending}
         />
       )}
+      {logRoute && <CallLogModal route={logRoute} onClose={() => setLogRoute(null)} />}
     </>
   )
 }
@@ -559,13 +697,17 @@ function TurnClassifierSection() {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_LANGUAGES = {
+  // NO turn_classifier pins here — matching the server seed since 2026-08-25:
+  // the platform default backend (Groq, Smart Turn fallback when no Groq key)
+  // covers every language, and a restore must not write a stale pin that
+  // would silently override it.
   phrases: {
-    en: { hold_message: 'One moment please, let me check.', greeting_fallback: 'Hello, how can I help you?', turn_classifier: 'smart_turn' },
-    el: { hold_message: 'Μια στιγμή παρακαλώ, θα το ελέγξω.', greeting_fallback: 'Γεια σας, πώς μπορώ να σας βοηθήσω;', turn_classifier: 'groq' },
-    de: { hold_message: 'Einen Moment bitte, ich schaue nach.', greeting_fallback: 'Hallo, wie kann ich Ihnen helfen?', turn_classifier: 'smart_turn' },
-    es: { hold_message: 'Un momento por favor, déjeme comprobar.', greeting_fallback: 'Hola, ¿en qué puedo ayudarle?', turn_classifier: 'smart_turn' },
-    fr: { hold_message: 'Un instant s\'il vous plaît, je vérifie.', greeting_fallback: 'Bonjour, comment puis-je vous aider ?', turn_classifier: 'smart_turn' },
-    it: { hold_message: 'Un momento per favore, controllo subito.', greeting_fallback: 'Salve, come posso aiutarla?', turn_classifier: 'smart_turn' },
+    en: { hold_message: 'One moment please, let me check.', greeting_fallback: 'Hello, how can I help you?' },
+    el: { hold_message: 'Μια στιγμή παρακαλώ, θα το ελέγξω.', greeting_fallback: 'Γεια σας, πώς μπορώ να σας βοηθήσω;' },
+    de: { hold_message: 'Einen Moment bitte, ich schaue nach.', greeting_fallback: 'Hallo, wie kann ich Ihnen helfen?' },
+    es: { hold_message: 'Un momento por favor, déjeme comprobar.', greeting_fallback: 'Hola, ¿en qué puedo ayudarle?' },
+    fr: { hold_message: 'Un instant s\'il vous plaît, je vérifie.', greeting_fallback: 'Bonjour, comment puis-je vous aider ?' },
+    it: { hold_message: 'Un momento per favore, controllo subito.', greeting_fallback: 'Salve, come posso aiutarla?' },
   } as Record<string, Record<string, string>>,
   backchannel: {
     en: ['mhm', 'ok', 'right', 'mm-hmm', 'uh-huh'], el: ['ναι', 'mmm', 'mhm'],
@@ -673,10 +815,15 @@ function LanguagesSection() {
             onBlur={e => { if (e.target.value !== (p.greeting_fallback || '')) updatePhrase('greeting_fallback', e.target.value) }}
             className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="Hello, how can I help you?" />
         </div>
-        <SettingRow label="Turn Classifier" description="Which backend classifies turn completeness">
-          <select value={p.turn_classifier || 'smart_turn'}
+        <SettingRow label="Turn Classifier"
+          description="Which backend classifies turn completeness. Platform default: Groq when a Groq key is configured, Smart Turn otherwise.">
+          {/* Empty value = no per-language pin → the platform default backend
+              decides (the phone daemon ignores a falsy pin). Only an explicit
+              choice here overrides it for this language. */}
+          <select value={p.turn_classifier || ''}
             onChange={e => updatePhrase('turn_classifier', e.target.value)}
             className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+            <option value="">Platform default (Groq → Smart Turn)</option>
             <option value="smart_turn">Smart Turn (audio, local)</option>
             <option value="groq">Groq (text, cloud)</option>
           </select>

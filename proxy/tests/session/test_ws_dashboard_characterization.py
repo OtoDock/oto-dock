@@ -349,9 +349,9 @@ class TestChatTurn:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 # ephemeral end-of-turn ping, routed to the sending device
-                # (NB: today's title uses the agent SLUG, not display name)
+                # (title = the agent DISPLAY NAME since 2026-08-29, via agent_label)
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 # the turn hit the layer with the raw prompt
@@ -430,7 +430,7 @@ class TestChatTurn:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 # the CLI prompt got the sandbox-virtual Read path appended

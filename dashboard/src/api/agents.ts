@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import { useAuth } from '../contexts/AuthContext'
 
@@ -25,11 +25,75 @@ export interface AgentSummary {
   schedule_count: number
   trigger_count: number
   has_workspace: boolean
+  // Departments (agents map): '' = unassigned.
+  department_id?: string
+  department_level_id?: string
+}
+
+export interface CompiledDelegationEdge {
+  target: string
+  department_id: string
+  department_name: string
 }
 
 export interface DelegationTargetsData {
+  // MANUAL targets — what the checkbox UI owns and PUTs back.
   targets: string[]
+  // Department-compiled targets: rendered checked + locked ("via <dept>"),
+  // NEVER included in the PUT payload (the compiler owns those rows).
+  compiled?: CompiledDelegationEdge[]
   available: { name: string; display_name: string; color: string }[]
+}
+
+export interface KnowledgeConsumer {
+  consumer_agent: string
+  writable: boolean
+}
+
+// One library THIS agent shares — a subtree of its knowledge folder
+// ('' subdir = the whole folder). An agent can share several disjoint
+// subtrees as independent libraries.
+export interface KnowledgeLibrary {
+  subdir: string
+  name: string
+  consumers: KnowledgeConsumer[]
+  // A source-resident bulletin/<name>.md exists — its content is injected
+  // into every attached agent's context.
+  has_bulletin: boolean
+}
+
+export interface KnowledgeAttachment {
+  source_agent: string
+  // The attached library's subtree ('' = whole-folder library). Part of
+  // the attachment's identity — every mutation carries it.
+  subdir: string
+  writable: boolean
+  // The library's display label. Empty for libraries shared before names
+  // existed — every surface falls back to source_agent.
+  name: string
+  has_bulletin: boolean
+}
+
+export interface KnowledgeAttachmentsData {
+  // Whether THIS agent shares at least one library.
+  is_library: boolean
+  // THIS agent's own shared libraries (with per-library consumers).
+  libraries: KnowledgeLibrary[]
+  // Libraries this agent consumes (mirrored at
+  // knowledge/shared/<source>/<subdir>/).
+  attachments: KnowledgeAttachment[]
+}
+
+export interface KnowledgeLibrarySummary {
+  source_agent: string
+  subdir: string
+  created_by: string
+  created_at: string
+  // Display label; '' for pre-naming libraries (fall back to source_agent).
+  name: string
+  // Attached-consumer COUNT — the list endpoint aggregates; per-consumer
+  // detail lives on the per-agent attachments GET.
+  consumers: number
 }
 
 export interface AgentInfo {
@@ -58,6 +122,9 @@ export interface AgentInfo {
   // Interactive-CLI per-agent default execution mode: '' (unset)
   // | 'interactive' | '-p'. Only meaningful for CLI execution layers.
   default_execution_mode?: '' | 'interactive' | '-p'
+  // Departments (agents map): '' = unassigned.
+  department_id?: string
+  department_level_id?: string
 }
 
 export interface FileNode {
@@ -69,7 +136,11 @@ export interface FileNode {
   children?: FileNode[]
 }
 
-export const useAgents = (opts?: { all?: boolean }) =>
+// keepPrevious: hold the previous list while a KEY change refetches (the
+// agents map's admin scope toggle flips `all` after ui-prefs land — without
+// this the data drops to [] for a beat and every 3D chip rebuilds). Only
+// the map opts in; other consumers keep the default loading semantics.
+export const useAgents = (opts?: { all?: boolean; keepPrevious?: boolean }) =>
   useQuery({
     queryKey: ['agents', opts?.all ?? false],
     queryFn: async (): Promise<AgentSummary[]> => {
@@ -79,6 +150,7 @@ export const useAgents = (opts?: { all?: boolean }) =>
       return data.agents ?? []
     },
     refetchInterval: 60_000,
+    ...(opts?.keepPrevious ? { placeholderData: keepPreviousData } : {}),
   })
 
 // ---------------------------------------------------------------------------
@@ -478,6 +550,109 @@ export function useSetDelegationTargets() {
     onSuccess: (_, { agent }) => {
       qc.invalidateQueries({ queryKey: ['delegation-targets', agent] })
       qc.invalidateQueries({ queryKey: ['agent-info', agent] })
+      // The 3D map draws from the all-edges feed — a config-page save must
+      // reach it immediately (staleTime hid a removal for up to a minute).
+      qc.invalidateQueries({ queryKey: ['delegation-edges-all'] })
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Shared knowledge libraries — promote an agent's knowledge folder to an
+// installation-wide library and attach it to other agents (mirrored at
+// knowledge/shared/<source>/). The per-agent GET is manager-tier; every
+// mutation is platform admin/creator (backend-enforced).
+// ---------------------------------------------------------------------------
+
+export function useKnowledgeAttachments(agent: string) {
+  return useQuery({
+    queryKey: ['knowledge-attachments', agent],
+    queryFn: async (): Promise<KnowledgeAttachmentsData> => {
+      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments`)
+      if (!res.ok) throw new Error('Failed to fetch knowledge attachments')
+      return res.json()
+    },
+    enabled: !!agent,
+  })
+}
+
+// The installation-wide library list is admin/creator-only server-side (403
+// otherwise) — callers pass enabled=false for other viewers so the query
+// never fires just to be rejected.
+export function useKnowledgeLibraries(enabled: boolean) {
+  return useQuery({
+    queryKey: ['knowledge-libraries'],
+    queryFn: async (): Promise<KnowledgeLibrarySummary[]> => {
+      const res = await apiFetch('/v1/knowledge-libraries')
+      if (!res.ok) throw new Error('Failed to fetch knowledge libraries')
+      const data = await res.json()
+      return data.libraries ?? []
+    },
+    enabled,
+  })
+}
+
+export function useSetKnowledgeLibrary() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ agent, enabled, name, subdir }: {
+      agent: string; enabled: boolean; name?: string; subdir?: string
+    }) => {
+      const res = await apiFetch(`/v1/agents/${agent}/knowledge-library`, {
+        method: 'PUT',
+        // `name` is the library's display label — the server requires it when
+        // enabling and ignores it when un-sharing. `subdir` identifies the
+        // library ('' = whole folder) in both directions.
+        body: JSON.stringify({ enabled, name: name ?? '', subdir: subdir ?? '' }),
+      })
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to update knowledge sharing') }
+      return res.json()
+    },
+    onSuccess: (_, { agent }) => {
+      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
+      qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
+    },
+  })
+}
+
+// Attach a library to `agent`, or update an existing attachment's writable
+// flag — the backend PUT upserts on (source, subdir, consumer).
+export function useAttachKnowledgeLibrary() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ agent, source_agent, subdir, writable }: {
+      agent: string; source_agent: string; subdir?: string; writable: boolean
+    }) => {
+      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments`, {
+        method: 'PUT',
+        body: JSON.stringify({ source_agent, subdir: subdir ?? '', writable }),
+      })
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to attach library') }
+      return res.json()
+    },
+    onSuccess: (_, { agent }) => {
+      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
+      qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
+    },
+  })
+}
+
+export function useDetachKnowledgeLibrary() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ agent, source, subdir }: {
+      agent: string; source: string; subdir?: string
+    }) => {
+      const qs = subdir ? `?subdir=${encodeURIComponent(subdir)}` : ''
+      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments/${source}${qs}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to detach library') }
+      return res.json()
+    },
+    onSuccess: (_, { agent }) => {
+      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
+      qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
     },
   })
 }

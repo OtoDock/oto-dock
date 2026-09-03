@@ -21,6 +21,23 @@ from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
 
 
+# The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
+# the target session must be alive. Tests that exercise the ws route register
+# a fake alive CLI session alongside their notify queue.
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+
+@contextmanager
+def _alive_cli_session(sid):
+    from core.layers.cli import layer as _cli_layer
+    _cli_layer._persistent_sessions[sid] = SimpleNamespace(is_alive=True)
+    try:
+        yield
+    finally:
+        _cli_layer._persistent_sessions.pop(sid, None)
+
+
 def _task() -> TaskDefinition:
     return TaskDefinition(id="task-1", name="sub", agent="pa", prompt="p", scope="agent")
 
@@ -33,6 +50,26 @@ def _delegate_events(chat_id):
 def _assistant_msgs(chat_id):
     return [m for m in task_store.get_chat_messages(chat_id)
             if m.get("role") == "assistant"]
+
+
+class TestDelegateOutputPreview:
+    """The delegate_result bubble payload: bounded, tail-keeping, marked.
+
+    The old silent [:2000] head cut always amputated the worker's final
+    summary (the deliverable lives at the END of a lane narration) — the
+    2026-09-02 "cut mid-word at 'Linke'" bug."""
+
+    def test_under_cap_unchanged(self):
+        assert scheduler._delegate_output_preview("short result") == "short result"
+
+    def test_over_cap_keeps_tail_with_marker(self):
+        text = "HEAD-NARRATION " + ("x" * scheduler._DELEGATE_PREVIEW_CAP) + " FINAL-SUMMARY"
+        preview = scheduler._delegate_output_preview(text)
+        assert preview.startswith("… [output truncated")
+        assert preview.endswith(" FINAL-SUMMARY")
+        assert "HEAD-NARRATION" not in preview
+        # bounded: cap + the marker line
+        assert len(preview) <= scheduler._DELEGATE_PREVIEW_CAP + 120
 
 
 class TestDelegateDelivery:
@@ -69,10 +106,11 @@ class TestDelegateDelivery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-z"] = q
         try:
-            asyncio.run(scheduler._do_deliver(
-                "sess-z", "pa", "echo prompt", _task(),
-                chat_id="chat-z", output_text="THE RESULT",
-            ))
+            with _alive_cli_session("sess-z"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-z", "pa", "echo prompt", _task(),
+                    chat_id="chat-z", output_text="THE RESULT",
+                ))
             assert not q.empty(), "expected a task_result_prompt on the notify queue"
             payload = q.get_nowait()
             assert payload["type"] == "task_result_prompt"
@@ -109,11 +147,12 @@ class TestDelegateDelivery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-s"] = q
         try:
-            asyncio.run(scheduler._do_deliver(
-                "sess-s", "pa", "echo prompt", _task(),
-                chat_id="chat-s", output_text="PARTIAL",
-                status="user_interrupted",
-            ))
+            with _alive_cli_session("sess-s"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-s", "pa", "echo prompt", _task(),
+                    chat_id="chat-s", output_text="PARTIAL",
+                    status="user_interrupted",
+                ))
             payload = q.get_nowait()
             assert payload["status"] == "user_interrupted"
         finally:

@@ -105,6 +105,8 @@ class _FakeLayer:
     def __init__(self):
         self._sessions = {}
         self.adopted = []
+        self.idle_adopted = []
+        self.closed = []
 
     async def adopt_session(self, *, machine_id, session_id, agent_name,
                             command_id, use_native_permissions=False):
@@ -112,6 +114,15 @@ class _FakeLayer:
         self.adopted.append(session_id)
         yield CommonEvent(type=TEXT, data={"content": "recovered answer"})
         yield CommonEvent(type=DONE, data={})
+
+    async def adopt_idle_session(self, *, machine_id, session_id, agent_name,
+                                 use_native_permissions=False):
+        self.idle_adopted.append(session_id)
+        self._sessions[session_id] = object()
+
+    async def close_session(self, session_id):
+        self._sessions.pop(session_id, None)
+        self.closed.append(session_id)
 
 
 class TestOnSessionsAlive:
@@ -150,6 +161,60 @@ class TestOnSessionsAlive:
         assert task_store.get_run(run_id)["status"] == "failed"
         assert "lost" in task_store.get_run(run_id)["error_message"]
         assert sid not in run_recovery._parked
+
+    @pytest.mark.asyncio
+    async def test_idle_session_with_chat_re_leashed(self, temp_db,
+                                                     monkeypatch):
+        """An idle (no turn) session with a chat row must be re-REGISTERED
+        so the idle reaper can leash it — restart-orphaned idle sessions
+        previously lived forever satellite-side and ate the machine's
+        capacity ("at capacity — too many active sessions" on every new
+        spawn)."""
+        _, chat_id, sid = _mk_remote_run(temp_db, status="completed")
+        layer = _FakeLayer()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": False, "agent_slug": "pa",
+        }])
+        assert layer.idle_adopted == [sid]
+        assert layer.closed == []          # has a chat → stays resumable
+        assert layer.adopted == []         # no turn → no recovery pump
+
+    @pytest.mark.asyncio
+    async def test_idle_session_without_chat_closed(self, temp_db,
+                                                    monkeypatch):
+        """A reported idle session with NO chat row is junk — register then
+        close it immediately (the close path needs the registry entry to
+        reach the satellite)."""
+        layer = _FakeLayer()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+
+        sid = uuid.uuid4().hex
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": False,
+        }])
+        assert layer.idle_adopted == [sid]
+        assert layer.closed == [sid]
+
+    @pytest.mark.asyncio
+    async def test_idle_session_already_registered_skipped(self, temp_db,
+                                                           monkeypatch):
+        """A reconnect blip reports sessions the proxy still tracks (grace)
+        — no double registration."""
+        _, chat_id, sid = _mk_remote_run(temp_db, status="completed")
+        layer = _FakeLayer()
+        layer._sessions[sid] = object()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": False,
+        }])
+        assert layer.idle_adopted == []
+        assert layer.closed == []
 
 
 class TestSweepExpired:

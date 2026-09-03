@@ -39,6 +39,8 @@ _ENGINE_LABELS = {
 from api.agents import discovery as _discovery
 from api.agents import files as _files
 from api.agents import user_context as _user_context
+from api.agents import activity as _activity
+from api.agents import knowledge_libraries as _knowledge_libraries
 
 # Backwards-compatible re-exports: api.media.* and the test-suite import these
 # helpers/handlers from ``api.agents.agents``.
@@ -50,8 +52,14 @@ restore_recover_bin = _files.restore_recover_bin
 discard_recover_bin = _files.discard_recover_bin
 
 # Reference the side-effect-only modules so linters see the imports as used
-# (importing them is what registers the discovery/user-context routes).
-_SECTION_MODULES = (_discovery, _files, _user_context)
+# (importing them is what registers the discovery/user-context/knowledge-
+# library routes). EVERY section module MUST appear here: an import missing
+# from this tuple reads as unused to ruff, and a `--fix` silently deletes it
+# — which unregistered all knowledge-library routes on 2026-08-28 (404s in
+# the agent config's Shared Knowledge card). tests/api/test_route_registry.py
+# pins the route set against exactly that.
+_SECTION_MODULES = (_discovery, _files, _user_context, _activity,
+                    _knowledge_libraries)
 
 
 def _require_admin(user: UserContext | None) -> UserContext:
@@ -99,6 +107,11 @@ class UpdateAgentRequest(BaseModel):
     # Per-agent default execution mode: "" (unset) | "interactive" | "-p".
     # Only valid when the agent's default model is a CLI execution layer.
     default_execution_mode: str | None = None
+    # Departments (agents map): ONE department per agent; set BOTH to assign,
+    # both "" to clear. Cookie admins + creators only (field-level gate in
+    # update_agent — assigning wires delegation edges into other teams).
+    department_id: str | None = None
+    department_level_id: str | None = None
 
 
 class DeleteAgentRequest(BaseModel):
@@ -344,6 +357,49 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         if ep == "direct-llm":
             raise HTTPException(400, "Direct LLM agents always run locally")
 
+    # Department assignment (agents map). The endpoint gate above
+    # (can_manage_agent) still applies — this field gate NARROWS within it,
+    # same layering as execution_target: a manager reaches the endpoint and is
+    # rejected only on this field. Wiring an agent into a department creates
+    # delegation edges into OTHER teams, so it is platform-role territory.
+    # WIDENED 2026-08-15 (operator decision, shared-libraries design
+    # § D-MCP) from cookie-only to
+    # ``acting_sub``-backed principals: a REAL-USER session token with
+    # admin/creator platform role may now assign departments too — the
+    # agent-config-mcp ``set_department`` tool rides this, sitting in the
+    # CRITICAL permission tier — always prompts, in EVERY mode incl.
+    # dontAsk, and is denied outright in no-human contexts — so a human
+    # approves each call in chat (the mitigation for the prompt-injection
+    # vector the old cookie-only predicate defended against). Master key +
+    # no-user sessions stay out.
+    _req_dept = getattr(req, "department_id", None)
+    _req_dept_level = getattr(req, "department_level_id", None)
+    if _req_dept is not None or _req_dept_level is not None:
+        if u.acting_sub is None or u.role not in ("admin", "creator"):
+            raise HTTPException(
+                403,
+                "Only admins and creators can change an agent's department.",
+            )
+        _dept = (_req_dept or "").strip()
+        _level = (_req_dept_level or "").strip()
+        if bool(_dept) != bool(_level):
+            raise HTTPException(
+                400,
+                "department_id and department_level_id must be set together "
+                "(or both empty to clear the assignment).",
+            )
+        if _dept:
+            from storage import db_departments
+            dept_row = await asyncio.to_thread(
+                db_departments.get_department, _dept
+            )
+            if not dept_row:
+                raise HTTPException(400, "Department not found")
+            if _level not in {lv["id"] for lv in dept_row["levels"]}:
+                raise HTTPException(
+                    400, "Level does not belong to that department"
+                )
+
     fields = req.model_dump(exclude_none=True)
     # Keep the PRIMARY execution layer consistent with the default model whenever
     # EITHER is updated. A no-picker session/task uses (primary layer + default
@@ -402,6 +458,10 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     result = await asyncio.to_thread(agent_store.update_agent, name, **fields)
     if not result:
         raise HTTPException(404, "Agent not found")
+    # Membership changed → the department edge set changed with it.
+    if "department_id" in fields or "department_level_id" in fields:
+        from services.departments import edge_compiler
+        await asyncio.to_thread(edge_compiler.recompile)
     # If this update put the agent into Shared-only mode (one shared chat history
     # across all users), drop any user→personal-machine overrides for it: a
     # shared-only agent may not run on a personal machine. Admin defaults (admin
@@ -493,10 +553,26 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
             name,
         )
 
+    # Knowledge-library consumers must be read BEFORE the DB cascade wipes
+    # the attachment rows — their mirror dirs live in OTHER agents' trees,
+    # which the rmtree below never reaches.
+    from storage import db_knowledge_libraries
+    _lib_consumers = [
+        a["consumer_agent"] for a in await asyncio.to_thread(
+            db_knowledge_libraries.consumers_of, name)
+    ]
+
     # Delete from DB (all related tables)
     deleted = await asyncio.to_thread(agent_store.delete_agent, name)
     if not deleted:
         raise HTTPException(404, "Agent not found")
+
+    if _lib_consumers:
+        from services.knowledge import library_projector
+        asyncio.create_task(
+            library_projector.teardown_source(name, consumers=_lib_consumers))
+        logger.info("knowledge-library teardown on agent delete: %s → %d consumers",
+                    name, len(_lib_consumers))
 
     # Delete filesystem: the agent folder (all user/agent workspace, knowledge,
     # config + Claude/Codex session files) AND the recover-bin tree, which lives

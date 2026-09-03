@@ -379,10 +379,17 @@ async def build_agent_config(
         agent_name, assigned_mcp_names,
         user_sub=creds_sub or "", user_role=user_role,
         delegation_targets=resolved_targets,
-        # Pre-resolved off-loop: the delegation provider is no-I/O.
+        # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
             dynamic_context.build_delegation_roster, resolved_targets,
         ),
+        meetings_access=await asyncio.to_thread(
+            dynamic_context.build_meetings_access, creds_sub or "", user_role or "",
+        ),
+        # Only a NO-USER session reads its delegation targets (the edge is
+        # the read grant) — user-backed sessions follow the user (the
+        # server enforces from the token either way; this is prompt).
+        nouser_reads=not creds_sub,
         is_remote=is_remote,
         target_admin_paired=(target_kind == "admin_remote"),
         target_os=target_os,
@@ -434,6 +441,18 @@ async def build_agent_config(
     # harmless here — the home branch would admit it anyway; this just admits it
     # slightly earlier. Empty for every normal session.
     session_allowed_roots: tuple = (work_cwd,) if work_cwd else ()
+    # Attached knowledge libraries — baked into the ctx like the mounts
+    # (attach/detach lands at the next session build). Fail-safe empty:
+    # mirror writes then deny at the policy layer, nothing widens.
+    try:
+        from storage import db_knowledge_libraries as _db_kl
+        _kl_rows = await asyncio.to_thread(
+            _db_kl.attachments_for_consumer, agent_name)
+        _knowledge_libraries = tuple(
+            (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
+            for a in _kl_rows)
+    except Exception:
+        _knowledge_libraries = ()
     security_ctx = SecurityContext(
         role=user_role,
         username=username or "",
@@ -459,6 +478,12 @@ async def build_agent_config(
         session_scope=vis.mount_scope,
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
+        knowledge_libraries=_knowledge_libraries,
+        # Manager-provenance knowledge writes ride ONLY a task re-warm's
+        # resolved identity (the rebuild of a scheduled/one-time/trigger
+        # fire). Human chat sessions stay on the bool(username)+role path.
+        knowledge_rw=(task_identity.knowledge_rw
+                      if task_identity is not None else False),
     )
     perm_ctx = build_permission_context(
         security_ctx,
@@ -485,8 +510,11 @@ async def build_agent_config(
         scope=scope,
     )
 
-    # Resolve model and effort
-    resolved_model = model or config.get_cli_model(agent_name)
+    # Resolve model and effort. Layer-aware: on a session whose layer
+    # differs from the agent's engine (task/delegate overrides, engine-
+    # switched chats warming with model="") the agent-default model may be
+    # foreign to the layer — never stamp it (the provider 400s every turn).
+    resolved_model = model or config.get_cli_model(agent_name, layer=execution_path)
     resolved_effort = config.get_cli_effort(agent_name)
     extra_env: dict[str, str] = {}
     subscription_id = ""

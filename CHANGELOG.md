@@ -14,6 +14,196 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-09-03
+
+Two headline additions — your agents on your own machines, and your agents
+on the phone — plus departments, shared knowledge libraries, a 3D company
+map, live voice conversations, and a long list of fixes.
+
+### Added
+- **Remote machines.** Pair a Linux, macOS or Windows computer with a
+  one-line install and run your agents on it, with full access to that
+  machine's files, apps, network and tools — same chat, same live streaming,
+  same dashboard. The connection is outbound-only (no open ports), pairing
+  codes are single-use, and every capability is an explicit grant. Files
+  sync both ways (generated build folders are skipped automatically), idle
+  sessions survive platform restarts, machine cards show each machine's CLI
+  versions, and the satellite keeps itself up to date. Two tools ride along
+  for agents on a machine: **browser control** (drive a real, logged-in
+  Chrome/Edge) and **computer control** (screen, mouse and keyboard).
+- **Phone calls.** Agents answer and place real phone calls, through Twilio
+  (paste an account SID and token; calls enter through your existing
+  dashboard URL) or your own Asterisk/FreePBX. Calls run on the live voice
+  pipeline: natural replies, talk-over interruptions, a spoken line before
+  each tool call. Routes can require a keypad PIN (lockouts after repeated
+  failures) and keep a 30-day call log. The phone service is part of the
+  standard install and idles until telephony is configured; its image is
+  published with every release. A phone-calls tool places outbound calls
+  from chats and tasks, and a transcription tool turns audio and video into
+  text and SRT subtitles.
+- **Live voice conversations.** A phone-style mode in chat: open mic with
+  echo cancellation, instant barge-in (even while the agent is silently
+  using a tool), a live transcript in the composer, short spoken replies
+  while documents and dashboards still render, click-to-edit drafts, and
+  agents that can end the call themselves. Say **"Hey OtoDock"** (or "Hey"
+  plus an agent's name) on any dashboard page to start one hands-free —
+  detection runs entirely in your browser, per-user opt-in. Needs the phone
+  service's voice engine; it replaces the earlier hands-free mode.
+- **Departments.** Create departments with named levels (up to 8), give each
+  agent a department and level, and delegation wires itself: peers to peers,
+  each level to the one below or the whole subtree, and results back up to
+  the level above. A chain guard stops delegation loops (depth capped at 4),
+  the Agents page groups agents by department, and each agent's prompt
+  states its place in the org.
+- **Delegation between agents.** Hand work to another agent as a visible
+  parallel session you can watch, steer and continue; the result comes back
+  as a report. `send_files` drops workspace files into another agent's
+  inbox. A scheduled run can read what the agents on its roster did (tasks,
+  sessions, triggers, notifications) — enough for a CEO agent's morning
+  briefing — while your own sessions read only what you could see yourself.
+- **Shared knowledge libraries.** Share an agent's knowledge folder, or any
+  subfolder, under a name of its own and attach it to other agents read-only
+  or writable, on remote machines too. Writable copies flow edits and
+  deletes back to the source at the end of the turn; read-only copies are
+  healed, with stray edits kept in the Recover bin. A `bulletin/<library>.md`
+  file is loaded into every attached agent's context — a standing team
+  briefing. Manager-created scheduled tasks and delegated workers can write
+  knowledge as well.
+- **A 3D company map.** The Agents page is a moonlit world where each
+  department stands on its own base: agents arranged by level, activity heat
+  and live "responding" pulses, delegation lines between agents, zoom as
+  navigation, arrow keys on desktop. The classic grid is one toggle away and
+  the automatic fallback without WebGL.
+- **Team dashboards.** Pin a mini-app for the whole team or just for you
+  from any chat, hide a shared app for yourself, ship dashboards inside
+  community agent templates, and a lone dashboard becomes the agent's
+  chrome-free home page. Dashboards use the full width on desktop, and the
+  mini-app kit gained three.js with glow effects.
+- **Chat.** Drag or paste files into the composer with live upload progress;
+  uploads of any size pass strict gateways in ~32 MB parts and resume after
+  a blip; runs of tool calls fold into one summary line (Compact/Detailed
+  setting); file paths in replies open a live preview; typing into a busy
+  Claude chat stops the turn gracefully and answers at once; question cards
+  show each option's full content; notifications open with the sending
+  agent's identity and are capped to headline length.
+- **Engines and models.** Claude Fable 5.1 is the default Claude model, with
+  Claude Code 2.1.258 and Codex 0.149.1 pinned. Pin a single scheduled task
+  to its own model or engine, switch a finished task chat to another engine,
+  and get 72h/24h warnings before a connected Claude or ChatGPT login
+  expires, with a one-click Reconnect; a dead login is reported at once
+  instead of retried forever.
+- **Skills and tools.** Skills can bundle scripts (Anthropic's skill-creator
+  ships built in); install any standard skill folder from a zip; agents can
+  browse and request skills and discover every MCP installed on your
+  platform; a built-in `otodock-platform` skill teaches every agent how
+  OtoDock itself works; approving an MCP request lets you pick the instance,
+  and a missing instance shows as "Needs instance" instead of a failure.
+  Agents can write their own persona, and managers are told while it is
+  still empty.
+- **Integrations.** Personal access tokens can be saved as separate labeled
+  accounts (a repo-scoped token for one agent next to your own), API-key
+  integrations connect with just the key, and a second Google-powered MCP
+  extends the existing grant instead of replacing it. Excel writes gained
+  real dates, format presets, named-range dropdowns and validation removal.
+- `scripts/sandbox-doctor.sh` explains why agent sandboxes cannot start on a
+  host (including the Ubuntu 24.04 user-namespace hardening), which the
+  platform now also detects and names at startup.
+
+### Changed
+- Delegated workers report back; callers no longer reply by delegation just
+  to acknowledge a result.
+- The Groq text classifier is the default end-of-turn judge for every
+  phone-mode language, with the on-box Smart Turn model as the fallback;
+  existing installs keep their stored choice.
+- Voice replies keep talking through tool work and start faster; the
+  first-generation buffer is tunable per ElevenLabs provider row.
+- Model pricing is refreshed to both vendors' current lists (GPT-5.6 tiers,
+  Claude Sonnet 5 at $2/$10) for cost attribution.
+- Satellite auto-update pauses after two rollbacks of the same version;
+  "Update now" retries it.
+- Meetings convened by sessions without a user are limited to the agent's
+  delegation targets, and the roster is labeled "Delegation Targets".
+- Document text extraction truncates at 512 KB with ranged-read guidance,
+  and every document read, render and write runs in a memory-bounded worker
+  so one pathological file cannot take the host down.
+- The "Active now" panels collapse and scroll instead of pushing the page.
+
+### Fixed
+- Voice conversations: barge-in truly interrupts, including silent tool
+  phases; the transcript keeps the whole utterance; replies no longer
+  stutter, fall silent late in a session or lose your first words; the mic
+  survives long pauses and stays muted when you mute it; a conversation
+  survives its engine process dying; the halo and status follow reality.
+- Phone calls no longer go deaf mid-call, crackle, or get cut by false
+  barge-ins from background noise (`phone_bargein_timer_s` now means the
+  minimum speech duration of an interruption).
+- Dictation in non-English languages no longer drops words already shown.
+- Shared libraries: a file deleted in a writable copy no longer comes back,
+  and restoring from the Recover bin into a read-only library is refused.
+- Uploads: no endless "Processing…" when no machine needs the file, chunked
+  uploads finish on Docker installs, big batches queue with progress,
+  oversized files say so, huge photos are downscaled instead of dropping the
+  connection, and the photo viewer no longer closes by itself.
+- Delegation: worker results are no longer cut off or shown twice, the
+  delegating agent reliably wakes to read them, and usage is attributed to
+  the model that actually ran.
+- Sessions: scheduled tasks no longer die at birth or get closed while
+  waiting on a question or a stalled tool; interactive/headless races and
+  duplicate spawns are gone; remote machines shed idle sessions instead of
+  refusing at capacity, forget no ghost sessions after a restart, and run
+  exactly the pinned CLI.
+- Task runs no longer report engine failures as successful empty runs, and
+  a task pinned to another engine no longer runs with the wrong model.
+- Logins: a transient provider outage no longer expires a healthy
+  subscription, and the "expires soon" warning fires at most twice.
+- Permissions: agent sessions see only what their user could (tasks,
+  triggers, notifications, webhook subscriptions), and viewers can no longer
+  replace a team dashboard.
+- Integrations: OAuth MCPs that refresh tokens in place start on shared-only
+  agents, Codex keeps MCP URLs with query strings intact, the sign-in page
+  no longer reload-loops with the wake word enabled, and bare-metal installs
+  apply MCP compose changes on restart. Community catalog: github-mcp 1.1.0
+  fixes schema failures on resumed sessions with Claude Code 2.1.243+.
+- Also fixed: Excel named-range corruption and stacked validations, file
+  paths pasted as links reloading the page, stale "Active now" titles, agent
+  settings overflowing on phones, and the 3D map's texture loading, framing
+  on large screens and pinch-zoom.
+
+### Security
+- A pre-release audit of the newly public surface (remote machines, phone,
+  five tool sidecars), every finding fixed: sidecars validate the ids they
+  put into URLs and refuse private-address URLs; skill and MCP installers
+  reject crafted names, references and compose files; cross-agent file
+  transfers re-verify paths at write time; a writable library attachment
+  requires editor access on the source; the Asterisk dialplan filters
+  caller-supplied variables and Twilio webhooks validate signatures before
+  spending rate-limit budget; satellites refuse plaintext `ws://` to public
+  hosts unless opted in, verify the process behind their Windows control
+  pipe, strip escape bytes from injected text and store their config
+  owner-only.
+- Remote-machine API responses no longer include credential hashes.
+- Dependency updates for the 2026-08/09 advisories: `cryptography` 50.0.0,
+  `aiohttp` 3.14.3, `h2` 4.4.1, `click` 8.3.3, `pillow` 12.3.0,
+  `react-router` 7.18.2, `brace-expansion` 5.0.9.
+
+### Upgrade notes (1.4 → 1.5)
+- **Phone service on an existing install** (new installs get it): in the
+  install directory run
+  `curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/v1.5.0/docker-compose.phone.yml`,
+  append `COMPOSE_FILE=docker-compose.yml:docker-compose.phone.yml` to
+  `.env`, then `docker compose up -d`. It idles until telephony is set up.
+- The departments schema migration and the Fable 5 → 5.1 remap of pinned
+  agents, chats and tasks run automatically on first boot. Fable 5.1 needs
+  Claude Code 2.1.251 or newer; paired machines update their CLIs and their
+  satellite on reconnect.
+- Asterisk/FreePBX installs: re-paste the generated dialplan snippet.
+- The hands-free half-duplex voice mode is gone; installs without the phone
+  service keep dictation only.
+- MCP containers on bare-metal installs are recreated once on the first
+  restart if their compose configuration changed.
+- Rolling the Codex pin back requires wiping `CODEX_HOME` runtime databases
+  (its migrations are forward-only).
+
 ## [1.4.0] — 2026-07-26
 
 ### Added
@@ -427,7 +617,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/OtoDock/oto-dock/compare/v1.3.0...v1.3.1

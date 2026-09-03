@@ -10,6 +10,7 @@ import { resolveTtsBackend } from '../../audio/resolver'
 import { detectTtsLanguage } from '../../audio/lang'
 import { type TTSBackend } from '../../audio/types'
 import { cleanForSpeech } from '../../audio/cleanText'
+import { registerStoppablePlayback, setSpeaking } from '../../audio/speechActivity'
 
 export function SoundIcon({ text }: { text: string }) {
   const { data: cap } = useChatAudioCapability()
@@ -17,10 +18,17 @@ export function SoundIcon({ text }: { text: string }) {
   const nativeVoiceURI = useAudioPrefsStore(s => s.nativeVoiceURI)
   const [playing, setPlaying] = useState(false)
   const activeBackend = useRef<TTSBackend | null>(null)
+  const clearSpeakingRef = useRef<() => void>(() => {})
 
   // Stop playback when this message unmounts (switching chats / navigating
-  // away) — otherwise the TTS keeps talking on the next page.
-  useEffect(() => () => { activeBackend.current?.stop(); activeBackend.current = null }, [])
+  // away) — otherwise the TTS keeps talking on the next page. Also clear
+  // the speech-activity flag: play() is not guaranteed to settle after a
+  // mid-play stop, and a wedged flag would defer heavy work to its cap.
+  useEffect(() => () => {
+    activeBackend.current?.stop()
+    activeBackend.current = null
+    clearSpeakingRef.current()
+  }, [])
 
   const spoken = cleanForSpeech(text)
   if (!cap || cap.tts === 'unavailable' || !spoken) return null
@@ -33,16 +41,46 @@ export function SoundIcon({ text }: { text: string }) {
   const language = detectTtsLanguage(spoken)
 
   const onClick = async () => {
-    if (playing) { backend.stop(); activeBackend.current = null; setPlaying(false); return }
+    if (playing) {
+      backend.stop()
+      activeBackend.current = null
+      clearSpeakingRef.current()
+      setPlaying(false)
+      return
+    }
     setPlaying(true)
     activeBackend.current = backend
+    // Speech-activity flag around the whole play (covers native AND
+    // platform backends): heavy turn-end work defers while this speaks.
+    // Idempotent clear shared with the unmount cleanup — the counted flag
+    // must decrement exactly once per play, whichever path ends it.
+    let cleared = false
+    const clearSpeaking = () => {
+      if (!cleared) { cleared = true; setSpeaking(false) }
+    }
+    clearSpeakingRef.current = clearSpeaking
+    setSpeaking(true)
+    // Dictation interlock: a dictation session starting mid-play silences
+    // this replay (its capture runs without AEC — the replay would
+    // transcribe itself into the composer).
+    const unregister = registerStoppablePlayback(() => {
+      backend.stop()
+      activeBackend.current = null
+      clearSpeaking()
+      setPlaying(false)
+    })
     try {
       await backend.play(spoken, {
         language,
         voiceURI: nativeVoiceURI[language],
         providerId: cap.tts_provider_id,
       })
-    } catch { /* ignore */ } finally { setPlaying(false); activeBackend.current = null }
+    } catch { /* ignore */ } finally {
+      unregister()
+      clearSpeaking()
+      setPlaying(false)
+      activeBackend.current = null
+    }
   }
 
   return (

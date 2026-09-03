@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# otodock — launch an interactive Claude/Codex session as your otodock agent in
+# the current folder. Thin wrapper around
+# `python -m satellite.terminal.otodock_cli` using the satellite's own venv.
+#
+#   otodock claude <agent>        # interactive Claude TUI as <agent>, here
+#   otodock codex  <agent>        # interactive Codex TUI
+#   otodock claude <agent> --folder /path/to/project
+#
+# Install: symlink this onto your PATH, e.g.
+#   ln -s "$(pwd)/satellite/bin/otodock" ~/.local/bin/otodock
+# (the satellite installer does this automatically).
+set -euo pipefail
+
+# Resolve this script's real location → the satellite package dir + install root.
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+bin_dir="$(cd -P "$(dirname "$src")" && pwd)"   # <pkg>/bin
+sat_dir="$(dirname "$bin_dir")"                  # <pkg> (the `satellite` package)
+root_dir="$(dirname "$sat_dir")"                 # parent of the package (on PYTHONPATH)
+
+# The venv lives at <pkg>/venv in the dev repo but at <root>/venv in an installed
+# satellite (~/.oto-dock/satellite/{satellite,venv}). Try both, then PATH python.
+py=""
+for cand in "$sat_dir/venv/bin/python" "$root_dir/venv/bin/python"; do
+  [ -x "$cand" ] && { py="$cand"; break; }
+done
+[ -n "$py" ] || py="$(command -v python3 || command -v python)"
+
+# PYTHONPATH must hold the dir CONTAINING the `satellite` package — which differs by
+# layout: an installed satellite nests it one level down ($sat_dir holds it), a dev
+# checkout has it at $root_dir. Put BOTH on the path; `-m satellite.*` resolves from
+# whichever actually holds the package.
+exec env PYTHONPATH="$sat_dir:$root_dir${PYTHONPATH:+:$PYTHONPATH}" "$py" -m satellite.terminal.otodock_cli "$@"

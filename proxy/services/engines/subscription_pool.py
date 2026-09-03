@@ -86,12 +86,32 @@ _issued_token_expiry: dict[str, int] = {}
 _session_token_expiry: dict[str, int] = {}
 
 # Backoff for failed OAuth refresh: sub_id → (fail_time, attempt_count)
-# After a failed refresh, wait before retrying (prevents rate limit loops)
+# After a failed refresh, wait before retrying (prevents rate limit loops).
+# Transient failures ONLY back off — they never expire the row: a provider
+# outage must not lock an account out until a human reconnects it. The one
+# single-shot terminal verdict is the provider's own `invalid_grant` (the
+# login grant is dead), which expires the row immediately — see
+# _refresh_error_terminal.
 _refresh_backoff: dict[str, tuple[float, int]] = {}
 
-# After this many consecutive refresh failures, mark the subscription as expired
-# in DB so it won't be retried even across proxy restarts.
-_MAX_REFRESH_ATTEMPTS = 5
+# Sustained-auth-death escalation: sub_id → (first_fail_time, count) of
+# 401-with-JSON-error refresh rejections. Not every provider says
+# `invalid_grant` for a dead login — OpenAI answers a generic 401
+# `invalid_request_error` forever — so a streak of provider auth rejections
+# spanning BOTH thresholds below earns the same expired verdict. 401-only:
+# RFC 6749 client-side request bugs (invalid_request / invalid_scope /
+# unsupported_grant_type) surface as 400 and must stay transient forever.
+# Other failures (400/429/5xx/non-JSON WAF pages/network errors) neither
+# count nor reset the streak; only a successful refresh, a reconnect
+# exchange, or the delivered verdict clears it. In-memory like
+# _refresh_backoff: a restart just restarts the ~2 h clock.
+_auth_fail_streaks: dict[str, tuple[float, int]] = {}
+_AUTH_STREAK_MIN_ATTEMPTS = 8
+_AUTH_STREAK_MIN_SPAN_S = 2 * 3600
+
+# Selection cooldown after the TOKEN ENDPOINT itself rate-limits a refresh
+# (not an account usage limit — just steer new work away briefly).
+_REFRESH_RATELIMIT_COOLDOWN_S = 60
 
 # Refresh at acquire only when the stored token has less runway than this — a
 # new session otherwise REUSES the shared token generation (the official CLIs
@@ -188,6 +208,15 @@ def _is_throttled(sub_id: str) -> bool:
 # judged dead, let alone deleted, before its session had a chance to reappear.
 _BOOT_MONOTONIC = time.monotonic()
 _LIVENESS_BOOT_GRACE_S = 600.0
+
+
+def within_boot_grace() -> bool:
+    """True while the live-session registries are still warming after a proxy
+    restart. Workers that act on a row *looking* unbound (e.g. the proactive
+    unbound-row token refresh) must stand down during this window — a
+    surviving satellite session's row is indistinguishable from a truly idle
+    one until it re-announces."""
+    return time.monotonic() - _BOOT_MONOTONIC < _LIVENESS_BOOT_GRACE_S
 
 
 def _session_registered_live(session_id: str) -> bool | None:
@@ -352,12 +381,15 @@ _USER_BORROWABLE_AUTH_TYPES = frozenset({"api_key", "relay", "local_endpoint"})
 class NoSubscriptionError(Exception):
     """Raised when USER-scoped work resolves to no usable credentials, so the
     dashboard can show an actionable message instead of a cryptic provider 401.
-    ``reason`` ∈ {auth_off, admin_oauth_only, no_pool, none, throttled} (see
-    ``user_scope_block_reason``)."""
+    ``reason`` ∈ {auth_off, admin_oauth_only, no_pool, none, throttled,
+    own_sub_expired} (see ``user_scope_block_reason``)."""
 
     _MESSAGES = {
         "throttled": "Your subscription is briefly resting after the provider reported "
                      "a rate limit or overload — try again in a few seconds.",
+        "own_sub_expired": "Your connected account's login has expired — reconnect it "
+                           "in User Settings → AI Engines to keep using your "
+                           "subscription.",
         "auth_off": "You don't have a subscription for this execution layer. "
                     "Connect your account in your User Settings.",
         "admin_oauth_only": "You don't have a subscription for this execution layer. "
@@ -653,10 +685,16 @@ def user_scope_block_reason(layer: str, user_sub: str, *, provider: str = "") ->
     blocked path. Returns one of:
       'throttled'        — the user owns a sub for this layer but it's resting
                            (recent provider rate-limit/overload) — transient, retry
+      'own_sub_expired'  — the user's own account(s) here are expired (dead
+                           login grant) — reconnecting revives them in place
       'auth_off'         — Platform Auth disabled and the user has no own sub
       'admin_oauth_only' — pool exists but holds only OAuth subs (not borrowable)
       'no_pool'          — nothing in the platform pool for this layer at all
       'none'             — a borrowable sub exists but couldn't yield creds (glitch)
+
+    Post-failure classification ONLY — never a pre-acquisition gate: a user
+    whose own row expired but who can borrow an admin api_key row still gets a
+    working session and never reaches this.
     """
     # The user DOES own a sub here, it's just resting — never tell them to "connect
     # an account". (With _select's throttled-fallback this rarely reaches a block,
@@ -664,6 +702,15 @@ def user_scope_block_reason(layer: str, user_sub: str, *, provider: str = "") ->
     own = subscription_store.list_personal(layer, user_sub, provider or None)
     if own and all(_is_throttled(s["id"]) for s in own):
         return "throttled"
+    if not own:
+        # No usable own account — but a dead one the user could revive beats
+        # every "connect an account" message. Specifically `expired` rows
+        # (grant death); an admin-DISABLED row must not say "reconnect".
+        stale = subscription_store.list_personal(
+            layer, user_sub, provider or None, any_status=True,
+        )
+        if any(s.get("status") == "expired" for s in stale):
+            return "own_sub_expired"
     if not subscription_store.get_user_allow_platform_auth(user_sub):
         return "auth_off"
     pool = subscription_store.list_platform_pool(layer, provider or None)
@@ -1517,11 +1564,84 @@ def resolve_subscription_env(
 # Token refresh
 # ---------------------------------------------------------------------------
 
-def _refresh_oauth_token(sub_id: str, refresh_token: str, provider: str = "anthropic") -> str | None:
+def _refresh_error_terminal(resp) -> bool:
+    """True only for a provider-confirmed dead grant: OAuth2 ``invalid_grant``
+    in the error body. Everything else — 429/5xx, WAF challenge pages
+    (non-JSON bodies), an ``invalid_scope``-class request bug on our side,
+    client-id drift — must stay transient: a blanket status-code rule would
+    mass-expire every healthy row over a single request-construction fault.
+    Grants whose provider never confirms death this way are caught by the
+    sustained-401 streak instead (``_sustained_auth_dead``)."""
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    err = body.get("error")
+    if isinstance(err, dict):
+        err = err.get("type") or err.get("code") or err.get("error")
+    return err == "invalid_grant"
+
+
+def _log_refresh_failure(sub_id: str, provider: str, resp) -> None:
+    detail = ""
+    auth_shaped = False
+    with contextlib.suppress(Exception):
+        body = resp.json()
+        err = body.get("error")
+        if isinstance(err, dict):
+            err = err.get("type") or err.get("code") or err.get("error")
+        desc = body.get("error_description") or ""
+        detail = f" ({err}{': ' + desc if desc else ''})"
+        # A provider auth rejection (as opposed to a WAF/proxy page): the
+        # token endpoint itself answered 401 with a structured error body.
+        auth_shaped = resp.status_code == 401 and err is not None
+    logger.error(
+        f"{provider} OAuth refresh failed for {sub_id[:8]}: "
+        f"{resp.status_code}{detail}"
+    )
+    if auth_shaped:
+        first, count = _auth_fail_streaks.get(sub_id) or (time.time(), 0)
+        _auth_fail_streaks[sub_id] = (first, count + 1)
+    if resp.status_code == 429:
+        _throttled_until[sub_id] = time.time() + _REFRESH_RATELIMIT_COOLDOWN_S
+
+
+def _sustained_auth_dead(sub_id: str) -> bool:
+    """The streak verdict: enough consecutive provider auth rejections, for
+    long enough, that the grant is dead even though the provider never said
+    ``invalid_grant``. Both thresholds must hold — at the 600 s backoff cap
+    the span condition dominates (~13 attempts over 2 h), so a brief vendor
+    incident or WAF event can never reach it, while a genuinely dead login
+    flips within ~2 h instead of retrying every 10 minutes forever
+    (observed: OpenAI answering 401 invalid_request_error 118+ times)."""
+    first, count = _auth_fail_streaks.get(sub_id) or (0.0, 0)
+    return (
+        count >= _AUTH_STREAK_MIN_ATTEMPTS
+        and first
+        and time.time() - first >= _AUTH_STREAK_MIN_SPAN_S
+    )
+
+
+def clear_refresh_backoff(sub_id: str) -> None:
+    """Drop a subscription's refresh backoff — the reconnect exchange calls
+    this after replacing the credential, so a just-revived row isn't left
+    waiting out a dead token's backoff window (up to 10 min) or carrying the
+    dead grant's auth-failure streak into its fresh credential."""
+    _refresh_backoff.pop(sub_id, None)
+    _auth_fail_streaks.pop(sub_id, None)
+
+
+def _refresh_oauth_token(
+    sub_id: str, refresh_token: str, provider: str = "anthropic",
+) -> tuple[str | None, bool]:
     """Refresh an expired OAuth access token using the stored refresh token.
 
     Supports both Anthropic and OpenAI OAuth providers.
-    Returns the new access_token on success, or None on failure.
+    Returns ``(new_access_token, terminal)`` — the token is None on failure,
+    and ``terminal`` is True only when the provider confirmed the grant dead
+    (``invalid_grant``; see ``_refresh_error_terminal``).
     Updates the subscription's credential_data in DB with new tokens.
 
     EVERY successful rotation fans the new token out to all live bound
@@ -1533,12 +1653,12 @@ def _refresh_oauth_token(sub_id: str, refresh_token: str, provider: str = "anthr
     lock).
     """
     if provider == "openai":
-        new_access = _refresh_openai_oauth_token(sub_id, refresh_token)
+        new_access, terminal = _refresh_openai_oauth_token(sub_id, refresh_token)
     else:
-        new_access = _refresh_anthropic_oauth_token(sub_id, refresh_token)
+        new_access, terminal = _refresh_anthropic_oauth_token(sub_id, refresh_token)
     if new_access:
         _fan_out_rotated_token(sub_id)
-    return new_access
+    return new_access, terminal
 
 
 def _fan_out_rotated_token(sub_id: str) -> None:
@@ -1601,7 +1721,7 @@ def _claude_file_blob(oauth_data: dict) -> dict:
     cannot rotate, it can only use the fanned-out access token or 401-recover
     it from disk, which fails SAFE (auth error repaired by the next fan-out)
     instead of cascading revocations."""
-    return {
+    blob = {
         "accessToken": oauth_data.get("accessToken", ""),
         "refreshToken": "",
         "expiresAt": int(oauth_data.get("expiresAt") or 0),
@@ -1609,6 +1729,12 @@ def _claude_file_blob(oauth_data: dict) -> dict:
         "subscriptionType": oauth_data.get("subscriptionType", ""),
         "rateLimitTier": oauth_data.get("rateLimitTier", ""),
     }
+    # Grant-lifetime expiry rides along when known (CLI ≥2.1.222 stores and
+    # warns on it; older CLIs ignore the extra key). Only when present — a
+    # zero would read as an epoch-expired login.
+    if oauth_data.get("refreshTokenExpiresAt"):
+        blob["refreshTokenExpiresAt"] = int(oauth_data["refreshTokenExpiresAt"])
+    return blob
 
 
 def ensure_fresh_and_fan_out(
@@ -1638,8 +1764,29 @@ def ensure_fresh_and_fan_out(
     return not expires_at or time.time() * 1000 < expires_at - min_runway_ms
 
 
-def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> str | None:
-    """Refresh an Anthropic OAuth token.
+def _grant_expiry_fields(data: dict, old: dict) -> dict:
+    """The grant-lifetime keys carried on the stored oauth_token blob.
+
+    ``refreshTokenExpiresAt`` is the login GRANT's expiry (finite — ~28 days
+    for Claude logins), not the rotated access token's: when a response omits
+    ``refresh_token_expires_in`` the previously stored value carries forward
+    (erasing it on every 8h rotation would blind the pre-expiry warning).
+    ``healthAlerts`` (the warning dedup stamps, see subscription_health) ride
+    along for the same reason — a full reconnect rebuilds the blob without
+    them, which is exactly the re-arm."""
+    fields: dict = {}
+    rt_expires_in = data.get("refresh_token_expires_in")
+    if rt_expires_in:
+        fields["refreshTokenExpiresAt"] = int((time.time() + rt_expires_in) * 1000)
+    elif old.get("refreshTokenExpiresAt"):
+        fields["refreshTokenExpiresAt"] = int(old["refreshTokenExpiresAt"])
+    if old.get("healthAlerts"):
+        fields["healthAlerts"] = old["healthAlerts"]
+    return fields
+
+
+def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> tuple[str | None, bool]:
+    """Refresh an Anthropic OAuth token → ``(access_token, terminal)``.
 
     Uses JSON body matching the Claude Code CLI (not form-urlencoded).
     Omits scope parameter — the CLI omits it for Claude.ai (inference) tokens.
@@ -1662,8 +1809,8 @@ def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> str | Non
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.error(f"Anthropic OAuth refresh failed for {sub_id[:8]}: {resp.status_code}")
-            return None
+            _log_refresh_failure(sub_id, "Anthropic", resp)
+            return None, _refresh_error_terminal(resp) or _sustained_auth_dead(sub_id)
 
         data = resp.json()
         new_access = data.get("access_token")
@@ -1690,18 +1837,19 @@ def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> str | Non
                 "scopes": data.get("scope", "").split() if data.get("scope") else [],
                 "subscriptionType": sub_type,
                 "rateLimitTier": rate_tier,
+                **_grant_expiry_fields(data, old),
             }
         }
         subscription_store.update_credential_data(sub_id, new_cred)
         logger.info(f"Anthropic OAuth token refreshed for {sub_id[:8]}")
-        return new_access
+        return new_access, False
     except Exception as e:
         logger.error(f"Anthropic OAuth refresh error for {sub_id[:8]}: {e}")
-        return None
+        return None, False
 
 
-def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> str | None:
-    """Refresh an OpenAI OAuth token."""
+def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> tuple[str | None, bool]:
+    """Refresh an OpenAI OAuth token → ``(access_token, terminal)``."""
     try:
         from auth.openai_oauth import TOKEN_URL as _OPENAI_TOKEN_URL, CLIENT_ID as _OPENAI_CLIENT_ID
         import urllib.parse
@@ -1720,8 +1868,8 @@ def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> str | None:
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.error(f"OpenAI OAuth refresh failed for {sub_id[:8]}: {resp.status_code}")
-            return None
+            _log_refresh_failure(sub_id, "OpenAI", resp)
+            return None, _refresh_error_terminal(resp) or _sustained_auth_dead(sub_id)
 
         data = resp.json()
         new_access = data.get("access_token")
@@ -1730,10 +1878,12 @@ def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> str | None:
 
         # Preserve existing credential_data (especially codex_auth_blob)
         existing_cred = subscription_store.get_credential_data(sub_id)
+        old_oauth = existing_cred.get("oauth_token") or {}
         existing_cred["oauth_token"] = {
             "accessToken": new_access,
             "refreshToken": new_refresh,
             "expiresAt": int((time.time() + expires_in) * 1000),
+            **_grant_expiry_fields(data, old_oauth),
         }
         # Keep codex_auth_blob tokens in sync
         blob = existing_cred.get("codex_auth_blob")
@@ -1745,10 +1895,10 @@ def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> str | None:
             blob["last_refresh"] = datetime.now(timezone.utc).isoformat()
         subscription_store.update_credential_data(sub_id, existing_cred)
         logger.info(f"OpenAI OAuth token refreshed for {sub_id[:8]}")
-        return new_access
+        return new_access, False
     except Exception as e:
         logger.error(f"OpenAI OAuth refresh error for {sub_id[:8]}: {e}")
-        return None
+        return None, False
 
 
 def _resolve_oauth_access_token(
@@ -1760,18 +1910,29 @@ def _resolve_oauth_access_token(
     has no expiry info. A successful refresh fans the rotated token out to
     every live bound session (see ``_refresh_oauth_token``).
 
-    A refresh failure never wastes a still-valid stored token: the failure is
-    logged and backed off (exponential: 60s → 600s cap), and the stored token
-    keeps sessions spawning while the admin gets signal. Repeated failures
-    still auto-expire the subscription, but only once the stored token is
-    genuinely dying — expiring an account whose sessions could still run for
-    hours would turn a transient refresh outage into a full lockout. The
-    returned expiry is the fail-soft's audit trail: it reports the runway of
-    the token ACTUALLY handed out, so per-session tracking can re-warm a
-    session that spawned on a short-runway stored token before it dies
-    mid-turn.
+    A transient refresh failure never wastes a still-valid stored token: the
+    failure is logged and backed off (exponential: 60s → 600s cap), and the
+    stored token keeps sessions spawning while the admin gets signal —
+    transient failures NEVER expire the row (a provider outage must not lock
+    an account out until a human reconnects it), though a sustained streak of
+    provider 401s earns the terminal verdict after ~2 h
+    (``_sustained_auth_dead``). Only a provider-confirmed
+    ``invalid_grant`` (the login grant itself is dead) expires the row, and it
+    does so immediately. The returned expiry is the fail-soft's audit trail:
+    it reports the runway of the token ACTUALLY handed out, so per-session
+    tracking can re-warm a session that spawned on a short-runway stored
+    token before it dies mid-turn.
     """
     sub_id = sub["id"]
+
+    # A non-active row never hits the token endpoint again: its grant is
+    # known-dead (terminal verdict) or an admin turned it off. Reconnect
+    # resets status to active, which re-enables refresh. Bound sessions keep
+    # running on the stored token while it lives.
+    if (sub.get("status") or "active") != "active":
+        expires_at = oauth_data.get("expiresAt", 0)
+        usable = not expires_at or time.time() * 1000 < expires_at - _HARD_EXPIRY_BUFFER_MS
+        return (oauth_data.get("accessToken"), expires_at) if usable else (None, 0)
 
     def _stored(data: dict) -> tuple[str | None, int, bool, bool]:
         """(accessToken, expiresAt, usable_now, wants_refresh) for a blob."""
@@ -1810,11 +1971,15 @@ def _resolve_oauth_access_token(
                 return (token, expires_at) if usable else (None, 0)
 
         new_access = None
+        terminal = False
         refresh_token = latest.get("refreshToken")
         if refresh_token:
-            new_access = _refresh_oauth_token(sub_id, refresh_token, sub.get("provider", "anthropic"))
+            new_access, terminal = _refresh_oauth_token(
+                sub_id, refresh_token, sub.get("provider", "anthropic"),
+            )
         if new_access:
             _refresh_backoff.pop(sub_id, None)
+            _auth_fail_streaks.pop(sub_id, None)
             # The refresher persisted the rotated credential; re-read for the
             # fresh token's real expiry (provider-reported expires_in).
             new_expires = 0
@@ -1825,6 +1990,39 @@ def _resolve_oauth_access_token(
                 )
             return new_access, new_expires
 
+        # A failure verdict is only actionable if the stored refresh token is
+        # still the one the attempt used. Writers outside this lock (a
+        # reconnect exchange landing through an older code path, an admin
+        # credential replacement) may have swapped the credential mid-attempt
+        # — their fresh grant must not inherit a dead token's verdict.
+        if refresh_token:
+            stored_now = (
+                subscription_store.get_credential_data(sub_id).get("oauth_token") or {}
+            )
+            if stored_now.get("refreshToken") != refresh_token:
+                logger.info(
+                    f"OAuth refresh failure for {sub_id[:8]} discarded — "
+                    f"credential was replaced mid-attempt"
+                )
+                # The replacement may not have gone through the reconnect
+                # exchange (clear_refresh_backoff) — drop the dead grant's
+                # streak here too, or the fresh grant's FIRST 401 would
+                # inherit an exhausted streak and expire it instantly.
+                _auth_fail_streaks.pop(sub_id, None)
+                token, expires_at, usable, _ = _stored(stored_now)
+                return (token, expires_at) if usable else (None, 0)
+
+        if terminal:
+            _auto_expire_subscription(
+                sub_id,
+                reason=(
+                    "sustained auth-rejected refresh (401 streak ≥2h)"
+                    if _sustained_auth_dead(sub_id)
+                    else "invalid_grant (login grant dead)"
+                ),
+            )
+            return (token, expires_at) if usable else (None, 0)
+
         attempts = (backoff_entry[1] + 1) if backoff_entry else 1
         _refresh_backoff[sub_id] = (now_s, attempts)
         logger.warning(
@@ -1832,24 +2030,28 @@ def _resolve_oauth_access_token(
             + (f"using stored token ({max(0, (expires_at - time.time() * 1000)) / 60000:.0f} min runway)"
                if usable else "no usable token")
         )
-        if not usable and attempts >= _MAX_REFRESH_ATTEMPTS:
-            _auto_expire_subscription(sub_id)
         return (token, expires_at) if usable else (None, 0)
 
 
-def _auto_expire_subscription(sub_id: str) -> None:
-    """Mark a subscription as expired after repeated refresh failures.
+def _auto_expire_subscription(sub_id: str, reason: str = "invalid_grant (login grant dead)") -> None:
+    """Mark a subscription expired: the provider terminally rejected its
+    refresh token — either a single ``invalid_grant`` verdict (e.g. the
+    ~28-day Claude login lifetime lapsed) or a sustained 401 streak from a
+    provider that never says so (see ``_sustained_auth_dead``).
 
-    This persists the decision to DB so it survives proxy restarts —
-    the admin can reconnect OAuth when the rate limit clears.
+    Persisted so the verdict survives restarts. Recovery is reconnecting the
+    SAME account (User Settings → AI Engines for user rows; Setup → Execution
+    Layers for admin pool rows) — the exchange matches on account identity
+    and revives the row in place. The subscription_health sweep notifies the
+    owner (dedup-stamped in the credential blob).
     """
     try:
         subscription_store.update_subscription(sub_id, status="expired")
         _refresh_backoff.pop(sub_id, None)
+        _auth_fail_streaks.pop(sub_id, None)
         logger.error(
-            f"OAuth subscription {sub_id[:8]} auto-expired after "
-            f"{_MAX_REFRESH_ATTEMPTS} consecutive refresh failures. "
-            f"Reconnect via admin Setup → Execution Layers."
+            f"OAuth subscription {sub_id[:8]} expired: {reason}. The owner "
+            f"must reconnect the same account to revive it."
         )
     except Exception as e:
         logger.error(f"Failed to auto-expire subscription {sub_id[:8]}: {e}")

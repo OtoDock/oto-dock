@@ -29,6 +29,24 @@ from core.session import visibility as _vis, interactive_session
 logger = logging.getLogger("claude-proxy")
 
 
+def _question_answers_to_text(answers: dict) -> str:
+    """Flatten a structured answers map ``{<qid>: {"answers": [...]}}`` to the
+    text the FREE-TEXT question path sends (dashboard QuestionDialog's Claude
+    branch: selected labels joined by ``", "``, one question per line). Only the
+    fallback below uses it — a delivered answer goes to the held request as the
+    verbatim map.
+    """
+    lines: list[str] = []
+    for entry in (answers or {}).values():
+        vals = entry.get("answers") if isinstance(entry, dict) else None
+        if not isinstance(vals, list):
+            continue
+        joined = ", ".join(str(v).strip() for v in vals if str(v).strip())
+        if joined:
+            lines.append(joined)
+    return "\n".join(lines)
+
+
 class ClientMessageDispatcher:
     """The between-turns client-message dispatcher (the in-stream twin lives
     in ChatController._stream_via_pump)."""
@@ -56,11 +74,17 @@ class ClientMessageDispatcher:
             await self._send({"type": "notification_count", "count": count})
         elif msg_type == "chat":
             if self.streaming:
-                # Queue the message
+                # Queue the message (capped: a client can't grow this list
+                # without bound by spamming `chat` while a turn streams).
                 text = msg.get("text", "")
                 if text:
-                    self.message_queue.append(text)
-                    await self._send({"type": "queued", "index": len(self.message_queue) - 1, "text": text})
+                    if len(self.message_queue) >= 64:
+                        await self._send_error(
+                            "Too many queued messages — wait for the current "
+                            "turn to finish.")
+                    else:
+                        self.message_queue.append(text)
+                        await self._send({"type": "queued", "index": len(self.message_queue) - 1, "text": text})
             else:
                 await self._handle_chat(msg)
         elif msg_type == "artifact_interaction":
@@ -105,11 +129,13 @@ class ClientMessageDispatcher:
             # Codex request_user_input answer arriving between turns (safety net;
             # a held question normally resolves mid-stream in _stream_via_pump).
             if await self._may_resolve_permission(msg["request_id"]):
-                resolve_question(msg["request_id"], msg.get("answers") or {})
+                delivered = resolve_question(msg["request_id"], msg.get("answers") or {})
                 for sid, pd in list(_pending_permissions.items()):
                     if pd.get("request_id") == msg["request_id"]:
                         del _pending_permissions[sid]
                         break
+                if not delivered:
+                    await self._question_answer_fallback(msg)
         elif msg_type == "pty_attach":
             # The client's terminal has mounted + subscribed → attach the PTY
             # viewer NOW (the scrollback replay can't race the subscribe). Resolve
@@ -140,8 +166,11 @@ class ClientMessageDispatcher:
                     logger.debug("pty_input decode/write failed", exc_info=True)
         elif msg_type == "pty_resize":
             # Client terminal resize → SIGWINCH to the TUI (viewed session).
+            # Gate on may_drive like pty_input/pty_attachments: a read-only
+            # viewer resizing the controller's PTY would disrupt their TUI
+            # rendering (SIGWINCH reflow).
             isess = interactive_session.get(self.session_id) if self.session_id else None
-            if isess is not None:
+            if isess is not None and isess.may_drive(self.user_sub):
                 try:
                     isess.resize(int(msg.get("rows", 24)), int(msg.get("cols", 80)))
                 except Exception:
@@ -246,13 +275,16 @@ class ClientMessageDispatcher:
             # opens): headless idle-reap emits no frame, so without this the
             # cross-engine options never appear on a chat that died while
             # being viewed. Bound chat only — arbitrary ids aren't probeable.
-            from ws.dashboard import chat_process_alive
+            from ws.dashboard import chat_process_alive, task_run_active
             _cid = self.chat_id or ""
             _chat = task_store.get_chat(_cid) if _cid else None
             _alive = False
             if _chat:
                 _pump = _active_pumps.get(_cid)
+                # task_run_active: a parked/spawning/recovering task run has
+                # no live session yet — the picker must still stay locked.
                 _alive = bool(_pump and not _pump.is_done) or \
+                    task_run_active(_cid) or \
                     await chat_process_alive(_chat)
             await self._send({"type": "liveness", "chat_id": _cid,
                               "process_alive": _alive})
@@ -369,6 +401,41 @@ class ClientMessageDispatcher:
         else:
             await self._send_error(f"Unknown message type: {msg_type}")
         return None
+
+    async def _question_answer_fallback(self, msg: dict) -> None:
+        """Deliver a structured question answer that reached NO live waiter.
+
+        ``resolve_question`` returning False means the held
+        ``item/tool/requestUserInput`` server-request is gone — its session was
+        reaped (or released) while the human was deciding — so the parked turn
+        can never resume and the answer would be silently lost (the app-server
+        write would hit a closed transport; live on T1, 2026-08-06). The answer
+        is a HUMAN's input, so re-send it as an ordinary composer message on the
+        chat: that takes ``_handle_chat``'s dead-session branch, which does the
+        registry-aware single-flight revival, persists the text as a user
+        message and runs the turn.
+        """
+        text = _question_answers_to_text(msg.get("answers") or {})
+        chat_id = msg.get("chat_id") or self.chat_id or ""
+        if not text or not chat_id:
+            logger.warning(
+                "WS dashboard question_response: no live waiter for request %s "
+                "and nothing to replay (chat=%s)", str(msg.get("request_id"))[:8], chat_id,
+            )
+            return
+        logger.warning(
+            "WS dashboard question_response: no live waiter for request %s — "
+            "replaying the answer as a chat message on chat=%s (session reaped "
+            "while the question was parked)",
+            str(msg.get("request_id"))[:8], chat_id,
+        )
+        if self.streaming:
+            self.message_queue.append(text)
+            await self._send({
+                "type": "queued", "index": len(self.message_queue) - 1, "text": text,
+            })
+            return
+        await self._handle_chat({"text": text, "chat_id": chat_id})
 
     async def _handle_move_chat(self):
         """Move the OPEN chat to the agent's CURRENT target — the locality
@@ -491,12 +558,18 @@ class ClientMessageDispatcher:
         chat row is authoritative for every resume read-site, so the rebind
         alone re-routes all subsequent spawns; the rebind is a CAS so a
         concurrent warmup/adopt that re-bound the row makes this a clean
-        no-op. Owner/admin only (move_chat parity — deliberately stricter
-        than rename/delete: an editor must not switch a shared chat's engine
-        out from under its other senders). Task-run and phone chats are
-        denied outright — their pipelines resolve the engine from task/agent
-        config, never from ``chats.execution_path``, so a switch there would
-        flip the badge while runs continue on the old engine."""
+        no-op. Normal chats: owner/admin only (move_chat parity). TASK-run
+        chats (1.5): allowed once the RUN is over — follow-up turns resolve
+        engine/model/seed from the chat row, so the switch governs exactly
+        those; gates = run not pending/running (``task_run_active`` — the
+        run lifecycle is invisible to session probes), the continue tier
+        (``_task_continue_allowed``: agent-scope → editor+, user-scope →
+        creator/admin), and TASK-identity credentials (agent scope runs on
+        the platform pool, not the viewer's subs). Phone chats stay denied
+        (their pipeline resolves the engine from agent config every call).
+        Chats targeted by an ACTIVE continuation task are denied — a rebind
+        NULLs session_id and the continuation's oneshot delivery would
+        starve (1.5 self-wake design round, W2-F5)."""
         import json as _json
         from api.agents._common import _get_execution_paths
         from services.engines import subscription_pool
@@ -526,14 +599,49 @@ class ClientMessageDispatcher:
             return
         cid = chat["id"]
         agent = chat.get("agent") or ""
-        if cid.startswith("task-") or chat.get("source_type") == "phone":
-            await _deny("Task and phone chats can't switch engines — their "
-                        "runs resolve the engine from the task/agent "
-                        "configuration.")
+        if chat.get("source_type") == "phone":
+            await _deny("Phone chats can't switch engines — their calls "
+                        "resolve the engine from the agent configuration.")
             return
         role = _effective_agent_role(self.user_sub, agent)
-        if chat.get("user_sub") != self.user_sub and role != "admin":
+        is_task_chat = cid.startswith("task-")
+        task_run = None
+        if is_task_chat:
+            from ws.dashboard import _task_continue_allowed, task_run_active
+            if task_run_active(cid):
+                await _deny("The task run is still active — switching "
+                            "engines is possible once it has finished.",
+                            alive=True)
+                return
+            task_run = task_store.get_run(cid.removeprefix("task-"))
+            if task_run is not None:
+                if not _task_continue_allowed(
+                        task_run, effective_role=role, user_sub=self.user_sub):
+                    await _deny("Switching this task chat's engine needs the "
+                                "same access as continuing it (agent-scope: "
+                                "editor or above; user-scope: the creator).")
+                    return
+            elif (chat.get("user_sub") or "").startswith("task::"):
+                # Run row aged out; the synthetic owner can't match any
+                # viewer — apply the agent-scope continue tier.
+                if role not in ("admin", "manager", "editor"):
+                    await _deny("Switching this task chat's engine needs "
+                                "editor access on the agent.")
+                    return
+            elif (chat.get("user_sub") != self.user_sub and role != "admin"):
+                await _deny("Only the chat owner can switch its engine.")
+                return
+        elif chat.get("user_sub") != self.user_sub and role != "admin":
             await _deny("Only the chat owner can switch its engine.")
+            return
+        # A chat wired as an active continuation target must keep its row
+        # coherent with the continuation's delivery ladder — deny for BOTH
+        # task-run chats and delegate worker chats (the latter pass the old
+        # prefix deny already today).
+        if task_store.list_continuations_for_chat(cid):
+            await _deny("This chat is the target of a scheduled follow-up — "
+                        "its engine is managed by that task until the "
+                        "follow-up completes.")
             return
         if ((self._warmup_task and not self._warmup_task.done())
                 or warmup_registry.get(cid) is not None
@@ -560,7 +668,31 @@ class ClientMessageDispatcher:
         if new_path not in _get_execution_paths(agent_rec):
             await _deny("That AI engine isn't enabled for this agent.")
             return
-        if not await asyncio.to_thread(
+        if is_task_chat:
+            # The follow-up turn rebuilds under the TASK identity, not the
+            # viewer: agent scope → platform pool only; user scope → the
+            # CREATOR's credentials. Checking the viewer here would both
+            # deny legitimate switches and green-light unusable ones.
+            _scope = ((task_run or {}).get("scope")
+                      or ("agent" if (chat.get("user_sub") or "").startswith(
+                          "task::") else "user"))
+            if _scope == "agent":
+                if not await asyncio.to_thread(
+                        subscription_pool.layer_platform_configured, new_path):
+                    await _deny("The platform pool has no credentials for "
+                                "that AI engine — an admin must connect one "
+                                "before agent-scope task chats can use it.")
+                    return
+            else:
+                _creator = ((task_run or {}).get("created_by")
+                            or chat.get("user_sub") or "")
+                if not await asyncio.to_thread(
+                        subscription_pool.user_can_run, new_path, _creator):
+                    await _deny("The task's creator has no access to that "
+                                "AI engine — its follow-up turns run on "
+                                "their credentials.")
+                    return
+        elif not await asyncio.to_thread(
                 subscription_pool.user_can_run, new_path, self.user_sub):
             await _deny("You don't have access to that AI engine — connect "
                         "it in your AI-engine settings first.")
@@ -602,6 +734,16 @@ class ClientMessageDispatcher:
                 or session_delivery.oneshot_inflight(cid) is not None):
             await _deny("The chat re-warmed while switching — try again.")
             return
+        if is_task_chat:
+            # Re-assert inside the no-await window: a scheduler fire that
+            # admitted a new run for this chat between the gate above and
+            # here must win (task_run_active is a synchronous DB read — no
+            # coroutine interleaves before the CAS below).
+            from ws.dashboard import task_run_active as _tra
+            if _tra(cid):
+                await _deny("A task run started while switching — try again "
+                            "once it finishes.", alive=True)
+                return
         if new_path == "direct-llm":
             # direct-llm never consumes seeds (it rebuilds full DB history
             # every turn): don't leave a flag to fire a stale digest on a

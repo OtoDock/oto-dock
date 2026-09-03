@@ -45,11 +45,13 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
           return
         }
 
-        // Register with FCM
-        await PushNotifications.register()
-
-        // Listen for registration token
-        PushNotifications.addListener('registration', async (token) => {
+        // Listeners BEFORE register(): once the device holds a cached FCM
+        // token the 'registration' event fires as soon as register() runs,
+        // and a listener attached after the await missed it — the server's
+        // token row then never refreshed after the first install (observed
+        // 2026-09-03: last refresh weeks old, no /v1/push/subscribe across
+        // six app restarts). Capacitor's own docs order it this way.
+        await PushNotifications.addListener('registration', async (token) => {
           try {
             await subscribePush('android', token.value)
           } catch (err) {
@@ -58,9 +60,12 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
         })
 
         // Registration error
-        PushNotifications.addListener('registrationError', (error) => {
+        await PushNotifications.addListener('registrationError', (error) => {
           console.error('FCM registration failed:', error)
         })
+
+        // Register with FCM
+        await PushNotifications.register()
 
         // Notification received while app is in foreground
         // We don't show native notification here — the WS toast handles it

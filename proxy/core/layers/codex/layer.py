@@ -192,6 +192,27 @@ def _inject_session_jwt_toml(
     )
 
 
+def _inject_session_id_toml(toml_content: str, session_id: str) -> str:
+    """Set ``?session_id=`` on every HTTP MCP ``url`` in the TOML (same purpose
+    as the CLI's ``_inject_session_id_into_sse`` — Docker MCPs need it for
+    per-session path resolution), mirroring the CLI's append logic: strip any
+    existing ``session_id`` param, then join with ``&`` when the URL already
+    carries a query string (a bare ``?`` append would corrupt e.g.
+    ``...?api_key=x`` into a double-``?`` URL).
+    """
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    def _sub(m: re.Match) -> str:
+        parsed = urlparse(m.group(2))
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        params.pop("session_id", None)
+        base = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+        sep = "&" if "?" in base else "?"
+        return f"{m.group(1)}{base}{sep}session_id={session_id}"
+
+    return re.sub(r'(url\s*=\s*")(http[^"]+)', _sub, toml_content)
+
+
 # ---------------------------------------------------------------------------
 # CodexCLIExecutionLayer
 # ---------------------------------------------------------------------------
@@ -287,6 +308,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             extra_egress_targets=[local_endpoint] if local_endpoint else None,
             config_visible=_ctx.config_visible if _ctx else None,
             mount_shared=_ctx.mount_shared if _ctx else True,
+            knowledge_rw=bool(getattr(_ctx, "knowledge_rw", False)) if _ctx else False,
             # TOML build file with host mcps/ paths — scanned (plain-text)
             # for the per-MCP dir binds.
             mcp_config_path=config.mcp_config_path,
@@ -294,6 +316,19 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         sandbox_builder = SandboxBuilder(sandbox_cfg)
 
         sandbox_cmd_prefix = sandbox_builder.build_command_prefix([])
+        # Boot-time nested-namespace probe said the engine's own inner bwrap
+        # cannot start on this host: name it per session, because the runtime
+        # symptom (every command degrading to unsandboxed retries + permission
+        # prompts, model-paraphrased as "sandbox unavailable") doesn't point
+        # anywhere near the cause.
+        from core.sandbox.sandbox import nested_sandbox_ok
+        if nested_sandbox_ok() is False:
+            logger.warning(
+                f"codex[{config.agent_name}]: this host denies nested bwrap "
+                "(boot probe) — the Codex inner sandbox will fail to start and "
+                "commands fall back to permission prompts. Run "
+                "scripts/sandbox-doctor.sh to pinpoint the denial."
+            )
         env_overrides = sandbox_builder.get_env_overrides(
             config_dir_name=".codex", config_env_var="CODEX_HOME",
         )
@@ -319,10 +354,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # Inject session_id into HTTP MCP URLs (same purpose as CLI's
         # _inject_session_id_into_sse — Docker MCPs need it for path resolution)
         if mcp_toml_content:
-            mcp_toml_content = re.sub(
-                r'(url\s*=\s*"http[^"]+)',
-                rf'\1?session_id={session_id}',
-                mcp_toml_content,
+            mcp_toml_content = _inject_session_id_toml(
+                mcp_toml_content, session_id,
             )
             # Swap the session-JWT sentinel (Docker MCPs w/ server.proxy_callbacks,
             # e.g. file-tools) for a real session JWT now that session_id is known.

@@ -1,0 +1,85 @@
+{
+  "name": "delegation-mcp",
+  "label": "Delegation",
+  "description": "Delegate work to parallel agent sessions and monitor them",
+  "version": "1.2.2",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [
+    {
+      "key": "MAX_PARALLEL_SPAWNS",
+      "label": "Max parallel spawns per user",
+      "input_type": "number",
+      "default": "4",
+      "user_overridable": false
+    },
+    {
+      "key": "MAX_DELEGATION_DEPTH",
+      "label": "Max delegation chain depth (hops)",
+      "input_type": "number",
+      "default": "4",
+      "user_overridable": false
+    },
+    {
+      "key": "SEND_FILES_MAX_FILES",
+      "label": "Max files per send_files call",
+      "input_type": "number",
+      "default": "20",
+      "user_overridable": false
+    },
+    {
+      "key": "SEND_FILES_MAX_PER_DAY",
+      "label": "Max send_files transfers per user per day",
+      "input_type": "number",
+      "default": "50",
+      "user_overridable": false
+    }
+  ],
+
+  "env": {},
+  "agent_env": {
+    "DELEGATION_MCP_AGENT": "${agent_name}",
+    "PROXY_TASK_OWNER": "${session.task_owner}",
+    "PROXY_TASK_USERNAME": "${session.task_username}",
+    "PROXY_TASK_SCOPE": "${session.task_scope}"
+  },
+
+  "exclude_from": [],
+
+  "skills": [
+    {
+      "id": "delegation",
+      "loading": "always",
+      "file": "skills/delegation.md",
+      "description": "Delegating work to parallel sessions, choosing chat vs task surface, monitoring lanes, project orchestration",
+      "default_exclude_from": []
+    }
+  ],
+
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "list_sessions",
+        "tier": "open"
+      },
+      {
+        "tool": "peek_session",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

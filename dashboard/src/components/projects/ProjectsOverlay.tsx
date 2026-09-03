@@ -285,7 +285,7 @@ export default function ProjectsOverlay({
           // With file pins the chat dock becomes a page scroll: the app (if
           // any) at content height on top, the pinned files below.
           <div className="flex-1 min-h-0 overflow-y-auto">
-            <div className="max-w-5xl mx-auto px-2 sm:px-4 pb-8">
+            <div className="px-2 pb-8">
               {chatApp && (
                 <div className="rounded-xl border border-p-border-light overflow-hidden bg-white dark:bg-p-surface mb-4">
                   <AppPanel app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" autoHeight />
@@ -332,9 +332,10 @@ export default function ProjectsOverlay({
 
   // ── Project dock: pinned project app (primary) beside the lane cards ─────
   const lanesPanel = (
-    // px-2 on mobile (operator ask): the lane cards and the docked dashboard
-    // below reach closer to the screen edges; sm+ keeps the roomier inset.
-    <div className="max-w-5xl mx-auto px-2 sm:px-4 pt-16 pb-3">
+    // Full-bleed at a flat px-2 (operator ask, 2026-08-13): dashboards use
+    // the whole tab width on desktop, matching the standing-apps tab's p-2
+    // frame — the lanes widen with them so the page keeps one aligned edge.
+    <div className="px-2 pt-14 pb-3">
       {/* Header */}
       <div className="flex items-center justify-between mb-1">
         <h2 className="text-lg font-semibold text-p-text truncate">
@@ -434,7 +435,7 @@ export default function ProjectsOverlay({
 
           {/* Decisions & hand-offs from the board document */}
           {board && (board.decisions.length > 0 || board.handoffs.length > 0) && (
-            <div className="grid sm:grid-cols-2 gap-3 mb-3">
+            <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mb-3">
               {board.decisions.length > 0 && (
                 <div className="px-3 py-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface">
                   <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1">Decisions</p>
@@ -499,10 +500,10 @@ export default function ProjectsOverlay({
   return (
     <div className="flex-1 min-h-0 bg-p-bg overflow-y-auto" data-testid="projects-overlay">
       {lanesPanel}
-      {/* Same 5xl column AND the same horizontal inset as the lanes — the
-          platform section and the dashboard read as one page, edges aligned
-          on every breakpoint (operator ask). */}
-      <div className="max-w-5xl mx-auto px-2 sm:px-4 pb-8">
+      {/* Same full-bleed px-2 inset as the lanes — the platform section and
+          the dashboard read as one page, edges aligned on every breakpoint
+          (operator ask; full width 2026-08-13). */}
+      <div className="px-2 pb-8">
         <div className="border-t border-p-border-light/60 mb-3" />
         <AppPanel app={projectApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-project-app" autoHeight />
       </div>

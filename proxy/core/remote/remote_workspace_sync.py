@@ -307,6 +307,7 @@ class RemoteWorkspaceSyncMixin:
         *, target_username: str | None = None,
         target_role: str = "",
         session_username: str = "",
+        session_knowledge_rw: bool = False,
         progress_cb=None,
     ) -> None:
         """Versioned last-write-wins sync of the agent_dir with a satellite at
@@ -330,6 +331,12 @@ class RemoteWorkspaceSyncMixin:
         target, and the merge scrubbed satellite-created config files that the
         live-path ``file_changed`` applier (which reads the SecurityContext)
         would have accepted.
+        ``session_knowledge_rw`` is the session's manager-provenance flag
+        (``SecurityContext.knowledge_rw``) — threaded into the merge's pull
+        gate so session-start reconciliation and the per-turn applier agree
+        on knowledge/ writes from agent-scope task fires (agent-scope tasks
+        DO run on admin-paired satellites, where this gate is the ONLY
+        boundary — no bwrap there). Machine-pairing merges pass False.
         Best-effort: any error is caught by the caller and the session proceeds.
         """
         import asyncio as _asyncio
@@ -364,6 +371,10 @@ class RemoteWorkspaceSyncMixin:
                     # satellites hard-reject >100MB, so bigger files must never
                     # enter their merge plan (doomed pushes / permanent churn).
                     max_file_size=self._cm.effective_sync_cap(machine_id),
+                    # Marker-confirmed build-dir exclusions — ONLY for machines
+                    # whose satellite ACKed the table (0.5.110+): both walks
+                    # must apply the same rules or the diff churns.
+                    ignore_rules=self._cm.effective_ignore_rules(machine_id),
                 ),
             )
             try:
@@ -420,6 +431,28 @@ class RemoteWorkspaceSyncMixin:
                 if (target_role in ("manager", "admin") and _cwb_username)
                 else set(file_sync.DEFAULT_PUSH_ONLY_PREFIXES)
             )
+            # Knowledge-library mirrors: read-only attachments are
+            # platform-authoritative on every machine (push-only + scrubbed
+            # everywhere — the projector owns mirror content); writable
+            # attachments participate in the normal merge, with their
+            # (source, subdir) pairs feeding can_write_back's segment-wise
+            # subtree rule. Prefixes are PER LIBRARY subtree — the trailing
+            # slash keeps the prefix match segment-safe (an RO library
+            # ``marketing`` never covers ``marketing-extra``).
+            from storage import db_knowledge_libraries
+            _attachments = await _asyncio.to_thread(
+                db_knowledge_libraries.attachments_for_consumer, agent_slug,
+            )
+            _lib_ro = {
+                (f"knowledge/shared/{a['source_agent']}/{a['subdir']}/"
+                 if a["subdir"] else f"knowledge/shared/{a['source_agent']}/")
+                for a in _attachments if not a["writable"]
+            }
+            writable_libraries = frozenset(
+                (a["source_agent"], a["subdir"] or "")
+                for a in _attachments if a["writable"]
+            )
+            push_only_dirs |= _lib_ro
             plan = await _asyncio.to_thread(
                 file_sync.diff_manifests,
                 local_entries, remote_entries,
@@ -429,7 +462,32 @@ class RemoteWorkspaceSyncMixin:
                 target_username=target_username, target_role=target_role,
                 session_username=session_username,
                 exclude_user_dirs=exclude_users,
+                writable_libraries=writable_libraries,
+                scrub_dirs=_lib_ro,
+                knowledge_rw=session_knowledge_rw,
             )
+
+            # Sync-delta telemetry (alert-only, never blocks or filters the
+            # sync): a huge planned pull of NEW satellite files usually means
+            # a build tree the sync-ignore table doesn't cover yet.
+            try:
+                from core.remote import sync_delta_alerts
+                _new_pulls = [a for a in plan.actions
+                              if a.op == "pull" and a.rel_path not in base]
+                if _new_pulls:
+                    _subs: dict[str, int] = {}
+                    _nbytes = 0
+                    for a in _new_pulls:
+                        _subs[sync_delta_alerts._top_subtree(a.rel_path)] = (
+                            _subs.get(
+                                sync_delta_alerts._top_subtree(a.rel_path), 0) + 1)
+                        _nbytes += remote_size.get(a.rel_path, 0)
+                    await sync_delta_alerts.maybe_alert(
+                        machine_id, agent_slug, source="reconcile",
+                        new_files=len(_new_pulls), new_bytes=_nbytes,
+                        subtree_counts=_subs)
+            except Exception:
+                logger.debug("sync-delta telemetry failed", exc_info=True)
 
             if not plan.actions and not plan.to_scrub:
                 logger.debug("Initial workspace sync for %s: in-sync", agent_slug)

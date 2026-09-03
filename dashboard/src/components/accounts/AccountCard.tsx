@@ -31,6 +31,15 @@ export function AccountCard({
 }: Props) {
   const isOAuth = !!integration.oauth
   const label = account.display_email || account.account_label
+  // A user-chosen label (PAT saves) is otherwise invisible when the provider
+  // identity fills display_email — two same-identity accounts then render as
+  // twins. Show the label in parens whenever it differs from the title.
+  const customLabel =
+    account.display_email &&
+    account.account_label &&
+    account.account_label !== account.display_email
+      ? account.account_label
+      : ''
   const overridesCount = account.agent_overrides.length
 
   return (
@@ -62,6 +71,11 @@ export function AccountCard({
           <div className="min-w-0 flex-1">
             <div className="text-sm font-medium text-p-text truncate">
               {label}
+              {customLabel && (
+                <span className="ml-2 text-xs text-p-text-light">
+                  ({customLabel})
+                </span>
+              )}
               {account.is_default && (
                 <span className="ml-2 text-xs text-p-text-light">
                   (default)

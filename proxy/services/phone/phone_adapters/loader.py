@@ -17,31 +17,38 @@ from storage import database as task_store
 from .asterisk_freepbx import AsteriskFreePBXAdapter
 from .base import PhoneAdapterError, PhoneServerAdapter
 from .manual_asterisk import ManualAsteriskAdapter
-from .stubs import ThreeCxStubAdapter, TwilioStubAdapter
+from .stubs import ThreeCxStubAdapter
+from .twilio import TwilioAdapter
 
-# adapter_type → class. Asterisk (manual + FreePBX over AMI) are real;
-# Twilio/3CX are graceful stubs until their automation ships.
+# adapter_type → class. Asterisk (manual + FreePBX over AMI) and Twilio are
+# real; 3CX stays a graceful stub until its automation ships.
 logger = logging.getLogger("claude-proxy.phone.adapters")
 
 ADAPTER_CLASSES: dict[str, type[PhoneServerAdapter]] = {
     "asterisk_manual": ManualAsteriskAdapter,
     "asterisk_freepbx": AsteriskFreePBXAdapter,
-    "twilio": TwilioStubAdapter,
+    "twilio": TwilioAdapter,
     "three_cx": ThreeCxStubAdapter,
 }
 
 # AudioSocket-based local-PBX adapter types (the Asterisk family). Gated OFF when
-# config.LOCAL_PBX_ENABLED is false (OtoDock cloud) — see config.py. Twilio/3CX are
-# cloud-reachable and stay available regardless.
+# config.LOCAL_PBX_ENABLED is false (OtoDock cloud) — see config.py. Twilio is
+# cloud-reachable and stays available regardless.
 LOCAL_PBX_ADAPTERS = frozenset({"asterisk_manual", "asterisk_freepbx"})
+
+# Deferred providers: never offered for NEW servers (the dashboard hides them
+# too); ADAPTER_CLASSES keeps the graceful stub so a legacy row still loads.
+UNRELEASED_ADAPTERS = frozenset({"three_cx"})
 
 
 def available_adapter_types() -> list[str]:
-    """Adapter types an admin may create on THIS install — ``ADAPTER_CLASSES`` minus
-    the local-PBX (Asterisk/FreePBX) ones when ``config.LOCAL_PBX_ENABLED`` is false."""
+    """Adapter types an admin may create on THIS install — ``ADAPTER_CLASSES``
+    minus the deferred providers, minus the local-PBX (Asterisk/FreePBX) ones
+    when ``config.LOCAL_PBX_ENABLED`` is false."""
+    types = [t for t in ADAPTER_CLASSES if t not in UNRELEASED_ADAPTERS]
     if config.LOCAL_PBX_ENABLED:
-        return list(ADAPTER_CLASSES)
-    return [t for t in ADAPTER_CLASSES if t not in LOCAL_PBX_ADAPTERS]
+        return types
+    return [t for t in types if t not in LOCAL_PBX_ADAPTERS]
 
 
 _DEFAULT_AUDIOSOCKET_PORT = "9092"

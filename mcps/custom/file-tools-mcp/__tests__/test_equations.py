@@ -109,6 +109,7 @@ def _word(monkeypatch):
         return None
 
     monkeypatch.setattr(word_mod, "_resolve_path", _async_ident)
+    monkeypatch.setattr("shared._resolve_path", _async_ident)
     monkeypatch.setattr(word_mod, "_push_preview", _noop_preview)
     return word_mod
 

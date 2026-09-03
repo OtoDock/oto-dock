@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { safeHref } from '../../lib/safeUrl'
 import { createPortal } from 'react-dom'
 import {
   useMcpInstances,
@@ -562,7 +563,7 @@ function InstanceForm({
               Credit is billed per-user
               {apiKeyRelay.billing_setup_url ? (
                 <>
-                  {' '}(<a href={apiKeyRelay.billing_setup_url} target="_blank" rel="noreferrer" className="text-brand underline">set up billing</a>).
+                  {' '}(<a href={safeHref(apiKeyRelay.billing_setup_url)} target="_blank" rel="noreferrer" className="text-brand underline">set up billing</a>).
                 </>
               ) : '.'}
             </p>

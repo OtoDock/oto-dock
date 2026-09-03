@@ -5,6 +5,7 @@ Uses the same get_conn() pattern as all other storage modules.
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import secrets
@@ -21,6 +22,24 @@ def _now() -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+# Credential-bearing columns that must never leave the storage layer — API
+# and WS callers forward these rows (or fields of them) to clients. The two
+# verifiers (``exchange_pairing_token`` / ``verify_machine_secret``) read the
+# hashes via their own targeted SELECTs, so every function that returns whole
+# machine rows strips them first.
+_SECRET_COLUMNS = (
+    "pairing_token_hash",
+    "pairing_token_created_at",
+    "machine_secret_hash",
+)
+
+
+def _strip_secret_columns(row: dict) -> dict:
+    for col in _SECRET_COLUMNS:
+        row.pop(col, None)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +97,7 @@ def create_remote_machine(
         row = conn.execute(
             "SELECT * FROM remote_machines WHERE id = %s", (machine_id,)
         ).fetchone()
-        result = dict(row)
+        result = _strip_secret_columns(dict(row))
 
     result["pairing_token"] = token
     return result
@@ -102,7 +121,7 @@ def get_remote_machine(machine_id: str) -> dict | None:
             "WHERE rm.id = %s",
             (machine_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return _strip_secret_columns(dict(row)) if row else None
 
 
 def get_target_metadata(
@@ -213,7 +232,7 @@ def get_all_remote_machines() -> list[dict]:
             "LEFT JOIN users u ON u.sub = rm.registered_by "
             "ORDER BY rm.name"
         ).fetchall()
-        machines = [dict(r) for r in rows]
+        machines = [_strip_secret_columns(dict(r)) for r in rows]
 
         # Attach assigned agents
         for m in machines:
@@ -452,8 +471,11 @@ def record_update_result(
     machine_id: str, *, target_version: str = "", error: str | None = None,
 ) -> None:
     """Record the outcome of an update attempt. Success: clears the error
-    column, stamps last_update_at, sets satellite_version to target. Failure:
-    keeps the previous satellite_version and stores the error text.
+    column, stamps last_update_at, sets satellite_version to target and
+    resets the rollback budget (``update_rollback_count/target``). Failure:
+    keeps the previous satellite_version and stores the error text (a push
+    that never left the proxy — for a rolled-back push use
+    ``record_update_rollback``, which also counts it).
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
@@ -462,7 +484,8 @@ def record_update_result(
             conn.execute(
                 "UPDATE remote_machines SET last_update_at = %s, "
                 "satellite_version = %s, last_update_error = NULL, "
-                "pending_update = FALSE "
+                "pending_update = FALSE, "
+                "update_rollback_count = 0, update_rollback_target = NULL "
                 "WHERE id = %s",
                 (now, target_version, machine_id),
             )
@@ -473,6 +496,34 @@ def record_update_result(
                 (error, now, machine_id),
             )
         conn.commit()
+
+
+def record_update_rollback(
+    machine_id: str, *, target_version: str, error: str,
+) -> int:
+    """Record that a pushed update to ``target_version`` rolled back (the
+    satellite reconnected BELOW the target). Counts consecutive rollbacks
+    PER TARGET: the same target increments, a different target starts a
+    fresh budget at 1. Stores the error, stamps ``last_update_at`` and
+    CLEARS ``pending_update`` — the explicit "Update now" attempt was
+    consumed, so an offline-queued push cannot loop on every reconnect.
+    Returns the new count; ``ws/satellite.py`` stops automatic pushes of
+    that target at ``MAX_AUTO_UPDATE_ROLLBACKS``.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        row = conn.execute(
+            "UPDATE remote_machines SET "
+            "update_rollback_count = CASE WHEN update_rollback_target = %s "
+            "THEN update_rollback_count + 1 ELSE 1 END, "
+            "update_rollback_target = %s, last_update_error = %s, "
+            "last_update_at = %s, pending_update = FALSE "
+            "WHERE id = %s RETURNING update_rollback_count",
+            (target_version, target_version, error, now, machine_id),
+        ).fetchone()
+        conn.commit()
+    return int(row["update_rollback_count"]) if row else 0
 
 
 def set_pending_update(machine_id: str, pending: bool) -> None:
@@ -503,7 +554,7 @@ def get_all_user_paired_machines() -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM remote_machines WHERE pairing_scope = 'user'"
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_strip_secret_columns(dict(r)) for r in rows]
 
 
 def clear_user_remote_targets_for_machine(machine_id: str) -> int:
@@ -553,7 +604,7 @@ def exchange_pairing_token(
             raise ValueError("Machine not found")
         if not row["pairing_token_hash"]:
             raise ValueError("Pairing token already exchanged")
-        if row["pairing_token_hash"] != token_hash:
+        if not hmac.compare_digest(row["pairing_token_hash"], token_hash):
             raise ValueError("Invalid pairing token")
 
         # Check expiry
@@ -565,12 +616,19 @@ def exchange_pairing_token(
         machine_secret = secrets.token_urlsafe(48)
         secret_hash = _sha256(machine_secret)
 
-        conn.execute(
+        # Conditional on the hash still being present: two racing exchanges
+        # (a token thief vs the legitimate installer) must produce ONE winner
+        # and one loud "already exchanged" error — an unconditional UPDATE
+        # would let the loser silently overwrite the winner's secret.
+        cur = conn.execute(
             "UPDATE remote_machines SET pairing_token_hash = NULL, "
-            "pairing_token_created_at = NULL, machine_secret_hash = %s WHERE id = %s",
-            (secret_hash, machine_id),
+            "pairing_token_created_at = NULL, machine_secret_hash = %s "
+            "WHERE id = %s AND pairing_token_hash = %s",
+            (secret_hash, machine_id, token_hash),
         )
         conn.commit()
+        if cur.rowcount != 1:
+            raise ValueError("Pairing token already exchanged")
 
     return machine_secret
 
@@ -764,7 +822,7 @@ def get_default_machine_for_agent(agent_slug: str) -> dict | None:
             "WHERE art.agent_slug = %s AND art.is_default = TRUE",
             (agent_slug,),
         ).fetchone()
-        return dict(row) if row else None
+        return _strip_secret_columns(dict(row)) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +891,7 @@ def get_visible_machines_for_user(
                 "ORDER BY name",
                 (user_sub,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [_strip_secret_columns(dict(r)) for r in rows]
 
 
 def set_user_remote_target(

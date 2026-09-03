@@ -189,7 +189,10 @@ async def list_subscriptions(
     accessible agents.
     """
     u = require_auth(user)
-    if u.is_admin or u.is_api_key:
+    # Keyed on is_service like /v1/tasks (H1/H2): a session JWT is
+    # api-key-shaped but must get the user-view (own user-scope +
+    # accessible-agent service-scope), never the full table.
+    if u.is_admin or u.is_service:
         rows = webhook_subscription_store.list_subscriptions(
             scope=scope, agent=agent, mcp_name=mcp_name, provider_id=provider_id,
             account_label=account_label,

@@ -192,6 +192,13 @@ RECOVER_BIN_DIR = PLATFORM_DATA_DIR / "recover-bin"
 # dashboard's "previous version" block shows trustworthy history. Sibling of
 # agents/ so no agent or satellite sync can reach or tamper with it.
 PREVIEW_SNAPSHOT_DIR = PLATFORM_DATA_DIR / "preview-snapshots"
+# In-flight chunked-upload staging (api/media/uploads.py): each large browser
+# upload assembles here as `<upload_id>.partial` + `<upload_id>.json` meta,
+# then atomic-renames into the agent tree at complete. Sibling of agents/ —
+# SAME filesystem (so the final os.replace stays atomic) but OUTSIDE every
+# agent tree, keeping staging invisible to sync manifests, agent shells, and
+# the `*.partial` retention reaper that patrols AGENTS_DIR.
+UPLOAD_STAGING_DIR = PLATFORM_DATA_DIR / "upload-staging"
 # Files larger than this are NOT backed up to the recover-bin (the delete /
 # overwrite still proceeds) — a safety net shouldn't copy huge build artifacts.
 # Deliberately much smaller than OTODOCK_MAX_FILE_MB (Windows-Recycle-Bin-style:
@@ -269,6 +276,74 @@ MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 SYNC_MAX_FILE_BYTES = MAX_FILE_BYTES  # alias read by core/remote/file_sync.py
 MAX_UPLOAD_SIZE_BYTES = MAX_FILE_BYTES  # alias read live by api/media/uploads.py
 
+# Sync-ignore rule table: marker-confirmed generated/build-dir exclusion for
+# satellite workspace sync (1.5). Shipped to 0.5.110+ satellites in the
+# auth_result policy handshake and applied to the proxy's own per-machine
+# manifest walk for those machines (core/remote/file_sync.py holds the engine
+# + full semantics; from the 1.5 sync-ignore design round).
+#
+# EVOLUTION CONTRACT — read before editing:
+#   * ADDITIVE data edits (new named rule, new marker, new veto entry) are
+#     safe proxy-only changes: 0.5.110+ satellites apply whatever v1 table
+#     the handshake carries, no satellite release needed.
+#   * Any FORMAT/semantic change requires version=2 + a NEW satellite
+#     capability gate (satellites reject unknown versions → legacy walk, so
+#     the proxy would have to compute legacy manifests for them or the diff
+#     misattributes whole trees as deletes).
+#   * A named rule WITHOUT sibling evidence is refused by validation — bare
+#     dir-name exclusion is exactly the false-positive class this design
+#     forbids (a project root merely NAMED `target` must keep syncing).
+#   * Veto entries must be files that THEMSELVES SYNC (never `.git` — the
+#     platform copy lacks it and the two walks would disagree → churn).
+SYNC_IGNORE_RULES: dict = {
+    "version": 1,
+    "in_dir_markers": [
+        # Cache Directory Tagging spec (bford.info/cachedir) — cargo>=1.46
+        # target/, uv caches+venvs, pytest/ruff/mypy caches write it. Only
+        # honored with the spec signature (first 43 bytes).
+        {"file": "CACHEDIR.TAG", "signed": True},
+        {"file": "CMakeCache.txt"},       # any CMake build tree, any name
+        {"file": "project.assets.json"},  # NuGet obj dir, any name
+        {"dir": "meson-info"},            # Meson builddir (never in-tree)
+    ],
+    "named": [
+        {"dir": "target", "siblings": ["Cargo.toml", "pom.xml", "build.sbt"]},
+        {"dir": "build", "siblings": ["build.gradle", "build.gradle.kts",
+                                      "settings.gradle", "settings.gradle.kts",
+                                      "pubspec.yaml"]},
+        {"dir": "obj", "sibling_globs": ["*.csproj", "*.fsproj", "*.vbproj"]},
+        {"dir": "Pods", "siblings": ["Podfile"]},
+        {"dir": "_build", "siblings": ["mix.exs"]},
+        {"dir": "dist-newstyle", "siblings": ["cabal.project"],
+         "sibling_globs": ["*.cabal"]},
+        {"dir": "zig-out", "siblings": ["build.zig"]},
+    ],
+    "veto_files": ["CMakeLists.txt", "Cargo.toml", "package.json",
+                   "pyproject.toml", "setup.py", "go.mod", "pom.xml",
+                   "build.gradle", "build.gradle.kts", "mix.exs",
+                   "composer.json", "Gemfile", "pubspec.yaml", "build.sbt",
+                   "build.zig", "meson.build"],
+    "veto_globs": ["*.csproj", "*.cabal"],
+}
+
+# Sync-delta telemetry (alert-only — sync NEVER pauses): an admin
+# notification fires when one reconcile plans more than this many new
+# pull-side files / bytes, or the per-turn inbound write counter crosses it
+# within its rolling window. Signal for extending SYNC_IGNORE_RULES, never a
+# decision point.
+SYNC_DELTA_ALERT_FILES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_FILES", "2000"))
+SYNC_DELTA_ALERT_BYTES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_MB", "500")) * 1024 * 1024
+
+# Chunk size handed to browsers by POST /v1/upload/chunked/init. Files bigger
+# than one chunk upload as N sequential ≤chunk-size requests, so CDN/gateway
+# request-body caps (Cloudflare ~100MB Free/Pro, nginx client_max_body_size)
+# never see the whole file. The default keeps a 1GB file at 32 requests while
+# clearing common edge caps with a 3× margin. The server DICTATES this value —
+# clients slice strictly by what init returns (a client-chosen size would
+# invite silent offset corruption).
+UPLOAD_CHUNK_MB = int(_cfg("OTODOCK_UPLOAD_CHUNK_MB", "32"))
+UPLOAD_CHUNK_BYTES = UPLOAD_CHUNK_MB * 1024 * 1024
+
 # Global cap on CONCURRENT LARGE outbound (proxy→satellite) workspace pushes,
 # across ALL machines and both push paths (live fan-out + initial-sync push
 # branch). Per-machine pacing already exists (windowed acks + the two-lane
@@ -322,6 +397,11 @@ RATE_LIMIT_RULES = {
     "webhook": _rate_limit_rule("WEBHOOK", 600, 60, 30, 600),
     # Per-IP webhook AUTH-FAILURE throttle — strict, to rate-limit key brute force.
     "webhook_auth": _rate_limit_rule("WEBHOOK_AUTH", 20, 300, 300, 3600),
+    # Per-USER password-confirm throttle (change-password/change-email/
+    # TOTP-disable/passkey management): these re-verify the account password
+    # on an already-authed session, so without a cap a stolen session cookie
+    # is an unbounded online password oracle.
+    "confirm": _rate_limit_rule("CONFIRM", 10, 900, 900, 3600),
 }
 
 # Stable per-install identifier (short, NOT a secret). Namespaces the proxy's
@@ -393,6 +473,35 @@ def get_agent_dir(agent_name: str) -> Path:
 _DOC_EXTENSIONS = {".md", ".txt", ".markdown"}
 _MAX_DOC_BYTES = 1 * 1024 * 1024       # 1 MB per file
 _MAX_TOTAL_DOC_BYTES = 5 * 1024 * 1024  # 5 MB total per agent
+
+
+def persona_is_unconfigured(agent_name: str) -> bool:
+    """True when the agent's persona file still holds nothing but its title.
+
+    A dashboard-created agent is seeded with ``# {display_name}\\n\\n`` and
+    nothing else, and that empty state is otherwise INVISIBLE — the prompt
+    builder only bails on a MISSING persona, so a title-only file renders as
+    a perfectly valid (and empty) section 1. The manager-facing
+    ``# Building Agents`` section uses this to say so, once, until someone
+    writes the persona.
+
+    Fail-safe: an unreadable/missing file returns False. Never nag when we
+    cannot tell (a template-installed agent always has real content).
+    """
+    if not is_safe_agent_name(agent_name):
+        return False
+    config_dir = AGENTS_DIR / agent_name / "config"
+    for candidate in (config_dir / "agent.md", config_dir / "prompt.md"):
+        try:
+            text = candidate.read_text()
+        except OSError:
+            continue
+        # Drop a single leading H1 (the seeded title) and see what remains.
+        body = text.strip()
+        if body.startswith("#"):
+            body = body.split("\n", 1)[1] if "\n" in body else ""
+        return not body.strip()
+    return False
 
 
 def _read_agent_files(model: str) -> list[tuple[str, str]]:
@@ -740,6 +849,91 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
     return "".join(parts)
 
 
+# Per-bulletin injection cap. Bulletins are prompt-level context — a short
+# team briefing, not a document dump.
+_BULLETIN_MAX_BYTES = 4 * 1024
+# Read-side soft warning. Bulletin edits are plain file writes (no tool
+# result to warn through, unlike memory's write-time soft limit), so the
+# injected section itself tells every attached agent when pruning is due —
+# any RW-attached agent can act on it.
+_BULLETIN_SOFT_WARN_BYTES = 3 * 1024
+
+
+def _read_bulletin(source_agent: str, sub_rel: str) -> str:
+    """The SOURCE-resident bulletin's text, capped at 4 KB and truncated on
+    a UTF-8 character boundary (decode drops a split trailing sequence).
+    '' when the file is missing/unreadable — injection then skips it."""
+    path = get_agent_dir(source_agent) / "knowledge" / sub_rel
+    try:
+        if not path.is_file() or path.is_symlink():
+            return ""
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    truncated = len(data) > _BULLETIN_MAX_BYTES
+    text = data[:_BULLETIN_MAX_BYTES].decode("utf-8", errors="ignore").strip()
+    if truncated and text:
+        text += ("\n\n_(bulletin truncated at 4 KB — anything below the cap "
+                 "never reaches agents; writers should prune older entries)_")
+    elif len(data) > _BULLETIN_SOFT_WARN_BYTES and text:
+        text += (f"\n\n_(this bulletin is {len(data) / 1024:.1f} KB of the "
+                 "4 KB injected cap — writers should prune older entries)_")
+    return text
+
+
+def _render_library_bulletins(agent_name: str) -> str | None:
+    """The ``# Library Bulletins`` prompt section — one subsection per
+    shared library this agent is ATTACHED to or is the SOURCE of, reading
+    the source-resident ``bulletin/<library name>.md`` only (writable
+    attachments may author the bulletin since 1.5 — those edits ARRIVE
+    here via the projector's normal mirror→source adoption, so the source
+    copy stays the single read point). Default-on convention: no flag,
+    missing file = no subsection."""
+    from storage import db_knowledge_libraries
+    # (source, subdir, name, own, writable)
+    entries: list[tuple[str, str, str, bool, bool]] = []
+    for a in db_knowledge_libraries.attachments_for_consumer(agent_name):
+        entries.append((a["source_agent"], a["subdir"] or "",
+                        a["name"] or "", False, bool(a.get("writable"))))
+    for lib in db_knowledge_libraries.libraries_of(agent_name):
+        entries.append((agent_name, lib["subdir"] or "",
+                        lib["name"] or "", True, False))
+    sections: list[str] = []
+    for source, subdir, name, own, writable in entries:
+        rel = db_knowledge_libraries.bulletin_rel(subdir, name)
+        if not rel:
+            continue
+        text = _read_bulletin(source, rel)
+        if not text:
+            continue
+        if own:
+            origin = "this agent's own library"
+            hint = f"\n_File: `/knowledge/{rel}`._"
+        elif writable:
+            mount = (f"/knowledge/shared/{source}/{subdir}/" if subdir
+                     else f"/knowledge/shared/{source}/")
+            origin = f"from the **{source}** agent"
+            hint = (f"\n_Writable attachment — publish updates at "
+                    f"`{mount}bulletin/{name}.md`._")
+        else:
+            origin = f"from the **{source}** agent"
+            hint = ""
+        sections.append(f"## {name} ({origin}){hint}\n\n{text}")
+    if not sections:
+        return None
+    return (
+        "\n\n---\n\n# Library Bulletins\n\n"
+        "Each shared knowledge library carries a bulletin — a small runtime "
+        "broadcast file auto-loaded into the context of every agent attached "
+        "to that library, at every session start. Teams use it to pass "
+        "daily/weekly progress and \"what changed\" notes between agents "
+        "automatically; it is NOT a memory — keep durable facts in memory or "
+        "knowledge files, and keep the bulletin short (only its first 4 KB "
+        "is injected): prune superseded entries whenever you update it.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def build_agent_prompt(model: str, *,
                        username: str | None = None,
                        role: str = "manager",
@@ -954,6 +1148,15 @@ def build_agent_prompt(model: str, *,
         if memory_section:
             parts.append(memory_section)
 
+    # Shared-library bulletins — the SOURCE-resident
+    # ``<subtree>/bulletin/<library name>.md`` of every library this agent
+    # is attached to or shares, read server-side so personal-only consumers
+    # and agent-scope sessions get it too. Best-effort like memory.
+    with contextlib.suppress(Exception):
+        bulletin_section = _render_library_bulletins(model)
+        if bulletin_section:
+            parts.append(bulletin_section)
+
     # Workspace and user directory listing
     ws_listing = _scan_workspace(agent_dir, model, username=username, role=role,
                                  sandboxed=sandboxed, mount_shared=mount_shared)
@@ -1107,11 +1310,19 @@ FCM_SERVICE_ACCOUNT_PATH = _cfg("FCM_SERVICE_ACCOUNT_PATH", "")
 # Update this when Anthropic changes pricing or adds new models.
 # ---------------------------------------------------------------------------
 MODEL_REGISTRY: dict[str, dict] = {
-    "claude-fable-5": {
-        "label": "Fable 5",
+    # Fable 5.1 (2026-09-01) replaces the Fable 5 builtin at the SAME base
+    # price ($10/$50) with cheaper cache reads (2.5% of input vs 10% —
+    # platform.claude.com models overview), so the swap is lossless: a
+    # one-time boot remap moves fable-5-pinned agents/tasks/chats to
+    # claude-fable-5-1 (MODEL_SUCCESSORS, walked at startup); sync_builtin_models
+    # retires the builtin row so pickers stop offering Fable 5 (still served
+    # by Anthropic as a legacy model — admins can re-add claude-fable-5 as a
+    # custom model). First position keeps it the claude-code-cli Auto default.
+    "claude-fable-5-1": {
+        "label": "Fable 5.1",
         "provider": "anthropic",
-        "context_window": 1_000_000,   # 1M is Fable 5's native (and only) window
-        "pricing": (10.0, 50.0, 12.50, 1.00),  # cache = 1.25x input / 0.1x input
+        "context_window": 1_000_000,   # 1M native window (as Fable 5)
+        "pricing": (10.0, 50.0, 12.50, 0.25),  # cache write 1.25x input; reads 2.5% of input (5.1 cut)
         # CLI-only: Fable's pricing is above Opus-tier, so keeping it off
         # direct-llm bounds accidental spend on the hosted (credit-metered) path.
         # Fable's safety classifiers can refuse a request mid-run; Claude Code
@@ -1124,7 +1335,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     },
     # Opus 5 (2026-07-24) replaces the retired Opus 4.8 builtin at the SAME
     # price, so the swap is lossless: a one-time boot remap moves 4.8-pinned
-    # agents/tasks/chats to claude-opus-5 (remap_retired_model, see startup);
+    # agents/tasks/chats to claude-opus-5 (MODEL_SUCCESSORS, walked at startup);
     # sync_builtin_models retires the builtin row so pickers stop offering
     # 4.8. Admins can re-add claude-opus-4-8[1m] as a custom model.
     "claude-opus-5": {
@@ -1141,7 +1352,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "label": "Sonnet 5",
         "provider": "anthropic",
         "context_window": 1_000_000,   # native 1M window (no [1m] suffix needed)
-        "pricing": (3.0, 15.0, 3.75, 0.30),  # sticker price; intro $2/$10 runs through 2026-08-31
+        "pricing": (2.0, 10.0, 2.50, 0.20),  # $2/$10 made the STANDARD price 2026-08 (the launch-promo increase to $3/$15 on Sept 1 was cancelled — platform.claude.com pricing page + CC 2.1.243 changelog)
         "layers": ["claude-code-cli", "direct-llm"],
         "server_tools": True,
         "supports_reasoning": True,
@@ -1171,11 +1382,19 @@ MODEL_REGISTRY: dict[str, dict] = {
     # half the cost, Luna = fast/cheap tier. New prompt-caching billing:
     # cache WRITES cost 1.25x the uncached input rate (previously $0) and
     # cache reads keep the 90% discount — reflected in the pricing tuples.
-    # Context: upstream corrected the 5.6 family window to 272k tokens
-    # (codex 0.144.6 release notes). codex-cli reads the LIVE
-    # modelContextWindow at runtime (headless gauges self-correct); this
-    # registry number drives the direct-llm layer's context management and
-    # the capability display.
+    # Prices re-verified 2026-08-25 against developers.openai.com/api/docs/
+    # pricing after OpenAI's July 30 (Terra/Luna, permanent) and Aug 21
+    # (Sol, promotional through ≥2026-11-21) cuts.
+    # Context: 272k is the PRICING-TIER line, not the raw model window —
+    # the 5.6 models are really 1.05M (922k input + 128k output), but input
+    # beyond 272k bills the WHOLE request at the long-context tier
+    # (2x input / 1.5x output). We keep the registry at 272k deliberately:
+    # it is codex-cli's own bundled default cap (raised to an opt-in 872k
+    # override ceiling in 0.149.0, default unchanged) and it keeps the
+    # direct-llm layer's context management from silently crossing into
+    # double-rate territory. codex-cli reads the LIVE modelContextWindow at
+    # runtime (headless gauges self-correct); this registry number drives
+    # the direct-llm layer's context management and the capability display.
     # Sol first: registry insertion order makes it the codex-cli "Auto"
     # default (flagship-first, as gpt-5.5 was). Agents still PINNED to
     # gpt-5.5 keep running (the CLI supports it; pricing falls back to the
@@ -1185,7 +1404,9 @@ MODEL_REGISTRY: dict[str, dict] = {
         "label": "GPT-5.6 Sol",
         "provider": "openai",
         "context_window": 272_000,   # corrected from 1M — see the family window note above
-        "pricing": (5.0, 30.0, 6.25, 0.50),  # per 1M: (input, output, cache_write, cache_read)
+        "pricing": (4.0, 20.0, 5.0, 0.40),  # per 1M: (input, output, cache_write, cache_read).
+                                            # 2026-08-21 cut ($5/$30 → $4/$20) — PROMOTIONAL,
+                                            # "at least through November 21, 2026"; revisit then.
         "layers": ["codex-cli"],
         "supports_reasoning": True,
         "supports_xhigh": True,
@@ -1195,7 +1416,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "label": "GPT-5.6 Terra",
         "provider": "openai",
         "context_window": 272_000,   # corrected from 1M — see the family window note above
-        "pricing": (2.50, 15.0, 3.125, 0.25),
+        "pricing": (2.0, 12.0, 2.50, 0.20),  # 2026-07-30 cut ($2.50/$15 → $2/$12), permanent
         "layers": ["codex-cli", "direct-llm"],
         "supports_reasoning": True,
         "supports_xhigh": True,
@@ -1206,7 +1427,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "label": "GPT-5.6 Luna",
         "provider": "openai",
         "context_window": 272_000,   # corrected from 1M — see the family window note above
-        "pricing": (1.0, 6.0, 1.25, 0.10),
+        "pricing": (0.20, 1.20, 0.25, 0.02),  # 2026-07-30 cut ($1/$6 → $0.20/$1.20, −80%), permanent
         "layers": ["codex-cli", "direct-llm"],
         "supports_reasoning": True,
         "supports_xhigh": True,
@@ -1349,7 +1570,7 @@ def get_model_layers(model: str) -> list[str]:
 # Used when a model isn't in MODEL_REGISTRY (e.g., dynamically discovered models).
 # A future per-model pricing table in the DB can override these defaults.
 PROVIDER_DEFAULT_PRICING: dict[str, tuple[float, float, float, float]] = {
-    "anthropic": (3.0, 15.0, 3.75, 0.30),   # Sonnet-level
+    "anthropic": (2.0, 10.0, 2.50, 0.20),   # Sonnet-level (tracks Sonnet 5's standard $2/$10, 2026-08)
     "openai":    (2.0, 8.0, 0, 1.0),          # GPT-4.1 level
     "groq":      (0.20, 0.20, 0, 0),          # very cheap hosted inference
     "ollama":            (0, 0, 0, 0),         # local, free
@@ -1357,6 +1578,21 @@ PROVIDER_DEFAULT_PRICING: dict[str, tuple[float, float, float, float]] = {
 }
 MODEL_DEFAULT_PRICING = PROVIDER_DEFAULT_PRICING["anthropic"]
 MODEL_DEFAULT_CONTEXT_WINDOW = 200_000
+
+# Retired builtin → successor. Walked at boot (startup.py →
+# subscription_store.remap_retired_model per entry) so every persisted PIN of
+# a retired id — agents.default_model, chats.model, dynamic_tasks.override_model
+# — moves to the successor. Why pins need this at all: sync_builtin_models
+# retires the old row, the retired id then fails the model-allowed check, and a
+# pinned agent's NEW chats would silently fall back to the layer's first
+# enabled model (not necessarily the successor). Agents on "Auto" never need
+# it — they follow MODEL_REGISTRY order. Only list lossless swaps (same or
+# lower price, same capabilities); a retirement WITHOUT a successor just
+# leaves the pins to the fallback. One line per retirement, no startup code.
+MODEL_SUCCESSORS: dict[str, str] = {
+    "claude-opus-4-8[1m]": "claude-opus-5",   # 2026-07-24 — identical price tuple
+    "claude-fable-5": "claude-fable-5-1",     # 2026-09-01 — same base price, cheaper cache reads
+}
 
 
 def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, float, float]:
@@ -1456,35 +1692,62 @@ _MODEL_REGISTRY_ORDER: dict[str, int] = {
 }
 
 
-def resolve_agent_model(agent_name: str) -> str:
+def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     """Resolve the effective model for an agent session.
 
     Precedence:
-      1. agents.default_model (admin-set per-agent) — used if non-empty.
-      2. First enabled model for agent's execution_path from the
+      1. agents.default_model (admin-set per-agent) — used if non-empty AND
+         served by the effective layer (see below).
+      2. First enabled model for the effective layer from the
          execution_layer_models DB table — builtins first in MODEL_REGISTRY
          insertion order, then custom models by created_at ASC.
       3. Raise RuntimeError — no silent Anthropic fallback, no env-var
          default. The caller decides how to surface this to the user.
+
+    ``layer`` — the execution path the session will ACTUALLY run on. Task /
+    delegate runs can override the agent's engine (override_execution_path),
+    and the agent default model is engine-specific: stamping a Claude model
+    onto a codex turn makes the provider 400 every turn ("The
+    'claude-sonnet-5' model is not supported when using Codex with a ChatGPT
+    account" — the 2026-08 "empty task turn" bug). When ``layer`` is given
+    and agents.default_model is not served by it, the default is SKIPPED and
+    the layer's own first enabled model is used instead. ``layer=None``
+    keeps the historical behavior (the agent's own execution_path).
 
     This is the single entry point for model resolution across CLI, Direct
     LLM, Codex, tasks, meetings, phone — replaces the old get_cli_model /
     get_agent_model split which both baked in Anthropic-specific defaults.
 
     Raises:
-        RuntimeError: if the agent has no default_model AND no enabled model
-            exists for its execution_path. Happens on fresh installs before
-            the admin enables any models, or after an admin disables every
-            builtin for a layer without adding a custom one. Message includes
-            the agent name and execution path so admins know where to look.
+        RuntimeError: if no usable default AND no enabled model exists for
+            the effective layer. Happens on fresh installs before the admin
+            enables any models, or after an admin disables every builtin for
+            a layer without adding a custom one. Message includes the agent
+            name and execution path so admins know where to look.
     """
     from storage import agent_store, subscription_store
 
     agent = agent_store.get_agent(agent_name)
-    if agent and agent.get("default_model"):
-        return agent["default_model"]
-
-    path = (agent.get("execution_path") if agent else None) or "claude-code-cli"
+    path = (layer
+            or (agent.get("execution_path") if agent else None)
+            or "claude-code-cli")
+    default_model = (agent or {}).get("default_model") or ""
+    if default_model:
+        if not layer:
+            return default_model
+        # Layer override: honor the default only when that layer serves it
+        # (mirror of ws/dashboard._model_allowed_for_path — fail OPEN on a
+        # lookup error: this guards cross-layer poison, it is not the model
+        # registry's gatekeeper).
+        try:
+            served = any(
+                (m.get("model_id") or "") == default_model
+                for m in subscription_store.list_models(layer=path)
+            )
+        except Exception:
+            served = True
+        if served:
+            return default_model
     db_models = subscription_store.list_models(layer=path)
     enabled = [m for m in db_models if m.get("enabled")]
     if not enabled:
@@ -1512,9 +1775,11 @@ def resolve_agent_model(agent_name: str) -> str:
 # used to differ, but after dropping the Anthropic-specific env defaults
 # they do exactly the same thing. Delegating to one implementation means
 # the ~11 existing call sites don't need updates.
-def get_cli_model(agent_name: str) -> str:
-    """Get the CLI model for an agent (dashboard sessions)."""
-    return resolve_agent_model(agent_name)
+def get_cli_model(agent_name: str, layer: str | None = None) -> str:
+    """Get the CLI model for an agent (dashboard sessions). ``layer`` = the
+    execution path the session will actually run on, when it can differ
+    from the agent's own (task/delegate overrides)."""
+    return resolve_agent_model(agent_name, layer=layer)
 
 
 def get_agent_model(agent_name: str) -> str:
@@ -1602,6 +1867,12 @@ SCHEDULER_TIMEZONE = _cfg("SCHEDULER_TIMEZONE", "UTC")
 SCHEDULER_MODE = _cfg("SCHEDULER_MODE", "embedded")  # embedded | standalone
 PROXY_INTERNAL_URL = _cfg("PROXY_INTERNAL_URL", f"http://localhost:{PORT}")
 SCHEDULER_SYNC_INTERVAL = int(_cfg("SCHEDULER_SYNC_INTERVAL", "30"))
+# Minimum seconds between scheduled-task SESSION SPAWNS. Tasks that share a
+# fire time (several 06:30 digests) otherwise start their CLI + sandbox +
+# MCP handshakes in the same second — a burst that spikes RAM/CPU on small
+# hosts. The fire times themselves stay exact; only the session starts are
+# spaced. 0 disables. Manual Run-Now and event triggers are never spaced.
+TASK_SPAWN_SPACING_SECONDS = int(_cfg("TASK_SPAWN_SPACING_SECONDS", "10"))
 
 
 def get_platform_timezone() -> str:
@@ -1703,6 +1974,11 @@ def format_current_time(user_tz: str | None = None) -> str:
 # Dashboard (React SPA served as static files)
 DASHBOARD_DIST = BASE_DIR.parent / "dashboard" / "dist"
 DASHBOARD_ENABLED = _cfg("DASHBOARD_ENABLED", "true").lower() == "true"
+
+# Wake-word spotter assets (wasm engine + model .data), committed in-repo.
+# Deliberately OUTSIDE dashboard/dist: `cap sync` copies all of dist into the
+# APK, and these ~18 MB are runtime-fetched, never bundled.
+KWS_ASSETS_DIR = BASE_DIR / "assets" / "kws"
 
 # JWT / Session
 _jwt = _cfg("JWT_SECRET")

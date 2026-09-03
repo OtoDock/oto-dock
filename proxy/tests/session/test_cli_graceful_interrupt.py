@@ -373,3 +373,80 @@ class TestTurnSpan:
             if chunk.is_done:
                 done.append(True)
         assert done == [True]
+
+
+# ---------------------------------------------------------------------------
+# CLIExecutionLayer.interrupt_for_queued — stop-and-send: graceful-ONLY.
+# ---------------------------------------------------------------------------
+
+class TestInterruptForQueued:
+    @pytest.mark.asyncio
+    async def test_live_turn_interrupts_and_releases_permissions(self, monkeypatch):
+        s = _mk_session()
+        s._turn_active = True
+        _persistent_sessions[s.session_id] = s
+
+        killed: list[str] = []
+        released: list[tuple[str, bool]] = []
+
+        async def fake_kill(sid):
+            killed.append(sid)
+            return True
+
+        monkeypatch.setattr(cli_layer_mod, "interrupt_persistent_session", fake_kill)
+        monkeypatch.setattr(
+            cli_layer_mod, "resolve_session_permissions",
+            lambda sid, approved: released.append((sid, approved)),
+        )
+
+        assert await CLIExecutionLayer().interrupt_for_queued(s.session_id) is True
+        assert _sent_frames(s)[0]["request"] == {"subtype": "interrupt"}
+        assert released == [(s.session_id, False)]
+        # Graceful-only: no killpg, no watchdog — even if the turn never
+        # closes, nothing escalates.
+        await asyncio.sleep(0.3)
+        assert killed == []
+        assert s.proc.returncode is None
+
+    @pytest.mark.asyncio
+    async def test_no_live_turn_is_a_pure_noop(self, monkeypatch):
+        """The critical difference from abort(): no turn → False and NOTHING
+        else — no killpg fallback, no permission release, process alive."""
+        s = _mk_session()
+        _persistent_sessions[s.session_id] = s
+        killed: list[str] = []
+
+        async def fake_kill(sid):
+            killed.append(sid)
+            return True
+
+        monkeypatch.setattr(cli_layer_mod, "interrupt_persistent_session", fake_kill)
+        released: list = []
+        monkeypatch.setattr(
+            cli_layer_mod, "resolve_session_permissions",
+            lambda sid, approved: released.append(sid),
+        )
+
+        assert await CLIExecutionLayer().interrupt_for_queued(s.session_id) is False
+        assert killed == []
+        assert released == []
+        assert s.proc.stdin.lines == []
+        assert s.proc.returncode is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_and_dead_pipe_return_false(self, monkeypatch):
+        killed: list[str] = []
+
+        async def fake_kill(sid):
+            killed.append(sid)
+            return True
+
+        monkeypatch.setattr(cli_layer_mod, "interrupt_persistent_session", fake_kill)
+
+        assert await CLIExecutionLayer().interrupt_for_queued("no-such") is False
+
+        s = _mk_session(broken_stdin=True)
+        s._turn_active = True
+        _persistent_sessions[s.session_id] = s
+        assert await CLIExecutionLayer().interrupt_for_queued(s.session_id) is False
+        assert killed == []

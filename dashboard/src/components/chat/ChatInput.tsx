@@ -6,8 +6,31 @@ import type { PendingImage, PendingFile } from '../../store/types'
 
 import { MicIcon } from './MicIcon'
 import { VoiceControl } from './VoiceControl'
+import { PresenceHalo } from './PresenceHalo'
+import type { DuplexPhase } from '../../hooks/useDuplexVoice'
+
+// ?presenceDebug=<phase> — the halo styling/geometry harness (see render).
+const _DEBUG_PHASES: ReadonlySet<string> =
+  new Set(['connecting', 'listening', 'thinking', 'speaking'])
+
+function presenceDebugParam(): DuplexPhase | null {
+  if (typeof window === 'undefined') return null
+  const v = new URLSearchParams(window.location.search).get('presenceDebug')
+  return v && _DEBUG_PHASES.has(v) ? (v as DuplexPhase) : null
+}
+
+// Synthetic audio for the harness: a slow swell + a faster flutter, so the
+// reactive glow and the speaking sparks both exercise without a mic.
+function debugLevels(): { mic: number; out: number } {
+  const t = performance.now() / 1000
+  const level = 0.35 + 0.3 * Math.sin(t * 1.1) + 0.25 * Math.abs(Math.sin(t * 5.3))
+  return { mic: level, out: level }
+}
 import { useCoarsePointer } from '../../hooks/useCoarsePointer'
 import { useAuth } from '../../contexts/AuthContext'
+import { useTransferStore } from '../../store/transferStore'
+import { Bar, fmtSize, pct } from '../common/TransferBar'
+import ImageLightbox from './media/ImageLightbox'
 
 // Any file type is accepted (no extension allowlist — see lib/fileTypes);
 // the universal cap mirrors proxy config OTODOCK_MAX_FILE_MB (default 1GB) —
@@ -20,6 +43,65 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+// Inline images ride the dashboard WS as base64 data-URLs in ONE frame with
+// the message text — and uvicorn's default WS frame cap is 16MB, so big
+// originals must shrink client-side or a single large photo kills the whole
+// dashboard socket. Mirror the server's own vision bound (1568px / JPEG q85 —
+// proxy/ws/dashboard.py downscales to exactly this before the model sees it),
+// so nothing of model-visible value is lost: a 25MB phone photo becomes a few
+// hundred KB. Small originals pass through byte-identical (keeps PNG alpha).
+const IMAGE_PASSTHROUGH_MAX = 2 * 1024 * 1024
+const IMAGE_MAX_DIM = 1568
+const IMAGE_JPEG_QUALITY = 0.85
+// Aggregate ENCODED budget across ALL inline images of one message — the
+// per-file downscale alone doesn't protect the shared frame.
+const IMAGE_MESSAGE_BUDGET = 10 * 1024 * 1024
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+function dataUrlBytes(dataUrl: string): number {
+  const idx = dataUrl.indexOf(',')
+  return idx < 0 ? 0 : Math.floor(((dataUrl.length - idx - 1) * 3) / 4)
+}
+
+/** Encode an image for the inline (vision) path — downscaled to the server's
+ * own bound when large. Returns null when this browser can't decode it (e.g.
+ * HEIC outside Safari): the caller demotes it to a regular file upload. */
+async function prepareImageForChat(file: File): Promise<string | null> {
+  if (file.size <= IMAGE_PASSTHROUGH_MAX) return readFileAsBase64(file)
+  if (typeof createImageBitmap !== 'function') {
+    // No canvas-decode path (very old engines): pass through only what can't
+    // threaten the WS frame; larger falls back to a file upload.
+    return file.size <= 8 * 1024 * 1024 ? readFileAsBase64(file) : null
+  }
+  try {
+    const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' })
+    try {
+      const scale = Math.min(1, IMAGE_MAX_DIM / Math.max(bitmap.width, bitmap.height))
+      const w = Math.max(1, Math.round(bitmap.width * scale))
+      const h = Math.max(1, Math.round(bitmap.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return null
+      ctx.drawImage(bitmap, 0, 0, w, h)
+      return canvas.toDataURL('image/jpeg', IMAGE_JPEG_QUALITY)
+    } finally {
+      bitmap.close()
+    }
+  } catch {
+    return null
+  }
 }
 
 interface Props {
@@ -51,6 +133,17 @@ interface Props {
   pendingFiles: PendingFile[]
   onAddFiles: (files: PendingFile[]) => void
   onRemoveFile: (id: string) => void
+  /** Re-queue a failed upload from its error chip. The affordance renders
+   * only for retryable failures (a file over the upload cap stays
+   * remove-only — retrying can't succeed). */
+  onRetryFile?: (id: string) => void
+  /** Dock overlay toggle — wired by the host page only when the open chat
+   * belongs to a delegation project or carries a chat-scoped pinned
+   * dashboard (staged feature; stripped from the public cut with this
+   * block). `dockKind` picks the tooltip: "Project dock" vs "Chat dock". */
+  projectsOpen?: boolean
+  onToggleProjects?: () => void
+  dockKind?: 'project' | 'chat'
   /** Workspace overlay toggle button. When `onToggleWorkspace` is set, a folder
    * icon button appears as the leftmost element of the input pill. */
   workspaceOpen?: boolean
@@ -67,11 +160,7 @@ interface Props {
   /** Voice mode (AgentChat only). Hands-free speak → send → hear. Omitted where
    * voice mode isn't wired → no voice UI or behaviour. */
   voice?: {
-    ttsAvailable: boolean      // chat TTS resolvable → live voice mode possible
-    live: boolean              // live voice mode on
-    onSetLive: (on: boolean) => void
-    speaking: boolean          // a reply is being spoken right now
-    onBargeIn: () => void      // cancel the spoken reply (barge-in)
+    duplex?: import('./VoiceControl').DuplexControlProps  // full-duplex mode
   }
 }
 
@@ -109,16 +198,21 @@ export default function ChatInput({
   pendingFiles,
   onAddFiles,
   onRemoveFile,
+  onRetryFile,
   workspaceOpen,
   onToggleWorkspace,
   workspaceHasNewMessage,
   appsOpen,
   onToggleApps,
+  projectsOpen,
+  onToggleProjects,
+  dockKind,
   textareaRef: externalTextareaRef,
   voice,
 }: Props) {
   const text = value
   const setText = onChange
+  const presenceDebugPhase = presenceDebugParam()
   // Per-install universal upload cap (OTODOCK_MAX_FILE_MB) with the shipped
   // default as fallback.
   const { user } = useAuth()
@@ -130,6 +224,22 @@ export default function ChatInput({
   valueRef.current = value
   const [menuOpen, setMenuOpen] = useState(false)
   const [hasCamera, setHasCamera] = useState(false)
+  // External-file drag over the composer (counter: child enter/leave pairs
+  // would flicker a boolean — the FileGrid drop-zone pattern).
+  const [dragDepth, setDragDepth] = useState(0)
+  // Tapping an image tile opens the standard lightbox over a SNAPSHOT of the
+  // pending photos. Snapshot, not the live array: background store activity
+  // (the draft→chat slice re-key at send-time warmup, a transfer, another
+  // tab clearing the draft) can make `pendingImages` transiently empty, and
+  // a live-array render condition would yank the viewer mid-look — the
+  // 2026-08-13 "picture closes itself after ~10s" report. Same
+  // defer-while-viewed philosophy as the doc-preview chip (76cdb5ca): what
+  // the user is actively viewing only closes by their own hand (Esc/✕/back).
+  const [lightbox, setLightbox] =
+    useState<{ images: PendingImage[]; idx: number } | null>(null)
+  // Phase-2 join: uploaded chips show the remote-machine sync driven by the
+  // transfer_* WS events (same store the workspace popup reads).
+  const transfersById = useTransferStore(s => s.byId)
   const [micStopSignal, setMicStopSignal] = useState(0)      // bump → close the mic, keep the tail (input focus)
   const [micDiscardSignal, setMicDiscardSignal] = useState(0)  // bump → close the mic, drop the tail (send)
   const internalRef = useRef<HTMLTextAreaElement>(null)
@@ -260,39 +370,68 @@ export default function ChatInput({
     nudgeResize()
   }
 
-  const readFileAsBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(reader.result as string)
-      reader.onerror = reject
-      reader.readAsDataURL(file)
-    })
-  }
+  // ONE routing helper behind every entrance — pickers, camera, drag-and-drop
+  // and clipboard paste — so caps, downscaling, demotion and error chips
+  // behave identically no matter how a file arrives. Images go to the inline
+  // vision path (downscaled, budgeted); everything else (plus images this
+  // browser can't decode) becomes a PendingFile upload. Oversize files are
+  // added as VISIBLE error chips — the old silent skip made a too-big pick
+  // look like the app ate the file.
+  const ingestFiles = useCallback(async (incoming: FileList | File[]) => {
+    // Materialize before any await: live FileLists empty when the input's
+    // value is reset by the caller right after this call.
+    const files = Array.from(incoming)
+    if (files.length === 0) return
+    const docFiles = files.filter(f => !f.type.startsWith('image/'))
+    const imageFiles = files.filter(f => f.type.startsWith('image/'))
+
+    if (imageFiles.length) {
+      const newImages: PendingImage[] = []
+      let budget = pendingImages.reduce((a, img) => a + dataUrlBytes(img.base64), 0)
+      for (const file of imageFiles) {
+        const prepared = await prepareImageForChat(file)
+        if (prepared === null) {
+          docFiles.push(file) // undecodable here — attach as a file instead
+          continue
+        }
+        const bytes = dataUrlBytes(prepared)
+        if (budget + bytes > IMAGE_MESSAGE_BUDGET) {
+          // The shared WS frame can't take more inline images this message —
+          // surface it as an error chip instead of silently dropping (retry
+          // uploads it as a file the agent can still open).
+          onAddFiles([{
+            id: generateId(), name: file.name, size: file.size, file,
+            error: 'Inline photo limit for one message reached — remove some photos or send it as a file',
+          }])
+          continue
+        }
+        budget += bytes
+        newImages.push({ id: generateId(), base64: prepared, name: file.name })
+      }
+      if (newImages.length) onAddImages(newImages)
+    }
+
+    if (docFiles.length) {
+      onAddFiles(docFiles.map(file => ({
+        id: generateId(), name: file.name, size: file.size, file,
+        ...(file.size > uploadCap
+          ? { error: `Over the ${formatFileSize(uploadCap)} upload limit` }
+          : {}),
+      })))
+    }
+  }, [pendingImages, onAddImages, onAddFiles, uploadCap])
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
-    if (!files?.length) return
-    const newImages: PendingImage[] = []
-    for (const file of Array.from(files)) {
-      if (!file.type.startsWith('image/')) continue
-      const base64 = await readFileAsBase64(file)
-      newImages.push({ id: generateId(), base64, name: file.name })
-    }
-    if (newImages.length) onAddImages(newImages)
+    if (files?.length) await ingestFiles(files)
     // Reset input so re-selecting same file works
     e.target.value = ''
     setMenuOpen(false)
   }
 
-  const handleDocSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files
-    if (!selected?.length) return
-    const newFiles: PendingFile[] = []
-    for (const file of Array.from(selected)) {
-      if (file.size > uploadCap) continue
-      newFiles.push({ id: generateId(), name: file.name, size: file.size, file })
-    }
-    if (newFiles.length) onAddFiles(newFiles)
+  const handleDocSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (files?.length) await ingestFiles(files)
     e.target.value = ''
     setMenuOpen(false)
   }
@@ -324,19 +463,78 @@ export default function ChatInput({
     (text.trim().length > 0 || pendingImages.length > 0 || pendingFiles.length > 0)
 
   return (
-    <div className="px-3 pb-3">
+    <div className="px-3 pb-composer-safe">
       <div className="max-w-4xl mx-auto">
-        <div className="bg-white/90 dark:bg-gray-900/90 backdrop-blur-xs rounded-xl border border-p-border-light dark:border-gray-700 shadow-xs p-2">
+        {/* relative wrapper: the PresenceHalo canvas positions against the
+            pill; the pill's explicit z-[1] keeps content above the glow
+            (before, that layering only held by accident of backdrop-blur's
+            stacking context). */}
+        <div className="relative">
+        {presenceDebugPhase ? (
+          // ?presenceDebug=<phase> forces the halo with synthetic levels —
+          // the styling/geometry harness (real phone-mode sessions need a
+          // live engine, which headless verification and device testing
+          // don't have). Visual-only; harmless in production.
+          <PresenceHalo phase={presenceDebugPhase} getLevels={debugLevels} />
+        ) : voice?.duplex && (
+          <PresenceHalo phase={voice.duplex.phase} getLevels={voice.duplex.getLevels} />
+        )}
+        <div
+          className="relative z-[1] bg-white/90 dark:bg-gray-900/90 backdrop-blur-xs rounded-xl border border-p-border-light dark:border-gray-700 shadow-xs p-2"
+          // Drop zone for EXTERNAL files only (dataTransfer carries 'Files').
+          // Internal agent-path drags never do, so their native text insert
+          // into the textarea keeps working untouched. preventDefault on the
+          // external path is load-bearing: an unhandled file drop navigates
+          // the page away.
+          onDragEnter={(e) => {
+            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            e.preventDefault()
+            setDragDepth(d => d + 1)
+          }}
+          onDragOver={(e) => {
+            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'copy'
+          }}
+          onDragLeave={(e) => {
+            if (disabled || !Array.from(e.dataTransfer?.types ?? []).includes('Files')) return
+            setDragDepth(d => Math.max(0, d - 1))
+          }}
+          onDrop={(e) => {
+            if (disabled) return
+            const files = e.dataTransfer?.files
+            setDragDepth(0)
+            if (!files?.length) return // internal path drag → textarea handles it
+            e.preventDefault()
+            void ingestFiles(files)
+          }}
+        >
+          {dragDepth > 0 && (
+            <div className="absolute inset-0 z-20 rounded-xl border-2 border-dashed border-brand bg-brand/10
+                            flex items-center justify-center pointer-events-none">
+              <span className="text-sm font-medium text-brand">Drop to attach</span>
+            </div>
+          )}
           {/* Attachment preview row (images + files) */}
           {(pendingImages.length > 0 || pendingFiles.length > 0) && (
             <div className="flex gap-2 overflow-x-auto pt-2 pb-2 mb-2 border-b border-p-border-light/50 px-1.5 items-center">
-              {pendingImages.map(img => (
+              {pendingImages.map((img, i) => (
                 <div key={img.id} className="relative shrink-0 group">
-                  <img
-                    src={img.base64}
-                    alt={img.name}
-                    className="w-14 h-14 rounded-lg object-cover border border-p-border-light"
-                  />
+                  {/* Tile opens the standard lightbox (zoom/swipe) so the
+                      photo can be checked while composing; ✕ stays removal. */}
+                  <button
+                    type="button"
+                    onClick={() => setLightbox({ images: [...pendingImages], idx: i })}
+                    aria-label={`Preview ${img.name}`}
+                    title="Click to preview"
+                    className="block rounded-lg focus:outline-hidden focus-visible:ring-2 focus-visible:ring-brand"
+                  >
+                    <img
+                      src={img.base64}
+                      alt={img.name}
+                      className="w-14 h-14 rounded-lg object-cover border border-p-border-light cursor-pointer"
+                    />
+                  </button>
                   <button
                     onClick={() => onRemoveImage(img.id)}
                     aria-label="Remove image"
@@ -349,43 +547,99 @@ export default function ChatInput({
                   </button>
                 </div>
               ))}
-              {pendingFiles.map(f => (
-                <div
-                  key={f.id}
-                  title={f.error || undefined}
-                  className={`relative shrink-0 group flex items-center gap-1.5
-                              bg-p-surface rounded-lg px-2.5 py-1.5 border
-                              ${f.error ? 'border-p-accent-red' : 'border-p-border-light'}`}
-                >
-                  {f.uploading ? (
-                    <span
-                      className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0"
-                      aria-label="Uploading"
-                    />
-                  ) : f.error ? (
-                    <svg className="w-4 h-4 text-p-accent-red shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                            d="M12 9v2m0 4h.01M12 5l7 12H5l7-12z" />
-                    </svg>
-                  ) : (
-                    <svg className="w-4 h-4 text-p-text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                            d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
-                  )}
-                  <span className="text-xs text-p-text truncate max-w-[100px]">{f.name}</span>
-                  <span className="text-xs text-p-text-light">{formatFileSize(f.size)}</span>
-                  <button
-                    onClick={() => onRemoveFile(f.id)}
-                    aria-label="Remove file"
-                    className={`w-4 h-4 rounded-full bg-p-accent-red text-white flex items-center justify-center
-                               text-xs shrink-0 transition-opacity ${removeBtnVisibility}`}
-                    style={{ fontSize: '9px', lineHeight: 1 }}
+              {pendingFiles.map(f => {
+                const transfer = f.transferId ? transfersById[f.transferId] : undefined
+                const syncing = Boolean(
+                  f.uploadedPath && f.remotePush && transfer && transfer.doneAt === null,
+                )
+                const uploadingNow = Boolean(f.uploading && !f.queued)
+                const uploadPct = pct(f.uploadSent ?? 0, f.uploadTotal ?? f.size)
+                let syncPct = 0
+                if (syncing && transfer) {
+                  const rows = Object.values(transfer.machines)
+                  const total = rows.reduce((a, r) => a + r.bytesTotal, 0)
+                  const sent = rows.reduce(
+                    (a, r) => a + (r.state === 'done' ? r.bytesTotal : r.bytesSent), 0,
+                  )
+                  syncPct = pct(sent, total)
+                }
+                const subText = f.error
+                  ? f.error
+                  : f.queued
+                    ? 'Queued'
+                    : uploadingNow
+                      ? `${uploadPct}% · ${fmtSize(f.uploadSent ?? 0)} of ${fmtSize(f.uploadTotal ?? f.size)}`
+                      : syncing
+                        ? 'Syncing to machines…'
+                        : null
+                return (
+                  <div
+                    key={f.id}
+                    title={f.error || undefined}
+                    className={`relative shrink-0 group flex flex-col gap-1
+                                bg-p-surface rounded-lg px-2.5 py-1.5 border
+                                ${(uploadingNow || syncing) ? 'min-w-[160px]' : ''}
+                                max-w-[220px]
+                                ${f.error ? 'border-p-accent-red' : 'border-p-border-light'}`}
                   >
-                    ✕
-                  </button>
-                </div>
-              ))}
+                    <div className="flex items-center gap-1.5">
+                      {f.uploading ? (
+                        <span
+                          className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0"
+                          aria-label={f.queued ? 'Queued' : 'Uploading'}
+                        />
+                      ) : f.error ? (
+                        <svg className="w-4 h-4 text-p-accent-red shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                d="M12 9v2m0 4h.01M12 5l7 12H5l7-12z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-p-text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                      )}
+                      <span className="text-xs text-p-text truncate max-w-[100px]">{f.name}</span>
+                      <span className="text-xs text-p-text-light shrink-0">{formatFileSize(f.size)}</span>
+                      {f.error && onRetryFile && f.size <= uploadCap && (
+                        <button
+                          onClick={() => onRetryFile(f.id)}
+                          aria-label="Retry upload"
+                          title="Retry upload"
+                          className="w-4 h-4 rounded-full text-p-text-secondary hover:text-brand
+                                     flex items-center justify-center shrink-0"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                                  d="M4 4v5h5M20 20v-5h-5M5.07 9A8 8 0 0119.4 6.6M18.93 15A8 8 0 014.6 17.4" />
+                          </svg>
+                        </button>
+                      )}
+                      <button
+                        onClick={() => onRemoveFile(f.id)}
+                        aria-label="Remove file"
+                        className={`w-4 h-4 rounded-full bg-p-accent-red text-white flex items-center justify-center
+                                   text-xs shrink-0 transition-opacity ${removeBtnVisibility}`}
+                        style={{ fontSize: '9px', lineHeight: 1 }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    {(uploadingNow || syncing) && (
+                      <Bar value={uploadingNow ? uploadPct : syncPct} />
+                    )}
+                    {subText && (
+                      <span
+                        className={`text-[10px] leading-tight truncate
+                                    ${f.error ? 'text-p-accent-red' : 'text-p-text-light'}`}
+                        title={subText}
+                      >
+                        {subText}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           )}
 
@@ -429,6 +683,27 @@ export default function ChatInput({
                   <rect x="13.3" y="3.5" width="7.2" height="7.2" rx="1.5" />
                   <rect x="3.5" y="13.3" width="7.2" height="7.2" rx="1.5" />
                   <rect x="13.3" y="13.3" width="7.2" height="7.2" rx="1.5" />
+                </svg>
+              </button>
+            )}
+            {/* Dock toggle — present only when the open chat has a dock:
+                a delegation project or a chat-scoped pinned dashboard (host
+                page decides). Layout-panels glyph, distinct from the apps
+                four-squares. */}
+            {onToggleProjects && (
+              <button
+                onClick={onToggleProjects}
+                title={`${projectsOpen ? 'Close' : 'Open'} ${dockKind === 'chat' ? 'chat dock' : 'project dock'}`}
+                className={`w-9 h-9 -mr-0.5 rounded-lg flex items-center justify-center transition-colors shrink-0
+                  ${projectsOpen
+                    ? 'bg-violet-600 text-white hover:bg-violet-700'
+                    : 'text-p-text-secondary hover:text-violet-600 hover:bg-violet-500/5'}
+                `}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                  <rect x="3.5" y="4" width="9" height="16" rx="1.5" />
+                  <rect x="15" y="4" width="5.5" height="7.2" rx="1.5" />
+                  <rect x="15" y="13.8" width="5.5" height="6.2" rx="1.5" />
                 </svg>
               </button>
             )}
@@ -503,19 +778,36 @@ export default function ChatInput({
               onKeyDown={handleKeyDown}
               onPointerDown={handleEngage}  // first genuine interaction → lazy pre-warm (non-favorite agents)
               onFocus={() => setMicStopSignal(n => n + 1)}  // clicking the input stops/pauses the mic
+              onBlur={() => {
+                // Click-to-edit abandoned: leaving an EMPTY composer while a
+                // live conversation is held resumes listening (a non-empty
+                // draft keeps the hold — Send is the only way it dispatches).
+                if (voice?.duplex?.active && !text.trim()) voice.duplex.onRelease?.()
+              }}
               onDrop={() => {
                 // Native textarea drop inserts the text and SELECTS it.
                 // Collapse the selection on the next frame so the user can
                 // keep typing after the inserted path without accidentally
                 // replacing it. We don't preventDefault — the browser's
                 // native insertion handles cursor placement correctly; we
-                // only fix the post-drop selection.
+                // only fix the post-drop selection. (External FILE drops are
+                // consumed by the composer container's onDrop instead.)
                 requestAnimationFrame(() => {
                   const ta = textareaRef.current
                   if (!ta) return
                   const end = ta.selectionEnd
                   if (ta.selectionStart !== end) ta.setSelectionRange(end, end)
                 })
+              }}
+              onPaste={(e) => {
+                // Ctrl/Cmd+V with files on the clipboard (screenshots, copied
+                // files) attaches them exactly like the + menu; plain text
+                // pastes are untouched.
+                const files = e.clipboardData?.files
+                if (files && files.length > 0 && !disabled) {
+                  e.preventDefault()
+                  void ingestFiles(files)
+                }
               }}
               placeholder={placeholder || 'Type a message...'}
               disabled={disabled}
@@ -533,14 +825,14 @@ export default function ChatInput({
                 others (e.g. a host without the voice prop) get plain dictation. */}
             {voice ? (
               <VoiceControl
-                ttsAvailable={voice.ttsAvailable}
-                live={voice.live}
-                onSetLive={voice.onSetLive}
-                speaking={voice.speaking}
-                onBargeIn={voice.onBargeIn}
-                streaming={!!streaming}
-                onSendText={onSend}
-                onClearInput={() => setText('')}
+                duplex={voice.duplex ? {
+                  ...voice.duplex,
+                  // The unmute tap hands a held draft back to the engine
+                  // (sticky-mute release) — the draft lives HERE, so this
+                  // component supplies the read + the clear.
+                  getHeldDraft: () => text,
+                  onDraftConsumed: () => setText(''),
+                } : undefined}
                 onDictateInterim={showInterim}
                 onDictateFinal={appendTranscript}
                 onDictateActive={onMicActive}
@@ -611,7 +903,24 @@ export default function ChatInput({
             className="hidden"
           />
         </div>
+        </div>
       </div>
+
+      {/* Standard image lightbox over the pending photos (tap a tile). Same
+          component chat messages use — zoom, swipe, download all work.
+          Renders from the open-time snapshot (see the state comment). */}
+      {lightbox !== null && lightbox.images.length > 0 && (
+        <ImageLightbox
+          images={lightbox.images.map(img => {
+            const m = img.base64.match(/^data:([^;,]+);base64,(.*)$/)
+            return m
+              ? { imageData: m[2], mimeType: m[1], caption: img.name }
+              : { url: img.base64, caption: img.name }
+          })}
+          initialIndex={Math.min(lightbox.idx, lightbox.images.length - 1)}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </div>
   )
 }

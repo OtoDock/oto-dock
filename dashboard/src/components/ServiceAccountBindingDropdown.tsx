@@ -121,7 +121,11 @@ export function ServiceAccountBindingDropdown({
             key={`m:${a.label}`}
             value={encodeOption(a.label, callerSub)}
           >
-            Personal: {a.display_email || a.label}
+            {/* Label first: two same-identity accounts (a labeled PAT next
+                to the browser grant) are twins by display_email; the label
+                is the distinguishing name and equals the identity when the
+                user never set one. */}
+            Personal: {a.label || a.display_email}
           </option>
         ))}
 
@@ -130,7 +134,7 @@ export function ServiceAccountBindingDropdown({
         {isForeignBinding && (
           <option value={selectedValue} disabled>
             Personal ({current_binding!.owner_name}):{' '}
-            {current_binding!.owner_email || current_binding!.label}
+            {current_binding!.label || current_binding!.owner_email}
           </option>
         )}
 

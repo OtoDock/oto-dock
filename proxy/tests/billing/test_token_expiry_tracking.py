@@ -80,7 +80,7 @@ class TestResolveReportsExpiry:
         exp = int(time.time() * 1000) + 90 * 60 * 1000  # 1h30m left
         cred = {"oauth_token": {"accessToken": "tok", "refreshToken": "r", "expiresAt": exp}}
         with patch.object(pool.subscription_store, "get_credential_data", return_value=cred), \
-             patch.object(pool, "_refresh_oauth_token", return_value=None):
+             patch.object(pool, "_refresh_oauth_token", return_value=(None, False)):
             tok, got = pool._resolve_oauth_access_token(
                 {"id": "sub-failsoft", "provider": "anthropic"}, cred["oauth_token"],
             )
@@ -95,7 +95,7 @@ class TestResolveReportsExpiry:
         # First read: under-lock re-check; second read: post-refresh expiry.
         with patch.object(pool.subscription_store, "get_credential_data",
                           side_effect=[before, after]), \
-             patch.object(pool, "_refresh_oauth_token", return_value="new"):
+             patch.object(pool, "_refresh_oauth_token", return_value=("new", False)):
             tok, got = pool._resolve_oauth_access_token(
                 {"id": "sub-refresh", "provider": "anthropic"}, before["oauth_token"],
             )
@@ -148,7 +148,7 @@ class TestRefreshPreservesPlanTier:
              patch.object(pool, "fetch_anthropic_subscription_fields",
                           return_value=profile_fields) as fetch:
             got = pool._refresh_anthropic_oauth_token("sub-tier", "r")
-        assert got == "new"
+        assert got == ("new", False)
         assert len(updates) == 1
         return updates[0]["oauth_token"], fetch
 
@@ -268,8 +268,8 @@ class TestFanOutOnRotation:
         with patch.object(pool.subscription_store, "get_credential_data",
                           return_value=cred), \
              patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value="rotated"):
-            assert pool._refresh_oauth_token("sub-r", "r1") == "rotated"
+                          return_value=("rotated", False)):
+            assert pool._refresh_oauth_token("sub-r", "r1") == ("rotated", False)
         import json
         written = json.loads((tmp_path / ".credentials.json").read_text())
         assert written["claudeAiOauth"]["accessToken"] == "rotated"
@@ -282,14 +282,14 @@ class TestFanOutOnRotation:
         with patch.object(pool.subscription_store, "get_credential_data",
                           side_effect=RuntimeError("db down")), \
              patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value="rotated"):
-            assert pool._refresh_oauth_token("sub-r", "r1") == "rotated"
+                          return_value=("rotated", False)):
+            assert pool._refresh_oauth_token("sub-r", "r1") == ("rotated", False)
 
     def test_rotation_without_bound_sessions_skips_fanout(self):
         with patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value="rotated"), \
+                          return_value=("rotated", False)), \
              patch.object(pool.subscription_store, "get_credential_data") as read:
-            assert pool._refresh_oauth_token("sub-lonely", "r1") == "rotated"
+            assert pool._refresh_oauth_token("sub-lonely", "r1") == ("rotated", False)
         read.assert_not_called()
 
 
@@ -321,7 +321,7 @@ class TestEnsureFreshAndFanOut:
                           return_value=self._sub()), \
              patch.object(pool.subscription_store, "get_credential_data",
                           side_effect=[before, before, after]), \
-             patch.object(pool, "_refresh_oauth_token", return_value="new") as refresh:
+             patch.object(pool, "_refresh_oauth_token", return_value=("new", False)) as refresh:
             assert pool.ensure_fresh_and_fan_out("sub-e") is True
         refresh.assert_called_once()
 
@@ -332,7 +332,7 @@ class TestEnsureFreshAndFanOut:
                           return_value=self._sub()), \
              patch.object(pool.subscription_store, "get_credential_data",
                           return_value=cred), \
-             patch.object(pool, "_refresh_oauth_token", return_value=None):
+             patch.object(pool, "_refresh_oauth_token", return_value=(None, False)):
             assert pool.ensure_fresh_and_fan_out("sub-e") is False
 
     def test_non_expiring_credential_is_fresh(self):
@@ -388,7 +388,7 @@ class TestConcurrentBindDuringFanOut:
                                   "accessToken": "a", "refreshToken": "r",
                                   "expiresAt": 1}}), \
                  patch.object(pool, "_refresh_anthropic_oauth_token",
-                              return_value="a"), \
+                              return_value=("a", False)), \
                  patch("services.engines.token_fanout.fan_out"):
                 for _ in range(500):
                     pool._refresh_oauth_token("sub-hot", "r")

@@ -1,0 +1,66 @@
+{
+  "name": "phone-mcp",
+  "server_name": "make-call",
+  "label": "Phone Calls",
+  "description": "Outbound phone call initiation and management",
+  "version": "1.1.0",
+  "category": "custom",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": [
+      "make_call_server.py"
+    ]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "instances": {
+    "delivery": "env",
+    "fields": [
+      {
+        "key": "OUTBOUND_ROUTE_ID",
+        "label": "Outbound phone route",
+        "input_type": "phone_route_outbound_select",
+        "required": true
+      }
+    ],
+    "max_instances": 0
+  },
+  "config": [],
+  "env": {},
+  "assignment_mode": "explicit",
+  "requires_capability": "phone_calls",
+  "exclude_from": [],
+  "skills": [
+    {
+      "id": "phone-calls-usage",
+      "loading": "always",
+      "file": "skills/phone-calls.md",
+      "description": "Phone call tool usage, monitoring loop, mid-call question handling",
+      "default_exclude_from": [
+        "phone"
+      ]
+    }
+  ],
+  "permissions": {
+    "default_tier": "sensitive",
+    "rules": [
+      {
+        "tool": "wait_for_call",
+        "tier": "open"
+      },
+      {
+        "tool": "get_call_status",
+        "tier": "open"
+      },
+      {
+        "tool": "answer_call_question",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

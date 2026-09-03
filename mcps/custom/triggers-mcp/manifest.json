@@ -2,7 +2,7 @@
   "name": "triggers-mcp",
   "label": "Triggers",
   "description": "Webhook trigger creation and management. Lets agents configure event-driven webhooks (per-user or per-agent) that fire tasks and/or notifications when external systems (GitHub, Stripe, Linear, IoT, etc.) call the platform.",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "category": "core",
 
   "server": {

@@ -21,6 +21,25 @@ import config as app_config
 
 logger = logging.getLogger("claude-proxy.sandbox")
 
+
+def _verified_literal_path(root_real: Path, *parts: str) -> Path | None:
+    """Resolve ``root_real/parts...`` and demand it IS that literal path.
+
+    ``root_real`` must already be fully resolved (``os.path.realpath``).
+    Returns the literal path when no component below the root is a symlink
+    (``realpath == expected``), else ``None``. Required for every bind
+    source / host-side dir operation under an agent-WRITABLE tree: an agent
+    holding the parent RW in one session can plant a symlink there, and a
+    follow at build/bind time moves the operation to the symlink's target
+    on the HOST (the file-transfer B4 class — a planted
+    ``knowledge/.credentials → /`` would otherwise become an RW bind of the
+    host root in the next agent-scope session).
+    """
+    expected = root_real.joinpath(*parts)
+    if os.path.realpath(expected) != str(expected):
+        return None
+    return expected
+
 # System paths to mount read-only into every sandbox
 _SYSTEM_RO_BINDS = [
     "/usr",
@@ -68,6 +87,20 @@ def _apparmor_userns_restricted() -> bool:
         return _APPARMOR_USERNS_SYSCTL.read_text().strip() == "1"
     except OSError:
         return False  # sysctl absent → not an Ubuntu-restricted kernel
+
+
+# Debian's older gate on the same capability (predates the AppArmor sysctl,
+# also present on Ubuntu kernels): 0 disables unprivileged userns creation
+# kernel-wide. Module-level so tests can point it at a fixture.
+_DEBIAN_USERNS_SYSCTL = Path("/proc/sys/kernel/unprivileged_userns_clone")
+
+
+def _debian_userns_disabled() -> bool:
+    """True when the Debian sysctl disables unprivileged user namespaces."""
+    try:
+        return _DEBIAN_USERNS_SYSCTL.read_text().strip() == "0"
+    except OSError:
+        return False  # sysctl absent → not a Debian-gated kernel
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +164,53 @@ def _host_resolv_has_loopback_ns(resolv_path: str = "/etc/resolv.conf") -> bool:
     return False
 
 
+# Result of the boot-time nested-namespace probe: None = not probed (yet),
+# True/False afterwards. Read by the codex layer to warn per local session on
+# hosts where the engine-owned inner sandbox cannot start.
+_nested_sandbox_ok: bool | None = None
+
+
+def nested_sandbox_ok() -> bool | None:
+    """Boot probe result: can a bwrap nest inside the sandbox stack?"""
+    return _nested_sandbox_ok
+
+
+def _nested_sandbox_probe() -> str | None:
+    """Probe that a SECOND bwrap can start inside the full sandbox stack.
+
+    Mirrors the real runtime shape — the pasta netns launcher wrapping bwrap
+    with our exact namespace flags — and runs a minimal inner bwrap where the
+    engine's helper would sit. System bwrap stands in for Codex's npm-vendored
+    copy (whose install path isn't knowable at proxy boot);
+    scripts/sandbox-doctor.sh probes the vendored binary itself.
+
+    Returns None when the nested level works, else a short failure detail.
+    Diagnostic only: callers must treat a failure as a warning, never fatal.
+    """
+    bwrap = shutil.which("bwrap")
+    if not bwrap:  # unreachable after the missing-tools gate; belt-and-braces
+        return "bwrap not on PATH"
+    argv = [str(_NETNS_LAUNCHER), "--block-private", "--",
+            bwrap, "--unshare-pid", "--die-with-parent", "--share-net"]
+    if os.getuid() != 0:
+        argv += ["--unshare-user", "--uid", str(os.getuid()),
+                 "--gid", str(os.getgid())]
+    argv += ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--",
+             bwrap, "--ro-bind", "/", "/", "--", "/bin/true"]
+    try:
+        probe = subprocess.run(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return "nested probe timed out after 20s"
+    except Exception as e:  # noqa: BLE001 — diagnostic-only path
+        return f"nested probe failed to run: {e}"
+    if probe.returncode == 0:
+        return None
+    detail = (probe.stderr or b"").decode(errors="replace").strip()
+    return detail[-400:] or f"exit {probe.returncode}"
+
+
 def netns_preflight() -> None:
     """Startup gate for the always-on sandbox network isolation — called at boot.
 
@@ -165,7 +245,26 @@ def netns_preflight() -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
         )
     except FileNotFoundError:
-        probe = None  # `unshare` (util-linux) absent — skip the probe, not fatal
+        # `unshare` (util-linux) absent. This used to skip the probe entirely —
+        # letting a namespace-denying host boot and then fail every session
+        # spawn — so probe with bwrap itself instead (bwrap presence is already
+        # gated above; --unshare-all exercises user+net+mount creation).
+        logger.warning(
+            "netns preflight: `unshare` (util-linux) is missing — probing "
+            "namespace support with bwrap directly. Install util-linux for "
+            "the canonical probe."
+        )
+        try:
+            probe = subprocess.run(
+                ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "--",
+                 "/bin/true"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Sandbox netns capability probe failed to run: {e}. The host "
+                "must allow unprivileged user+network namespaces."
+            )
     except Exception as e:
         raise RuntimeError(
             f"Sandbox netns capability probe failed to run: {e}. The host must "
@@ -193,11 +292,45 @@ def netns_preflight() -> None:
                 "NOT set the sysctl to 0 — that disables the protection for "
                 "the entire host."
             )
+        if _debian_userns_disabled():
+            raise RuntimeError(
+                "Sandbox network isolation is mandatory but unprivileged user "
+                "namespaces are disabled on this host "
+                "(kernel.unprivileged_userns_clone=0 — the Debian hardening "
+                f"knob; probe failed: {detail}). Re-enable it "
+                "(`sysctl kernel.unprivileged_userns_clone=1` + a "
+                "/etc/sysctl.d drop-in) — the sandbox is built on unprivileged "
+                "user namespaces."
+            )
         raise RuntimeError(
             "Sandbox network isolation is mandatory but this host cannot create "
             f"an unprivileged user+network namespace (`unshare -Urn` failed: {detail}). "
             "Enable unprivileged user namespaces (and, in a container, relax the "
             "seccomp/userns profile)."
+        )
+
+    # Nested-level probe (diagnostic, never boot-fatal): the Codex engine ships
+    # its own bubblewrap and nests it INSIDE our sandbox for every shell
+    # command (its "fs sandbox helper"). A host can pass the one-level gate
+    # above yet deny the second level — e.g. Ubuntu 24.04's AppArmor userns
+    # restriction covers /usr/bin/bwrap via distro profiles but not what runs
+    # a level deeper — and the only runtime symptom is every Codex command
+    # degrading to unsandboxed retries + permission prompts, paraphrased by
+    # the model as "the local sandbox could not start" (2026-08-12 incident).
+    global _nested_sandbox_ok
+    nested_detail = _nested_sandbox_probe()
+    _nested_sandbox_ok = nested_detail is None
+    if nested_detail is None:
+        logger.info("netns: nested-namespace probe OK (engine inner sandboxes can start)")
+    if nested_detail is not None:
+        logger.warning(
+            "Sandbox nested-namespace probe FAILED — the agent sandbox itself "
+            "works, but a bwrap nested inside it cannot start (%s). Local "
+            "Codex sessions lose their engine-side inner sandbox: shell "
+            "commands degrade to unsandboxed retries behind permission "
+            "prompts (Claude sessions are unaffected). Run "
+            "scripts/sandbox-doctor.sh on this host to pinpoint the denial.",
+            nested_detail,
         )
 
     resolv = netns_resolv_path()
@@ -311,6 +444,20 @@ class SandboxConfig:
     #                    /knowledge? False only for Personal-only.
     config_visible: bool | None = None
     mount_shared: bool = True
+    # Manager-provenance knowledge writes (agent-scope task fires only):
+    # mounts /knowledge RW on the agent-scope branch — WITHOUT /config,
+    # which stays human-manager-only. Computed by resolve_task_identity
+    # from the dynamic task's creator; False everywhere else.
+    knowledge_rw: bool = False
+    # Attached knowledge libraries: ``(source_slug, subdir, writable)`` per
+    # row of knowledge_library_attachments (``subdir == ''`` = whole-folder
+    # share). Mirrors are real dirs inside THIS agent's knowledge tree
+    # (``knowledge/shared/<source>/<subdir>/``), so they ride the parent
+    # /knowledge bind wherever it exists; the mount builder adds a nested
+    # ``--ro-bind`` of each read-only library's subtree when the parent is
+    # RW (kernel-level RO), and mounts library subtrees individually
+    # (always RO) on Personal-only agents with no parent /knowledge at all.
+    knowledge_libraries: list[tuple[str, str, bool]] = field(default_factory=list)
     mcp_sandbox_mounts: list[SandboxMount] = field(default_factory=list)
     extra_ro_binds: list[str] = field(default_factory=list)  # additional RO paths to mount
     # Per-MCP dirs to identity-bind RO (this session's assigned stdio MCPs +
@@ -486,6 +633,12 @@ class SandboxBuilder:
     def _namespace_flags(self) -> list[str]:
         flags = [
             "--unshare-pid",      # new PID namespace (can't see other processes)
+            "--unshare-ipc",      # own SysV/POSIX-mq namespace — all local
+                                  # sandboxes share the proxy uid, so a shared
+                                  # IPC namespace would be a live cross-agent
+                                  # shm/semaphore channel (/dev/shm is per-
+                                  # sandbox tmpfs already; this closes shmget)
+            "--unshare-uts",      # own hostname namespace (completeness)
             "--die-with-parent",  # kill sandbox if parent dies
             "--share-net",        # share network (hooks need localhost:8400;
                                   # under the netns launcher this is pasta's
@@ -601,11 +754,16 @@ class SandboxBuilder:
         | editor                | (none)  | RO         | RW         | RW*        |
         | viewer                | (none)  | RO         | RO         | RW*        |
         | admin                 | RW      | RW         | RW         | RW*        |
-        | agent-scope (no user) | (none)  | RO         | RW         | (none)     |
+        | agent-scope (no user) | (none)  | RO†        | RW         | (none)     |
 
         *RW* = the user dir's ROOT is RO; its known subdirs (workspace/,
         context/, .claude/, .codex/, .credentials/) stack RW on top, so
         stray root-level files are kernel-denied for every tool path.
+
+        †RO with `knowledge/.credentials/` stacked RW on top (when it
+        exists): agent-scope MCP credentials live there and MCP processes
+        write-check + self-refresh tokens in place. Tool access to the
+        subtree stays blocked at the application layer (path_policy).
 
         `/config/` is **owner-only** — editor + viewer don't see it at all.
         Config shapes agent BEHAVIOR (prompt, MCP wiring, auto-loaded
@@ -621,6 +779,11 @@ class SandboxBuilder:
         username = self.cfg.username
         agent_dir_path = self._agent_dir
         agent_dir = str(agent_dir_path)
+        # Anchor for symlink-refusing bind-source checks below. The agent
+        # root itself is platform-owned (safe to resolve); everything BELOW
+        # it that we bind from an agent-writable subtree must additionally
+        # prove it carries no symlinked component (_verified_literal_path).
+        agent_root_real = Path(os.path.realpath(agent_dir_path))
 
         # Defensive: bwrap --bind fails if source doesn't exist. The agent
         # template creation (agent_store.create_agent) now creates knowledge/
@@ -643,6 +806,40 @@ class SandboxBuilder:
         except Exception:
             pass  # never block a sandbox build on quota assignment
 
+        lib_attachments = self.cfg.knowledge_libraries
+
+        def _mirror_host(src: str, subdir: str) -> str:
+            # bwrap --bind fails on a missing source, and under an RO parent
+            # bind it cannot create the mountpoint either — host-side mkdir
+            # is the same insurance as the knowledge/ mkdir above.
+            # Symlink-refusing: the mirror chain lives under the RW-bindable
+            # /knowledge, so an owner-tier agent could have replaced a
+            # component with a symlink (detach/re-attach leaves plain dirs
+            # behind). Verify BEFORE mkdir — mkdir(parents=True) through a
+            # symlinked component would create dirs at the TARGET — and fail
+            # the build loudly on tampering rather than bind the target.
+            parts = ["knowledge", "shared", *Path(src).parts]
+            if subdir:
+                parts += Path(subdir).parts
+            p = _verified_literal_path(agent_root_real, *parts)
+            if p is None:
+                raise RuntimeError(
+                    f"Refusing sandbox build: knowledge mirror path "
+                    f"knowledge/shared/{src}{'/' + subdir if subdir else ''} "
+                    f"contains a symlinked component (possible tampering)"
+                )
+            p.mkdir(parents=True, exist_ok=True)
+            if os.path.realpath(p) != str(p):
+                raise RuntimeError(
+                    f"Refusing sandbox build: knowledge mirror path {p} "
+                    f"changed underneath the build (possible tampering)"
+                )
+            return str(p)
+
+        def _mirror_dest(src: str, subdir: str) -> str:
+            return (f"/knowledge/shared/{src}/{subdir}" if subdir
+                    else f"/knowledge/shared/{src}")
+
         config_visible = self.cfg.config_visible
         if config_visible is None:
             # Not explicitly resolved (direct construction / pre-visibility-modes
@@ -662,13 +859,48 @@ class SandboxBuilder:
                 args.extend(["--ro-bind", f"{agent_dir}/workspace", "/workspace"])
             else:
                 args.extend(["--bind", f"{agent_dir}/workspace", "/workspace"])
-            if config_visible:
-                # Owner-tier human in the agent scope: curate knowledge + config.
+            if config_visible or self.cfg.knowledge_rw:
+                # Owner-tier human in the agent scope (curates knowledge +
+                # config) — or a manager-provenance task fire (knowledge_rw:
+                # knowledge RW, /config deliberately NOT mounted).
                 args.extend(["--bind", f"{agent_dir}/knowledge", "/knowledge"])
-                args.extend(["--bind", f"{agent_dir}/config", "/config"])
+                if config_visible:
+                    args.extend(["--bind", f"{agent_dir}/config", "/config"])
+                # Read-only library mirrors stay kernel-RO under the RW
+                # parent — one nested bind per library SUBTREE.
+                for _src, _subdir, _writable in lib_attachments:
+                    if not _writable:
+                        args.extend(["--ro-bind", _mirror_host(_src, _subdir),
+                                     _mirror_dest(_src, _subdir)])
             else:
-                # Knowledge is universal + RO for non-owners / service sessions.
+                # Knowledge is universal + RO for non-owners / service sessions
+                # (mirrors ride the RO parent — no nested binds needed).
                 args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
+                # Agent-scope MCP credentials live at knowledge/.credentials
+                # (path_roles credentials_dir role) and MCP processes must
+                # WRITE there: workspace-mcp write-checks the dir on boot and
+                # self-refreshes tokens in place. RW child bind AFTER the RO
+                # root (bwrap later-bind precedence) — fixed literal subtree,
+                # never a manifest-supplied path. Existence-guarded: bwrap
+                # cannot create a mountpoint under an RO parent, and the dir
+                # exists iff credential_resolver materialized a bound account
+                # (which runs before the sandbox is built).
+                # Symlink-refusing: owner-tier sessions hold /knowledge RW,
+                # so this path is agent-plantable across runs — a symlink
+                # here would bind its TARGET read-write into this sandbox
+                # (bwrap resolves bind sources). Refuse and boot without the
+                # bind instead: the MCP shows up unconnected, nothing leaks.
+                cred_dir = _verified_literal_path(
+                    agent_root_real, "knowledge", ".credentials")
+                if cred_dir is None:
+                    logger.error(
+                        "Refusing knowledge/.credentials bind for agent %s: "
+                        "path contains a symlinked component (possible "
+                        "tampering)", self.cfg.agent_name,
+                    )
+                elif cred_dir.is_dir():
+                    args.extend(["--bind", str(cred_dir),
+                                 "/knowledge/.credentials"])
             return args
 
         # User-scope MOUNT — the session has its own personal dir. The dir
@@ -714,6 +946,12 @@ class SandboxBuilder:
                 # Owner tier: knowledge RW (reference library) + workspace RW.
                 args.extend(["--bind", f"{agent_dir}/knowledge", "/knowledge"])
                 args.extend(["--bind", f"{agent_dir}/workspace", "/workspace"])
+                # Read-only library mirrors stay kernel-RO under the RW
+                # parent — one nested bind per library SUBTREE.
+                for _src, _subdir, _writable in lib_attachments:
+                    if not _writable:
+                        args.extend(["--ro-bind", _mirror_host(_src, _subdir),
+                                     _mirror_dest(_src, _subdir)])
             elif role == "editor":
                 # Editor: workspace RW (collaboration), knowledge RO.
                 args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
@@ -722,6 +960,16 @@ class SandboxBuilder:
                 # Viewer (or unknown): both RO — SEE state + docs, mutate nothing.
                 args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
                 args.extend(["--ro-bind", f"{agent_dir}/workspace", "/workspace"])
+        elif lib_attachments:
+            # Personal-only: no shared /knowledge exists, but attached
+            # libraries still mount — each mirror individually, ALWAYS
+            # read-only (a personal-only agent has no knowledge-curation
+            # surface, so the writable flag deliberately does not apply).
+            # With no parent bind, bwrap creates the /knowledge/shared
+            # chain inside the sandbox root itself.
+            for _src, _subdir, _writable in lib_attachments:
+                args.extend(["--ro-bind", _mirror_host(_src, _subdir),
+                             _mirror_dest(_src, _subdir)])
 
         return args
 
@@ -863,6 +1111,7 @@ def resolve_sandbox_config(
     extra_egress_targets: list[str] | None = None,
     config_visible: bool | None = None,
     mount_shared: bool = True,
+    knowledge_rw: bool = False,
     mcp_config_path: str | Path | None = None,
     mcp_dir_binds: list[str] | None = None,
 ) -> SandboxConfig:
@@ -910,6 +1159,23 @@ def resolve_sandbox_config(
                 "netns: egress resolution failed for agent %s — wrapping with "
                 "proxy port only (no MCP/target carve-outs)", agent_name)
             net_forwards = [str(app_config.PORT)]
+    # Attached knowledge libraries — resolved HERE (the single funnel every
+    # local layer builds through) so no layer call site needs to know about
+    # them. Resolution failure logs loudly and mounts none: the parent
+    # /knowledge bind still exposes mirror CONTENT read-appropriately; only
+    # the nested kernel-RO overlay is lost, and the path-policy subtree gate
+    # remains as defense-in-depth for that degraded window.
+    try:
+        from storage import db_knowledge_libraries
+        knowledge_libraries = [
+            (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
+            for a in db_knowledge_libraries.attachments_for_consumer(agent_name)
+        ]
+    except Exception:
+        logger.exception(
+            "knowledge-library resolution failed for %s — mounting none",
+            agent_name)
+        knowledge_libraries = []
     # ``config_visible`` is forwarded as-is: None (the default) lets the mount
     # builder apply the historical derivation; an explicit bool from the
     # visibility resolver overrides it (e.g. a Shared-only owner-tier human).
@@ -923,6 +1189,8 @@ def resolve_sandbox_config(
         host_claude_dir=host_claude_dir,
         config_visible=config_visible,
         mount_shared=mount_shared,
+        knowledge_rw=knowledge_rw,
+        knowledge_libraries=knowledge_libraries,
         mcp_sandbox_mounts=mcp_sandbox_mounts or [],
         extra_ro_binds=extra_ro_binds or [],
         net_forwards=net_forwards or [],

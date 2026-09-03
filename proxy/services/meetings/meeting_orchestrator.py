@@ -1135,6 +1135,7 @@ async def start_meeting(meeting_id: str) -> None:
                         meeting_participants=_meeting_participants)
     )
     pump.producer = producer_task
+    pump.system_queue_consumer = True  # _drain_system_notes reads it each round
 
     _active_pumps[parent_chat_id] = pump
     _active_meetings[meeting_id] = asyncio.current_task()

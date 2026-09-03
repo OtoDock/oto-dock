@@ -139,8 +139,10 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
     async start() {
       last = ''; ended = false
       const sr = await loadSR()
-      // Permission is primed by MicIcon (getUserMedia, the Capacitor way); this
-      // is a read-only confirm + a last-ditch plugin request if still ungranted.
+      // Permission check first; ensureNativeMicPermission below is the
+      // last-ditch getUserMedia primer (Capacitor's own dialog flow) and
+      // runs ONLY while still ungranted — once granted, a dictation start
+      // opens no browser capture at all.
       let perm = await sr.checkPermissions().catch(() => ({ speechRecognition: 'prompt' }))
       if (perm.speechRecognition !== 'granted') {
         perm = await sr.requestPermissions().catch(() => ({ speechRecognition: 'denied' }))

@@ -32,8 +32,8 @@ from core.layers.codex.codex_approvals import (
     approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
 )
 from core.session.session_state import (
-    clear_session_liveness, get_session_user_tz, resolve_bg_command,
-    resolve_session_permissions,
+    clear_session_liveness, get_session_user_tz, has_pending_question,
+    resolve_bg_command, resolve_session_permissions,
 )
 
 logger = logging.getLogger("codex-session")
@@ -41,6 +41,14 @@ logger = logging.getLogger("codex-session")
 # Codex idle reaping is unified across all session kinds via
 # config.get_idle_timeout() (the admin `session_idle_timeout` setting); the reaper
 # reads it per-sweep. See core/concurrency.py.
+# Reaper spare for a turn held open by an unanswered `request_user_input`: the
+# daemon blocks on the server-request while the human decides, so `last_activity`
+# alone reads as idle and reaping it drops the waiter — the eventual answer then
+# hits a closed transport and is LOST (live 2026-08-06, T1). Waiting on a human is
+# not idleness, so grant ONE extra idle window (the same multiple the interactive
+# reaper uses); past it reap as before — the answer path falls back to a chat
+# message on the revived session (ws/dashboard_dispatch question_response).
+_QUESTION_PARK_TIMEOUT_MULT = 2
 
 # Bounded warm-gate for MCP startup before the first turn (the analog of the
 # CLI's _wait_for_init). app-server emits mcpServer/startupStatus/updated per
@@ -773,7 +781,9 @@ class CodexAppServerSession:
                 continue  # already supervised (carried over from a prior turn)
             # Ensure a buffer exists even if the sub emitted nothing post-spawn.
             self._thread_consumers.setdefault(aid, asyncio.Queue())
-            reg.register_spawn(aid, aid)
+            from core.events.bg_command_state import shorten_label
+            reg.register_spawn(
+                aid, aid, label=shorten_label(p.get("description", "")))
             self._bg_supervisors[aid] = asyncio.create_task(
                 self._supervise_bg_subagent(aid)
             )
@@ -1010,6 +1020,28 @@ async def close_codex_session(session_id: str) -> bool:
     return True
 
 
+def _codex_reap_candidates(now: float, idle_timeout: float) -> list[str]:
+    """Session ids the idle sweep must close.
+
+    Dead sessions always; over-idle ones unless the turn is parked on an
+    unanswered `request_user_input` and still inside the extra window
+    (``_QUESTION_PARK_TIMEOUT_MULT``).
+    """
+    reap: list[str] = []
+    for sid, s in list(_codex_sessions.items()):
+        if not s.is_alive:
+            reap.append(sid)
+            continue
+        idle = now - s.last_activity
+        if idle <= idle_timeout:
+            continue
+        if (has_pending_question(sid)
+                and idle < _QUESTION_PARK_TIMEOUT_MULT * idle_timeout):
+            continue
+        reap.append(sid)
+    return reap
+
+
 async def reap_idle_codex_sessions() -> None:
     """Background task: reap idle Codex sessions every 60 s."""
     while True:
@@ -1017,10 +1049,7 @@ async def reap_idle_codex_sessions() -> None:
         try:
             now = time.monotonic()
             idle_timeout = app_config.get_idle_timeout()
-            to_reap = [
-                sid for sid, s in list(_codex_sessions.items())
-                if now - s.last_activity > idle_timeout or not s.is_alive
-            ]
+            to_reap = _codex_reap_candidates(now, idle_timeout)
             for sid in to_reap:
                 logger.info(f"Reaping idle Codex session {sid[:8]}")
                 await close_codex_session(sid)

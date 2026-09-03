@@ -291,3 +291,10 @@ class TestVendorHostSeeds:
         entries = bearer_allowlist.list_allowed()
         hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
         assert ("zoom", "mcp.zoom.us") in hosts
+
+    def test_postiz_api_postiz_com_seeded(self):
+        """postiz-mcp is a remote bearer-required MCP at api.postiz.com —
+        the user's Postiz API key rides as the bearer to the hosted MCP."""
+        entries = bearer_allowlist.list_allowed()
+        hosts = {(e["provider_id"], e["host_pattern"]) for e in entries}
+        assert ("postiz", "api.postiz.com") in hosts

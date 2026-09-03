@@ -327,3 +327,66 @@ class TestValidateSpawnOverrides:
         self._agent(monkeypatch, path="claude-code-cli")
         with pytest.raises(HTTPException):
             validate_spawn_overrides("w", "codex-cli", None)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Delegation chain guard (2026-09-02, with the symmetric department topology)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestDelegationChainGuard:
+    """check_delegation_chain: cycle + depth refusals over chats.parent_chat_id."""
+
+    def _chain(self, agents):
+        """Create chats c0←c1←…, agent[i] on chat i; returns the LAST chat id."""
+        prev = ""
+        cid = ""
+        for i, agent in enumerate(agents):
+            cid = f"chain-{uuid.uuid4().hex[:8]}"
+            task_store.create_chat(cid, "user-1", agent, parent_chat_id=prev)
+            prev = cid
+        return cid
+
+    def test_root_spawn_allowed(self, temp_db):
+        from services.delegation.spawn_authz import check_delegation_chain
+        check_delegation_chain("", "ceo", "marketing")  # no parent chat → root
+
+    def test_cycle_refused(self, temp_db):
+        from services.delegation.spawn_authz import check_delegation_chain
+        lane = self._chain(["ceo", "marketing"])  # ceo's chat → marketing's lane
+        with pytest.raises(HTTPException) as exc:
+            check_delegation_chain(lane, "marketing", "ceo")
+        assert exc.value.status_code == 403
+        assert "already in this delegation chain" in exc.value.detail
+
+    def test_downward_then_new_target_allowed(self, temp_db):
+        from services.delegation.spawn_authz import check_delegation_chain
+        lane = self._chain(["ceo", "marketing"])
+        check_delegation_chain(lane, "marketing", "content-creator")  # no raise
+
+    def test_self_delegation_exempt(self, temp_db):
+        from services.delegation.spawn_authz import check_delegation_chain
+        lane = self._chain(["writer"])
+        check_delegation_chain(lane, "writer", "writer")  # parallelize yourself
+
+    def test_depth_cap_default(self, temp_db):
+        from services.delegation.spawn_authz import check_delegation_chain
+        # The root chat is not a delegation hop: a chain of N chats spawning
+        # a worker creates hop N (root→1st worker = hop 1).
+        deep = self._chain(["a1", "a2", "a3", "a4", "a5"])  # next spawn = hop 5
+        ok = self._chain(["a1", "a2", "a3", "a4"])          # next spawn = hop 4
+        check_delegation_chain(ok, "a4", "a9")               # at the cap — allowed
+        with pytest.raises(HTTPException) as exc:
+            check_delegation_chain(deep, "a5", "a9")         # over the cap
+        assert exc.value.status_code == 403
+        assert "chain too deep" in exc.value.detail
+
+    def test_depth_cap_tunable(self, temp_db, monkeypatch):
+        from services.delegation import spawn_authz
+        monkeypatch.setattr(
+            spawn_authz.mcp_store, "get_mcp_config_values",
+            lambda name: {"MAX_DELEGATION_DEPTH": "1"},
+        )
+        lane = self._chain(["a1", "a2"])
+        with pytest.raises(HTTPException):
+            spawn_authz.check_delegation_chain(lane, "a2", "a9")

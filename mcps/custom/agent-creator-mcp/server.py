@@ -194,6 +194,7 @@ def _format_plan(result: dict) -> list[str]:
             f"{seeds.get('tasks', 0)} task(s)",
             f"{seeds.get('triggers', 0)} trigger(s)",
             f"{seeds.get('notifications', 0)} notification(s)",
+            f"{seeds.get('dashboards', 0)} dashboard(s)",
             f"{seeds.get('context_files', 0)} context file(s)",
         ]
         if seeds.get("has_setup"):
@@ -265,8 +266,15 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
         f"{result.get('seeded_tasks', 0)} task(s)",
         f"{result.get('seeded_triggers', 0)} trigger(s)",
         f"{result.get('seeded_notifications', 0)} notification(s)",
+        f"{result.get('seeded_dashboards', 0)} dashboard(s)",
     ]
     lines.append(f"\n**Seeded**: {', '.join(seeded)}")
+    if result.get("seeded_dashboards"):
+        lines.append(
+            "Seeded dashboards are pinned already (display-only — no "
+            "buttons to approve); the new agent can re-pin them with "
+            "actions later.",
+        )
     if result.get("setup_md_copied"):
         lines.append(
             "The agent has a setup guide in its context — open a chat with it "

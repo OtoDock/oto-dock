@@ -135,12 +135,23 @@ class ChatStreamPump:
         self._done = False
         self._abort_requested = False  # abort() sets; drives the resumed-task run-status close
         self._task: asyncio.Task | None = None
+        # Terminal engine/provider error, if the stream died on one. The
+        # event loop BREAKS on ERROR, so a non-empty value here is terminal
+        # by construction. Task runs consult it (scheduler step 7) so an
+        # engine failure ("Not logged in", a cross-engine model 400) never
+        # lands as a deceptive `completed` run with empty output.
+        self.last_error: str = ""
 
         # Message queue (shared with producer closure)
         self.message_queue: list[str] = []
         # System prompt queue — delivered silently (no user bubble).
         # Used for delegate results and bg nudges during background drain.
         self.system_queue: list[str] = []
+        # True only when a producer actually DRAINS system_queue (dashboard
+        # turn loop, duplex, meetings). Task/scheduler pumps never do — the
+        # delivery ladder must not "succeed" onto a queue nobody reads
+        # (queue_pump_prompt checks this flag).
+        self.system_queue_consumer: bool = False
         # Artifact-interaction queue (shared with producer closure) — pending
         # otodock.send payloads from display_ui artifacts, delivered as their
         # own framed turn(s) at the boundary (ws/artifact_interactions.py).
@@ -225,6 +236,15 @@ class ChatStreamPump:
         self._permission_active: dict | None = None  # currently shown permission
         self._permission_buffer: list[dict] = []  # queued permissions waiting
 
+        # Stop-and-send flags ({"fired": bool, "note": bool}) — assigned ONLY
+        # by dashboard_chat._start_new_stream, whose producer drains
+        # message_queue (the same ownership pattern as the shared queue
+        # lists). None = foreign producer (task/meeting/duplex/delegate-echo/
+        # recovery pumps) that never drains typed messages: the fire site
+        # treats None as "queue-only", so an interrupt can never destroy a
+        # turn whose queued message nothing would deliver.
+        self.stop_and_send: dict | None = None
+
     # Tools that have dedicated events (task_spawn, plan_mode) — skip tool persistence
     _SKIP_TOOL_PERSIST = frozenset({"Agent", "Task", "EnterPlanMode", "ExitPlanMode", "mcp__delegation-mcp__delegate"})
 
@@ -290,6 +310,23 @@ class ChatStreamPump:
             # No more pending — clear reconnect storage
             _pending_permissions.pop(self.session_id, None)
 
+    def clear_permission_state(self):
+        """Drop the active + buffered permission slots without advancing.
+
+        Stop-and-send companion: the graceful interrupt's auto-deny releases
+        the hook waiters (``resolve_session_permissions``) but nothing would
+        clear the PUMP's slot — the drain turn's next permission would then
+        buffer invisibly behind a dead card and hang the turn. (The Stop
+        button never hits this: no drain follows it.) Buffered prompts are
+        dropped, not shown — their waiters were just denied with the turn.
+        """
+        self._permission_active = None
+        self._permission_buffer.clear()
+        _pending_permissions.pop(self.session_id, None)
+        live = _chat_streaming_state.get(self.chat_id)
+        if live:
+            live["pending_permission"] = None
+
     async def _show_permission(self, perm_data: dict):
         """Set a permission as active and forward to WS."""
         self._permission_active = perm_data
@@ -322,7 +359,7 @@ class ChatStreamPump:
                            else "") or "Waiting for your answer"
                 asyncio.create_task(notification_manager.fire_ephemeral(
                     chat["user_sub"],
-                    title=f"{chat['agent']} needs your input",
+                    title=f"{notification_manager.agent_label(chat['agent'])} needs your input",
                     body=first_q,
                     chat_id=self.chat_id,
                 ))
@@ -340,8 +377,18 @@ class ChatStreamPump:
         else:
             self._permission_buffer.append(perm_data)
 
+    # Cap the pending-message backlog per pump. A client that holds a turn
+    # open and keeps sending `chat` frames (which, when steer isn't available,
+    # queue with no DB write) would otherwise grow this list without bound in
+    # the shared proxy process. ~64 unsent messages is far beyond any real
+    # between-turns backlog.
+    _QUEUE_CAP = 64
+
     def queue_message(self, text: str) -> int:
-        """Queue a user message for the producer. Returns index."""
+        """Queue a user message for the producer. Returns the index, or -1 when
+        the backlog cap is hit (caller surfaces a 'queue full' notice)."""
+        if len(self.message_queue) >= self._QUEUE_CAP:
+            return -1
         self.message_queue.append(text)
         return len(self.message_queue) - 1
 
@@ -634,6 +681,7 @@ class ChatStreamPump:
 
                 if event.type == ERROR:
                     err_msg = event.data.get("message", "")
+                    self.last_error = err_msg or "engine error"
                     # Failover: if the turn died on a provider limit/overload, rest
                     # this session's subscription so the next chat/turn picks another.
                     # A real rate/usage limit gets the full cooldown; a transient
@@ -913,6 +961,19 @@ class ChatStreamPump:
             except Exception:
                 pass  # Don't break pump cleanup for notification failure
 
+            # Shared-library turn-end reconcile: a sandbox delete/write inside
+            # a library (mirror or source) passes no proxy chokepoint — kick
+            # the projector now so the agent's own change lands before it
+            # reports, instead of waiting for the 5-minute sweep. No-op for
+            # agents without library rows (one indexed SELECT).
+            try:
+                from services.knowledge import library_projector
+                _chat_row = task_store.get_chat(self.chat_id)
+                if _chat_row and _chat_row.get("agent"):
+                    library_projector.schedule_reconcile_for_agent(_chat_row["agent"])
+            except Exception:
+                pass
+
             logger.info(
                 f"ChatStreamPump ended: chat={self.chat_id}, "
                 f"blocks={len(self._turn_blocks)}, plan={self.implementing_plan or 'none'}"
@@ -940,7 +1001,7 @@ class ChatStreamPump:
         if not task_store.get_active_meeting_for_chat(self.chat_id):
             asyncio.create_task(notification_manager.fire_ephemeral(
                 chat["user_sub"],
-                title=f"{chat['agent']} finished",
+                title=f"{notification_manager.agent_label(chat['agent'])} finished",
                 body="Response ready",
                 chat_id=self.chat_id,
             ))

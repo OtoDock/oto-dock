@@ -29,6 +29,12 @@ const COMMAND_TAG_RE =
 const COMMAND_TAG_START_RE =
   /^<(command-name|command-message|command-args|local-command-stdout)>/
 
+// Platform-injected context blocks (e.g. the duplex chat context prepended to
+// the first spoken turn after each attach — `ws/duplex_attach.py::_build_prompt`).
+// The interactive tailer persists the PTY-typed prompt verbatim, so the block
+// renders inside the user's own bubble on interactive-terminal chats.
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+
 /** Strip leading injected `[Current time: ...]` prelude line(s). */
 export function stripInjectedPreludes(text: string): string {
   let out = text
@@ -44,7 +50,18 @@ export function stripInjectedPreludes(text: string): string {
  * and the row should be hidden entirely.
  */
 export function cleanUserMessageText(text: string): string | null {
-  const stripped = stripInjectedPreludes(text ?? '')
+  let stripped = stripInjectedPreludes(text ?? '')
+  // Injected <system-reminder> blocks: stripped only when the message STARTS
+  // with one (the injected shape — the block is prepended to the user's
+  // text), same start-anchor discipline as command tags below so a pasted or
+  // quoted fragment mid-message is never hidden. Preludes run again after —
+  // a time stamp that sat between the block and the user's text becomes
+  // leading once the block is gone.
+  if (stripped.trimStart().startsWith('<system-reminder>')) {
+    stripped = stripInjectedPreludes(
+      stripped.replace(SYSTEM_REMINDER_RE, '').replace(/^\s+/, ''),
+    )
+  }
   const trimmed = stripped.trim()
   if (!trimmed) {
     // Original had content but nothing user-authored survives → hide; a row

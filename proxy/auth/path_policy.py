@@ -118,6 +118,21 @@ class SecurityContext:
     # The agent's mode scopes — drives Personal-only's dropped shared dirs and
     # the scope-aware prompt variants.
     available_scopes: tuple = ("user", "agent")
+    # Attached knowledge libraries: ``((source_slug, subdir, writable), …)``
+    # — the session's snapshot of knowledge_library_attachments, baked at
+    # build time like the mounts themselves (``subdir == ''`` = whole-folder
+    # share; the mirror path is ``knowledge/shared/<slug>/<subdir>/``).
+    # Drives the mirror-subtree write gate (clean denials where the kernel
+    # would give a bare EROFS) and the prompt's shared-knowledge rows.
+    knowledge_libraries: tuple = ()
+    # Manager-provenance knowledge writes for AGENT-SCOPE task fires: True
+    # only when ``resolve_task_identity`` computed it from the dynamic
+    # task's creator (platform admin / per-agent manager) under the
+    # scheduler's explicit opt-in (scheduled / one-time / trigger fires).
+    # Chats, meetings, phone, headless apps and delegate workers stay False
+    # by construction. Grants ``/knowledge`` RW (mount + hook + satellite
+    # write-back); ``/config`` is deliberately untouched (human-manager-only).
+    knowledge_rw: bool = False
 
     @property
     def mount_username(self) -> str:
@@ -511,11 +526,51 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     def _check_agent_write(agent_name: str) -> bool:
         agent_dir = (_AGENTS_DIR / agent_name).resolve()
 
-        # Agent-scoped context (no username): only workspace/ is writable.
-        # Knowledge is RO for agent-scope (curated by owners; agent-scope
-        # sessions consume it but don't curate).
+        def _mirror_verdict() -> bool | None:
+            """Knowledge-library mirrors (knowledge/shared/<source>/…) sit
+            inside knowledge but are decided by the covering attachment's
+            writable flag, not the session's knowledge tier alone — a
+            read-only mirror gets a clean policy denial here instead of
+            the kernel's bare EROFS. The shared/ root itself is
+            projector-owned: never hand-writable. Libraries are per
+            SUBTREE — matching is segment-wise (a library ``marketing``
+            never authorizes ``marketing-extra``); a path under the slug
+            but outside every attached subtree is denied.
+            ``None`` = not a mirror-namespace path."""
+            shared_root = (agent_dir / "knowledge" / "shared").resolve()
+            if not _path_under(resolved, shared_root):
+                return None
+            try:
+                rel_parts = resolved.relative_to(shared_root).parts
+            except ValueError:
+                return False
+            if not rel_parts:
+                return False
+            src, sub_parts = rel_parts[0], list(rel_parts[1:])
+            for entry in (ctx.knowledge_libraries or ()):
+                e_src, e_subdir, e_writable = entry[0], entry[1], bool(entry[2])
+                if e_src != src or not e_writable:
+                    continue
+                prefix = e_subdir.split("/") if e_subdir else []
+                if sub_parts[: len(prefix)] == prefix:
+                    return True
+            return False
+
+        # Agent-scoped context (no username): workspace/ is writable, and —
+        # ONLY for manager-provenance task fires (ctx.knowledge_rw) — the
+        # knowledge tree, under the same per-attachment mirror rule as the
+        # owner tier (attachment writable AND provenance, both required).
+        # /config stays denied (human-manager-only), memory/ was denied
+        # earlier (_is_memory_file precedes this branch).
         if not ctx.username:
-            return _path_under(resolved, (agent_dir / "workspace").resolve())
+            if _path_under(resolved, (agent_dir / "workspace").resolve()):
+                return True
+            if ctx.knowledge_rw:
+                mirror = _mirror_verdict()
+                if mirror is not None:
+                    return mirror
+                return _path_under(resolved, (agent_dir / "knowledge").resolve())
+            return False
 
         # Viewer: only own user dir + plans (no workspace, no config, no knowledge)
         if ctx.role == "viewer":
@@ -531,6 +586,9 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
             return True
         if _path_under(resolved, (agent_dir / "config").resolve()):
             return True
+        mirror = _mirror_verdict()
+        if mirror is not None:
+            return mirror
         if _path_under(resolved, (agent_dir / "knowledge").resolve()):
             return True
         return False

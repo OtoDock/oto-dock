@@ -3,7 +3,7 @@
   "server_name": "display",
   "label": "Display",
   "description": "Display images, files, audio, video, and URLs in chat",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "category": "core",
 
   "server": {

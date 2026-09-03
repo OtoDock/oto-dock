@@ -1,0 +1,17 @@
+websockets>=12.0
+aiohttp>=3.14.3
+psutil>=5.9
+setproctitle>=1.3.3
+
+# Windows-only system-tray icon (satellite/tray.py). Markered so the shared
+# tarball's venv only pulls these on Windows — the tray is imported lazily and
+# guarded (maybe_start_tray returns None off-Windows / on ImportError), so a
+# Linux/macOS install without them runs fully headless. pystray pulls `six`.
+pystray>=0.19 ; sys_platform == "win32"
+Pillow>=12.3 ; sys_platform == "win32"
+
+# Windows-only ConPTY backend for the interactive CLI (satellite/winpty_relay.py).
+# Markered so only a Windows install pulls it; the
+# backend is imported lazily by pty_session on win32, and detect_capabilities
+# probes find_spec("winpty") before advertising the interactive_pty capability.
+pywinpty>=2.0 ; sys_platform == "win32"

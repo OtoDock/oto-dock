@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 
 import { useTransferStore, type TransferItem, type TransferMachineRow } from '../../store/transferStore'
+import { Bar, fmtSize, pct } from '../common/TransferBar'
 
 /** Anchored popover listing the current section's active uploads/syncs:
  * per item a phase-1 upload bar (while the XHR runs), then phase-2 rows —
@@ -13,30 +14,6 @@ interface Props {
   items: TransferItem[]
   anchor: { left: number; top: number }
   onClose: () => void
-}
-
-function pct(sent: number, total: number): number {
-  if (!total) return 0
-  return Math.min(100, Math.round((sent / total) * 100))
-}
-
-function fmtSize(bytes: number): string {
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
-}
-
-function Bar({ value, failed }: { value: number; failed?: boolean }) {
-  return (
-    <div className="h-1 w-full rounded-full bg-p-surface-hover overflow-hidden">
-      <div
-        className={`h-full rounded-full transition-[width] duration-300 ${
-          failed ? 'bg-red-500' : 'bg-brand'
-        }`}
-        style={{ width: `${value}%` }}
-      />
-    </div>
-  )
 }
 
 function MachineRowView({ row }: { row: TransferMachineRow }) {

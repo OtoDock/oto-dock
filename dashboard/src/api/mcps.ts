@@ -78,6 +78,9 @@ export interface McpServer {
   config_values: Record<string, string>
   assignment_mode: 'auto' | 'explicit'
   instances?: McpInstancesConfig
+  // Skill packages only: the package bundles executable scripts/ content
+  // (allowed since 2026-08-27; always surfaced as a provenance badge).
+  has_scripts?: boolean
   docker_status?: 'running' | 'unhealthy' | 'starting' | 'stopped' | 'not_found' | 'not_checked' | 'unknown' | 'error'
   // false = operator-owned compose sibling (core file-tools on containerized
   // installs) — no status pill, no start/stop/restart controls.
@@ -371,6 +374,41 @@ export function useInstallMcp() {
       return res.json()
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
+  })
+}
+
+export interface SkillInstallResult {
+  status: 'installed' | 'updated'
+  name: string
+  version: string
+  old_version: string | null
+  kind: 'skill'
+  has_scripts: boolean
+}
+
+// Skill-package zip upload (admin Skills page). Accepts BOTH a platform
+// skill package (manifest.json) and a bare spec-standard skill folder
+// (SKILL.md is the manifest — the server synthesizes the package).
+export function useInstallSkillZip() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (file: File): Promise<SkillInstallResult> => {
+      const form = new FormData()
+      form.append('file', file)
+      const res = await apiFetch('/v1/admin/skills/install', {
+        method: 'POST',
+        body: form,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Install failed' }))
+        throw new Error(err.detail || `Install failed (${res.status})`)
+      }
+      return res.json()
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['admin-mcps'] })
+      qc.invalidateQueries({ queryKey: ['community-skills'] })
+    },
   })
 }
 

@@ -31,15 +31,15 @@ export function AccountsManager({ integration, ops }: Props) {
         className="w-full flex items-center justify-between p-4 text-left"
         onClick={() => setExpanded(!expanded)}
       >
-        <div>
+        <div className="min-w-0 flex-1 pr-3">
           <div className="font-medium text-p-text">
             {integration.display_name}
           </div>
-          <div className="text-sm text-p-text-secondary">
+          <div className="text-sm text-p-text-secondary break-words">
             {integration.description}
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           {accounts.length > 0 ? (
             <span className="text-xs px-2 py-0.5 rounded-lg bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
               {accounts.length} account{accounts.length === 1 ? '' : 's'}

@@ -212,20 +212,51 @@ async def deliver_prompt(
             # is persisted; later rungs skip the duplicate via _persist_once).
 
     # Rung 2: WS connected — the dashboard handler drives the turn AND owns
-    # the event persistence on this path.
-    notify_queue = _dashboard_notify_queues.get(session_id) if session_id else None
-    if not notify_queue and chat and chat.get("session_id"):
+    # the event persistence on this path. The chat's CURRENT session is
+    # preferred over the caller's captured anchor: a queue registered under a
+    # replaced/reaped sid is stale (registrations are never cleaned on session
+    # close), and routing under it hands the handler a dead target.
+    notify_queue = None
+    if chat and chat.get("session_id"):
         current_sid = chat["session_id"]
         queue = _dashboard_notify_queues.get(current_sid)
         if queue:
             notify_queue = queue
             session_id = current_sid
+    if not notify_queue and session_id:
+        notify_queue = _dashboard_notify_queues.get(session_id)
 
     logger.info(
         f"deliver_prompt[{source}]: session={session_id[:8] if session_id else '-'}, "
         f"chat={target_chat_id[:8] if target_chat_id else '-'}, "
         f"notify_queue={'found' if notify_queue else 'not found'}"
     )
+
+    # Liveness gate: the WS handler can only run the turn on a session that is
+    # actually alive — a dead/reaped target must take the ladder instead
+    # (persistent/one-shot warm it, or the durable wake replays on the next
+    # warmup). Only a POSITIVE dead verdict skips the route; a resolution
+    # failure keeps the old behavior.
+    if notify_queue and session_id:
+        try:
+            from core.session.session_manager import (
+                get_layer_by_path, resolve_execution_path,
+            )
+            _ws_layer = get_layer_by_path(resolve_execution_path(
+                (chat or {}).get("agent", ""),
+                (chat or {}).get("execution_path", ""),
+            ))
+            if not await _ws_layer.is_session_alive(session_id):
+                logger.info(
+                    f"deliver_prompt[{source}]: session {session_id[:8]} not "
+                    f"alive — skipping WS route, using the ladder"
+                )
+                notify_queue = None
+        except Exception:
+            logger.warning(
+                f"deliver_prompt[{source}]: liveness resolution failed for "
+                f"session {session_id[:8]} — keeping the WS route", exc_info=True,
+            )
 
     if allow_ws and notify_queue and notify_payload is not None:
         if target_chat_id and pump_event:
@@ -277,7 +308,9 @@ async def deliver_prompt(
                 )
 
     # Rung 3: a pump is streaming this chat — queue for in-context delivery
-    # after the current turn (system=True: no user bubble).
+    # after the current turn (system=True: no user bubble). Only pumps whose
+    # producer drains system_queue accept (pump.system_queue_consumer) — a
+    # task/scheduler pump refuses instead of swallowing the prompt forever.
     if target_chat_id and queue_pump_prompt(target_chat_id, text, system=True):
         if pump_event:
             push_pump_event(target_chat_id, pump_event)
@@ -288,6 +321,25 @@ async def deliver_prompt(
             DeliveryOutcome("pump", chat_id=target_chat_id, session_id=session_id),
             on_outcome,
         )
+
+    # A live pump we could NOT queue on (non-consumer producer — a mid-run
+    # task lane receiving a nested delegate's result) also blocks the
+    # persistent/one-shot rungs: both would drive a SECOND producer onto the
+    # same chat/session (pump-registry clobber + dual-writer). Land on "none"
+    # — the persisted event carries the result and the caller parks a durable
+    # wake for the next turn chokepoint.
+    if target_chat_id:
+        from core.events.stream_pump import _active_pumps as _pumps_now
+        _live_pump = _pumps_now.get(target_chat_id)
+        if _live_pump is not None and not _live_pump.is_done:
+            logger.info(
+                f"deliver_prompt[{source}]: live non-consumer pump on "
+                f"chat={target_chat_id[:8]} — deferring to durable wake"
+            )
+            return await _finish(
+                DeliveryOutcome("none", chat_id=target_chat_id, session_id=session_id),
+                on_outcome,
+            )
 
     # Rung 4: persistent session alive, no pump. With a chat the rung runs a
     # headless pump turn (visible: chat_status, live attach, unread) and

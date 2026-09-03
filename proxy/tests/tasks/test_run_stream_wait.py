@@ -94,7 +94,8 @@ class TestQueuedRunVisibility:
             await release.wait()
 
         monkeypatch.setattr(scheduler, "_run_task", _parked_run_task)
-        monkeypatch.setattr(config, "get_cli_model", lambda agent: "test-model")
+        monkeypatch.setattr(config, "get_cli_model",
+                            lambda agent, layer=None: "test-model")
 
         async def _drive():
             task = scheduler.TaskDefinition(

@@ -39,6 +39,16 @@ def register_cred_name(server_id: int) -> str:
     return f"phone-server-{server_id}-register-secret"
 
 
+# Twilio auth-token storage: one ``infra_credentials`` row per Twilio server
+# (admin-typed, like the AMI secret). The account SID is non-secret config.
+TWILIO_AUTH_TOKEN_KEY = "AUTH_TOKEN"
+
+
+def twilio_cred_name(server_id: int) -> str:
+    """infra_credentials mcp_name holding a server's Twilio auth token."""
+    return f"phone-server-{server_id}-twilio-auth-token"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

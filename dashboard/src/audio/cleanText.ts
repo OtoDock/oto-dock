@@ -1,6 +1,6 @@
 // Strip markdown syntax + emoji/symbols so TTS speaks prose, not "## hash hash"
 // / bullet stars / table pipes / icons. Shared by the SoundIcon (one-shot replay)
-// and the voice-mode sentence feed (voiceFeed). Non-text blocks (tool/image/etc.)
+// (per-message read-aloud). Non-text blocks (tool/image/etc.)
 // are already excluded upstream by extractPlainText.
 
 export function cleanForSpeech(text: string): string {

@@ -15,6 +15,9 @@ const LABELS: Record<string, string> = {
   delegate_completed: 'Delegated task completed',
   bg_agents_completed: 'Background agents completed',
   bg_commands_completed: 'Background commands completed',
+  // Provenance marker before an unprompted self-wake review turn (the
+  // engine wakes itself when background work finishes — 1.5).
+  bg_wake: 'Background work finished — the agent reviews it',
   meeting_concluded: 'Meeting concluded',
   meeting_agent_failed: 'Agent disconnected from meeting',
   meeting_agent_left: 'Agent left the meeting',
@@ -126,6 +129,23 @@ export default function SystemEvent({
         <span className="h-px flex-1 bg-[#0891b2]/30" />
         <span className="text-[#0891b2] font-medium px-2">Meeting started</span>
         <span className="h-px flex-1 bg-[#0891b2]/30" />
+      </div>
+    )
+  }
+
+  // Undelivered input: the server buffered text for a starting terminal and
+  // could not confirm it became a turn (a TUI dialog may have swallowed it).
+  // Full text shown un-truncated so the user can copy their prompt back.
+  if (subtype === 'undelivered_input') {
+    return (
+      <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
+        <div className="font-medium">This message may not have reached the agent</div>
+        {message && (
+          <div className="mt-1 whitespace-pre-wrap break-words opacity-90 select-text">{message}</div>
+        )}
+        <div className="mt-1 text-xs opacity-70">
+          It was typed while the session was starting. If the agent never answered it, copy it and send again.
+        </div>
       </div>
     )
   }

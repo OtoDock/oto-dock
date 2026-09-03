@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 
 from fastapi import WebSocket, WebSocketDisconnect, Query
@@ -56,13 +57,23 @@ def _pump_item_to_phone_ws(item: dict, turn_id: int) -> dict | None:
             if content:
                 return {"type": "text", "turn": turn_id, "data": {"content": content}}
 
-        elif etype == "tool_use":
+        elif etype in ("tool_use", "tool_start"):
+            # The pump emits "tool_start" (stream_pump TOOL_USE handler);
+            # "tool_use" kept for any raw-event pusher. Matching only
+            # "tool_use" silently dropped EVERY tool_start — the phone
+            # pipeline never got the early pre-tool TTS flush and callers
+            # sat through silent tool runs before hearing the pre-tool
+            # sentence (live-hit 2026-08-14, inbound home-assistant call:
+            # 10 s of dead air, pre-tool text played only with the final).
             return {"type": "tool_start", "turn": turn_id, "data": {
                 "name": event.get("name", ""),
                 "tool_use_id": event.get("tool_id", ""),
             }}
 
-        elif etype == "tool_result":
+        elif etype in ("tool_result", "tool_end"):
+            # "tool_result" = the hook path's content-carrying frame;
+            # "tool_end" = the pump's TOOL_RESULT close frame. Both mark the
+            # boundary; downstream repeats are no-ops on an empty buffer.
             return {"type": "tool_end", "turn": turn_id, "data": {
                 "tool_use_id": event.get("tool_id", ""),
                 "result_preview": event.get("result_preview", ""),
@@ -178,12 +189,15 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
     "chat" that arrives while a previous turn is still draining queues
     behind the layer's per-session lock instead of jamming the socket.
     """
-    # Auth: master key via Authorization: Bearer header (query params are
-    # written to access logs; ``?key=`` still accepted for older phone
-    # daemons). Constant-time compare; fail closed if unset.
+    # Auth: master key via Authorization: Bearer header ONLY — query params
+    # are written to access logs, so the legacy ``?key=`` fallback would
+    # deposit the master key there (dropped for the first public release;
+    # the shipped daemon has sent the header for many versions).
     auth_header = websocket.headers.get("authorization", "")
     bearer = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
-    if not config.is_master_key(bearer or key):
+    if key:
+        logger.warning("phone WS: ignoring legacy ?key= query auth — use the Authorization header")
+    if not config.is_master_key(bearer):
         await websocket.close(code=4001, reason="Invalid API key")
         return
 
@@ -195,6 +209,17 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
     layer = None  # ExecutionLayer — resolved on warmup
     model_name: str = "personal-assistant"
     first_turn = True
+    # Set by a graceful abort; the NEXT turn's dispatch carries the duplex-
+    # style interruption note (CLI/Codex can't rewrite their own history).
+    interrupted_last_turn = False
+    # Call parameters captured at warmup so the dead-process heal in
+    # _run_turn can rebuild the SAME phone config. trigger_payload stays None
+    # for a reused pre-warmed session (its enrichment lives in the resumed
+    # history) — a heal-rebuild without it just resolves ${trigger.*} empty.
+    call_type: str = "inbound"
+    phone_context_override: str = ""
+    phone_mode = False
+    trigger_payload: dict | None = None
 
     # Turns stream from tasks so this receive loop stays responsive to
     # "abort" (barge-in) and follow-up "chat" while a turn is in flight.
@@ -210,8 +235,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
 
     async def _run_turn(turn_id: int, prompt: str, barge_in_chars) -> None:
         """Run one chat turn: producer -> pump -> WS frames stamped with turn_id."""
-        nonlocal first_turn
+        nonlocal first_turn, interrupted_last_turn
         producer: asyncio.Task | None = None
+        t_sent = time.monotonic()   # sent→first_text: the engine leg, proxy-side
         try:
             # Save user message to DB
             task_store.add_chat_message(chat_id, "user", prompt)
@@ -224,6 +250,79 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 task_store.update_chat(chat_id, title=title)
                 first_turn = False
 
+            # Dead-process heal (the dashboard turn chokepoint's twin, cf.
+            # ws/headless_resume.py): a hard abort (soft-interrupt watchdog
+            # escalation) or a satellite-side death between turns leaves the
+            # CLI dead while the call keeps sending turns. Respawn under the
+            # SAME session id with the phone's own config shape (phone
+            # prompt + call-scoped MCP set — never the chat-row/dashboard
+            # rebuild), resuming the on-disk history when it survives. Fail
+            # toward ALIVE on probe uncertainty; a satellite inside its
+            # reconnect grace window is "reconnecting", not dead. Direct-llm
+            # never process-dies (is_session_process_dead is always False).
+            # Probe + respawn hold the session lock so overlapping turns
+            # (abandoned-turn drain) can't double-heal; the producer takes
+            # the same lock again afterwards, sequentially — never nested.
+            async with layer.session_lock(session_id):
+                try:
+                    _grace = getattr(layer, "is_session_grace_held", None)
+                    proc_dead = (
+                        not (_grace is not None and _grace(session_id))
+                        and (await layer.is_session_process_dead(session_id)
+                             or not await layer.is_session_alive(session_id))
+                    )
+                except Exception:
+                    proc_dead = False
+                if proc_dead:
+                    logger.info(
+                        f"WS phone: session {session_id} process dead — "
+                        f"respawning in place"
+                    )
+                    can_resume = await layer.can_resume_session(
+                        session_id, agent_name=model_name, username="",
+                    )
+                    await layer.prepare_resume(session_id)
+                    heal_cfg = await build_phone_agent_config(
+                        agent_name=model_name,
+                        call_type=call_type,
+                        phone_context_override=phone_context_override,
+                        phone_mode=phone_mode,
+                        trigger_payload=trigger_payload,
+                    )
+                    heal_cfg.resume = can_resume
+                    await layer.start_session(session_id, heal_cfg)
+                    if (not can_resume
+                            and layer.capabilities.name != "direct-llm"):
+                        # History unrecoverable — seed the fresh session with
+                        # the DB-transcript digest so the call keeps context.
+                        from core.session.history_seed import (
+                            consume_pending_seed,
+                        )
+                        task_store.update_chat(
+                            chat_id, pending_history_seed="resume_failed")
+                        prompt, _seed_notice = consume_pending_seed(
+                            chat_id, prompt)
+
+            # Interruption note for layers that can't rewrite their own
+            # history (CLI/Codex — Direct gets the precise annotation via the
+            # barge_in_chars kwarg). Same wording as the duplex chat attach.
+            # The DB row above keeps the RAW spoken words; only the dispatch
+            # carries the note.
+            dispatch_prompt = prompt
+            _layer_kind = getattr(
+                getattr(layer, "capabilities", None), "name", "")
+            if (_layer_kind != "direct-llm"
+                    and (interrupted_last_turn or barge_in_chars)):
+                heard = (
+                    f"; they heard only the first {barge_in_chars} characters"
+                    if barge_in_chars else ""
+                )
+                dispatch_prompt = (
+                    "[The user interrupted your previous spoken reply"
+                    f"{heard} — they did not hear the rest.]\n\n" + prompt
+                )
+            interrupted_last_turn = False
+
             event_queue: asyncio.Queue = asyncio.Queue()
             local_session_id = session_id
 
@@ -231,7 +330,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 try:
                     async with layer.session_lock(local_session_id):
                         async for event in layer.send_message(
-                            local_session_id, prompt,
+                            local_session_id, dispatch_prompt,
                             barge_in_chars=barge_in_chars,
                             inject_time=True,
                         ):
@@ -266,6 +365,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
             # Attach as phone subscriber and stream events
             ws_queue = pump.attach()
 
+            first_text_logged = False
             while True:
                 try:
                     item = await ws_queue.get()
@@ -274,6 +374,13 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
 
                 phone_msg = _pump_item_to_phone_ws(item, turn_id)
                 if phone_msg:
+                    if (not first_text_logged
+                            and phone_msg.get("type") == "text"):
+                        first_text_logged = True
+                        logger.info(
+                            f"phone turn {turn_id}: sent→first_text "
+                            f"{(time.monotonic() - t_sent) * 1000:.0f}ms"
+                        )
                     await _send(phone_msg)
 
                 # Exit subscriber loop when pump is done
@@ -306,6 +413,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
             msg_type = msg.get("type", "")
 
             if msg_type == "warmup":
+                t_warm = time.monotonic()
                 model_name = msg.get("model", "")
                 if not model_name:
                     await _send({"type": "error", "data": {"message": "Agent name required in warmup 'model' field"}})
@@ -377,7 +485,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             task_store.update_chat(chat_id, session_id=session_id)
                         logger.info(
                             f"WS warmup: reusing pre-warmed session={session_id}, "
-                            f"chat={chat_id}"
+                            f"chat={chat_id} "
+                            f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                         )
                         await _send({
                             "type": "warmup_ready",
@@ -446,7 +555,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     logger.info(
                         f"WS warmup: session={session_id}, chat={chat_id}, "
                         f"agent={model_name}, "
-                        f"trigger={'yes' if trigger_payload else 'no'}"
+                        f"trigger={'yes' if trigger_payload else 'no'} "
+                        f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                     )
 
                     await _send({
@@ -486,21 +596,35 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 t.add_done_callback(turn_tasks.discard)
 
             elif msg_type == "abort":
-                # Barge-in: cancel the in-flight turn's producer. On the
-                # Direct layer the CancelledError unwinds the API stream and
-                # any in-flight MCP tool; the direct session pops the
-                # un-answered user message so the phone server can resend it
-                # batched with the caller's new speech. No-op if the turn
-                # already finished (its history stays committed — the client
-                # resends regardless, which the model absorbs harmlessly).
+                # Barge-in: graceful-first, per layer — the same shape as the
+                # duplex chat attach. layer.abort() sends the CLI's stdin
+                # interrupt / Codex interrupt; the turn CLOSES normally with
+                # the partial reply persisted, so the producer is left
+                # running to drain it (the daemon's turn-id filter drops the
+                # tail frames). Direct returns False there and falls back to
+                # the producer cancel, whose CancelledError unwinds the API
+                # stream and pops the un-answered user message so the phone
+                # server can resend it batched with the caller's new speech.
+                # No-op if the turn already finished (its history stays
+                # committed — the client resends regardless, which the model
+                # absorbs harmlessly).
                 turn_id = msg.get("turn")
                 producer = turn_producers.get(turn_id)
                 if producer and not producer.done():
+                    graceful = False
+                    if layer is not None:
+                        try:
+                            graceful = bool(await layer.abort(session_id))
+                        except Exception:
+                            graceful = False
                     logger.info(
-                        f"WS abort: cancelling turn {turn_id} "
-                        f"(session={session_id})"
+                        f"WS abort: turn {turn_id} "
+                        f"({'graceful interrupt' if graceful else 'producer cancel'}, "
+                        f"session={session_id})"
                     )
-                    producer.cancel()
+                    if not graceful:
+                        producer.cancel()
+                    interrupted_last_turn = True
                 else:
                     logger.info(f"WS abort: turn {turn_id} not in flight")
 

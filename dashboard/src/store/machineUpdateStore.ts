@@ -20,6 +20,10 @@ export interface MachineUpdateSlice {
   status: MachineUpdateStatus
   error?: string
   rolledBackTo?: string
+  // Consecutive rollbacks of this target; at 2 the proxy pauses automatic
+  // pushes of it (autoUpdatePaused) until an admin clicks "Update now".
+  attempts?: number
+  autoUpdatePaused?: boolean
 }
 
 interface MachineUpdateStoreState {
@@ -44,6 +48,8 @@ interface MachineUpdateStoreState {
     machine_name?: string
     error: string
     rolled_back_to?: string
+    attempts?: number
+    auto_update_paused?: boolean
   }) => void
 
   dismiss: (machineId: string) => void
@@ -112,6 +118,8 @@ export const useMachineUpdateStore = create<MachineUpdateStoreState>((set) => ({
             status: 'failed',
             error: data.error,
             rolledBackTo: data.rolled_back_to,
+            attempts: data.attempts,
+            autoUpdatePaused: !!data.auto_update_paused,
           },
         },
       }

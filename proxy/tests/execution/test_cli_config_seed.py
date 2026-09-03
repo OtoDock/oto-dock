@@ -20,6 +20,8 @@ def test_seed_writes_wizard_and_banner_flags(tmp_path):
     data = _read(tmp_path)
     assert data["hasCompletedOnboarding"] is True
     assert data["hasSeenAutoModeEntryWarning"] is True
+    # Resume-from-summary picker suppression (would eat cold-flushed prompts).
+    assert data["resumeReturnDismissed"] is True
     assert data["theme"] == "light"
     proj = data["projects"]["/sandbox/cwd"]
     assert proj["hasTrustDialogAccepted"] is True

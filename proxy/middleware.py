@@ -149,6 +149,7 @@ async def refresh_session_cookie(request: Request, call_next):
         return response
     from auth.providers import (
         validate_session_jwt, create_session_jwt, apply_session_cookie,
+        session_iat_after_password_change,
     )
     payload = validate_session_jwt(cookie)
     if not payload:
@@ -157,6 +158,13 @@ async def refresh_session_cookie(request: Request, call_next):
     if (isinstance(iat, int) and isinstance(exp, int) and exp > iat
             and (now - iat) < (exp - iat) / 2):
         return response  # still fresh — no re-issue yet
+    # Never LAUNDER a cookie that predates the user's last password change into
+    # a fresh-iat one — that would make a stolen pre-change cookie immortal.
+    # (This runs even on 401 responses, so the check is load-bearing here.)
+    from storage import database as _task_store
+    _u = _task_store.get_user(payload.get("sub", ""))
+    if _u and not session_iat_after_password_change(_u, payload):
+        return response
     token = create_session_jwt(
         payload["sub"], payload.get("email", ""), payload.get("name", ""),
         payload.get("role", "member"),

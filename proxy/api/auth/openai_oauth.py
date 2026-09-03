@@ -303,9 +303,13 @@ async def oauth_finish(
         or (auth_data.get("tokens") or {}).get("account_id")
         or ""
     )
+    # include_disabled: a reconnect on an admin-disabled row must MATCH it
+    # (and keep it disabled, below) — excluding it would fork a second ACTIVE
+    # row for the same account, silently routing around the admin.
     existing = subscription_store.list_subscriptions(
         layer=meta["layer"],
         owner_sub=owner_sub,
+        include_disabled=True,
     )
     existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == "openai"]
 
@@ -325,11 +329,21 @@ async def oauth_finish(
             )
 
     if match:
+        # Under the sub's refresh lock — an in-flight refresh of the old
+        # token must not land its failure verdict on the fresh grant. An
+        # admin-DISABLED row keeps its status (see the Anthropic twin).
         sub_id = match["id"]
-        subscription_store.update_credential_data(sub_id, credential_data)
-        subscription_store.update_subscription(
-            sub_id, status="active", label=label, oauth_email=identity or None,
-        )
+        new_status = "disabled" if match.get("status") == "disabled" else "active"
+
+        def _apply_reconnect() -> None:
+            with subscription_pool._refresh_lock(sub_id):
+                subscription_store.update_credential_data(sub_id, credential_data)
+                subscription_store.update_subscription(
+                    sub_id, status=new_status, label=label, oauth_email=identity or None,
+                )
+                subscription_pool.clear_refresh_backoff(sub_id)
+
+        await asyncio.to_thread(_apply_reconnect)
         sub = subscription_store.get_subscription(sub_id)
         logger.info(f"Updated existing OpenAI OAuth subscription {sub_id[:8]} with fresh tokens")
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —

@@ -1,0 +1,14 @@
+# Telephony glue. The STT / TTS / VAD / turn-classifier engines all come from the
+# audio package — with the [localmodels] extra (on-box Silero VAD + Smart Turn
+# ONNX/transformers) since the phone pipeline runs them locally. `uv pip compile`
+# pins the transitive deps below. Compile + install run from the repo root so
+# `./audio` resolves (dev `oto-dock/`, Docker `/app`, bare-metal `/opt/otodock`).
+-e ./audio[localmodels]
+python-dotenv>=1.2.2,<2.0
+aiohttp>=3.14.3,<4.0
+websockets>=13.0,<17.0
+# Security floors (2026-07 + 2026-08 Dependabot sweeps) for transitive deps.
+h2>=4.4.1
+idna>=3.15
+requests>=2.33.0
+urllib3>=2.7.0

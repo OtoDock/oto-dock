@@ -85,7 +85,11 @@ def verify_session_match(authorization: str | None, session_id: str) -> None:
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session_id")
     token_sid = payload.get("sid", "")
-    if token_sid and not hmac.compare_digest(token_sid, session_id):
+    # Fail CLOSED on an empty token sid: a session JWT that carries no `sid`
+    # can't be proven to match this request, so it must not pass the
+    # cross-check (the old `token_sid and …` let an empty sid through). Every
+    # mint site sets a real sid; the master key already returned above.
+    if not token_sid or not hmac.compare_digest(token_sid, session_id):
         raise HTTPException(
             status_code=403,
             detail="Session token does not match request session_id",

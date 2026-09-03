@@ -45,6 +45,9 @@ mcps/community/*/
 # image built from this context (their venvs/__pycache__/logs are already
 # stripped by the global patterns above):
 #   audio/     — the lean `oto-audio` core (proxy: cloud STT/TTS; phone: +localmodels), venv-installed.
+#   satellite/ — the proxy reads its SATELLITE_VERSION + serves its source as the
+#                pairing tarball (api/remote_machines.py). Source only (~1 MB).
+#   phone/     — the otodock-phone telephony daemon's own image (phone/Dockerfile).
 scheduler/
 
 # ── VCS / IDE / OS ──

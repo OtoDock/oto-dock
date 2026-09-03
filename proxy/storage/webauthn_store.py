@@ -16,18 +16,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class CredentialAlreadyRegistered(ValueError):
+    """The credential_id is already registered (to this or another user)."""
+
+
 def add_credential(credential_id: str, user_sub: str, public_key: str,
                    sign_count: int, name: str, transports: list[str]) -> None:
+    from psycopg import errors as _pg_errors
     with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO webauthn_credentials
-               (credential_id, user_sub, public_key, sign_count, name,
-                transports, created_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-            (credential_id, user_sub, public_key, sign_count, name,
-             json.dumps(transports or []), _now()),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                """INSERT INTO webauthn_credentials
+                   (credential_id, user_sub, public_key, sign_count, name,
+                    transports, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (credential_id, user_sub, public_key, sign_count, name,
+                 json.dumps(transports or []), _now()),
+            )
+            conn.commit()
+        except _pg_errors.UniqueViolation as e:
+            # credential_id is the PRIMARY KEY. With attestation "none" the
+            # client controls it, so a crafted response can carry an existing
+            # id — the PK correctly blocks the row (no cross-user takeover),
+            # but the raw IntegrityError would surface as a 500. Translate to a
+            # typed error the endpoint turns into a clean 400.
+            conn.rollback()
+            raise CredentialAlreadyRegistered(
+                "This passkey is already registered") from e
 
 
 def get_credential(credential_id: str) -> dict | None:

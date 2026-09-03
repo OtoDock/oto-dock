@@ -15,6 +15,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { safeHref } from '../lib/safeUrl'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   useCommunitySkills,
@@ -304,15 +305,23 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
             </span>
             {pkg.author && (
               <a
-                href={pkg.author_url || undefined}
+                href={safeHref(pkg.author_url)}
                 target="_blank"
                 rel="noreferrer"
-                onClick={e => { if (!pkg.author_url) e.preventDefault() }}
+                onClick={e => { if (!safeHref(pkg.author_url)) e.preventDefault() }}
                 className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:underline"
                 title={`Curated from ${pkg.author}'s official skills repository${pkg.license ? ` — ${pkg.license}` : ''}`}
               >
                 by {pkg.author}
               </a>
+            )}
+            {pkg.has_scripts && (
+              <span
+                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+                title="This package bundles executable helper scripts the agent can run"
+              >
+                bundles scripts
+              </span>
             )}
             {pkg.deprecated && (
               <span className="text-[10px] px-1 py-0.5 rounded-sm bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">

@@ -5,6 +5,7 @@ realtime WebSocket server (no network, no key)."""
 import asyncio
 import base64
 import json
+import logging
 
 import httpx
 import pytest
@@ -423,4 +424,114 @@ async def test_partials_suppressed_when_nothing_voiced(fake_scribe):
     await stt.send_audio(b"\x00\x10" * 2000)
     await asyncio.sleep(0.2)
     assert stt.pop_interim() == "kali"
+    await stt.close()
+
+
+async def test_committed_transcript_fires_on_partial_final(fake_scribe):
+    """R4.6: committed transcripts push through ``on_partial_final`` at the
+    moment they are queued — but NOT when the hallucination guard drops a
+    silence-only commit (the pipeline never sees that text, so the caption
+    must not either)."""
+    stt = ElevenLabsSTT(api_key="k")
+    got: list[str] = []
+    stt.on_partial_final = got.append
+    await stt.start(sample_rate=16000)
+
+    # Silence-only commit → dropped by the guard → no push.
+    await stt.send_audio(b"\x00\x01" * 160)
+    await asyncio.sleep(0.1)
+    await fake_scribe.push_committed("Πάει καλά;")
+    await asyncio.sleep(0.2)
+    assert got == []
+
+    # Voiced audio → the committed final pushes AND drains.
+    await stt.send_audio(b"\x00\x10" * 2000)
+    await fake_scribe.push_committed("Καλημέρα")
+    await asyncio.sleep(0.2)
+    assert got == ["Καλημέρα"]
+    assert stt.drain_transcript() == "Καλημέρα"
+    await stt.close()
+
+
+# ── Liveness (guard-task surface) ───────────────────────────────────────
+
+
+async def test_keepalive_sends_zeros_and_bypasses_gate(fake_scribe):
+    """`keepalive()` ships ~100 ms of zeros DIRECTLY (never via send_audio /
+    the RMS gate) so it can never arm `_voiced_since_commit` — through the
+    gate, a zeros chunk with silence_gate_rms=0 counts as voiced and a later
+    commit hits the Whisper-hallucination path the guard blocks (audit F9)."""
+    stt = ElevenLabsSTT(api_key="k", silence_gate_rms=0)  # worst case: gate off
+    await stt.start(language="en", sample_rate=16000)
+
+    await stt.keepalive()
+    await asyncio.sleep(0.2)
+
+    audio_frames = [f for f in fake_scribe.frames
+                    if f.get("message_type") == "input_audio_chunk"]
+    assert len(audio_frames) == 1
+    chunk = base64.b64decode(audio_frames[0]["audio_base_64"])
+    assert chunk == b"\x00" * (int(16000 * 0.1) * 2)  # 100 ms of zeros @16k
+    assert audio_frames[0]["commit"] is False
+    assert stt._voiced_since_commit is False  # the gate bypass held
+    # …so a force_endpoint after only keepalives stays a no-op (no commit).
+    await stt.force_endpoint()
+    await asyncio.sleep(0.1)
+    assert fake_scribe.commit_frames() == []
+    await stt.close()
+
+
+async def test_ensure_alive_probe_vs_reconnect_queue_semantics(fake_scribe):
+    """Healthy probe with clear_queue=False keeps queued finals (audit F6 —
+    after a barge-in they are the interrupting utterance); clear_queue=True
+    discards them (opening semantics)."""
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(language="en", sample_rate=16000)
+    stt._transcript_queue.put_nowait("survivor")
+
+    ok = await stt.ensure_alive("en", clear_queue=False)
+    assert ok is True
+    assert stt.drain_transcript() == "survivor"
+
+    stt._transcript_queue.put_nowait("echo artifact")
+    ok = await stt.ensure_alive("en", clear_queue=True)
+    assert ok is True
+    assert stt.drain_transcript() is None
+    await stt.close()
+
+
+async def test_ensure_alive_reconnects_with_active_rate(fake_scribe):
+    """A mid-call reconnect must reuse the negotiated sample rate — the old
+    recover path fell back to the 8 kHz default and decoded a 16 kHz mic as
+    garbage (audit F5)."""
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(language="en", sample_rate=16000)
+    await stt._ws.close()
+    await asyncio.sleep(0.2)
+    assert stt.is_open is False
+
+    ok = await stt.ensure_alive("en", clear_queue=False)
+    assert ok is True
+    assert stt.is_open is True
+    assert "audio_format=pcm_16000" in fake_scribe.paths[1]
+    await stt.close()
+
+
+async def test_send_skip_warning_rate_limited(fake_scribe, caplog):
+    """A dead socket logs ONE send-skip warning per incident, not one per
+    frame (a dead 35 s call tail used to log 1,700+)."""
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(language="en", sample_rate=16000)
+    await stt._ws.close()
+    await asyncio.sleep(0.2)
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(50):
+            await stt.send_audio(b"\x00\x10" * 100)
+    skips = [r for r in caplog.records if "send skipped" in r.message]
+    assert len(skips) == 1
+    assert stt._send_skips == 50
+    # Reconnect resets the incident counter.
+    assert await stt.ensure_alive("en") is True
+    assert stt._send_skips == 0
     await stt.close()

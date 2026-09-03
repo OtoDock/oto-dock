@@ -259,7 +259,9 @@ async def local_template_building_blocks(
                 "skills": [],
             })
     except Exception as exc:
-        catalog_error = str(exc)
+        # Detail goes to the log only — exception text can carry paths/URLs
+        # the response has no business echoing.
+        catalog_error = "community MCP catalog unreachable"
         logger.warning("building-blocks: MCP catalog unreachable: %s", exc)
 
     try:
@@ -278,7 +280,7 @@ async def local_template_building_blocks(
             })
     except Exception as exc:
         if not catalog_error:
-            catalog_error = str(exc)
+            catalog_error = "community skills catalog unreachable"
         logger.warning("building-blocks: skills catalog unreachable: %s", exc)
 
     slugs = [a["slug"] for a in await asyncio.to_thread(agent_store.get_all_agents)]
@@ -387,6 +389,7 @@ async def validate_local_template(
                 "tasks": len(template.tasks),
                 "triggers": len(template.triggers),
                 "notifications": len(template.notifications),
+                "dashboards": len(template.dashboards),
                 "context_files": len(template.context_files),
                 "has_setup": template.setup_md is not None,
                 "has_user_setup": template.user_setup_md is not None,

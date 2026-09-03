@@ -20,6 +20,7 @@ from core.session.session_state import (
     _record_session_use, resolve_session_permissions,
     get_hook_activity, get_session_user_tz, reset_subagent_registry,
     resolve_bg_command_frame, clear_session_liveness,
+    reconcile_background_snapshot,
 )
 from core.events.bg_command_state import reset_bg_command_registry
 from core.layers.cli.helpers import (
@@ -116,6 +117,7 @@ class PersistentSession:
         self.proc: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()  # serializes concurrent requests
         self.last_activity = time.monotonic()
+        self._created = time.monotonic()  # reaper startup-grace anchor
         self._started = False
         self._closed = False
         self._init_done = False  # True after MCP init event received
@@ -457,6 +459,14 @@ class PersistentSession:
         self._started = True
         self.last_activity = time.monotonic()
 
+        if self._closed:
+            # Closed while the spawn was in flight (abort/shutdown) — kill the
+            # fresh process instead of leaking it outside the pool.
+            await _kill_process(self.proc, self.session_id)
+            raise RuntimeError(
+                f"Persistent session {self.session_id} closed during start"
+            )
+
         # Register for abort support
         _active_processes[self.session_id] = self.proc
 
@@ -511,6 +521,56 @@ class PersistentSession:
             )
             self._init_done = True
 
+    async def _read_parsed_frame(self, timeout: float) -> dict | None:
+        """Next parsed stream-json frame from stdout, or None on
+        timeout/EOF. Skips blank + unparsable lines; bumps ``last_activity``
+        per raw line so the idle reaper never kills a session that is
+        actively streaming (e.g. a self-wake turn being captured)."""
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                raw_line = await asyncio.wait_for(
+                    self.proc.stdout.readline(), timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                return None
+            if not raw_line:
+                return None  # EOF
+            self.last_activity = time.monotonic()
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    async def _capture_wake_bracket(self, first_frame: dict, *,
+                                    source: str) -> None:
+        """Record a CLI self-wake turn (2.1.243 background-wake) whose
+        ``system/init`` was just read between turns. Runs under the caller's
+        hold of ``self.lock``. Occupies the turn-active span so a user Stop
+        reaches the wake turn as a graceful interrupt (which ends the
+        bracket with an early ``result``) instead of a killpg."""
+        from core.events import wake_capture
+        # Save/restore: a stale-drain capture runs INSIDE send_message's own
+        # turn-active span — the capture must not clear it on exit.
+        prev_active = self._turn_active
+        self._turn_seq += 1
+        self._turn_active = True
+        try:
+            await wake_capture.capture_wake_turn(
+                self.session_id, first_frame, self._read_parsed_frame,
+                source=source,
+            )
+        finally:
+            self._turn_active = prev_active
+
     async def _drain_stale_output(self) -> None:
         """Drain any leftover stdout from a previous interrupted response.
 
@@ -523,10 +583,18 @@ class PersistentSession:
         path for the common case (clean pipe). If stale data IS found, uses
         a longer timeout (2s) to wait for the 'result' event that signals
         the end of the previous turn.
+
+        1.5: a ``system/init`` here is a SELF-WAKE turn (2.1.243) that was
+        buffered/starting when this user turn won the lock — it is captured
+        to the chat (persist + usage; the audit's pre-send rule: the next
+        bracket after the prompt write is then guaranteed to be the user
+        turn's own). The added send latency is the wake's remaining runtime;
+        a user Stop cuts it short via the turn-active span.
         """
         if self.proc is None or self.proc.stdout is None:
             return
 
+        from core.events import wake_capture
         drained: Counter[str] = Counter()
         timeout = 0.05  # initial probe — fast exit if pipe is clean
         while True:
@@ -545,11 +613,21 @@ class PersistentSession:
                         data = json.loads(line)
                         drained["?"] -= 1
                         drained[data.get("type", "?")] += 1
+                        if wake_capture.is_wake_init(data):
+                            # Between-turns init = a self-wake turn. Record
+                            # it, then keep draining (another bracket may
+                            # follow; wake→wake chains are real).
+                            drained["wake_captured"] += 1
+                            await self._capture_wake_bracket(
+                                data, source="stale_drain")
+                            timeout = 0.05
+                            continue
                         # A backgrounded command may have completed while the
                         # session was idle between turns — resolve it (badge clear
                         # + registry) instead of discarding the frame, else its
                         # badge sticks forever and the agent never gets nudged.
                         resolve_bg_command_frame(self.session_id, data)
+                        reconcile_background_snapshot(self.session_id, data)
                         if data.get("type") == "result":
                             break  # Previous response fully drained
             except asyncio.TimeoutError:
@@ -566,17 +644,21 @@ class PersistentSession:
             )
 
     async def drain_bg_commands(self, budget: float = 2.0) -> bool:
-        """Between turns, read whatever stdout the IDLE session has buffered and
-        resolve any background-command completion frames found (badge clear +
-        registry). Returns True if at least one command was resolved.
+        """Between turns, read whatever stdout the IDLE session has buffered:
+        resolve background-command completion frames (badge clear + registry),
+        apply ``background_tasks_changed`` snapshots, and CAPTURE any self-wake
+        turn (2.1.243) as a real chat turn. Returns True on any progress.
 
         Background bash has NO completion hook (unlike subagents' SubagentStop),
         so this active read is the only post-turn completion signal — the
-        bg-command monitor polls it. Acquires ``self.lock`` (the SAME lock that
+        bg-command monitor polls it (and, since 1.5, the bg monitors' wake
+        grace polls it too). Acquires ``self.lock`` (the SAME lock that
         serializes send_message, via layer.session_lock) with a short timeout: if
         a user turn holds it, back off and let that turn's own translator resolve
         completions. Because it only reads while holding the lock exclusively, it
-        never races the turn reader or consumes turn output."""
+        never races the turn reader or consumes turn output. A wake capture
+        holds the lock for the bracket's duration — a concurrent user send
+        queues behind it (and can cut it short via the graceful interrupt)."""
         if self.proc is None or self.proc.stdout is None:
             return False
         try:
@@ -585,25 +667,25 @@ class PersistentSession:
             return False  # a turn is in flight — retry next poll
         progressed = False
         try:
+            from core.events import wake_capture
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
-                try:
-                    raw_line = await asyncio.wait_for(
-                        self.proc.stdout.readline(), timeout=0.4,
-                    )
-                except asyncio.TimeoutError:
-                    break  # no more buffered data right now
-                if not raw_line:
-                    break  # EOF — process exited
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
+                data = await self._read_parsed_frame(0.4)
+                if data is None:
+                    break  # no more buffered data right now / EOF
+                if wake_capture.is_wake_init(data):
+                    # A self-wake turn is starting (2.1.243 background-wake):
+                    # record it as a real chat turn. Deliberately ignores the
+                    # drain budget — the bracket has its own ceiling, and
+                    # abandoning it mid-turn would orphan the rest of the
+                    # frames. The monitor's nudges stand down via
+                    # recently_captured().
+                    await self._capture_wake_bracket(data, source="idle_drain")
+                    progressed = True
                     continue
                 if resolve_bg_command_frame(self.session_id, data):
                     progressed = True
+                reconcile_background_snapshot(self.session_id, data)
         finally:
             self.lock.release()
         return progressed
@@ -884,6 +966,14 @@ class PersistentSession:
             # Settle-mode bookkeeping: extend reaper, emit periodic heartbeat
             if settle.settling:
                 self.last_activity = time.monotonic()
+                # An init DURING settle = the CLI's self-wake review turn
+                # running INLINE through this pump (its content joins the
+                # task output). Note it so the task producer / bg monitors
+                # don't dispatch a second, redundant review.
+                if (data.get("type") == "system"
+                        and data.get("subtype") == "init"):
+                    from core.events import wake_capture as _wake
+                    _wake.note_captured(self.session_id)
                 logger.info(
                     f"Persistent session {self.session_id}: settle event: "
                     f"{data.get('type', '?')}"
@@ -1135,7 +1225,20 @@ async def get_or_create_persistent_session(
             _persistent_sessions[session_id] = session
 
     # Start outside the pool lock (slow: MCP init)
-    await session.start()
+    try:
+        await session.start()
+    except BaseException:
+        # A failed start leaves the entry unreachable (never is_alive) — drop
+        # it and release what the caller acquired BEFORE start (chat slot +
+        # subscription), mirroring the reaper's reap path.
+        async with _persistent_sessions_lock:
+            if _persistent_sessions.get(session_id) is session:
+                _persistent_sessions.pop(session_id, None)
+        from core.concurrency import release_chat_slot
+        release_chat_slot(session_id)
+        from services.engines.subscription_pool import release_subscription
+        release_subscription(session_id)
+        raise
     _record_session_use(session_id, client_type=client_type)
     return session
 
@@ -1185,36 +1288,54 @@ async def interrupt_persistent_session(session_id: str) -> bool:
     return False
 
 
+# A session sits in the pool with _started=False between insert and the end
+# of start() (~tens of ms; longer if the spawn is slow). It is NOT dead —
+# reaping it there kills the run with "Session not found" and leaks the
+# process start() spawns right after (seen live 2026-09-01 04:10Z on a task
+# cron whose fire aligned with the reaper tick). Grace-cap the skip so an
+# entry stranded by a crashed start() still gets collected eventually.
+_STARTUP_REAP_GRACE_S = 600
+
+
+async def _reap_idle_pass() -> None:
+    """One reaper scan: collect + close idle/dead sessions."""
+    now = time.monotonic()
+    to_reap: list[str] = []
+
+    async with _persistent_sessions_lock:
+        for sid, session in _persistent_sessions.items():
+            if not session._started:
+                if now - session._created > _STARTUP_REAP_GRACE_S:
+                    to_reap.append(sid)  # start() died without cleanup
+                continue  # still starting — never reap mid-start
+            idle = now - session.last_activity
+            # Also check hook activity — background agents may be
+            # working without producing stdout events or send_message
+            # calls that update last_activity.
+            last_hook = get_hook_activity(sid)
+            if last_hook:
+                hook_idle = now - last_hook
+                idle = min(idle, hook_idle)
+            if idle > config.get_idle_timeout():
+                to_reap.append(sid)
+            elif not session.is_alive:
+                to_reap.append(sid)
+
+    for sid in to_reap:
+        logger.info(f"Reaping idle persistent session {sid}")
+        await close_persistent_session(sid)
+        # Release concurrency slot + subscription (bypasses layer.close_session)
+        from core.concurrency import release_chat_slot
+        release_chat_slot(sid)
+        from services.engines.subscription_pool import release_subscription
+        release_subscription(sid)
+
+
 async def reap_idle_sessions() -> None:
     """Background task: reap persistent sessions idle longer than timeout."""
     while True:
         await asyncio.sleep(60)
-        now = time.monotonic()
-        to_reap: list[str] = []
-
-        async with _persistent_sessions_lock:
-            for sid, session in _persistent_sessions.items():
-                idle = now - session.last_activity
-                # Also check hook activity — background agents may be
-                # working without producing stdout events or send_message
-                # calls that update last_activity.
-                last_hook = get_hook_activity(sid)
-                if last_hook:
-                    hook_idle = now - last_hook
-                    idle = min(idle, hook_idle)
-                if idle > config.get_idle_timeout():
-                    to_reap.append(sid)
-                elif not session.is_alive:
-                    to_reap.append(sid)
-
-        for sid in to_reap:
-            logger.info(f"Reaping idle persistent session {sid}")
-            await close_persistent_session(sid)
-            # Release concurrency slot + subscription (bypasses layer.close_session)
-            from core.concurrency import release_chat_slot
-            release_chat_slot(sid)
-            from services.engines.subscription_pool import release_subscription
-            release_subscription(sid)
+        await _reap_idle_pass()
 
 
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import WebSocket, WebSocketDisconnect
 
 import config as app_config
+from core.remote import file_sync as file_sync_rules
 from core.remote.satellite_connection import get_connection_manager
 from storage import remote_store
 
@@ -130,9 +131,40 @@ def satellite_source_available() -> bool:
 # machine_id → target_version we just pushed via update_required. Read on the
 # next reconnect to detect a rolled-back update (satellite came back BELOW the
 # target) so we (a) notify dashboards via _broadcast_satellite_update_failed
-# and (b) do NOT re-push (which would crash-loop the satellite). In-memory: a
-# proxy restart loses it and we fall back to re-pushing, which is acceptable.
+# and (b) do NOT re-push on THAT reconnect (which would crash-loop the
+# satellite). In-memory: a proxy restart loses it and we fall back to
+# re-pushing, which is acceptable. The persistent per-target rollback budget
+# (below) is what stops a deterministically broken build from looping.
 _pending_pushed_updates: dict[str, str] = {}
+
+# Automatic re-pushes of the SAME target stop after this many rollbacks
+# (`remote_machines.update_rollback_count`, counted per target version by
+# `remote_store.record_update_rollback`). The reconnect-after-push check only
+# skips ONE re-push; without a budget a broken build would push → crash →
+# rollback on every reconnect forever. Once paused, only an explicit
+# "Update now" (pending_update, or the online push) attempts that target
+# again; a successful reconnect on the target — or a new target — resets it.
+MAX_AUTO_UPDATE_ROLLBACKS = 2
+
+
+def note_update_pushed(machine_id: str, target_version: str) -> None:
+    """Remember a just-pushed target so the machine's NEXT reconnect can
+    detect a rollback. The single writer of ``_pending_pushed_updates`` —
+    used by the auth-time automatic push AND the admin/user "Update now"
+    online push, so a manual push whose satellite rolls back is recorded,
+    counted and announced exactly like an automatic one."""
+    _pending_pushed_updates[machine_id] = target_version
+
+
+def auto_update_paused(machine: dict, target_version: str | None) -> bool:
+    """True when automatic pushes of ``target_version`` are exhausted for this
+    machine: the stored rollback budget refers to the SAME target and has
+    reached ``MAX_AUTO_UPDATE_ROLLBACKS``. Pure — reads the machine row only."""
+    if not target_version:
+        return False
+    if (machine.get("update_rollback_target") or "") != target_version:
+        return False
+    return int(machine.get("update_rollback_count") or 0) >= MAX_AUTO_UPDATE_ROLLBACKS
 
 
 def _version_at_least(version: str, minimum: str) -> bool:
@@ -263,31 +295,50 @@ async def ws_satellite_handler(websocket: WebSocket):
     # just crash-loop it. It connects on the old (working) version instead.
     _pushed_target = _pending_pushed_updates.pop(machine_id, "")
     if _pushed_target and not _version_at_least(sat_version, _pushed_target):
-        logger.warning(
-            "Satellite %s: update → %s rolled back (reconnected on %s); "
-            "not re-pushing", machine_id[:8], _pushed_target, sat_version or "unknown",
-        )
         try:
-            remote_store.record_update_result(
-                machine_id,
+            attempts = remote_store.record_update_rollback(
+                machine_id, target_version=_pushed_target,
                 error=f"update to {_pushed_target} rolled back to {sat_version}",
             )
+        except Exception:
+            logger.exception("Failed to record update rollback")
+            attempts = int(machine.get("update_rollback_count") or 0) + 1
+        paused = attempts >= MAX_AUTO_UPDATE_ROLLBACKS
+        logger.warning(
+            "Satellite %s: update → %s rolled back (reconnected on %s), "
+            "attempt %d/%d; not re-pushing%s",
+            machine_id[:8], _pushed_target, sat_version or "unknown",
+            attempts, MAX_AUTO_UPDATE_ROLLBACKS,
+            " — automatic updates PAUSED until 'Update now'" if paused else "",
+        )
+        try:
             await _broadcast_satellite_update_failed(
                 machine_id, machine,
                 error=f"Update to {_pushed_target} failed; rolled back.",
                 rolled_back_to=sat_version,
+                attempts=attempts, paused=paused,
             )
         except Exception:
-            logger.exception("Failed to record/announce update rollback")
+            logger.exception("Failed to announce update rollback")
         needs_update = False  # connect on the old version; do not re-push
 
     if needs_update or must_reject:
         auto_update = bool(machine.get("auto_update_enabled", True))
         pending = bool(machine.get("pending_update", False))
+        # Rollback budget for THIS target exhausted → no automatic push; an
+        # explicit "Update now" (pending) still goes through.
+        paused = auto_update and auto_update_paused(machine, SATELLITE_VERSION_LATEST)
+        if paused and not pending:
+            logger.warning(
+                "Satellite %s: automatic update to %s paused after %d "
+                "rollback(s); waiting for 'Update now'",
+                machine_id[:8], SATELLITE_VERSION_LATEST,
+                int(machine.get("update_rollback_count") or 0),
+            )
         # A push needs the satellite source tree (the tarball is built from
         # it) — without it, a below-floor satellite falls through to the
         # manual-reject branch instead of a doomed tarball build.
-        if (auto_update or pending) and satellite_source_available():
+        if (pending or (auto_update and not paused)) and satellite_source_available():
             # Push the new tarball over WS, then close. The satellite
             # extracts, restarts via systemd, and reconnects on the new
             # version. Dashboards are notified by _broadcast_satellite_updating.
@@ -313,7 +364,7 @@ async def ws_satellite_handler(websocket: WebSocket):
                     machine_id, machine, sat_version, SATELLITE_VERSION_LATEST,
                 )
                 # Remember the target so the next reconnect can detect a rollback.
-                _pending_pushed_updates[machine_id] = SATELLITE_VERSION_LATEST
+                note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
             except Exception as e:
                 logger.exception(
                     "Satellite %s: failed to push update: %s",
@@ -326,13 +377,15 @@ async def ws_satellite_handler(websocket: WebSocket):
             await websocket.close(code=4007, reason="updating")
             return
         elif must_reject:
-            # Auto-update disabled and version is below the hard floor —
-            # this satellite cannot connect until an admin clicks "Update
-            # now" (which sets pending_update=True) or re-pairs.
+            # Auto-update disabled (or paused after repeated rollbacks) and
+            # version is below the hard floor — this satellite cannot connect
+            # until an admin clicks "Update now" (sets pending_update=True)
+            # or re-pairs.
+            why = ("automatic updates are paused after repeated rollbacks"
+                   if paused else "auto-update is disabled")
             logger.warning(
-                "Satellite %s rejected: version %r < required %s and "
-                "auto_update_enabled=False",
-                machine_id[:8], sat_version, MIN_SATELLITE_VERSION,
+                "Satellite %s rejected: version %r < required %s and %s",
+                machine_id[:8], sat_version, MIN_SATELLITE_VERSION, why,
             )
             await websocket.send_text(json.dumps({
                 "type": "auth_result",
@@ -340,7 +393,7 @@ async def ws_satellite_handler(websocket: WebSocket):
                 "reason": (
                     f"Satellite version {sat_version or 'unknown'} is older "
                     f"than the proxy's minimum {MIN_SATELLITE_VERSION}, and "
-                    f"auto-update is disabled. Ask your admin to click "
+                    f"{why}. Ask your admin to click "
                     f"'Update now' in the dashboard."
                 ),
             }))
@@ -374,6 +427,16 @@ async def ws_satellite_handler(websocket: WebSocket):
             # it to their manifests + inbound writes. Handshake-only delivery:
             # the cap changes only on proxy restart, which re-auths every WS.
             "sync_max_file_bytes": app_config.SYNC_MAX_FILE_BYTES,
+            # Marker-confirmed generated-dir exclusions (1.5). 0.5.110+
+            # satellites validate + apply the table to every sync walk;
+            # older ones ignore the unknown key (their set_policy whitelist)
+            # and the proxy's per-machine manifest gate keeps THEIR walks
+            # legacy too (satellite_supports_sync_ignore_rules) — the two
+            # sides must always walk with the same rules. Validated once at
+            # send so a config typo degrades to legacy instead of shipping
+            # asymmetric garbage.
+            "sync_ignore_rules": file_sync_rules.validate_ignore_rules(
+                app_config.SYNC_IGNORE_RULES),
         },
         # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
         # claude/codex to these on auth, so the fleet runs the EXACT versions the
@@ -605,14 +668,19 @@ async def _broadcast_satellite_updated(
 
 async def _broadcast_satellite_update_failed(
     machine_id: str, machine: dict, error: str, rolled_back_to: str,
+    *, attempts: int = 1, paused: bool = False,
 ) -> None:
     """Fired when an update was attempted but the satellite came back on
     the OLD version (rollback path). Dashboards render a sticky red
-    banner until dismissed."""
+    banner until dismissed. ``attempts`` = consecutive rollbacks of this
+    target; ``paused`` = automatic pushes of it are now suspended (the
+    banner tells the admin to use "Update now")."""
     await _push_machine_event(machine, {
         "type": "satellite_update_failed",
         "machine_id": machine_id,
         "machine_name": machine.get("name", ""),
         "error": error,
         "rolled_back_to": rolled_back_to,
+        "attempts": attempts,
+        "auto_update_paused": paused,
     })

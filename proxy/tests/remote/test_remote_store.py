@@ -69,6 +69,9 @@ class TestExchangePairingToken:
             "pairing_token_hash": token_hash,
             "pairing_token_created_at": now,
         }
+        # The exchange UPDATE is conditional on the hash still being present
+        # and requires exactly one affected row (atomic one-time use).
+        mock_db.execute.return_value.rowcount = 1
         secret = exchange_pairing_token("machine-1", token)
         assert len(secret) > 0
     def test_invalid_token_raises(self, mock_db):

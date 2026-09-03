@@ -35,6 +35,7 @@ _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"^/v1/sessions/warmup$"), frozenset({"POST"})),
     (re.compile(r"^/v1/sessions/[^/]+$"), frozenset({"DELETE"})),  # close session
     (re.compile(r"^/v1/phone/usage/turn-classifier$"), frozenset({"POST"})),
+    (re.compile(r"^/v1/phone/calls/report$"), frozenset({"POST"})),  # call-log rows at teardown
 ]
 
 

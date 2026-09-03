@@ -28,6 +28,11 @@ class GoogleOAuthProvider(OAuthProvider):
 
     provider_id = "google"
     flow = "authorization_code"
+    # Google supports incremental authorization: with
+    # `include_granted_scopes=true` a re-consent grants the union of old +
+    # new scopes, letting one grant power every google-provider MCP
+    # (workspace-mcp + google-analytics-mcp share the token file).
+    supports_incremental_auth = True
     authorization_url = "https://accounts.google.com/o/oauth2/v2/auth"
     token_url = "https://oauth2.googleapis.com/token"
     revoke_url = "https://oauth2.googleapis.com/revoke"

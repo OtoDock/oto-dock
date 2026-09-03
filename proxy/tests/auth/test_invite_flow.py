@@ -244,6 +244,13 @@ def test_forgot_password_never_sends_broken_relative_links(monkeypatch):
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://dash.example.com")
     resp = client.post("/auth/forgot-password", json={"email": "invitee@t.com"})
     assert resp.status_code == 200
+    # The send is fire-and-forget (a background task, so the hit and miss
+    # paths answer equally fast); under a loaded xdist run it can land after
+    # the response — wait for it instead of asserting immediately.
+    for _ in range(100):
+        if sent:
+            break
+        time.sleep(0.02)
     assert len(sent) == 1
     assert sent[0][1].startswith("https://dash.example.com/reset-password?token=")
 

@@ -7,7 +7,7 @@
  * (success text and the added-row fill are both `ansi:green`), so neither lever
  * can brand the diff. Rewriting the six known rgb triples per mode in the byte
  * stream is the only seam. Triples are from Claude Code 2.1.201, re-verified
- * byte-identical on 2.1.220 (the VERSIONS.md pin; all 12 diff triples both
+ * byte-identical on 2.1.243 (the VERSIONS.md pin; all 12 diff triples both
  * themes + both userMessageBackground grays, `grep -oa` on the native ELF) — a
  * CLI bump that changes them degrades gracefully to the stock colors.
  * Dashboard-side only: real terminals (otodock-CLI) keep stock.

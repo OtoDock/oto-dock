@@ -180,3 +180,28 @@ describe('transfersForSection', () => {
     expect(transfersForSection(S().byId, 'a1', '', 'alice')).toEqual([])
   })
 })
+
+describe('zero-target push (transfer_done before link)', () => {
+  it('a transfer_done that lands before linkUpload still completes the linked item', () => {
+    S().beginLocalUpload({
+      clientId: 'local:early', agent: 'a1', targetDir: 'workspace',
+      filename: 'rec.m4a', bytesTotal: 300,
+    })
+    // Server: zero precise targets → started + done emitted at birth, and the
+    // done can beat the POST /v1/upload response.
+    S().applyDone({ transfer_id: 't-none', agent_slug: 'a1', ok: true } as any)
+    S().linkUpload('local:early', {
+      transferId: 't-none', relPath: 'workspace/rec.m4a', remotePush: true,
+    })
+    const t = S().byId['t-none']
+    expect(t).toBeDefined()
+    expect(t.filename).toBe('rec.m4a')
+    expect(t.doneAt).not.toBeNull()
+    expect(isTransferActive(t, Date.now() + 60_000)).toBe(false)
+  })
+
+  it('an orphan early done renders in no section and is prunable', () => {
+    S().applyDone({ transfer_id: 't-orphan', agent_slug: 'a1', ok: true } as any)
+    expect(sectionForRelPath(S().byId['t-orphan'].relPath, 'alice')).toBeNull()
+  })
+})

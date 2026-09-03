@@ -107,6 +107,11 @@ _CLI_RUNTIME_CHILD_DIRS = frozenset({
     ".tmp", "tmp", "cache",                  # temp + caches
     "shell-snapshots", "shell_snapshots",    # host-specific shell env
     "backups", "debug", "telemetry", "session-env", "plans",
+    # Claude Code plugins dir: ``marketplaces/`` holds cloned marketplace
+    # repos (hundreds of docs/examples — pure refetchable cache) and installs
+    # are per-machine. Pushing the tree flooded a satellite off the socket
+    # mid-sync (2026-08-06 incident).
+    "plugins",
     # Per-session ssh keys ($OTO_SSH_KEY_DIR) — materialized locally by
     # session_config_dir.materialize_ssh_keys_for_sandbox, delivered to
     # satellites only via the session-file broker (purged at close). Syncing
@@ -222,6 +227,187 @@ def _is_venv_dir(path: Path) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Sync-ignore rules: marker-confirmed generated-dir exclusion (1.5).
+#
+# The proxy is the table's SOURCE (``config.SYNC_IGNORE_RULES``, shipped to
+# 0.5.110+ satellites in the auth_result policy handshake) and applies the
+# SAME table to its own per-machine manifest walk — but ONLY for machines
+# whose satellite ACKed support (``satellite_supports_sync_ignore_rules``),
+# else both sides must walk legacy-style or the diff churns. Semantics are
+# documented in satellite/transport/file_sync.py — engine code MUST stay
+# semantically identical here (evidence from walk LISTINGS by exact string
+# compare / fnmatchcase, never filesystem probes: the satellite may sit on
+# case-insensitive NTFS while this walk runs on Linux, and any decision
+# divergence between the two walks misattributes whole trees as deletes).
+# Table evolution contract: ``version`` stays 1 permanently for proxy-only
+# ADDITIVE data edits; any format/semantic change requires a new version
+# AND a new SATELLITE_VERSION capability gate (satellites reject unknown
+# versions → legacy, so the proxy must then send legacy-computed manifests
+# to them too).
+# ---------------------------------------------------------------------------
+
+_CACHEDIR_SIG = b"Signature: 8a477f597d28d172789f06886806bc55"
+_RULE_PROTECTED_DIR_NAMES = frozenset({"workspace", "config", "users"})
+_RULES_MAX_LIST = 64
+_RULES_MAX_MARKERS = 16
+_RULES_MAX_STR = 128
+_RULES_MAX_SERIALIZED = 32 * 1024
+
+
+def validate_ignore_rules(raw) -> dict | None:
+    """Shape-validate a rule table → normalized copy, or None. Mirror of
+    satellite/transport/file_sync.py::validate_ignore_rules — the satellite
+    runs this on the handshake payload; the proxy runs it ONCE on its own
+    ``config.SYNC_IGNORE_RULES`` (dev-typo guard) before sending/applying."""
+    try:
+        if not isinstance(raw, dict) or raw.get("version") != 1:
+            return None
+        import json as _json
+        if len(_json.dumps(raw)) > _RULES_MAX_SERIALIZED:
+            return None
+
+        def _name_ok(s) -> bool:
+            return (isinstance(s, str) and 0 < len(s) <= _RULES_MAX_STR
+                    and "/" not in s and "\\" not in s and s not in (".", ".."))
+
+        def _strs(v) -> list[str]:
+            if v is None:
+                return []
+            if not isinstance(v, list) or len(v) > _RULES_MAX_LIST:
+                raise ValueError
+            for s in v:
+                if not _name_ok(s):
+                    raise ValueError
+            return list(v)
+
+        markers_raw = raw.get("in_dir_markers") or []
+        if not isinstance(markers_raw, list) or len(markers_raw) > _RULES_MAX_MARKERS:
+            return None
+        markers: list[dict] = []
+        for m in markers_raw:
+            if not isinstance(m, dict):
+                return None
+            kind = "file" if "file" in m else ("dir" if "dir" in m else None)
+            if kind is None or not _name_ok(m.get(kind)):
+                return None
+            entry = {kind: m[kind]}
+            if m.get("signed"):
+                entry["signed"] = True
+            markers.append(entry)
+
+        named_raw = raw.get("named") or []
+        if not isinstance(named_raw, list) or len(named_raw) > _RULES_MAX_LIST:
+            return None
+        named: list[dict] = []
+        for n in named_raw:
+            if not isinstance(n, dict) or not _name_ok(n.get("dir")):
+                return None
+            siblings = _strs(n.get("siblings"))
+            sibling_globs = _strs(n.get("sibling_globs"))
+            if not siblings and not sibling_globs:
+                return None
+            named.append({"dir": n["dir"], "siblings": siblings,
+                          "sibling_globs": sibling_globs})
+
+        return {
+            "version": 1,
+            "in_dir_markers": markers,
+            "named": named,
+            "veto_files": _strs(raw.get("veto_files")),
+            "veto_globs": _strs(raw.get("veto_globs")),
+        }
+    except (ValueError, TypeError):
+        return None
+
+
+class _IgnoreMatcher:
+    """Compiled rule table — mirror of the satellite class. Immutable after
+    construction, safe to share across walks."""
+
+    __slots__ = ("file_markers", "signed_markers", "dir_markers", "named",
+                 "veto_files", "veto_globs")
+
+    def __init__(self, rules: dict):
+        file_m, signed_m, dir_m = set(), set(), set()
+        for m in rules.get("in_dir_markers") or []:
+            if "file" in m:
+                (signed_m if m.get("signed") else file_m).add(m["file"])
+            else:
+                dir_m.add(m["dir"])
+        self.file_markers = frozenset(file_m)
+        self.signed_markers = frozenset(signed_m)
+        self.dir_markers = frozenset(dir_m)
+        named: dict[str, list] = {}
+        for n in rules.get("named") or []:
+            named.setdefault(n["dir"], []).append(
+                (frozenset(n.get("siblings") or ()),
+                 tuple(n.get("sibling_globs") or ())))
+        self.named = named
+        self.veto_files = frozenset(rules.get("veto_files") or ())
+        self.veto_globs = tuple(rules.get("veto_globs") or ())
+
+    def named_match(self, dir_name: str, parent_files: list[str]) -> bool:
+        rule_list = self.named.get(dir_name)
+        if not rule_list:
+            return False
+        for siblings, globs in rule_list:
+            for f in parent_files:
+                if f in siblings or any(
+                        fnmatch.fnmatchcase(f, g) for g in globs):
+                    return True
+        return False
+
+    def has_in_dir_marker(self, dir_path: Path, files: list[str],
+                          dirs: list[str]) -> bool:
+        for f in files:
+            if f in self.file_markers:
+                return True
+            if f in self.signed_markers:
+                try:
+                    with open(dir_path / f, "rb") as fh:
+                        if fh.read(len(_CACHEDIR_SIG)) == _CACHEDIR_SIG:
+                            return True
+                except OSError:
+                    pass  # unreadable tag → not a marker (fail toward syncing)
+        return any(d in self.dir_markers for d in dirs)
+
+    def is_vetoed(self, files: list[str]) -> bool:
+        for f in files:
+            if f in self.veto_files or any(
+                    fnmatch.fnmatchcase(f, g) for g in self.veto_globs):
+                return True
+        return False
+
+
+_matcher_lock = threading.Lock()
+_matcher_cache: tuple[str, _IgnoreMatcher] | None = None
+
+
+def compiled_ignore_matcher(rules: dict | None) -> "_IgnoreMatcher | None":
+    """Compile (with a single-entry cache — one active table per proxy) a
+    VALIDATED rule table. None/invalid → None → legacy walk."""
+    global _matcher_cache
+    if not rules:
+        return None
+    import json as _json
+    try:
+        key = _json.dumps(rules, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    with _matcher_lock:
+        cached = _matcher_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        matcher = _IgnoreMatcher(rules)
+    except (KeyError, TypeError):
+        return None
+    with _matcher_lock:
+        _matcher_cache = (key, matcher)
+    return matcher
+
+
 def _is_satellite_owned(rel_path: str) -> bool:
     """True when ``rel_path`` lies under a satellite-authoritative subtree.
 
@@ -314,6 +500,7 @@ def compute_manifest(
     target_role: str = "",
     exclude_user_dirs: bool = False,
     max_file_size: int | None = None,
+    ignore_rules: dict | None = None,
 ) -> list[FileEntry]:
     """Compute file manifest for an agent directory.
 
@@ -341,13 +528,36 @@ def compute_manifest(
             ``effective_sync_cap`` so a pre-0.5.103 satellite's merge plan
             never contains a file it would reject at 100MB. None = the
             config-driven ``MAX_FILE_SIZE``.
+        ignore_rules: VALIDATED sync-ignore rule table to apply to this
+            walk, or None for the legacy walk. Pass the table ONLY for
+            machines whose satellite ACKed support (0.5.110+ — see
+            ``satellite_supports_sync_ignore_rules``); the two walks must
+            apply the SAME rules or the diff misattributes deletes.
     """
     entries = []
     if not agent_dir.exists():
         return entries
     size_cap = max_file_size or MAX_FILE_SIZE
+    matcher = compiled_ignore_matcher(ignore_rules)
+    rule_candidates: set[str] = set()
 
     for root, dirs, files in os.walk(agent_dir):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(agent_dir)
+        # Sync-ignore rules: at-visit decision — mirror of the satellite's
+        # ``_walk_sync_tree`` (same candidate mechanics, same evidence-from-
+        # listings rule; see the engine block above).
+        if matcher is not None:
+            _rel_posix = rel_root.as_posix()
+            _was_candidate = _rel_posix in rule_candidates
+            rule_candidates.discard(_rel_posix)
+            if (len(rel_root.parts) >= 2
+                    and root_path.name not in _RULE_PROTECTED_DIR_NAMES
+                    and (_was_candidate
+                         or matcher.has_in_dir_marker(root_path, files, dirs))
+                    and not matcher.is_vetoed(files)):
+                dirs[:] = []
+                continue
         # Skip heavy / unwanted dirs. Hidden dirs are skipped UNLESS in
         # the dotted-dir whitelist (``.credentials/``, ``.claude/``,
         # ``.codex/``) so OAuth tokens + CLI config sync to the satellite.
@@ -364,8 +574,10 @@ def compute_manifest(
         ]
         if exclude_user_dirs and root == str(agent_dir) and "users" in dirs:
             dirs.remove("users")
-
-        rel_root = Path(root).relative_to(agent_dir)
+        if matcher is not None:
+            for d in dirs:
+                if matcher.named_match(d, files):
+                    rule_candidates.add((rel_root / d).as_posix())
 
         # Scope filtering
         if scope == "config_only":
@@ -463,7 +675,11 @@ def _is_other_user_or_sensitive(rel_path: str, target_username: str) -> bool:
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if rel_path.startswith(prefix):
             return True
-    if rel_path.startswith("knowledge/.credentials/"):
+    # ``.credentials`` as a SEGMENT, not a literal prefix — a re-rooted
+    # credentials dir (e.g. under a knowledge-library mirror) must stay
+    # just as unsyncable as ``knowledge/.credentials/`` itself. Mirrors
+    # never contain one (projector exclusion) — defense-in-depth.
+    if ".credentials" in parts:
         return True
     return False
 
@@ -537,8 +753,54 @@ def is_engine_machinery_path(rel_path: str) -> bool:
     return ".claude" in parts or ".codex" in parts or ".credentials" in parts
 
 
+def library_mirror_source(rel_path: str) -> str | None:
+    """The source-agent slug when ``rel_path`` lies inside the
+    knowledge-library mirror NAMESPACE (``knowledge/shared/<source>/…``),
+    else None. Bare ``knowledge/shared`` / ``knowledge/shared/<source>``
+    directory paths also return the slug (they exist only for mirrors).
+    Which LIBRARY of that source covers the path — libraries are
+    per-subtree — is :func:`library_for_mirror_rel`."""
+    parts = rel_path.split("/")
+    if len(parts) >= 3 and parts[0] == "knowledge" and parts[1] == "shared":
+        return parts[2]
+    return None
+
+
+def library_for_mirror_rel(
+    rel_path: str, libraries,
+) -> tuple[str, str] | None:
+    """The ``(source_agent, subdir)`` library whose mirror subtree contains
+    ``rel_path`` (``knowledge/shared/<source>/<source-rel>``), else None.
+
+    ``libraries`` is an iterable of ``(source_agent, subdir)`` pairs
+    (``subdir == ''`` = whole-folder share). Matching is SEGMENT-WISE
+    (``rel_parts[:n] == subdir_parts``) — a library ``marketing`` never
+    authorizes a sibling ``marketing-extra``. Kept dependency-free
+    (mirrors ``db_knowledge_libraries.subtree_covers``) so this module
+    stays storage-import-free.
+    """
+    parts = rel_path.split("/")
+    if len(parts) < 3 or parts[0] != "knowledge" or parts[1] != "shared":
+        return None
+    src, sub_parts = parts[2], parts[3:]
+    for lib_src, lib_subdir in libraries or ():
+        if lib_src != src:
+            continue
+        if not lib_subdir:
+            return (lib_src, lib_subdir)
+        prefix = lib_subdir.split("/")
+        if sub_parts[: len(prefix)] == prefix:
+            return (lib_src, lib_subdir)
+    return None
+
+
 def can_write_back(rel_path: str, role: str, username: str,
-                   mount_username: str | None = None) -> bool:
+                   mount_username: str | None = None, *,
+                   writable_libraries: (
+                       frozenset[tuple[str, str]] | set[tuple[str, str]] | None
+                   ) = None,
+                   knowledge_rw: bool = False,
+                   ) -> bool:
     """Can a satellite session with this role + username write this
     agent-tree-relative path BACK to the platform?
 
@@ -564,6 +826,13 @@ def can_write_back(rel_path: str, role: str, username: str,
     ``rel_path`` is forward-slash, relative to the agent root (e.g.
     ``"knowledge/x.md"``, ``"users/alice/workspace/y.md"``). Fail-closed:
     empty / unclassifiable paths return ``False``.
+
+    ``knowledge_rw`` is the session's manager-provenance flag
+    (``SecurityContext.knowledge_rw`` — agent-scope scheduled/one-time/
+    trigger fires whose creator is a per-agent manager or platform admin).
+    It substitutes for the ``bool(username)`` human-curation requirement on
+    the knowledge tier ONLY — the owner-tier role check still applies, and
+    every other path class is untouched.
     """
     if not is_canonical_rel_path(rel_path):
         return False
@@ -577,6 +846,19 @@ def can_write_back(rel_path: str, role: str, username: str,
         return False
     owner_tier = role in ("manager", "admin")
     top = parts[0]
+    # 1b. Knowledge-library mirrors (``knowledge/shared/<source>/…``) — the
+    #     covering attachment's writable flag decides, ON TOP of the
+    #     knowledge curation tier below. ``writable_libraries`` is the
+    #     session agent's set of RW-attached ``(source, subdir)`` pairs,
+    #     resolved by the caller from the attachments table
+    #     (``db_knowledge_libraries.writable_pairs_for``); callers that
+    #     don't carry it (``None``) fail closed for mirror paths — a
+    #     mirror write must never ride a legacy code path that predates
+    #     libraries. Matching is segment-wise per library subtree.
+    if library_mirror_source(rel_path) is not None:
+        if library_for_mirror_rel(rel_path, writable_libraries) is None:
+            return False
+        return owner_tier and (bool(username) or knowledge_rw)
     # 2. Agent config + knowledge — owner curation only. Requires owner-tier
     #    (manager/admin) AND a real username. ``username`` here is the REAL
     #    human from the SecurityContext (a Shared-only human chat keeps it set;
@@ -584,8 +866,12 @@ def can_write_back(rel_path: str, role: str, username: str,
     #    curates knowledge/config from any scope, mirroring the local mounts
     #    (owner-tier humans mount both RW via ``config_visible``). SERVICE
     #    sessions (tasks / phone / triggers — no human) carry username == ""
-    #    and mount knowledge RO, so the username gate blocks exactly them.
-    if top in ("config", "knowledge"):
+    #    and mount knowledge RO, so the username gate blocks exactly them —
+    #    EXCEPT a manager-provenance task fire (``knowledge_rw``), which may
+    #    write knowledge/ (never config/: that stays human-manager-only).
+    if top == "knowledge":
+        return owner_tier and (bool(username) or knowledge_rw)
+    if top == "config":
         return owner_tier and bool(username)
     # 3. Shared agent workspace — editor tier and up (viewer is read-only here).
     if top == "workspace":
@@ -667,6 +953,8 @@ def _resolve_merge(
     clock_offset: float | None, author_of, satellite_user: str,
     target_role: str, target_username: str,
     satellite_tree_present: bool = True,
+    writable_libraries: frozenset[tuple[str, str]] | None = None,
+    knowledge_rw: bool = False,
 ) -> FileAction | None:
     """The 3-way merge for one path (after push-only / isolation filtering).
 
@@ -677,7 +965,9 @@ def _resolve_merge(
     no-op (leave the satellite's copy), never a clobber.
     """
     def cwb() -> bool:
-        return can_write_back(path, target_role, target_username)
+        return can_write_back(path, target_role, target_username,
+                              writable_libraries=writable_libraries,
+                              knowledge_rw=knowledge_rw)
 
     # --- both present ---
     if P is not None and S is not None:
@@ -790,6 +1080,9 @@ def diff_manifests(
     target_role: str = "",
     session_username: str = "",
     exclude_user_dirs: bool = False,
+    writable_libraries: frozenset[tuple[str, str]] | None = None,
+    scrub_dirs: set[str] | None = None,
+    knowledge_rw: bool = False,
 ) -> MergePlan:
     """Resolve a 3-way merge (platform vs satellite vs last-converged base) into a
     per-file action plan — **newest-version-wins**, not proxy-always-wins.
@@ -825,6 +1118,12 @@ def diff_manifests(
             dropped from BOTH manifests before merging (never pushed, never
             pulled, never scrubbed: a stray satellite-side copy is simply
             ignored rather than deleted from the user's disk).
+        knowledge_rw: the SESSION's manager-provenance flag
+            (``SecurityContext.knowledge_rw``), threaded into every
+            ``can_write_back`` pull gate so the initial-sync merge and the
+            per-turn ``file_changed`` applier agree on knowledge/ writes
+            from agent-scope task fires. Machine-pairing merges (reconnect,
+            idle sweep, presync) carry no session and pass False.
 
     Returns a ``MergePlan`` (per-file ``FileAction`` list + the ``to_scrub``
     isolation deletes). Pure / side-effect-free — the caller executes it.
@@ -840,6 +1139,7 @@ def diff_manifests(
         push_only_segments if push_only_segments is not None
         else set(DEFAULT_PUSH_ONLY_SEGMENTS)
     )
+    scrub_p = scrub_dirs or set()
     base = base or {}
     tombstones = tombstones or {}
     if author_of is None:
@@ -893,7 +1193,19 @@ def diff_manifests(
         if _is_push_only(path, push_only_p, push_only_s):
             if P is not None:
                 if S is None or P != S:
-                    actions.append(FileAction(path, "push", base_hash=P))
+                    # A divergent satellite copy of a READ-ONLY library
+                    # mirror is someone's local edit about to be reverted —
+                    # honor revert-to-trash: capture the satellite bytes
+                    # before the platform push clobbers them. Other
+                    # push-only divergences (config/, machinery) keep the
+                    # historical silent-overwrite behavior.
+                    capture = (S is not None
+                               and library_mirror_source(path) is not None)
+                    actions.append(FileAction(
+                        path, "push", base_hash=P,
+                        capture_side="satellite" if capture else None,
+                        capture_reason="conflict" if capture else None,
+                    ))
             elif S is not None:
                 # Satellite-only extra under a push-only path. Scrubbing is an
                 # ISOLATION measure, so it applies where holding the file is an
@@ -907,8 +1219,12 @@ def diff_manifests(
                 # non-owner warmup) — so leave it for a merge with a real
                 # owner-tier identity to pull. Scrubbing here deleted
                 # owner-written config/context files.
+                # ``scrub_p`` extends the everywhere-scrub set beyond the
+                # regenerated segments: read-only library-mirror extras are
+                # an anomaly on ANY pairing (the projector owns mirror
+                # content), unlike config/ pending-curation extras.
                 if (target_username is not None
-                        or _is_push_only(path, set(), push_only_s)):
+                        or _is_push_only(path, scrub_p, push_only_s)):
                     to_scrub.append(path)
             continue
 
@@ -934,6 +1250,8 @@ def diff_manifests(
                 target_username if target_username is not None else session_username
             ) or "",
             satellite_tree_present=sat_tree_present,
+            writable_libraries=writable_libraries,
+            knowledge_rw=knowledge_rw,
         )
         if action is not None:
             actions.append(action)

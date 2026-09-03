@@ -330,11 +330,41 @@ def safe_agent_path(
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
     rel = resolved.relative_to(agent_root).as_posix()
     _check_oauth_protected(rel)  # OAuth token dirs are off-limits to EVERY principal
+    if writing:
+        # Knowledge-library mirrors gate on the attachment's writable flag,
+        # for EVERY principal (incl. admin + agent sessions): mirror content
+        # is projector-owned, and a read-only mirror is edited at its SOURCE.
+        _check_library_mirror_write(rel, name)
     uname = ""
     if user.acting_sub is not None:
         uname = task_store.get_username_by_sub(user.sub) or ""
         _check_file_role(rel, user.get_agent_role(name), writing=writing, username=uname)
     return resolved, uname
+
+
+def _check_library_mirror_write(rel: str, agent: str) -> None:
+    """403 for writes into ``knowledge/shared/`` unless the target lies
+    inside an RW-attached library SUBTREE (segment-wise — libraries are
+    per-subtree). The bare ``shared/`` namespace, the slug level, and any
+    path outside every attached subtree are reserved (projector-owned)."""
+    parts = rel.split("/")
+    if len(parts) < 2 or parts[0] != "knowledge" or parts[1] != "shared":
+        return
+    if len(parts) == 2:
+        raise HTTPException(
+            status_code=403,
+            detail="knowledge/shared/ is reserved for shared knowledge "
+                   "library mirrors",
+        )
+    src, sub_rel = parts[2], "/".join(parts[3:])
+    from storage import db_knowledge_libraries
+    att = db_knowledge_libraries.attachment_covering(src, agent, sub_rel)
+    if att is None or not att["writable"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Read-only shared knowledge library mirror — edit this "
+                   f"content on the '{src}' agent (the library source).",
+        )
 
 
 async def _record_platform_write(agent_slug: str, rel_path: str, writer: str | None) -> None:
@@ -345,6 +375,7 @@ async def _record_platform_write(agent_slug: str, rel_path: str, writer: str | N
     await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
     if writer:
         await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
+    _schedule_library_projection(agent_slug, rel_path, deleted=False)
 
 
 async def _tombstone_path(agent_slug: str, rel_path: str) -> None:
@@ -356,6 +387,36 @@ async def _tombstone_path(agent_slug: str, rel_path: str) -> None:
         file_tombstones_store.record, agent_slug, rel_path, _t.time(), origin="dashboard",
     )
     await asyncio.to_thread(file_author_store.clear, agent_slug, rel_path)
+    _schedule_library_projection(agent_slug, rel_path, deleted=True)
+
+
+def _schedule_library_projection(agent_slug: str, rel_path: str, *, deleted: bool) -> None:
+    """Fire-and-forget knowledge-library projection for a dashboard write /
+    delete (rename and move decompose into exactly these two): a promoted
+    source's knowledge change reaches every consumer mirror; an RW mirror
+    change flows back to its source. Dashboard deletes of RW mirror files
+    are the one EXPLICIT mirror→source delete channel — satellite/absence
+    deletes never propagate (they heal). Cheap no-op off knowledge/."""
+    if not rel_path.startswith("knowledge/"):
+        return
+    from services.knowledge import library_projector
+    parsed = library_projector.parse_library_rel(rel_path)
+    if parsed is not None:
+        src, sub_rel = parsed
+        if not sub_rel:
+            return
+        if deleted:
+            asyncio.create_task(
+                library_projector.propagate_mirror_delete(agent_slug, src, sub_rel))
+        else:
+            asyncio.create_task(
+                library_projector.propagate_mirror_write(agent_slug, src, sub_rel))
+        return
+    knowledge_rel = rel_path[len("knowledge/"):]
+    if knowledge_rel:
+        asyncio.create_task(
+            library_projector.propagate_source_write(
+                agent_slug, knowledge_rel, deleted=deleted))
 
 
 async def _tombstone_subtree(agent_slug: str, agent_dir: "Path", src: "Path") -> None:
@@ -894,7 +955,6 @@ async def restore_recover_bin(
     u = require_auth(user)
     require_agent_access(u, name)
     from storage import recover_bin_store
-    from services.remote import workspace_fanout
 
     agent_dir = _get_agent_dir(name)
     agent_root = agent_dir.resolve()
@@ -933,6 +993,19 @@ async def restore_recover_bin(
             denied.append(entry_id)  # traversal guard (defensive)
             continue
 
+        # Knowledge-library mirrors gate on the attachment's writable flag,
+        # exactly like every other platform write does at the path-resolve
+        # chokepoint. Restore wrote to the filesystem directly and skipped
+        # it, so a manager could restore INTO a read-only mirror — content
+        # the projector owns and heals away on its next sweep. Denied per
+        # entry rather than aborting: one ineligible file must not sink the
+        # rest of the selection.
+        try:
+            _check_library_mirror_write(rel_path, name)
+        except HTTPException:
+            denied.append(entry_id)
+            continue
+
         # Restore to the original path, or to a "(recovered)" sibling if
         # something now occupies it — never override existing content.
         final_rel = rel_path
@@ -960,12 +1033,18 @@ async def restore_recover_bin(
             denied.append(entry_id)
             continue
 
-        # Re-sync the restored file to any satellites (per-user/role routing;
-        # no-ops when the agent has no active machines).
+        # Publish it the way EVERY other platform write is published. Doing
+        # its own fan-out call meant a restore skipped the rest of
+        # _record_platform_write: the delete tombstone stayed, so an idle
+        # satellite would re-apply the delete and undo the restore; the
+        # author was never recorded; and a restore into an RW library mirror
+        # never reached the source, so the next reconcile healed it away.
+        # This also picks up include_idle, which the bare call lacked.
         try:
-            await workspace_fanout.fan_out_write(name, final_rel, content)
+            await _push_file_write_to_remote(
+                name, final_rel, dest, writer=_dashboard_writer(u))
         except Exception:
-            logger.exception("recover-bin restore fan-out failed for %s", final_rel)
+            logger.exception("recover-bin restore publish failed for %s", final_rel)
 
         await asyncio.to_thread(recover_bin_store.delete, entry_id)
         restored.append({"entry_id": entry_id, "rel_path": final_rel})
@@ -1024,7 +1103,16 @@ async def write_agent_file(
     # Create parent directories if needed
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    file_path.write_text(req.content, encoding="utf-8")
+    try:
+        file_path.write_text(req.content, encoding="utf-8")
+    except OSError as e:
+        import errno as _errno
+        if e.errno in (_errno.EDQUOT, _errno.ENOSPC):
+            raise HTTPException(
+                status_code=507,
+                detail=f"Not enough storage in '{name}'s bucket for this write.",
+            )
+        raise
     logger.info(f"Wrote file: {file_path}")
 
     rel = file_path.relative_to(agent_dir).as_posix()
@@ -1051,10 +1139,19 @@ async def create_agent_file(
 
     ext = req.file_type or file_path.suffix.lower()
     template = _BLANK_TEMPLATES.get(ext)
-    if template:
-        file_path.write_bytes(template)
-    else:
-        file_path.write_text("", encoding="utf-8")
+    try:
+        if template:
+            file_path.write_bytes(template)
+        else:
+            file_path.write_text("", encoding="utf-8")
+    except OSError as e:
+        import errno as _errno
+        if e.errno in (_errno.EDQUOT, _errno.ENOSPC):
+            raise HTTPException(
+                status_code=507,
+                detail=f"Not enough storage in '{name}'s bucket for this write.",
+            )
+        raise
 
     logger.info(f"Created file: {file_path}")
     rel = file_path.relative_to(agent_dir).as_posix()

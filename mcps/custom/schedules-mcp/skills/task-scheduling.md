@@ -84,13 +84,28 @@ Pick the coarsest interval that meets the user's intent — don't schedule `* * 
 If the user asks to pause, resume, or delete a scheduled task — or to check what tasks exist — use these tools:
 
 - **`list_tasks`** — shows all tasks for this agent with their current status (`active` or `paused`), schedule, next run time, and ID. Always call this first to find the task ID before pausing/resuming/deleting.
+
+**Cross-agent reads**: `list_tasks`, `get_task_history`, and `get_task_result` take an optional `agent` argument — another agent's slug, or `"all"` for every agent your user can access. You see exactly what your user would see on that agent's pages (their role travels with you); sessions without a user see only this agent plus its wired delegation targets (their agent-scope tasks and runs — the scheduled-briefing pattern: read what your delegation targets did, then summarize). Reading is where it ends: to CHANGE another agent's schedule, ask that agent via delegation — mutations never cross agents.
 - **`pause_task(task_id)`** — stops a task from firing on its schedule without deleting it. The task can be resumed later. Use when the user says "pause", "stop for now", "disable temporarily".
 - **`resume_task(task_id)`** — re-enables a paused task. Note: for one-time tasks whose `run_at` has already passed, resume keeps the row active but does NOT auto-fire — the user can run it manually from the dashboard if they want.
-- **`edit_task(task_id, ...)`** — change the schedule, run time, name, prompt, timeout, or notification settings of an existing task **without deleting and recreating it**. Pass only the fields you want to change. `schedule` and `run_at` are mutually exclusive — setting one switches the task between recurring and one-time mode and clears the other. Use this whenever the user says "change the time of X", "update the X reminder to Y", "make this run every 3 hours instead", "edit the prompt of X". **Always prefer this over delete+recreate** — it preserves the task ID, history references, and any in-flight context.
+- **`edit_task(task_id, ...)`** — change the schedule, run time, name, prompt, timeout, notification settings, or the model / execution layer of an existing task **without deleting and recreating it**. Pass only the fields you want to change. `schedule` and `run_at` are mutually exclusive — setting one switches the task between recurring and one-time mode and clears the other. Use this whenever the user says "change the time of X", "update the X reminder to Y", "make this run every 3 hours instead", "edit the prompt of X". **Always prefer this over delete+recreate** — it preserves the task ID, history references, and any in-flight context.
 - **`delete_task(task_id)`** — permanently removes a task (or a pending continuation). Use when the user says "delete", "remove", "cancel for good". Static tasks (defined in `tasks.json`) cannot be deleted via this tool.
 - **`run_task(task_id)`** — fires an existing task immediately, regardless of schedule. Use for "run X now" or to manually fire a paused/expired task.
 
 **One-time tasks auto-clean up** after they fire successfully — the row is removed and won't appear in `list_tasks`. Recurring tasks persist and keep firing until paused or deleted.
+
+### Choosing a Model for a Task
+
+Every task runs on **your agent's default model and execution layer** unless it says otherwise. That default is the right answer almost always — leave `model` and `layer` out.
+
+The exception is a task whose cost profile genuinely differs from your everyday work: a heavy daily briefing that has to reason over a lot of material, or conversely a trivial hourly sync that would be wasteful on a big model. `create_scheduled_task`, `create_one_time_task`, and `edit_task` all take an optional `model` (and `layer`) that pins **that one task's runs**, leaving the agent's default untouched for everything else. It is a real cost lever: a cheap default with one task pinned up, or an expensive default with the noisy tasks pinned down.
+
+Rules:
+
+- **Ask the user before pinning a model, unless they already asked for it.** Which model a schedule burns is their spend, not your call. "Should I run that daily report on <stronger model> and keep everything else on the default?" is the shape of the question.
+- **Valid values come from your own `layers:` line** — it lists your enabled execution layers and the model ids on each, with your current default marked `[default]`. Look for it under **Scheduled-task Execution** in your prompt; if you also have the delegation tools it lives on your own row in **Available Agents** instead, and the Scheduled-task Execution block points you there. A model that isn't on that line is rejected with a 400; do not guess ids.
+- **Retuning is cheap.** `edit_task(task_id, model="...")` re-pins a live schedule from its next run on, with no change to when it fires. `edit_task(task_id, model="")` clears the pin and returns the task to your default.
+- **Read it back, never assume.** `list_tasks` shows every task's effective model and layer — `runs on: <model> [pinned]` for a task-level pin, `runs on: <model> [agent default]` when it follows the agent's current setting. When asked "what model does this task run on?", answer from `list_tasks`, not from memory or the default. The dashboard's Scheduled Tasks tab shows the same.
 
 ### Trigger-only Tasks (`task_type='trigger'`)
 

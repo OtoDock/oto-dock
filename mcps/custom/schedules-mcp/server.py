@@ -9,7 +9,13 @@ Environment variables (set in per-agent mcp-config.json):
   SCHEDULES_MCP_AGENT      - Which agent this instance serves (e.g. "system-admin")
   PROXY_URL                - Proxy URL (e.g. "http://localhost:8400")
   SCHEDULES_MCP_API_KEY    - Proxy API key (falls back to PROXY_API_KEY from process env)
-  SCHEDULES_MCP_ALLOW_ALL  - "true" for unified agent (unrestricted access)
+
+Cross-agent reads: the read tools take an optional ``agent`` arg — a slug,
+or "all" for every agent the session's user can access. Server-side the
+proxy filters by the TOKEN identity (reads follow the user), so this server
+just forwards the arg: "all" maps to omitting the ``agent`` query param.
+No-user sessions reach only their own agent plus their wired delegation
+targets (agent-scope rows, read-only) — also proxy-enforced.
 """
 
 import asyncio
@@ -24,7 +30,73 @@ from mcp.types import TextContent, Tool
 AGENT = os.environ.get("SCHEDULES_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("SCHEDULES_MCP_API_KEY") or os.environ.get("PROXY_API_KEY", "")
-ALLOW_ALL = os.environ.get("SCHEDULES_MCP_ALLOW_ALL", "false").lower() == "true"
+
+
+# The shared `agent` arg of the read tools (list_tasks / get_task_history /
+# get_task_result). Visibility is enforced server-side from the session token.
+_AGENT_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "Cross-agent read: an agent slug, or 'all' for every agent your "
+        f"user can access. Omit for this agent ({AGENT}). Sessions without "
+        "a user (scheduled agent-scope runs) see only this agent plus its "
+        "wired delegation targets (agent-scope, read-only)."
+    ),
+}
+
+
+# The shared per-task execution pins of the write tools (create_scheduled_task
+# / create_one_time_task / edit_task). Validated server-side against this
+# agent's envelope — the same check delegate() gets — so a bad value is a
+# clear error, never a silent downgrade.
+_MODEL_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "OPTIONAL model override for THIS task's runs — every run uses it "
+        f"instead of {AGENT}'s default model. Use it to pin one demanding "
+        "task (a daily briefing, a report) to a stronger model while the "
+        "agent's everyday default stays cheap, or the reverse. Must be a "
+        "model enabled on the task's execution layer — read the valid ids "
+        "off this agent's `layers:` line in the prompt. Omit to inherit the "
+        "agent's default (recommended). On `edit_task`, pass \"\" to clear "
+        "an existing pin."
+    ),
+}
+
+_LAYER_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "OPTIONAL execution-layer override for THIS task's runs (e.g. "
+        "'claude-code-cli', 'codex-cli', 'direct-llm') — must be enabled for "
+        f"{AGENT}. Omit to inherit the agent's default layer. On `edit_task`, "
+        "pass \"\" to clear an existing pin."
+    ),
+}
+
+
+def _lane_line(args: dict, cleared: bool = False) -> str:
+    """One confirmation line for the per-task model/layer pins, or ''.
+
+    Echoing the pin back matters: the agent needs to see that the task is NOT
+    on the agent default any more. ``cleared`` (edit path) also reports an
+    explicit "" as a reset rather than staying silent about it.
+    """
+    bits = []
+    for key in ("model", "layer"):
+        if key not in args:
+            continue
+        if args[key]:
+            bits.append(f"{key}={args[key]}")
+        elif cleared:
+            bits.append(f"{key}=agent default (pin cleared)")
+    return f"Runs on: {', '.join(bits)}" if bits else ""
+
+
+def _agent_param(args: dict) -> dict:
+    """Resolve the ``agent`` arg into query params: default = own agent,
+    'all' = no filter (the proxy then returns every accessible agent)."""
+    agent = args.get("agent") or AGENT
+    return {} if agent == "all" else {"agent": agent}
 
 # Per-agent default scope (drives the scope arg default for every
 # scope-aware MCP). Falls back through PROXY_TASK_SCOPE (the session's
@@ -45,6 +117,10 @@ AVAILABLE_SCOPES = [
     s for s in (os.environ.get("OTO_AVAILABLE_SCOPES", "") or "").split(":")
     if s in ("user", "agent")
 ] or ["user", "agent"]
+# The single scope fallback for BOTH the advertised schema default and the
+# create handlers. They must agree: a shared-only agent's schema says
+# `agent`, so a handler defaulting to a literal "user" made every
+# scope-omitted create 400 ("does not support 'user'-scoped tasks").
 SCOPE_DEFAULT = DEFAULT_SCOPE if DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABLE_SCOPES[0]
 
 
@@ -181,6 +257,8 @@ async def list_tools() -> list[Tool]:
                         "default": "info",
                         "description": "Severity for the generic 'Task Complete' notification (only used in 'auto' mode)",
                     },
+                    "model": _MODEL_ARG_SCHEMA,
+                    "layer": _LAYER_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
@@ -267,6 +345,8 @@ async def list_tools() -> list[Tool]:
                         "default": "info",
                         "description": "Severity for the generic 'Task Complete' notification (only used in 'auto' mode)",
                     },
+                    "model": _MODEL_ARG_SCHEMA,
+                    "layer": _LAYER_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
@@ -383,6 +463,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Task ID to check"},
+                    "agent": _AGENT_ARG_SCHEMA,
                 },
                 "required": ["task_id"],
             },
@@ -392,10 +473,21 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List all tasks (static + agent-created) for this agent, including "
                 "pending session continuations. Shows each task's schedule, next run "
-                "time, and status (active or paused). Use this to find a task before "
-                "calling pause_task, resume_task, run_task, or delete_task."
+                "time, status (active or paused), and what its runs execute on — "
+                "the effective model and execution layer, marked [pinned] when the "
+                "task carries its own override or [agent default] when it follows "
+                "the agent's current setting. This is the authoritative read for "
+                "\"what model does this task run on?\" — never assume the default. "
+                "Use this to find a task before "
+                "calling pause_task, resume_task, run_task, or delete_task. "
+                "With `agent`, lists another accessible agent's tasks instead "
+                "(read-only — mutations stay same-agent; ask that agent via "
+                "delegation to change its schedule)."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            inputSchema={
+                "type": "object",
+                "properties": {"agent": _AGENT_ARG_SCHEMA},
+            },
         ),
         Tool(
             name="delete_task",
@@ -448,9 +540,11 @@ async def list_tools() -> list[Tool]:
             name="edit_task",
             description=(
                 "Edit a scheduled or one-time task in place — change its "
-                "schedule, run time, name, prompt, or notification settings "
-                "without deleting and recreating it. At least one editable "
-                "field besides task_id must be provided. "
+                "schedule, run time, name, prompt, notification settings, or "
+                "the model / execution layer its runs use, without deleting "
+                "and recreating it. Model and layer changes apply from the "
+                "next run; the schedule keeps firing exactly as before. "
+                "At least one editable field besides task_id must be provided. "
                 "schedule, interval_seconds, and run_at are mutually exclusive: "
                 "setting one switches the task's mode and automatically clears "
                 "the others. Static tasks (defined in tasks.json) cannot be edited."
@@ -519,13 +613,22 @@ async def list_tools() -> list[Tool]:
                         "enum": ["info", "success", "warning"],
                         "description": "Severity for the generic 'Task Complete' notification (only used in 'auto' mode)",
                     },
+                    "model": _MODEL_ARG_SCHEMA,
+                    "layer": _LAYER_ARG_SCHEMA,
                 },
                 "required": ["task_id"],
             },
         ),
         Tool(
             name="get_task_history",
-            description="Get recent run history for this agent's tasks.",
+            description=(
+                "Get recent run history for this agent's tasks. With `agent`, "
+                "reads another accessible agent's history instead — runs carry "
+                "their prompt + output text, exactly what your user would see "
+                "on that agent's Task History page. Runs are NOT stamped with "
+                "the model they executed on — a task's current model/layer "
+                "(pinned or agent default) is read via list_tasks."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -538,6 +641,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Max number of runs to return",
                         "default": 10,
                     },
+                    "agent": _AGENT_ARG_SCHEMA,
                 },
             },
         ),
@@ -591,10 +695,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "prompt": arguments["prompt"],
                 "llm_mode": arguments.get("llm_mode", "cli"),
                 "timeout_seconds": arguments.get("timeout_seconds", 600),
-                "scope": arguments.get("scope", "user"),
+                "scope": arguments.get("scope") or SCOPE_DEFAULT,
                 "notification_mode": arguments["notification_mode"],
                 "notify_severity": arguments.get("notify_severity", "info"),
             }
+            for k in ("model", "layer"):
+                if arguments.get(k):
+                    body[k] = arguments[k]
             if has_schedule:
                 body["schedule"] = arguments["schedule"]
                 timing_line = f"Schedule: {arguments['schedule']}"
@@ -602,13 +709,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 body["interval_seconds"] = arguments["interval_seconds"]
                 timing_line = f"Interval: every {arguments['interval_seconds']}s"
             result = await _post("/v1/tasks/scheduled", body)
-            return [TextContent(type="text", text="\n".join([
+            return [TextContent(type="text", text="\n".join(x for x in [
                 f"Created scheduled task: {result['task_id']}",
                 timing_line,
-                f"Scope: {arguments.get('scope', 'user')}",
+                f"Scope: {arguments.get('scope') or SCOPE_DEFAULT}",
                 f"Notification mode: {arguments['notification_mode']}",
+                _lane_line(arguments),
                 f"Name: {arguments['name']}",
-            ]))]
+            ] if x))]
 
         elif name == "create_one_time_task":
             if "notification_mode" not in arguments:
@@ -642,11 +750,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "delay_seconds": arguments.get("delay_seconds"),
                 "llm_mode": arguments.get("llm_mode", "cli"),
                 "timeout_seconds": arguments.get("timeout_seconds", 600),
-                "scope": arguments.get("scope", "user"),
+                "scope": arguments.get("scope") or SCOPE_DEFAULT,
                 "notification_mode": arguments["notification_mode"],
                 "notify_severity": arguments.get("notify_severity", "info"),
                 "task_type": task_type,
             }
+            for k in ("model", "layer"):
+                if arguments.get(k):
+                    body[k] = arguments[k]
             result = await _post("/v1/tasks/one-time", body)
             if task_type == "trigger":
                 timing = "on trigger fire"
@@ -655,11 +766,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"at {arguments['run_at']}" if arguments.get("run_at")
                     else f"in {arguments['delay_seconds']}s"
                 )
-            return [TextContent(type="text", text="\n".join([
+            return [TextContent(type="text", text="\n".join(x for x in [
                 f"Created {task_type} task: {result['task_id']}",
                 f"Runs: {timing}",
+                _lane_line(arguments),
                 f"Name: {arguments['name']}",
-            ]))]
+            ] if x))]
 
         elif name == "schedule_continuation":
             prompt = arguments.get("prompt", "")
@@ -781,9 +893,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "get_task_result":
             task_id = arguments["task_id"]
-            params: dict = {"task_id": task_id, "limit": 1}
-            if not ALLOW_ALL:
-                params["agent"] = AGENT
+            params: dict = {"task_id": task_id, "limit": 1, **_agent_param(arguments)}
             result = await _get("/v1/tasks/runs", params=params)
             runs = result.get("runs", [])
             if not runs:
@@ -805,8 +915,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "list_tasks":
-            params = {} if ALLOW_ALL else {"agent": AGENT}
-            result = await _get("/v1/tasks", params=params)
+            result = await _get("/v1/tasks", params=_agent_param(arguments))
             tasks = result.get("tasks", [])
             if not tasks:
                 return [TextContent(type="text", text="No tasks found.")]
@@ -822,9 +931,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 next_run = t.get("next_run_time") or "—"
                 status = "active" if t.get("enabled") else "paused"
                 task_type = t.get("task_type", "task")
+                # What the task's runs execute on. The backend resolves
+                # effective_model/effective_execution_path (task pin, else the
+                # agent's CURRENT default); the raw override_* fields tell pin
+                # from default. An unresolved default comes back "" — render
+                # nothing rather than a wrong claim (matches the dashboard).
+                eff_model = t.get("effective_model") or ""
+                model_tag = "pinned" if t.get("override_model") else "agent default"
+                layer_bit = (
+                    f" via {t['effective_execution_path']} [pinned layer]"
+                    if t.get("override_execution_path")
+                       and t.get("effective_execution_path") else ""
+                )
+                runs_on = (
+                    f", runs on: {eff_model} [{model_tag}]{layer_bit}"
+                    if eff_model else (layer_bit and f", runs{layer_bit}")
+                )
                 lines.append(
                     f"  [{task_type}] {t['id']} — {t['name']} "
-                    f"({t['agent']}, {schedule_info}, {status}, next: {next_run})"
+                    f"({t['agent']}, {schedule_info}, {status}, next: {next_run}"
+                    f"{runs_on})"
                 )
             return [TextContent(type="text", text="\n".join(lines))]
 
@@ -856,9 +982,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "edit_task":
             task_id = arguments["task_id"]
             # Build the edit body from any provided field besides task_id.
+            # ``model``/``layer`` are included even when empty — "" is the
+            # explicit "drop the pin, go back to the agent's default" signal.
             edit_keys = (
                 "name", "prompt", "schedule", "run_at", "interval_seconds",
                 "timeout_seconds", "notification_mode", "notify_severity",
+                "model", "layer",
             )
             body = {k: arguments[k] for k in edit_keys if k in arguments}
             if not body:
@@ -877,29 +1006,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )]
             await _post(f"/v1/tasks/{task_id}/edit", body)
             changed = ", ".join(body.keys())
+            lane = _lane_line(body, cleared=True)
             return [TextContent(
                 type="text",
-                text=f"Updated task {task_id} ({changed}).",
+                text="\n".join(x for x in [
+                    f"Updated task {task_id} ({changed}).",
+                    lane,
+                ] if x),
             )]
 
         elif name == "get_task_history":
             # Delegate runs stay visible here (the dashboard's Tasks page
             # excludes them — they live in the chat history there).
             params: dict = {"limit": arguments.get("limit", 10),
-                            "include_delegates": "true"}
-            if not ALLOW_ALL:
-                params["agent"] = AGENT
+                            "include_delegates": "true",
+                            **_agent_param(arguments)}
             if arguments.get("task_id"):
                 params["task_id"] = arguments["task_id"]
             result = await _get("/v1/tasks/runs", params=params)
             runs = result.get("runs", [])
             if not runs:
                 return [TextContent(type="text", text="No runs found.")]
+            cross_agent = "agent" in arguments  # label rows on cross-agent reads
             lines = [f"Recent runs ({len(runs)} of {result.get('total', '?')} total):"]
             for r in runs:
                 duration = f"{r['duration_ms']}ms" if r.get("duration_ms") else "—"
+                agent_tag = f" ({r.get('agent', '?')})" if cross_agent else ""
                 lines.append(
-                    f"  {r['id']} — {r['task_id']} [{r['status']}] "
+                    f"  {r['id']} — {r['task_id']}{agent_tag} [{r['status']}] "
                     f"started={r.get('started_at', '—')} duration={duration}"
                 )
                 if r.get("error_message"):

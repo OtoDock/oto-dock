@@ -143,19 +143,30 @@ class TTSProvider(ABC):
     # ── Streaming surface ──────────────────────────────────────────
 
     @abstractmethod
-    async def connect(self) -> None:
-        """Open the connection to the TTS provider."""
+    async def connect(self, *, output_sample_rate: int | None = None) -> None:
+        """Open the connection to the TTS provider.
+
+        ``output_sample_rate`` hints the session's real output rate so
+        providers with per-rate socket bindings (ElevenLabs) can prewarm the
+        binding the first utterance will actually use; rate-agnostic
+        providers ignore it. ``None`` → the 8 kHz telephony default.
+        """
 
     @abstractmethod
     async def close(self) -> None:
         """Close the connection."""
 
     @abstractmethod
-    async def synthesize(self, text: str, *, language: str | None = None) -> bytes:
+    async def synthesize(
+        self, text: str, *, language: str | None = None,
+        output_sample_rate: int | None = None,
+    ) -> bytes:
         """Synthesize complete text to PCM audio (one-shot, e.g. greetings/fillers).
 
         ``language`` (base code, e.g. ``de``) tells the engine which language to
         pronounce — needed when a multilingual voice serves several languages.
+        ``output_sample_rate`` overrides the 8 kHz telephony default (duplex
+        fillers are synthesized at the transport's output rate).
         """
 
     @abstractmethod

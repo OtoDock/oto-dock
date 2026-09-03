@@ -124,11 +124,29 @@ async def create_meeting(
     # per-agent role (self-limiting), so read access suffices. Service / api-key /
     # no-user sessions keep their existing access-only check.
     from core.session.visibility import is_shared_only
+    # A no-user session (agent-scope task/trigger, phone) has no roles to
+    # derive access from — its participant reach is its agent's DELEGATION
+    # ROSTER ∪ itself (rule 3: autonomy needs explicit wiring; the roster is
+    # that wiring). Token-authoritative: the source agent comes from the
+    # session JWT, never the X-Agent-Name header.
+    nouser_allowed: set[str] | None = None
+    if u.is_no_user_session:
+        source = u.agent or ""
+        nouser_allowed = {source} | set(
+            agent_store.get_delegation_targets(source) if source else [])
     for slug in req.agents:
         agent = agent_store.get_agent(slug)
         if not agent:
             raise HTTPException(400, f"Agent '{slug}' not found")
-        if u.is_no_user_session or u.is_service:
+        if nouser_allowed is not None:
+            if slug not in nouser_allowed:
+                raise HTTPException(
+                    403,
+                    f"This session has no user identity; it can only meet its "
+                    f"own agent's delegation targets — '{slug}' is not wired.",
+                )
+            continue
+        if u.is_service:
             continue
         runs_agent_scope = req.scope == "agent" or is_shared_only(slug)
         if runs_agent_scope and u.acting_sub is not None:

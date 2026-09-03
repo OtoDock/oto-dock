@@ -225,6 +225,23 @@ def test_interrupt_diagnostic_text_is_dropped():
             if e.type == "text"] == ["a real answer"]
 
 
+def test_interrupt_diagnostic_error_is_dropped():
+    # The same marker can arrive as an is_error RESULT when the graceful
+    # interrupt lands mid-tool-use (stop_reason=tool_use) — a duplex
+    # barge-in during a web search rendered "Error: [ede_diagnostic] …"
+    # in the chat (live-hit 2026-08-11). Drop it on the error path too;
+    # real errors still surface.
+    from core.layers.cli.session import ClaudeStreamChunk
+    noise = ClaudeStreamChunk(
+        text="[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+        is_error=True,
+    )
+    assert cli_chunk_to_events(noise) == []
+    real = ClaudeStreamChunk(text="engine exploded", is_error=True)
+    assert [e.data["message"] for e in cli_chunk_to_events(real)
+            if e.type == "error"] == ["engine exploded"]
+
+
 # ---------------------------------------------------------------------------
 # Surfaced vs unsurfaced completions (task-producer review-turn decision)
 # ---------------------------------------------------------------------------
@@ -290,3 +307,64 @@ def test_post_turn_drain_resolve_is_unsurfaced():
               "task_id": "bD", "patch": {"status": "completed"}})
     assert bgreg.pending_count == 0
     assert bgreg.unsurfaced_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Nudge labels (2026-08-27 round): registration composes a model-facing label
+# so completion nudges can name WHICH job finished.
+# ---------------------------------------------------------------------------
+
+def test_bg_bash_nudge_label_composed_at_spawn():
+    # Claude: shell id FIRST (the handle the model saw in its Bash result and
+    # what BashOutput/KillShell take), then the real command for recognition.
+    sid = "s-bg-label"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, _bash_tool_call(
+        0, "tuL",
+        '{"command":"sleep 5 && echo X","description":"bg sleep","run_in_background":true}',
+    ))
+    _events(t, [_sys("task_started", task_id="bL1", tool_use_id="tuL",
+                     description="bg sleep", task_type="local_bash")])
+    assert get_bg_command_registry(sid).label_for("bL1") == "bL1 — sleep 5 && echo X"
+
+
+def test_bg_bash_label_falls_back_to_description():
+    # No staged command (replay edge) → the description still names the job.
+    sid = "s-bg-label-desc"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, [_sys("task_started", task_id="b9x", tool_use_id="tu9x",
+                     description="mystery job", task_type="local_bash")])
+    assert get_bg_command_registry(sid).label_for("b9x") == "b9x — mystery job"
+
+
+def test_subagent_label_from_task_started():
+    # CLI subagents: description + the agentId the model holds as its
+    # SendMessage handle.
+    sid = "s-sub-label"
+    t = ClaudeCLIEventTranslator(sid)
+    _events(t, [_sys("task_started", task_id="a1b2c3", tool_use_id="tuA",
+                     description="probe auth flow", task_type="local_agent")])
+    assert get_subagent_registry(sid).label_for("a1b2c3") == '"probe auth flow" [a1b2c3]'
+
+
+def test_label_helpers():
+    from core.events.bg_command_state import shorten_label
+    from core.events.pump_bg_monitors import format_job_list
+    assert shorten_label("a\n  b\tc") == "a b c"
+    capped = shorten_label("x" * 100)
+    assert len(capped) == 80 and capped.endswith("…")
+    assert format_job_list([]) == ""
+    assert format_job_list(["", ""]) == ""            # all-empty → count-only nudge
+    assert format_job_list(["a", "", "b"]) == "a; b"  # empties dropped, not counted
+    assert format_job_list(["a", "b", "c", "d", "e"]) == "a; b; c (+2 more)"
+
+
+def test_registry_reset_keeps_pending_labels():
+    sid = "s-label-reset"
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("p1", "t1", label="p1 — keep")
+    bgreg.register_spawn("d1", "t2", label="d1 — drop")
+    bgreg.mark_done("d1")
+    bgreg.reset()
+    assert bgreg.label_for("p1") == "p1 — keep"
+    assert bgreg.label_for("d1") == ""

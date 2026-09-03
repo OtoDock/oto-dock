@@ -1,18 +1,20 @@
 # `scripts/`
 
 Repo-wide tooling — scripts that operate across the whole OtoDock stack rather
-than inside any single service (`proxy/`, `dashboard/`, `audio/`). They live at the repo root alongside the other whole-stack artifacts
+than inside any single service (`proxy/`, `dashboard/`, `phone/`, `satellite/`,
+`audio/`). They live at the repo root alongside the other whole-stack artifacts
 (`docker-compose*.yml`, `VERSIONS.md`, `config.env.example`).
 
 ## Install / host setup
 
 | Script | Purpose | Consumed by |
 |--------|---------|-------------|
-| `install.sh` | One-command bootstrap for the Docker quick start: preflights Docker/Compose, installs into the directory it is run from (refuses `$HOME`; `OTODOCK_DIR` honored as a legacy override), writes `.env` with a generated Postgres password, handles the Ubuntu 24.04+ userns step (fetches + runs `setup-apparmor-userns.sh` under one sudo prompt), fetches the release-pinned `docker-compose.yml` and starts the stack. Fresh installs only — refuses to touch an existing one; idempotent on re-run after a stop. | self-host operators (fetched raw from GitHub, per the README quick start) |
-| `install-baseline-tools.sh` | Installs the baseline dev toolchain (git, gh, python+uv, node+pnpm, ripgrep, …) every agent sandbox expects. | the platform `proxy/Dockerfile` |
-| `install-baseline-tools.ps1` | Windows (winget) equivalent of the above. | Windows hosts |
+| `install.sh` | One-command bootstrap for the Docker quick start: preflights Docker/Compose, installs into the directory it is run from (refuses `$HOME`; `OTODOCK_DIR` honored as a legacy override), writes `.env` with a generated Postgres password, handles the Ubuntu 24.04+ userns step (fetches + runs `setup-apparmor-userns.sh` under one sudo prompt), fetches the release-pinned `docker-compose.yml` + the phone overlay (enabled via `COMPOSE_FILE` in the generated `.env`; remove it from that line to opt out) and starts the stack. Fresh installs only — refuses to touch an existing one; idempotent on re-run after a stop. | self-host operators (fetched raw from GitHub, per the README quick start) |
+| `install-baseline-tools.sh` | Installs the baseline dev toolchain (git, gh, python+uv, node+pnpm, ripgrep, …) every agent sandbox expects. | `satellite/install.sh`, the platform `proxy/Dockerfile` |
+| `install-baseline-tools.ps1` | Windows (winget) equivalent of the above, for Windows satellite hosts. | `satellite/install.ps1` |
 | `oto-git-credential-helper` | Git credential helper that feeds `GH_TOKEN` (from the github-mcp manifest's `env_injection`) to `git push`/`fetch` for `github.com` only. Installed into `/usr/local/bin` + wired into `/etc/gitconfig`. | installed by `install-baseline-tools.sh`; relied on by `proxy/core/sandbox/sandbox.py` |
 | `setup-apparmor-userns.sh` | One-time host setup for Ubuntu 24.04+ (`kernel.apparmor_restrict_unprivileged_userns=1`): installs + loads the scoped `otodock_userns` AppArmor profile so the containerised proxy can create the unprivileged user namespaces the agent sandbox is built on — WITHOUT disabling the system-wide hardening. Self-contained (the pull-only compose flow fetches just this file); idempotent; no-ops on hosts without the restriction. | self-host operators (`sudo`); run automatically by `compose.sh` when needed |
+| `sandbox-doctor.sh` | Read-only sandbox diagnosis (no root, writes nothing): host facts (userns sysctls, AppArmor profiles, tool versions) + the namespace probe ladder — `unshare -Urn`, one-level bwrap with the session flags, nested bwrap, Codex's npm-vendored bwrap — ending in a copy-paste report block. Run on the host (T1) or `docker exec` into the proxy container (T2/T3) when sessions report "sandbox unavailable". | self-host operators; named by the proxy's boot/session sandbox warnings |
 
 ## Compose / version pinning (self-host)
 
@@ -38,4 +40,5 @@ than inside any single service (`proxy/`, `dashboard/`, `audio/`). They live at 
 
 | Script | Purpose | Consumed by |
 |--------|---------|-------------|
+| `sync-satellite-code.sh` | Vendors the shared proxy modules into `satellite/_vendored/` (byte-identical copies) and updates the `SHARED_*_HASH` constants in `satellite/config.py` so the satellite detects drift at import. **Run this after editing any shared module — never edit the vendored copies directly.** | maintainers |
 | `loadtest_sessions.py` | Concurrency load-test + memory/CPU calibration harness for the live-RAM admission gates (`SESSION_EST_*_MB` in `proxy/config.py`). Spawns K concurrent sessions through the real dashboard WebSocket and measures the proxy process tree. | maintainers (sizing/calibration) |

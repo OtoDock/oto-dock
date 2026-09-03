@@ -4,6 +4,7 @@ import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask } f
 import { formatNextRun, formatCronDescription, formatIntervalDescription } from '../../lib/format'
 import { useAuth } from '../../contexts/AuthContext'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
+import { TaskModelChip } from '../../components/common/TaskModelChip'
 
 export default function AgentSchedules() {
   const { name } = useParams<{ name: string }>()
@@ -99,7 +100,10 @@ export default function AgentSchedules() {
                 <tr key={task.id} className="border-b border-p-border-light hover:bg-p-surface-hover">
                   <td className="px-4 py-3">
                     <div className="font-medium text-p-text">{task.name}</div>
-                    <div className="text-xs text-p-text-light font-mono">{task.id}</div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                      <TaskModelChip task={task} />
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-xs text-p-text-secondary">
                     <div>{formatIntervalDescription(task.interval_seconds) || formatCronDescription(task.schedule) || task.run_at || (task.delay_seconds != null ? `in ${task.delay_seconds}s` : '\u2014')}</div>
@@ -183,7 +187,10 @@ export default function AgentSchedules() {
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-sm font-medium text-p-text">{task.name}</p>
-                <p className="text-xs text-p-text-light font-mono mt-0.5">{task.id}</p>
+                <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                  <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                  <TaskModelChip task={task} />
+                </div>
               </div>
               <div className="flex gap-1">
                 <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${

@@ -1,0 +1,66 @@
+{
+  "name": "browser-control",
+  "server_name": "local",
+  "label": "Local Browser",
+  "description": "Drive a real, logged-in Chrome/Edge on this machine (Playwright). The agent navigates, reads the page's accessibility tree, clicks, types, and fills forms on sites you're signed into \u2014 using a DEDICATED browser profile you log into once, never your everyday one.",
+  "version": "0.0.78",
+  "category": "custom",
+  "server": {
+    "runtime": "node",
+    "transport": "stdio",
+    "command": "node",
+    "args": [
+      "index.js"
+    ],
+    "source": "npm:@playwright/mcp@0.0.76"
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "config": [
+    {
+      "key": "OTO_BROWSER_CHANNEL",
+      "label": "Browser channel",
+      "input_type": "text",
+      "default": "auto",
+      "user_overridable": true,
+      "help": "auto (default) = the wrapper detects an installed browser on EACH machine and uses it \u2014 Google Chrome or Microsoft Edge via their system channel, or a Chromium-family browser (Brave, Vivaldi, Opera, Chromium) via its executable. Set an explicit value to force one: chrome, msedge, chromium, firefox, or webkit. Note: firefox/webkit use Playwright's OWN downloaded builds (a one-time ~80MB install on that machine), not your system Firefox. The agent always uses a dedicated per-agent profile under ~/.oto-dock/browser-profiles/<agent>/, never your personal one."
+    }
+  ],
+  "env": {
+    "PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*;https://localhost:*;http://127.0.0.1:*;https://127.0.0.1:*"
+  },
+  "agent_env": {},
+  "assignment_mode": "auto",
+  "placement": "satellite_only",
+  "requires_display": true,
+  "device_capability": "browser",
+  "exclude_from": [],
+  "system_requirements": {
+    "notes": "Requires Google Chrome or Microsoft Edge installed on the machine (Playwright drives the system browser via its channel \u2014 there is NO separate Playwright browser download). Node 18+ is required (the platform ships Node). The MCP launches a HEADED window on the user's display for the one-time sign-in, so the machine needs a reachable graphical session: on Linux an X11 or Wayland session must be present \u2014 a headless / linger-only `systemd --user` service has no display and the framework's requires_display gate withholds this MCP there; macOS and Windows per-user services have a display. The dedicated browser profile lives at ~/.oto-dock/browser-profiles/<agent>/ (outside this MCP's directory and outside the synced workspace, so logins survive MCP updates and never leave the machine). The capture-studio tool family (studio_*) is Linux-only and additionally needs Xvfb + xsetroot and ffmpeg/ffprobe (~/tools/bin or $FFMPEG); audio capture needs PulseAudio (pactl/parec/paplay). The studio runs on its OWN virtual display and profile (~/.oto-dock/capture-studio/<agent>/) \u2014 it never records or touches the everyday browser."
+  },
+  "skills": [
+    {
+      "id": "browser-control-usage",
+      "loading": "always",
+      "file": "skills/browser-control.md",
+      "description": "How to drive the logged-in browser: the snapshot-then-act loop, signing in once on the dedicated profile, the origin limits, the headed-on-your-display behavior, and the shared long-lived browser window sessions attach to.",
+      "default_exclude_from": []
+    },
+    {
+      "id": "capture-studio-usage",
+      "loading": "on_demand",
+      "file": "skills/capture-studio-usage/SKILL.md",
+      "description": "Staged screen recordings with the studio_* tools: the take workflow (start → stage → record → perform → stop → cut with video-tools), pointer styles (real X cursor / DOM arrow / touch fingertip), zoom and coordinate traps handled internally, and audio capture.",
+      "default_exclude_from": []
+    }
+  ],
+  "permissions": {
+    "default_tier": "sensitive"
+  },
+  "device_high_risk_tools": [
+    "browser_run_code_unsafe"
+  ],
+  "patched": false,
+  "patch_note": null
+}

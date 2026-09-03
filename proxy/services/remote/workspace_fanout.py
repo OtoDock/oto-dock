@@ -304,13 +304,6 @@ async def fan_out_write(
         )
         if idle:
             machines = list(set(machines) | set(idle))
-    if not machines:
-        return
-    from core.remote.satellite_connection import get_connection_manager
-    from services.path_policy_v2 import PathRef
-    cm = get_connection_manager()
-    ref = PathRef("agent_tree", rel_path)
-
     from core.remote import transfer_registry
     from core.remote.file_sync import MAX_CHUNK_SIZE
     if isinstance(source, (bytes, bytearray)):
@@ -320,6 +313,23 @@ async def fan_out_write(
             size = source.stat().st_size
         except OSError:
             size = 0
+    if not machines:
+        if transfer_id is not None:
+            # The caller promised the client a tracked push (the cheap
+            # candidate gate said yes) but the precise target set is empty —
+            # register it with no rows so the registry emits the terminal
+            # the client is waiting for, instead of returning silently.
+            await transfer_registry.begin(
+                agent_slug, rel_path, kind=transfer_kind, bytes_total=size,
+                machine_ids=[], transfer_id=transfer_id,
+                origin_user_sub=origin_user_sub,
+            )
+        return
+    from core.remote.satellite_connection import get_connection_manager
+    from services.path_policy_v2 import PathRef
+    cm = get_connection_manager()
+    ref = PathRef("agent_tree", rel_path)
+
     tid: str | None = None
     if transfer_id is not None or size > MAX_CHUNK_SIZE:
         tid = await transfer_registry.begin(
@@ -542,3 +552,20 @@ async def propagate_write(
         await fan_out_write(
             agent_slug, rel_path, content, exclude_machine_id=exclude_machine_id,
         )
+    # Knowledge-library projection (outside the lock — the projector takes
+    # its own per-source lock): Collabora/file-tools writes into a promoted
+    # source's knowledge propagate to consumer mirrors; RW mirror edits flow
+    # back to the source. RO mirrors never mint edit tokens, so no gate here.
+    if rel_path.startswith("knowledge/"):
+        from services.knowledge import library_projector
+        parsed = library_projector.parse_library_rel(rel_path)
+        if parsed is not None:
+            _src, _sub = parsed
+            if _sub:
+                asyncio.create_task(
+                    library_projector.propagate_mirror_write(
+                        agent_slug, _src, _sub))
+        else:
+            asyncio.create_task(
+                library_projector.propagate_source_write(
+                    agent_slug, rel_path[len("knowledge/"):]))

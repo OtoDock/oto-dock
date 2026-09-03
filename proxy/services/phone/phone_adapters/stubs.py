@@ -2,10 +2,10 @@
 
 Selecting one of these in the dashboard is graceful — every method degrades
 cleanly instead of crashing — so the UI can offer the full provider list now
-while the real implementations land incrementally (Twilio / 3CX = future;
-Asterisk + FreePBX are real). A stub server can never reach ``verified`` (verify returns
-``failed``), so the route cascade never actually calls ``provision_route`` on
-one; it raises defensively anyway.
+while the real implementations land incrementally (3CX = future; Asterisk,
+FreePBX and Twilio are real). A stub server can never reach ``verified``
+(verify returns ``failed``), so the route cascade never actually calls
+``provision_route`` on one; it raises defensively anyway.
 """
 
 from __future__ import annotations
@@ -42,12 +42,6 @@ class _StubAdapter(PhoneServerAdapter):
     async def deprovision_route(self, route: dict) -> None:
         # Deleting a never-provisioned route must not explode.
         return None
-
-
-class TwilioStubAdapter(_StubAdapter):
-    adapter_type = "twilio"
-    label = "Twilio"
-    requires_bootstrap = False
 
 
 class ThreeCxStubAdapter(_StubAdapter):

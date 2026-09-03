@@ -34,6 +34,7 @@ class _Entry:
     role: str
     exec_path: str
     ts: float
+    model: str = ""
 
 
 _entries: dict[str, _Entry] = {}
@@ -41,12 +42,13 @@ _lock = asyncio.Lock()
 
 
 async def register(session_id: str, *, agent: str, user_sub: str = "",
-                   role: str = "manager", exec_path: str = "") -> None:
+                   role: str = "manager", exec_path: str = "",
+                   model: str = "") -> None:
     """Record a freshly pre-warmed (not-yet-claimed) session as reapable."""
     async with _lock:
         _entries[session_id] = _Entry(
             agent=agent, user_sub=user_sub, role=role or "manager",
-            exec_path=exec_path, ts=time.monotonic(),
+            exec_path=exec_path, ts=time.monotonic(), model=model,
         )
 
 
@@ -56,6 +58,23 @@ async def claim(session_id: str) -> bool:
     reaped / never registered (the caller must spawn fresh)."""
     async with _lock:
         return _entries.pop(session_id, None) is not None
+
+
+async def claim_by_key(*, user_sub: str, agent: str, model: str,
+                       role: str, exec_path: str) -> tuple[str, float] | None:
+    """Atomically claim a pre-warm by its full match key — the recovery path
+    for DETACHED pre-warms (wake-word detection fires an HTTP pre-warm with no
+    WS connection to remember the sid on). Returns ``(session_id, age_s)`` or
+    None. Model is part of the key because CLI sessions spawn with ``--model``
+    and can't swap; role because the SecurityContext is baked at start."""
+    async with _lock:
+        for sid, e in _entries.items():
+            if (e.user_sub == user_sub and e.agent == agent
+                    and e.model == model and e.role == (role or "manager")
+                    and e.exec_path == exec_path):
+                _entries.pop(sid, None)
+                return sid, time.monotonic() - e.ts
+    return None
 
 
 async def discard(session_id: str) -> None:

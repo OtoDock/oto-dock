@@ -276,15 +276,22 @@ async def install_from_extracted_template(
         installer_role=installer_role,
         batch_id=batch_id,
     )
-    # If no requests landed, the batch_id is meaningless — null it out for
-    # the response envelope.
-    if not cascade["created_requests"]:
-        batch_id = None
+    # 4b. Skill packages: admins install-if-missing directly; managers get a
+    # ``kind: "skill"`` request queued for anything not yet installed
+    # (request-flow parity with MCPs, 2026-08-27 — preflight no longer
+    # hard-fails them). Assign to the agent + seed skill rows for whatever
+    # is ready. Per-package failures never abort the agent install.
+    skill_results = await _cascade_skill_packages(
+        template, target_slug,
+        installer_user_sub=installer_user_sub,
+        installer_role=installer_role,
+        batch_id=batch_id,
+    )
 
-    # 4b. Skill packages: install (admin-only reaches an uninstalled one —
-    # preflight blocks managers there), assign to the agent, seed skill rows.
-    # Per-package failures never abort the agent install.
-    skill_results = await _cascade_skill_packages(template, target_slug)
+    # If no requests landed (MCP or skill), the batch_id is meaningless —
+    # null it out for the response envelope.
+    if not cascade["created_requests"] and not skill_results.get("requested"):
+        batch_id = None
 
     # 4c. Core MCPs. The manifest only declares what the agent SPECIFICALLY
     # needs; core MCPs (memory, schedules, display…) belong to every agent
@@ -309,7 +316,7 @@ async def install_from_extracted_template(
         except Exception:
             logger.exception("core-MCP assign failed for %s", target_slug)
 
-    # 5. Seed tasks / triggers / notifications.
+    # 5. Seed tasks / triggers / notifications / dashboards.
     seeded_tasks = await asyncio.to_thread(
         _seed_tasks, target_slug, template, installer_user_sub,
     )
@@ -318,6 +325,9 @@ async def install_from_extracted_template(
     )
     seeded_notifs = await asyncio.to_thread(
         _seed_notifications, target_slug, template, installer_user_sub,
+    )
+    seeded_dashboards = await asyncio.to_thread(
+        _seed_dashboards, target_slug, template, installer_user_sub,
     )
 
     # 6. Copy context/ + setup.md. Apply variable substitution to setup.md
@@ -358,6 +368,7 @@ async def install_from_extracted_template(
         "seeded_tasks": seeded_tasks,
         "seeded_triggers": seeded_triggers,
         "seeded_notifications": seeded_notifs,
+        "seeded_dashboards": seeded_dashboards,
         "copied_context": copied_context,
         "setup_md_copied": setup_copied,
         "skill_packages": skill_results,
@@ -418,12 +429,12 @@ async def _preflight_check_skill_packages(
 ) -> None:
     '''Raise 400 when a required skill package can't be satisfied.
 
-    Two failure modes, checked before any agent state exists:
-    - not installed AND not in the skills catalog → ``missing_skills``;
-    - not installed AND the installer is not admin → standalone skill
-      package installs are admin-only, so the manager gets an explicit
-      "ask an admin to install X first" instead of a half-functional agent
-      (request-flow parity with MCPs is a deliberate non-goal for now).
+    One failure mode, checked before any agent state exists: not installed
+    AND not in the skills catalog → ``missing_skills`` (nobody could
+    satisfy it). Everything else proceeds: admins install-if-missing in the
+    cascade; non-admin installers get a ``kind: "skill"`` request queued
+    per missing package (request-flow parity with MCPs, 2026-08-27 — the
+    old ``skills_require_admin`` hard-fail is gone).
     '''
     if not required:
         return
@@ -463,27 +474,20 @@ async def _preflight_check_skill_packages(
             },
         )
 
-    if installer_role != "admin":
-        needs_install = [
-            r.name for r in required if r.name not in installed_names
-        ]
-        if needs_install:
-            raise HTTPException(
-                400,
-                detail={
-                    "error": "skills_require_admin",
-                    "missing": needs_install,
-                    "message": (
-                        "Skill package installs are admin-only. Ask an admin "
-                        "to install from Browse Community Skills first: "
-                        + ", ".join(needs_install)
-                    ),
-                },
-            )
+async def _cascade_skill_packages(
+    template, target_slug: str, *,
+    installer_user_sub: str = "",
+    installer_role: str = "admin",
+    batch_id: str | None = None,
+) -> dict:
+    '''Satisfy each required skill package for the new agent.
 
-
-async def _cascade_skill_packages(template, target_slug: str) -> dict:
-    '''Install-if-missing + assign + seed each required skill package.
+    Installed → assign + seed (any installer). Not installed → an ADMIN
+    installer catalog-installs inline; a manager installer files a
+    ``kind: "skill"`` request tagged with the install's ``batch_id``
+    (request-flow parity with MCPs — approval installs + assigns + seeds
+    default-on rows; the template's per-skill config applies only on the
+    direct path, a documented divergence).
 
     Assignment (``add_agent_mcp``) is what makes the package's skills reach
     the session prompt — ``get_skills_for_agent`` only surfaces skills of
@@ -496,10 +500,28 @@ async def _cascade_skill_packages(template, target_slug: str) -> dict:
 
     ready: list[str] = []
     failed: list[dict] = []
+    requested: list[dict] = []
     for req in template.skill_packages:
         try:
             manifest = await asyncio.to_thread(mcp_registry.get_manifest, req.name)
             if manifest is None:
+                if installer_role != "admin":
+                    if not installer_user_sub:
+                        failed.append({
+                            "name": req.name,
+                            "error": "not installed and no requester identity",
+                        })
+                        continue
+                    from storage import mcp_request_store
+                    row = await asyncio.to_thread(
+                        mcp_request_store.create_request,
+                        req.name, target_slug, installer_user_sub,
+                        f"Required by community agent template '{template.slug}'",
+                        batch_id,
+                        "skill",
+                    )
+                    requested.append(row)
+                    continue
                 from services.community import skills_installer
                 await skills_installer.install_skill_package_from_catalog(req.name)
             await asyncio.to_thread(mcp_store.add_agent_mcp, target_slug, req.name)
@@ -516,7 +538,7 @@ async def _cascade_skill_packages(template, target_slug: str) -> dict:
                 "skill package %s failed for %s", req.name, target_slug,
             )
             failed.append({"name": req.name, "error": f"{type(exc).__name__}: {exc}"})
-    return {"ready": ready, "failed": failed}
+    return {"ready": ready, "failed": failed, "requested": requested}
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +614,107 @@ def _substitute_template_vars(content: str, agent_slug: str) -> str:
     don't accidentally chew up other braces in markdown/code fences.
     """
     return content.replace("{agent_slug}", agent_slug)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard seeding (S5 — template-shipped mini-app dashboards)
+# ---------------------------------------------------------------------------
+
+def _seed_dashboards(
+    agent_slug: str, template: CommunityAgentTemplate,
+    installer_user_sub: str | None,
+) -> int:
+    """Materialize template dashboards: a source copy under
+    ``config/community/dashboards/`` (the late-joiner seed source — the
+    persisted template dict carries metadata only), then the pins —
+    "agent" visibility = ONE shared row + ``workspace/apps/`` file for the
+    whole team; "user" visibility = the INSTALLER's personal pin now (later
+    joiners ride ``on_user_added_to_agent``). Pins are HTML-only (actions
+    ``[]`` — zero approval surface; the agent can re-pin with actions
+    later) and idempotent by the pinned_apps ``(agent, username, slug)``
+    upsert key. Returns the number of pins created."""
+    if not template.dashboards:
+        return 0
+    import config as app_config
+    from storage import database as task_store
+
+    agent_dir = app_config.get_agent_dir(agent_slug)
+    src_dir = agent_dir / "config" / "community" / "dashboards"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for item in template.dashboards:
+        html = _substitute_template_vars(item.html or "", agent_slug)
+        if not html.strip():
+            logger.warning("dashboard %s: empty html — skipped", item.slug)
+            continue
+        (src_dir / f"{item.slug}.html").write_text(html, encoding="utf-8")
+        if item.visibility == "agent":
+            target = agent_dir / "workspace" / "apps" / f"{item.slug}.html"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(html, encoding="utf-8")
+            task_store.upsert_app(
+                agent_slug, "", None, item.slug,
+                title=item.title,
+                rel_path=f"workspace/apps/{item.slug}.html",
+                actions_json="[]",
+            )
+            count += 1
+        elif installer_user_sub:
+            count += _pin_user_dashboard(
+                agent_slug, item.slug, item.title, html, installer_user_sub,
+            )
+    return count
+
+
+def _pin_user_dashboard(
+    agent_slug: str, slug: str, title: str, html: str, user_sub: str,
+) -> int:
+    """One per-user dashboard pin: the file under
+    ``users/<u>/workspace/apps/`` + a personal pinned_apps row. Returns 1
+    on success, 0 when the sub has no username row (nothing to anchor)."""
+    import config as app_config
+    from storage import database as task_store
+
+    username = task_store.get_username_by_sub(user_sub)
+    if not username:
+        return 0
+    agent_dir = app_config.get_agent_dir(agent_slug)
+    target = agent_dir / "users" / username / "workspace" / "apps" / f"{slug}.html"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(html, encoding="utf-8")
+    task_store.upsert_app(
+        agent_slug, username, user_sub, slug,
+        title=title or slug,
+        rel_path=f"users/{username}/workspace/apps/{slug}.html",
+        actions_json="[]",
+    )
+    return 1
+
+
+def _seed_dashboards_for_user(
+    agent_slug: str, template: CommunityAgentTemplate, user_sub: str,
+) -> int:
+    """Late-joiner seed for "user"-visibility dashboards flagged
+    ``auto_pin_for_new_users``. HTML is re-read from the install-time copy
+    under ``config/community/dashboards/`` (already slug-substituted).
+    Re-fires upsert idempotently; a user's OWN per-user hide of a shared
+    template dashboard is never touched (different table)."""
+    import config as app_config
+
+    count = 0
+    src_dir = (app_config.get_agent_dir(agent_slug)
+               / "config" / "community" / "dashboards")
+    for item in template.dashboards:
+        if item.visibility != "user" or not item.auto_pin_for_new_users:
+            continue
+        src = src_dir / f"{item.slug}.html"
+        if not src.is_file():
+            continue
+        count += _pin_user_dashboard(
+            agent_slug, item.slug, item.title,
+            src.read_text(encoding="utf-8"), user_sub,
+        )
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +837,28 @@ async def _cascade_required_mcps(
             await asyncio.to_thread(mcp_store.add_agent_mcp, target_slug, mcp_name)
             await _seed_skills_for_mcp(target_slug, mcp_name, req.skills)
             ready_mcps.append(mcp_name)
+            continue
+        if installer_role == "admin" and installer_user_sub:
+            # Zero instances. Run the same inline-approve the not-installed
+            # branch uses so this terminates in the SAME state as its
+            # sibling (install step skipped, needs-instance guidance on the
+            # request row). Previously this queued a plain ``pending`` row
+            # the admin then had to approve at themself, while the
+            # not-installed variant of the identical situation surfaced as
+            # a guided failure — one situation, two presentations.
+            row = await _admin_inline_install(
+                mcp_name=mcp_name,
+                target_slug=target_slug,
+                installer_user_sub=installer_user_sub,
+                reason=(
+                    f"Required by community agent template "
+                    f"'{template.slug}' v{template.version}"
+                ),
+                batch_id=batch_id,
+            )
+            created_requests.append(row)
+            if row["status"] == "installed":
+                ready_mcps.append(mcp_name)
             continue
         if installer_user_sub:
             row = await asyncio.to_thread(
@@ -1146,8 +1291,10 @@ def on_user_added_to_agent(
 ) -> dict[str, int]:
     """Seed per-user template items when a user joins a community-agent template.
 
-    Called from:
-    - ``database.set_user_agents`` whenever a new (sub, agent) row lands.
+    Called from the ASSIGNMENT CALL SITES (the storage fns themselves never
+    fire it):
+    - ``api/auth/admin_users.py`` — the admin assignment PUT (per added
+      agent) and the additive POST (the agents-map "add me" CTA).
     - ``services.community.default_agent_assigner.assign_default_agents`` after the
       auto-attach insert.
     - ``POST /v1/admin/agents/{slug}/reseed-template-items`` for recovery.
@@ -1165,7 +1312,7 @@ def on_user_added_to_agent(
     user_setup = seed_user_setup_file(agent_slug, user_sub) if seed_user_setup else 0
 
     empty = {"tasks": 0, "triggers": 0, "notifications": 0,
-             "user_setup": user_setup}
+             "dashboards": 0, "user_setup": user_setup}
     agent = agent_store.get_agent(agent_slug)
     if not agent or not agent.get("community_template"):
         return empty
@@ -1184,6 +1331,7 @@ def on_user_added_to_agent(
         "tasks": _seed_tasks_for_user(agent_slug, template, user_sub, role),
         "triggers": _seed_triggers_for_user(agent_slug, template, user_sub, role),
         "notifications": _seed_notifs_for_user(agent_slug, template, user_sub, role),
+        "dashboards": _seed_dashboards_for_user(agent_slug, template, user_sub),
         "user_setup": user_setup,
     }
 

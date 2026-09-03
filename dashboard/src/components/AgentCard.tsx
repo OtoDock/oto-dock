@@ -12,9 +12,12 @@ interface Props {
   agent: AgentSummary
   isDefault: boolean
   onSetDefault: (name: string) => void
+  /** Department role (level name) when the card renders inside a
+   *  department group on the grid — e.g. "Head", "Senior". */
+  roleLabel?: string
 }
 
-export default function AgentCard({ agent, isDefault, onSetDefault }: Props) {
+export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }: Props) {
   // If agent has a remote target configured, look up the live status so the
   // badge reflects reality (admin-visible). The query is role-gated inside
   // useRemoteMachines — non-admins never hit the admin endpoint and get no
@@ -87,8 +90,18 @@ export default function AgentCard({ agent, isDefault, onSetDefault }: Props) {
           {agent.display_name && agent.display_name !== agent.name && (
             <span className="text-xs text-p-text-light truncate block">{agent.name}</span>
           )}
-          <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs text-p-text-secondary bg-p-surface">
-            {MODE_LABEL[mode]}
+          <span className="flex items-center gap-1.5 flex-wrap">
+            <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs text-p-text-secondary bg-p-surface">
+              {MODE_LABEL[mode]}
+            </span>
+            {roleLabel && (
+              // The bordered house label badge (DepartmentsEditor's
+              // "View only" / the AI-engines provider tag) — bg-p-bg so it
+              // stays visible against the card's own dark:bg-p-surface.
+              <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+                {roleLabel}
+              </span>
+            )}
           </span>
         </div>
       </div>

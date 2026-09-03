@@ -156,6 +156,48 @@ class TestCodexSwap:
 
 
 # --------------------------------------------------------------------------
+# Codex TOML session_id injection
+# --------------------------------------------------------------------------
+
+class TestCodexSessionIdInjection:
+    def test_plain_url_gets_query(self):
+        from core.layers.codex.layer import _inject_session_id_toml
+
+        toml = '[mcp_servers.file-tools]\nurl = "http://localhost:8932/mcp/"\n'
+        out = _inject_session_id_toml(toml, "sess-1")
+        assert 'url = "http://localhost:8932/mcp/?session_id=sess-1"' in out
+
+    def test_existing_query_appends_with_ampersand(self):
+        # The bug this closes: the old regex always appended "?", corrupting a
+        # URL that already carried a query string into a double-"?" URL.
+        from core.layers.codex.layer import _inject_session_id_toml
+
+        toml = '[mcp_servers.vendor]\nurl = "https://mcp.example.com/mcp?api_key=k1"\n'
+        out = _inject_session_id_toml(toml, "sess-2")
+        assert 'url = "https://mcp.example.com/mcp?api_key=k1&session_id=sess-2"' in out
+        assert out.count("?") == 1
+
+    def test_stale_session_id_replaced_not_duplicated(self):
+        from core.layers.codex.layer import _inject_session_id_toml
+
+        toml = '[mcp_servers.file-tools]\nurl = "http://localhost:8932/mcp/?session_id=old"\n'
+        out = _inject_session_id_toml(toml, "sess-3")
+        assert "session_id=old" not in out
+        assert out.count("session_id=") == 1
+        assert "session_id=sess-3" in out
+
+    def test_non_url_lines_untouched(self):
+        from core.layers.codex.layer import _inject_session_id_toml
+
+        toml = (
+            '[mcp_servers.display]\n'
+            'command = "python"\n'
+            'args = ["display_mcp.py"]\n'
+        )
+        assert _inject_session_id_toml(toml, "s") == toml
+
+
+# --------------------------------------------------------------------------
 # CLI swap
 # --------------------------------------------------------------------------
 

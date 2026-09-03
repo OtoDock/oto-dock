@@ -236,7 +236,7 @@ def test_resume_username_task_chat_agent_scope(monkeypatch):
     )
     monkeypatch.setattr(
         dashboard, "resolve_task_identity",
-        lambda agent, scope, created_by: SimpleNamespace(username=""),
+        lambda agent, scope, created_by, **kw: SimpleNamespace(username=""),
     )
     assert dashboard._resume_username_for_chat("task-r1", "agent-1", "alice") == ""
 
@@ -250,7 +250,7 @@ def test_resume_username_task_chat_user_scope(monkeypatch):
     )
     monkeypatch.setattr(
         dashboard, "resolve_task_identity",
-        lambda agent, scope, created_by: SimpleNamespace(username="bob"),
+        lambda agent, scope, created_by, **kw: SimpleNamespace(username="bob"),
     )
     assert dashboard._resume_username_for_chat("task-r1", "agent-1", "alice") == "bob"
 

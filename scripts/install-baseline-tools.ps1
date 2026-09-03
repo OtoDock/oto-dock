@@ -1,7 +1,7 @@
 # Oto Dock baseline dev tooling installer -- Windows.
 #
 # Parallel to scripts/install-baseline-tools.sh. Single source of truth
-# for what a Windows host needs:
+# for what a Windows satellite host needs:
 #   Tier 1 (always): git, gh, python3 + pipx, node + npm + pnpm, uv,
 #                    jq, ripgrep, curl (built-in on Win10+)
 #   CLIs:    claude (npm), codex (npm)
@@ -322,8 +322,37 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.220' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.145.0' }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.258' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.149.1' }
+
+    function Test-ResolvedCli {
+        # After an install/upgrade, verify what the shell NOW resolves for the
+        # bare name. npm placed the pinned copy in its prefix, but PATH may
+        # still resolve another install (e.g. the vendor's standalone
+        # installer) — the upgrade then silently changes nothing for anything
+        # that spawns the bare name. Warn with every resolvable copy.
+        param([string]$Label, [string]$Bin, [string]$Want)
+        $now = $null
+        $winner = Get-Command $Bin -ErrorAction SilentlyContinue
+        if ($winner) {
+            $verOut = (& $winner.Source --version 2>$null | Out-String)
+            if ($verOut -match '(\d+\.\d+\.\d+)') { $now = $Matches[1] }
+        }
+        if ($now -eq $Want) {
+            Write-Host "[baseline]   $Label resolves at pinned $Want" -ForegroundColor Green
+            return
+        }
+        $nowText = if ($now) { $now } else { 'nothing' }
+        Write-Warning "$Label`: '$Bin' still resolves $nowText - want $Want. Another install shadows the pinned copy on PATH:"
+        foreach ($c in @(Get-Command $Bin -All -ErrorAction SilentlyContinue)) {
+            $v = $null
+            $o = (& $c.Source --version 2>$null | Out-String)
+            if ($o -match '(\d+\.\d+\.\d+)') { $v = $Matches[1] }
+            $vText = if ($v) { $v } else { 'unknown' }
+            Write-Warning "  $($c.Source) ($vText)"
+        }
+        Write-Warning "Remove or upgrade the shadowing copy so '$Bin' resolves $Want."
+    }
 
     function Install-PinnedCli {
         # Install OR upgrade an npm-global CLI to the EXACT pinned version.
@@ -341,7 +370,11 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
             Write-Host "[baseline] Installing $Label $Want..."
         }
         $spec = "$Pkg@$Want"
-        return (Invoke-Native -Name "$Label (npm)" -Cmd ({ npm install -g $spec }.GetNewClosure()))
+        $installed = (Invoke-Native -Name "$Label (npm)" -Cmd ({ npm install -g $spec }.GetNewClosure()))
+        if ($installed) {
+            Test-ResolvedCli -Label $Label -Bin ($BinCmd -replace '\.cmd$', '') -Want $Want
+        }
+        return $installed
     }
 
     if ($env:SKIP_CLAUDE_CLI -ne 'true') {

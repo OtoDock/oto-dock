@@ -212,6 +212,10 @@ _KEEP_AFTER_DELETE = {
     # Shared multi-agent meeting transcript — not owned by any single agent, so
     # deleting one participant must not erase the others' shared history.
     "meeting_turns",
+    # Call-log rows are historical records; ``agent`` is a display snapshot
+    # (like ``route_name``), not a live reference — the admin's call history
+    # must survive an agent deletion. Rows age out via 30-day retention.
+    "phone_call_log",
 }
 
 

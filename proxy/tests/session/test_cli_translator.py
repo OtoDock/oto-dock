@@ -453,3 +453,48 @@ def test_reset_for_settle_clears_parsing_state_keeps_spawn_count():
     assert t.agents_spawned == 3       # spawn count survives settle
     assert t._tool_inputs == {}         # parsing state cleared
     assert t.has_emitted_text is False
+
+
+def test_context_window_drift_warns_once_per_session(caplog):
+    """A CLI predating a model reports its default contextWindow for it; the
+    translator logs ONE warning per session — it is rebuilt every turn, so a
+    per-instance flag would fire once per turn instead."""
+    import logging
+
+    import config as app_config
+    from core.layers.cli import translator as tr
+
+    model_id = next(iter(app_config.MODEL_REGISTRY))
+    registry_win = app_config.MODEL_REGISTRY[model_id]["context_window"]
+    tr._ctx_window_warned.discard("s-drift")
+    result = {
+        "type": "result", "total_cost_usd": 0, "duration_ms": 0,
+        "modelUsage": {model_id: {"contextWindow": registry_win + 7}},
+    }
+    with caplog.at_level(logging.WARNING, logger="cli-translator"):
+        ClaudeCLIEventTranslator("s-drift").feed(dict(result))
+        ClaudeCLIEventTranslator("s-drift").feed(dict(result))  # next turn
+    warnings = [r for r in caplog.records if "context window" in r.message]
+    assert len(warnings) == 1
+    assert model_id in warnings[0].message
+
+
+def test_context_window_match_and_unknown_model_stay_silent(caplog):
+    import logging
+
+    import config as app_config
+    from core.layers.cli import translator as tr
+
+    model_id = next(iter(app_config.MODEL_REGISTRY))
+    registry_win = app_config.MODEL_REGISTRY[model_id]["context_window"]
+    tr._ctx_window_warned.discard("s-nodrift")
+    with caplog.at_level(logging.WARNING, logger="cli-translator"):
+        ClaudeCLIEventTranslator("s-nodrift").feed({
+            "type": "result", "total_cost_usd": 0, "duration_ms": 0,
+            "modelUsage": {model_id: {"contextWindow": registry_win}},
+        })
+        ClaudeCLIEventTranslator("s-custom").feed({
+            "type": "result", "total_cost_usd": 0, "duration_ms": 0,
+            "modelUsage": {"some-custom-model": {"contextWindow": 12345}},
+        })
+    assert not [r for r in caplog.records if "context window" in r.message]

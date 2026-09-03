@@ -38,6 +38,9 @@ jobs:
           - image: otodock-file-tools
             context: mcps/custom/file-tools-mcp
             dockerfile: mcps/custom/file-tools-mcp/Dockerfile
+          - image: otodock-phone
+            context: .
+            dockerfile: phone/Dockerfile
     steps:
       - uses: actions/checkout@v4
 

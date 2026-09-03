@@ -43,6 +43,7 @@ from storage import notification_store
 from services.scheduler import trigger_manager
 from services.infra import api_key_manager
 from auth.providers import UserContext, get_current_user, require_auth
+from core.session.visibility import nouser_read_targets
 
 logger = logging.getLogger("claude-proxy.triggers")
 router = APIRouter()
@@ -82,9 +83,17 @@ def _can_manage_trigger(trigger: dict, user: UserContext) -> bool:
     3-tier model:
       - Agent-scoped: manager (any) or editor (own only).
       - User-scoped: creator only (or admin).
+
+    Only the master key bypasses (``is_service``). A session JWT is
+    api-key-shaped but carries a real (or no-user) identity: a user-backed
+    session resolves the 3-tier model like a cookie caller, and a no-user
+    session may manage ONLY its own agent's agent-scope triggers.
     """
-    if user.is_admin or user.is_api_key:
+    if user.is_admin or user.is_service:
         return True
+    if user.is_no_user_session:
+        return (trigger.get("scope") == "agent"
+                and trigger.get("agent") == user.agent)
     scope = trigger.get("scope")
     if scope == "agent":
         if user.can_manage_agent(trigger["agent"]):
@@ -98,11 +107,20 @@ def _can_manage_trigger(trigger: dict, user: UserContext) -> bool:
 
 
 def _can_view_trigger(trigger: dict, user: UserContext) -> bool:
-    """Return True if the user can see this trigger in lists."""
-    if user.is_admin or user.is_api_key:
+    """Return True if the user can see this trigger (lists, detail).
+
+    Keyed on ``is_service``, not ``is_api_key`` — a session JWT must stay
+    inside its identity's reach (keying on ``is_api_key`` let any agent
+    session read AND test-fire any trigger by id). A NO-USER session
+    additionally sees the AGENT-SCOPE triggers of its delegation targets —
+    but test-fire has its own no-user own-agent pin (firing makes the
+    target's agent RUN; the edge is read-only)."""
+    if user.is_admin or user.is_service:
         return True
     if not user.can_access_agent(trigger["agent"]):
-        return False
+        if not (trigger.get("scope") == "agent"
+                and trigger["agent"] in nouser_read_targets(user)):
+            return False
     scope = trigger.get("scope")
     if scope == "agent":
         return True
@@ -123,13 +141,22 @@ def _check_trigger_mutation_authority(trigger: dict, user: UserContext) -> None:
     """
     acting = user.acting_sub
     if acting is None:
-        if user.is_no_user_session and trigger.get("scope") == "user":
+        if user.is_service:
+            return  # master key: full s2s
+        # No-user session: agent-scope management on ITS OWN agent only.
+        if trigger.get("scope") == "user":
             raise HTTPException(
                 403,
                 "This session has no user identity and cannot manage "
                 "user-scoped triggers.",
             )
-        return  # master key: full s2s; no-user: agent-scope management allowed
+        if trigger.get("agent") != user.agent:
+            raise HTTPException(
+                403,
+                "This session can only manage its own agent's triggers "
+                "(to change another agent, delegate to it).",
+            )
+        return
     scope = trigger.get("scope")
     if scope == "user":
         if trigger.get("created_by") != acting:
@@ -176,6 +203,15 @@ def _enforce_create_permission(
             400,
             f"This agent does not support {scope!r}-scoped triggers "
             f"(mode offers: {', '.join(_avail)})",
+        )
+    # Writes never cross agents: an agent session (user-backed or not) creates
+    # triggers only on ITS OWN agent — changing another agent goes through
+    # delegation. Cookie users and the master key keep their role-based reach.
+    if user.is_session and agent != user.agent:
+        raise HTTPException(
+            403,
+            "Agent sessions can create triggers only on their own agent "
+            "(to change another agent, delegate to it).",
         )
     acting = user.acting_sub
     if scope == "agent":
@@ -408,11 +444,14 @@ async def list_triggers_endpoint(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    # API keys + the admin AUDIT surface (``audit=true`` — the admin Triggers
-    # page) see every user's triggers so they can audit; everyone else —
-    # INCLUDING an admin on an agent's settings tab — gets the user-view (own
-    # user-scoped + agent-scoped). ``agent`` stays a plain filter in both modes.
-    if u.is_api_key or (audit and u.is_admin):
+    # The master key + the admin AUDIT surface (``audit=true`` — the admin
+    # Triggers page) see every user's triggers so they can audit; everyone
+    # else — INCLUDING an admin on an agent's settings tab — gets the
+    # user-view (own user-scoped + agent-scoped). ``agent`` stays a plain
+    # filter in both modes. Keyed on is_service like /v1/tasks (H1/H2): a
+    # session JWT is api-key-shaped but must get the user-view + the
+    # accessible-agents filter exactly like a cookie caller.
+    if u.is_service or (audit and u.is_admin):
         rows = trigger_store.list_triggers(agent=agent, scope=scope)
     else:
         rows = trigger_store.list_triggers_for_user_view(
@@ -420,9 +459,16 @@ async def list_triggers_endpoint(
         )
         if scope:
             rows = [r for r in rows if r.get("scope") == scope]
-    # Filter by accessible agents for non-admin
-    if not (u.is_admin or u.is_api_key):
-        rows = [r for r in rows if u.can_access_agent(r["agent"])]
+    # Filter by accessible agents for non-admin. Delegation edges add the
+    # targets' AGENT-SCOPE triggers to a no-user caller's view (the store's
+    # user-view already dropped foreign user-scope rows).
+    if not (u.is_admin or u.is_service):
+        edge_reach = nouser_read_targets(u)
+        rows = [
+            r for r in rows
+            if u.can_access_agent(r["agent"])
+            or (r.get("scope") == "agent" and r["agent"] in edge_reach)
+        ]
     return {"triggers": [_decorate_for_user(r, u) for r in rows]}
 
 
@@ -562,6 +608,15 @@ async def fire_test_endpoint(
         raise HTTPException(404, "Trigger not found")
     if not _can_view_trigger(row, u):
         raise HTTPException(403, "Forbidden")
+    # Edge visibility is READ-ONLY — firing makes the target's agent
+    # run (rule 2: writes never cross agents), so a no-user session may fire
+    # only its own agent's triggers no matter what it can see.
+    if u.is_no_user_session and row.get("agent") != u.agent:
+        raise HTTPException(
+            403,
+            "Cross-agent visibility is read-only — this session cannot fire "
+            "another agent's triggers (delegate to that agent instead).",
+        )
     if not row.get("enabled"):
         raise HTTPException(400, "Trigger is paused")
     body = await _safe_json(request)
@@ -587,7 +642,11 @@ def _decorate_for_user(row: dict, user: UserContext) -> dict:
     out["can_delete"] = can_manage
     out["can_pause"] = can_manage and is_enabled
     out["can_resume"] = can_manage and not is_enabled
-    out["can_fire"] = _can_view_trigger(row, user)
+    # Fire is view-level EXCEPT for no-user callers on edge-visible rows —
+    # the fire endpoint pins them to their own agent, so the flag must not lie.
+    out["can_fire"] = _can_view_trigger(row, user) and not (
+        user.is_no_user_session and row.get("agent") != user.agent
+    )
 
     # Webhook URL relative path (frontend prepends host). Lives under
     # /v1/webhooks/ — same prefix as vendor-subscribed webhooks so a

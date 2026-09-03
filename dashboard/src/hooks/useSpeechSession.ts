@@ -5,9 +5,11 @@
 // error handling, a finals accumulator, and a once-per-session clean-end commit
 // (onCommit fires on silence/stop with the full transcript, NEVER on error).
 
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
+import { acquireMic, releaseMic } from '../audio/micCoordinator'
+import { setDictationActive, stopActivePlayback } from '../audio/speechActivity'
 import { resolveSttBackend } from '../audio/resolver'
 import { platformStt } from '../audio/backends/platformStt'
 import { type STTBackend, type STTSession } from '../audio/types'
@@ -70,6 +72,18 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
 
   const available = !!cap && cap.stt !== 'unavailable' && !!resolveSttBackend(cap, prefs?.stt_mode ?? 'auto')
 
+  // Mic arbiter: dictation (platform OR native backend) holds the mic — the
+  // ambient wake-word listener must release it while we record. Status-driven
+  // so every start/stop/error path is covered without touching each one.
+  useEffect(() => {
+    if (status !== 'idle') acquireMic('dictation')
+    else releaseMic('dictation')
+    // Dictation-active interlock flag (chime suppression) — status-driven
+    // for the same every-path coverage as the mic arbiter.
+    setDictationActive(status !== 'idle')
+  }, [status])
+  useEffect(() => () => { releaseMic('dictation'); setDictationActive(false) }, [])
+
   const stop = useCallback((discardTail = false) => {
     if (discardTail) killRef.current?.()
     const s = sessionRef.current
@@ -83,6 +97,11 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     if (sessionRef.current) return
     const backend = cap ? resolveSttBackend(cap, prefs?.stt_mode ?? 'auto') : null
     if (!backend || !cap) { hRef.current.onError?.('Microphone unavailable.'); return }
+
+    // Dictation captures WITHOUT echo cancellation (see platformStt) — any
+    // in-flight one-shot TTS replay would transcribe itself into the
+    // composer. Silence it before the mic opens.
+    stopActivePlayback()
 
     setStatus('connecting')
     hRef.current.onActive?.(true)

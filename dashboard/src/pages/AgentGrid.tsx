@@ -1,13 +1,74 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
-import { useAgents, useSetDefaultAgent } from '../api/agents'
+import { useAgents, useSetDefaultAgent, type AgentSummary } from '../api/agents'
+import { useDepartments, type Department } from '../api/departments'
 import AgentCard from '../components/AgentCard'
 import AgentInstallModal from '../components/AgentInstallModal'
 import CommunityAgentsBrowser from '../components/CommunityAgentsBrowser'
 
-export default function AgentGrid() {
+const CARD_GRID = 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6'
+
+/** One department as a collapsible group (the AI-Engines/DepartmentsEditor
+ * pill idiom — header row is the summary, chevron toggles the body), holding
+ * its member cards with their department role. Default EXPANDED on purpose:
+ * a grid of agents must show its cards without a click (deliberate
+ * divergence from the idiom's collapsed default). */
+function DepartmentGroup({ dept, members, defaultAgent, onSetDefault }: {
+  dept: Department
+  members: { agent: AgentSummary; roleLabel?: string }[]
+  defaultAgent: string | undefined
+  onSetDefault: (name: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+  return (
+    // Fill lives on the HEADER only — the body stays transparent so the
+    // page background shows between the member cards' borders and the
+    // group border (the cards' own fill matches the old group fill, which
+    // read as one flat slab). overflow-hidden clips the header fill to the
+    // section's radius (ExecutionLayersTab idiom).
+    <section className="rounded-xl border border-p-border-light overflow-hidden">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded(v => !v)}
+        className="w-full flex items-center justify-between gap-3 p-4 text-left bg-white dark:bg-p-surface"
+      >
+        <div className="min-w-0">
+          <div className="font-medium text-p-text truncate">{dept.name}</div>
+          <div className="text-sm text-p-text-secondary">
+            {members.length} {members.length === 1 ? 'agent' : 'agents'}
+          </div>
+        </div>
+        <svg
+          className={`w-4 h-4 shrink-0 text-p-text-light transition-transform ${expanded ? 'rotate-180' : ''}`}
+          fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+      {expanded && (
+        <div className="px-4 pb-4 border-t border-p-border-light pt-4">
+          <div className={CARD_GRID}>
+            {members.map(({ agent, roleLabel }) => (
+              <AgentCard
+                key={agent.name}
+                agent={agent}
+                isDefault={defaultAgent === agent.name}
+                onSetDefault={onSetDefault}
+                roleLabel={roleLabel}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+export default function AgentGrid({ embedded = false }: { embedded?: boolean }) {
   const { data: agents, isLoading } = useAgents()
+  const { data: departments } = useDepartments()
   const { user, setUser } = useAuth()
   const setDefaultAgent = useSetDefaultAgent()
   const [confirmAgent, setConfirmAgent] = useState<string | null>(null)
@@ -35,31 +96,80 @@ export default function AgentGrid() {
   const displayName = (name: string) =>
     name.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 
-  // Show the user's favorite (default) agent first, keeping every other agent
-  // in its normal (backend) order. Unfavoriting restores the natural position.
+  // Departments as collapsible groups above the plain grid (operator
+  // 2026-08-15). Grouping keys ride the agents payload itself
+  // (department_id / department_level_id); useDepartments supplies names,
+  // level labels, and the display order (name-ascending from the API). In-
+  // group order matches the 3D map's stage: level rank asc, then slug asc
+  // (the agents list arrives slug-sorted; the rank sort is stable). Members
+  // with no/dangling level sort last with no role badge — the map DROPS
+  // those from its amphitheater, the grid must not.
+  const groups = useMemo(() => {
+    if (!agents || !departments) return []
+    const byDept = new Map<string, AgentSummary[]>()
+    for (const a of agents) {
+      if (!a.department_id) continue
+      const list = byDept.get(a.department_id)
+      if (list) list.push(a)
+      else byDept.set(a.department_id, [a])
+    }
+    const out: { dept: Department; members: { agent: AgentSummary; roleLabel?: string }[] }[] = []
+    for (const dept of departments) {
+      const members = byDept.get(dept.id)
+      // Zero VISIBLE members renders nothing (real for admins whose
+      // checkbox set excludes a whole department they can still list).
+      if (!members?.length) continue
+      const levels = [...dept.levels].sort((a, b) => a.rank - b.rank)
+      const rankOf = new Map(levels.map(l => [l.id, l.rank]))
+      const nameOf = new Map(levels.map(l => [l.id, l.name]))
+      const sorted = [...members].sort((a, b) =>
+        (rankOf.get(a.department_level_id ?? '') ?? Number.MAX_SAFE_INTEGER)
+        - (rankOf.get(b.department_level_id ?? '') ?? Number.MAX_SAFE_INTEGER))
+      out.push({
+        dept,
+        members: sorted.map(agent => ({
+          agent,
+          roleLabel: nameOf.get(agent.department_level_id ?? ''),
+        })),
+      })
+    }
+    return out
+  }, [agents, departments])
+
+  // Independent = no department OR a department that isn't rendered (the
+  // map's own two-part test — an agent in a filtered-out department must
+  // not silently vanish). Favorite-first applies HERE only; a favorite
+  // inside a department stays in its group (the ★ still marks it).
   const sortedAgents = useMemo(() => {
     if (!agents) return agents
+    const groupedIds = new Set(groups.map(g => g.dept.id))
+    const independents = agents.filter(
+      a => !a.department_id || !groupedIds.has(a.department_id),
+    )
     const fav = user?.default_agent
-    if (!fav) return agents
-    return [...agents].sort((a, b) =>
+    if (!fav) return independents
+    return independents.sort((a, b) =>
       a.name === fav ? -1 : b.name === fav ? 1 : 0,
     )
-  }, [agents, user?.default_agent])
+  }, [agents, groups, user?.default_agent])
 
   return (
-    <div className="min-h-screen bg-p-bg">
-      {/* Top bar — standard "Back to Chat" button (matches agent settings / admin) */}
-      <div className="flex items-center h-12 px-4 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-p-border-light">
-        <Link
-          to="/"
-          className="flex items-center justify-center gap-1.5 w-full sm:w-auto px-3 sm:px-8 py-1.5 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
-        >
-          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-          </svg>
-          Back to Chat
-        </Link>
-      </div>
+    <div className={embedded ? '' : 'min-h-screen bg-p-bg'}>
+      {/* Top bar — standard "Back to Chat" button (matches agent settings /
+          admin). Hidden when embedded in AgentsPage, which brings its own. */}
+      {!embedded && (
+        <div className="flex items-center h-12 px-4 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-p-border-light">
+          <Link
+            to="/"
+            className="flex items-center justify-center gap-1.5 w-full sm:w-auto px-3 sm:px-8 py-1.5 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            </svg>
+            Back to Chat
+          </Link>
+        </div>
+      )}
 
       {/* Content */}
       <main className="p-6 max-w-5xl mx-auto">
@@ -98,18 +208,31 @@ export default function AgentGrid() {
 
         {isLoading ? (
           <p className="text-sm text-p-text-secondary">Loading agents...</p>
-        ) : !sortedAgents || sortedAgents.length === 0 ? (
+        ) : groups.length === 0 && (!sortedAgents || sortedAgents.length === 0) ? (
           <p className="text-sm text-p-text-secondary">No agents found.</p>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {sortedAgents.map((agent) => (
-              <AgentCard
-                key={agent.name}
-                agent={agent}
-                isDefault={user?.default_agent === agent.name}
+          <div className="space-y-6">
+            {groups.map(({ dept, members }) => (
+              <DepartmentGroup
+                key={dept.id}
+                dept={dept}
+                members={members}
+                defaultAgent={user?.default_agent}
                 onSetDefault={handleSetDefault}
               />
             ))}
+            {sortedAgents && sortedAgents.length > 0 && (
+              <div className={CARD_GRID}>
+                {sortedAgents.map((agent) => (
+                  <AgentCard
+                    key={agent.name}
+                    agent={agent}
+                    isDefault={user?.default_agent === agent.name}
+                    onSetDefault={handleSetDefault}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         )}
       </main>

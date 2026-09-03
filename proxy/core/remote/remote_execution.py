@@ -49,7 +49,15 @@ logger = logging.getLogger("remote-layer")
 # Soft-interrupt escalation window. Longer than the local layer's 8s: the
 # frame rides the satellite WS and the CLI's result event rides back the
 # same way, so budget for two hops plus the CLI's own reaction time.
-_REMOTE_INTERRUPT_WATCHDOG_S = 12.0
+# 30s (was 12): a CLI mid-TOOL on a slow machine legitimately needs longer
+# to close the turn after control_request{interrupt} — live 2026-08-12 an
+# old laptop mid-WebSearch missed 12s, the escalation tree-killed the CLI
+# and every later spoken turn errored (duplex had no dead-session heal
+# then; ws/headless_resume.py now respawns, this window just makes the
+# trigger rare). The window is invisible to users: barge-in already cut the
+# TTS and Stop already acked — this only delays the wedge repair for
+# genuinely dead/stuck processes.
+_REMOTE_INTERRUPT_WATCHDOG_S = 30.0
 
 # Strong refs — a bare create_task is GC-collectable mid-flight.
 _remote_watchdog_tasks: set[asyncio.Task] = set()
@@ -293,6 +301,14 @@ class RemoteExecutionLayer(
         # reports it's at its session ceiling (admin override or its own physical
         # recommendation). Best-effort + fail-open; the satellite's hard reject in
         # session_manager._check_capacity is the authoritative backstop.
+        # At the ceiling, first try the LOCAL admit path's move: evict the
+        # most-idle idle sessions this proxy tracks on the machine (never a
+        # turn in flight) — an evicted session resumes with full context via
+        # --resume exactly like an idle-reaped one, so a new session beats a
+        # hard refusal (operator-requested parity with local eviction,
+        # 2026-08-12).
+        if self._cm.machine_at_capacity(machine_id):
+            await self._evict_idle_on_machine(machine_id)
         if self._cm.machine_at_capacity(machine_id):
             raise RuntimeError(
                 f"Remote machine {machine_id[:8]} is at capacity — too many active sessions"
@@ -515,6 +531,8 @@ class RemoteExecutionLayer(
                     target_username=target_username,
                     target_role=target_role,
                     session_username=session_username,
+                    session_knowledge_rw=bool(getattr(
+                        config.security_context, "knowledge_rw", False)),
                     progress_cb=_sync_progress,
                 )
             except Exception as e:
@@ -773,6 +791,83 @@ class RemoteExecutionLayer(
                 "future rotations may miss it until re-warm)", session_id[:8],
             )
 
+    async def _evict_idle_on_machine(self, machine_id: str) -> int:
+        """Capacity twin of the local ``_admit_with_eviction``: a satellite at
+        its session ceiling closes its most-idle idle sessions (this proxy's
+        view; never a turn in flight) until the cached count shows headroom
+        or nothing evictable remains. Same floor as local —
+        ``min(SESSION_EVICT_FLOOR_S, idle_timeout)`` — so a *just*-parked
+        session isn't sacrificed. Headless sessions only in v1 (evicting a
+        remote interactive PTY kills a terminal someone may be looking at).
+        Best-effort: the satellite's hard capacity check remains the
+        authoritative backstop."""
+        import config as app_config
+        floor_age = min(
+            app_config.SESSION_EVICT_FLOOR_S, app_config.get_idle_timeout(),
+        )
+        evicted = 0
+        while self._cm.machine_at_capacity(machine_id):
+            now = time.monotonic()
+            candidates = [
+                (now - i.last_activity, sid)
+                for sid, i in list(self._sessions.items())
+                if i.machine_id == machine_id and i.alive
+                and not i.turn_active
+                and (now - i.last_activity) >= floor_age
+            ]
+            if not candidates:
+                break
+            idle_s, victim = max(candidates)
+            logger.info(
+                "Remote eviction: closing idle session %s on %s (idle %.0fs) "
+                "to make room for a new spawn", victim[:8], machine_id[:8],
+                idle_s,
+            )
+            # close_session debits the cached heartbeat count, so the loop
+            # condition observes the reclaimed headroom immediately.
+            await self.close_session(victim)
+            evicted += 1
+        return evicted
+
+    async def adopt_idle_session(
+        self, *, machine_id: str, session_id: str, agent_name: str,
+        use_native_permissions: bool = False,
+    ) -> None:
+        """Registry-only twin of ``adopt_session`` for sessions the satellite
+        kept alive across a proxy restart with NO turn in flight. Nothing
+        streams — the point is that the session EXISTS proxy-side again:
+        the idle reaper can leash it, a later chat resume finds it, and
+        token rotations reach it. Without this, restart-orphaned idle
+        sessions lived forever satellite-side and ate the machine's
+        session capacity (the operator's laptop hit its at-capacity wall
+        after an evening of proxy redeploys). ``last_activity`` starts
+        fresh: one more standard idle leash beats yanking a session a
+        user is about to resume."""
+        if session_id in self._sessions:
+            return
+        queue = self._cm.create_session_queue(
+            machine_id, session_id, "claude-code-cli",
+        )
+        translator = ClaudeCLIEventTranslator(session_id)
+        info = RemoteSessionInfo(
+            session_id=session_id,
+            machine_id=machine_id,
+            agent_name=agent_name,
+            execution_path="claude-code-cli",
+            event_queue=queue,
+            cli_translator=translator,
+            cli_settle=SettleController(session_id, 0, translator),
+            use_native_permissions=use_native_permissions,
+        )
+        self._sessions[session_id] = info
+        reset_subagent_registry(session_id)
+        reset_bg_command_registry(session_id)
+        _record_session_use(session_id, client_type="", agent=agent_name)
+        await asyncio.to_thread(
+            self._restore_adopted_credentials, session_id, machine_id,
+            agent_name,
+        )
+
     async def adopt_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
         command_id: str, use_native_permissions: bool = False,
@@ -973,14 +1068,31 @@ class RemoteExecutionLayer(
             # bodies): a swallowed late answer from an orphaned prior turn is
             # otherwise invisible (queue events buffered satellite-side
             # between turns arrive AFTER this drain and are handled by the
-            # foreign-skip gate instead).
+            # foreign-skip gate instead). 1.5: a self-wake bracket buffered
+            # here (satellite post-turn drain forwarded it while nobody
+            # listened) is CAPTURED to the chat instead of dropped — the
+            # pre-send rule that makes the next bracket the user turn's own.
+            from core.events import wake_capture as _wake
+            from core.session.session_state import (
+                reconcile_background_snapshot as _reconcile_snapshot,
+            )
             drained: Counter[str] = Counter()
             while True:
                 try:
                     ev = info.event_queue.get_nowait()
-                    drained[(ev or {}).get("type", "?") if isinstance(ev, dict) else "?"] += 1
                 except asyncio.QueueEmpty:
                     break
+                if isinstance(ev, dict) and _wake.is_wake_init(ev):
+                    drained["wake_captured"] += 1
+                    await _wake.capture_wake_turn(
+                        session_id, ev, self._make_queue_frame_reader(info),
+                        source="remote_stale_drain",
+                    )
+                    continue
+                if isinstance(ev, dict):
+                    resolve_bg_command_frame(session_id, ev)
+                    _reconcile_snapshot(session_id, ev)
+                drained[(ev or {}).get("type", "?") if isinstance(ev, dict) else "?"] += 1
             if drained:
                 logger.warning(
                     "Remote session %s: drained %d stale events (types=%s, results=%d)",
@@ -1199,6 +1311,14 @@ class RemoteExecutionLayer(
             # junk text must not flip the next zero-content result to
             # "real" and close the turn on it.
             info.last_activity = time.monotonic()
+            # An init DURING settle = the CLI's self-wake review turn running
+            # INLINE through this stream (its content joins the task output)
+            # — note it so the producer/monitors skip the redundant nudge.
+            # Twin of the local session loop's marker.
+            if (settle.settling and rtype == "system"
+                    and raw.get("subtype") == "init"):
+                from core.events import wake_capture as _wake
+                _wake.note_captured(info.session_id)
             for chunk in translator.feed(raw):
                 if (chunk_is_content(chunk)
                         and (not ev_cmd or ev_cmd == expected_cmd_id)):
@@ -1349,14 +1469,20 @@ class RemoteExecutionLayer(
                     return
 
     async def _send_stop_turn(self, info: "RemoteSessionInfo") -> None:
-        """Tell the satellite to exit its stdout read loop for this turn. If a
-        backgrounded command is still pending, ask the satellite to keep draining
-        + forwarding stdout post-turn (``drain_bg``) so the command's completion
-        frame — which claude emits idle, AFTER this turn ends — still reaches the
-        proxy's bg-command monitor (the satellite's per-turn forwarder otherwise
-        stops here, stranding the badge + skipping the autonudge)."""
+        """Tell the satellite to exit its stdout read loop for this turn. If
+        background work is still pending, ask the satellite to keep draining
+        + forwarding stdout post-turn (``drain_bg``) so the completion frames
+        — which claude emits idle, AFTER this turn ends — still reach the
+        proxy (the satellite's per-turn forwarder otherwise stops here,
+        stranding the badge + skipping the autonudge). 1.5: armed for
+        pending SUBAGENTS too — their completion also triggers the CLI's
+        self-wake turn on stdout, which the proxy-side drain captures; the
+        satellite's drain loop forwards every frame unfiltered (verified
+        0.5.110 ``_bg_drain_loop``), so no satellite change/gate is needed."""
         from core.events.bg_command_state import get_bg_command_registry
-        drain_bg = get_bg_command_registry(info.session_id).has_pending
+        from core.session.session_state import get_subagent_registry
+        drain_bg = (get_bg_command_registry(info.session_id).has_pending
+                    or get_subagent_registry(info.session_id).has_pending)
         try:
             await self._cm.send_fire_and_forget(info.machine_id, {
                 "type": "stop_turn",
@@ -1511,6 +1637,41 @@ class RemoteExecutionLayer(
             info.cli_dead = True
         return False
 
+    async def interrupt_for_queued(self, session_id: str) -> bool:
+        """Stop-and-send for a REMOTE Claude CLI session — the graceful arm
+        of ``abort`` only: relay ``interrupt_turn`` (the satellite writes the
+        same ``control_request {interrupt}`` into the CLI's stdin; process +
+        MCP sidecars + background tasks survive). NO ``_soft_interrupt_
+        watchdog``, NO ``_hard_abort`` — an ignored interrupt degrades to
+        the queued message draining at the natural turn end. Send-THEN-
+        resolve (opposite of ``abort``): ``send_fire_and_forget`` silently
+        no-ops on a disconnected machine, and a failed send must never deny
+        a parked permission blind — that would un-park the turn with no
+        interrupt delivered.
+        """
+        info = self._sessions.get(session_id)
+        if (
+            info is None
+            or not info.turn_active
+            or info.execution_path != "claude-code-cli"
+            or not self._cm.is_connected(info.machine_id)
+            or not self._cm.satellite_supports_soft_interrupt(info.machine_id)
+        ):
+            return False
+        try:
+            await self._cm.send_fire_and_forget(info.machine_id, {
+                "type": "interrupt_turn",
+                "session_id": session_id,
+            })
+        except Exception as e:
+            logger.warning(
+                "Remote stop-and-send interrupt failed for session %s: %s",
+                session_id[:8], e,
+            )
+            return False
+        resolve_session_permissions(session_id, approved=False)
+        return True
+
     async def _soft_interrupt_watchdog(
         self, session_id: str, armed_cmd_id: str,
     ) -> None:
@@ -1637,6 +1798,10 @@ class RemoteExecutionLayer(
             }, timeout=15.0)
         except Exception as e:
             logger.warning("Remote close failed: %s", e)
+        # Keep the cached heartbeat count roughly honest between heartbeats —
+        # the capacity pre-check + eviction loop read it (see
+        # debit_reported_session).
+        self._cm.debit_reported_session(info.machine_id)
         self._cm.remove_session_queue(info.machine_id, session_id)
         cleanup_session_permission_state(session_id)
 
@@ -1803,6 +1968,13 @@ class RemoteExecutionLayer(
         else:
             yield
 
+    async def session_self_wakes(self, session_id: str) -> bool:
+        """Wake-grace eligibility (see pump_bg_monitors._wake_grace_covers):
+        only claude sessions self-wake; a remote codex session must not pay
+        the grace window."""
+        info = self._sessions.get(session_id)
+        return bool(info) and info.execution_path == "claude-code-cli"
+
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
         """Resolve background bash-command completions for a REMOTE CLI session
         between turns. The satellite forwards claude's stdout CONTINUOUSLY into
@@ -1833,6 +2005,8 @@ class RemoteExecutionLayer(
             return False  # a turn is in flight — retry next poll
         progressed = False
         try:
+            from core.events import wake_capture
+            from core.session.session_state import reconcile_background_snapshot
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
                 try:
@@ -1841,11 +2015,45 @@ class RemoteExecutionLayer(
                     break  # no more buffered frames right now
                 if not isinstance(raw, dict):
                     continue  # synthetic marker (_turn_ended, None) — ignore
+                info.last_activity = time.monotonic()
+                if wake_capture.is_wake_init(raw):
+                    # A self-wake turn (2.1.243) forwarded by the satellite's
+                    # post-turn drain — record it as a real chat turn (twin
+                    # of the local drain). Ignores the drain budget: the
+                    # bracket has its own ceiling; abandoning it mid-turn
+                    # would orphan the remaining frames.
+                    await wake_capture.capture_wake_turn(
+                        session_id, raw, self._make_queue_frame_reader(info),
+                        source="remote_idle_drain",
+                    )
+                    progressed = True
+                    continue
                 if resolve_bg_command_frame(session_id, raw):
                     progressed = True
+                reconcile_background_snapshot(session_id, raw)
         finally:
             info.lock.release()
         return progressed
+
+    def _make_queue_frame_reader(self, info: "RemoteSessionInfo"):
+        """Frame reader over ``info.event_queue`` for a wake-bracket capture:
+        skips synthetic markers, bumps ``last_activity`` (idle reaper), None
+        on timeout. The caller holds ``info.lock`` for the whole capture."""
+        async def _read(timeout: float) -> dict | None:
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    raw = await asyncio.wait_for(
+                        info.event_queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return None
+                if isinstance(raw, dict):
+                    info.last_activity = time.monotonic()
+                    return raw
+        return _read
 
     async def _drain_codex_bg_commands(
         self, info: "RemoteSessionInfo", *, budget: float,

@@ -222,6 +222,22 @@ async def begin(
             "started_at": item.started_at_iso,
             "machines": [_machine_row_event(r) for r in item.machines.values()],
         }, recipients)
+        if not machine_ids:
+            # Tracked transfer with NO target: the cheap has_fanout_candidates
+            # gate over-approximates (any connected machine says "yes"), so
+            # the upload response already promised remote_push=true and the
+            # client waits for a terminal. Complete at birth — with zero rows
+            # set_state would never fire transfer_done and the popup/chip hung
+            # on "Processing…" / "Syncing to machines…" forever (found live
+            # 2026-09-02 on an install with idle satellites).
+            async with _lock:
+                item.done_at = time.monotonic()
+            await _emit({
+                "type": "transfer_done",
+                "transfer_id": tid,
+                "agent_slug": agent_slug,
+                "ok": True,
+            }, recipients)
         return tid
     except Exception:
         logger.exception(

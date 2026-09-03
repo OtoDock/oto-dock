@@ -11,12 +11,10 @@ import { persist, createJSONStorage } from 'zustand/middleware'
 interface AudioPrefsState {
   nativeVoiceURI: Record<string, string>   // language → SpeechSynthesisVoice.voiceURI
   autoplayTts: boolean                      // sound icon auto-plays new assistant messages
-  voiceModeEnabled: boolean                 // hands-free: speak the reply aloud as it streams
   __user_sub: string
 
   setNativeVoice: (language: string, voiceURI: string) => void
   setAutoplayTts: (on: boolean) => void
-  setVoiceModeEnabled: (on: boolean) => void
   setUserSub: (userSub: string) => void
   reset: () => void
 }
@@ -26,19 +24,17 @@ export const useAudioPrefsStore = create<AudioPrefsState>()(
     (set) => ({
       nativeVoiceURI: {},
       autoplayTts: false,
-      voiceModeEnabled: false,
-      __user_sub: '',
+          __user_sub: '',
 
       setNativeVoice: (language, voiceURI) =>
         set((s) => ({ nativeVoiceURI: { ...s.nativeVoiceURI, [language]: voiceURI } })),
 
       setAutoplayTts: (on) => set({ autoplayTts: on }),
 
-      setVoiceModeEnabled: (on) => set({ voiceModeEnabled: on }),
-
+    
       setUserSub: (userSub) => set({ __user_sub: userSub }),
 
-      reset: () => set({ nativeVoiceURI: {}, autoplayTts: false, voiceModeEnabled: false, __user_sub: '' }),
+      reset: () => set({ nativeVoiceURI: {}, autoplayTts: false, __user_sub: '' }),
     }),
     {
       name: 'oto-dock-audio-prefs',

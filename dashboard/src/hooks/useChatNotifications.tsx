@@ -6,6 +6,7 @@ import NotificationToast from '../components/chat/notifications/NotificationToas
 import { useNotifications } from './useNotifications'
 import { useNotificationSound } from './useNotificationSound'
 import { usePushSubscription } from './usePushSubscription'
+import { useAgents } from '../api/agents'
 
 /**
  * Shared notification surface for the chat page (AgentChat).
@@ -27,6 +28,9 @@ export function useChatNotifications() {
   const notif = useNotifications()
   const notifSound = useNotificationSound()
   usePushSubscription()  // Web Push (browsers)
+  // Sender identity for the cards: the app-wide cached agents list resolves
+  // each delivery's `agent_slug` to its avatar color + display name.
+  const { data: agents } = useAgents()
 
   // Auto-stop the danger alarm once no danger toasts remain (covers every
   // dismiss path).
@@ -64,6 +68,7 @@ export function useChatNotifications() {
         <NotificationPanel
           deliveries={notif.deliveries}
           loading={notif.loading}
+          agents={agents}
           onMarkRead={notif.markRead}
           onMarkAllRead={notif.markAllRead}
           onDismiss={(id) => { notif.dismiss(id); notifSound.stopDangerAlarm() }}
@@ -78,6 +83,7 @@ export function useChatNotifications() {
   const notificationToast = (
     <NotificationToast
       toasts={notif.toasts}
+      agents={agents}
       onDismiss={(id) => { notif.dismissToast(id); notifSound.stopDangerAlarm() }}
       onStopAlarm={notifSound.stopDangerAlarm}
       onNavigate={handleNotifNavigate}

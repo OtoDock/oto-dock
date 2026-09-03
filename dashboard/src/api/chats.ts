@@ -139,6 +139,53 @@ export function useSearchChats(agent: string | undefined, query: string, kind: '
   })
 }
 
+// --- resolve-path: the clickable file-path chips in chat markdown ---
+
+/** A resolved chip path — POST /v1/chats/{id}/resolve-path with found:true.
+ * `path` is agent-tree-relative; `previewable` mirrors the wopi-url
+ * confinement (Collabora doc extension AND workspace/ or users/). */
+export interface ResolvedChatPath {
+  agent: string
+  path: string
+  filename: string
+  size: number
+  previewable: boolean
+}
+
+// Positive results only: a resolved path is stable for the chat's lifetime,
+// but a miss is not — a satellite may sync the file up moments later — so
+// found:false / errors are never cached and the next click re-resolves.
+const resolvePathCache = new Map<string, ResolvedChatPath>()
+
+/** Resolve a file-path string from chat markdown to a live file in the chat
+ * agent's tree. Returns `null` for found:false (every non-match is a 200
+ * `{found: false}` — no oracle); throws only on transport/HTTP errors.
+ * Event-driven (called on chip click), so it's a plain function. */
+export async function resolveChatPath(
+  chatId: string, path: string,
+): Promise<ResolvedChatPath | null> {
+  const cacheKey = `${chatId}\n${path}`
+  const cached = resolvePathCache.get(cacheKey)
+  if (cached) return cached
+  const res = await apiFetch(`/v1/chats/${chatId}/resolve-path`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  if (!res.ok) throw new Error(`Failed to resolve path (HTTP ${res.status})`)
+  const data = await res.json() as { found: boolean } & Omit<ResolvedChatPath, 'previewable'> & { previewable?: boolean }
+  if (!data.found) return null
+  const resolved: ResolvedChatPath = {
+    agent: data.agent,
+    path: data.path,
+    filename: data.filename,
+    size: data.size,
+    previewable: !!data.previewable,
+  }
+  resolvePathCache.set(cacheKey, resolved)
+  return resolved
+}
+
 /** Imperative fetch of one older page of messages (lazy scroll-back). Returns the
  * older rows (chronological, with id < beforeId) + whether still-older rows remain.
  * Event-driven (called on scroll), so it's a plain function, not a useQuery hook. */

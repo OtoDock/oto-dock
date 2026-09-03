@@ -4,6 +4,7 @@
 # Single source of truth for what the host must have installed for OtoDock
 # agent sandboxes to function. Read by:
 #
+#   - `satellite/install.sh`     (satellite hosts — calls this before pairing)
 #   - the platform `Dockerfile`  (Docker deployments — baked into the image via RUN)
 #
 # (A bare-metal platform `setup.sh` install path is planned but not yet wired.)
@@ -354,12 +355,35 @@ install_sympy() {
 # via the matching env vars (compose.sh passes the VERSIONS.md values in);
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.220}"
-CODEX_VERSION="${CODEX_VERSION:-0.145.0}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.258}"
+CODEX_VERSION="${CODEX_VERSION:-0.149.1}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").
 _cli_ver() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+
+# After an install/upgrade, verify what the shell NOW resolves. npm places
+# the pinned copy in its global prefix, but PATH may still resolve another
+# install (e.g. the vendor's standalone installer under ~/.local/bin) — the
+# upgrade then silently changes nothing for anything that spawns "$bin".
+# Warn with every resolvable copy and its version so the shadow is obvious.
+_verify_resolved_cli() {
+    local label="$1" bin="$2" want="$3"
+    local now; now="$(_cli_ver "$bin")"
+    if [ "$now" = "$want" ]; then
+        ok "${label} resolves at pinned ${want}"
+        return 0
+    fi
+    warn "${label}: '${bin}' still resolves ${now:-nothing} — want ${want}."
+    warn "Another install shadows the pinned copy on PATH:"
+    local p
+    while read -r p; do
+        [ -n "$p" ] || continue
+        warn "  ${p} ($("$p" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1))"
+    done < <(type -aP "$bin" 2>/dev/null | awk '!seen[$0]++')
+    warn "Remove or upgrade the shadowing copy so '${bin}' resolves ${want}."
+    return 0
+}
 
 # Install OR upgrade an npm-global CLI to the EXACT pinned version. The platform
 # runs against a verified CLI (auto-update disabled in-app), so a mismatched
@@ -378,12 +402,14 @@ _install_pinned_cli() {
         if command -v npm &>/dev/null; then
             info "Upgrading ${label} ${have:-unknown} → ${want}..."
             $SUDO npm install -g "${pkg}@${want}"
+            _verify_resolved_cli "$label" "$bin" "$want"
         else
             warn "${label} is ${have:-unknown}, want ${want}, but npm not present to upgrade."
         fi
     elif command -v npm &>/dev/null; then
         info "Installing ${label} ${want}..."
         $SUDO npm install -g "${pkg}@${want}"
+        _verify_resolved_cli "$label" "$bin" "$want"
     else
         warn "Cannot install ${label}: npm not present."
     fi

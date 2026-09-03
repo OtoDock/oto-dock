@@ -652,3 +652,52 @@ def test_delegation_context_renders_roster(monkeypatch, temp_db):
     # Without the pre-resolved roster the provider stays name-only (no I/O).
     text2 = dynamic_context._delegation_mcp_context("self-agent", ["worker"])
     assert "layers:" not in text2
+
+
+def test_delegation_context_nouser_reads_paragraph(monkeypatch, temp_db):
+    # Builders pass nouser_reads=True only for NO-USER sessions — the
+    # provider adds one read-usage paragraph (every wired target is
+    # readable; the merged-edge semantics need no per-row marker).
+    _roster_env(monkeypatch, models=[{"model_id": "m-default", "enabled": True}])
+    text = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], nouser_reads=True)
+    assert "runs without a user" in text
+    assert "READABLE" in text
+    # User-backed sessions (False / absent kwarg): no read paragraph.
+    text2 = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], nouser_reads=False)
+    assert "READABLE" not in text2
+
+
+def test_schedules_context_renders_own_layers(monkeypatch, temp_db):
+    """An agent with schedules-mcp but NO delegation-mcp has to learn the
+    valid per-task model ids somewhere — no delegation block to do it."""
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-default", "enabled": True},
+        {"model_id": "m-b", "enabled": True},
+    ])
+    roster = dynamic_context.build_delegation_roster(["self-agent"])
+    text = dynamic_context._schedules_mcp_context(
+        "self-agent", delegation_roster=roster,
+        assigned_mcps=["schedules-mcp"])
+    assert ("Your layers: claude-code-cli (default | models: "
+            "m-default [default], m-b)") in text
+    assert "edit_task" in text
+
+
+def test_schedules_context_defers_to_delegation_block(monkeypatch, temp_db):
+    """Both assigned: point at the Available Agents line instead of printing
+    the same model list a second time in the same prompt."""
+    _roster_env(monkeypatch, models=[{"model_id": "m-default", "enabled": True}])
+    roster = dynamic_context.build_delegation_roster(["self-agent"])
+    text = dynamic_context._schedules_mcp_context(
+        "self-agent", delegation_roster=roster,
+        assigned_mcps=["delegation-mcp", "schedules-mcp"])
+    assert "Available Agents" in text
+    assert "Your layers:" not in text
+
+
+def test_schedules_context_silent_without_roster(temp_db):
+    """No pre-resolved roster (providers are no-I/O by contract) → no block,
+    rather than a block claiming an empty model list."""
+    assert dynamic_context._schedules_mcp_context("self-agent") is None

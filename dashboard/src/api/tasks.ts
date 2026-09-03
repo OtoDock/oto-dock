@@ -19,6 +19,15 @@ export interface Task {
   created_by: string | null
   notification_mode: 'auto' | 'manual' | 'none'
   notify_severity: 'info' | 'success' | 'warning'
+  // Per-task execution pins, set by an agent through the schedules MCP.
+  // Empty/null = this task inherits the agent's default. The effective_*
+  // fields are server-computed for display: the pin when there is one, else
+  // the agent's currently-resolved default ('' when the install has no
+  // enabled model for that agent's layer).
+  override_model: string | null
+  override_execution_path: string | null
+  effective_model: string
+  effective_execution_path: string
   can_run: boolean
   can_delete: boolean
   can_pause: boolean

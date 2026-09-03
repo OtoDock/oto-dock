@@ -41,10 +41,12 @@ def _register_hardcoded() -> None:
     from auth.oauth_providers.slack import SlackOAuthProvider
     from auth.oauth_providers.microsoft import MicrosoftOAuthProvider
     from auth.oauth_providers.zoom import ZoomOAuthProvider
+    from auth.oauth_providers.facebook import FacebookOAuthProvider
     _HARDCODED["google"] = GoogleOAuthProvider()
     _HARDCODED["slack"] = SlackOAuthProvider()
     _HARDCODED["microsoft"] = MicrosoftOAuthProvider()
     _HARDCODED["zoom"] = ZoomOAuthProvider()
+    _HARDCODED["facebook"] = FacebookOAuthProvider()
 
 
 _register_hardcoded()
@@ -122,7 +124,14 @@ def _build_from_manifest(provider_id: str) -> "OAuthProvider | None":
             continue
         authorization_url = oauth.get("authorization_url", "")
         token_url = oauth.get("token_url", "")
-        if not authorization_url or not token_url:
+        flows = list(oauth.get("flows") or ["authorization_code"])
+        # PAT-only providers (postiz) have NO browser dance: the pasted key
+        # IS the token, so authorization_url/token_url are legitimately
+        # absent — only fetch_userinfo is ever called on them.
+        pat_only = bool(flows) and all(
+            f == "personal_access_token" for f in flows
+        )
+        if (not authorization_url or not token_url) and not pat_only:
             logger.warning(
                 "Manifest %s declares provider_id=%s but is missing "
                 "authorization_url/token_url; cannot build provider.",
@@ -141,10 +150,11 @@ def _build_from_manifest(provider_id: str) -> "OAuthProvider | None":
             userinfo_headers=oauth.get("userinfo_headers") or {},
             userinfo_method=oauth.get("userinfo_method", "GET"),
             userinfo_body=oauth.get("userinfo_body") or None,
+            userinfo_auth_scheme=oauth.get("userinfo_auth_scheme", "bearer"),
             # Provider's default flow = first declared in the manifest's
             # `flows` list. Multi-flow MCPs (github-mcp) pick alternatives at
             # connect time via the dashboard's flow picker.
-            flow=(oauth.get("flows") or ["authorization_code"])[0],
+            flow=flows[0],
             device_authorization_url=oauth.get("device_authorization_url", ""),
         )
     return None

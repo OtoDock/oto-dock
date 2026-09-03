@@ -50,6 +50,8 @@ def _write_template(
     user_setup_md: str | None = None,
     skills: list[dict] | None = None,
     context_files: dict[str, str] | None = None,
+    dashboards: list[dict] | None = None,
+    dashboard_files: dict[str, str] | None = None,
 ) -> Path:
     """Write a minimal valid template directory under tmp_path/<slug>/."""
     template_dir = tmp_path / slug
@@ -88,6 +90,14 @@ def _write_template(
         context_dir.mkdir()
         for rel, content in context_files.items():
             (context_dir / rel).write_text(content)
+    if dashboards is not None:
+        (template_dir / "dashboards.json").write_text(
+            json.dumps({"dashboards": dashboards})
+        )
+        dash_dir = template_dir / "dashboards"
+        dash_dir.mkdir(exist_ok=True)
+        for name, content in (dashboard_files or {}).items():
+            (dash_dir / name).write_text(content)
     return template_dir
 
 
@@ -605,7 +615,7 @@ class TestUserJoinHook:
         db.add_user_agent("user-bob", agent_slug, "viewer", "system")
 
         counts = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
-        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1, "user_setup": 0}
+        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "user_setup": 0}
 
         # bob owns: the user-task itself + the trigger's paired task
         # (trigger model spawns a dynamic_tasks row with
@@ -631,8 +641,8 @@ class TestUserJoinHook:
         second = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
         # First call seeds, second call sees the unique-index conflict and
         # returns 0 across the board.
-        assert first == {"tasks": 1, "triggers": 1, "notifications": 1, "user_setup": 0}
-        assert second == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
+        assert first == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "user_setup": 0}
+        assert second == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
 
     def test_hook_respects_role_filter(self, tmp_path, temp_db):
         """Item with ``roles: ["manager"]`` is NOT seeded for a viewer."""
@@ -662,7 +672,7 @@ class TestUserJoinHook:
         _make_user("user-viewer", "viewer@example.com")
         db.add_user_agent("user-viewer", "role-agent", "viewer", "system")
         counts = on_user_added_to_agent("role-agent", "user-viewer", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
 
         _make_user("user-mgr", "mgr@example.com")
         db.add_user_agent("user-mgr", "role-agent", "manager", "system")
@@ -677,7 +687,7 @@ class TestUserJoinHook:
 
         agent_store.create_agent("native-agent", "Native Agent")
         counts = on_user_added_to_agent("native-agent", "user-anon", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "user_setup": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
 
     def test_hook_skips_auto_create_for_new_users_false(self, tmp_path, temp_db):
         """Items where ``auto_create_for_new_users=False`` are NOT seeded for
@@ -764,6 +774,40 @@ class TestUserJoinHook:
 # ---------------------------------------------------------------------------
 
 class TestSkillPackages:
+    @pytest.fixture(autouse=True)
+    def _theme_factory_not_installed(self, monkeypatch):
+        """Pin the installed-package view so these tests don't depend on
+        whether the registry happens to have been scanned in this process.
+
+        The repo ships a REAL ``mcps/skills/theme-factory`` and ``MCPS_DIR``
+        points at the repo, so any earlier test that triggers
+        ``mcp_registry.scan_manifests()`` — the skills installer calls it —
+        registers theme-factory as genuinely INSTALLED for the rest of the
+        worker. Every test in this class asserts on the package NOT being
+        installed yet, so they passed alone and failed whenever xdist put a
+        scanning test in the same worker first. (Root-caused 2026-08-16; the
+        symptom was two tests flapping in full-suite runs.)
+
+        Only theme-factory is removed — the rest of the registry view stays
+        real, so nothing else silently changes shape. BOTH readers are
+        covered: the preflight asks ``get_all_manifests``, the cascade asks
+        ``get_manifest`` per package. A test that patches ``get_manifest``
+        itself still wins inside its own ``with`` block.
+        """
+        from services.mcp import mcp_registry
+        real_all = mcp_registry.get_all_manifests
+        real_one = mcp_registry.get_manifest
+
+        def _without_theme_factory():
+            return {k: v for k, v in real_all().items() if k != "theme-factory"}
+
+        def _one(name):
+            return None if name == "theme-factory" else real_one(name)
+
+        monkeypatch.setattr(mcp_registry, "get_all_manifests",
+                            _without_theme_factory)
+        monkeypatch.setattr(mcp_registry, "get_manifest", _one)
+
     def test_skills_json_validation(self, tmp_path, temp_db):
         from storage.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
@@ -790,21 +834,34 @@ class TestSkillPackages:
         assert exc.value.status_code == 400
         assert exc.value.detail["error"] == "missing_skills"
 
-    def test_preflight_manager_blocked_when_uninstalled(self, tmp_path, temp_db):
-        """Standalone skill-package installs are admin-only: a manager
-        installing a template whose package is only in the catalog gets an
-        explicit ask-an-admin error, not a half-functional agent."""
-        from fastapi import HTTPException
+    def test_preflight_manager_queues_skill_requests(self, tmp_path, temp_db):
+        """Request-flow parity (2026-08-27): a manager installing a template
+        whose package is only in the catalog gets the AGENT plus a queued
+        ``kind: "skill"`` request per missing package — not the old
+        ``skills_require_admin`` hard-fail."""
+        from storage import mcp_request_store
         tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
         with patch(
             "services.community.community_catalog.fetch_skills_registry",
             new=AsyncMock(return_value={"skills": [{"name": "theme-factory"}]}),
+        ), patch(
+            "services.mcp.mcp_registry.get_manifest", return_value=None,
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
         ):
-            with pytest.raises(HTTPException) as exc:
-                _install_admin(tdir, installer_sub="user-manager",
-                               installer_role="manager")
-        assert exc.value.status_code == 400
-        assert exc.value.detail["error"] == "skills_require_admin"
+            result = _install_admin(tdir, target_slug="mgr-skills-agent",
+                                    installer_sub="user-manager",
+                                    installer_role="manager")
+        reqs = result["skill_packages"]["requested"]
+        assert [r["mcp_name"] for r in reqs] == ["theme-factory"]
+        assert reqs[0]["kind"] == "skill"
+        assert result["skill_packages"]["ready"] == []
+        row = mcp_request_store.get_request(reqs[0]["id"])
+        assert row["status"] == "pending" and row["kind"] == "skill"
+        # The queued request keeps the install batch alive for the
+        # one-collapsed-notification flow.
+        assert result.get("batch_id")
 
     def test_admin_cascade_installs_assigns_and_seeds(self, tmp_path, temp_db):
         from types import SimpleNamespace
@@ -870,3 +927,125 @@ class TestSkillPackages:
         assert agent_store.agent_exists("resilient-agent")
         assert result["skill_packages"]["ready"] == []
         assert result["skill_packages"]["failed"][0]["name"] == "theme-factory"
+
+
+# ---------------------------------------------------------------------------
+# Template dashboards (S5)
+# ---------------------------------------------------------------------------
+
+class TestDashboardSeeding:
+    """Template-shipped mini-app dashboards: shared pins at install, per-user
+    pins for the installer + late joiners, idempotent by the pinned_apps
+    (agent, username, slug) upsert key. HTML-only v1 (actions '[]')."""
+
+    def _install_dash(self, tmp_path, *, dashboards, dashboard_files,
+                      slug="dashtpl", target="dash-agent",
+                      installer=ADMIN_SUB):
+        from unittest.mock import AsyncMock, patch
+        _make_user(ADMIN_SUB, "admin@test.com", "admin")
+        tdir = _write_template(
+            tmp_path, slug=slug,
+            dashboards=dashboards, dashboard_files=dashboard_files,
+        )
+        with patch(
+            "services.community.community_agents_catalog.fetch_registry",
+            new=AsyncMock(return_value={"mcps": []}),
+        ), patch(
+            "services.mcp.mcp_registry.get_all_manifests",
+            return_value={},
+        ), patch(
+            "services.notifications.notification_manager.fire_notification",
+            new=AsyncMock(),
+        ):
+            return _install_admin(tdir, target_slug=target,
+                                  installer_sub=installer)
+
+    def test_shared_dashboard_seeded(self, tmp_path, temp_db):
+        import config as app_config
+        from storage import database as db
+        result = self._install_dash(
+            tmp_path,
+            dashboards=[{"slug": "team-board", "title": "Team Board",
+                         "file": "board.html", "visibility": "agent"}],
+            dashboard_files={"board.html": "<h1>Board for {agent_slug}</h1>"},
+        )
+        assert result["seeded_dashboards"] == 1
+        row = db.get_app_by_slug("dash-agent", "", "team-board")
+        assert row is not None
+        assert row["owner_sub"] is None and row["actions"] == "[]"
+        assert row["rel_path"] == "workspace/apps/team-board.html"
+        agent_dir = app_config.get_agent_dir("dash-agent")
+        target = agent_dir / "workspace/apps/team-board.html"
+        assert target.is_file()
+        # {agent_slug} substituted; late-joiner source copy materialized.
+        assert "Board for dash-agent" in target.read_text()
+        assert (agent_dir / "config/community/dashboards/team-board.html").is_file()
+
+    def test_user_dashboard_installer_and_late_joiner(self, tmp_path, temp_db):
+        import config as app_config
+        from storage import database as db
+        from services.community.community_agent_installer import on_user_added_to_agent
+        result = self._install_dash(
+            tmp_path,
+            dashboards=[{"slug": "my-brief", "file": "brief.html",
+                         "visibility": "user"}],
+            dashboard_files={"brief.html": "<h1>Brief</h1>"},
+        )
+        assert result["seeded_dashboards"] == 1
+        admin_name = db.get_username_by_sub(ADMIN_SUB)
+        assert db.get_app_by_slug("dash-agent", admin_name, "my-brief") is not None
+        # Late joiner gets their own copy…
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "dash-agent", "viewer", "test")
+        counts = on_user_added_to_agent("dash-agent", "bob-sub", "viewer")
+        assert counts["dashboards"] == 1
+        bob_name = db.get_username_by_sub("bob-sub")
+        row = db.get_app_by_slug("dash-agent", bob_name, "my-brief")
+        assert row is not None and row["owner_sub"] == "bob-sub"
+        assert (app_config.get_agent_dir("dash-agent")
+                / f"users/{bob_name}/workspace/apps/my-brief.html").is_file()
+        # …and a re-fire upserts instead of duplicating.
+        again = on_user_added_to_agent("dash-agent", "bob-sub", "viewer")
+        assert again["dashboards"] == 1
+        rows = [a for a in db.list_apps("dash-agent", bob_name)
+                if a["slug"] == "my-brief"]
+        assert len(rows) == 1
+
+    def test_auto_pin_opt_out_skips_late_joiners(self, tmp_path, temp_db):
+        from storage import database as db
+        from services.community.community_agent_installer import on_user_added_to_agent
+        self._install_dash(
+            tmp_path,
+            dashboards=[{"slug": "opt", "file": "o.html", "visibility": "user",
+                         "auto_pin_for_new_users": False}],
+            dashboard_files={"o.html": "<p>o</p>"},
+        )
+        _make_user("carol-sub", "carol@test.com")
+        db.add_user_agent("carol-sub", "dash-agent", "viewer", "test")
+        counts = on_user_added_to_agent("dash-agent", "carol-sub", "viewer")
+        assert counts["dashboards"] == 0
+
+    def test_validation_mode_and_files(self, tmp_path, temp_db):
+        import json as _json
+        import pytest as _pytest
+        from storage.community_agent_template_store import (
+            TemplateValidationError, load_template_from_dir)
+        # visibility the template's mode doesn't offer → manifest error.
+        tdir = _write_template(
+            tmp_path, slug="po-tpl",
+            dashboards=[{"slug": "x", "file": "x.html", "visibility": "agent"}],
+            dashboard_files={"x.html": "<p>x</p>"},
+        )
+        agent_json = _json.loads((tdir / "agent.json").read_text())
+        agent_json.update(collaborative=False, default_scope="user")
+        (tdir / "agent.json").write_text(_json.dumps(agent_json))
+        with _pytest.raises(TemplateValidationError, match="not offered"):
+            load_template_from_dir(tdir)
+        # Missing file → manifest error.
+        tdir2 = _write_template(
+            tmp_path, slug="missing-tpl",
+            dashboards=[{"slug": "x", "file": "nope.html"}],
+            dashboard_files={},
+        )
+        with _pytest.raises(TemplateValidationError, match="missing file"):
+            load_template_from_dir(tdir2)

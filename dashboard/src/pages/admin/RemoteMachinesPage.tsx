@@ -11,6 +11,7 @@ import { useAgents } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
+import { cliChipInfo } from '../../lib/cliChip'
 import RemoteBadge from '../../components/RemoteBadge'
 import PairInstallCommand from '../../components/PairInstallCommand'
 
@@ -140,12 +141,19 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
   const version = machine.satellite_version || 'unknown'
   const updateError = machine.last_update_error
   const pending = machine.pending_update ?? false
+  // Proxy-side budget (ws/satellite.py MAX_AUTO_UPDATE_ROLLBACKS = 2): once
+  // the same target rolled back twice, automatic pushes of it stop and only
+  // "Update now" retries — say so, or the admin keeps waiting for an update
+  // that will never come by itself.
+  const rollbackCount = machine.update_rollback_count ?? 0
+  const rollbackTarget = machine.update_rollback_target || ''
+  const autoPaused = autoEnabled && !pending && !!rollbackTarget && rollbackCount >= 2
 
   return (
     <div className="pt-2 border-t border-p-border-light space-y-2">
       <p className="text-xs font-medium text-p-text-light">Updates</p>
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex flex-col gap-0.5">
+        <div className="flex flex-col gap-0.5 min-w-0">
           <p className="text-xs text-p-text">
             Satellite version: <span className="font-mono">{version}</span>
             {pending && (
@@ -157,6 +165,13 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
           {updateError && (
             <p className="text-xs text-red-600 dark:text-red-400">
               Last update failed: {updateError}
+            </p>
+          )}
+          {autoPaused && (
+            <p className="text-xs text-amber-700 dark:text-amber-400" data-testid="auto-update-paused">
+              Automatic updates paused — the update to{' '}
+              <span className="font-mono">{rollbackTarget}</span> rolled back{' '}
+              {rollbackCount} times. Click "Update now" to retry.
             </p>
           )}
         </div>
@@ -450,11 +465,20 @@ export default function RemoteMachinesPage() {
                       {m.capabilities.os} {m.capabilities.arch}
                     </span>
                   )}
-                  {(m.capabilities.installed_clis ?? []).map(cli => (
-                    <span key={cli} className="px-2 py-0.5 rounded-sm text-xs bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
-                      {cli}
-                    </span>
-                  ))}
+                  {(m.capabilities.installed_clis ?? []).map(cli => {
+                    const info = cliChipInfo(cli, m.capabilities.cli_status, m.cli_pins)
+                    return (
+                      <span
+                        key={cli}
+                        title={info.title}
+                        className={`px-2 py-0.5 rounded-sm text-xs ${info.mismatch
+                          ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                          : 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}
+                      >
+                        {info.label}
+                      </span>
+                    )
+                  })}
                 </div>
                 {m.capabilities.os_user && (
                   <p className="text-xs text-p-text-light mt-1">

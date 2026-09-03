@@ -26,7 +26,81 @@ from core.events.bg_command_state import get_bg_command_registry
 logger = logging.getLogger("claude-proxy")
 
 
+def format_job_list(labels: list[str], limit: int = 3) -> str:
+    """Render finished-job labels for a nudge: `a; b (+2 more)`.
+
+    Labels come from the registries (composed at registration by the layer
+    that knows what the model can see — see BackgroundCommandRegistry.labels).
+    Empty/missing labels are dropped; an all-empty list renders "" and the
+    nudge degrades to its count-only form."""
+    named = [l for l in labels if l]
+    shown = named[:limit]
+    out = "; ".join(shown)
+    if len(named) > len(shown):
+        out += f" (+{len(named) - len(shown)} more)"
+    return out
+
+
+def compose_agent_nudge(count: int, labels: list[str] | None = None) -> str:
+    """The bg-subagent completion nudge — THE single composition point
+    (the WS notify path in dashboard_server_events re-composes with this)."""
+    listed = format_job_list(labels or [])
+    if listed:
+        return (f"Your {count} background agent(s) have completed: {listed}. "
+                f"Please review the results and continue.")
+    return (f"Your {count} background agent(s) have completed. "
+            f"Please review the results and continue.")
+
+
+def compose_command_nudge(count: int, labels: list[str] | None = None) -> str:
+    """The bg-command completion nudge — single composition point (see
+    compose_agent_nudge)."""
+    listed = format_job_list(labels or [])
+    if listed:
+        return (f"Your {count} background command(s) have finished: {listed}. "
+                f"Review their output and continue with the task.")
+    return (f"Your {count} background command(s) have finished. "
+            f"Review their output and continue with the task.")
+
+
 _bg_monitors_running: set[str] = set()  # session_ids with an active bg-agent monitor
+
+# Grace window for the CLI's OWN self-wake review turn (Claude ≥2.1.243):
+# after a background cohort resolves, the CLI wakes itself and reviews the
+# completion — our nudge is the FALLBACK now, fired only when no wake turn
+# was captured within this window. Event-driven (no CLI-version gate): older
+# engines never wake, the grace expires, the nudge fires as before.
+WAKE_GRACE_S = 15.0
+
+
+async def _wake_grace_covers(layer, session_id: str) -> bool:
+    """True when a captured self-wake turn covers the just-resolved cohort —
+    the nudge stands down. Actively drains during the grace (the drain
+    records wake brackets — core/events/wake_capture.py): the subagent path
+    has no other between-turns stdout reader, so a passive wait could never
+    observe the wake. Claude sessions only (``layer.session_self_wakes``);
+    codex has no self-wake and skips the grace entirely."""
+    try:
+        wakes = getattr(layer, "session_self_wakes", None)
+        if wakes is None or not await wakes(session_id):
+            return False
+    except Exception:
+        return False
+    from core.events import wake_capture
+    if wake_capture.recently_captured(session_id, within_s=WAKE_GRACE_S):
+        return True
+    deadline = time.monotonic() + WAKE_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            await layer.drain_bg_commands(session_id, budget=1.0)
+        except Exception:
+            logger.debug("wake grace: drain failed for %s", session_id[:8],
+                         exc_info=True)
+            return False
+        if wake_capture.recently_captured(session_id, within_s=WAKE_GRACE_S):
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 def bg_monitor_running(session_id: str) -> bool:
@@ -108,7 +182,24 @@ async def _bg_agent_monitor_impl(
     if not await layer.is_session_alive(session_id):
         return
 
-    nudge = f"Your {count} background agent(s) have completed. Please review the results and continue."
+    # The CLI's own self-wake review turn (≥2.1.243) supersedes the nudge —
+    # firing ours too would run a second, redundant review at double cost.
+    # The cohort's badges still clear (the wake turn was recorded as a real
+    # turn; the *_complete cohort frame below keeps reconnect state honest).
+    if await _wake_grace_covers(layer, session_id):
+        mark_bg_agents_completed(chat_id)
+        push_pump_event(chat_id, {"type": "bg_agents_complete", "count": count})
+        logger.info(
+            f"BG agent monitor: self-wake turn covered the cohort — nudge "
+            f"stands down (session={session_id[:8]})"
+        )
+        return
+
+    # Which agents finished — so the model can tell each completion apart
+    # (dogfooding find 2026-08-27: the count-only nudge made an agent read a
+    # still-running sibling's output file). Labels were captured at spawn.
+    labels = [reg.label_for(t) for t in sorted(reg.completed)]
+    nudge = compose_agent_nudge(count, labels)
 
     # Update live state (for reconnect accuracy)
     mark_bg_agents_completed(chat_id)
@@ -122,13 +213,15 @@ async def _bg_agent_monitor_impl(
             "session_id": session_id,
             "chat_id": chat_id,
             "count": count,
+            "labels": labels,
         })
         logger.info(f"BG agent monitor: nudge queued for session={session_id[:8]}")
         return
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery
     task_store.add_chat_message(chat_id, "event", "",
-        event_type="bg_nudge", event_data=json.dumps({"count": count}))
+        event_type="bg_nudge",
+        event_data=json.dumps({"count": count, "labels": labels}))
     if queue_pump_prompt(chat_id, nudge, system=True):
         push_pump_event(chat_id, {"type": "bg_agents_complete", "count": count})
         logger.info(f"BG agent monitor: nudge queued on pump for chat={chat_id[:8]}")
@@ -256,10 +349,20 @@ async def _bg_command_monitor_impl(
         )
         return
 
-    nudge = (
-        f"Your {count} background command(s) have finished. "
-        f"Review their output and continue with the task."
-    )
+    # Self-wake supersession — mirror of the subagent monitor: the CLI's own
+    # review turn (captured by the drain above or during this grace) makes
+    # our nudge redundant. Per-command badges are already cleared.
+    if await _wake_grace_covers(layer, session_id):
+        logger.info(
+            f"BG command monitor: self-wake turn covered the cohort — nudge "
+            f"stands down (session={session_id[:8]})"
+        )
+        return
+
+    # Which commands finished — labels captured at spawn (claude: shell id +
+    # command; codex: command text). See compose_command_nudge.
+    labels = [bgreg.label_for(t) for t in sorted(bgreg.completed)]
+    nudge = compose_command_nudge(count, labels)
 
     # Path 1: WS connected — deliver as a server turn via the notify queue. The
     # per-command badges are already cleared (resolve_bg_command), so unlike the
@@ -271,13 +374,15 @@ async def _bg_command_monitor_impl(
             "session_id": session_id,
             "chat_id": chat_id,
             "count": count,
+            "labels": labels,
         })
         logger.info(f"BG command monitor: nudge queued for session={session_id[:8]}")
         return
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery.
     task_store.add_chat_message(chat_id, "event", "",
-        event_type="bg_command_nudge", event_data=json.dumps({"count": count}))
+        event_type="bg_command_nudge",
+        event_data=json.dumps({"count": count, "labels": labels}))
     if queue_pump_prompt(chat_id, nudge, system=True):
         logger.info(f"BG command monitor: nudge queued on pump for chat={chat_id[:8]}")
         return

@@ -46,7 +46,7 @@ TEMPLATE_RAW_BASE = _os.environ.get("OTODOCK_AGENTS_CATALOG_RAW_BASE") or (
 TARBALL_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_TARBALL_URL") or (
     "https://codeload.github.com/OtoDock/community-agents/tar.gz/main"
 )
-TARBALL_FALLBACK_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_TARBALL_URL") or (
+TARBALL_FALLBACK_URL = _os.environ.get("OTODOCK_AGENTS_CATALOG_TARBALL_FALLBACK_URL") or (
     "https://github.com/OtoDock/community-agents/tarball/main"
 )
 

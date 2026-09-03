@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.4.0
+OTODOCK_VERSION=1.5.0
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
@@ -38,8 +38,8 @@ UV_VERSION=0.11.24
 NPM_VERSION=11.16.0
 PNPM_VERSION=11.9.0
 SYMPY_VERSION=1.14.0
-CLAUDE_CODE_VERSION=2.1.220
-CODEX_VERSION=0.145.0
+CLAUDE_CODE_VERSION=2.1.258
+CODEX_VERSION=0.149.1
 GH_VERSION=2.94.0
 BUBBLEWRAP_VERSION=0.6.1
 BUBBLEWRAP_MIN_VERSION=0.6.0
@@ -52,6 +52,7 @@ Notes:
 - **Node**: minimum is 22 LTS. We default to 24.18.0 (current LTS — "Krypton" — as of platform v1.0.0). Capacitor 8 requires Node 22+.
 - **pnpm**: installed via `npm install -g pnpm@${PNPM_VERSION}` by the installer (faster Node package manager for some MCP authors / agent workflows). v11 is the current major (new store format + supply-chain defaults).
 - **sympy**: symbolic maths in the agents' python (the file-tools maths workflow). Installed by the baseline installers pip-first into whatever `python3` resolves to (exact pin); externally-managed system pythons (PEP 668) fall back to the distro package (`python3-sympy` / brew `sympy`), whose version floats with the distro — presence beats an exact pin there.
+- **Claude Code**: 2.1.258 (2026-09-02). Claude Fable 5.1 — the platform's default Claude model since 2026-09-02 — REQUIRES ≥2.1.251 (older CLIs 400 on the model); satellites reconcile installed CLIs to this pin on reconnect (pin-and-freeze), so a pin bump here propagates to the fleet without a satellite release.
 - **GitHub CLI**: `GH_VERSION` is a reference value only — the installer adds the cli.github.com apt repo and installs the **latest** `gh` (no pin).
 - **Bubblewrap**: distro-provided (`apt install bubblewrap`), **not** pinned to an exact version — `BUBBLEWRAP_VERSION` is an informational reference (Ubuntu 22.04 LTS ships 0.6.1; Debian 12 ships ~0.8; latest upstream is 0.11.2). `BUBBLEWRAP_MIN_VERSION` (0.6.0) is the **documented floor** — the realistic oldest supported host (Ubuntu 22.04 LTS ships 0.6.1) for the namespace/seccomp/mount features the sandbox uses. It is documentation, *not* yet a runtime gate (no `bwrap --version` preflight); adding one is an optional polish. Don't raise it higher (0.8+ would exclude Ubuntu 22.04 LTS, still supported to 2027).
 - **passt / pasta**: provides the user-mode network stack that wraps **every** local agent sandbox in an isolated network namespace (always on — there is no toggle). Date-versioned upstream (`YYYY_MM_DD.<short-sha>`); `PASST_MIN_VERSION` is a *feature* floor (the build must support `--no-map-gw` + per-port `-T` forwarding), not a staleness pin — leave it unless a needed feature lands in a newer build. The startup preflight checks pasta's **presence** + that an unprivileged user+net namespace can be created (hard-fails the proxy boot if `pasta`/`ip`/`bwrap` are missing or namespaces are blocked), not its version. **Not in Ubuntu 22.04 (jammy) main** — `scripts/install-baseline-tools.sh` installs it as a HARD requirement, auto-fetching the upstream **static** build from `https://passt.top/builds/` on jammy; Debian 12 (bookworm) / Ubuntu 23.10+ ship it as `apt install passt`. The proxy Dockerfile installs `passt iproute2 bubblewrap`.
@@ -126,10 +127,12 @@ The platform runs against **exact** Claude Code / Codex CLI versions. `CLAUDE_CO
 - `proxy/config.py` parses these out of this file at startup → `PINNED_CLAUDE_CODE_VERSION` / `PINNED_CODEX_VERSION` (missing/garbled → "" → reconcile becomes a no-op, never a crash).
 
 **Propagation + reconcile (the freeze)**
+- The proxy ships the pins to each satellite in the WS `auth_result` (`cli_pins`). The satellite records them synchronously at auth (`cli_versions.set_pins` — before any spawn command can arrive) and runs `reconcile_cli_versions()` off-thread (fail-open), **verify-first** (satellite ≥ 0.5.106): it scans candidate binaries — the `satellite.conf` hint, the service PATH, npm's global bin dirs — probing `--version` against the pin; a candidate already at the pin is recorded with NO install, and `npm i -g <pkg>@<pin>` runs only when nothing satisfies the pin. Every session spawn then resolves through the recorded pin-verified path (`resolve_spawn_bin*`, with a spawn-time fast-verify for the first session racing a cold install) — so PATH order and stale `satellite.conf` absolutes can never pick a shadowing install (e.g. a native-installer copy in `~/.local/bin`); with no pin shipped, the conf hint keeps full authority. On sudo-less Linux the global npm prefix (NodeSource `/usr`) isn't writable — the install falls back to `--prefix ~/.npm-global`, whose `bin/` the satellite prepends to PATH at startup (`ensure_user_npm_bin_on_path`). Windows/macOS prefixes are user-writable and never hit the fallback. Satellites ≥ 0.5.107 also report the resolved per-CLI `{version, path}` after every reconcile pass (`cli_status`) — surfaced on the admin Remote Machines cards with an amber highlight when a machine drifts from the pin. Design doc: `satellite/host/cli_versions.py` module docstring.
 - The CLIs' **own** auto-update is disabled so they can't drift: Claude Code via `autoUpdates: false` in `settings.json` (`core/sandbox.py`) **+** `DISABLE_AUTOUPDATER=1` env (`core/env_builder.py`). Codex has **no silent auto-updater** (only the manual `codex update` subcommand) and is strict about unknown `config.toml` keys, so nothing is added there — the npm pin is its freeze.
+  - Satellites apply the same freeze on their side (`satellite/cli_session.py` writes `autoUpdates: false`; the satellite env carries `DISABLE_AUTOUPDATER=1`).
 - The proxy host itself is checked at boot by `core/sandbox.cli_version_preflight()` — **warn-only** (logs drift so an operator can re-run the installer; never blocks startup).
 
-**To bump a CLI version:** edit `CLAUDE_CODE_VERSION` / `CODEX_VERSION` above, update the matching defaults in `scripts/install-baseline-tools.{sh,ps1}` and the doc references (`CLAUDE-CODE-CLI.md`, `CODEX.md`), restart the proxy (re-reads the pin). **Codex bumps require a live app-server smoke test** (its turn/thread surface is only re-verified by hand — see `CODEX.md`). **Claude bumps: re-check the TUI diff colors** against `dashboard/src/lib/ptyBrandColors.ts` — the dashboard terminal brand-tints the file-edit rows by rewriting the theme's exact truecolor triples, which are read from the pinned binary; a change degrades silently to the stock colors (grep the new binary for `diffAdded:"rgb(`).
+**To bump a CLI version:** edit `CLAUDE_CODE_VERSION` / `CODEX_VERSION` above, update the matching defaults in `scripts/install-baseline-tools.{sh,ps1}` and the doc references (`CLAUDE-CODE-CLI.md`, `CODEX.md`), restart the proxy (re-reads the pin) → satellites self-reconcile on reconnect. **Codex bumps require a live app-server smoke test** (its turn/thread surface is only re-verified by hand — see `CODEX.md`). **Claude bumps: re-check the TUI diff colors** against `dashboard/src/lib/ptyBrandColors.ts` — the dashboard terminal brand-tints the file-edit rows by rewriting the theme's exact truecolor triples, which are read from the pinned binary; a change degrades silently to the stock colors (grep the new binary for `diffAdded:"rgb(`).
 
 ## Downstream community repos
 
@@ -140,6 +143,16 @@ COMMUNITY_AGENTS_VERSION=v1.0.0
 
 Tagged releases of the `OtoDock/community-mcps` and `OtoDock/community-agents` repos — recorded here as the catalog versions validated against this platform release. These are real tags on those repos, not placeholders: bump the value here only after tagging the catalog repo itself.
 
+## Protocol versions
+
+```
+SATELLITE_VERSION=0.5.114
+MIN_SATELLITE_VERSION=0.5.76
+```
+
+Wire-protocol version between platform and satellite daemon, bumped on every wire-protocol change. `SATELLITE_VERSION` here mirrors the authoritative `satellite/config.py::SATELLITE_VERSION` — the proxy reads that file (not this one) for its latest-version push, so update both when bumping.
+
+`MIN_SATELLITE_VERSION` is the minimum the platform will accept; older satellites are rejected with an upgrade prompt.
 
 ## Database schema version
 
@@ -156,6 +169,7 @@ cascade (a bump is rarely a one-line edit). The short form:
 2. **Regenerate any affected lockfiles** (Python deps via `uv pip compile --python-version <ver>`, dashboard via `npm install`) — and, on a **Python** bump, the `mcps/custom/*` lockfiles too.
 3. **Mirror toolchain pins into the install scripts** where they're carried as defaults (the Docker build runs `install-baseline-tools.{sh,ps1}` before VERSIONS.md is in the image): `UV_VERSION`, `PNPM_VERSION`, `CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `SYMPY_VERSION`.
 4. **Test** end-to-end: base images → rebuild + offline smoke; CLI versions → a dashboard chat through that path.
+   - Satellite bumps: pair a fresh satellite, run a turn.
 5. **Bump `OTODOCK_VERSION`** on a breaking change. **Tag a release** (`git tag v0.X.Y && git push --tags`).
 
 ## Versions pinned ELSEWHERE (index)
@@ -163,7 +177,7 @@ cascade (a bump is rarely a one-line edit). The short form:
 `VERSIONS.md` is the source only for the shared toolchain above. These are pinned
 in their own files (one place to *see* them, but not owned here):
 
-- **Library deps** — `proxy/`, `audio/pyproject.toml`, `mcps/custom/*/requirements.txt` (all `==`, regenerated from `requirements.in` via `uv pip compile`); `dashboard/package-lock.json` (npm-managed). **Regenerate, never hand-edit.** Watch for **major** bumps: backend `fastapi`/`starlette`/`sse-starlette`/`pydantic`; frontend `react`/`vite`/`tailwindcss`/`typescript`.
+- **Library deps** — `proxy/`, `phone/`, `satellite/requirements.txt`, `audio/pyproject.toml`, `mcps/custom/*/requirements.txt` (all `==`, regenerated from `requirements.in` via `uv pip compile`); `dashboard/package-lock.json` (npm-managed). **Regenerate, never hand-edit.** Watch for **major** bumps: backend `fastapi`/`starlette`/`sse-starlette`/`pydantic`; frontend `react`/`vite`/`tailwindcss`/`typescript`.
 - **Third-party compose images** — pinned directly in `docker-compose.yml` (not via a `*_IMAGE` var): `collabora/code:25.04.9.4.1` (document preview), `tecnativa/docker-socket-proxy:v0.4.2` (Docker-socket allowlist shim — the Docker-access **security boundary**; v0.4.x rebases the engine on haproxy 3.x. The allowlist env semantics — `CONTAINERS/IMAGES/NETWORKS/VOLUMES/POST` + default-deny — are unchanged; verified by an allowlist-matrix + real container-lifecycle smoke before the bump. Note the tag is `v`-prefixed from 0.4.x on. Bump deliberately + re-smoke the boundary, never opportunistically). Bump deliberately, not opportunistically.
 - **Docker-MCP runtimes** — each Docker MCP carries its own runtime, independent of the platform (the startup reconciliation skips them): `mcps/custom/file-tools-mcp` (python:3.13 — tracked here under `mcps/custom/`), `mcps/community/camoufox` (python:3.12 in the published GHCR image — **3.13 update pending a community-repo CI republish**; playwright 1.59.0 — locked; **sourced from the `OtoDock/community-mcps` repo + CI→GHCR**, the `mcps/community/` copy here is a gitignored runtime artifact), `mcps/community/github-mcp` (go1.25 + python:3.12), `m365-mcp`, etc. Only file-tools + camoufox are *ours* to track (file-tools in-repo; camoufox via the community repo); the rest are community MCPs wrapped for compat.
 - **Custom MCP system requirements** — each MCP's `manifest.json` `system_requirements` (`node_min` + OS packages; no `python_min` — that comes from the package's upstream `requires-python`).

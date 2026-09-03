@@ -49,7 +49,7 @@ AUDIOSOCKET_DIALPLAN_TEMPLATE = """[oto-audiosocket-bridge]
 exten => _.,1,Answer()
  same => n,Set(AS_UUID=${DB(otodock/route_uuid/${EXTEN})})
  same => n,GotoIf($["${AS_UUID}" = ""]?dead)
- same => n,System(curl -s -m 1 -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer __REGISTER_SECRET__' --data-binary '{"audiosocket_uuid":"${AS_UUID}","phone":"${CALLERID(num)}","did":"${EXTEN}","source":"phone-freepbx","dial_event":{"channel":"${CHANNEL}","uniqueid":"${UNIQUEID}"}}' http://__REGISTER_ENDPOINT__)
+ same => n,System(curl -s -m 1 -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer __REGISTER_SECRET__' --data-binary '{"audiosocket_uuid":"${AS_UUID}","phone":"${FILTER(+*#0-9A-Za-z,${CALLERID(num)})}","did":"${FILTER(+*#0-9A-Za-z,${EXTEN})}","source":"phone-freepbx","dial_event":{"channel":"${FILTER(/._!:A-Za-z0-9-,${CHANNEL})}","uniqueid":"${FILTER(.0-9,${UNIQUEID})}"}}' http://__REGISTER_ENDPOINT__)
  same => n,AudioSocket(${AS_UUID},__MEDIA_ENDPOINT__)
  same => n,Hangup()
  same => n(dead),Verbose(1,No OtoDock route for ${EXTEN})
@@ -67,11 +67,16 @@ exten => s,1,Answer()
 # PBX-facing address (same host the dialplan dials for media/register).
 # ``call,originate`` ride along by default so flipping a server to outbound
 # later doesn't need a PBX revisit; inbound-only operators can trim them.
+# ``dtmf`` read is REQUIRED for the daemon's DTMF event listener (PIN entry
+# on RFC2833/SIP-INFO trunks): AMI delivers read-perms ∩ EventMask, so a
+# user without the class silently yields zero digit events while login and
+# ping look healthy. Servers provisioned before this class existed must
+# re-paste the block (or add ``dtmf`` to read=) + ``manager reload``.
 AMI_MANAGER_USER_TEMPLATE = """[__AMI_USER__]
 secret = __AMI_SECRET__
 deny = 0.0.0.0/0.0.0.0
 permit = __PROXY_HOST__/255.255.255.255
-read = system,call,originate
+read = system,call,originate,dtmf
 write = system,call,originate
 ; remove call,originate if this server never places outbound calls
 """

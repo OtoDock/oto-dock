@@ -22,6 +22,7 @@ from services.scheduler import scheduler
 from storage import database as task_store
 from storage import agent_store
 from core.session.session_state import get_user_tz
+from core.session.visibility import nouser_read_targets
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
 
 logger = logging.getLogger("claude-proxy.task-api")
@@ -69,6 +70,13 @@ class CreateScheduledTaskRequest(BaseModel):
     # IANA timezone snapshot. Usually proxy-resolved from the calling session
     # (browser-detected via client_info). Callers may override explicitly.
     user_tz: str | None = None
+    # Per-task execution overrides — pin THIS task's runs to a specific model
+    # / execution layer instead of the agent's default (the token lever: a
+    # cheap default with one expensive recurring task, or vice versa).
+    # Validated against the agent's envelope by the same validator that
+    # guards delegate spawns. Omit both to inherit.
+    model: str | None = None
+    layer: str | None = None
 
 
 class CreateOneTimeTaskRequest(BaseModel):
@@ -98,6 +106,9 @@ class CreateOneTimeTaskRequest(BaseModel):
     # 'one_time' (default — needs run_at OR delay_seconds), 'trigger'
     # (no schedule, fired only via trigger webhook)
     task_type: str | None = None
+    # Per-task execution overrides — see CreateScheduledTaskRequest.
+    model: str | None = None
+    layer: str | None = None
 
 
 def _validate_user_tz(value: str | None) -> str | None:
@@ -126,6 +137,23 @@ def _resolve_user_tz(
     if user and not user.is_api_key:
         return get_user_tz(user.sub)
     return None
+
+
+async def _validate_task_overrides(
+    agent: str, layer: str | None, model: str | None,
+) -> None:
+    """Reject a per-task model/engine pin outside the agent's envelope.
+
+    Delegates to the SAME validator the delegate-spawn path uses
+    (``spawn_authz.validate_spawn_overrides``) so a schedule and a delegation
+    can never advertise different sets: layer must be one of the agent's
+    enabled execution paths, model must be enabled on that layer. Raises 400.
+    Call after the agent-access check and before any row write.
+    """
+    if not (layer or model):
+        return
+    from services.delegation.spawn_authz import validate_spawn_overrides
+    await asyncio.to_thread(validate_spawn_overrides, agent, layer, model)
 
 
 # --- Scope + permission helpers ---
@@ -271,7 +299,11 @@ def _check_run_access(run: dict, user: UserContext) -> None:
     if user.is_service:
         return
     if not user.can_access_agent(run["agent"]):
-        raise HTTPException(403, "Not authorized to access this agent's runs")
+        # A delegation edge lets a NO-USER session read the target's
+        # AGENT-SCOPE runs by id (user-scope stays out — rule 1).
+        if not (run.get("scope", "agent") != "user"
+                and run["agent"] in nouser_read_targets(user)):
+            raise HTTPException(403, "Not authorized to access this agent's runs")
     run_scope = run.get("scope", "agent")
     if run_scope == "user" and run.get("created_by") != user.sub:
         if not user.is_admin:
@@ -400,6 +432,7 @@ async def create_scheduled_task(
         err = scheduler._validate_interval_seconds(req.interval_seconds)
         if err:
             raise HTTPException(400, err)
+    await _validate_task_overrides(req.agent, req.layer, req.model)
 
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, x_agent_name)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
@@ -419,6 +452,8 @@ async def create_scheduled_task(
         notification_mode=req.notification_mode,
         notify_severity=req.notify_severity,
         user_tz=user_tz,
+        override_model=req.model or None,
+        override_execution_path=req.layer or None,
     )
     await scheduler.add_dynamic_task(task)
     timing_desc = (
@@ -458,6 +493,7 @@ async def create_one_time_task(
                 f"Agent '{req.source_agent}' is not allowed to delegate to '{req.agent}'. "
                 f"Configure delegation targets in agent settings.",
             )
+    await _validate_task_overrides(req.agent, req.layer, req.model)
 
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, x_agent_name)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
@@ -498,6 +534,8 @@ async def create_one_time_task(
         notify_severity=req.notify_severity,
         user_tz=user_tz,
         task_type=task_type,
+        override_model=req.model or None,
+        override_execution_path=req.layer or None,
     )
     await scheduler.add_dynamic_task(task)
     logger.info(
@@ -519,34 +557,80 @@ async def list_tasks(
     all_tasks = [t for t in all_tasks if not t.use_persistent]
     if agent:
         all_tasks = [t for t in all_tasks if t.agent == agent]
-    # Filter by accessible agents for non-API-key users
-    if not u.is_api_key:
-        all_tasks = [t for t in all_tasks if u.can_access_agent(t.agent)]
+    # Filter by accessible agents for everyone except the master key.
+    # Session JWTs are api-key-shaped but carry a real (or no-user)
+    # identity — they must NOT see agents outside their reach (H2: keying
+    # this on is_api_key let any agent session list every agent's tasks).
+    # Delegation edges extend a NO-USER session's reach to the targets'
+    # AGENT-SCOPE definitions only (user-scope also dies below — no acting
+    # sub); user-backed sessions never consult the roster.
+    if not u.is_service:
+        edge_reach = await asyncio.to_thread(nouser_read_targets, u)
+        all_tasks = [
+            t for t in all_tasks
+            if u.can_access_agent(t.agent)
+            or (t.scope == "agent" and t.agent in edge_reach)
+        ]
 
     # Scope-aware filtering. Agent-scoped items are shared; a user's user-scoped
     # items are private to them. The admin AUDIT surface (``audit=true``, admin
     # only — the admin Scheduled Tasks page) sees every user's items so it can
     # audit; every other caller — INCLUDING an admin on an agent's settings tab —
     # gets the user-view (own user-scoped + agent-scoped). ``agent`` stays a plain
-    # filter in both modes.
+    # filter in both modes. Keyed on is_service like _scope_filter_sub (H1:
+    # keying on is_api_key exempted agent-session callers, so an agent could
+    # list OTHER users' user-scoped task definitions — prompts included — on
+    # the same agent; the runs endpoint already filtered correctly).
     audit_view = audit and u.is_admin
-    if not u.is_api_key and not audit_view:
+    if not u.is_service and not audit_view:
         filtered = []
         for t in all_tasks:
             if t.scope == "agent":
                 filtered.append(t)
-            elif t.scope == "user" and t.created_by == u.sub:
+            elif (t.scope == "user" and u.acting_sub is not None
+                    and t.created_by == u.acting_sub):
                 filtered.append(t)
         all_tasks = filtered
 
     # Build APScheduler job index for next_run_time lookup
     jobs_by_task_id = {j["task_id"]: j for j in scheduler.get_scheduled_jobs()}
 
+    # What each task will ACTUALLY run on — its own pin, else the agent's
+    # current default. Memoized per agent: the admin listing spans agents and
+    # resolve_agent_model hits the DB. It raises when the install has no
+    # enabled model for the agent's layer; "" then means "unresolved", which
+    # the UI renders as nothing rather than a wrong claim.
+    _default_model_cache: dict[str, str] = {}
+    _default_path_cache: dict[str, str] = {}
+
+    def _agent_default_model(agent_slug: str) -> str:
+        if agent_slug not in _default_model_cache:
+            try:
+                _default_model_cache[agent_slug] = config.resolve_agent_model(agent_slug)
+            except Exception:
+                _default_model_cache[agent_slug] = ""
+        return _default_model_cache[agent_slug]
+
+    def _agent_execution_path(agent_slug: str) -> str:
+        if agent_slug not in _default_path_cache:
+            row = agent_store.get_agent(agent_slug) or {}
+            _default_path_cache[agent_slug] = row.get("execution_path") or ""
+        return _default_path_cache[agent_slug]
+
     result = []
     for t in all_tasks:
         job = jobs_by_task_id.get(t.id)
         d = t.model_dump()
         d["next_run_time"] = job["next_run_time"] if job else None
+        # getattr, not attribute access: this listing also renders duck-typed
+        # task defs (the scoping tests' minimal stubs), and task_config_builder
+        # reads the same fields the same way.
+        d["effective_model"] = (getattr(t, "override_model", None)
+                                or _agent_default_model(t.agent))
+        d["effective_execution_path"] = (
+            getattr(t, "override_execution_path", None)
+            or _agent_execution_path(t.agent)
+        )
 
         # Permission metadata for UI (3-tier per-agent model).
         # owner = manager + admin; can mutate any task on the agent.
@@ -690,6 +774,12 @@ class EditTaskRequest(BaseModel):
     notification_mode: Literal["auto", "manual", "none"] | None = None
     notify_severity: str | None = None
     user_tz: str | None = None
+    # Per-task execution overrides. "" (or null) CLEARS the pin — the task
+    # goes back to the agent's default on its next run; a non-empty value is
+    # validated against the agent's envelope like it is on create. Omit the
+    # field entirely to leave the current pin untouched.
+    model: str | None = None
+    layer: str | None = None
 
 
 async def _edit_task_impl(
@@ -727,6 +817,23 @@ async def _edit_task_impl(
             status_code=400,
             detail="schedule, run_at, and interval_seconds are mutually exclusive — set only one",
         )
+
+    # Per-task execution overrides: request names (model/layer, matching
+    # delegate()) → column names. Empty/None clears the pin back to the
+    # agent's default; "" rather than NULL keeps every row's inherit-state
+    # spelled the same way. Validate against the EFFECTIVE layer — a
+    # model-only edit on a task that already pins a layer must be checked
+    # against that layer, not the agent's primary one.
+    if "model" in fields or "layer" in fields:
+        new_layer = (fields.get("layer") if "layer" in fields
+                     else dyn.get("override_execution_path")) or None
+        new_model = (fields.get("model") if "model" in fields
+                     else dyn.get("override_model")) or None
+        await _validate_task_overrides(dyn["agent"], new_layer, new_model)
+        if "model" in fields:
+            fields["override_model"] = fields.pop("model") or ""
+        if "layer" in fields:
+            fields["override_execution_path"] = fields.pop("layer") or ""
 
     ok, err = await scheduler.update_dynamic_task(task_id, fields)
     if err:
@@ -930,22 +1037,40 @@ async def list_runs(
     # The DEFAULT listing excludes delegate runs (surface=chat delegations
     # live in the chat history; API consumers usually want schedules). A
     # direct task_id query is explicit (delegate continue flows resolve
-    # output by task id); schedules-mcp AND the dashboard's per-agent Task
-    # History pass include_delegates — task-surface background jobs are
-    # documented as "visible in the agent's History", and the Active-now
-    # widget's task rows click through there expecting to find them.
+    # output by task id); schedules-mcp passes include_delegates —
+    # task-surface background jobs are documented as "visible in the agent's
+    # History", and the Active-now widget's task rows click through there
+    # expecting to find them.
     exclude = None if (include_delegates or task_id) else "delegate"
+    # Accessible-agents filter IN SQL, not a Python post-filter (H2 — session
+    # JWTs are api-key-shaped but must stay inside their identity's reach): a
+    # post-filter after SQL LIMIT/COUNT returned short pages and an inflated
+    # ``total`` on cross-agent listings. Admin passes can_access_agent
+    # everywhere, so only non-admin callers are constrained.
+    agents_filter: list[str] | None = None
+    edge_filter: list[str] | None = None
+    if not u.is_service and not u.is_admin:
+        reach = set(u.agents)
+        if u.agent:
+            reach.add(u.agent)
+        agents_filter = sorted(reach)
+        # Delegation edges add the targets' AGENT-SCOPE runs for a no-user
+        # caller — a separate SQL disjunct, NOT a widened agents_filter (the
+        # own-agent branch deliberately includes user-scope runs, edge
+        # targets must not).
+        edge_filter = sorted(
+            await asyncio.to_thread(nouser_read_targets, u) - reach
+        ) or None
     runs = await asyncio.to_thread(
         task_store.list_runs, limit, offset, agent, status, task_id, session_id,
         scope_user_sub=scope_sub, created_by=created_by,
-        exclude_task_type=exclude,
+        exclude_task_type=exclude, agents_filter=agents_filter,
+        edge_agents_filter=edge_filter,
     )
-    # Filter runs by accessible agents for non-API-key users
-    if not u.is_api_key:
-        runs = [r for r in runs if u.can_access_agent(r["agent"])]
     total = await asyncio.to_thread(
         task_store.get_run_count, agent, status, scope_user_sub=scope_sub,
         created_by=created_by, exclude_task_type=exclude,
+        agents_filter=agents_filter, edge_agents_filter=edge_filter,
     )
     return {"runs": runs, "total": total, "limit": limit, "offset": offset}
 

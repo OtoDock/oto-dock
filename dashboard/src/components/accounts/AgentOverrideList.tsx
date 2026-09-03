@@ -22,7 +22,8 @@ export function AgentOverrideList({ integration, account, ops }: Props) {
   for (const acc of integration.accounts) {
     if (acc.account_label === account.account_label) continue
     for (const agent of acc.agent_overrides) {
-      ownedByOtherAccount[agent] = acc.display_email || acc.account_label
+      // Label first — same-identity accounts are twins by display_email.
+      ownedByOtherAccount[agent] = acc.account_label || acc.display_email
     }
   }
 

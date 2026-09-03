@@ -963,6 +963,31 @@ def get_visible_mcps_for_agent(agent_name: str) -> list[McpManifest]:
     return result
 
 
+def get_unauthorized_explicit_mcps_for_agent(agent_name: str) -> list[McpManifest]:
+    """The complement of :func:`get_visible_mcps_for_agent` within the
+    platform-enabled set: explicit-mode MCPs installed and enabled on the
+    platform where NO instance authorizes this agent yet.
+
+    These are the MCPs a manager can *request* (the admin attaches the agent
+    to an instance on approval) but cannot self-enable. Auto-mode MCPs never
+    appear here — they are always visible once platform-enabled.
+    Platform-disabled MCPs are excluded on purpose: the admin turned them
+    off deliberately, so they are not offered for request either.
+    """
+    state_enabled = mcp_store.get_all_mcp_states()
+    visible_explicit = mcp_store.get_visible_explicit_mcps(agent_name)
+
+    result = []
+    for name, manifest in _manifests.items():
+        if not state_enabled.get(name, False):
+            continue
+        if not manifest_capability_available(manifest):
+            continue
+        if manifest.assignment_mode == "explicit" and name not in visible_explicit:
+            result.append(manifest)
+    return result
+
+
 def _hosted_schema(m) -> dict | None:
     """Serialize the manifest's hosted block (oauth_app / api_key_relay) for the
     dashboard. Independent of credential type — an MCP can be credentials.type
@@ -1033,6 +1058,14 @@ def get_credential_schema(name: str) -> dict | None:
             "proposed_hosts": cred.oauth.get("proposed_hosts", []),
             "flows": flows,
             "pat_instructions_url": cred.oauth.get("pat_instructions_url", ""),
+            # Optional manifest-supplied placeholder for the PAT/API-key
+            # textarea (e.g. github's "ghp_…"). Empty = dashboard's neutral
+            # fallback — without this, every PAT provider showed GitHub's.
+            "pat_placeholder": cred.oauth.get("pat_placeholder", ""),
+            # Provider-specific copy for the PAT flow-picker option
+            # (github: "…in your GitHub account settings (Developer
+            # settings)…"). Empty = dashboard's generic fallback.
+            "pat_description": cred.oauth.get("pat_description", ""),
         }
         if cred.app_credential_fields:
             result["app_credential"] = cred.oauth.get("app_credential", "")

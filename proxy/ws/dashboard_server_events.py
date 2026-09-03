@@ -194,11 +194,17 @@ class ServerNotificationController:
             # absent (shouldn't happen — the monitor always carries them).
             nudge_chat_id = notification.get("chat_id") or self.chat_id
             nudge_sid = notification.get("session_id") or self.session_id
-            nudge = f"Your {count} background agent(s) have completed. Please review the results and continue."
+            # Composed by the SAME function as the monitor's direct paths —
+            # the payload carries the finished-job labels so the model can
+            # tell which agent completed.
+            from core.events.pump_bg_monitors import compose_agent_nudge
+            labels = notification.get("labels") or []
+            nudge = compose_agent_nudge(count, labels)
             # Save the system event on the ORIGINATING chat.
             if nudge_chat_id:
                 task_store.add_chat_message(nudge_chat_id, "event", "",
-                    event_type="bg_nudge", event_data=json.dumps({"count": count}))
+                    event_type="bg_nudge",
+                    event_data=json.dumps({"count": count, "labels": labels}))
             # Clear the bg-agent status bar — only if this socket is viewing the
             # originating chat (else it would clear the WRONG chat's badges; a
             # reattach reconstructs the state from live_state/chat_history).
@@ -220,11 +226,13 @@ class ServerNotificationController:
             count = notification["count"]
             nudge_chat_id = notification.get("chat_id") or self.chat_id
             nudge_sid = notification.get("session_id") or self.session_id
-            nudge = (f"Your {count} background command(s) have finished. "
-                     f"Review their output and continue with the task.")
+            from core.events.pump_bg_monitors import compose_command_nudge
+            labels = notification.get("labels") or []
+            nudge = compose_command_nudge(count, labels)
             if nudge_chat_id:
                 task_store.add_chat_message(nudge_chat_id, "event", "",
-                    event_type="bg_command_nudge", event_data=json.dumps({"count": count}))
+                    event_type="bg_command_nudge",
+                    event_data=json.dumps({"count": count, "labels": labels}))
             # Clear the bg-command badges on the viewed socket. The per-command
             # bg_command_done can't deliver post-turn (the turn's pump is gone —
             # app.py _push_to_pump needs an active pump), so this notify-queue
@@ -306,12 +314,24 @@ class ServerNotificationController:
                 })
             # Drive the synthesis turn on the delegating chat (headless if unviewed).
             res_layer = self.layer if res_chat_id == self.chat_id else self._resolve_layer_for_chat(res_chat_id)
-            await self._run_server_turn(
+            turn_pump = await self._run_server_turn(
                 result_prompt,
                 target_session_id=res_sid,
                 target_chat_id=res_chat_id,
                 target_layer=res_layer,
             )
+            if turn_pump is None and res_chat_id and result_prompt:
+                # No turn ran (dead target that couldn't warm, layer gone) —
+                # the event row above is only a bubble. Park the prompt as a
+                # durable wake so the next warmup/turn on the chat replays it
+                # (the _start_new_stream chokepoint claims pending wakes).
+                stored = task_store.append_pending_delegate_wake(
+                    res_chat_id, result_prompt)
+                logger.warning(
+                    f"WS dashboard: delegate-result turn could not start for "
+                    f"chat={res_chat_id[:8]} — wake "
+                    f"{'stored for replay' if stored else 'NOT stored'}"
+                )
 
         elif ntype == "continuation_prompt":
             # A scheduled self-continuation woke this session's chat (scheduler
@@ -340,7 +360,7 @@ class ServerNotificationController:
         prompt: str, *, target_session_id: str | None, target_chat_id: str,
         target_layer: "ExecutionLayer | None", images: list[dict] | None = None,
         force_headless: bool = False,
-    ) -> None:
+    ) -> object | None:
         """Run a server-initiated turn (bg nudge / delegate result / server-kick)
         on its ORIGINATING chat, regardless of what this socket is viewing.
 
@@ -366,12 +386,13 @@ class ServerNotificationController:
             images=images,
         )
         if not pump:
-            # Warm FAILED (a dead non-viewed target that couldn't resume — its
-            # marker is already persisted, so it runs on reopen), or a genuine
-            # failure on the viewed chat → reset the viewed UI.
+            # Warm FAILED (a dead non-viewed target that couldn't resume), or a
+            # genuine failure on the viewed chat → reset the viewed UI. Returns
+            # None so the caller can store a durable wake — the persisted event
+            # row alone is just a bubble, NOT a replayable prompt.
             if is_viewed:
                 await self._send({"type": "done", "chat_id": self.chat_id or ""})
-            return
+            return None
         if is_viewed:
             # A server-initiated turn (bg-nudge review / delegate-result synthesis)
             # has no user-send to flip the frontend's `streaming` state, so without
@@ -386,6 +407,7 @@ class ServerNotificationController:
             # the pump broadcasts its own chat_status start/end, and
             # _start_new_stream already armed its bg-monitor watcher.
             pass
+        return pump
 
     async def _run_kick_headless(self,
         wcid: str, sid: str | None, text: str,

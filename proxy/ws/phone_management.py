@@ -10,6 +10,13 @@ Protocol:
   Server → Client: {"type": "ping"}                            every 30s
   Client → Server: {"type": "pong"}                            keepalive response
   Client → Server: {"type": "request_config"}                  force re-push
+  Client → Server: {"type": "capabilities", "duplex": {...}}   daemon feature advert (on connect)
+  Server → Client: {"type": "duplex_open", ...}                open a duplex session (ws/duplex.py)
+  Client → Server: {"type": "duplex_open_failed", ...}         dial-back refusal (ws/duplex.py)
+
+Unknown frame types are ignored on both sides, so old daemons and old proxies
+interop cleanly — a daemon that never sends ``capabilities`` simply has no
+duplex support recorded.
 """
 
 import asyncio
@@ -22,6 +29,7 @@ from fastapi import WebSocket, WebSocketDisconnect, Query
 from websockets.exceptions import ConnectionClosed
 
 import config
+from services.phone import phone_config
 from services.phone.phone_config import assemble_phone_config, _management_clients
 
 logger = logging.getLogger("claude-proxy")
@@ -32,12 +40,15 @@ _PONG_TIMEOUT_S = 60
 
 async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(default="")):
     """Persistent management WebSocket for phone server config push."""
-    # Auth: master key via Authorization: Bearer header (query params are
-    # written to access logs; ``?key=`` still accepted for older phone
-    # daemons). Constant-time compare; fail closed if unset.
+    # Auth: master key via Authorization: Bearer header ONLY — query params
+    # are written to access logs, so the legacy ``?key=`` fallback would
+    # deposit the master key there (dropped for the first public release;
+    # the shipped daemon has sent the header for many versions).
     auth_header = websocket.headers.get("authorization", "")
     bearer = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
-    if not config.is_master_key(bearer or key):
+    if key:
+        logger.warning("phone WS: ignoring legacy ?key= query auth — use the Authorization header")
+    if not config.is_master_key(bearer):
         await websocket.close(code=4001, reason="Invalid API key")
         return
 
@@ -88,6 +99,20 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
                 if msg_type == "pong":
                     last_pong = time.monotonic()
 
+                elif msg_type == "capabilities":
+                    caps = {k: v for k, v in msg.items() if k != "type"}
+                    phone_config.set_management_capabilities(websocket, caps)
+                    logger.info(
+                        f"Phone management: daemon capabilities {caps}"
+                    )
+
+                elif msg_type == "duplex_open_failed":
+                    from ws import duplex as ws_duplex
+                    ws_duplex.on_open_failed(
+                        str(msg.get("duplex_id") or ""),
+                        str(msg.get("reason") or "daemon refused"),
+                    )
+
                 elif msg_type == "request_config":
                     config_data = assemble_phone_config()
                     await websocket.send_json({
@@ -107,4 +132,5 @@ async def ws_phone_management_handler(websocket: WebSocket, key: str = Query(def
         logger.error(f"Phone management WebSocket error: {e}", exc_info=True)
     finally:
         _management_clients.discard(websocket)
+        phone_config.clear_management_capabilities(websocket)
         logger.info("Phone management WebSocket disconnected")

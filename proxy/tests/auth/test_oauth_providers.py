@@ -349,3 +349,121 @@ class TestCredentialLocks:
             ["A-enter", "A-exit", "B-enter", "B-exit"],
             ["B-enter", "B-exit", "A-enter", "A-exit"],
         )
+
+
+# ---------------------------------------------------------------------------
+# PAT-only manifest providers (postiz) — factory allowance + raw auth scheme
+# ---------------------------------------------------------------------------
+
+
+class TestPatOnlyProvider:
+    """postiz-mcp shape: flows=["personal_access_token"], NO authorization/
+    token URLs, raw (non-Bearer) Authorization on userinfo, and an
+    identity-less userinfo payload (a JSON array of channels)."""
+
+    @staticmethod
+    def _postiz_manifest(**oauth_overrides):
+        from types import SimpleNamespace
+
+        oauth = {
+            "provider_id": "postiz",
+            "flows": ["personal_access_token"],
+            "userinfo_url": "https://api.postiz.com/public/v1/integrations",
+            "userinfo_email_field": "",
+            "userinfo_name_field": "",
+            "userinfo_id_field": "",
+            "userinfo_auth_scheme": "raw",
+        }
+        oauth.update(oauth_overrides)
+        return SimpleNamespace(
+            name="postiz-mcp", credentials=SimpleNamespace(oauth=oauth),
+        )
+
+    def test_factory_builds_pat_only_provider_without_urls(self):
+        from auth import oauth_providers
+
+        m = self._postiz_manifest()
+        oauth_providers._MANIFEST_CACHE.pop("postiz", None)
+        try:
+            with patch(
+                "services.mcp.mcp_registry.get_all_manifests",
+                return_value={"postiz-mcp": m},
+            ):
+                p = get_provider("postiz")
+            assert p.provider_id == "postiz"
+            assert p.flow == "personal_access_token"
+            assert p.userinfo_auth_scheme == "raw"
+        finally:
+            oauth_providers._MANIFEST_CACHE.pop("postiz", None)
+
+    def test_factory_still_rejects_urlless_browser_flow(self):
+        from auth import oauth_providers
+
+        m = self._postiz_manifest(
+            provider_id="urlless-browser", flows=["authorization_code"],
+        )
+        oauth_providers._MANIFEST_CACHE.pop("urlless-browser", None)
+        with patch(
+            "services.mcp.mcp_registry.get_all_manifests",
+            return_value={"x-mcp": m},
+        ):
+            with pytest.raises(KeyError):
+                get_provider("urlless-browser")
+
+    @pytest.mark.asyncio
+    async def test_raw_scheme_bare_token_and_list_payload(self):
+        p = GenericOAuthProvider(
+            provider_id="postiz",
+            authorization_url="",
+            token_url="",
+            userinfo_url="https://api.postiz.com/public/v1/integrations",
+            userinfo_email_field="",
+            userinfo_name_field="",
+            userinfo_id_field="",
+            userinfo_auth_scheme="raw",
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json = MagicMock(return_value=[{"id": "chan-1"}])
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        with patch(
+            "auth.oauth_providers.generic.httpx.AsyncClient",
+            return_value=mock_client,
+        ):
+            ts, ui = await p.exchange_personal_access_token(
+                token="raw-key", scopes=[],
+            )
+        headers = mock_client.get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "raw-key"  # bare — no Bearer
+        assert ts.access_token == "raw-key"
+        assert ts.expires_in == 0  # never-expires sentinel for the refresher
+        # Empty field names + array payload = identity-less, not an error.
+        assert ui.email == "" and ui.name == "" and ui.account_id == ""
+        assert ui.raw == {"items": [{"id": "chan-1"}]}
+
+    @pytest.mark.asyncio
+    async def test_bearer_default_scheme_unchanged(self):
+        p = GenericOAuthProvider(
+            provider_id="x",
+            authorization_url="https://x/a",
+            token_url="https://x/t",
+            userinfo_url="https://x/me",
+        )
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json = MagicMock(return_value={"email": "e@x", "name": "N", "sub": "1"})
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=mock_response)
+        with patch(
+            "auth.oauth_providers.generic.httpx.AsyncClient",
+            return_value=mock_client,
+        ):
+            ui = await p.fetch_userinfo(access_token="at")
+        headers = mock_client.get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer at"
+        assert ui.email == "e@x"

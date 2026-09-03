@@ -24,7 +24,9 @@ import asyncio
 
 import pytest
 
-from core.config.task_config_builder import resolve_task_identity, TaskIdentity
+from core.config.task_config_builder import (
+    TaskIdentity, resolve_task_identity, task_allows_knowledge_rw,
+)
 from ws.dashboard import _rewarm_chat_allowed, _task_continue_allowed
 from storage import agent_store
 from storage import database as task_store
@@ -109,6 +111,131 @@ class TestResolveTaskIdentity:
         ident = resolve_task_identity("ops", "user", None)
         assert ident.scope == "agent"
         assert ident.username == ""
+
+
+# ---------------------------------------------------------------------------
+# knowledge_rw provenance — manager-created agent-scope task fires
+# ---------------------------------------------------------------------------
+
+class TestKnowledgeRwProvenance:
+    """Truth table for the manager-provenance knowledge-write grant.
+
+    The flag is computed ONLY when the caller opts in (the scheduler's
+    scheduled / one-time / trigger fire paths and their WS re-warms), and
+    only on the agent-scope branch, from the dynamic task's ``created_by``:
+    a REAL platform user who is a platform admin or a per-agent MANAGER of
+    the agent. Everything else — editors, viewers, deleted users, agent
+    slugs, ``"api"``, delegate fires, meetings, headless apps — is False.
+    """
+
+    def _ident(self, agent="ops", created_by=None, *, allow=True):
+        return resolve_task_identity(
+            agent, "agent", created_by, allow_knowledge_rw=allow)
+
+    def test_platform_admin_creator_grants(self, temp_db):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-a", "Ada", role="admin")
+        assert self._ident(created_by="sub-a").knowledge_rw is True
+
+    def test_per_agent_manager_creator_grants(self, temp_db):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-m", "Max", role="member")
+        task_store.add_user_agent("sub-m", "ops", "manager", "admin")
+        assert self._ident(created_by="sub-m").knowledge_rw is True
+
+    def test_editor_creator_denied(self, temp_db):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-e", "Eve", role="member")
+        task_store.add_user_agent("sub-e", "ops", "editor", "admin")
+        assert self._ident(created_by="sub-e").knowledge_rw is False
+
+    def test_viewer_and_unassigned_creator_denied(self, temp_db):
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-v", "Vic", role="member")
+        task_store.add_user_agent("sub-v", "ops", "viewer", "admin")
+        assert self._ident(created_by="sub-v").knowledge_rw is False
+        _mk_user("sub-n", "Noa", role="member")  # no assignment at all
+        assert self._ident(created_by="sub-n").knowledge_rw is False
+
+    def test_manager_on_other_agent_denied(self, temp_db):
+        # Per-agent roles only — manager of a DIFFERENT agent grants nothing.
+        agent_store.create_agent("ops", "Ops")
+        agent_store.create_agent("pa", "PA")
+        _mk_user("sub-o", "Omar", role="member")
+        task_store.add_user_agent("sub-o", "pa", "manager", "admin")
+        assert self._ident(created_by="sub-o").knowledge_rw is False
+
+    def test_nonuser_creators_denied(self, temp_db):
+        # created_by is mixed-type: agent slugs (self-scheduled tasks) and
+        # "api" never resolve to a platform user → no self-escalation.
+        agent_store.create_agent("ops", "Ops")
+        assert self._ident(created_by="ops").knowledge_rw is False
+        assert self._ident(created_by="api").knowledge_rw is False
+        assert self._ident(created_by=None).knowledge_rw is False
+        assert self._ident(created_by="sub-deleted").knowledge_rw is False
+
+    def test_without_opt_in_even_admin_denied(self, temp_db):
+        # The default (meetings, headless apps, direct construction) is OFF.
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-a", "Ada", role="admin")
+        assert self._ident(created_by="sub-a", allow=False).knowledge_rw is False
+        assert resolve_task_identity("ops", "agent", "sub-a").knowledge_rw is False
+
+    def test_user_scope_identity_never_carries_it(self, temp_db):
+        agent_store.create_agent("pa", "PA")
+        _mk_user("sub-m", "Max", role="member")
+        task_store.add_user_agent("sub-m", "pa", "manager", "admin")
+        ident = resolve_task_identity(
+            "pa", "user", "sub-m", allow_knowledge_rw=True)
+        assert ident.scope == "user"
+        assert ident.knowledge_rw is False
+
+    def test_admin_only_agent_branch_carries_it(self, temp_db):
+        agent_store.create_agent("secret", "Secret", admin_only=True)
+        _mk_user("sub-a", "Ada", role="admin")
+        ident = self._ident(agent="secret", created_by="sub-a")
+        assert ident.role == "admin"
+        assert ident.knowledge_rw is True
+
+    def test_reresolve_at_fire_demote_between_fires(self, temp_db):
+        # The flag is provenance re-resolved at EVERY fire: a creator demoted
+        # from manager to editor loses it at the next resolve.
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-m", "Max", role="member")
+        task_store.add_user_agent("sub-m", "ops", "manager", "admin")
+        assert self._ident(created_by="sub-m").knowledge_rw is True
+        task_store.set_user_agent_role("sub-m", "ops", "editor")
+        assert self._ident(created_by="sub-m").knowledge_rw is False
+
+    def test_task_type_gate(self):
+        # Scheduler fire shapes AND delegate workers opt in (operator
+        # decision 2026-08-24: a delegate's created_by is the real
+        # delegating user, so the manager-provenance check applies the same
+        # way — no-user delegations record the agent slug, which the
+        # provenance check fails closed on). Continuations / unknowns stay
+        # out.
+        assert task_allows_knowledge_rw("scheduled") is True
+        assert task_allows_knowledge_rw("one_time") is True
+        assert task_allows_knowledge_rw("trigger") is True
+        assert task_allows_knowledge_rw("delegate") is True
+        assert task_allows_knowledge_rw("continuation") is False
+        assert task_allows_knowledge_rw("") is False
+        assert task_allows_knowledge_rw(None) is False
+
+    def test_delegate_provenance_matrix(self, temp_db):
+        # Manager-delegated agent-scope worker gets knowledge RW on the
+        # TARGET (same reach as that user's own chat there); an editor's
+        # delegation and an agent-to-agent delegation (created_by = source
+        # agent slug) stay RO.
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-mgr", "Mia", role="member")
+        task_store.add_user_agent("sub-mgr", "ops", "manager", "admin")
+        _mk_user("sub-ed", "Ed", role="member")
+        task_store.add_user_agent("sub-ed", "ops", "editor", "admin")
+        assert self._ident(created_by="sub-mgr").knowledge_rw is True
+        assert self._ident(created_by="sub-ed").knowledge_rw is False
+        # No-user delegation: created_by is the SOURCE AGENT slug.
+        assert self._ident(created_by="some-agent").knowledge_rw is False
 
 
 # ---------------------------------------------------------------------------

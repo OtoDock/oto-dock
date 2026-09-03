@@ -95,7 +95,13 @@ def get_admin_only_slugs() -> set[str]:
 # ---------------------------------------------------------------------------
 
 def get_delegation_targets(agent_name: str) -> list[str]:
-    """Return list of agent slugs this agent can delegate to."""
+    """Return list of agent slugs this agent can delegate to (all sources).
+
+    This is the EFFECTIVE delegation set — manual checkbox edges plus
+    department-compiled ones — and is what spawn authz, the session config
+    builders, and no-user read reach (core.session.visibility.
+    nouser_read_targets — a wired edge IS the read grant) consume.
+    """
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT target_agent FROM agent_delegation_targets WHERE agent_name = %s ORDER BY target_agent",
@@ -104,13 +110,65 @@ def get_delegation_targets(agent_name: str) -> list[str]:
         return [r["target_agent"] for r in rows]
 
 
-def set_delegation_targets(agent_name: str, targets: list[str]) -> None:
-    """Replace all delegation targets for an agent."""
+def get_delegation_targets_detailed(agent_name: str) -> list[dict]:
+    """Return [{target, source}] so the config UI can lock compiled edges."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM agent_delegation_targets WHERE agent_name = %s", (agent_name,))
+        rows = conn.execute(
+            "SELECT target_agent, source FROM agent_delegation_targets "
+            "WHERE agent_name = %s ORDER BY target_agent",
+            (agent_name,),
+        ).fetchall()
+        return [
+            {"target": r["target_agent"], "source": r["source"]}
+            for r in rows
+        ]
+
+
+def set_delegation_targets(agent_name: str, targets: list[str]) -> None:
+    """Replace the MANUAL delegation targets for an agent.
+
+    Source-scoped: department-compiled rows are owned by the edge compiler
+    and must survive a checkbox save untouched (the config UI autosaves the
+    full manual set on every toggle — before source-scoping, one toggle wiped
+    every compiled edge for the agent). A target that already exists as a
+    compiled row stays compiled (ON CONFLICT DO NOTHING) — the UI excludes
+    locked compiled edges from the manual set, so this is defensive only.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM agent_delegation_targets "
+            "WHERE agent_name = %s AND source = 'manual'",
+            (agent_name,),
+        )
         for target in targets:
             conn.execute(
-                "INSERT INTO agent_delegation_targets (agent_name, target_agent) VALUES (%s, %s)",
+                "INSERT INTO agent_delegation_targets "
+                "(agent_name, target_agent, source) "
+                "VALUES (%s, %s, 'manual') "
+                "ON CONFLICT (agent_name, target_agent) DO NOTHING",
+                (agent_name, target),
+            )
+        conn.commit()
+
+
+def replace_department_edges(desired: set[tuple[str, str]]) -> None:
+    """Atomically swap ALL department-compiled edges for the desired set.
+
+    Owned by services/departments/edge_compiler.py (global recompile — no
+    per-department bookkeeping). Manual rows are never touched; a desired
+    edge that already exists as a manual row stays manual, so it survives
+    the department later retracting it (the user explicitly asked for it).
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM agent_delegation_targets WHERE source = 'department'"
+        )
+        for agent_name, target in sorted(desired):
+            conn.execute(
+                "INSERT INTO agent_delegation_targets "
+                "(agent_name, target_agent, source) "
+                "VALUES (%s, %s, 'department') "
+                "ON CONFLICT (agent_name, target_agent) DO NOTHING",
                 (agent_name, target),
             )
         conn.commit()
@@ -126,6 +184,21 @@ def get_all_delegation_targets() -> dict[str, list[str]]:
         for r in rows:
             result.setdefault(r["agent_name"], []).append(r["target_agent"])
         return result
+
+
+def get_all_delegation_edges() -> list[dict]:
+    """Every delegation edge with its source — the agents-map edge feed
+    (visibility scoping is the API layer's job)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT agent_name, target_agent, source "
+            "FROM agent_delegation_targets ORDER BY agent_name, target_agent"
+        ).fetchall()
+        return [
+            {"from": r["agent_name"], "to": r["target_agent"],
+             "source": r["source"]}
+            for r in rows
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +416,7 @@ def update_agent(slug: str, **fields) -> dict | None:
         "execution_paths", "default_model", "default_effort",
         "color", "description", "execution_target", "default_scope",
         "default_for_new_users_role", "collaborative",
-        "default_execution_mode",
+        "default_execution_mode", "department_id", "department_level_id",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if "default_scope" in updates and updates["default_scope"] not in ("user", "agent"):
@@ -424,6 +497,9 @@ def delete_agent(slug: str) -> bool:
         conn.execute("DELETE FROM user_agents WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_delegation_targets WHERE target_agent = %s", (slug,))
+        conn.execute("DELETE FROM knowledge_libraries WHERE source_agent = %s", (slug,))
+        conn.execute("DELETE FROM knowledge_library_attachments WHERE source_agent = %s", (slug,))
+        conn.execute("DELETE FROM knowledge_library_attachments WHERE consumer_agent = %s", (slug,))
         conn.execute("DELETE FROM agent_browser_origins WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_account_bindings WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM service_agent_bindings WHERE agent_name = %s", (slug,))

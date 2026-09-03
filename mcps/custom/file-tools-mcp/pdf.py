@@ -9,20 +9,26 @@ write_pdf: HTML/Markdown → PDF via WeasyPrint.
 convert_document: LibreOffice headless format conversion.
 """
 
+import asyncio
 import contextlib
 import os
 import re
+import shutil
 from pathlib import Path
 
+from isolation import run_parse
 from shared import (
+    _checked_resolved,
     _dropped_note,
     _libreoffice_convert,
     _normalize_operations,
     _op_type,
     _push_image_preview,
     _push_preview,
+    _resolve_or_mark,
     _resolve_path,
     _to_agents_relative,
+    _WORKER_TMP_SUFFIX,
     logger,
 )
 
@@ -133,6 +139,11 @@ def _text_style_at(page, rect):
 # ---------------------------------------------------------------------------
 
 
+# Stats sweep ceiling per read — word/image/annotation counts on a huge PDF
+# are not worth a page-by-page pass over thousands of pages.
+_STATS_SAMPLE_PAGES = 500
+
+
 def read_pdf(path: str, pages: str | None) -> str:
     import fitz
 
@@ -171,31 +182,45 @@ def read_pdf(path: str, pages: str | None) -> str:
     else:
         result.append(f"**Size**: {file_size / 1_000:.0f} KB")
 
-    # Content stats
+    # Read range — parsed BEFORE the stats pass so both halves of one read
+    # honor the identical range ("N" / "A-B" semantics).
+    start, end = 0, total
+    if pages:
+        parts = pages.split("-")
+        start = max(0, int(parts[0]) - 1)
+        end = min(total, int(parts[-1]))
+
+    # Content stats, scanned over the read range only and sampled past a cap:
+    # a full-document sweep of a huge PDF costs a page-by-page get_text of
+    # everything the caller deliberately did NOT ask for.
+    stats_end = min(end, start + _STATS_SAMPLE_PAGES)
     stats = []
     word_count = 0
     img_count = 0
     annot_count = 0
-    for page in doc:
+    form_fields = 0
+    for i in range(start, stats_end):
+        page = doc[i]
         text = page.get_text()
         word_count += len(text.split())
         img_count += len(page.get_images(full=False))
         annot_count += len(list(page.annots() or []))
+        form_fields += len(list(page.widgets() or []))
     stats.append(f"~{word_count:,} words")
     if img_count:
         stats.append(f"{img_count} images")
     if annot_count:
         stats.append(f"{annot_count} annotations")
-    # Form fields
-    form_fields = 0
-    for page in doc:
-        widgets = list(page.widgets() or [])
-        form_fields += len(widgets)
     if form_fields:
         stats.append(f"{form_fields} form fields")
     else:
         stats.append("No forms")
-    result.append(f"**Content**: {' | '.join(stats)}")
+    label = "**Content**"
+    if pages:
+        label += f" (pages {start + 1}–{end})"
+    if stats_end < end:
+        label += f" (sampled from the first {stats_end - start} pages of the range)"
+    result.append(f"{label}: {' | '.join(stats)}")
 
     # TOC / bookmarks
     toc = doc.get_toc()
@@ -218,11 +243,6 @@ def read_pdf(path: str, pages: str | None) -> str:
     # collapsed range markers so mixed documents stay readable, capped by a
     # guidance line instead of silence — the agent can SEE scanned pages via
     # screenshot_document, which OCR can never match on handwriting.
-    start, end = 0, total
-    if pages:
-        parts = pages.split("-")
-        start = max(0, int(parts[0]) - 1)
-        end = min(total, int(parts[-1]))
     scanned_run: list[int] | None = None
     scanned_any = False
 
@@ -349,9 +369,24 @@ def _render_math_spans(html_body: str, spans, errors: list[str]) -> str:
     return html_body
 
 
+_WRITE_PDF_ADVICE = (
+    "Write shorter content per call (split long documents into sections) "
+    "or embed smaller images"
+)
+
+
+def _render_pdf_core(full_html: str, path: str) -> None:
+    """Worker core: WeasyPrint layout/render — the memory hazard — plus an
+    atomic save (a killed child must never truncate an existing PDF)."""
+    from weasyprint import HTML
+
+    tmp = path + _WORKER_TMP_SUFFIX
+    HTML(string=full_html).write_pdf(tmp)
+    os.replace(tmp, path)
+
+
 async def handle_write_pdf(args: dict) -> str:
     import markdown as md
-    from weasyprint import HTML
 
     path = await _resolve_path(args["path"], writing=True)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -411,7 +446,14 @@ img {{ max-width: 100%; }}
 {custom_css}
 </style></head><body>{html_body}</body></html>"""
 
-    HTML(string=full_html).write_pdf(path)
+    # Assembly above is cheap and needs the async resolver; the WeasyPrint
+    # render is the memory hazard and runs in a bounded worker child.
+    try:
+        await run_parse(_render_pdf_core, full_html, path, _advice=_WRITE_PDF_ADVICE)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path + _WORKER_TMP_SUFFIX)
+        raise
     await _push_preview(path)
     msg = f"PDF created: {_to_agents_relative(path)}"
     rendered_eqs = len(math_spans) - len(math_errors)
@@ -430,9 +472,46 @@ img {{ max-width: 100%; }}
 # ---------------------------------------------------------------------------
 
 
-async def handle_edit_pdf(args: dict) -> str:
-    import fitz
+_EDIT_PDF_ADVICE = (
+    "Split the operation list into smaller edit_pdf calls or work on a "
+    "smaller file"
+)
 
+
+async def _preresolve_pdf_ops(ops: list) -> None:
+    """Pre-resolve every path-bearing op field in the parent — the proxy
+    resolve API is async/HTTP and can never run inside a worker core.
+    Failures become marker strings (`_checked_resolved` re-raises them at the
+    op's use site so per-op containment matches the old inline awaits)."""
+    for op in ops:
+        ot = _op_type(op)
+        if ot == "merge":
+            op["files"] = [await _resolve_or_mark(f) for f in op.get("files", [])]
+        elif ot == "split":
+            if op.get("output_path"):
+                op["output_path"] = await _resolve_or_mark(
+                    op["output_path"], writing=True
+                )
+        elif ot == "add_image":
+            src = op.get("image_path") or op.get("path") or op.get("image", "")
+            op.pop("path", None)
+            op.pop("image", None)
+            op["image_path"] = await _resolve_or_mark(src)
+        elif ot == "extract_images":
+            od = op.get("output_dir")
+            # Absolute-only resolve quirk preserved: relative dirs stay raw,
+            # and the missing-dir default derives from the (already resolved)
+            # main path inside the core.
+            if od and str(od).startswith("/"):
+                op["output_dir"] = await _resolve_or_mark(od, writing=True)
+        elif ot == "ocr":
+            if op.get("output_path"):
+                op["output_path"] = await _resolve_or_mark(
+                    op["output_path"], writing=True
+                )
+
+
+async def handle_edit_pdf(args: dict) -> str:
     # edit_pdf ALWAYS rewrites the source in place at save time (even
     # extraction-only op sets go through the save→os.replace tail), so the
     # input is a write target — resolve it as one so the proxy's write-RBAC
@@ -441,7 +520,41 @@ async def handle_edit_pdf(args: dict) -> str:
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
 
+    # Normalize ONCE here (it handles double-JSON-encoded op lists) and
+    # detect ocr via _op_type over the NORMALIZED ops — scanning the raw
+    # arguments would miss aliased (`op`/`operation`/`action`) or
+    # string-encoded ocr ops and ship them into the worker.
     ops, dropped = _normalize_operations(args.get("operations"))
+    await _preresolve_pdf_ops(ops)
+
+    if any(_op_type(op) == "ocr" for op in ops):
+        # OCR stays out of the worker pool ON PURPOSE: the documented
+        # multi-minute runs would hog the single parse permit on a 2g
+        # sidecar, starving every read_document in the install, and per-page
+        # allocations are already bounded (_ocr_raster_dpi caps the raster
+        # at the scan's own resolution). It runs in a thread, not on the
+        # event loop — pymupdf/tesseract hold the CPU for minutes and would
+        # otherwise stall /health and every other session.
+        msg = await asyncio.to_thread(_edit_pdf_core, path, ops, dropped)
+    else:
+        try:
+            msg = await run_parse(
+                _edit_pdf_core, path, ops, dropped, _advice=_EDIT_PDF_ADVICE
+            )
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(path + _WORKER_TMP_SUFFIX)
+            raise
+    await _push_preview(path)
+    return msg
+
+
+def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
+    """Worker core: the whole op loop + atomic save. Pure sync — paths were
+    pre-resolved by the parent (markers re-raise at the op's use site), no
+    session state, no HTTP."""
+    import fitz
+
     doc = fitz.open(path)
     errors = []
     notes = []
@@ -457,7 +570,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 files = op.get("files", [])
                 position = op.get("position", "end")
                 for f in files:
-                    src_path = await _resolve_path(f)
+                    src_path = _checked_resolved(f)
                     if not Path(src_path).exists():
                         errors.append(f"Op #{idx} merge: file not found: {f}")
                         continue
@@ -476,14 +589,17 @@ async def handle_edit_pdf(args: dict) -> str:
                 if not output_path:
                     errors.append(f"Op #{idx} split: output_path required")
                     continue
-                out = await _resolve_path(output_path, writing=True)
+                out = _checked_resolved(output_path)
                 Path(out).parent.mkdir(parents=True, exist_ok=True)
                 page_indices = _parse_pages(page_spec, doc.page_count)
                 new_doc = fitz.open()
                 for pi in page_indices:
                     new_doc.insert_pdf(doc, from_page=pi, to_page=pi)
-                new_doc.save(out)
+                # Atomic: `out` may name an existing file, and a killed
+                # child must never leave it truncated.
+                new_doc.save(out + _WORKER_TMP_SUFFIX)
                 new_doc.close()
+                os.replace(out + _WORKER_TMP_SUFFIX, out)
 
             elif ot == "rotate_page":
                 page_spec = op.get("pages", "all")
@@ -557,9 +673,7 @@ async def handle_edit_pdf(args: dict) -> str:
                     errors.append(f"Op #{idx} add_image: page {pi} out of range")
                     continue
                 page = doc[pi]
-                img_path = await _resolve_path(
-                    op.get("image_path") or op.get("path") or op.get("image", "")
-                )
+                img_path = _checked_resolved(op.get("image_path", ""))
                 rect = op.get("rect", [50, 50, 200, 200])
                 page.insert_image(fitz.Rect(*rect), filename=img_path)
 
@@ -799,7 +913,7 @@ async def handle_edit_pdf(args: dict) -> str:
                 output_dir = op.get("output_dir")
                 if not output_dir:
                     output_dir = str(Path(path).parent / (Path(path).stem + "_images"))
-                out_dir = await _resolve_path(output_dir, writing=True) if output_dir.startswith("/") else output_dir
+                out_dir = _checked_resolved(output_dir)
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
 
                 extracted = []
@@ -854,7 +968,7 @@ async def handle_edit_pdf(args: dict) -> str:
                         errors.append(f"Op #{idx} ocr: page {pi} failed: {e}")
 
                 if output_path:
-                    out = await _resolve_path(output_path, writing=True)
+                    out = _checked_resolved(output_path)
                     Path(out).parent.mkdir(parents=True, exist_ok=True)
                     doc.save(out)
 
@@ -891,12 +1005,11 @@ async def handle_edit_pdf(args: dict) -> str:
     if getattr(doc, "_compress_deflate_fonts", False):
         save_kwargs["deflate_fonts"] = True
 
-    # Save — pymupdf can't overwrite the source file directly, so save to temp then replace
-    import tempfile
-
+    # Save — pymupdf can't overwrite the source file directly, so save to a
+    # deterministic temp then replace (deterministic so the PARENT can clean
+    # the orphan after a worker kill — see _WORKER_TMP_SUFFIX).
     size_before = os.path.getsize(path)
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=str(Path(path).parent))
-    os.close(tmp_fd)
+    tmp_path = path + _WORKER_TMP_SUFFIX
     try:
         doc.save(tmp_path, **save_kwargs)
         doc.close()
@@ -907,8 +1020,6 @@ async def handle_edit_pdf(args: dict) -> str:
             os.unlink(tmp_path)
         raise
     size_after = os.path.getsize(path)
-
-    await _push_preview(path)
 
     msg = f"PDF saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)
@@ -927,9 +1038,41 @@ async def handle_edit_pdf(args: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def handle_pdf_to_images(args: dict) -> str:
+_RENDER_ADVICE = "Render fewer pages per call (`pages`) or lower `dpi`"
+
+
+def _pdf_to_images_core(path: str, tmp_dir: str, page_spec, dpi: int,
+                        fmt: str) -> list[dict]:
+    """Worker core: render every requested page into the parent-named temp
+    dir. The parent moves the COMPLETE set into the real output dir only on
+    success — a deadline kill must not leave a partial page set that looks
+    complete on `ls`. Unbounded pixmaps (degenerate page geometry × dpi) are
+    exactly what the worker's RLIMIT_AS is for."""
     import fitz
 
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir)
+
+    doc = fitz.open(path)
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    saved = []
+    for pi in _parse_pages(page_spec, doc.page_count):
+        page = doc[pi]
+        pix = page.get_pixmap(matrix=mat)
+        fname = f"page_{pi + 1:03d}.{fmt}"
+        out_path = os.path.join(tmp_dir, fname)
+        if fmt in ("jpg", "jpeg"):
+            pix.save(out_path, jpg_quality=95)
+        else:
+            pix.save(out_path)
+        saved.append({"name": fname, "width": pix.width, "height": pix.height})
+    doc.close()
+    return saved
+
+
+async def handle_pdf_to_images(args: dict) -> str:
     path = await _resolve_path(args["path"])
     if not Path(path).exists():
         return f"Error: File not found: {args['path']}"
@@ -938,48 +1081,36 @@ async def handle_pdf_to_images(args: dict) -> str:
     if not output_dir:
         output_dir = str(Path(path).parent / (Path(path).stem + "_pages"))
     out_dir = await _resolve_path(output_dir, writing=True)
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     page_spec = args.get("pages", "all")
     dpi = int(args.get("dpi", 150))
     fmt = args.get("format", "png").lower()
 
-    doc = fitz.open(path)
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
+    tmp_dir = out_dir.rstrip("/") + _WORKER_TMP_SUFFIX
+    try:
+        saved = await run_parse(
+            _pdf_to_images_core, path, tmp_dir, page_spec, dpi, fmt,
+            _advice=_RENDER_ADVICE,
+        )
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
-    page_indices = _parse_pages(page_spec, doc.page_count)
-    saved = []
-
-    for pi in page_indices:
-        page = doc[pi]
-        pix = page.get_pixmap(matrix=mat)
-        fname = f"page_{pi + 1:03d}.{fmt}"
-        out_path = Path(out_dir) / fname
-        if fmt == "png":
-            pix.save(str(out_path))
-        elif fmt in ("jpg", "jpeg"):
-            pix.save(str(out_path), jpg_quality=95)
-        else:
-            pix.save(str(out_path))
-        # _abs = the resolved container path for INTERNAL re-opens; the
-        # display form ("<agent>/users/...") does not survive a _resolve_path
-        # round-trip (the proxy anchors slash-less paths at /workspace and
-        # 403s on the doubled slug). Display strings only ever reach text.
-        saved.append({"path": _to_agents_relative(str(out_path)), "_abs": str(out_path), "width": pix.width, "height": pix.height})
-
-    doc.close()
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for s in saved:
+        os.replace(os.path.join(tmp_dir, s["name"]), os.path.join(out_dir, s["name"]))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Push first page inline for preview
     if saved:
-        img_bytes = Path(saved[0]["_abs"]).read_bytes()
+        img_bytes = (Path(out_dir) / saved[0]["name"]).read_bytes()
         mime = "image/png" if fmt == "png" else "image/jpeg"
         await _push_image_preview(img_bytes, mime, f"Page 1 of {Path(path).name}")
 
     return (
         f"Rendered {len(saved)} pages from {_to_agents_relative(path)} at {dpi}dpi.\n"
         f"Output: {_to_agents_relative(out_dir)}/\n"
-        f"Files: {', '.join(Path(s['path']).name for s in saved[:5])}"
+        f"Files: {', '.join(s['name'] for s in saved[:5])}"
         + (f" ... +{len(saved) - 5} more" if len(saved) > 5 else "")
     )
 
@@ -1001,16 +1132,84 @@ _SCREENSHOT_PNG_FALLBACK_BYTES = int(1.5 * 1024 * 1024)
 _SCREENSHOT_TOTAL_BYTES = 8 * 1024 * 1024
 
 
+def _render_screenshot_core(pdf_path: str, pages_spec, dpi: int) -> dict:
+    """Worker core: the fitz render loop with the payload caps below.
+    Returns raw bytes — base64 and mcp.types stay in the parent (they never
+    cross the pipe).
+
+    Vision-sized payloads: the 300 s timeouts this tool hit were the
+    RESPONSE path for multi-MB base64, never rendering (the same page
+    renders in under a second) — so cap pixels and bytes here. The long-edge
+    cap is dpi-aware: a flat cap would bite exactly on the explicit dpi:300
+    calls the skill mandates for handwriting (A4@300 ≈ 3508 px passes
+    untouched). Encoding follows CONTENT: pages with a text layer stay PNG
+    (JPEG ringing is worst on crisp text) with a byte-size JPEG fallback;
+    scanned pages go straight to JPEG q85. A total budget truncates the
+    batch with a note."""
+    import fitz
+
+    zoom = dpi / 72.0
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    page_indices = _parse_pages(pages_spec, total)
+    if not page_indices:
+        doc.close()
+        return {"total": total, "images": [], "rendered": [],
+                "capped": False, "truncated_at": None}
+
+    capped = False
+    if len(page_indices) > _MAX_INLINE_PAGES:
+        page_indices = page_indices[:_MAX_INLINE_PAGES]
+        capped = True
+
+    long_edge_cap = (
+        _SCREENSHOT_LONG_EDGE_STD if dpi <= 200 else _SCREENSHOT_LONG_EDGE_HIGH
+    )
+    images: list = []
+    rendered: list = []
+    total_bytes = 0
+    truncated_at = None
+    for pi in page_indices:
+        page = doc[pi]
+        long_edge = max(page.rect.width, page.rect.height) * zoom
+        eff_zoom = zoom if long_edge <= long_edge_cap else (
+            zoom * (long_edge_cap / long_edge)
+        )
+        pix = page.get_pixmap(matrix=fitz.Matrix(eff_zoom, eff_zoom))
+        scanned = not page.get_text().strip()
+        if scanned:
+            img_bytes = pix.tobytes("jpg", jpg_quality=85)
+            mime = "image/jpeg"
+        else:
+            img_bytes = pix.tobytes("png")
+            mime = "image/png"
+            if len(img_bytes) > _SCREENSHOT_PNG_FALLBACK_BYTES:
+                img_bytes = pix.tobytes("jpg", jpg_quality=85)
+                mime = "image/jpeg"
+        if images and total_bytes + len(img_bytes) > _SCREENSHOT_TOTAL_BYTES:
+            truncated_at = pi + 1
+            break
+        total_bytes += len(img_bytes)
+        images.append({"data": img_bytes, "mime": mime})
+        rendered.append({
+            "page": pi + 1,
+            "width_in": round(page.rect.width / 72, 2),
+            "height_in": round(page.rect.height / 72, 2),
+        })
+
+    doc.close()
+    return {"total": total, "images": images, "rendered": rendered,
+            "capped": capped, "truncated_at": truncated_at}
+
+
 async def handle_screenshot_document(args: dict) -> list:
     """Render document pages as ImageContent for LLM visual inspection.
 
     Returns list of ImageContent + TextContent (not pushed to dashboard).
     """
     import base64
-    import shutil
     import tempfile
 
-    import fitz
     from mcp.types import ImageContent, TextContent
 
     path = await _resolve_path(args.get("path", ""))
@@ -1025,7 +1224,6 @@ async def handle_screenshot_document(args: dict) -> list:
     pages_spec = args.get("pages", "1")
     dpi = int(args.get("dpi", 150))
     sheet = args.get("sheet")
-    zoom = dpi / 72.0
 
     pdf_path = path
     temp_dir = None
@@ -1036,102 +1234,70 @@ async def handle_screenshot_document(args: dict) -> list:
             temp_dir = tempfile.mkdtemp(dir=str(Path(path).parent))
             convert_path = path
 
-            # Excel: set fit-to-width page setup + handle sheet selection
+            # Excel: set fit-to-width page setup + handle sheet selection.
+            # The prep full-DOM-loads the workbook (bomb risk) — worker
+            # child. Sheet names ride back with it so no un-isolated
+            # openpyxl load remains in the parent (even a read_only load
+            # eagerly parses the whole sharedStrings table).
             if ext in (".xlsx", ".xls"):
                 try:
-                    convert_path = _excel_prepare_for_screenshot(
-                        path, temp_dir, sheet
+                    convert_path, sheetnames = await run_parse(
+                        _excel_prepare_for_screenshot, path, temp_dir,
+                        _advice=_RENDER_ADVICE,
                     )
                     if sheet is not None:
                         # Sheet selection: override pages to target sheet
-                        sheet_idx = _excel_sheet_index(path, sheet)
-                        pages_spec = str(sheet_idx + 1)
+                        pages_spec = str(
+                            _sheet_index_from_names(sheetnames, sheet) + 1
+                        )
                 except Exception as e:
                     logger.warning(f"screenshot excel prep failed: {e}, using original")
                     convert_path = path
             elif sheet is not None and ext in (".ods", ".csv"):
-                # ODS/CSV: just handle sheet selection (no page setup tweak)
-                try:
-                    sheet_idx = _excel_sheet_index(path, sheet)
-                    pages_spec = str(sheet_idx + 1)
-                except Exception as e:
-                    logger.warning(f"screenshot sheet lookup failed: {e}")
+                # ODS/CSV: openpyxl can't open either format, so the old
+                # name lookup ALWAYS failed here — numeric sheet selection
+                # is honored, names warn (the reachable subset of the old
+                # behavior, minus the pointless workbook load).
+                if isinstance(sheet, int) or str(sheet).isdigit():
+                    pages_spec = str(int(sheet) + 1)
+                else:
+                    logger.warning(
+                        f"screenshot sheet lookup by name unsupported for {ext}"
+                    )
 
             pdf_path = await _libreoffice_convert(convert_path, "pdf", temp_dir)
 
-        # Open PDF and render pages
-        doc = fitz.open(pdf_path)
-        total = len(doc)
-        page_indices = _parse_pages(pages_spec, total)
-
-        if not page_indices:
-            doc.close()
-            return [TextContent(type="text", text=f"No valid pages to render (document has {total} pages).")]
-
-        # Cap inline pages
-        capped = False
-        if len(page_indices) > _MAX_INLINE_PAGES:
-            page_indices = page_indices[:_MAX_INLINE_PAGES]
-            capped = True
-
-        # Render pages as ImageContent (visible to LLM via vision, NOT pushed
-        # to dashboard). Vision-sized payloads: the 300 s timeouts this tool
-        # hit were the RESPONSE path for multi-MB base64, never rendering
-        # (the same page renders in under a second) — so cap pixels and bytes
-        # here. The long-edge cap is dpi-aware: a flat cap would bite exactly
-        # on the explicit dpi:300 calls the skill mandates for handwriting
-        # (A4@300 ≈ 3508 px passes untouched). Encoding follows CONTENT:
-        # pages with a text layer stay PNG (JPEG ringing is worst on crisp
-        # text) with a byte-size JPEG fallback; scanned pages go straight to
-        # JPEG q85. A total budget truncates the batch with a note.
-        long_edge_cap = (
-            _SCREENSHOT_LONG_EDGE_STD if dpi <= 200 else _SCREENSHOT_LONG_EDGE_HIGH
+        # Render in a bounded worker child (fitz pixmaps are the memory
+        # hazard); the parent only b64-encodes and assembles content items.
+        render = await run_parse(
+            _render_screenshot_core, pdf_path, pages_spec, dpi,
+            _advice=_RENDER_ADVICE,
         )
-        content_items: list = []
-        rendered = []
-        total_bytes = 0
-        truncated_at = None
-        for pi in page_indices:
-            page = doc[pi]
-            long_edge = max(page.rect.width, page.rect.height) * zoom
-            eff_zoom = zoom if long_edge <= long_edge_cap else (
-                zoom * (long_edge_cap / long_edge)
-            )
-            pix = page.get_pixmap(matrix=fitz.Matrix(eff_zoom, eff_zoom))
-            scanned = not page.get_text().strip()
-            if scanned:
-                img_bytes = pix.tobytes("jpg", jpg_quality=85)
-                mime = "image/jpeg"
-            else:
-                img_bytes = pix.tobytes("png")
-                mime = "image/png"
-                if len(img_bytes) > _SCREENSHOT_PNG_FALLBACK_BYTES:
-                    img_bytes = pix.tobytes("jpg", jpg_quality=85)
-                    mime = "image/jpeg"
-            if content_items and total_bytes + len(img_bytes) > _SCREENSHOT_TOTAL_BYTES:
-                truncated_at = pi + 1
-                break
-            total_bytes += len(img_bytes)
-            b64 = base64.b64encode(img_bytes).decode()
-            w_in = round(page.rect.width / 72, 2)
-            h_in = round(page.rect.height / 72, 2)
-            content_items.append(ImageContent(
-                type="image", data=b64, mimeType=mime,
-            ))
-            rendered.append({"page": pi + 1, "width_in": w_in, "height_in": h_in})
 
-        doc.close()
+        if not render["rendered"]:
+            return [TextContent(
+                type="text",
+                text=f"No valid pages to render (document has {render['total']} pages).",
+            )]
+
+        content_items: list = []
+        for img in render["images"]:
+            content_items.append(ImageContent(
+                type="image",
+                data=base64.b64encode(img["data"]).decode(),
+                mimeType=img["mime"],
+            ))
 
         # Append text summary after images
         fname = Path(path).name
-        lines = [f"Rendered {len(rendered)} page(s) from {fname} at {dpi} DPI:"]
-        for r in rendered:
+        lines = [f"Rendered {len(render['rendered'])} page(s) from {fname} at {dpi} DPI:"]
+        for r in render["rendered"]:
             lines.append(f"  Page {r['page']}: {r['width_in']} x {r['height_in']} inches")
-        if capped:
+        if render["capped"]:
             lines.append(f"  (capped at {_MAX_INLINE_PAGES} pages — use specific page ranges for more)")
-        if truncated_at is not None:
+        if render["truncated_at"] is not None:
             lines.append(
-                f"  (stopped before page {truncated_at}: inline image budget "
+                f"  (stopped before page {render['truncated_at']}: inline image budget "
                 "reached — request the remaining pages in a follow-up call)"
             )
         content_items.append(TextContent(type="text", text="\n".join(lines)))
@@ -1144,19 +1310,20 @@ async def handle_screenshot_document(args: dict) -> list:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _excel_sheet_index(path: str, sheet) -> int:
-    """Get 0-based sheet index from name or numeric index."""
-    import openpyxl
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    names = wb.sheetnames
-    wb.close()
+def _sheet_index_from_names(names: list, sheet) -> int:
+    """Get 0-based sheet index from name or numeric index (parent-side —
+    the names come back from the prep worker, never from an openpyxl load
+    in the server process)."""
     if isinstance(sheet, int) or (isinstance(sheet, str) and sheet.isdigit()):
         return int(sheet)
     return names.index(str(sheet)) if str(sheet) in names else 0
 
 
-def _excel_prepare_for_screenshot(path: str, temp_dir: str, sheet=None) -> str:
-    """Create a temp copy of an Excel file with fit-to-width page setup.
+def _excel_prepare_for_screenshot(path: str, temp_dir: str) -> tuple:
+    """Worker core: create a temp copy of an Excel file with fit-to-width
+    page setup. Returns (temp_path, sheetnames) — the full-DOM load below is
+    exactly the allocation profile that took the read path down, so this
+    always runs in a bounded child.
 
     Safeguards based on column count:
       <= 10 columns: portrait, fit to 1 page wide
@@ -1189,9 +1356,10 @@ def _excel_prepare_for_screenshot(path: str, temp_dir: str, sheet=None) -> str:
             ws.page_setup.orientation = "landscape"
 
     temp_path = os.path.join(temp_dir, Path(path).name)
+    names = list(wb.sheetnames)
     wb.save(temp_path)
     wb.close()
-    return temp_path
+    return temp_path, names
 
 
 # ---------------------------------------------------------------------------
@@ -1199,21 +1367,12 @@ def _excel_prepare_for_screenshot(path: str, temp_dir: str, sheet=None) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def handle_images_to_pdf(args: dict) -> str:
+def _images_to_pdf_core(image_paths: list, out: str, page_size: str,
+                        fit: str) -> int:
+    """Worker core: build the PDF from pre-resolved, existing image paths
+    and save atomically. A bomb image (fitz decodes it for dimensions and
+    embedding) dies at the child's limit, not the server's."""
     import fitz
-
-    images = args.get("images", [])
-    output_path = args.get("output_path")
-    if not output_path:
-        return "Error: output_path is required"
-    if not images:
-        return "Error: images list is empty"
-
-    out = await _resolve_path(output_path, writing=True)
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-
-    page_size = args.get("page_size", "a4").lower()
-    fit = args.get("fit", "contain")
 
     # Page dimensions in points
     sizes = {
@@ -1224,12 +1383,7 @@ async def handle_images_to_pdf(args: dict) -> str:
 
     doc = fitz.open()
 
-    for img_input in images:
-        img_path = await _resolve_path(img_input)
-        if not Path(img_path).exists():
-            logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
-            continue
-
+    for img_path in image_paths:
         # Get image dimensions
         img_doc = fitz.open(img_path)
         if img_doc.page_count == 0:
@@ -1266,8 +1420,51 @@ async def handle_images_to_pdf(args: dict) -> str:
 
         page.insert_image(img_rect, filename=img_path)
 
-    doc.save(out)
+    inserted = doc.page_count
+    tmp = out + _WORKER_TMP_SUFFIX
+    doc.save(tmp)
     doc.close()
+    os.replace(tmp, out)
+    return inserted
+
+
+async def handle_images_to_pdf(args: dict) -> str:
+    images = args.get("images", [])
+    output_path = args.get("output_path")
+    if not output_path:
+        return "Error: output_path is required"
+    if not images:
+        return "Error: images list is empty"
+
+    out = await _resolve_path(output_path, writing=True)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+
+    page_size = args.get("page_size", "a4").lower()
+    fit = args.get("fit", "contain")
+
+    # Pre-resolve in the parent; a missing image skips with a warning (the
+    # old per-image containment), it never fails the call.
+    image_paths = []
+    for img_input in images:
+        try:
+            img_path = await _resolve_path(img_input)
+        except Exception as exc:
+            logger.warning(f"images_to_pdf: skipping {img_input} ({exc})")
+            continue
+        if not Path(img_path).exists():
+            logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
+            continue
+        image_paths.append(img_path)
+
+    try:
+        await run_parse(
+            _images_to_pdf_core, image_paths, out, page_size, fit,
+            _advice=_RENDER_ADVICE,
+        )
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(out + _WORKER_TMP_SUFFIX)
+        raise
 
     await _push_preview(out)
     return f"PDF created: {_to_agents_relative(out)} ({len(images)} images, {page_size})"
@@ -1328,7 +1525,12 @@ async def handle_convert_document(args: dict) -> str:
         })
         return f"Converted: {_to_agents_relative(out_dir)}/"
 
-    # LibreOffice headless for everything else
+    # LibreOffice headless for everything else. Deliberately NOT a worker
+    # child: soffice is already a separate OS process, so the container cap
+    # bounds it and a cgroup OOM kill targets its RSS, not the server;
+    # _libreoffice_lock serializes runs and the 120s timeout kills hangs.
+    # A worker wrapper could only strip the child's RLIMIT_AS (it survives
+    # fork+exec — see isolation.py) or cap soffice confusingly.
     try:
         out = await _libreoffice_convert(input_path, output_format, output_dir)
     except RuntimeError as exc:

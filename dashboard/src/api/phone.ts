@@ -37,12 +37,34 @@ export interface PhoneRoute {
   // When set, the proxy fetches the trigger row at warmup and enriches the
   // session prompt via manifest agent_context `${trigger.*}` tokens.
   trigger_slug: string | null
+  // Server-computed mask flag — the PIN value itself never leaves the proxy
+  // (write-only sub-resource, useSetRoutePin/useDeleteRoutePin).
+  pin_configured: boolean
   created_at: string
   updated_at: string
 }
 
-export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at'>
+export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured'>
 export type PhoneRouteUpdate = Partial<PhoneRouteCreate>
+
+export interface PhoneCallLogEntry {
+  id: number
+  route_id: string | null
+  route_name: string
+  phone_server_id: number | null
+  agent: string
+  direction: 'inbound' | 'outbound'
+  from_number: string
+  to_number: string
+  transport: string
+  call_uuid: string
+  outcome: string
+  pin_attempts: number
+  started_at: string
+  ended_at: string | null
+  duration_s: number | null
+  created_at: string
+}
 
 export interface PhoneServer {
   id: number
@@ -58,6 +80,7 @@ export interface PhoneServer {
   last_health_detail: string
   is_default: boolean
   ami_secret_configured: boolean
+  twilio_auth_token_configured: boolean
   created_at: string
   updated_at: string
 }
@@ -70,6 +93,7 @@ export type PhoneServerCreate = {
   credentials?: Record<string, unknown>
   is_default?: boolean
   ami_secret?: string
+  twilio_auth_token?: string
 }
 export type PhoneServerUpdate = Partial<Omit<PhoneServerCreate, 'ami_secret' | 'is_default'>>
 
@@ -130,6 +154,51 @@ export function useDeletePhoneRoute() {
       return res.json()
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
+  })
+}
+
+// Route PIN — write-only secret pair (twilio-auth-token shape).
+export function useSetRoutePin() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, value }: { id: string; value: string }) => {
+      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin`, {
+        method: 'PUT',
+        body: JSON.stringify({ value }),
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to set the PIN')
+      return res.json()
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
+  })
+}
+
+export function useDeleteRoutePin() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin`, { method: 'DELETE' })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to remove the PIN')
+      return res.json()
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
+  })
+}
+
+// Per-route call log — fetched lazily while the viewer modal is open.
+export function usePhoneRouteCallLog(routeId: string, open: boolean, offset = 0, limit = 25) {
+  return useQuery({
+    queryKey: ['phone-call-log', routeId, offset, limit],
+    enabled: open && !!routeId,
+    refetchInterval: open ? 15_000 : false,
+    queryFn: async (): Promise<{ calls: PhoneCallLogEntry[]; total: number }> => {
+      const params = new URLSearchParams({
+        route_id: routeId, offset: String(offset), limit: String(limit),
+      })
+      const res = await apiFetch(`/v1/admin/phone/call-log?${params}`)
+      if (!res.ok) throw new Error('Failed to fetch the call log')
+      return res.json()
+    },
   })
 }
 
@@ -225,6 +294,33 @@ export function useDeletePhoneServerAmiSecret() {
     mutationFn: async (id: number) => {
       const res = await apiFetch(`/v1/admin/phone-servers/${id}/ami-secret`, { method: 'DELETE' })
       if (!res.ok) throw new Error('Failed to delete AMI secret')
+      return res.json()
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
+  })
+}
+
+export function useSetPhoneServerTwilioAuthToken() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ id, value }: { id: number; value: string }) => {
+      const res = await apiFetch(`/v1/admin/phone-servers/${id}/twilio-auth-token`, {
+        method: 'PUT',
+        body: JSON.stringify({ value }),
+      })
+      if (!res.ok) throw new Error('Failed to save Twilio auth token')
+      return res.json()
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
+  })
+}
+
+export function useDeletePhoneServerTwilioAuthToken() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (id: number) => {
+      const res = await apiFetch(`/v1/admin/phone-servers/${id}/twilio-auth-token`, { method: 'DELETE' })
+      if (!res.ok) throw new Error('Failed to delete Twilio auth token')
       return res.json()
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },

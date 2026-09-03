@@ -510,6 +510,19 @@ class SatelliteFileTransferMixin:
         # and have it sync back to the platform.
         from core.session.session_state import get_session_security
         sec = get_session_security(session_id) if session_id else None
+        # Bind the claimed session to the SENDING machine (same rule as
+        # transcript_lines / pty_inject_result): a compromised satellite
+        # must not inherit another machine's session role by quoting its
+        # session id. Positive mismatch only — task/meeting/phone contexts
+        # carry no target_machine_id and keep their normal path.
+        _sess_target = getattr(sec, "target_machine_id", "") if sec else ""
+        if sec is not None and _sess_target and _sess_target != machine_id:
+            logger.warning(
+                "file_changed: session %s is bound to machine %s but the "
+                "frame came from %s — dropping the claimed role",
+                str(session_id)[:8], str(_sess_target)[:8], str(machine_id)[:8],
+            )
+            sec = None
         _role = getattr(sec, "role", "") if sec else ""
         _uname = getattr(sec, "username", "") if sec else ""
         # MOUNT identity for the per-user-dir rule (Shared-only human chats
@@ -517,8 +530,20 @@ class SatelliteFileTransferMixin:
         # curation working. None (a ctx without the property) falls back to
         # username inside can_write_back.
         _mount = getattr(sec, "mount_username", None) if sec else None
+        # Knowledge-library mirror paths need the consumer's RW-attachment
+        # (source, subdir) pairs for can_write_back's segment-wise subtree
+        # rule (one indexed SELECT, only for mirror paths — plain writes
+        # never pay it).
+        _lib_src = core_file_sync.library_mirror_source(rel_path)
+        _writable_libs: frozenset[tuple[str, str]] | None = None
+        if _lib_src is not None:
+            from storage import db_knowledge_libraries
+            _writable_libs = await asyncio.to_thread(
+                db_knowledge_libraries.writable_pairs_for, agent_slug)
         if sec is None or not core_file_sync.can_write_back(
-                rel_path, _role, _uname, mount_username=_mount):
+                rel_path, _role, _uname, mount_username=_mount,
+                writable_libraries=_writable_libs,
+                knowledge_rw=bool(getattr(sec, "knowledge_rw", False))):
             # Engine-internal machinery paths (.claude/.codex/.credentials)
             # are denied for EVERY role by design, and engines rewrite their
             # own runtime state each turn (codex: models_cache.json) — that
@@ -550,7 +575,58 @@ class SatelliteFileTransferMixin:
                 (session_id[:8] if session_id else "?"), sec_agent, agent_slug, rel_path,
             )
             return
+        # Satellite-side delete inside a library mirror. The satellite only
+        # sends ``action=delete`` for a live watcher event (never inferred
+        # from absence), so on a WRITABLE attachment it is the agent's
+        # explicit intent — route it through the projector's explicit-delete
+        # channel (capture at the source, delete at the source, propagate to
+        # every mirror; 2026-09-03). A read-only mirror keeps the old rule:
+        # ignored, the projector heals the file back from the source.
+        # Applying the delete locally would just churn a tombstone against
+        # the heal. Content writes above already passed the RW gate.
+        if _lib_src is not None and action == "delete":
+            _parts = rel_path.split("/")
+            _sub_rel = "/".join(_parts[3:]) if len(_parts) >= 4 else ""
+            _propagated = False
+            if _sub_rel:
+                from services.knowledge import library_projector
+                try:
+                    _propagated = await library_projector.propagate_mirror_delete(
+                        agent_slug, _lib_src, _sub_rel)
+                except Exception:
+                    logger.exception(
+                        "library-mirror delete propagation failed: %s/%s",
+                        agent_slug, rel_path)
+            if _propagated:
+                logger.info(
+                    "library-mirror delete propagated to source %s: %s/%s",
+                    _lib_src, agent_slug, rel_path,
+                )
+            else:
+                logger.info(
+                    "library-mirror delete ignored (heals from source): %s/%s",
+                    agent_slug, rel_path,
+                )
+            return
         agent_dir = _cfg.AGENTS_DIR / agent_slug
+
+        # Sync-delta telemetry (alert-only, post-gate): count authorized
+        # satellite-authored writes in a rolling window — a per-turn flood
+        # usually means a build tree the sync-ignore table doesn't cover.
+        if action == "write":
+            try:
+                from core.remote import sync_delta_alerts
+                _sz = msg.get("size") or (
+                    len(msg.get("content_b64") or "") * 3 // 4)
+                _crossed = sync_delta_alerts.record_turn_write(
+                    machine_id, agent_slug, rel_path, int(_sz or 0))
+                if _crossed is not None:
+                    asyncio.ensure_future(sync_delta_alerts.maybe_alert(
+                        machine_id, agent_slug, source="per-turn",
+                        new_files=_crossed[0], new_bytes=_crossed[1],
+                        subtree_counts=_crossed[2]))
+            except Exception:
+                logger.debug("sync-delta turn counter failed", exc_info=True)
 
         # All platform-side writes to this agent file serialize on the global
         # per-(agent, rel_path) lock — across sessions and machines — so
@@ -673,6 +749,23 @@ class SatelliteFileTransferMixin:
         await notification_manager.broadcast_file_updated(
             agent_slug, rel_path, source="disk",
         )
+
+        # Knowledge-library projection (best-effort, post-lock): a write into
+        # a promoted source's knowledge/ updates every consumer mirror; an
+        # authorized RW mirror write flows back to its source. Both no-op in
+        # one SELECT when the agent has no library rows.
+        from services.knowledge import library_projector
+        if _lib_src is not None:
+            _parts = rel_path.split("/")
+            if len(_parts) >= 4:
+                asyncio.create_task(library_projector.propagate_mirror_write(
+                    agent_slug, _lib_src, "/".join(_parts[3:]),
+                ))
+        elif rel_path.startswith("knowledge/"):
+            asyncio.create_task(library_projector.propagate_source_write(
+                agent_slug, rel_path[len("knowledge/"):],
+                deleted=(action == "delete"),
+            ))
 
     async def _capture_pre_overwrite(
         self, agent_dir, rel_path: str,

@@ -27,7 +27,7 @@ function mkApp(over: Partial<PinnedApp> = {}): PinnedApp {
       { id: 'tool', label: 'Tool', type: 'mcp_tool', mcp: 'ha-mcp', tool: 'toggle' },
     ],
     actions_sig: 'sig', actions_approved: true, approval_stale: false,
-    can_approve: true, can_manage: true,
+    can_approve: true, can_manage: true, hidden_for_me: false,
     ...over,
   }
 }

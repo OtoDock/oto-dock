@@ -16,6 +16,7 @@ fitz = pytest.importorskip("fitz")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pdf as pdf_mod  # noqa: E402
+import shared  # noqa: E402
 
 
 async def _async_ident(p, writing=False, **kw):
@@ -24,8 +25,11 @@ async def _async_ident(p, writing=False, **kw):
 
 @pytest.fixture(autouse=True)
 def _bypass_platform(monkeypatch):
-    """Identity path resolution + swallowed preview push."""
+    """Identity path resolution (BOTH namespaces — handlers resolve via
+    their module import, the op pre-resolve passes via shared) + swallowed
+    preview push."""
     monkeypatch.setattr(pdf_mod, "_resolve_path", _async_ident)
+    monkeypatch.setattr(shared, "_resolve_path", _async_ident)
     monkeypatch.setattr(pdf_mod, "_to_agents_relative", lambda p: p)
 
     async def _noop_preview(path):
@@ -240,3 +244,44 @@ def test_ocr_op_capped_output_keeps_text_layer(tmp_path):
     # RGB raster capped at the 150 dpi source: the old unconditional 300 dpi
     # swap quadrupled the pixel count for zero OCR gain (536MB incident).
     assert out_path.stat().st_size < f.stat().st_size * 6
+
+
+def _make_text_pdf(path, n_pages: int):
+    doc = fitz.open()
+    for i in range(n_pages):
+        page = doc.new_page()
+        page.insert_text(fitz.Point(72, 100), f"alpha beta page {i + 1}",
+                         fontsize=12, fontname="helv")
+    doc.save(str(path))
+    doc.close()
+
+
+def test_read_pdf_ranged_stats_scan_only_the_range(tmp_path, monkeypatch):
+    """A ranged read must not sweep pages outside the range for its stats
+    header — and the header says which pages the stats cover."""
+    f = tmp_path / "ranged.pdf"
+    _make_text_pdf(f, 6)
+
+    swept = []
+    orig = fitz.Page.get_images
+
+    def _spy(self, full=False):
+        swept.append(self.number)
+        return orig(self, full=full)
+
+    monkeypatch.setattr(fitz.Page, "get_images", _spy)
+    out = pdf_mod.read_pdf(str(f), "2-4")
+    assert "**Content** (pages 2–4):" in out
+    assert swept == [1, 2, 3]  # 0-based pages 2..4, nothing else
+    assert "--- Page 2 ---" in out and "--- Page 5 ---" not in out
+
+
+def test_read_pdf_unranged_stats_sample_capped(tmp_path, monkeypatch):
+    """Past the sampling cap the stats header says it sampled."""
+    f = tmp_path / "long.pdf"
+    _make_text_pdf(f, 8)
+    monkeypatch.setattr(pdf_mod, "_STATS_SAMPLE_PAGES", 5)
+    out = pdf_mod.read_pdf(str(f), None)
+    assert "(sampled from the first 5 pages of the range)" in out
+    # text extraction still covers the whole document
+    assert "--- Page 8 ---" in out

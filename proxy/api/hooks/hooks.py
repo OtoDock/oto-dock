@@ -1208,7 +1208,7 @@ async def _decide_tool_permission(
         # Claude Code outside the platform. Consequences, accepted and
         # documented (PERMISSIONS.md + UPGRADING): trusted-dir Write/Edit
         # run without a prompt in default mode (native CLI behavior,
-        # verified 2.1.215/changelog-reviewed to 2.1.220), and the old
+        # verified 2.1.215/changelog-reviewed to 2.1.243), and the old
         # generic "OtoDock '<mode>' mode" prompt spam is gone. Hard denies
         # (Pass-1) and the carve-outs below are unaffected; stored dontAsk
         # still hard-allowed above (an explicit silence choice the TUI
@@ -1792,11 +1792,20 @@ class HookAppPinRequest(BaseModel):
     # surface on the Dock overlay. Scope ids are SESSION-DERIVED only (the
     # session's chat / its project), never caller-supplied.
     scope: str = "standing"
+    # OWNERSHIP (S1, orthogonal to ``scope``): "agent" = one shared row/file
+    # for every user of the agent; "user" = the caller's personal row/file;
+    # "" = the session's effective default scope (mode default with the
+    # viewer clamp — the same value scope-aware MCPs see as
+    # OTO_DEFAULT_SCOPE).
+    visibility: str = ""
 
 
 class HookAppSlugRequest(BaseModel):
     session_id: str
     slug: str = ""
+    # Unpin only: "" = auto-detect the namespace (unambiguous slug), else
+    # "user" | "agent" to disambiguate a slug pinned in both.
+    visibility: str = ""
 
 
 def _app_scope(ctx) -> tuple[str, str | None]:
@@ -1808,6 +1817,82 @@ def _app_scope(ctx) -> tuple[str, str | None]:
     if not mu:
         return "", None
     return mu, task_store.get_user_sub_by_username(mu)
+
+
+def _resolve_pin_visibility(ctx, requested: str) -> tuple[str, str | None]:
+    """(username, owner_sub) for a pin's OWNERSHIP (S1).
+
+    ``requested`` is the tool's ``visibility`` arg. Empty = the session's
+    effective default scope — the same resolution ``resolve_visibility``
+    feeds scope-aware MCPs (no user → agent; viewer → user; else the mode
+    default, availability-clamped), so the tool schema's advertised default
+    and the server's fallback can never disagree. Service sessions and
+    Shared-only chats resolve to "agent" exactly as the old mount-derived
+    rule did.
+
+    Gates: the agent's mode must OFFER the scope (400 otherwise);
+    "user" needs a real human identity on the session (400 for agent-scope
+    tasks/triggers/phone); "agent" from a human additionally passes the H3
+    editor+ gate at the call sites (``_require_shared_pin_authority``).
+    """
+    from core.session.visibility import available_scopes_for
+    from storage import agent_store as _agent_store
+    row = _agent_store.get_agent(ctx.agent) or {}
+    available = available_scopes_for(
+        bool(row.get("collaborative", True)), row.get("default_scope") or "user",
+    )
+    vis = (requested or "").strip().lower()
+    if vis and vis not in ("user", "agent"):
+        raise HTTPException(status_code=400,
+                            detail='visibility must be "user" or "agent"')
+    if not vis:
+        if not ctx.username or ctx.session_scope == "agent":
+            # Service sessions AND Shared-only human chats (agent mount).
+            # The MOUNT is ground truth here — it must win even over a
+            # missing/odd agents row, so a shared-only chat can never
+            # default into a per-user dir its mode doesn't have (the
+            # 2026-07-10 live bug class).
+            vis = "agent"
+        elif ctx.role == "viewer" and "user" in available:
+            vis = "user"
+        else:
+            vis = row.get("default_scope") or "user"
+        if vis not in available:
+            vis = available[0]
+    elif vis not in available:
+        raise HTTPException(
+            status_code=400,
+            detail=f"this agent's mode does not offer {vis!r}-visibility "
+                   f"pins (mode offers: {', '.join(available)})",
+        )
+    if vis == "agent":
+        return "", None
+    if not ctx.username:
+        raise HTTPException(
+            status_code=400,
+            detail='visibility="user" needs a session with a user — this '
+                   "session has none (agent-scope task/trigger/service)",
+        )
+    return ctx.username, task_store.get_user_sub_by_username(ctx.username)
+
+
+def _require_shared_pin_authority(ctx, username: str) -> None:
+    """H3: a SHARED-target pin/unpin from a HUMAN chat needs editor+.
+
+    Shared-only agents mount the agent scope for every role, and the proxy
+    writes the app file itself (this hook is otherwise un-RBAC-gated) — so
+    without this gate a VIEWER chatting with a shared-only agent could
+    create, replace, or delete the TEAM-wide dashboard despite their
+    read-only workspace mount. Service sessions (no human, ``ctx.username``
+    empty) keep full authority: scheduled refresh tasks ARE the shared-
+    dashboard update path. Mirrors the platform's viewer clamp ("viewers
+    can never create agent-scope artifacts")."""
+    if not username and ctx.username and ctx.role == "viewer":
+        raise HTTPException(
+            status_code=403,
+            detail="viewer role cannot pin, update, or remove a shared "
+                   "(team) dashboard — editor or manager required",
+        )
 
 
 @router.post("/v1/hooks/apps/pin")
@@ -1833,6 +1918,13 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
     ``project_id``) — never from caller input, so there is nothing to forge.
     A scoped pin REPLACES the scope's existing pin (scope is the identity,
     slug is cosmetic); approval carries iff the manifest is unchanged.
+
+    ``visibility="user"|"agent"`` (S1) picks the OWNERSHIP — personal row +
+    ``users/<u>/workspace/apps/`` vs shared row + ``workspace/apps/`` —
+    independent of ``scope``. Default = the session's effective default
+    scope; see ``_resolve_pin_visibility`` for the gates. A slug may exist
+    in BOTH namespaces (distinct rows + files); restore-by-slug looks up
+    only the resolved namespace.
     """
     from api.apps import manifest as _mf
 
@@ -1855,7 +1947,10 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
     if ctx is None:
         raise HTTPException(status_code=400, detail="unknown session")
     agent_dir = config.get_agent_dir(ctx.agent)
-    username, owner_sub = _app_scope(ctx)
+    username, owner_sub = await asyncio.to_thread(
+        _resolve_pin_visibility, ctx, req.visibility,
+    )
+    _require_shared_pin_authority(ctx, username)
 
     # Session-derived scope resolution (DECIDED: no caller-supplied ids —
     # a refresh task re-pinning a project app runs as a continuation of a
@@ -2025,14 +2120,42 @@ async def hook_app_unpin(req: HookAppSlugRequest, authorization: str | None = He
     ctx = get_session_security(req.session_id)
     if ctx is None:
         raise HTTPException(status_code=400, detail="unknown session")
-    username, _ = _app_scope(ctx)
-    row = await asyncio.to_thread(
-        task_store.get_app_by_slug, ctx.agent, username, req.slug.strip().lower(),
-    )
-    if row is None:
+    slug = req.slug.strip().lower()
+    vis = (req.visibility or "").strip().lower()
+    if vis and vis not in ("user", "agent"):
+        raise HTTPException(status_code=400,
+                            detail='visibility must be "user" or "agent"')
+
+    def _find() -> dict[str, dict]:
+        # The caller's reachable namespaces (S1): shared always (role-gated
+        # below), personal when the session has a human. Auto-detect keeps
+        # the pre-S1 one-arg call working for unambiguous slugs.
+        found: dict[str, dict] = {}
+        if vis in ("", "agent"):
+            r = task_store.get_app_by_slug(ctx.agent, "", slug)
+            if r is not None:
+                found["agent"] = r
+        if vis in ("", "user") and ctx.username:
+            r = task_store.get_app_by_slug(ctx.agent, ctx.username, slug)
+            if r is not None:
+                found["user"] = r
+        return found
+
+    rows = await asyncio.to_thread(_find)
+    if not rows:
         raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope")
+    if len(rows) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"slug '{slug}' is pinned both shared and personal — "
+                   'pass visibility="user" or "agent" to pick one',
+        )
+    found_vis, row = next(iter(rows.items()))
+    if found_vis == "agent":
+        _require_shared_pin_authority(ctx, "")
     await asyncio.to_thread(task_store.delete_app, row["id"])
-    logger.info(f"Hook app unpin: session={req.session_id}, slug={req.slug}")
+    logger.info(f"Hook app unpin: session={req.session_id}, slug={req.slug}, "
+                f"visibility={found_vis}")
     return {"status": "ok", "kept_file": row["rel_path"]}
 
 
@@ -2364,11 +2487,20 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     if _is_host_cache:
         if (getattr(sec, "role", "") or "") in ("editor", "manager", "admin"):
             permissions = "edit"
-    elif sec is not None and can_write_back(
-        tree_rel, getattr(sec, "role", "") or "", getattr(sec, "username", "") or "",
-        mount_username=getattr(sec, "mount_username", None),
-    ):
-        permissions = "edit"
+    elif sec is not None:
+        from core.remote.file_sync import library_mirror_source
+        _wl = None
+        if library_mirror_source(tree_rel) is not None:
+            from storage import db_knowledge_libraries
+            _wl = db_knowledge_libraries.writable_pairs_for(
+                getattr(sec, "agent", "") or "")
+        if can_write_back(
+            tree_rel, getattr(sec, "role", "") or "",
+            getattr(sec, "username", "") or "",
+            mount_username=getattr(sec, "mount_username", None),
+            writable_libraries=_wl,
+        ):
+            permissions = "edit"
 
     # Reuse an existing WOPI URL if still valid (avoids spawning multiple
     # Collabora sessions). Keyed by permission too, so a viewer never receives a

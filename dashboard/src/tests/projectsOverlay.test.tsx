@@ -54,7 +54,7 @@ function pin(slug: string, over: Partial<PinnedApp> = {}): PinnedApp {
     id: `id-${slug}`, slug, title: slug, scope: 'shared', position: 0,
     rel_path: `workspace/apps/${slug}.html`, updated_at: '', actions: [],
     actions_sig: '', actions_approved: true, approval_stale: false,
-    can_approve: true, can_manage: true, agent: 'dev', ...over,
+    can_approve: true, can_manage: true, hidden_for_me: false, agent: 'dev', ...over,
   }
 }
 

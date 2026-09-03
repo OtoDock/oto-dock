@@ -1,8 +1,8 @@
 {
   "name": "mcps-mcp",
   "label": "MCPs Manager",
-  "description": "Lets agents browse the community MCP catalog, see what is installed/enabled for the current agent, request the admin to install or enable an MCP, and (for admin sessions) install or enable MCPs directly. Permission-aware: viewers see zero tools.",
-  "version": "1.0.0",
+  "description": "Lets agents browse the community MCP and skills catalogs, see what is installed/enabled for the current agent, request the admin to install or enable an MCP or skill package, and (for admin sessions) install or enable MCPs directly. Permission-aware: viewers see zero tools. Also ships the platform's built-in skills (otodock-platform, skill-creator) — on-demand only, available to every agent regardless of role.",
+  "version": "1.3.0",
   "category": "core",
 
   "server": {
@@ -23,7 +23,22 @@
 
   "exclude_from": ["task", "meeting"],
 
-  "skills": [],
+  "skills": [
+    {
+      "id": "otodock-platform",
+      "loading": "on_demand",
+      "file": "skills/otodock-platform/SKILL.md",
+      "description": "How the OtoDock platform itself works and where every setting lives — installing and first-run setup, agents, AI engines, sessions, departments, shared knowledge libraries, tasks/triggers/notifications, remote machines, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock.",
+      "default_exclude_from": []
+    },
+    {
+      "id": "skill-creator",
+      "loading": "on_demand",
+      "file": "skills/skill-creator/SKILL.md",
+      "description": "Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.",
+      "default_exclude_from": []
+    }
+  ],
 
   "permissions": {
     "default_tier": "standard",

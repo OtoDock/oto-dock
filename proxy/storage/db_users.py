@@ -576,6 +576,19 @@ def update_user_auth_fields(sub: str, **kwargs) -> None:
         conn.commit()
 
 
+def clear_failed_logins(sub: str) -> None:
+    """Reset the tarpit counter after a successful login — without this a
+    user's lifetime typos accumulate and the exponential delay ratchets
+    permanently toward the cap."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET failed_login_attempts = 0, "
+            "last_failed_login = NULL WHERE sub=%s",
+            (sub,),
+        )
+        conn.commit()
+
+
 def record_failed_login(sub: str) -> None:
     """Atomically increment failed_login_attempts."""
     now = datetime.now(timezone.utc).isoformat()

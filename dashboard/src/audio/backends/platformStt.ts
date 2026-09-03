@@ -17,7 +17,7 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ws/audio/stt`
 }
 
-function downsampleToPCM16(input: Float32Array, srcRate: number, dstRate: number): ArrayBuffer {
+export function downsampleToPCM16(input: Float32Array, srcRate: number, dstRate: number): ArrayBuffer {
   const ratio = srcRate / dstRate
   const outLen = Math.floor(input.length / ratio)
   const out = new Int16Array(outLen)
@@ -74,8 +74,21 @@ export const platformStt: STTBackend = {
         const { ws_token } = await sessRes.json()
         if (stopping) return
 
-        // 2. Mic.
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        // 2. Mic. echoCancellation OFF, deliberately: Chrome/Android flips
+        // the whole app into MODE_IN_COMMUNICATION (in-call volume slider,
+        // quiet call-stream output) whenever a capture opens with the
+        // hardware AEC attached — and dictation normally has nothing
+        // playing to cancel. NS/AGC stay ON (they never trigger the mode
+        // flip, and AGC keeps quiet speakers recognizable). Playback that
+        // could overlap dictation is interlocked in useSpeechSession
+        // (SoundIcon flush + chime suppression).
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        })
         if (stopping) { teardown(); return } // stopped while the mic opened
         ctx = new AudioContext()
         // Autoplay policy can leave a fresh AudioContext "suspended"; the mic tap

@@ -63,11 +63,42 @@ logger = logging.getLogger("claude-proxy.interactive")
 # (observed live: `\x1b[<35;70;68M`).
 _MOUSE_RE = re.compile(rb"\x1b\[<[0-9;]*[Mm]|\x1b\[M.{3}", re.DOTALL)
 
+# Minimum recovered-text length for an undelivered-input breadcrumb. A cold
+# flush that dies unconfirmed is persisted into the chat so the user can copy
+# their prompt back (2026-08-18 field loss: a 1143-byte prompt typed into
+# Claude's resume-from-summary picker vanished with no DB trace). Short
+# residues (arrow keys, a stray Enter, tiny edits) are noise, not prompts.
+_BREADCRUMB_MIN_CHARS = 40
+
+
+def _breadcrumb_text(raw: bytes) -> str:
+    """Human-readable text of a buffered PTY input chunk, for the
+    undelivered-input breadcrumb. Strips bracketed-paste framing, CSI/OSC
+    escape sequences, and control chars (except newline/tab); collapses the
+    trailing submit CR. Pure — unit-tested directly."""
+    text = raw.decode("utf-8", errors="replace")
+    text = text.replace("\x1b[200~", "").replace("\x1b[201~", "")
+    text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)  # OSC
+    text = re.sub(r"\x1b\[[0-9;?<>=]*[A-Za-z~]", "", text)         # CSI
+    text = re.sub(r"\x1b.", "", text)                              # bare ESC+x
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(c for c in text if c in ("\n", "\t") or ord(c) >= 0x20)
+    return text.strip()
+
 # Idle reaping is unified across all session kinds via config.get_idle_timeout()
 # (the admin `session_idle_timeout` setting); reap_idle() reads it per-sweep. A
 # viewer attached, or any PTY byte in/out, keeps an interactive session alive
 # regardless of the timeout (see reap_idle).
 _REAPER_PERIOD_S = 60
+# Reaper spare cap for question-parked sessions, as a MULTIPLE of the admin idle
+# knob (30 min at the 900s default) — not a fixed wall clock: on a multi-tenant
+# box a long fixed cap lets abandoned questions pin slots the admin believes are
+# reclaimed after `session_idle_timeout`. Waiting on a HUMAN is not idleness, so
+# a parked turn gets ONE extra window; past it the platform reclaims the slot,
+# and the answer path revives the session (single-flight). Under memory pressure
+# the capacity evictor (core/concurrency._admit_with_eviction) reclaims it after
+# ~5 min regardless — it sorts on last_activity and never consults these spares.
+_QUESTION_PARK_TIMEOUT_MULT = 2
 
 # Readiness gate: buffer input until the TUI has rendered + gone quiet, so the
 # first prompt (a human's, or an autonomous task's injected prompt) is never sent
@@ -125,6 +156,13 @@ _POST_OUTPUT_TAIL_S = getattr(config, "INTERACTIVE_POST_OUTPUT_TAIL_S", 3.0)
 # transcript read this soon, so the reopened turn shows live instead of
 # waiting out the starved post-output debounce.
 _RESUME_TAIL_S = getattr(config, "INTERACTIVE_RESUME_TAIL_S", 1.5)
+# Mid-turn tail cadence (LOCAL only): while a turn is open the TUI spinner
+# redraws continuously, so the post-output debounce never fires and a local
+# turn's rows historically landed only at turn end (+3s). Remote sessions
+# already persist rows mid-turn (the satellite polls its transcript every
+# 0.8s); this periodic tail gives local sessions the same incremental
+# persistence — live rich view and voice mode read rows as they land.
+_MIDTURN_TAIL_S = getattr(config, "INTERACTIVE_MIDTURN_TAIL_S", 1.0)
 
 # LLM chat-title latency cap: if the FIRST turn is still running this long
 # after it opened and no tail batch has crossed the char/tool thresholds
@@ -401,6 +439,12 @@ class InteractiveSession:
         # Remote sessions don't need it (forwarded lines flow on the
         # satellite's cadence regardless of turn state).
         self._resume_tail_handle: Optional[asyncio.TimerHandle] = None
+        # Mid-turn periodic tail (local only): armed on the turn-open
+        # transition, re-arms itself each _MIDTURN_TAIL_S while the turn stays
+        # open, cancelled on close. The task ref lets a beat be skipped while
+        # the previous tail is still off-thread (slow disk / huge batch).
+        self._midturn_tail_handle: Optional[asyncio.TimerHandle] = None
+        self._midturn_tail_task: Optional[asyncio.Task] = None
         # Server-prompt queue (delegate results …): injected at CLI quiescence,
         # FIFO, ONE item per turn. Items are dicts carrying full re-delivery
         # context (text/source/chat_id/agent/user_sub/role/hops + the ladder's
@@ -445,6 +489,9 @@ class InteractiveSession:
         # logging in the drain — the block reason is the whole diagnosis when
         # a delegate result sits queued on a live session).
         self._last_held_reason: str | None = None
+        # Last reap-spare reason logged for this session (change-only DEBUG in
+        # reap_idle — the spare re-fires every sweep for hours-long parks).
+        self._last_reap_spare: str | None = None
         # Serialize persistence of transcript lines FORWARDED from a remote
         # satellite (the satellite tails its JSONL + sends new lines; we persist
         # them in arrival order). Local sessions never use this (they read the
@@ -783,7 +830,15 @@ class InteractiveSession:
                 self.session_id[:8], len(data),
             )
             self._cancel_deferred_submit()
-            self._clear_cold_flush()  # the user is driving — no replay
+            # The user is driving — no replay. But the flushed text is not yet
+            # a confirmed turn: usually it sits in the composer (their next
+            # Enter sends it), yet a TUI dialog can have swallowed it (the
+            # resume-from-summary picker field loss) — so breadcrumb it
+            # before dropping. Redundancy in the happy case is the accepted
+            # cost of never losing a prompt.
+            if self._cold_flush_pending:
+                self._persist_undelivered_input(self._cold_flush_pending)
+            self._clear_cold_flush()
         self._emit_to_pty(data)
 
     def interrupt_turn(self) -> bool:
@@ -985,6 +1040,9 @@ class InteractiveSession:
                 "attempt(s) — giving up (the user must resend)",
                 self.session_id[:8], self._cold_flush_attempts + 1,
             )
+            # Definitive loss (no turn ever opened with this text) — leave
+            # the recovery breadcrumb before dropping the bytes.
+            self._persist_undelivered_input(self._cold_flush_pending)
             self._cold_flush_pending = b""
             self._cold_flush_seed = ""
             return
@@ -1009,6 +1067,48 @@ class InteractiveSession:
         if self._cold_flush_watcher is not None:
             self._cold_flush_watcher.cancel()
             self._cold_flush_watcher = None
+
+    def _persist_undelivered_input(self, raw: bytes) -> None:
+        """Persist an abandoned cold flush into the chat as a recovery
+        breadcrumb (system event ``undelivered_input``).
+
+        A cold flush that never became a confirmed turn is otherwise GONE —
+        interactive persistence is transcript-derived, so text swallowed by a
+        TUI dialog (the CLI's resume-from-summary picker ate a 1143-byte
+        prompt in the field, 2026-08-18) leaves no DB trace. Called from the
+        two places the flush is abandoned: the confirm-and-retry watcher's
+        give-up branch, and the user-input cancel (there the text USUALLY
+        sits safely in the composer — the breadcrumb may then be redundant,
+        which is the acceptable side of the trade). Length-gated so key
+        residue never becomes a row; best-effort, off-loop."""
+        if not self.chat_id:
+            return
+        text = _breadcrumb_text(raw)
+        if len(text) < _BREADCRUMB_MIN_CHARS:
+            return
+        from storage import database as task_store
+        from core.session.transcript_tool_events import persist_event
+        block = {
+            "type": "system",
+            "subtype": "undelivered_input",
+            "message": text,
+        }
+        async def _write() -> None:
+            try:
+                await asyncio.to_thread(
+                    persist_event, task_store, self.chat_id, block,
+                )
+                logger.warning(
+                    "interactive %s: cold flush abandoned — %d char(s) "
+                    "persisted as undelivered-input breadcrumb",
+                    self.session_id[:8], len(text),
+                )
+            except Exception:
+                logger.exception(
+                    "interactive %s: undelivered-input breadcrumb persist "
+                    "failed", self.session_id[:8],
+                )
+        self._loop.create_task(_write())
 
     def set_pending_seed(self, digest: str) -> None:
         """Stash a restored-history digest (DB-fallback) to prepend to the cold
@@ -1108,7 +1208,14 @@ class InteractiveSession:
                 self._title_timer_spent = True
                 self._title_timer = self._loop.call_later(
                     _TITLE_EARLY_TIMER_S, self._fire_title_timer)
+            # Mid-turn tail cycle (local): rows land as the turn produces them.
+            if self.target == "local" and self._midturn_tail_handle is None:
+                self._midturn_tail_handle = self._loop.call_later(
+                    _MIDTURN_TAIL_S, self._run_midturn_tail)
         else:
+            if self._midturn_tail_handle is not None:
+                self._midturn_tail_handle.cancel()
+                self._midturn_tail_handle = None
             self._turn_end_effects()
 
     def _turn_end_effects(self) -> None:
@@ -1443,6 +1550,22 @@ class InteractiveSession:
             return
         self._loop.create_task(self._tail_and_maybe_complete())
 
+    def _run_midturn_tail(self) -> None:
+        """Periodic mid-turn tail (local): persist the open turn's rows as they
+        land instead of at turn end. Re-arms itself while the turn stays open;
+        the close transition (or ``close()``) cancels the cycle. A beat is
+        skipped while the previous tail is still off-thread — the tailer's
+        line cursor plus row claim-keys make overlapping reads harmless, but
+        there is no point stacking them."""
+        self._midturn_tail_handle = None
+        if self._closed or not self.chat_id or not self._turn_open:
+            return
+        if self._midturn_tail_task is None or self._midturn_tail_task.done():
+            self._midturn_tail_task = self._loop.create_task(
+                self._tail_and_maybe_complete())
+        self._midturn_tail_handle = self._loop.call_later(
+            _MIDTURN_TAIL_S, self._run_midturn_tail)
+
     async def _tail_and_maybe_complete(self) -> None:
         """Tail off the loop, then — if the tailer reports a turn-end signal —
         fire the interactive-task completion callback (gated in
@@ -1496,6 +1619,18 @@ class InteractiveSession:
         Both best-effort; the boundary line is read once (tail cursors), so
         the compaction ping can't double-fire."""
         self._maybe_fire_title_early(result)
+        # Duplex feed: an attached full-duplex session speaks new assistant
+        # rows as they persist (interactive chats have no pump to tap) and
+        # needs the turn-close edge even when the batch persisted nothing.
+        try:
+            from ws import duplex_attach
+            duplex_attach.on_interactive_batch(
+                self.chat_id or "",
+                persisted=int(result.get("persisted", 0) or 0),
+                turn_open=self._turn_open,
+            )
+        except Exception:
+            pass
         try:
             if result.get("persisted", 0) > 0 and self.chat_id \
                     and not self.chat_id.startswith("meeting-"):
@@ -1678,6 +1813,17 @@ class InteractiveSession:
         if persisted > 0:
             self._fire_turn_notification(question=question, compacted=compacted)
 
+        # (2a) shared-library turn-end reconcile (parity with the -p pump): an
+        # interactive turn that deleted/wrote inside a library in its sandbox
+        # propagates now, not at the next 5-min sweep. Loop-thread hop — this
+        # runs on the tailer thread. Best-effort, never blocks the tailer.
+        try:
+            from services.knowledge import library_projector
+            self._loop.call_soon_threadsafe(
+                library_projector.schedule_reconcile_for_agent, self.agent_name)
+        except Exception:
+            pass
+
         # (2b) a turn just closed with the shared gates clear — drain any queued
         # server prompts (delegate results waiting for quiescence). Never during
         # close(): its final tail also lands here, but the PTY is already dead —
@@ -1736,14 +1882,16 @@ class InteractiveSession:
             )
             if self.on_turn_complete is not None:
                 return
+            # Display name, not slug — the title is what the phone shows.
+            label = notification_manager.agent_label(self.agent_name)
             if compacted:
-                title = f"{self.agent_name} compacted the conversation"
+                title = f"{label} compacted the conversation"
                 body = "Context compacted — session ready"
             elif question:
-                title = f"{self.agent_name} needs your input"
+                title = f"{label} needs your input"
                 body = "Waiting for your answer"
             else:
-                title = f"{self.agent_name} finished"
+                title = f"{label} finished"
                 body = "Response ready"
             self._loop.create_task(notification_manager.fire_ephemeral(
                 self.user_sub,
@@ -1849,11 +1997,12 @@ class InteractiveSession:
 
         for h in (self._settle_handle, self._ready_max_handle, self._tail_handle,
                   self._inject_backstop_handle, self._resume_tail_handle,
-                  self._title_timer):
+                  self._midturn_tail_handle, self._title_timer):
             if h is not None:
                 h.cancel()
         self._settle_handle = self._ready_max_handle = self._tail_handle = None
         self._inject_backstop_handle = self._resume_tail_handle = None
+        self._midturn_tail_handle = None
         self._title_timer = None
         for _h in self._submit_tail_handles:
             with contextlib.suppress(Exception):
@@ -2087,6 +2236,14 @@ def streaming_chat_ids() -> set[str]:
             and s.alive and s._turn_open}
 
 
+def live_agent_names() -> set[str]:
+    """Agent slugs with a live PTY session (local or satellite) — the
+    interactive half of the agents-map activity pulse (the headless halves
+    are the per-layer ``active_agent_names`` enumerators)."""
+    return {s.agent_name for s in _sessions.values()
+            if getattr(s, "agent_name", "") and s.alive}
+
+
 async def _register_session(
     session: "InteractiveSession",
     *,
@@ -2313,6 +2470,35 @@ async def close_all(reason: str = "shutdown") -> None:
 # Idle reaper
 # ---------------------------------------------------------------------------
 
+def _reap_spare_reason(session: "InteractiveSession", timeout_s: float) -> str:
+    """Why an over-timeout session must NOT be reaped, or "".
+
+    * ``question-parked`` — the turn is parked on an unanswered
+      AskUserQuestion: idle by every byte measure, but waiting on a HUMAN.
+      Capped at ``_QUESTION_PARK_TIMEOUT_MULT`` × the idle knob (see the
+      constant).
+    * ``turn-open`` — mid-turn work with no viewer: a byte-quiet stretch of a
+      long tool call can outlast the idle window. Capped at the per-TURN
+      ceiling (``config.get_session_timeout()``): a turn cannot legitimately
+      outlive it, so past that the flag is stuck and must not confer immortality.
+    * ``hook-activity`` — tool hooks are still firing for this session id even
+      though the PTY output stalled (satellite WS-down frames are dropped
+      silently), so the CLI is demonstrably working. Session-id-keyed, same
+      signal the headless reapers consult. Self-limiting: it needs hooks to keep
+      firing inside the window.
+    """
+    if (session.question_parked
+            and session.idle_seconds < _QUESTION_PARK_TIMEOUT_MULT * timeout_s):
+        return "question-parked"
+    if session.turn_open and session.idle_seconds < config.get_session_timeout():
+        return "turn-open"
+    from core.session.session_state import get_hook_activity
+    last_hook = get_hook_activity(session.session_id)
+    if last_hook and time.monotonic() - last_hook < timeout_s:
+        return "hook-activity"
+    return ""
+
+
 async def reap_idle(timeout_s: float | None = None) -> int:
     """Close sessions with no viewer and no activity for ``timeout_s``.
 
@@ -2321,7 +2507,8 @@ async def reap_idle(timeout_s: float | None = None) -> int:
     A viewer attached, or any byte in/out, keeps a session alive, so a
     long unviewed agent turn is never killed mid-flight; an on-screen or
     reconnect-grace terminal is also spared below (don't kill visible state —
-    that is NOT a longer timeout). Returns the count reaped.
+    that is NOT a longer timeout). A parked question / open turn / recent hook
+    activity also spares (``_reap_spare_reason``). Returns the count reaped.
     """
     if timeout_s is None:
         timeout_s = config.get_idle_timeout()
@@ -2337,6 +2524,15 @@ async def reap_idle(timeout_s: float | None = None) -> int:
             if get_connection_manager().is_pty_in_grace(session.target):
                 continue
         if session.idle_seconds > timeout_s:
+            spare = _reap_spare_reason(session, timeout_s)
+            if spare:
+                if spare != session._last_reap_spare:
+                    session._last_reap_spare = spare
+                    logger.debug(
+                        "interactive %s: sparing idle session (%s, %.0fs idle)",
+                        session.session_id[:8], spare, session.idle_seconds,
+                    )
+                continue
             logger.info(
                 "interactive %s: reaping idle (%.0fs, no viewer)",
                 session.session_id[:8], session.idle_seconds,

@@ -105,4 +105,27 @@ describe('computeModelGroups', () => {
     expect(computeModelGroups({ ...base, layers: undefined })).toBeUndefined()
     expect(computeModelGroups({ ...base, agentPaths: [] })).toBeUndefined()
   })
+
+  // 1.5: task chats flow through these same rules (the FE lock is
+  // interactive-only now) — a chat whose CURRENT model was retired from
+  // the catalog still needs its check row.
+  it('prepends an unlisted active model to the chat layer group only', () => {
+    const groups = computeModelGroups({
+      ...base, chatActiveLayer: 'claude-code-cli', processAlive: false,
+      activeModel: 'claude-opus-4-6',
+    })!
+    const claude = groups.find(g => g.layer === 'claude-code-cli')!
+    expect(claude.models[0]).toEqual({
+      value: 'claude-code-cli::claude-opus-4-6', label: 'claude-opus-4-6',
+    })
+    // Foreign groups untouched; a served model is NOT duplicated.
+    const codex = groups.find(g => g.layer === 'codex-cli')!
+    expect(codex.models.some(m => m.label === 'claude-opus-4-6')).toBe(false)
+    const served = computeModelGroups({
+      ...base, chatActiveLayer: 'claude-code-cli',
+      activeModel: 'claude-sonnet-5',
+    })!
+    expect(served[0].models.filter(m => m.value.endsWith('claude-sonnet-5')))
+      .toHaveLength(1)
+  })
 })

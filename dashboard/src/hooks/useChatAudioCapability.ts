@@ -16,9 +16,13 @@ import { type ChatAudioCapability } from '../audio/types'
 import { probeNativeTtsAvailable } from '../audio/backends/nativeTts'
 import { probeNativeSttAvailable } from '../audio/backends/nativeStt'
 
-export function useChatAudioCapability() {
+export function useChatAudioCapability(enabled = true) {
+  // `enabled=false` for pre-auth mounts (useWakeWord under RequireAuth) —
+  // see useMyAudioPrefs: an unauthenticated 401 triggers apiFetch's
+  // expired-session redirect and reload-loops the login page.
   return useQuery({
     queryKey: ['audio-capability'],
+    enabled,
     queryFn: async (): Promise<ChatAudioCapability> => {
       const [hasNativeTts, hasNativeStt] = await Promise.all([
         probeNativeTtsAvailable().catch(() => false),

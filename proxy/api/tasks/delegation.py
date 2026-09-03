@@ -20,9 +20,11 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_auth
-from core.session.visibility import chat_history_owner
-from services.delegation.spawn_authz import authorize_spawn, validate_spawn_overrides
-from services.delegation import lane_status
+from core.session.visibility import chat_history_owner, nouser_read_targets
+from services.delegation.spawn_authz import (
+    authorize_spawn, check_delegation_chain, validate_spawn_overrides,
+)
+from services.delegation import file_transfer, lane_status
 from services.scheduler import scheduler
 from storage import database as task_store
 from storage import mcp_store
@@ -45,7 +47,12 @@ _ON_COMPLETE_PROMPT = (
     "was deferred until that settled. The [User interjected] lines above are "
     "their instructions and the turns after them are the worker's replies; "
     "fold that into your plan instead of re-delegating or assuming the lane "
-    "died."
+    "died.\n\n"
+    "This result is the worker's report and is final for its run. Do not "
+    "answer it with another delegation just to acknowledge, confirm or thank "
+    "— delegate again (continue_id) only when the user asked for more work "
+    "or the worker is blocked on something only you can supply. Otherwise "
+    "report to the user and let them decide what happens next."
 )
 
 
@@ -89,6 +96,39 @@ def _resolve_continued_chat(continue_id: str) -> dict | None:
     if session_id:
         return task_store.get_chat_by_session(session_id)
     return None
+
+
+def _model_served_by_layer(model: str, layer: str) -> bool:
+    """True iff the execution layer serves this model. Fail-OPEN on lookup
+    errors — this guards cross-layer poison, it is not the registry's
+    gatekeeper (twin of ws/dashboard._model_allowed_for_path)."""
+    try:
+        from storage import subscription_store
+        return any(
+            (m.get("model_id") or "") == model
+            for m in subscription_store.list_models(layer)
+        )
+    except Exception:
+        return True
+
+
+def _model_is_cross_layer_poison(model: str, layer: str) -> bool:
+    """POSITIVE cross-layer evidence only: the model is NOT served by
+    ``layer`` but IS served by some other layer (the 2026-08 stamp bug shape
+    — a Claude model on a codex lane). A model unknown to the registry
+    everywhere is NOT poison (custom/retired ids keep their pin; spawn
+    validation owns that case). Fail-open (False) on lookup errors."""
+    try:
+        if _model_served_by_layer(model, layer):
+            return False
+        from storage import subscription_store
+        return any(
+            (m.get("model_id") or "") == model
+            and (m.get("layer") or "") != layer
+            for m in subscription_store.list_models()
+        )
+    except Exception:
+        return False
 
 
 @router.post("/v1/delegation/spawn")
@@ -165,6 +205,16 @@ async def spawn_delegate(
         )
     parent_chat_id = parent_chat["id"] if parent_chat else ""
 
+    # Chain guard (fresh spawns only): cycles and over-deep chains 403 with a
+    # message telling the agent what to do instead. Continues extend a lane
+    # that already passed this at spawn time. Introduced with the symmetric
+    # department topology (2026-09-02) — see spawn_authz.check_delegation_chain.
+    if continued_chat is None:
+        await asyncio.to_thread(
+            check_delegation_chain,
+            parent_chat_id, authz.source_agent, effective_agent,
+        )
+
     # Resolve the worker chat / continuation session. Continues run inside
     # the continued chat regardless of surface — a continued task-run chat
     # behaves exactly like a worker chat (same chat, same agent, same pins).
@@ -190,6 +240,14 @@ async def spawn_delegate(
         # an explicit pin re-pins.
         ov_model = continued_chat.get("model") or None
         ov_layer = continued_chat.get("execution_path") or None
+        # Lenient re-derivation: a pre-fix lane whose chat row was stamped
+        # with a model belonging to a DIFFERENT layer (the 2026-08
+        # cross-engine poison) must keep continuing — drop the model pin
+        # instead of converting the bad stamp into an explicit override
+        # that the create-time validation would reject. Positive evidence
+        # only: a registry-unknown model keeps its pin.
+        if ov_model and ov_layer and _model_is_cross_layer_poison(ov_model, ov_layer):
+            ov_model = None
         ov_mode = (continued_chat.get("execution_mode")
                    if continued_chat.get("execution_mode") in
                    ("interactive", "non-interactive") else None)
@@ -198,8 +256,11 @@ async def spawn_delegate(
         # Best-effort: the run resolves its real model itself (override
         # included); the chat row's model/layer/mode only seed the
         # dashboard header and the continue re-derivation above.
+        # Layer-aware: with a per-lane layer override, the agent-default
+        # model may be foreign to that engine.
         try:
-            worker_model = ov_model or config.get_cli_model(effective_agent)
+            worker_model = ov_model or config.get_cli_model(
+                effective_agent, layer=ov_layer)
         except Exception:
             worker_model = ov_model or ""
         await asyncio.to_thread(
@@ -329,6 +390,90 @@ def _broadcast_orchestrator_stamp(chat_id: str, project_id: str) -> None:
     })
 
 
+class SendFilesRequest(BaseModel):
+    target_agent: str
+    paths: list[str]
+    dest_dir: str = ""
+    note: str = ""
+    source_agent: str | None = None
+    scope: str = "user"
+
+
+@router.post("/v1/delegation/send_files")
+async def send_files(
+    req: SendFilesRequest,
+    user: UserContext | None = Depends(get_current_user),
+    x_agent_name: str | None = Header(None, alias="x-agent-name"),
+):
+    """Copy workspace files into another agent's ``workspace/inbox/<source>/``.
+
+    The proxy mediates (sandboxes cannot see each other); the roster edge
+    is the consent — gates mirror ``spawn_authz`` via
+    ``services/delegation/file_transfer``. Passive by design: no turn is
+    spawned on the target and there is no active notice — its sessions
+    see ``workspace/inbox/<source>/…`` in their workspace listing, and
+    context travels IN the files (README pattern, taught by the skill)."""
+    u = require_auth(user)
+    if not req.paths:
+        raise HTTPException(400, "`paths` must name at least one file or directory.")
+    authz = await asyncio.to_thread(
+        lambda: file_transfer.authorize_send_files(
+            u,
+            target_agent=req.target_agent,
+            requested_scope=req.scope,
+            source_agent=req.source_agent,
+            x_agent_name=x_agent_name,
+        )
+    )
+    result = await asyncio.to_thread(
+        lambda: file_transfer.perform_send_files(
+            authz, paths=req.paths, dest_dir=req.dest_dir, note=req.note,
+        )
+    )
+    _schedule_transfer_fanout(
+        authz.target_agent, result.landed, origin_user_sub=authz.owner_sub,
+    )
+    return {
+        "transfer_id": result.transfer_id,
+        "target_agent": authz.target_agent,
+        "files": result.landed,
+        "total_bytes": result.total_bytes,
+        "scope": authz.dest_scope,
+        "scope_note": authz.scope_note or None,
+        "skipped": result.skipped,
+    }
+
+
+def _schedule_transfer_fanout(
+    target_agent: str, rel_paths: list[str], *, origin_user_sub: str,
+) -> None:
+    """Background satellite push per landed inbox file — best-effort, never
+    blocks the response (uploads precedent: a target agent living on a
+    remote machine must see the inbox too). ``include_idle`` so a connected
+    satellite holding the agent receives it even with no live session."""
+    try:
+        from services.remote import workspace_fanout
+    except Exception:
+        return
+    agent_dir = config.get_agent_dir(target_agent)
+    for rel in rel_paths:
+        if not workspace_fanout.has_fanout_candidates(
+            target_agent, rel, include_idle=True,
+        ):
+            continue
+
+        async def _push(rel: str = rel) -> None:
+            try:
+                await workspace_fanout.fan_out_write(
+                    target_agent, rel, agent_dir / rel,
+                    include_idle=True, origin_user_sub=origin_user_sub,
+                )
+            except Exception:
+                logger.exception("send_files fan-out failed: %s", rel)
+
+        asyncio.create_task(_push())
+
+
 class AdoptProjectRequest(BaseModel):
     project_id: str
 
@@ -441,6 +586,28 @@ def _caller_visibility(u: UserContext, x_agent_name: str | None) -> tuple[str, s
     return source_agent, owner, caller_chat_id
 
 
+def _nouser_edge_peek(u: UserContext, chat: dict) -> bool:
+    """May a NO-USER session peek this chat via a delegation edge?
+
+    Agent-shape only — the target's shared ``agent::`` pool or its
+    AGENT-SCOPE task-run chats (run-row rule; a user-scope run has a creator
+    to protect and no user on this side to match it). Per-user chat pools
+    are never reachable: there is no user to follow (rule 1).
+    """
+    chat_agent = chat.get("agent") or ""
+    if not chat_agent or chat_agent not in nouser_read_targets(u):
+        return False
+    owner = chat.get("user_sub") or ""
+    if owner == f"agent::{chat_agent}":
+        return True
+    if owner.startswith("task::") or (chat.get("id") or "").startswith("task-"):
+        from api.agents.chats import _run_for_chat
+        run = _run_for_chat(chat)
+        if run is not None:
+            return (run.get("scope") or "agent") != "user"
+    return False
+
+
 def _session_row(chat: dict, caller_chat_id: str) -> dict:
     return {
         "chat_id": chat["id"],
@@ -458,17 +625,75 @@ def _session_row(chat: dict, caller_chat_id: str) -> dict:
 @router.get("/v1/delegation/sessions")
 async def list_delegation_sessions(
     limit: int = 30,
+    agent: str | None = None,
     user: UserContext | None = Depends(get_current_user),
     x_agent_name: str | None = Header(None, alias="x-agent-name"),
 ):
-    """The caller's visibility set: its identity's own chats on its agent plus
-    workers its chat spawned (any agent). Live status derived per row."""
+    """The caller's visibility set. Live status derived per row.
+
+    Default (no ``agent``): its identity's own chats on its own agent plus
+    workers its chat spawned (any agent) — the pre-C2 set, unchanged.
+
+    ``agent=<slug>`` / ``agent=all`` (C2, user-backed callers): reads
+    follow the user — the pools the acting user could open in the dashboard
+    on that agent (their per-user chats, the shared ``agent::`` pool of a
+    Shared-only agent) PLUS its task-run chats under the run-row rule
+    (agent-scope runs for anyone with agent access, user-scope runs only for
+    their creator). A no-user session's cross-agent reach is its DELEGATION
+    roster instead: agent-shape pools only — the target's shared
+    ``agent::`` pool + its agent-scope task-run chats, never per-user chats
+    (there is no user to follow). No edge → 403."""
     u = require_auth(user)
     await asyncio.to_thread(_require_delegation_enabled)
     limit = max(1, min(limit, 100))
     source_agent, owner, caller_chat_id = await asyncio.to_thread(
         _caller_visibility, u, x_agent_name,
     )
+
+    if agent:
+        acting = u.acting_sub
+        nouser_slugs: list[str] | None = None
+        if acting is None:
+            edge_reach = await asyncio.to_thread(nouser_read_targets, u)
+            if agent == "all":
+                nouser_slugs = sorted(edge_reach | ({u.agent} if u.agent else set()))
+            elif agent == u.agent or agent in edge_reach:
+                nouser_slugs = [agent]
+            else:
+                raise HTTPException(
+                    403,
+                    "This session has no user identity; its cross-agent "
+                    f"visibility is its delegation targets — '{agent}' "
+                    "is not on this agent's roster.",
+                )
+        elif agent != "all" and not u.can_access_agent(agent):
+            raise HTTPException(403, f"No access to agent '{agent}'")
+
+        def _gather_cross() -> list[dict]:
+            from storage import agent_store as _agent_store
+            if nouser_slugs is not None:
+                slugs = nouser_slugs
+            elif agent == "all":
+                slugs = (_agent_store.get_agent_slugs() if u.is_admin
+                         else sorted(set(u.agents) | ({u.agent} if u.agent else set())))
+            else:
+                slugs = [agent]
+            rows: dict[str, dict] = {}
+            for slug in slugs:
+                # No-user callers read agent-shape pools (rule 1: no user
+                # to follow); user-backed callers read the acting user's
+                # dashboard pools.
+                pool_owner = (f"agent::{slug}" if acting is None
+                              else chat_history_owner(slug, acting))
+                for c in task_store.list_chats(pool_owner, agent=slug, limit=limit):
+                    rows[c["id"]] = c
+                for c in task_store.list_task_chats(slug, acting or "", limit=limit):
+                    rows[c["id"]] = c
+            merged = sorted(rows.values(), key=lambda c: c.get("updated_at") or "",
+                            reverse=True)[:limit]
+            return [_session_row(c, caller_chat_id) for c in merged]
+
+        return {"sessions": await asyncio.to_thread(_gather_cross)}
 
     def _gather() -> list[dict]:
         rows: dict[str, dict] = {}
@@ -510,10 +735,22 @@ async def peek_delegation_session(
     if not chat:
         raise HTTPException(404, f"No chat '{chat_id}'.")
     # Own history pool (any agent — covers task-surface worker chats the
-    # caller's identity owns) or a worker this chat spawned.
+    # caller's identity owns) or a worker this chat spawned. Beyond that (C2):
+    # reads follow the user — anything the ACTING USER could open in the
+    # dashboard is peekable (cross-agent per-user pools, shared ``agent::``
+    # pools, task-run chats via their run row). ``can_access_chat`` IS the
+    # dashboard's own rule, so the two surfaces can never disagree. No-user
+    # callers get the owner/lineage rule plus their DELEGATION edges
+    # (agent-shape only) — never the user-derived fallback.
     if not ((owner and chat.get("user_sub") == owner)
             or (caller_chat_id and chat.get("parent_chat_id") == caller_chat_id)):
-        raise HTTPException(403, "This session is not in your visibility set.")
+        if u.acting_sub is not None:
+            from api.agents.chats import can_access_chat
+            allowed = await asyncio.to_thread(can_access_chat, u, chat)
+        else:
+            allowed = await asyncio.to_thread(_nouser_edge_peek, u, chat)
+        if not allowed:
+            raise HTTPException(403, "This session is not in your visibility set.")
 
     # Live in-progress turn (headless pump): snapshot SYNCHRONOUSLY on the
     # event loop — the pump mutates these dicts in place on this same loop,

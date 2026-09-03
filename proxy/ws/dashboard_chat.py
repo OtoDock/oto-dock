@@ -29,6 +29,7 @@ from core.session.session_state import (
     resolve_location,
     get_permission_request_session,
     get_meeting_session_info,
+    get_session_user_tz,
     get_user_tz,
     set_session_user_tz,
     get_subagent_registry,
@@ -62,6 +63,7 @@ from ws.dashboard import (
     _save_base64_image,
     _task_continue_allowed,
     chat_process_alive,
+    task_run_active,
 )
 
 logger = logging.getLogger("claude-proxy")
@@ -70,6 +72,12 @@ logger = logging.getLogger("claude-proxy")
 # ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shape only).
 _TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)")
 
+# Bounded wait on an in-flight warmup during the dead-session re-check
+# (single-flight revival). Covers a normal respawn (~2-10s) with slack for a
+# satellite resume; past it the send falls back to synthesizing its own warmup
+# rather than hanging the turn behind a stuck 90s MCP install.
+_REVIVAL_WAIT_S = 30.0
+
 # A mini-app action's framed prompt header (``ws/artifact_interactions.
 # frame_text`` — title/label have had '"' replaced with "'"). Recognized by
 # the title chokepoints so an action-started chat names as "App — Label",
@@ -77,6 +85,28 @@ _TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+
 _APP_ACTION_HEADER_RE = re.compile(
     r'^\[action from mini-app "(.{1,200}?)" — (.{1,80}?)\]'
 )
+
+# Stop-and-send: rides the ENGINE prompt of the interrupted-then-drained
+# queued message only — the QUEUE_TURN event / DB user row keep the raw text
+# (mirrors duplex ``_build_prompt``'s prompt-side-only interruption note).
+_STOP_AND_SEND_NOTE = (
+    "[The user sent the message below while you were still working — the "
+    "previous turn was interrupted mid-step so you can respond now. "
+    "Completed work and running background tasks are unaffected.]"
+)
+
+
+def _queued_outgoing(stop_flags: dict, combined: str) -> str:
+    """Engine text for a drained queue batch; consumes the stop-and-send
+    flags. When a graceful interrupt landed for this boundary the note is
+    prepended to the ENGINE prompt only — the caller's QUEUE_TURN event
+    (and thus the DB user row) keeps ``combined`` raw."""
+    outgoing = combined
+    if stop_flags["note"]:
+        outgoing = _STOP_AND_SEND_NOTE + "\n\n" + combined
+    stop_flags["note"] = False
+    stop_flags["fired"] = False
+    return outgoing
 
 
 class ChatController:
@@ -239,6 +269,51 @@ class ChatController:
         if self.session_id and self.agent_name and self.chat_id:
             alive = self.layer and await self.layer.is_session_alive(self.session_id)
             if not alive:
+                # The headless liveness check above never sees PTY sessions
+                # (they live in interactive_session, not the layer's registry):
+                # a live interactive revival must take this send, or the warmup
+                # below spawns a headless TWIN on the same session id whose
+                # stale sibling's eventual teardown wipes the survivor's
+                # permission/secret state (incident 2026-08-06, chat 9f56bf65).
+                if await self._deliver_chat_to_live_interactive(msg):
+                    return
+                # Single-flight: a warmup already in flight for this chat (the
+                # chat-open revival racing this send) owns the respawn — await
+                # it bounded, then re-check BOTH registries. Only a still-dead
+                # session with none in flight synthesizes a warmup below.
+                inflight = warmup_registry.get(self.chat_id)
+                if inflight is not None:
+                    logger.info(
+                        f"WS dashboard _handle_chat: warmup in flight for "
+                        f"chat={self.chat_id} — awaiting it instead of re-warming"
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            inflight.completed.wait(), timeout=_REVIVAL_WAIT_S)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"WS dashboard _handle_chat: in-flight warmup for "
+                            f"chat={self.chat_id} still running after "
+                            f"{_REVIVAL_WAIT_S:.0f}s — falling back to auto-warm"
+                        )
+                    if await self._deliver_chat_to_live_interactive(msg):
+                        return
+                    # The finished warmup may have bound a NEW session id to the
+                    # chat row — adopt it (+ its layer) before re-checking.
+                    _cur = task_store.get_chat(self.chat_id) or {}
+                    _cur_sid = _cur.get("session_id") or ""
+                    if _cur_sid and _cur_sid != self.session_id:
+                        self.session_id = _cur_sid
+                        _cur_role = _effective_agent_role(
+                            self.user_sub, self.agent_name, fallback_user=self.user)
+                        self.layer = get_execution_layer(
+                            self.agent_name,
+                            execution_path=_cur.get("execution_path", ""),
+                            user_sub=self.user_sub, role=_cur_role,
+                            execution_target=_cur.get("execution_target") or "",
+                        )
+                    alive = self.layer and await self.layer.is_session_alive(self.session_id)
+            if not alive:
                 logger.info(
                     f"WS dashboard _handle_chat: session {self.session_id} "
                     f"dead/reaped, auto-warming for chat={self.chat_id}"
@@ -384,7 +459,20 @@ class ChatController:
             if chat_rec and not chat_rec.get("title") and not artifact_framed:
                 _title = self._deterministic_title(text)
                 task_store.update_chat(self.chat_id, title=_title)
+                # BOTH sends, deliberately: the broadcast reaches every other
+                # viewer's sidebar + Active-now widget now, but the SENDING
+                # socket's notify queue drains only between turns — the direct
+                # send is what titles the sending tab for the whole first
+                # turn. The client's title_updated patch is idempotent.
                 await self._send({"type": "title_updated", "chat_id": self.chat_id, "title": _title})
+                try:
+                    notification_manager.broadcast_chat_title(
+                        chat_rec.get("user_sub") or "", self.chat_id, _title,
+                        agent=chat_rec.get("agent") or "",
+                    )
+                except Exception:
+                    logger.debug("first-message title broadcast failed for %s",
+                                 self.chat_id, exc_info=True)
 
             # Inject cancelled turn context if previous turn was aborted AND
             # the abort was a hard kill (killpg / stream cancel) — those paths
@@ -478,6 +566,140 @@ class ChatController:
         else:
             # Pump creation failed (dead session, error) — reset frontend streaming state
             await self._send({"type": "done", "chat_id": self.chat_id or ""})
+
+    def _maybe_stop_and_send(self, pump) -> None:
+        """Typed message queued onto a busy turn → graceful stop-and-send.
+
+        Fires only on pumps OWNED by ``_start_new_stream`` (``stop_and_send``
+        flags present — its producer drains ``message_queue``); foreign
+        producers (task runs, meetings, duplex turns, delegate-result
+        echoes, recovery adopts) never drain typed messages, so interrupting
+        them would destroy the turn for nothing — they keep queue-only.
+        Steered engines (Codex) never reach the queue branch. The layer call
+        is graceful-ONLY (`interrupt_for_queued`): no killpg, no watchdog —
+        background bash/subagents survive, and a turn that ignores the
+        interrupt degrades to today's deliver-at-turn-end.
+        """
+        flags = getattr(pump, "stop_and_send", None)
+        if flags is None or flags["fired"] or self.layer is None:
+            return
+        flags["fired"] = True
+        asyncio.create_task(self._fire_stop_and_send(pump, flags))
+
+    async def _fire_stop_and_send(self, pump, flags: dict) -> None:
+        # Pre-flight re-checks (the ack await above yielded the loop): the
+        # producer may have claimed the queue already (the interrupt would
+        # land on the DRAIN turn delivering this very message), the user may
+        # have cancelled the queued message, or the pump may have been
+        # superseded (never interrupt the successor's turn). Un-latch the
+        # debounce on every no-fire path so a later typed message can fire.
+        if not pump.message_queue or _active_pumps.get(pump.chat_id) is not pump:
+            flags["fired"] = False
+            return
+        try:
+            # The pump's session, never the connection's — an attach viewer
+            # may hold a different session id than the streaming turn.
+            if await self.layer.interrupt_for_queued(pump.session_id):
+                flags["note"] = True
+                # The auto-deny released the hook waiters; clear the pump's
+                # permission slot too, else the drain turn's next permission
+                # buffers invisibly behind the dead card.
+                pump.clear_permission_state()
+                logger.info(
+                    f"stop-and-send: graceful interrupt fired for "
+                    f"chat={pump.chat_id[:8]}"
+                )
+            else:
+                flags["fired"] = False
+        except Exception:
+            flags["fired"] = False
+            logger.warning("stop-and-send: interrupt attempt failed",
+                           exc_info=True)
+
+    async def _deliver_chat_to_live_interactive(self, msg: dict) -> bool:
+        """Deliver a composer ``chat`` frame to a LIVE interactive session on
+        the viewed chat, if one exists. Returns True when the send was handled
+        (typed into the PTY, held by its question-parked queue, or refused
+        read-only) — the caller must NOT warm. Delivery mirrors the server-side
+        first-prompt submit in ``_spawn_tail`` (persist the raw row, stamp the
+        time prelude, note the stamped bytes so the tailer's duplicate-skip
+        matches the journaled user line byte-for-byte)."""
+        if not self.chat_id:
+            return False
+        isess = interactive_session.get(self.session_id) if self.session_id else None
+        if isess is None or not isess.alive or isess.chat_id != self.chat_id:
+            # Session-id drift: a revival may have re-warmed under a new id.
+            isess = interactive_session.find_live_for_chat(self.chat_id)
+        if isess is None or not isess.alive:
+            return False
+        if not isess.may_drive(self.user_sub):
+            await self._send_pty_read_only(isess)
+            return True
+
+        text = msg.get("text", "")
+        cli_text = text
+        image_meta: list = []
+        valid_files: list = []
+        if msg.get("images") or msg.get("files"):
+            # Same pipeline as the pty_attachments frame: save + push the
+            # attachments, build the prompt with sandbox-virtual paths.
+            cli_text, _imgs, image_meta, valid_files = await self._process_attachments(
+                text, msg.get("images", []), msg.get("files", []),
+                agent=self.agent_name, agent_dir=config.get_agent_dir(self.agent_name),
+                is_agent_scoped=_vis.is_shared_only(self.agent_name),
+                username=self.user.get("username") or "",
+                is_direct_llm=False,
+            )
+
+        # Adopt the live session + tell the client it is interactive so it
+        # attaches the terminal (same frame shape as the resume re-attach) —
+        # the client sent `chat` precisely because it believed the session
+        # dead.
+        from core.concurrency import acquire_chat_slot
+        await acquire_chat_slot(isess.session_id, target=isess.target)
+        self.session_id = isess.session_id
+        chat_rec = task_store.get_chat(self.chat_id) or {}
+        await self._send({
+            "type": "warmup_ready",
+            "session_id": self.session_id,
+            "chat_id": self.chat_id,
+            "mode": get_session_mode(self.session_id) or chat_rec.get("permission_mode", "default"),
+            "model": chat_rec.get("model", "") or config.get_cli_model(self.agent_name),
+            "execution_path": chat_rec.get("execution_path", ""),
+            "interactive": True,
+            "turn_open": isess.turn_open,
+        })
+
+        # A _server_kick's prompt was persisted at _do_warmup send-time; an
+        # artifact-framed turn's distinct row was persisted by its handler.
+        if not msg.get("_server_kick") and not msg.get("_artifact_framed"):
+            event_meta = {}
+            if image_meta:
+                event_meta["images"] = image_meta
+            if valid_files:
+                event_meta["files"] = valid_files
+            task_store.add_chat_message(
+                self.chat_id, "user", text,
+                event_data=json.dumps(event_meta) if event_meta else "",
+                author_sub=self.user_sub,
+            )
+        user_tz = get_session_user_tz(self.session_id) or get_user_tz(self.user_sub)
+        stamped = (
+            f"[Current time: {config.format_current_time(user_tz)}]\n\n{cli_text}"
+        )
+        from core.session.transcript_tool_events import note_sent_prompt
+        note_sent_prompt(self.chat_id, stamped)
+        # Bracketed paste + CR (the composer's own framing): the question-
+        # parked hold in deliver_dashboard_input strips exactly this shape.
+        isess.deliver_dashboard_input(
+            ("\x1b[200~" + stamped + "\x1b[201~\r").encode("utf-8"),
+            composer=True, sender_sub=self.user_sub,
+        )
+        logger.info(
+            f"WS dashboard _handle_chat: delivered composer send to live "
+            f"interactive session={self.session_id[:8]}, chat={self.chat_id[:8]}"
+        )
+        return True
 
     async def _handle_artifact_interaction(self, msg: dict):
         """Between-turns entry for a display_ui backchannel send (the
@@ -950,9 +1172,13 @@ class ChatController:
                      # Best-effort process liveness (in-memory only, no RPC) —
                      # gates the cross-engine model options client-side. An
                      # active pump also means alive (the attach below streams
-                     # it). The switch op re-checks authoritatively.
+                     # it); a pending/running TASK RUN counts as alive too
+                     # (parked/spawning runs have no session yet but must
+                     # keep the picker locked). The switch op re-checks
+                     # authoritatively.
                      "process_alive": (
                          bool(pump and not pump.is_done)
+                         or task_run_active(chat["id"])
                          or await chat_process_alive(chat)
                      )})
 
@@ -1171,7 +1397,17 @@ class ChatController:
         # (adopt=True); a dead NON-viewed target (a server turn whose originating
         # chat was reaped) is warmed via adopt=False and run headless on the
         # returned spawn — never clobbering the viewed chat's session.
-        process_dead = bool(target_layer) and await target_layer.is_session_process_dead(sid)
+        # A session ABSENT from the pool (idle-reaped, proxy restart) counts as
+        # dead here too: is_session_process_dead alone reports False for it
+        # ("not in pool = absent"), which used to skip the warm branches and
+        # fall through to a silent "Session not found" — a server turn's
+        # delegate result then never ran (the 18:56 no-resume bug). The layer
+        # predicates keep their semantics; this chokepoint is where "absent"
+        # and "dead" must both mean "warm it".
+        process_dead = bool(target_layer) and (
+            await target_layer.is_session_process_dead(sid)
+            or not await target_layer.is_session_alive(sid)
+        )
         if target_layer and not process_dead:
             # Turn-start token guard: never dispatch a turn onto an OAuth token
             # that expires within the turn-safety margin — a long turn would
@@ -1285,6 +1521,12 @@ class ChatController:
         # System prompt queue: delivered silently (no user bubble).
         # Shared with pump — external code can append during streaming.
         sys_queue: list[str] = []
+        # Stop-and-send flags, shared with the pump like the queues above.
+        # "fired" debounces to one graceful interrupt per turn boundary;
+        # "note" marks that an interrupt actually landed, so the drain
+        # prepends the interruption note to the engine prompt. Both reset
+        # at each message drain.
+        stop_flags: dict = {"fired": False, "note": False}
 
         # Memory-capture nudge: after N user turns without a memory tool
         # call, one reminder line rides this turn's outgoing message. The
@@ -1331,7 +1573,10 @@ class ChatController:
                             combined = "\n\n".join(msg_queue)
                             msg_queue.clear()
                             await event_queue.put(CommonEvent(type=QUEUE_TURN, data={"text": combined}))
-                            async for event in target_layer.send_message(sid, combined, inject_time=True):
+                            # Stop-and-send: the note rides the engine prompt
+                            # only — the QUEUE_TURN row above stays raw.
+                            outgoing = _queued_outgoing(stop_flags, combined)
+                            async for event in target_layer.send_message(sid, outgoing, inject_time=True):
                                 await event_queue.put(event)
                         # Artifact interactions drain AFTER user words (lower
                         # authority) as their own framed turn per batch; the
@@ -1381,7 +1626,9 @@ class ChatController:
         )
         pump.message_queue = msg_queue  # share the same list with producer
         pump.system_queue = sys_queue   # share system prompt queue with producer
+        pump.system_queue_consumer = True  # this producer drains it each turn
         pump.artifact_queue = art_queue  # share artifact-interaction queue too
+        pump.stop_and_send = stop_flags  # ownership marker: this producer drains
         if is_viewed:
             pump._plan_filename = self.chat_plan_filename  # inherit from previous pump
         _active_pumps[target_chat_id] = pump
@@ -1445,7 +1692,11 @@ class ChatController:
                      or live.get("live_blocks") or live.get("thinking_active")
                      or live.get("pending_permission")
                      or live.get("meeting_participants")
-                     or live.get("active_agents")):  # bg residual after a turn ended
+                     # bg residuals after a turn ended — agents AND commands
+                     # (a Commands-only residual previously failed this gate
+                     # and the badge was lost on reconnect):
+                     or live.get("active_agents")
+                     or live.get("active_commands")):
             await self._send({"type": "live_state", **live, "chat_id": frame_chat_id})
             logger.info(f"WS dashboard: sent live_state after attach for chat={pump.chat_id}")
 
@@ -1535,6 +1786,14 @@ class ChatController:
                             pump.implementing_plan = plan_fn
                     elif cm_type == "chat":
                         text = client_msg.get("text", "")
+                        # Same task continue-gate the between-turns/warmup/
+                        # permission paths enforce — WITHOUT it a viewer of a
+                        # shared-only agent's task chat could steer/queue into a
+                        # running task run they're not allowed to continue
+                        # (Codex steer injects into the live turn). Applies only
+                        # to task-{run} chats; a no-op for regular chats.
+                        if text and await self._deny_task_continue(pump.chat_id):
+                            text = ""
                         if text:
                             # Steer-first: engines that support it (Codex
                             # turn/steer) take the message INTO the running
@@ -1560,7 +1819,17 @@ class ChatController:
                                 await self._send({"type": "steered", "text": text, "chat_id": frame_chat_id})
                             else:
                                 idx = pump.queue_message(text)
-                                await self._send({"type": "queued", "index": idx, "text": text, "chat_id": frame_chat_id})
+                                if idx < 0:
+                                    await self._send_error(
+                                        "Too many queued messages — wait for the "
+                                        "current turn to finish.")
+                                else:
+                                    await self._send({"type": "queued", "index": idx, "text": text, "chat_id": frame_chat_id})
+                                    # Stop-and-send (Claude CLI headless): fire a
+                                    # graceful-only interrupt so the producer's
+                                    # queue drain delivers this message as the
+                                    # next turn in seconds, not at turn end.
+                                    self._maybe_stop_and_send(pump)
                     elif cm_type == "artifact_interaction":
                         # display_ui backchannel mid-turn: QUEUE ONLY — page
                         # events never steer a running turn (lower authority
@@ -2096,7 +2365,23 @@ class ChatController:
         notification_manager.set_chat_turn_origin(self.user_sub, cid, self.notify_connection_id)
         rec = task_store.get_chat(cid)
         if rec and not rec.get("title"):
-            task_store.update_chat(cid, title=self._deterministic_title(prompt_text))
+            title = self._deterministic_title(prompt_text)
+            task_store.update_chat(cid, title=title)
+            # Inside the not-title guard: this method re-runs on every cold
+            # re-send of an already-titled chat, and the fan-out belongs only
+            # to the one send that actually writes the title. Broadcast so
+            # OTHER tabs/users' sidebars + Active-now widgets title the row
+            # during the warmup window; the SENDING socket's copy rides its
+            # notify queue, which drains between turns — its own tab already
+            # renders the prompt it just typed.
+            try:
+                notification_manager.broadcast_chat_title(
+                    rec.get("user_sub") or "", cid, title,
+                    agent=rec.get("agent") or "",
+                )
+            except Exception:
+                logger.debug("first-prompt title broadcast failed for %s",
+                             cid, exc_info=True)
 
     def _build_cancelled_context(self, cid: str) -> str:
         """Read the cancelled turn's messages from DB and format for injection.
@@ -2424,6 +2709,22 @@ class ChatController:
         if not new_model:
             await self._send_error("Model required")
             return
+
+        # Task chats (1.5): the persisted model drives every follow-up turn
+        # AND the pump's usage attribution at record time — gate on the
+        # continue tier (until now only the FE lock protected this op), and
+        # never re-attribute an in-flight run mid-stream from a picker click.
+        if self.chat_id and self.chat_id.startswith("task-"):
+            if await self._deny_task_continue(self.chat_id):
+                return
+            if task_run_active(self.chat_id):
+                chat_rec = task_store.get_chat(self.chat_id) or {}
+                await self._send({
+                    "type": "model_changed",
+                    "model": chat_rec.get("model", ""),
+                    "chat_id": self.chat_id,
+                })
+                return
 
         # Refuse a model foreign to this chat's execution layer (see
         # _model_allowed_for_path) and resync the client's selector to the

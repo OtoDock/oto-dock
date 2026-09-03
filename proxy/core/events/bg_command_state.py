@@ -31,6 +31,15 @@ bound here at :meth:`BackgroundCommandRegistry.register_spawn`.
 import asyncio
 
 
+def shorten_label(text: str, limit: int = 80) -> str:
+    """Collapse whitespace and cap a nudge-label fragment.
+
+    Shared by every registration site that composes a model-facing job
+    label (commands can be arbitrarily long multi-line strings)."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 # session_id → registry
 _bg_command_registries: dict[str, "BackgroundCommandRegistry"] = {}
 
@@ -56,7 +65,7 @@ class BackgroundCommandRegistry:
     """
 
     __slots__ = ("spawned", "completed", "unsurfaced", "task_to_tuid",
-                 "chat_id", "_all_done_event")
+                 "labels", "chat_id", "_all_done_event")
 
     def __init__(self) -> None:
         self.spawned: set[str] = set()           # shell ids seen at task_started
@@ -69,16 +78,26 @@ class BackgroundCommandRegistry:
         # unsurfaced work — not for completions the model already read inline.
         self.unsurfaced: set[str] = set()
         self.task_to_tuid: dict[str, str] = {}    # shell id → spawning Bash tool_use_id
+        # task_id → model-facing label ("b5gxm4wuh — sleep 30 && make test"
+        # for claude, whose shell id the model knows from its Bash result;
+        # bare command text for codex, whose itemId the model never sees).
+        # Composed by the TRANSLATOR at registration — engine knowledge stays
+        # there. Consumed by the completion nudges so the model can tell WHICH
+        # job finished. Empty label → the nudge degrades to count-only.
+        self.labels: dict[str, str] = {}
         self.chat_id: str = ""                    # set by the pump/monitor (badge + nudge routing)
         self._all_done_event = asyncio.Event()
 
-    def register_spawn(self, task_id: str, tool_use_id: str) -> None:
+    def register_spawn(self, task_id: str, tool_use_id: str,
+                       label: str = "") -> None:
         """Record a backgrounded command (CLI ``task_started``, local_bash)."""
         if not task_id:
             return
         self.spawned.add(task_id)
         if tool_use_id:
             self.task_to_tuid[task_id] = tool_use_id
+        if label:
+            self.labels[task_id] = label
         self._refresh()
 
     def mark_done(self, task_id: str, *, surfaced: bool = True) -> bool:
@@ -115,6 +134,10 @@ class BackgroundCommandRegistry:
         """Resolve a shell id to its spawning Bash tool_use_id (the dashboard key)."""
         return self.task_to_tuid.get(task_id, "")
 
+    def label_for(self, task_id: str) -> str:
+        """Model-facing label for a tracked command ("" when never captured)."""
+        return self.labels.get(task_id, "")
+
     @property
     def has_pending(self) -> bool:
         """True if any tracked command hasn't finished yet."""
@@ -150,6 +173,7 @@ class BackgroundCommandRegistry:
         self.completed = set()
         self.unsurfaced = set()
         self.task_to_tuid = {t: u for t, u in self.task_to_tuid.items() if t in pending}
+        self.labels = {t: l for t, l in self.labels.items() if t in pending}
         self.chat_id = ""
         self._refresh()
 

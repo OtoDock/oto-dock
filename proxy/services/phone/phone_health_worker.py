@@ -19,6 +19,8 @@ import contextlib
 import logging
 from datetime import datetime, timezone
 
+from services.phone.phone_adapters.twilio import normalize_did
+
 logger = logging.getLogger("claude-proxy.phone-health-worker")
 
 _INTERVAL_SECONDS = 300
@@ -118,12 +120,15 @@ async def _reconcile_server(server: dict) -> None:
         return
 
     all_routes = await asyncio.to_thread(phone_route_store.get_all_routes)
+    # Digits-only comparison: providers report canonical E.164 while admins
+    # type numbers with formatting — matching what the daemon's DID lookup
+    # does, so a formatting difference is never flagged as drift.
     db_dids = {
-        r["did"] for r in all_routes
+        normalize_did(r["did"]) for r in all_routes
         if r.get("phone_server_id") == server["id"]
         and r.get("direction") == "inbound" and r.get("did")
     }
-    pbx_dids = {h.did for h in handles if h.did}
+    pbx_dids = {normalize_did(h.did) for h in handles if h.did}
     if db_dids == pbx_dids:
         return
 

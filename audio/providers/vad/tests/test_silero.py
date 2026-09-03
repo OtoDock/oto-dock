@@ -44,3 +44,18 @@ def test_reset_returns_to_idle():
     vad.process(b"\x00" * 320)
     vad.reset()
     assert vad.state == VadState.IDLE
+
+
+def test_16k_instance_runs_real_model():
+    # Duplex sessions feed 16 kHz mic audio; the model derives its 32 ms
+    # window from the rate (512 samples), and silence still stays IDLE.
+    vad = SileroVad(
+        threshold=0.5, silence_duration_ms=800, speech_pad_ms=64,
+        min_energy_rms=200.0, bargein_threshold=0.7, bargein_debounce_ms=200,
+        bargein_chunk_ratio=0.6, bargein_silence_duration_ms=1200,
+        sample_rate=16000,
+    )
+    assert vad._chunk_bytes == 512 * 2
+    for _ in range(50):
+        assert vad.process(b"\x00" * 640) in (VadEvent.NONE,)
+    assert vad.state == VadState.IDLE

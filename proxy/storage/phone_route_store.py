@@ -21,6 +21,37 @@ def _row_to_dict(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Inbound PIN — encrypted sidecar credential (phone-server secret precedent:
+# no route column, so the raw ``SELECT *`` rows that feed API responses and
+# the daemon config push can never leak it by accident).
+# ---------------------------------------------------------------------------
+
+#: Inner credential key for a route's PIN.
+ROUTE_PIN_KEY = "PIN"
+
+
+def pin_cred_name(route_id: str) -> str:
+    """infra_credentials mcp_name for a route's inbound PIN."""
+    return f"phone-route-{route_id}-pin"
+
+
+def get_route_pin(route_id: str) -> str:
+    """Decrypted PIN for a route ("" when none is configured)."""
+    from storage.credential_store import get_infra_credentials
+    return get_infra_credentials(pin_cred_name(route_id)).get(ROUTE_PIN_KEY, "")
+
+
+def set_route_pin(route_id: str, pin: str) -> None:
+    from storage.credential_store import set_infra_credentials
+    set_infra_credentials(pin_cred_name(route_id), {ROUTE_PIN_KEY: pin})
+
+
+def delete_route_pin(route_id: str) -> None:
+    from storage.credential_store import delete_infra_credentials
+    delete_infra_credentials(pin_cred_name(route_id))
+
+
+# ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
 

@@ -228,6 +228,27 @@ class ExecutionLayer(ABC):
         """
         return False
 
+    async def interrupt_for_queued(self, session_id: str) -> bool:
+        """Stop-and-send: gracefully stop the in-flight turn so a just-queued
+        USER message becomes the next turn (the producer's queue drain
+        delivers it within seconds instead of after the whole turn).
+
+        GRACEFUL-ONLY — True only when the engine accepted an interrupt that
+        keeps the partial turn in its own history (Claude control_request
+        interrupt); the process survives, so background bash commands and
+        background subagents keep running. False = no live turn /
+        unsupported / dead pipe — the caller leaves the message in the
+        post-turn queue (today's behavior). Unlike ``abort`` there is NO
+        killpg fallback and NO watchdog: a turn that ignores the interrupt
+        simply drains at its natural end. (Known exception: the interrupt
+        arms the CLI's #63943 wedge detector, which kills a session whose
+        NEXT turn hits the thinking-signature 400 — the correct repair for a
+        genuinely wedged process, same as the Stop button.) Default:
+        unsupported — Codex takes ``steer`` instead, Direct's abort is
+        erase-style, interactive PTYs never reach the queue branch.
+        """
+        return False
+
     async def compact(self, session_id: str) -> dict | None:
         """Manually compact the session's context, between turns.
 

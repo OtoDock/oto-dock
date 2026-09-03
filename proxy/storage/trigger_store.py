@@ -280,6 +280,7 @@ def cleanup_user_triggers(user_sub: str) -> int:
             "DELETE FROM triggers WHERE scope='user' AND created_by=%s",
             (user_sub,),
         )
+        conn.commit()
         return cur.rowcount
 
 

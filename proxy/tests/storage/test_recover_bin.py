@@ -290,13 +290,24 @@ def _make_agent():
 
 @pytest.fixture
 def _fanout_calls(monkeypatch):
-    """Capture workspace_fanout.fan_out_write calls instead of hitting satellites."""
+    """Capture workspace_fanout.fan_out_write calls instead of hitting satellites.
+
+    Restore publishes through ``_push_file_write_to_remote`` (the same helper
+    every other platform write uses), which skips the network push when the
+    agent has no fan-out candidates — so the gate is forced open here to keep
+    exercising the push. The bookkeeping half of that helper (tombstone
+    retire / author / library projection) runs BEFORE the gate and is
+    unconditional.
+    """
     calls = []
 
     async def _fake(agent_slug, rel_path, content, **kw):
         calls.append((agent_slug, rel_path, content))
 
     monkeypatch.setattr("services.remote.workspace_fanout.fan_out_write", _fake)
+    monkeypatch.setattr(
+        "services.remote.workspace_fanout.has_fanout_candidates",
+        lambda *a, **kw: True)
     return calls
 
 
@@ -482,3 +493,108 @@ async def test_restore_manager_can_restore_config(_fanout_calls):
     )
     # Pre-1.4 persona entries restore under the current filename.
     assert [r["rel_path"] for r in res["restored"]] == ["config/agent.md"]
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-library mirrors — restore is a platform write and must obey the
+# same gate. Restore used to reach the filesystem directly, so a manager could
+# put a file back INSIDE a read-only mirror: content the projector owns, which
+# its next reconcile would capture as a conflict and heal away. Worse, the
+# restore also skipped tombstone retirement (an idle satellite would re-apply
+# the delete and undo it) and the mirror→source projection (an RW restore
+# never reached the library source).
+# ---------------------------------------------------------------------------
+
+
+def _attach_library(source: str, consumer: str, *, writable: bool):
+    from storage import agent_store, db_knowledge_libraries
+    agent_store.create_agent(source, "Lib Source")
+    agent_store._invalidate_cache()
+    db_knowledge_libraries.promote(source, created_by="u-admin", name="Lib")
+    db_knowledge_libraries.attach(
+        source, consumer, writable=writable, created_by="u-admin")
+
+
+@pytest.mark.asyncio
+async def test_restore_into_read_only_mirror_is_denied(_fanout_calls):
+    _make_agent()
+    _attach_library("lib-src", AGENT, writable=False)
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    rel = "knowledge/shared/lib-src/doc.md"
+    e = rb.capture(AGENT, rel, b"stray", "conflict")
+
+    res = await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert res["restored"] == []
+    assert res["denied"] == [e["entry_id"]]
+    # Nothing written into the projector-owned mirror…
+    assert not (config.get_agent_dir(AGENT) / rel).exists()
+    # …and the entry survives, so the bytes are not lost on a denial.
+    assert rb.get(e["entry_id"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_restore_into_writable_mirror_is_allowed(_fanout_calls):
+    _make_agent()
+    _attach_library("lib-rw", AGENT, writable=True)
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    rel = "knowledge/shared/lib-rw/doc.md"
+    e = rb.capture(AGENT, rel, b"data", "conflict")
+
+    res = await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert [r["rel_path"] for r in res["restored"]] == [rel]
+    assert (config.get_agent_dir(AGENT) / rel).read_bytes() == b"data"
+
+
+@pytest.mark.asyncio
+async def test_denied_mirror_entry_does_not_sink_the_batch(_fanout_calls):
+    """One ineligible file must not abort the rest of the selection."""
+    _make_agent()
+    _attach_library("lib-ro", AGENT, writable=False)
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    bad = rb.capture(AGENT, "knowledge/shared/lib-ro/x.md", b"no", "conflict")
+    good = rb.capture(AGENT, "workspace/ok.txt", b"yes", "deleted")
+
+    res = await restore_recover_bin(
+        AGENT,
+        RecoverRestoreRequest(entry_ids=[bad["entry_id"], good["entry_id"]]),
+        _admin(),
+    )
+    assert res["denied"] == [bad["entry_id"]]
+    assert [r["rel_path"] for r in res["restored"]] == ["workspace/ok.txt"]
+
+
+@pytest.mark.asyncio
+async def test_restore_publishes_like_every_other_write(_fanout_calls, monkeypatch):
+    """A restore must retire the delete tombstone (else an idle satellite
+    re-applies the delete and undoes it) and record the author — the
+    bookkeeping the bare fan-out call skipped."""
+    _make_agent()
+    seen: list = []
+
+    async def _rec(agent_slug, rel_path, writer):
+        seen.append((agent_slug, rel_path, writer))
+
+    monkeypatch.setattr("api.agents.files._record_platform_write", _rec)
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    e = rb.capture(AGENT, "workspace/back.txt", b"data", "deleted")
+    await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert [(a, r) for a, r, _ in seen] == [(AGENT, "workspace/back.txt")]
+
+
+@pytest.mark.asyncio
+async def test_bare_shared_namespace_restore_is_denied(_fanout_calls):
+    """`knowledge/shared/<file>` is the reserved mirror namespace itself."""
+    _make_agent()
+    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    e = rb.capture(AGENT, "knowledge/shared/loose.md", b"x", "conflict")
+    res = await restore_recover_bin(
+        AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
+    )
+    assert res["restored"] == []
+    assert res["denied"] == [e["entry_id"]]

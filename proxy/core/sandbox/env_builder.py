@@ -111,6 +111,13 @@ def build_session_env(
     # "Engines / CLI upgrades — follow-ups").
     env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "1"
 
+    # Claude Code 2.1.233 removed the Todo/Task tools (TodoWrite,
+    # TaskCreate/Get/Update/List) on Opus 4.8 / Sonnet 5 / Fable 5 and newer —
+    # but the dashboard's live todo checklist is fed by their TODO_UPDATE
+    # frames (cli/translator → stream_pump → messageBlocks), so the platform
+    # opts back in. Mirrored on satellite CLI spawns (cli_session/pty_session).
+    env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1"
+
     # Standard OTO_* platform env vars (incl. OTO_SESSION_ID) — community MCPs
     # read these for scope-aware paths without per-manifest declarations.
     from core.sandbox.oto_env import build_oto_env, resolve_memory_and_scope

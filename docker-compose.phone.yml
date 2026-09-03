@@ -1,0 +1,78 @@
+# OtoDock — optional telephony add-on (the otodock-phone daemon).
+#
+# Bridges Asterisk/FreePBX (and, later, Twilio/3CX) calls to an agent: an
+# AudioSocket TCP server (PBX media in) + an outbound-call HTTP API, running the
+# on-box VAD→STT→LLM→TTS pipeline. Connects OUT to the proxy's
+# /ws/phone-management to receive ALL runtime config (routes, providers,
+# credentials) from the proxy DB — it needs only PROXY_URL + the shared secrets
+# here. Takes calls only once a PBX / SIP trunk or Twilio is configured in
+# the dashboard (Setup → Phone); until then it idles fail-closed.
+#
+# Enable by stacking this overlay on the base file — either add to `.env`:
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.phone.yml
+# or pass it on the CLI:
+#     docker compose -f docker-compose.yml -f docker-compose.phone.yml up -d
+# (scripts/compose.sh includes it automatically when this file is present;
+#  set OTODOCK_PHONE=0 to skip it.)
+
+services:
+  # The proxy reaches the phone daemon over the compose network.
+  otodock-proxy:
+    environment:
+      # The phone daemon's HTTP API (outbound-call origination + the per-route
+      # config push). Matches the otodock-phone service below.
+      PHONE_SERVER_URL: http://otodock-phone:9093
+      # The address an EXTERNAL Asterisk/FreePBX dials to reach the phone
+      # daemon's AudioSocket — baked into the generated dialplan. Inside a
+      # container the auto-detect would pick the (unreachable) container IP, so
+      # set this to the Docker HOST's LAN IP in the env file when you wire up
+      # telephony.
+      OTO_AUDIOSOCKET_PUBLIC_HOST: ${OTO_AUDIOSOCKET_PUBLIC_HOST:-}
+
+  otodock-phone:
+    # Fallback must track VERSIONS.md like docker-compose.yml does — a stale
+    # default here made bare `docker compose` builds tag phone images 1.2.0
+    # (and a bare pull would fetch the genuinely old published 1.2.0).
+    image: ghcr.io/otodock/otodock-phone:${OTODOCK_VERSION:-1.5.0}
+    # Pull the release image when missing; `--build` (or scripts/compose.sh
+    # up -d --build) still builds from source using the block below.
+    pull_policy: missing
+    build:
+      context: .
+      dockerfile: phone/Dockerfile
+      # PYTHON_IMAGE from VERSIONS.md when built via scripts/compose.sh; unset →
+      # the Dockerfile ARG default. (The phone image is pure-Python — no Node.)
+      args:
+        - PYTHON_IMAGE
+    restart: unless-stopped
+    # Same stdout-log cap as the base file's x-logging anchor (YAML anchors
+    # don't cross compose files, so it's inlined here).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Non-root runtime user (matches the proxy + file-tools uid contract).
+    user: "1000:1000"
+    environment:
+      TZ: ${TZ:-UTC}
+      # Reach the proxy's management WS over the compose network (service-DNS),
+      # NOT loopback. PROXY_API_KEY + PHONE_API_SECRET are auto-loaded from the
+      # shared config.env (mounted read-only below).
+      PROXY_URL: http://otodock-proxy:8400
+    ports:
+      # AudioSocket media + the register/outbound HTTP API. The PBX is off-stack,
+      # so these are reachable at the host's LAN IP (set OTO_AUDIOSOCKET_PUBLIC_HOST
+      # on the proxy to that IP).
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      # Shared secrets only (PROXY_API_KEY + PHONE_API_SECRET), read-only.
+      - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env:ro
+    networks: [otodock]
+    depends_on:
+      # Wait until the proxy is HEALTHY — by then it has generated + written
+      # PROXY_API_KEY/PHONE_API_SECRET to the env file (which this daemon reads
+      # on startup) and the /ws/phone-management endpoint is ready to push config.
+      otodock-proxy:
+        condition: service_healthy

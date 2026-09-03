@@ -70,7 +70,7 @@ class TestServerKickFirstTurn:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 assert [p for _s, p, _k in layer.messages] == [

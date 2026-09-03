@@ -202,6 +202,9 @@ def _build_session_parts(agent: str, row: dict):
         session_scope=vis.mount_scope,
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
+        # PINNED False: mini-app action clicks are not scheduled fires —
+        # the knowledge_rw opt-in never applies here, whoever owns the app.
+        knowledge_rw=False,
     )
     return mcp_config, secret_bundles, credential_env, sandbox_builder, ctx
 

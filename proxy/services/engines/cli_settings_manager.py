@@ -53,6 +53,17 @@ def seed_interactive_cli_config(
     # re-trigger every session. The auto-mode entry banner is the noisy one
     # (a full paragraph at every auto-mode session start) — mark it seen.
     data["hasSeenAutoModeEntryWarning"] = True
+    # Claude Code ≥2.1.x shows a resume-from-summary picker when resuming a
+    # session that is old + large ("This session is 2d 17h old and 490.8k
+    # tokens… ❯ 1. Resume from summary (recommended)"). Fatal for platform
+    # spawns: the cold-flushed first prompt types into the PICKER (lost), and
+    # the deferred cold Enter would CONFIRM option 1 — silently degrading the
+    # whole session to a summary. This is the key the picker's own
+    # "3. Don't ask me again" persists (verified empirically on 2.1.220;
+    # changelog-reviewed to 2.1.243 — no picker/key change);
+    # seeding it resumes the full session as-is, which is the platform's
+    # resume contract.
+    data["resumeReturnDismissed"] = True
     # Map the dashboard mode to a Claude theme; default dark. Claude's TUI text
     # color follows this, so it MUST match the xterm background or text is
     # unreadable (a light xterm bg with Claude's dark theme = invisible text).

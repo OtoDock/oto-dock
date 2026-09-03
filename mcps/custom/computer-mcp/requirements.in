@@ -1,0 +1,14 @@
+# computer-control MCP. The lockfile is a full cross-platform freeze — always
+# compile with --universal (the platform's dependency-regen runbook keys on
+# this phrase). PyAutoGUI needs a DIFFERENT backend per OS (pyobjc on macOS,
+# python3-xlib on Linux, pywin32 on Windows) and the satellite installs this
+# MCP from requirements.txt on whichever OS the controlled machine runs, so
+# the freeze carries every backend behind environment markers — the same
+# pattern as satellite/requirements.txt. A plain (Linux-flavored) compile
+# hard-pins the Linux backend, drops the others, and breaks macOS/Windows
+# installs.
+mcp>=1.28.1,<2.0
+mss>=9.0
+Pillow>=12.2
+pyautogui>=0.9.54
+pyperclip>=1.8

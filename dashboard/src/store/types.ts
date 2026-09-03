@@ -14,7 +14,18 @@ export interface PendingFile {
   size: number
   file: File
   uploading?: boolean
+  /** Waiting in the sequential upload queue. `uploading` stays true while
+   * queued so the send gate still holds — a Send while a file waits in the
+   * queue would silently drop it (handleSend keeps only uploadedPath). */
+  queued?: boolean
   uploadedPath?: string
   error?: string
   abortController?: AbortController
+  /** Live byte progress while the XHR runs (throttled writes). */
+  uploadSent?: number
+  uploadTotal?: number
+  /** Server transfer id from the upload response — joins the chip to the
+   * phase-2 remote-machine sync progress in transferStore. */
+  transferId?: string
+  remotePush?: boolean
 }

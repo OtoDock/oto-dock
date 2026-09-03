@@ -230,6 +230,18 @@ async def oauth_start(
     _require_dashboard_user(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
     _validate_services_against_manifest(body.mcp_name, body.services)
+    # A caller-supplied label rides the state to the callback where it
+    # becomes a token FILENAME — validate up front so a bad one is a clear
+    # 400 now instead of an opaque callback-page failure later.
+    if body.account_label:
+        try:
+            oauth_account_store.validate_account_label(body.account_label.strip())
+        except ValueError:
+            raise HTTPException(
+                400,
+                "Account label may only use letters, numbers, spaces and "
+                ". _ @ + - (no leading/trailing space, max 128 characters)",
+            )
 
     manifest = mcp_registry.get_manifest(body.mcp_name)
     oauth_block = manifest.credentials.oauth or {}
@@ -297,13 +309,22 @@ async def oauth_start(
     # of truth for which scopes back which services.
     scopes = mcp_registry.build_oauth_scopes(body.mcp_name, body.services)
 
-    # Incremental scope grant: if the user is reconnecting an account
-    # they already have, send `include_granted_scopes=true` so the
-    # consent screen only asks for the NEW scopes (not the ones already
-    # granted). Detected by an existing account row for
-    # (user_sub, mcp_name, account_label).
+    # Incremental scope grant. Two triggers:
+    #   1. Provider-level (google): ALWAYS send `include_granted_scopes=true`.
+    #      A first grant is unaffected, and any re-consent by the same vendor
+    #      account returns the UNION of old + new scopes — which is what lets
+    #      one grant power several MCPs sharing the provider_id (their
+    #      email-derived account labels collide on ONE token file, so a
+    #      second MCP's connect would otherwise overwrite it with a token
+    #      missing the first MCP's scopes). `persist_oauth_account` records
+    #      the matching scope union on overwrite.
+    #   2. Same-account reconnect on THIS mcp (any provider): the consent
+    #      screen only asks for the NEW scopes. Detected by an existing
+    #      account row for (user_sub, mcp_name, account_label).
     extra: dict[str, str] = {}
-    if body.account_label:
+    if getattr(provider_impl, "supports_incremental_auth", False):
+        extra["include_granted_scopes"] = "true"
+    elif body.account_label:
         existing_accounts = await asyncio.to_thread(
             credential_store.list_user_accounts, user.sub, body.mcp_name,
         )
@@ -903,15 +924,29 @@ async def pat_save(
 
     if not userinfo.email:
         # Some providers (GitHub) don't return email if user hides it.
-        # Fall back to account_id / name; require something stable.
-        userinfo.email = userinfo.account_id or userinfo.name
-        if not userinfo.email:
-            raise HTTPException(
-                500,
-                f"{provider}: could not derive account identity from PAT — "
-                f"userinfo returned no email/id/name",
-            )
+        # Fall back to account_id / name. Identity-less providers (postiz —
+        # a workspace API key with no user behind it) return none of the
+        # three: the key already survived fetch_userinfo, so accept it and
+        # identify the account by the user's label or the provider itself.
+        userinfo.email = (
+            userinfo.account_id
+            or userinfo.name
+            or body.account_label.strip()
+            or provider
+        )
     account_label = body.account_label.strip() or userinfo.email
+    # Validate HERE with a friendly 400 — the label becomes a token FILENAME
+    # and persist_oauth_account's deep validation would otherwise surface as
+    # an opaque 500 ("Failed to save token") for something as innocent as a
+    # trailing space or an emoji in a user-typed label.
+    try:
+        oauth_account_store.validate_account_label(account_label)
+    except ValueError:
+        raise HTTPException(
+            400,
+            "Account label may only use letters, numbers, spaces and "
+            ". _ @ + - (no leading/trailing space, max 128 characters)",
+        )
 
     # PATs have no client_id/client_secret; persist empty strings so the
     # refresh worker's zero-expiry guard skips them safely.

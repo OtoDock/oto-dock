@@ -53,6 +53,7 @@ class GenericOAuthProvider(OAuthProvider):
         userinfo_headers: dict[str, str] | None = None,
         userinfo_method: str = "GET",
         userinfo_body: dict | None = None,
+        userinfo_auth_scheme: str = "bearer",
         flow: str = "authorization_code",
         device_authorization_url: str = "",
     ):
@@ -73,6 +74,11 @@ class GenericOAuthProvider(OAuthProvider):
         # nested response (`data.viewer.email`).
         self.userinfo_method = (userinfo_method or "GET").upper()
         self.userinfo_body = dict(userinfo_body or {})
+        # "bearer" (default) sends `Authorization: Bearer <token>`; "raw"
+        # sends the token bare — Postiz's public API rejects the Bearer
+        # prefix (its /mcp endpoint, conversely, REQUIRES it; the runtime
+        # bearer injection is separate and unaffected by this knob).
+        self.userinfo_auth_scheme = (userinfo_auth_scheme or "bearer").lower()
         self.flow = flow
         self.device_authorization_url = device_authorization_url
 
@@ -157,7 +163,11 @@ class GenericOAuthProvider(OAuthProvider):
             )
         headers = {
             **self.userinfo_headers,
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": (
+                access_token
+                if self.userinfo_auth_scheme == "raw"
+                else f"Bearer {access_token}"
+            ),
         }
         async with httpx.AsyncClient(timeout=15) as client:
             if self.userinfo_method == "POST":
@@ -176,6 +186,11 @@ class GenericOAuthProvider(OAuthProvider):
         # and any downstream `if not email` fallback. Convert null to ""
         # so the not-empty checks fire correctly.
         def _field(key: str) -> str:
+            # Identity-less providers (postiz) declare empty field names,
+            # and some endpoints return a JSON array — both mean "no
+            # identity in the payload", not an error.
+            if not key or not isinstance(data, dict):
+                return ""
             v = data.get(key)
             if v is None and "." in key:
                 # Dotted path → walk nested objects (e.g. Notion's
@@ -194,7 +209,7 @@ class GenericOAuthProvider(OAuthProvider):
             email=_field(self.userinfo_email_field),
             name=_field(self.userinfo_name_field),
             account_id=_field(self.userinfo_id_field),
-            raw=data,
+            raw=data if isinstance(data, dict) else {"items": data},
         )
 
     async def revoke(self, *, token: str, client_id: str, client_secret: str) -> bool:

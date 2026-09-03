@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 
 from cartesia import AsyncCartesia
 
@@ -74,6 +75,8 @@ class CartesiaTTS(TTSProvider):
         self.voice_id: str = voice_id or ""
         self._advanced = advanced or {}
         self._model_id = self._advanced.get("model_id") or _MODEL_ID
+        self._t_first_send = 0.0   # first-audio isolation stamps (per context)
+        self._sent_chars = 0
 
     # ── Factory / metadata ─────────────────────────────────────────
 
@@ -94,8 +97,13 @@ class CartesiaTTS(TTSProvider):
 
     # ── Connection lifecycle ───────────────────────────────────────
 
-    async def connect(self) -> None:
-        """Open the long-lived WebSocket connection to Cartesia."""
+    async def connect(self, *, output_sample_rate: int | None = None) -> None:
+        """Open the long-lived WebSocket connection to Cartesia.
+
+        ``output_sample_rate`` is accepted for provider-interface parity and
+        ignored: the socket is rate-agnostic — each streaming context carries
+        its own ``output_format``, so there is no per-rate binding to prewarm.
+        """
         self._conn = await self._client.tts.websocket_connect().enter()
         self._cancelled = False
         logger.info("Cartesia TTS WebSocket connected")
@@ -112,7 +120,10 @@ class CartesiaTTS(TTSProvider):
 
     # ── One-shot synthesis (greetings / fillers) ───────────────────
 
-    async def synthesize(self, text: str, *, language: str | None = None) -> bytes:
+    async def synthesize(
+        self, text: str, *, language: str | None = None,
+        output_sample_rate: int | None = None,
+    ) -> bytes:
         """Synthesize complete text to PCM audio (one-shot). Drives a dedicated
         context to completion on the shared connection. ``language`` (base code)
         tells the engine which language to pronounce (None → voice default)."""
@@ -121,7 +132,7 @@ class CartesiaTTS(TTSProvider):
 
         ctx = self._conn.context(
             model_id=self._model_id, voice=self._voice(),
-            output_format=_output_format(SAMPLE_RATE),
+            output_format=_output_format(output_sample_rate or SAMPLE_RATE),
             language=language,
         )
         await ctx.push(text)
@@ -159,6 +170,9 @@ class CartesiaTTS(TTSProvider):
             language=language,
         )
         self._cancelled = False
+        # First-audio isolation stamps (one context at a time — provider-level)
+        self._t_first_send = 0.0
+        self._sent_chars = 0
         logger.debug("TTS streaming context started")
 
     async def send_text_chunk(self, text: str, is_last: bool = False) -> None:
@@ -174,6 +188,9 @@ class CartesiaTTS(TTSProvider):
         try:
             if text:
                 await self._ctx.push(text)
+                self._sent_chars += len(text)
+                if not self._t_first_send:
+                    self._t_first_send = time.monotonic()
             if is_last:
                 await self._ctx.no_more_inputs()
         except Exception as e:
@@ -185,11 +202,21 @@ class CartesiaTTS(TTSProvider):
         if not self._ctx:
             return
 
+        first = True
         try:
             async for r in self._ctx.receive():
                 if self._cancelled:
                     break
                 if r.type == "chunk" and r.audio:
+                    if first:
+                        first = False
+                        if self._t_first_send:
+                            logger.info(
+                                "Cartesia TTS first audio: +%.0fms after "
+                                "first text (%d chars sent)",
+                                (time.monotonic() - self._t_first_send) * 1000,
+                                self._sent_chars,
+                            )
                     yield r.audio
         except Exception as e:
             if not self._cancelled:

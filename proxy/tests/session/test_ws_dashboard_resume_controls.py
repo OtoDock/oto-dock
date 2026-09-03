@@ -413,7 +413,7 @@ class TestStreamingTurnControls:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 msgs = temp_db.get_chat_messages(chat_id)
@@ -487,7 +487,7 @@ class TestStreamingTurnControls:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 msgs = temp_db.get_chat_messages(chat_id)
@@ -749,7 +749,7 @@ class TestStreamingTurnControls:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
@@ -825,7 +825,7 @@ class TestPlanFilenameCarryOver:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
 
                 # second turn: its pump must inherit the plan filename
@@ -855,7 +855,7 @@ class TestPlanFilenameCarryOver:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
                 ws.client_send({"type": "close"})
             ws.no_more_frames()

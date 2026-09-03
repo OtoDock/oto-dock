@@ -772,7 +772,9 @@ class TestProviderBreakdown:
             provider="anthropic", model="claude-opus-4-1",
         )
         m_start = (datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)).isoformat()
-        m_end = (datetime.now(timezone.utc).replace(day=28, hour=23)).isoformat()
+        # Window must include "now" — a hard `day=28` end excluded today's
+        # rows on the 29th-31st of every month (suite failed on 2026-08-29).
+        m_end = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
         rows = [r for r in task_store.get_usage_provider_breakdown("user", m_start, m_end)
                 if r["user_sub"] == "user-viewer"]
         # ONE row, summed across both agents
@@ -799,7 +801,9 @@ class TestProviderBreakdown:
             provider="image-gen", model="nano-banana",
         )
         m_start = (datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)).isoformat()
-        m_end = (datetime.now(timezone.utc).replace(day=28, hour=23)).isoformat()
+        # Window must include "now" — a hard `day=28` end excluded today's
+        # rows on the 29th-31st of every month (suite failed on 2026-08-29).
+        m_end = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
         rows = task_store.get_usage_provider_breakdown("user", m_start, m_end)
         by_key = {(r["provider"], r["model"]): r["cost"] for r in rows if r["user_sub"] == "user-viewer"}
         assert by_key[("anthropic", "claude-opus-4-1")] == 12.0
@@ -812,7 +816,9 @@ class TestProviderBreakdown:
             provider="image-gen", model="gpt-image",
         )
         m_start = (datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)).isoformat()
-        m_end = (datetime.now(timezone.utc).replace(day=28, hour=23)).isoformat()
+        # Window must include "now" — a hard `day=28` end excluded today's
+        # rows on the 29th-31st of every month (suite failed on 2026-08-29).
+        m_end = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
         # Agent scope query returns it
         agent_rows = task_store.get_usage_provider_breakdown("agent", m_start, m_end)
         assert any(r["agent"] == "social-bot" and r["provider"] == "image-gen" for r in agent_rows)

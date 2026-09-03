@@ -93,6 +93,13 @@ _FILE_STAT_MIN_VERSION = (0, 5, 95)
 # caller degrades instantly (compact → "not supported", steer → queue).
 _CODEX_THREAD_OPS_MIN_VERSION = (0, 5, 98)
 
+# Sync-ignore rule tables (auth_result policy ``sync_ignore_rules``): the
+# satellite validates + applies the table to every sync walk from 0.5.110.
+# The proxy's per-machine manifest walk applies the SAME table only for
+# supporting machines (effective_ignore_rules below) — asymmetric walks
+# would misattribute whole excluded trees as deletes.
+_SYNC_IGNORE_RULES_MIN_VERSION = (0, 5, 110)
+
 # Minimum SATELLITE_VERSION that honours the config-driven sync file cap
 # delivered in the auth_result policy handshake (``sync_max_file_bytes``).
 # Older satellites hard-reject inbound files above the legacy 100MB in
@@ -555,7 +562,21 @@ class SatelliteConnectionManager(
         remote_store.update_machine_status(
             machine_id, "online", last_seen=_iso_now()
         )
-        remote_store.update_machine_capabilities(machine_id, capabilities)
+        # Bounded persist — same rule as the cli_status handler: an
+        # authenticated-but-compromised satellite must not park arbitrary
+        # payloads in the capabilities column (it is parsed and returned to
+        # admin/owner dashboards verbatim).
+        try:
+            caps_size = len(json.dumps(capabilities))
+        except (TypeError, ValueError):
+            caps_size = -1
+        if 0 <= caps_size <= 64 * 1024:
+            remote_store.update_machine_capabilities(machine_id, capabilities)
+        else:
+            logger.warning(
+                "Satellite %s sent an oversized/unserializable capabilities "
+                "payload (%s bytes) — not persisted", machine_id[:8], caps_size,
+            )
         logger.info(
             "Satellite %s connected (capabilities: %s)",
             machine_id[:8], list(capabilities.get("installed_clis", [])),
@@ -752,6 +773,17 @@ class SatelliteConnectionManager(
     def is_connected(self, machine_id: str) -> bool:
         return machine_id in self._connections
 
+    def debit_reported_session(self, machine_id: str) -> None:
+        """Optimistically decrement the cached heartbeat session count after
+        the proxy closes a session on this machine — the capacity pre-check
+        would otherwise read the STALE count until the next heartbeat and
+        (a) refuse a spawn whose room eviction just reclaimed, or (b) keep
+        evicting past the needed headroom. Approximate by design: the next
+        heartbeat overwrites with the satellite's true count."""
+        conn = self._connections.get(machine_id)
+        if conn is not None and conn.reported_sessions > 0:
+            conn.reported_sessions -= 1
+
     def machine_at_capacity(self, machine_id: str) -> bool:
         """Soft pre-check: True when the satellite reports it's at/over its
         effective session ceiling — the admin override (remote_machines.max_sessions)
@@ -892,6 +924,23 @@ class SatelliteConnectionManager(
         if self.satellite_supports_config_sync_cap(machine_id):
             return MAX_FILE_SIZE
         return min(MAX_FILE_SIZE, LEGACY_SYNC_MAX_FILE_BYTES)
+
+    def satellite_supports_sync_ignore_rules(self, machine_id: str) -> bool:
+        """True if the connected satellite validates + applies the
+        ``sync_ignore_rules`` policy table (SATELLITE_VERSION 0.5.110)."""
+        return self._satellite_at_least(machine_id, _SYNC_IGNORE_RULES_MIN_VERSION)
+
+    def effective_ignore_rules(self, machine_id: str) -> dict | None:
+        """The VALIDATED sync-ignore rule table to use for THIS machine's
+        manifest walk, or None (legacy walk). Rules apply only when the
+        satellite ACKed support — an old satellite walks legacy-style, so
+        the proxy must too or the two manifests disagree and the diff
+        misattributes whole build trees as deletes."""
+        if not self.satellite_supports_sync_ignore_rules(machine_id):
+            return None
+        import config as app_config
+        from core.remote.file_sync import validate_ignore_rules
+        return validate_ignore_rules(app_config.SYNC_IGNORE_RULES)
 
     def _satellite_at_least(self, machine_id: str, version: tuple) -> bool:
         conn = self._connections.get(machine_id)
@@ -1098,6 +1147,51 @@ class SatelliteConnectionManager(
             # auth (tray Resume / reboot) clears the flag.
             from storage import remote_store
             await asyncio.to_thread(remote_store.set_paused, machine_id, True)
+
+        elif msg_type == "cli_status":
+            # Per-CLI {version, path} from the satellite's pin reconcile
+            # (0.5.107+), sent after every reconcile pass. Data only — pin
+            # mismatch is judged against config.PINNED_* by consumers, never
+            # asserted by the satellite. Merged into capabilities for the
+            # machines API; auth REPLACES capabilities wholesale on reconnect
+            # and the reconcile re-reports seconds later, so this
+            # self-refreshes every connect. Input is whitelisted + bounded:
+            # an authenticated-but-compromised satellite must not park
+            # arbitrary payloads in the capabilities column.
+            conn = self._connections.get(machine_id)
+            if conn:
+                clis_raw = msg.get("clis")
+                clis: dict = {}
+                if isinstance(clis_raw, dict):
+                    for name in ("claude", "codex"):
+                        entry = clis_raw.get(name)
+                        if not isinstance(entry, dict):
+                            continue
+                        ver = entry.get("version")
+                        path = entry.get("path")
+                        clis[name] = {
+                            "version": ver[:300] if isinstance(ver, str) else None,
+                            "path": path[:300] if isinstance(path, str) else None,
+                        }
+                conn.capabilities["cli_status"] = clis
+                # Persist a SNAPSHOT: json.dumps on the worker thread must
+                # never iterate a dict the event loop can still mutate.
+                snapshot = dict(conn.capabilities)
+                from storage import remote_store
+                await asyncio.to_thread(
+                    remote_store.update_machine_capabilities, machine_id, snapshot,
+                )
+                # A reconnect may have replaced the connection while the
+                # persist ran — register() wrote the fresh capabilities but
+                # our thread's write may have landed after it. Re-persist the
+                # current connection's snapshot so a stale write never
+                # stands (its own cli_status re-report follows anyway).
+                fresh = self._connections.get(machine_id)
+                if fresh is not conn and fresh is not None:
+                    await asyncio.to_thread(
+                        remote_store.update_machine_capabilities,
+                        machine_id, dict(fresh.capabilities),
+                    )
 
         elif msg_type == "heartbeat":
             conn = self._connections.get(machine_id)

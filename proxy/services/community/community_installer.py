@@ -764,7 +764,12 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
     return "\n".join(notes)
 
 
-async def approve_request(request_id: int, admin_sub: str, admin_note: str = "") -> dict:
+async def approve_request(
+    request_id: int,
+    admin_sub: str,
+    admin_note: str = "",
+    instance_id: int | None = None,
+) -> dict:
     """Approve an assignment request: install if needed + enable for agent.
 
     Returns the updated request row. Status transitions:
@@ -776,6 +781,15 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
     The MCP is enabled for the requesting agent (``mcp_store.add_agent_mcp``)
     only after the install completes successfully. Notifies the requester
     once the request resolves.
+
+    ``instance_id`` (explicit-mode MCPs only) pins the instance the agent is
+    attached to; ``None`` keeps the automatic pick (catch-all / already
+    attached / lowest-id). Validated BEFORE any status transition — a 400
+    mid-cascade would strand the row in ``installing``, a state the
+    transition table only exits via installed/install_failed. Consequently
+    ``instance_id`` requires the MCP to already be installed and
+    explicit-mode; for a not-yet-installed MCP the admin approves without it
+    and the needs-instance retry offers the selector.
     """
     from storage import mcp_request_store, mcp_store
 
@@ -787,6 +801,25 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
             409,
             f"Cannot approve request in status {req['status']!r}",
         )
+
+    if instance_id is not None:
+        manifest = mcp_registry.get_manifest(req["mcp_name"])
+        if manifest is None or getattr(manifest, "assignment_mode", "auto") != "explicit":
+            raise HTTPException(
+                400,
+                "instance_id only applies to installed explicit-mode MCPs "
+                f"('{req['mcp_name']}' is "
+                f"{'not installed' if manifest is None else 'auto-mode'})",
+            )
+        _instances = await asyncio.to_thread(
+            mcp_store.get_mcp_instances, req["mcp_name"],
+        )
+        if not any(int(i["id"]) == instance_id for i in _instances):
+            raise HTTPException(
+                400,
+                f"Instance {instance_id} does not belong to MCP "
+                f"'{req['mcp_name']}'",
+            )
 
     # pending → approved → installing in one shot (avoid two notifications).
     if req["status"] == "pending":
@@ -871,6 +904,7 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
     # authorizes them. Make sure that's true before declaring success.
     instance_status, instance_detail = await asyncio.to_thread(
         _ensure_agent_authorized_for_instance_mcp, mcp_name, agent_slug,
+        instance_id,
     )
     if instance_status == "no_instances":
         # Roll the agent_mcps assignment back so the manager UI doesn't
@@ -912,7 +946,7 @@ async def approve_request(request_id: int, admin_sub: str, admin_note: str = "")
 
 
 def _ensure_agent_authorized_for_instance_mcp(
-    mcp_name: str, agent_slug: str,
+    mcp_name: str, agent_slug: str, instance_id: int | None = None,
 ) -> tuple[str, str]:
     """Make sure an explicit-mode MCP authorizes ``agent_slug`` via at least one
     instance. No-op for non-explicit (auto-mode) MCPs.
@@ -920,6 +954,12 @@ def _ensure_agent_authorized_for_instance_mcp(
     Returns (status, human_log) where status is one of:
 
     - ``"not_applicable"`` — MCP is auto-mode; nothing to do.
+    - ``"added_to_selected"`` — admin chose an instance on approval; the
+      agent was attached to exactly that one. An explicit choice wins over
+      the catch-all/already-attached shortcuts — the admin said where the
+      agent goes. (The id was validated against this MCP's instances before
+      any status transition, so a vanished instance here means it was
+      deleted mid-approve — that falls through to the automatic path.)
     - ``"assigned_to_all"`` — a catch-all instance already authorizes everyone.
     - ``"already_authorized"`` — agent was already in some instance's list.
     - ``"added_to_first"`` — agent was attached to the lowest-id instance
@@ -944,6 +984,19 @@ def _ensure_agent_authorized_for_instance_mcp(
     instances = mcp_store.get_mcp_instances(mcp_name)
     if not instances:
         return ("no_instances", "")
+
+    if instance_id is not None:
+        chosen = next(
+            (i for i in instances if int(i["id"]) == instance_id), None,
+        )
+        if chosen is not None:
+            mcp_store.add_agent_to_instance(chosen["id"], agent_slug)
+            return (
+                "added_to_selected",
+                f"Attached agent to instance '{chosen['instance_name']}' "
+                f"(admin-selected on approval).",
+            )
+        # Deleted between validation and here — automatic path below.
 
     if any(i["assigned_to_all"] for i in instances):
         return ("assigned_to_all", f"Authorized via catch-all instance.")
@@ -1197,10 +1250,31 @@ async def _notify_request_rejected(request: dict) -> None:
 async def _notify_request_failed(request: dict) -> None:
     from services.notifications import notification_manager
     log_excerpt = (request.get("install_log") or "")[:300]
-    body = (
-        f"Install failed for **{request['mcp_name']}** on agent "
-        f"**{request['agent_slug']}**. The admin can retry from MCP Requests."
+    # The no-instances outcome is not a failure — the install (if any) went
+    # fine and only admin instance work remains — so don't say "failed".
+    # Same condition _ensure_agent_authorized_for_instance_mcp reported;
+    # detected via the manifest rather than the log text so a reworded
+    # guidance string can't silently break the branch.
+    manifest = mcp_registry.get_manifest(request["mcp_name"])
+    needs_instance = (
+        manifest is not None
+        and getattr(manifest, "assignment_mode", "auto") == "explicit"
     )
+    if needs_instance:
+        title = "MCP needs an instance"
+        body = (
+            f"**{request['mcp_name']}** is installed but needs an instance "
+            f"before it can be enabled for **{request['agent_slug']}**. "
+            f"Pick or create one from MCP Requests / MCP Servers — the "
+            f"request completes automatically once an instance covers the "
+            f"agent."
+        )
+    else:
+        title = "MCP install failed"
+        body = (
+            f"Install failed for **{request['mcp_name']}** on agent "
+            f"**{request['agent_slug']}**. The admin can retry from MCP Requests."
+        )
     if log_excerpt:
         body += f"\n\n```\n{log_excerpt}\n```"
     # Notify both the requester and admins so neither side has to chase the
@@ -1210,7 +1284,7 @@ async def _notify_request_failed(request: dict) -> None:
     targets.update(admin_subs)
     for sub in targets:
         await notification_manager.fire_notification(
-            title="MCP install failed",
+            title=title,
             body=body,
             # Platform severity vocabulary is info/success/warning/danger —
             # "error" renders unstyled and plays no sound.

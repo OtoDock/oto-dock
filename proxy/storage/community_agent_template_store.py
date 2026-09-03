@@ -79,6 +79,29 @@ class NotificationItem:
 
 
 @dataclass
+class DashboardItem:
+    """One template-shipped mini-app dashboard (``dashboards.json`` item +
+    its HTML file under ``dashboards/``). HTML-only v1: no actions manifest
+    — a seeded dashboard is display-only (zero approval surface); the agent
+    can re-pin it with actions later. ``html`` carries the file content at
+    load time; it is NOT persisted to the DB — the installer materializes a
+    copy under ``config/community/dashboards/`` for late-joiner seeding."""
+    slug: str
+    title: str
+    file: str                     # dashboards/<name>.html (template-relative)
+    visibility: str               # "agent" (one shared pin) | "user" (per-user)
+    auto_pin_for_new_users: bool  # user-visibility: pin for later joiners too
+    html: str = ""
+
+
+# Mirrors api/apps/manifest.APP_SLUG_RE (storage must not import the API
+# layer): 1-40 chars of [a-z0-9-], starting alphanumeric.
+_DASHBOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+_MAX_DASHBOARDS = 4
+_MAX_DASHBOARD_BYTES = 1024 * 1024  # local-template snapshots cap files at 1MB
+
+
+@dataclass
 class McpRequirement:
     name: str
     min_version: str | None = None
@@ -128,6 +151,8 @@ class CommunityAgentTemplate:
     # Standalone skill packages (skills.json) — installed from the skills
     # catalog and assigned to the agent at install time.
     skill_packages: list[SkillPackageRequirement] = field(default_factory=list)
+    # Template-shipped mini-app dashboards (dashboards.json + dashboards/).
+    dashboards: list[DashboardItem] = field(default_factory=list)
     default_scope: str = "user"
     # Visibility-modes: with ``default_scope`` selects the agent's mode
     # (Personal+shared / Shared+personal / Personal only / Shared only).
@@ -230,6 +255,16 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
             f"default_scope must be 'user' or 'agent', got {raw_default_scope!r}"
         )
 
+    dashboards_path = template_dir / "dashboards.json"
+    dashboards = (
+        _parse_dashboards_json(
+            _load_optional_json(dashboards_path), template_dir,
+            collaborative=bool(agent_json.get("collaborative", True)),
+            default_scope=raw_default_scope,
+        )
+        if dashboards_path.is_file() else []
+    )
+
     raw_core_mcps = agent_json.get("core_mcps", "all") or "all"
     if raw_core_mcps not in ("all", "none"):
         raise TemplateValidationError(
@@ -255,6 +290,7 @@ def load_template_from_dir(template_dir: Path) -> CommunityAgentTemplate:
         setup_md=setup_md,
         user_setup_md=user_setup_md,
         skill_packages=skill_packages,
+        dashboards=dashboards,
         context_files=context_files,
         source_dir=template_dir.resolve(),
         default_scope=raw_default_scope,
@@ -291,6 +327,10 @@ def template_to_persistable_dict(template: CommunityAgentTemplate) -> dict[str, 
         "tasks": [_task_to_dict(t) for t in template.tasks],
         "triggers": [_trigger_to_dict(t) for t in template.triggers],
         "notifications": [_notification_to_dict(n) for n in template.notifications],
+        # Dashboard METADATA only — the HTML lives on disk under the agent's
+        # ``config/community/dashboards/`` (written at install), so a
+        # late-joiner seed re-reads the file instead of bloating the JSONB.
+        "dashboards": [_dashboard_to_dict(d) for d in template.dashboards],
         "default_for_new_users": dict(template.default_for_new_users),
     }
 
@@ -320,12 +360,108 @@ def load_template_from_dict(data: dict[str, Any]) -> CommunityAgentTemplate:
         tasks=[_task_from_dict(t) for t in data.get("tasks", [])],
         triggers=[_trigger_from_dict(t) for t in data.get("triggers", [])],
         notifications=[_notification_from_dict(n) for n in data.get("notifications", [])],
+        dashboards=[_dashboard_from_dict(d) for d in data.get("dashboards", [])],
         setup_md=None,
         context_files={},
         source_dir=Path("/dev/null"),
         default_scope="user",
         default_for_new_users=dict(data.get("default_for_new_users") or {}),
     )
+
+
+def _dashboard_to_dict(d: DashboardItem) -> dict[str, Any]:
+    return {
+        "slug": d.slug, "title": d.title, "file": d.file,
+        "visibility": d.visibility,
+        "auto_pin_for_new_users": d.auto_pin_for_new_users,
+    }
+
+
+def _dashboard_from_dict(d: dict[str, Any]) -> DashboardItem:
+    return DashboardItem(
+        slug=str(d.get("slug", "")),
+        title=str(d.get("title", "")),
+        file=str(d.get("file", "")),
+        visibility=str(d.get("visibility", "agent")),
+        auto_pin_for_new_users=bool(d.get("auto_pin_for_new_users", True)),
+        html="",  # content re-read from config/community/dashboards/ on seed
+    )
+
+
+def _parse_dashboards_json(
+    data: Any, template_dir: Path, *, collaborative: bool, default_scope: str,
+) -> list[DashboardItem]:
+    """Validate ``dashboards.json`` and load each item's HTML file.
+
+    Shape: ``{"dashboards": [{slug, title?, file, visibility?,
+    auto_pin_for_new_users?}]}``. Files live under ``dashboards/`` inside the
+    template. ``visibility`` must be one the template's MODE offers — an
+    "agent" dashboard on a Personal-only template (or "user" on Shared-only)
+    is a manifest error, not an install-time surprise.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("dashboards"), list):
+        raise TemplateValidationError(
+            'dashboards.json must be {"dashboards": [...]}'
+        )
+    items = data["dashboards"]
+    if len(items) > _MAX_DASHBOARDS:
+        raise TemplateValidationError(
+            f"at most {_MAX_DASHBOARDS} dashboards per template"
+        )
+    if collaborative:
+        available = {"user", "agent"}
+    else:
+        available = {"agent"} if default_scope == "agent" else {"user"}
+    out: list[DashboardItem] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            raise TemplateValidationError(f"dashboards[{i}] must be an object")
+        slug = str(raw.get("slug", "")).strip().lower()
+        if not _DASHBOARD_SLUG_RE.match(slug):
+            raise TemplateValidationError(
+                f"dashboards[{i}].slug must be 1-40 chars of [a-z0-9-], "
+                "starting alphanumeric"
+            )
+        if slug in seen:
+            raise TemplateValidationError(f"duplicate dashboard slug {slug!r}")
+        seen.add(slug)
+        vis = str(raw.get("visibility", "agent") or "agent")
+        if vis not in ("user", "agent"):
+            raise TemplateValidationError(
+                f"dashboards[{i}].visibility must be 'user' or 'agent'"
+            )
+        if vis not in available:
+            raise TemplateValidationError(
+                f"dashboards[{i}]: visibility {vis!r} is not offered by this "
+                f"template's mode (offers: {', '.join(sorted(available))})"
+            )
+        file_name = str(raw.get("file", "")).strip()
+        file_path = (template_dir / "dashboards" / file_name)
+        if (not file_name or "/" in file_name or "\\" in file_name
+                or not file_name.endswith(".html")):
+            raise TemplateValidationError(
+                f"dashboards[{i}].file must be a bare *.html name under "
+                "dashboards/"
+            )
+        if not file_path.is_file():
+            raise TemplateValidationError(
+                f"dashboards[{i}]: missing file dashboards/{file_name}"
+            )
+        html = file_path.read_text(encoding="utf-8")
+        if len(html.encode("utf-8", errors="ignore")) > _MAX_DASHBOARD_BYTES:
+            raise TemplateValidationError(
+                f"dashboards/{file_name} exceeds the 1MB dashboard cap"
+            )
+        out.append(DashboardItem(
+            slug=slug,
+            title=str(raw.get("title", "")).strip() or slug,
+            file=file_name,
+            visibility=vis,
+            auto_pin_for_new_users=bool(raw.get("auto_pin_for_new_users", True)),
+            html=html,
+        ))
+    return out
 
 
 def _task_to_dict(t: TaskItem) -> dict[str, Any]:

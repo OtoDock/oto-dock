@@ -5,6 +5,7 @@ import { emitIframeSwipe } from '../../lib/iframeGestures'
 import { hasUserActivation, openExternalUrl, validateBridgedUrl } from '../../lib/openExternal'
 import { fireAppAction, type PinnedApp } from '../../api/apps'
 import { useActiveChats } from '../../hooks/useActiveChats'
+import { onIdle as speechIdle } from '../../audio/speechActivity'
 
 /**
  * Sandboxed pinned mini-app frame — agent-authored HTML served cookie-authed
@@ -40,6 +41,10 @@ interface Props {
       `content_height` messages) instead of filling the parent — the Dock's
       single-scroll layout: the PAGE scrolls, the frame never does. */
   autoHeight?: boolean
+  /** The app document's own scroll offset (the shim's `scroll_pos`
+      messages, rAF-throttled) — lets the host slide overlay chrome (the
+      solo-app ✕) away with the content. Reset to 0 on every frame load. */
+  onScrollY?: (y: number) => void
 }
 
 // autoHeight clamp: a hostile/broken page can post any number — keep the
@@ -65,7 +70,7 @@ function readOpenConsent(key: string): OpenConsent {
   } catch { return 'unset' }
 }
 
-export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoHeight = false }: Props) {
+export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoHeight = false, onScrollY }: Props) {
   const { resolvedTheme } = useTheme()
   const initialThemeRef = useRef(resolvedTheme)
   // Nonce bumps on file_updated → full reload (the served content is
@@ -77,6 +82,8 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const lastActionAtRef = useRef<Map<string, number>>(new Map())
   const onSendPromptRef = useRef(onSendPrompt)
   onSendPromptRef.current = onSendPrompt
+  const onScrollYRef = useRef(onScrollY)
+  onScrollYRef.current = onScrollY
   const appRef = useRef(app)
   appRef.current = app
 
@@ -87,10 +94,17 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // the page subscribes while parsing, BEFORE the load event, so an onLoad
   // clear wipes a fresh subscription and every later push is skipped
   // (found live on T1 — the initial snapshot arrived, updates never did).
+  // Agents write app files exactly at turn end, and a reload is a full
+  // iframe document parse on the main thread — defer past live TTS
+  // (speechIdle runs synchronously when nothing is speaking). The clear +
+  // nonce bump stay ONE unit inside the deferred callback (see above —
+  // splitting them strands the live document unsubscribed).
   useEffect(() => onFileUpdate((u) => {
     if (u.agent_slug === agent && u.rel_path === app.rel_path) {
-      feedSubsRef.current.clear()
-      setNonce((n) => n + 1)
+      speechIdle(() => {
+        feedSubsRef.current.clear()
+        setNonce((n) => n + 1)
+      })
     }
   }), [agent, app.rel_path])
 
@@ -126,9 +140,18 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     }
     return { error: 'unknown feed' }
   }
-  // Push on change to every live subscription.
+  // Push on change to every live subscription. active_chats churns exactly
+  // at turn end (finish + linger-drop) — while speech is live, defer the
+  // push and let the trailing flush read the freshest rows from the ref
+  // (same-origin iframe = same main thread; the postMessage itself is
+  // cheap, the in-frame re-render is not).
   useEffect(() => {
-    if (feedSubsRef.current.has('active_chats')) postFeed('active_chats', activeChats)
+    if (!feedSubsRef.current.has('active_chats')) return
+    speechIdle(() => {
+      if (feedSubsRef.current.has('active_chats')) {
+        postFeed('active_chats', activeChatsRef.current)
+      }
+    })
   }, [activeChats])
   useEffect(() => {
     if (projectLanes && feedSubsRef.current.has('project_lanes')) {
@@ -182,6 +205,11 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (Number.isFinite(h)) {
           setContentHeight(Math.min(AUTO_HEIGHT_MAX, Math.max(AUTO_HEIGHT_MIN, Math.ceil(h))))
         }
+        return
+      }
+      if (d.type === 'scroll_pos') {
+        const y = Number(d.y)
+        if (Number.isFinite(y)) onScrollYRef.current?.(Math.max(0, y))
         return
       }
       if (d.type === 'swipe') {
@@ -368,6 +396,9 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
           { source: 'otodock-host', type: 'theme', theme: themeRef.current },
           '*',
         )
+        // A (re)loaded document starts at scroll 0 but fires no scroll
+        // event — reset host chrome that tracks the offset.
+        onScrollYRef.current?.(0)
       }}
       className={`block w-full border-0 bg-transparent ${autoHeight ? '' : 'h-full'}`}
       // autoHeight: adopt the app's reported content height so the frame

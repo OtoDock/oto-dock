@@ -4,7 +4,13 @@ target-version = "py310" # satellite's floor; proxy/phone/audio run 3.13
 
 # .gitignore already hides venvs, node_modules, and runtime trees from ruff;
 # these cover checkouts where ignored trees exist without the ignore rules.
-extend-exclude = ["mcps/.uv-python", "mcps/community"]
+extend-exclude = [
+    "mcps/.uv-python",
+    "mcps/community",
+    # Vendored skill content (Anthropic skill-creator scripts) — shipped for
+    # agents to run, not platform code; upstream style stays untouched.
+    "mcps/custom/mcps-mcp/skills",
+]
 
 [lint]
 select = [

@@ -23,6 +23,7 @@ async def _async_ident(p, writing=False, **kw):
 @pytest.fixture(autouse=True)
 def _bypass_platform(monkeypatch):
     monkeypatch.setattr(ppt_mod, "_resolve_path", _async_ident)
+    monkeypatch.setattr("shared._resolve_path", _async_ident)
     monkeypatch.setattr(ppt_mod, "_to_agents_relative", lambda p: p)
 
     async def _noop_preview(path):

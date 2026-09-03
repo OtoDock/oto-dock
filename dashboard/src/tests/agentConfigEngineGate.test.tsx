@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
 // ─── AgentConfig — platform-configured gate on the engine cards ─────────────
@@ -38,8 +39,15 @@ vi.mock('@/api/agents', () => ({
   useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
   useExecutionLayers: () => ({ data: h.layers }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
+  useKnowledgeAttachments: () => ({ data: undefined }),
+  useKnowledgeLibraries: () => ({ data: undefined }),
+  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useAgentFiles: () => ({ data: undefined }),
 }))
 vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
     data: {
@@ -58,12 +66,17 @@ vi.mock('@/contexts/AuthContext', () => ({
 import AgentConfig from '@/pages/agent/AgentConfig'
 
 function renderConfig() {
+  // AgentConfig calls useQueryClient (department-save invalidation), so the
+  // harness needs a real provider around it.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <MemoryRouter initialEntries={['/agents/demo/config']}>
-      <Routes>
-        <Route path="/agents/:name/config" element={<AgentConfig />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={['/agents/demo/config']}>
+        <Routes>
+          <Route path="/agents/:name/config" element={<AgentConfig />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   )
 }
 

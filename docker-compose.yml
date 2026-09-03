@@ -93,7 +93,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.4.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.5.0}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
@@ -231,7 +231,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.4.0}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.5.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -255,9 +255,17 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.4.0}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.5.0}
     restart: unless-stopped
     logging: *default-logging
+    # Bound so a runaway document parse OOM-restarts this container instead of
+    # dragging the whole host into swap thrash (memswap == mem: no swap
+    # growth). Sized above the generic sidecar default because this container
+    # also runs LibreOffice conversions and image editing; in-container parse
+    # workers self-limit below this cap and return a clean per-call error
+    # first. 0 disables. Raise via config.env for very heavy documents.
+    mem_limit: ${OTODOCK_FILETOOLS_MEM_LIMIT:-4g}
+    memswap_limit: ${OTODOCK_FILETOOLS_MEM_LIMIT:-4g}
     environment:
       PROXY_URL: http://otodock-proxy:8400
       WOPI_BASE_URL: http://otodock-proxy:8400

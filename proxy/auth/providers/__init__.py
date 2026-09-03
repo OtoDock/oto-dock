@@ -279,6 +279,34 @@ def apply_session_cookie(response, token: str) -> None:
     )
 
 
+def session_iat_after_password_change(user: dict, payload: dict) -> bool:
+    """True if this session cookie was issued AT OR AFTER the user's last
+    password change — i.e. it is still valid against the credential timeline.
+
+    A cookie minted before ``password_changed_at`` must be rejected: password
+    change / admin reset / self-service reset all stamp that column, and
+    without this check a cookie stolen before the change stays valid forever
+    (the sliding-refresh middleware would even keep re-minting it). Fails
+    OPEN only when the column is absent/unparseable (legacy rows / OIDC
+    accounts that never set a password) — there is no pre-change baseline to
+    invalidate against, so existing sessions are unaffected.
+    """
+    changed_at = user.get("password_changed_at")
+    if not changed_at:
+        return True
+    iat = payload.get("iat")
+    if not isinstance(iat, int):
+        return False  # a session cookie must carry iat; treat missing as stale
+    try:
+        from datetime import datetime
+        changed_ts = datetime.fromisoformat(changed_at).timestamp()
+    except (ValueError, TypeError):
+        return True
+    # 5 s grace: the fresh cookie issued IN the change response can carry an
+    # iat a hair before the DB write timestamp under clock jitter.
+    return iat >= changed_ts - 5
+
+
 def validate_session_jwt(token: str) -> dict | None:
     """Decode and validate a dashboard session-cookie JWT. Returns payload or None.
 
@@ -385,6 +413,10 @@ async def get_current_user(request: Request) -> UserContext | None:
         if payload:
             sub = payload["sub"]
             user = task_store.get_user(sub)
+            if user and not session_iat_after_password_change(user, payload):
+                # Cookie predates the last password change → dead. (logout-all,
+                # admin reset, and self-service reset all invalidate here.)
+                return None
             if user:
                 agent_roles = task_store.get_user_agent_roles(sub)
                 default_agent = task_store.get_user_default_agent(sub) or ""
@@ -417,10 +449,70 @@ def require_auth(user: UserContext | None) -> UserContext:
 
 
 def require_admin(user: UserContext | None) -> UserContext:
-    """Raise 401/403 if not authenticated or not admin."""
+    """Raise 401/403 unless a REAL admin user (dashboard session, not a key).
+
+    API-key/session-token principals are rejected like ``require_creator``
+    does: the per-session JWT every agent subprocess holds resolves to the
+    session OWNER's real role, so without this gate agent code running in an
+    admin-owned session could drive the entire /v1/admin/* surface (user
+    creation, password resets) with raw HTTP from inside the sandbox. The
+    master key never legitimately reaches admin routes either — the S2S
+    confinement middleware limits it to its endpoint allowlist.
+    """
     u = require_auth(user)
+    if getattr(u, "is_api_key", False):
+        raise HTTPException(
+            status_code=403, detail="User authentication required (not API key)"
+        )
     if not u.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
+    return u
+
+
+def require_creator(user: UserContext | None) -> UserContext:
+    """Raise 401/403 unless a REAL user (not API key) with creator+ role.
+
+    The canonical admin-or-creator gate (promoted from the six inline copies
+    scattered across api/ — new call sites use this one). API-key principals
+    are rejected: creator-tier surfaces are human dashboard actions, and an
+    S2S key must never inherit them.
+    """
+    u = require_auth(user)
+    if getattr(u, "is_api_key", False):
+        raise HTTPException(
+            status_code=403, detail="User authentication required (not API key)"
+        )
+    if u.role not in ("admin", "creator"):
+        raise HTTPException(status_code=403, detail="Creator role required")
+    return u
+
+
+def require_creator_interactive(user: UserContext | None) -> UserContext:
+    """``require_creator`` widened to REAL-USER-backed session principals.
+
+    Accepts: dashboard cookies AND session JWTs whose ``user_sub`` resolved
+    to a real users row (``acting_sub`` set) — with platform role
+    admin/creator either way. Still rejects the master key and no-user
+    agent sessions.
+
+    This is the deliberate, operator-decided carve-out (2026-08-15,
+    shared-libraries design § D-MCP) for platform-role
+    actions driven from chat via self-config MCP tools. The residual
+    prompt-injection risk is mitigated by the MCP layer: every tool that
+    reaches a ``require_creator_interactive`` endpoint sits in the
+    CRITICAL permission tier — always prompts (every mode incl. dontAsk),
+    denied outright in no-human contexts — so the human approves each
+    call in chat before it runs. Use ``require_creator`` for surfaces
+    that must stay dashboard-only.
+    """
+    u = require_auth(user)
+    if u.acting_sub is None:
+        raise HTTPException(
+            status_code=403,
+            detail="User authentication required (not a service credential)",
+        )
+    if u.role not in ("admin", "creator"):
+        raise HTTPException(status_code=403, detail="Creator role required")
     return u
 
 

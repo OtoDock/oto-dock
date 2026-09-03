@@ -10,7 +10,7 @@ import logging
 import time
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Body, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -83,6 +83,13 @@ class ChangePasswordRequest(BaseModel):
 class ChangeEmailRequest(BaseModel):
     new_email: str
     password: str
+
+
+class TotpSetupRequest(BaseModel):
+    # Only consulted when 2FA is ALREADY enabled (reconfiguration) — the
+    # initial enable flow sends no body. Guards against a hijacked session
+    # silently rotating a victim's live 2FA secret + recovery codes.
+    password: str = ""
 
 
 class TotpSetupVerifyRequest(BaseModel):
@@ -279,11 +286,6 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
     if tcfg.enabled and not await turnstile.verify_token(tcfg, req.turnstile_token or "", client_ip):
         raise HTTPException(status_code=403, detail="Bot verification failed")
 
-    # LAN restriction check (need to look up user first for local_only flag)
-    user_row = await asyncio.to_thread(task_store.get_user_by_email, req.email.strip().lower())
-    if user_row and not check_local_auth_allowed(request, user_row):
-        raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
-
     # Authenticate
     result = await _local_provider.authenticate({"email": req.email, "password": req.password})
 
@@ -292,6 +294,15 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
         if result.error_code == "account_locked":
             raise HTTPException(status_code=429, detail=result.error)
         raise HTTPException(status_code=401, detail=result.error)
+
+    # LAN restriction — checked ONLY after the credentials verify, so the
+    # distinctive "local network" 403 can no longer be used pre-auth as an
+    # oracle for which emails are local_only accounts. The restriction itself
+    # is unchanged: a valid-credential remote login to a local_only account is
+    # still refused (before any session token / 2FA step is handed out).
+    user_row = await asyncio.to_thread(task_store.get_user, result.sub)
+    if user_row and not check_local_auth_allowed(request, user_row):
+        raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
 
     # Second-factor assembly. TOTP is provider-flagged; passkeys join the 2FA
     # step whenever enrolled (nice-to-have in passwordless mode, MANDATORY gate
@@ -347,6 +358,12 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     user = await asyncio.to_thread(task_store.get_user, sub)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
+    # Re-check the LAN restriction at step 2: step 1 verified it, but the step
+    # token is portable for its 5-minute TTL — a local_only login must not be
+    # completable from off-LAN with a token minted on-LAN.
+    if not check_local_auth_allowed(request, user):
+        raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
 
     # Decrypt TOTP secret
     totp_enc = user.get("totp_secret_enc")
@@ -604,6 +621,11 @@ async def change_my_password(
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
 
+    _confirm_ok, _retry = rate_limit_hit("confirm", u.sub)
+    if not _confirm_ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {_retry} seconds.",
+                            headers={"Retry-After": str(_retry)})
+
     db_user = await asyncio.to_thread(task_store.get_user, u.sub)
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "No password set for this account")
@@ -618,7 +640,14 @@ async def change_my_password(
     pw_hash = hash_password(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, u.sub, pw_hash)
     logger.info(f"User {mask_email(u.email)} changed their password")
-    return {"status": "ok"}
+    # The caller's CURRENT cookie now predates password_changed_at and would be
+    # rejected on their next request (that rejection is the whole point — it
+    # evicts any OTHER live session on the old credential). Re-issue a fresh
+    # cookie on THIS response so the person who just changed it stays signed in.
+    response = JSONResponse(content={"status": "ok"})
+    _issue_session_cookie(response, u.sub, u.email, u.name, u.role,
+                          auth_provider=u.auth_provider or "local")
+    return response
 
 
 @router.put("/v1/users/me/email")
@@ -630,6 +659,11 @@ async def change_my_email(
     u = require_auth(user)
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
+
+    _confirm_ok, _retry = rate_limit_hit("confirm", u.sub)
+    if not _confirm_ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {_retry} seconds.",
+                            headers={"Retry-After": str(_retry)})
 
     db_user = await asyncio.to_thread(task_store.get_user, u.sub)
     if not db_user or not db_user.get("password_hash"):
@@ -648,11 +682,29 @@ async def change_my_email(
 
 
 @router.post("/v1/users/me/totp/setup")
-async def totp_setup(user: UserContext | None = Depends(get_current_user)):
+async def totp_setup(
+    req: TotpSetupRequest | None = Body(default=None),
+    user: UserContext | None = Depends(get_current_user),
+):
     """Generate TOTP secret and recovery codes. Does not enable 2FA yet."""
     u = require_auth(user)
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
+
+    # Reconfiguring while 2FA is already enabled overwrites the live secret +
+    # recovery codes — require the password (like /totp DELETE does) so a
+    # hijacked session can't silently swap the victim's second factor and
+    # lock them out. The initial enable flow (2FA off) needs no password.
+    db_user = await asyncio.to_thread(task_store.get_user, u.sub)
+    if db_user and db_user.get("totp_enabled"):
+        _confirm_ok, _retry = rate_limit_hit("confirm", u.sub)
+        if not _confirm_ok:
+            raise HTTPException(429, f"Too many attempts. Try again in {_retry} seconds.",
+                                headers={"Retry-After": str(_retry)})
+        if not db_user.get("password_hash"):
+            raise HTTPException(400, "Cannot reconfigure 2FA without a password")
+        if not req or not verify_password(req.password, db_user["password_hash"]):
+            raise HTTPException(401, "Password confirmation required to reconfigure 2FA")
 
     secret = generate_totp_secret()
     qr_uri = get_totp_uri(secret, u.email)
@@ -709,6 +761,11 @@ async def totp_disable(
     if u.is_api_key:
         raise HTTPException(403, "Dashboard only")
 
+    _confirm_ok, _retry = rate_limit_hit("confirm", u.sub)
+    if not _confirm_ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {_retry} seconds.",
+                            headers={"Retry-After": str(_retry)})
+
     db_user = await asyncio.to_thread(task_store.get_user, u.sub)
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "Cannot disable 2FA without a password")
@@ -760,7 +817,18 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
             config.JWT_SECRET, algorithm="HS256",
         )
         reset_url = f"{config.DASHBOARD_PUBLIC_URL}/reset-password?token={token}"
-        await asyncio.to_thread(send_password_reset_email, email, reset_url)
+
+        # Fire-and-forget: awaiting the SMTP send here would make the response
+        # measurably slower ONLY for registered emails — a timing oracle that
+        # contradicts this endpoint's no-enumeration contract. Send in the
+        # background so both the hit and miss paths return immediately.
+        async def _send_reset() -> None:
+            try:
+                await asyncio.to_thread(send_password_reset_email, email, reset_url)
+            except Exception:
+                logger.warning("Password-reset email send failed for %s",
+                               mask_email(email))
+        asyncio.create_task(_send_reset())
 
     # Always return success (prevent enumeration)
     return {"status": "ok", "message": "If your email is registered, you'll receive a reset link."}

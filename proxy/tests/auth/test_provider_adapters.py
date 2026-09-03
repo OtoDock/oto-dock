@@ -194,14 +194,14 @@ def test_openai_usage_no_details_is_all_plain_input():
 
 
 def test_openai_usage_cost_matches_openai_bill_gpt56():
-    # End-to-end with the shared calculate_cost: terra rates (2.50 in, 15 out,
-    # 3.125 write = 1.25x, 0.25 read = 0.1x) — the decomposed row must price to
-    # exactly what OpenAI bills.
+    # End-to-end with the shared calculate_cost: terra rates (2.00 in, 12 out,
+    # 2.50 write = 1.25x, 0.20 read = 0.1x — the 2026-07-30 cut) — the
+    # decomposed row must price to exactly what OpenAI bills.
     u = OpenAIAdapter._decompose_usage(
         _usage(1_000_000, 100_000, cached=600_000, written=300_000))
     cost = OpenAIAdapter().calculate_cost("gpt-5.6-terra", u)
-    #   100k plain * 2.50 + 300k written * 3.125 + 600k read * 0.25 + 100k out * 15
-    assert abs(cost - (0.25 + 0.9375 + 0.15 + 1.5)) < 1e-9
+    #   100k plain * 2.00 + 300k written * 2.50 + 600k read * 0.20 + 100k out * 12
+    assert abs(cost - (0.20 + 0.75 + 0.12 + 1.2)) < 1e-9
 
 
 # ---------------------------------------------------------------------------

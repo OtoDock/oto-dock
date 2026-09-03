@@ -323,6 +323,70 @@ def _inject_mcp_env(manifest) -> bool:
     return True
 
 
+# T1 recreate-trigger state: the compose-config hash the running container
+# was (re)created from, stored beside the generated `.env` (gitignored).
+_COMPOSE_HASH_NAME = ".otodock-compose-hash"
+
+
+def _compose_config_hash(manifest) -> str | None:
+    """sha256 over the on-disk compose config (base + generated override).
+
+    Raw file text, not ``docker compose config``: the interpolation inputs
+    that matter live in the generated ``.env``, whose changes the existing
+    ``env_changed`` trigger already catches, and default-bound changes
+    (``OTODOCK_MCP_DEFAULT_MEM_LIMIT``) materialize in the override TEXT via
+    ``ensure_t1_override``. The one blind spot — interpolation straight from
+    the proxy's process env — is accepted (documented in
+    DOCKER-DEPLOYMENT.md). Filenames are part of the digest, so a renamed
+    compose file forces one recreate (harmless). Returns None when the base
+    compose is missing/unreadable — callers degrade to the plain skip,
+    never raise.
+    """
+    import hashlib
+
+    try:
+        base = manifest.mcp_dir / manifest.server.docker_compose
+        if not base.is_file():
+            return None
+        h = hashlib.sha256()
+        for p in (base, manifest.mcp_dir / "docker-compose.override.yml"):
+            if p.is_file():
+                h.update(p.name.encode())
+                h.update(b"\0")
+                h.update(p.read_bytes())
+                h.update(b"\0")
+        return h.hexdigest()
+    except Exception as e:
+        logger.debug("Compose hash for %s unavailable: %s", manifest.name, e)
+        return None
+
+
+def _read_recorded_compose_hash(manifest) -> str | None:
+    try:
+        return (manifest.mcp_dir / _COMPOSE_HASH_NAME).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _record_compose_hash(manifest) -> None:
+    """Record the CURRENT on-disk config hash — recomputed here, never a
+    precomputed value: the subnet-TOCTOU retry rewrites the override
+    mid-``compose up``, and recording a stale hash would force a spurious
+    recreate on the next boot. T1-only: ``start_container`` also runs on T2
+    (community install / admin API paths) where the file would be litter in
+    dirs nothing ever reads it from. Never raises — recording is
+    bookkeeping, and an IO error here must not turn a successful start into
+    a failure."""
+    if deployment.current_mode() != deployment.MANAGED_LOCAL:
+        return
+    try:
+        digest = _compose_config_hash(manifest)
+        if digest:
+            (manifest.mcp_dir / _COMPOSE_HASH_NAME).write_text(digest + "\n")
+    except Exception as e:
+        logger.warning("Could not record compose hash for %s: %s", manifest.name, e)
+
+
 def start_container(manifest, *, force_recreate: bool = False) -> bool:
     """Start Docker container via docker compose up -d.
 
@@ -438,6 +502,7 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
             "Started Docker MCP: %s%s",
             manifest.name, " (force-recreated)" if "--force-recreate" in args else "",
         )
+        _record_compose_hash(manifest)
         return True
 
     if t1_retry and "overlap" in stderr.lower():
@@ -453,6 +518,7 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
         )
         if rc == 0:
             logger.info("Started Docker MCP %s after subnet reallocation", manifest.name)
+            _record_compose_hash(manifest)
             return True
         stderr = retry_err
 
@@ -488,6 +554,7 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
                     "Started Docker MCP %s after removing the previous "
                     "generation's container", manifest.name,
                 )
+                _record_compose_hash(manifest)
                 return True
             stderr = retry_err
         elif rm is not None:
@@ -716,9 +783,48 @@ def startup_docker_mcps() -> None:
 
         status = get_container_status(manifest)
         if status == "running":
+            # Compose-config drift check: the skip path historically ran
+            # NOTHING, so base-compose/override changes (a new mem_limit
+            # default, an image retag) never reached a running container
+            # until something else happened to recreate it. Hash the on-disk
+            # config BEFORE refreshing the override (the pre-refresh text is
+            # a faithful baseline for what the running container was created
+            # from — only start_container ever writes the override), refresh
+            # it, re-hash, and recreate on drift. Any failure degrades to
+            # the plain skip this branch always was.
+            compose_changed = False
+            try:
+                from services.mcp import compose_rewrite
+
+                pre = _compose_config_hash(manifest)
+                compose_rewrite.ensure_t1_override(manifest)
+                post = _compose_config_hash(manifest)
+                recorded = _read_recorded_compose_hash(manifest)
+                if post is not None:
+                    if recorded is not None:
+                        compose_changed = post != recorded
+                    else:
+                        # First boot with this feature: recreate only on
+                        # REAL pending drift (the refresh changed the
+                        # effective config); otherwise seed quietly so
+                        # unchanged installs see no recreate storm.
+                        compose_changed = pre is not None and post != pre
+                        if not compose_changed:
+                            _record_compose_hash(manifest)
+            except Exception as e:
+                logger.warning(
+                    "Compose drift check for %s failed (skipping): %s", name, e,
+                )
+
             if env_changed:
                 logger.info(
                     "Docker MCP %s: .env changed, force-recreating to pick up new values",
+                    name,
+                )
+                start_container(manifest, force_recreate=True)
+            elif compose_changed:
+                logger.info(
+                    "Docker MCP %s: compose config changed, force-recreating to pick it up",
                     name,
                 )
                 start_container(manifest, force_recreate=True)

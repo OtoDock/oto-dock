@@ -235,7 +235,8 @@ def get_app_by_slug(agent: str, username: str, slug: str) -> dict | None:
 _UNSCOPED = "scope_chat_id IS NULL AND scope_project_id IS NULL"
 
 
-def list_apps(agent: str, username: str = "", include_hidden: bool = False) -> list[dict]:
+def list_apps(agent: str, username: str = "", include_hidden: bool = False,
+              viewer_sub: str = "") -> list[dict]:
     """The viewer's merged STANDING list: shared rows first, then the
     viewer's own personal rows, each group by position. ``username=""``
     returns only the shared group (agent-scope callers). order[0] is the
@@ -243,22 +244,38 @@ def list_apps(agent: str, username: str = "", include_hidden: bool = False) -> l
     ``include_hidden`` — the agent-facing list hook passes True so
     re-pinnable slugs surface. Scoped (chat/project) rows never appear here
     — they surface on their scope's Dock (``list_scoped_apps`` for the
-    agent-facing merged view)."""
+    agent-facing merged view).
+
+    ``viewer_sub`` (S2): stamp each SHARED row with ``hidden_for_me`` from
+    ``pinned_app_user_hides`` — the rows still return (the dashboard's
+    hidden-affordance needs them); the API layer/client segregate. Personal
+    rows always carry ``hidden_for_me=False``."""
     hid = "" if include_hidden else "AND NOT hidden "
+    hide_col = (", EXISTS(SELECT 1 FROM pinned_app_user_hides h "
+                "WHERE h.app_id = pinned_apps.id AND h.user_sub = %s) "
+                "AS hidden_for_me" if viewer_sub else "")
     with get_conn() as conn:
+        shared_params: list = ([viewer_sub] if viewer_sub else []) + [agent]
         shared = conn.execute(
-            f"SELECT * FROM pinned_apps WHERE agent=%s AND username='' {hid}"
+            f"SELECT *{hide_col} FROM pinned_apps "
+            f"WHERE agent=%s AND username='' {hid}"
             f"AND {_UNSCOPED} ORDER BY position, created_at",
-            (agent,),
+            shared_params,
         ).fetchall()
         rows = [dict(r) for r in shared]
+        if not viewer_sub:
+            for r in rows:
+                r["hidden_for_me"] = False
         if username:
             own = conn.execute(
                 f"SELECT * FROM pinned_apps WHERE agent=%s AND username=%s {hid}"
                 f"AND {_UNSCOPED} ORDER BY position, created_at",
                 (agent, username),
             ).fetchall()
-            rows.extend(dict(r) for r in own)
+            for r in own:
+                d = dict(r)
+                d["hidden_for_me"] = False
+                rows.append(d)
         return rows
 
 
@@ -321,6 +338,32 @@ def set_app_hidden(app_id: str, hidden: bool) -> bool:
             )
         conn.commit()
         return True
+
+
+def hide_app_for_user(app_id: str, user_sub: str) -> None:
+    """S2 hide-for-me: park a SHARED app off THIS user's strip only. The
+    row/manifest/approval and every other user's view are untouched.
+    Idempotent (re-hide is a no-op). The caller validates the app is a
+    shared standing row."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO pinned_app_user_hides (app_id, user_sub, created_at)
+               VALUES (%s, %s, %s) ON CONFLICT (app_id, user_sub) DO NOTHING""",
+            (app_id, user_sub, now),
+        )
+        conn.commit()
+
+
+def unhide_app_for_user(app_id: str, user_sub: str) -> bool:
+    """Restore a hide-for-me. Returns True if a hide row existed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM pinned_app_user_hides WHERE app_id=%s AND user_sub=%s",
+            (app_id, user_sub),
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def approve_app_actions(app_id: str, sig: str, approved_by: str) -> bool:

@@ -213,6 +213,35 @@ def resolve_chat_audio_capability(*, has_native_tts: bool, has_native_stt: bool)
     return ChatAudioCapability(tts, stt, tpid, spid, f"TTS: {treason}. STT: {sreason}.", True)
 
 
+def duplex_capability() -> dict:
+    """Full-duplex chat voice availability: ``{available, reason}``.
+
+    Unlike the feature-flags fail-open convention, absence of ANY signal here
+    means UNAVAILABLE — the duplex button only renders on a positive signal:
+    kill-switches on (the duplex flag requires an explicit "true"), platform
+    chat STT+TTS usable, and a connected phone daemon advertising duplex
+    support. Native speech can't do full duplex, so native-only policy also
+    gates it off.
+    """
+    if not chat_audio_enabled():
+        return {"available": False,
+                "reason": "chat audio is turned off by the administrator"}
+    if task_store.get_platform_setting("audio_chat_duplex_enabled") != "true":
+        return {"available": False,
+                "reason": "full-duplex mode is not enabled by the administrator"}
+    if is_native_only_policy():
+        return {"available": False,
+                "reason": "admin policy is native-only speech"}
+    if not (_provider_usable(audio_provider_store.get_default_provider("stt", "chat"))
+            and _provider_usable(audio_provider_store.get_default_provider("tts", "chat"))):
+        return {"available": False,
+                "reason": "no usable platform chat STT and TTS providers"}
+    from services.phone.phone_config import duplex_engine_available
+    if not duplex_engine_available():
+        return {"available": False, "reason": "duplex engine not connected"}
+    return {"available": True, "reason": "ok"}
+
+
 def is_native_only_policy() -> bool:
     """Server-side gate for the STT/TTS session mints: when the
     policy is native-only the platform audio WS must be refused even if hit

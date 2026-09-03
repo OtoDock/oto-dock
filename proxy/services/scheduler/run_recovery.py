@@ -215,6 +215,44 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict]) -> None:
             run_id=None, chat_id=chat["id"], agent=chat.get("agent") or "",
         ))
 
+    # Idle sessions the satellite kept alive across the restart get
+    # re-REGISTERED (registry only — nothing streams). Without this they
+    # were invisible to the remote idle reaper and lived forever
+    # satellite-side, eating the machine's session capacity until every
+    # new spawn failed "at capacity" (hit live 2026-08-11 after an
+    # evening of proxy redeploys). With a chat row they become normal
+    # idle sessions again — resumable, reaped on the standard leash;
+    # without one they are junk and close immediately.
+    from core.session.session_manager import _get_remote_layer as _grl
+    idle_layer = _grl()
+    if idle_layer is not None:
+        for sid, info in reported.items():
+            if sid in already or sid in _parked or info.get("turn_active"):
+                continue
+            if sid in getattr(idle_layer, "_sessions", {}):
+                continue
+            chat = await asyncio.to_thread(task_store.get_chat_by_session, sid)
+            agent = (chat or {}).get("agent") or info.get("agent_slug") or ""
+            try:
+                await idle_layer.adopt_idle_session(
+                    machine_id=machine_id, session_id=sid, agent_name=agent,
+                    use_native_permissions=bool(
+                        info.get("use_native_permissions")),
+                )
+                if not chat:
+                    logger.info(
+                        "Recovery: closing unknown idle session %s on %s",
+                        sid[:8], machine_id[:8])
+                    await idle_layer.close_session(sid)
+                else:
+                    logger.info(
+                        "Recovery: re-leashed idle session %s on %s",
+                        sid[:8], machine_id[:8])
+            except Exception:
+                logger.exception(
+                    "Recovery: idle adoption failed for %s on %s",
+                    sid[:8], machine_id[:8])
+
     # This machine is back: redeliver any delegate wakes parked on ITS chats —
     # including idle ones the adopt loops above never touch (a wake stored
     # while the machine was away can only deliver now).

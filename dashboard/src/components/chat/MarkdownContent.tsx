@@ -1,10 +1,143 @@
-import { useRef, isValidElement, cloneElement } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { memo, useEffect, useRef, useState, isValidElement, cloneElement } from 'react'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { Components } from 'react-markdown'
+import { resolveChatPath, type ResolvedChatPath } from '../../api/chats'
 import CodeBlock from './CodeBlock'
+import ChatFilePreview from './ChatFilePreview'
+import { useChatFileContext } from './ChatFileContext'
 import SearchHighlight from './SearchHighlight'
 import { useSearch } from '../../contexts/SearchContext'
+
+// Known document/asset extensions — the last-resort path signal for hrefs
+// that carry no other filesystem marker (bare `report.xlsx` relative links).
+const FILE_EXT_RE = /\.(xlsx|xlsm|xls|csv|docx|doc|pptx|ppt|pdf|md|txt|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|bmp|tiff?|zip|tar|gz|7z|json|xml|ya?ml|log)$/i
+
+// Filesystem roots on the platform's containers and common OSes. Deliberately
+// NOT `/agents`: it is both an SPA route and the container mount root — the
+// extension rule disambiguates those hrefs.
+const POSIX_ROOT_RE = /^\/(workspace|users|knowledge|config|home|tmp|mnt|var|opt|srv|etc|root|media|private)\//i
+
+/**
+ * True when a markdown href is a filesystem path, not a navigable URL.
+ * Agents sometimes emit `[open](C:\Users\...\file.xlsx)` — the browser cannot
+ * open local files, so such links render as inert chips instead of anchors.
+ * Order matters: the drive-letter/backslash tests must precede the generic
+ * scheme test because `C:` parses as a URI scheme.
+ * Accepted false positive: `./notes.md`-style relative file links become
+ * chips too — they have no working SPA target anyway.
+ */
+export function isFileSystemPathHref(href: string): boolean {
+  // Windows drive-relative + UNC. micromark's normalizeUri percent-encodes
+  // '\' as %5C before urlTransform ever runs — both forms must match.
+  if (/\\|%5C/i.test(href)) return true
+  if (/^[a-zA-Z]:\//.test(href)) return true // C:/...
+  if (/^(file|sandbox):/i.test(href)) return true
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return false // any other real scheme
+  if (/^~\//.test(href)) return true
+  if (/^[#?]/.test(href)) return false
+  if (POSIX_ROOT_RE.test(href)) return true
+  return FILE_EXT_RE.test(href.split(/[?#]/)[0])
+}
+
+// micromark percent-encodes non-ASCII hrefs (Greek filenames); a raw '%' in
+// a path would make decodeURI throw.
+function decodePathHref(href: string): string {
+  try {
+    return decodeURI(href)
+  } catch {
+    return href
+  }
+}
+
+// defaultUrlTransform empties any href outside its protocol allowlist —
+// C:\..., file://, sandbox: hrefs would reach the `a` component as "" (an
+// anchor that reloads the current route). Path hrefs pass through verbatim;
+// everything else keeps the javascript:/data: neutralization.
+function urlTransform(url: string): string | null | undefined {
+  return isFileSystemPathHref(url) ? url : defaultUrlTransform(url)
+}
+
+// How long the chip's transient "not found" state lasts before reverting.
+const NOT_FOUND_REVERT_MS = 2500
+
+/**
+ * A filesystem-path chip. Without `ChatFileContext` (meetings, every other
+ * MarkdownContent surface) it is exactly the inert chip. Inside a chat it
+ * becomes a button: click → `POST /v1/chats/{id}/resolve-path` → on a match
+ * the workspace preview stack opens (`ChatFilePreview`); `found: false` or a
+ * fetch error shows a transient "not found" state (no toast) that reverts —
+ * negatives are not cached, so the next click re-resolves.
+ */
+function FileChip({ href }: { href: string }) {
+  const ctx = useChatFileContext()
+  const [busy, setBusy] = useState(false)
+  const [notFound, setNotFound] = useState(false)
+  const [preview, setPreview] = useState<ResolvedChatPath | null>(null)
+  const revertTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (revertTimer.current) clearTimeout(revertTimer.current)
+  }, [])
+
+  // micromark percent-encodes non-ASCII/backslash hrefs. The decoded form is
+  // what the user sees AND what gets POSTed — the backend never URL-decodes.
+  const decoded = decodePathHref(href)
+
+  if (!ctx) {
+    return (
+      <span
+        title="Local file path — ask for a preview or download link"
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-[0.85em] font-mono border border-gray-200 dark:border-gray-700 cursor-default break-all"
+      >
+        <span aria-hidden="true">📄</span>
+        {decoded}
+      </span>
+    )
+  }
+
+  const handleClick = async () => {
+    if (busy) return
+    if (revertTimer.current) {
+      clearTimeout(revertTimer.current)
+      revertTimer.current = null
+    }
+    setNotFound(false)
+    setBusy(true)
+    let resolved: ResolvedChatPath | null = null
+    try {
+      resolved = await resolveChatPath(ctx.chatId, decoded)
+    } catch {
+      resolved = null // network/HTTP error — same transient state as found:false
+    }
+    setBusy(false)
+    if (resolved) {
+      setPreview(resolved)
+      return
+    }
+    setNotFound(true)
+    revertTimer.current = setTimeout(() => setNotFound(false), NOT_FOUND_REVERT_MS)
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleClick}
+        title={notFound ? "File not found in the agent's workspace" : 'Open file preview'}
+        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-[0.85em] font-mono border border-gray-200 dark:border-gray-700 cursor-pointer hover:ring-1 hover:ring-brand/40 break-all text-left align-baseline${busy ? ' opacity-60' : ''}`}
+      >
+        <span aria-hidden="true">📄</span>
+        {decoded}
+        {notFound ? (
+          <span className="font-sans text-amber-600 dark:text-amber-400 whitespace-nowrap">not found</span>
+        ) : (
+          <span aria-hidden="true" className="opacity-60">↗</span>
+        )}
+      </button>
+      {preview && <ChatFilePreview resolved={preview} onClose={() => setPreview(null)} />}
+    </>
+  )
+}
 
 const baseComponents: Components = {
   // Code blocks + inline code
@@ -31,6 +164,11 @@ const baseComponents: Components = {
 
   // Links — styled with external icon
   a({ href, children }) {
+    // Filesystem paths render as chips (clickable only inside a chat) —
+    // same predicate as urlTransform
+    if (href && isFileSystemPathHref(href)) {
+      return <FileChip href={href} />
+    }
     const isExternal = href?.startsWith('http')
     return (
       <a
@@ -163,7 +301,13 @@ interface Props {
   searchOrder?: number          // explicit sort key for match ordering
 }
 
-export default function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder }: Props) {
+// memo: ReactMarkdown re-runs the full unified parse on EVERY render and
+// the chat maps messages inline — without this, each turn-end state write
+// re-parses every message in the chat (the main-thread burst that starved
+// the duplex player's 250ms lookahead). Props are all primitives, so the
+// default shallow compare is exact; context-driven re-renders (search)
+// still pass through memo as always.
+function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder }: Props) {
   const { query } = useSearch()
   const counterRef = useRef(0)
   // Reset counter on each render so IDs are stable for same content
@@ -185,9 +329,11 @@ export default function MarkdownContent({ children, className, searchMatchIdPref
       prose-strong:text-gray-900 dark:prose-strong:text-gray-100
       ${className || ''}`}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={urlTransform}>
         {children}
       </ReactMarkdown>
     </div>
   )
 }
+
+export default memo(MarkdownContent)

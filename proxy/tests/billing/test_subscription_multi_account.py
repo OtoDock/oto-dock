@@ -42,7 +42,7 @@ def _row(sub_id, oauth_email=""):
     }
 
 
-def _exchange(account, existing_rows):
+def _exchange(account, existing_rows, extra_token_fields=None):
     """Drive the exchange endpoint with everything mocked; return the store."""
     store = MagicMock()
     store.list_subscriptions.return_value = existing_rows
@@ -53,12 +53,13 @@ def _exchange(account, existing_rows):
     meta = {"user_sub": "user-1", "owner_type": "user", "code_verifier": "ver"}
     req = OAuthExchangeRequest(code="auth-code", state="st-1")
 
+    token_response = {**_token_response(account), **(extra_token_fields or {})}
     with patch.object(claude_api, "subscription_store", store), \
          patch.object(claude_api, "_consume_state", return_value=meta), \
          patch.object(claude_api, "require_auth", lambda u: u), \
          patch.object(
              claude_api.claude_oauth, "exchange_code",
-             return_value=_token_response(account),
+             return_value=token_response,
          ):
         asyncio.run(claude_api.oauth_exchange(req, user=user))
     return store
@@ -103,6 +104,46 @@ def test_no_identity_falls_back_to_single_row_refresh():
     store.update_credential_data.assert_called_once()
     assert store.update_credential_data.call_args.args[0] == "s1"
     store.add_subscription.assert_not_called()
+
+
+def test_reconnect_expired_row_revives_to_active():
+    row = {**_row("s1", "a@example.com"), "status": "expired"}
+    store = _exchange(_ACCOUNT_A, existing_rows=[row])
+    store.update_credential_data.assert_called_once()
+    assert store.update_subscription.call_args.kwargs["status"] == "active"
+    store.add_subscription.assert_not_called()
+
+
+def test_reconnect_disabled_row_stays_disabled():
+    # Reconnect refreshes the credential but must NOT override the admin's
+    # disable — and matching the row at all (vs. forking a second ACTIVE one)
+    # is the point of the include_disabled match list.
+    row = {**_row("s1", "a@example.com"), "status": "disabled"}
+    store = _exchange(_ACCOUNT_A, existing_rows=[row])
+    store.update_credential_data.assert_called_once()
+    assert store.update_subscription.call_args.kwargs["status"] == "disabled"
+    store.add_subscription.assert_not_called()
+
+
+def test_reconnect_clears_refresh_backoff():
+    from services.engines import subscription_pool as sp
+    sp._refresh_backoff["s1"] = (0.0, 3)
+    try:
+        _exchange(_ACCOUNT_A, existing_rows=[_row("s1", "a@example.com")])
+        assert "s1" not in sp._refresh_backoff
+    finally:
+        sp._refresh_backoff.pop("s1", None)
+
+
+def test_exchange_stores_grant_expiry():
+    import time as _time
+    store = _exchange(
+        _ACCOUNT_A, existing_rows=[],
+        extra_token_fields={"refresh_token_expires_in": 14 * 86400},
+    )
+    blob = store.add_subscription.call_args.kwargs["credential_data"]["oauth_token"]
+    expected_ms = (_time.time() + 14 * 86400) * 1000
+    assert abs(blob["refreshTokenExpiresAt"] - expected_ms) < 10_000
 
 
 # ── owner-scoped update endpoint (per-account toggles for every role) ───────

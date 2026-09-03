@@ -14,6 +14,8 @@ import {
   useSetDefaultPhoneServer,
   useSetPhoneServerAmiSecret,
   useDeletePhoneServerAmiSecret,
+  useSetPhoneServerTwilioAuthToken,
+  useDeletePhoneServerTwilioAuthToken,
   useServerBootstrap,
   useVerifyServerBootstrap,
   useApplyServerBootstrap,
@@ -89,9 +91,6 @@ function BootstrapSection({ server }: { server: PhoneServer }) {
   const [sftp, setSftp] = useState({ host: '', port: '22', username: '', password: '' })
 
   if (isLoading || !boot) return <p className="text-xs text-p-text-light">Loading bootstrap…</p>
-  if (!boot.requires_bootstrap) {
-    return <p className="text-xs text-p-text-light">This provider needs no manual bootstrap — it's usable once credentials are valid.</p>
-  }
 
   const verified = server.bootstrap_status === 'verified'
 
@@ -115,6 +114,14 @@ function BootstrapSection({ server }: { server: PhoneServer }) {
 
       {verified ? (
         <p className="text-xs text-green-600 dark:text-green-400">✓ Verified — routes auto-provision on this server.</p>
+      ) : !boot.requires_bootstrap ? (
+        // No-bootstrap adapters (Twilio) still need the Verify click: it
+        // probes the credentials + public URL and flips the server to
+        // `verified`, which is what unlocks route provisioning.
+        <p className="text-xs text-p-text-light">
+          No manual bootstrap needed — click <span className="font-medium">Verify</span> to
+          check the credentials and enable routes on this server.
+        </p>
       ) : (
         <>
           {server.adapter_type === 'asterisk_freepbx' && <FreePBXChecklist />}
@@ -183,11 +190,14 @@ export function PhoneServerPill({ server }: { server: PhoneServer }) {
   const setDefault = useSetDefaultPhoneServer()
   const setSecret = useSetPhoneServerAmiSecret()
   const delSecret = useDeletePhoneServerAmiSecret()
+  const setTwilioToken = useSetPhoneServerTwilioAuthToken()
+  const delTwilioToken = useDeletePhoneServerTwilioAuthToken()
 
   // Collapsed by default — only a server the user explicitly expanded
   // (persisted 'open') starts open.
   const [open, setOpen] = useState(() => localStorage.getItem(`phone-server-${server.id}`) === 'open')
   const [secretValue, setSecretValue] = useState('')
+  const [twilioTokenValue, setTwilioTokenValue] = useState('')
   const [saved, setSaved] = useState('')
 
   const toggleOpen = () => {
@@ -211,7 +221,15 @@ export function PhoneServerPill({ server }: { server: PhoneServer }) {
     })
   }
 
+  const saveTwilioToken = () => {
+    if (!twilioTokenValue.trim()) return
+    setTwilioToken.mutate({ id: server.id, value: twilioTokenValue.trim() }, {
+      onSuccess: () => { setTwilioTokenValue(''); flash('twilio_token') },
+    })
+  }
+
   const isAsterisk = server.adapter_type.startsWith('asterisk')
+  const isTwilio = server.adapter_type === 'twilio'
 
   return (
     <div className="border border-p-border-light rounded-lg">
@@ -246,16 +264,19 @@ export function PhoneServerPill({ server }: { server: PhoneServer }) {
               />
               <SavedBadge show={saved === 'name'} />
             </div>
-            <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Host</label>
-              <input
-                defaultValue={server.host}
-                onBlur={e => { if (e.target.value !== server.host) saveField({ host: e.target.value }, 'host') }}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text"
-                placeholder="pbx.example.com"
-              />
-              <SavedBadge show={saved === 'host'} />
-            </div>
+            {/* Twilio has no host — its coordinates live in the section below. */}
+            {!isTwilio && (
+              <div>
+                <label className="block text-xs font-medium text-p-text mb-1">Host</label>
+                <input
+                  defaultValue={server.host}
+                  onBlur={e => { if (e.target.value !== server.host) saveField({ host: e.target.value }, 'host') }}
+                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text"
+                  placeholder="pbx.example.com"
+                />
+                <SavedBadge show={saved === 'host'} />
+              </div>
+            )}
           </div>
 
           {isAsterisk && (
@@ -316,6 +337,55 @@ export function PhoneServerPill({ server }: { server: PhoneServer }) {
                 )}
                 <SavedBadge show={saved === 'secret'} />
               </div>
+            </div>
+          )}
+
+          {isTwilio && (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider">Twilio account</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-p-text-light mb-1">Account SID</label>
+                  <input
+                    defaultValue={cfg(server, 'account_sid')}
+                    onBlur={e => { if (e.target.value !== cfg(server, 'account_sid')) saveConfig('account_sid', e.target.value.trim()) }}
+                    className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                    placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-p-text-light w-20 shrink-0">Auth token</label>
+                <input
+                  type="password"
+                  value={twilioTokenValue}
+                  onChange={e => setTwilioTokenValue(e.target.value)}
+                  placeholder={server.twilio_auth_token_configured ? '********' : 'from the Twilio console'}
+                  className="flex-1 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                />
+                <button
+                  onClick={saveTwilioToken}
+                  disabled={!twilioTokenValue.trim() || setTwilioToken.isPending}
+                  className="px-3 py-1 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40"
+                >
+                  Save
+                </button>
+                {server.twilio_auth_token_configured && (
+                  <button
+                    onClick={() => { if (confirm('Remove Twilio auth token?')) delTwilioToken.mutate(server.id) }}
+                    className="px-3 py-1 text-xs rounded-lg border border-red-200 text-red-500 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20"
+                  >
+                    Remove
+                  </button>
+                )}
+                <SavedBadge show={saved === 'twilio_token'} />
+              </div>
+              <p className="text-xs italic text-p-text-light">
+                Calls enter through your public dashboard URL (https required) — behind a forced-login
+                gateway (Authentik, Authelia, …), exempt <span className="font-mono">/v1/twilio/</span> like the other
+                documented paths. Click Verify below, then add routes: each inbound route's number is
+                wired to this install automatically.
+              </p>
             </div>
           )}
 

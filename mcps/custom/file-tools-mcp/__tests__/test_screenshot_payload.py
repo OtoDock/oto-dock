@@ -26,6 +26,7 @@ async def _ident(p, writing=False, **kw):
 @pytest.fixture(autouse=True)
 def _no_proxy(monkeypatch):
     monkeypatch.setattr(pdf_mod, "_resolve_path", _ident)
+    monkeypatch.setattr("shared._resolve_path", _ident)
 
 
 def _text_pdf(path: Path, pages: int = 1, width: float = 595,

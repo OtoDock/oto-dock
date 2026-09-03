@@ -149,6 +149,19 @@
     height: 100vh;
     height: 100dvh;
   }
+  /* Composer bottom breathing room: 20px more than the old pb-3 (raised
+     +10px on operator request 2026-08-12), and never less than the
+     home-indicator inset on notched phones (viewport-fit=cover is set, so
+     env() is live). The Android shell's decorative 10dp moved here so
+     web/desktop get the same gap. The PresenceHalo canvas extends downward
+     by exactly this var so its glow ends at the viewport edge without
+     creating scrollable overflow. */
+  :root {
+    --composer-pb: max(32px, calc(22px + env(safe-area-inset-bottom)));
+  }
+  .pb-composer-safe {
+    padding-bottom: var(--composer-pb);
+  }
 }
 
 /* User message bubble — copy button uses white/semi-transparent colors */

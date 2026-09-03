@@ -42,24 +42,68 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     # is availability-driven: the capability resolver hides the icons on its
     # own when no usable speech path (native or provider) exists.
     "audio_chat_enabled": "true",
+    # Full-duplex chat voice (the phone daemon's conversation engine on
+    # dashboard chats). Requires an explicit "true" — absence does NOT
+    # enable, unlike audio_chat_enabled — and the capability additionally
+    # needs a duplex-capable daemon + usable chat providers, so installs
+    # without the phone service stay dictation-only either way.
+    "audio_chat_duplex_enabled": "true",
+    # Whole-session budget for one duplex session (proxy-enforced timer).
+    "audio_duplex_max_seconds": "1800",
+    # Wake word ("hey <agent>" → duplex). Install-wide kill switch for the
+    # on-device browser listener; the real gate is the PER-USER opt-in
+    # (user_audio_prefs.wake_word_enabled, default off). Threshold is the
+    # spotter's acoustic trigger probability — RAISE it to cut false
+    # accepts, lower toward the model default 0.25 if wakes are missed.
+    # 0.35 missed real accented speech in live testing (2026-08-14);
+    # 0.30 is the field-tuned default.
+    "audio_wake_word_enabled": "true",
+    "audio_wake_word_threshold": "0.30",
+    # Per-line sensitivity for the PLATFORM ("hey OtoDock") keyword lines
+    # only — agent-name lines keep the globals. Boost scales the keyword's
+    # path score in the spotter's search (raise to favor it), the platform
+    # threshold replaces the global one for those lines (lower = easier to
+    # fire). Both must stay > 0 — non-positive/junk values fall back to
+    # these defaults in code and are never emitted.
+    "audio_wake_word_platform_boost": "2.0",
+    "audio_wake_word_platform_threshold": "0.20",
     # Chat STT defaults (per-VAD/limits for the WS session)
     "audio_chat_stt_max_seconds": "60",
     "audio_tts_max_chars_per_request": "5000",
     "audio_tts_rate_limit_chars_per_min": "10000",
     "audio_transcribe_max_upload_mb": "100",
     "audio_transcribe_max_duration_min": "60",
-    # Barge-in (production-tuned) — phone
+    # AMI DTMF event listener kill switch — phone. Seeded (unlike the pin_*
+    # timing knobs) so the switch is VISIBLE in the admin settings UI: it is
+    # what an operator reaches for when a misbehaving PBX needs the
+    # persistent AMI connections gone. Daemon default is on either way.
+    "phone_ami_dtmf_listener": "on",
+    # Barge-in (production-tuned) — phone. VAD speech during playback
+    # PAUSES the sender; a commit (cancel TTS + abort the turn) requires a
+    # non-empty final transcript AND a speech episode >= bargein_timer_s —
+    # the timer key kept its name and default across the pause/confirm/
+    # commit redesign, so upgraded installs keep their tuned value; only
+    # its role changed (was: VAD-only abort timer; now: minimum episode
+    # duration composed with the transcript requirement).
     "phone_bargein_threshold": "0.35",
     "phone_bargein_debounce_ms": "300",
     "phone_bargein_chunk_ratio": "0.5",
     "phone_bargein_silence_duration_ms": "500",
     "phone_bargein_timer_s": "0.6",
+    "phone_bargein_confirm_timeout_s": "3.0",
+    "phone_bargein_resume_grace_s": "1.0",
     # Turn timing (production-tuned) — phone
     "phone_turn_complete_timeout_s": "1.0",
     "phone_turn_incomplete_timeout_s": "2.0",
     "phone_turn_classifier_grace_s": "0.0",
     "phone_turn_classifier_lang_map": "",
-    "phone_turn_classifier_default_backend": "smart_turn",
+    # groq since 2026-08-25 (operator decision after live A/B): the text
+    # classifier judges sentence completeness better than SmartTurn's
+    # audio prosody in EVERY tested language, English included (SmartTurn
+    # dispatched "Final thing I wanted to ask here is" as complete). The
+    # dispatcher still falls back to smart_turn automatically when no
+    # Groq relay/key is configured.
+    "phone_turn_classifier_default_backend": "groq",
     # Fillers — phone. Enable/disable is per-route (phone_routes
     # backchannel_mode / thinking_filler_mode toggles); these tune timing.
     # The thinking filler is latency-gated: it only plays when the LLM
@@ -110,7 +154,7 @@ _DEFAULT_SETTINGS: dict[str, str] = {
         "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
         "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
         "- Don't spell out URLs, paths, or IPs unless asked.\n"
-        "- When using tools: say 'One moment' first — in the SAME language as the call, like everything else — then summarize the result in 1-2 short sentences.\n"
+        "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you' — in the SAME language as the call). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
         "- To end the call (e.g. user says goodbye or the conversation is clearly over), append [CALL_COMPLETE] at the end of your final message. The system will strip it before speaking.\n"
     ),
     "phone_context_outbound": (
@@ -123,44 +167,72 @@ _DEFAULT_SETTINGS: dict[str, str] = {
         "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
         "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
         "- Don't spell out URLs, paths, or IPs unless asked.\n"
-        "- When using tools: say 'One moment' first — in the SAME language as the call, like everything else — then summarize the result in 1-2 short sentences.\n"
+        "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you' — in the SAME language as the call). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
         "- Complete the task you were given, politely and professionally.\n"
         "- If you need information from your manager during the call, emit [QUESTION: your question here] in your response. "
         "The system will relay the question while the call stays active.\n"
         "- When the task is complete or clearly cannot be completed, end your final message with [CALL_COMPLETE].\n"
         "- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they're signals for the system.\n"
     ),
-    # Per-language JSON blobs — phone
+    # Duplex-mode context (dashboard full-duplex voice): the spoken-reply
+    # rules, adapted from the call contexts — same language + brevity + never
+    # read structured output aloud, but the user HAS a screen, so rich content
+    # goes through the display tools instead. Injected as a prefix on the
+    # first duplex turn after each attach (not a warmup suffix — duplex
+    # toggles mid-session). One call-control marker: [DUPLEX_COMPLETE].
+    "chat_duplex_context": (
+        "You are in a live spoken conversation — the user hears your replies "
+        "aloud AND sees the chat on screen.\n"
+        "RULES:\n"
+        "- ALWAYS respond in the SAME LANGUAGE the user speaks. Never switch language mid-conversation.\n"
+        "- Keep spoken replies SHORT: 1-3 conversational sentences. Summarize instead of listing details.\n"
+        "- Talk naturally, the way you'd say it out loud — no stiff or formal phrasing.\n"
+        "- NEVER read tables, lists, JSON, code, or URLs aloud. Show rich content on screen with your "
+        "display tools instead, then describe it in one short sentence.\n"
+        "- NO sources, citations, footnotes, or links in your replies — everything you write is spoken "
+        "aloud, and 'Sources: …' sounds terrible. If sources matter, put them on screen via a display tool.\n"
+        "- Before ANY tool call, FIRST write one short spoken line saying what you're doing "
+        "(e.g. 'Let me check that' — in the SAME language as the conversation). NEVER go silent "
+        "into a tool — in a spoken conversation silence feels broken. During multi-step tool "
+        "work, add a brief spoken progress line between steps, then summarize the result in "
+        "1-2 short sentences.\n"
+        "ENDING THE CONVERSATION: append [DUPLEX_COMPLETE] at the very end of "
+        "your reply to close the spoken session after it is read aloud. Use it "
+        "when the user clearly says goodbye or is done ('thanks, good night'), "
+        "or when you take on LONG work that should not keep the microphone "
+        "open: say you'll continue and notify them when it's done (schedule a "
+        "notification if appropriate), then end with the marker and keep "
+        "working in the normal chat. The user can always reopen the "
+        "conversation manually. Do NOT use it for quick answers.\n"
+    ),
+    # Per-language JSON blobs — phone. A language may pin its classifier
+    # with a "turn_classifier" field ("groq" | "smart_turn"); none do by
+    # default since 2026-08-25 — the default backend (groq, smart_turn
+    # fallback) covers every language.
     "phone_phrases": json.dumps({
         "en": {
             "hold_message": "One moment please, let me check.",
             "greeting_fallback": "Hello, how can I help you?",
-            "turn_classifier": "smart_turn",
         },
         "el": {
             "hold_message": "Μια στιγμή παρακαλώ, θα το ελέγξω.",
             "greeting_fallback": "Γεια σας, πώς μπορώ να σας βοηθήσω;",
-            "turn_classifier": "groq",
         },
         "de": {
             "hold_message": "Einen Moment bitte, ich schaue nach.",
             "greeting_fallback": "Hallo, wie kann ich Ihnen helfen?",
-            "turn_classifier": "smart_turn",
         },
         "es": {
             "hold_message": "Un momento por favor, déjeme comprobar.",
             "greeting_fallback": "Hola, ¿en qué puedo ayudarle?",
-            "turn_classifier": "smart_turn",
         },
         "fr": {
             "hold_message": "Un instant s'il vous plaît, je vérifie.",
             "greeting_fallback": "Bonjour, comment puis-je vous aider ?",
-            "turn_classifier": "smart_turn",
         },
         "it": {
             "hold_message": "Un momento per favore, controllo subito.",
             "greeting_fallback": "Salve, come posso aiutarla?",
-            "turn_classifier": "smart_turn",
         },
     }),
     "phone_backchannel_phrases": json.dumps({

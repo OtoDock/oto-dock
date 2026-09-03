@@ -22,6 +22,11 @@ export interface UseChatStreamOptions {
    * useState needs an explicit reset); chat: false (chatStore is reconciled
    * by the backend's queue deltas). */
   clearQueueOnAbort?: boolean
+  /** Route heavy non-visible work (currently the defensive end-of-turn
+   * history refetch — a full message-list remount) through the page's
+   * speech-activity deferral so it can't hard-cut live TTS. Must run the
+   * callback synchronously when nothing is speaking. Omitted → immediate. */
+  deferHeavy?: (fn: () => void) => void
 
   // --- Warmup / error tails (reference page-owned state only) ---
   /** Fires on warmup_ready BEFORE the stale-chat guard (chat: refetchChats). */

@@ -63,6 +63,17 @@ def _to_deepgram_lang(tag: str) -> str:
     return tag.split("-", 1)[0]
 
 
+# Punctuation smart_format may add/alter between an interim and its final —
+# includes the Greek question mark (;) and ano teleia (·).
+_WORD_STRIP = ".,;:!?·»«\"'()[]{}"
+
+
+def _norm_words(text: str) -> list[str]:
+    """Casefolded, punctuation-stripped tokens, for prefix comparisons between
+    interim and final variants of the same audio window (dictation mode)."""
+    return [t for t in (w.strip(_WORD_STRIP).casefold() for w in text.split()) if t]
+
+
 class DeepgramSTT(STTProvider):
     """Streaming + prerecorded speech-to-text via Deepgram."""
 
@@ -102,6 +113,11 @@ class DeepgramSTT(STTProvider):
         self._interim_results = False  # mode last requested in start() (kept on reconnect)
         self._endpointing_override: int | None = None  # per-connection override (kept on reconnect)
         self._fatal_error: str | None = None  # last Error event, surfaced once via pop_fatal_error
+        # Rate actually negotiated by the last start() — reconnects MUST reuse
+        # it: falling back to the constructor default decodes a 16 kHz stream
+        # as 8 kHz → permanent garbage transcripts (live duplex bug, audit F5).
+        self._active_rate = sample_rate
+        self._send_skips = 0  # closed-connection sends since last open (one WARNING per incident)
 
     # ── Factory / metadata ─────────────────────────────────────────
 
@@ -220,6 +236,8 @@ class DeepgramSTT(STTProvider):
         """
         rate = sample_rate or self._sample_rate
         language = _to_deepgram_lang(language)
+        self._active_rate = rate
+        self._send_skips = 0
         self._latest_interim = ""
         self._last_interim_sent = ""
         self._fatal_error = None
@@ -232,8 +250,13 @@ class DeepgramSTT(STTProvider):
         self._connection = self._client.listen.asyncwebsocket.v("1")
 
         self._connection.on(LiveTranscriptionEvents.Transcript, self._on_transcript)
-        self._connection.on(LiveTranscriptionEvents.Error, self._on_error)
-        # Bind the current generation so stale _on_close callbacks are ignored
+        # Bind the current generation so stale callbacks are ignored — a
+        # replaced socket's dying gasp (net0001 after a mid-call reconnect)
+        # must not surface as a pipeline "STT fatal" for the LIVE connection.
+        self._connection.on(
+            LiveTranscriptionEvents.Error,
+            lambda _conn, error, _gen=gen, **kw: self._on_error(_conn, error, _gen=_gen, **kw),
+        )
         self._connection.on(
             LiveTranscriptionEvents.Close,
             lambda _conn, close, _gen=gen, **kw: self._on_close(_conn, close, _gen=_gen, **kw),
@@ -267,16 +290,25 @@ class DeepgramSTT(STTProvider):
             except Exception as e:
                 logger.error(f"Deepgram send error: {e}")
         elif not self._is_open and self._connection:
-            logger.warning("Deepgram send skipped — connection closed")
+            # One WARNING per death incident, not one per 20 ms frame (a dead
+            # 35 s call tail used to log 1,700+ of these). The guard task owns
+            # recovery; the counter is reported when the connection reopens.
+            self._send_skips += 1
+            if self._send_skips == 1:
+                logger.warning("Deepgram send skipped — connection closed "
+                               "(suppressing repeats until reconnect)")
 
     async def send_keep_alive(self) -> None:
         """Send a KeepAlive message to maintain the WebSocket connection.
 
         Rate-limited to at most once per _KEEPALIVE_INTERVAL_S seconds.
-        Use this instead of sending silence frames during TTS playback —
-        silence frames train Deepgram's acoustic model to expect silence,
-        causing the first real speech after TTS to produce empty transcripts.
-        KeepAlive keeps the connection alive without affecting the model.
+        KeepAlive keeps the SOCKET alive without feeding audio — but it does
+        NOT keep the streaming model's audio timeline warm: a session that
+        receives only KeepAlives for ~10 s goes stale and the first real
+        utterances return empty transcripts (live-hit 2026-08-14, outbound
+        opening). Pair it with a silence feed (``feed_during_tts``) whenever
+        real audio is being withheld for long; KeepAlive alone is only right
+        for short gaps.
         """
         if not self._connection or not self._is_open:
             return
@@ -300,6 +332,10 @@ class DeepgramSTT(STTProvider):
             except asyncio.QueueEmpty:
                 break
         self._transcript_ready.clear()
+        # A discarded utterance's live partial must go with it — a stale
+        # interim that never finalizes reads as permanent speech "evidence"
+        # to the barge-in pause monitor (audit A5, 2026-08-24).
+        self._latest_interim = ""
         if discarded:
             logger.info(f"STT queue cleared ({discarded} items discarded)")
 
@@ -327,13 +363,21 @@ class DeepgramSTT(STTProvider):
 
     def pop_interim(self) -> str | None:
         """Return the latest live (non-final) partial if it changed since the
-        last call. Used by the chat WS to stream text as the user speaks; the
-        call pipeline never enables interims so this stays empty there."""
+        last call. Used by the chat WS to stream text as the user speaks.
+
+        Dictation mode also suppresses a pure backtrack — an interim revision
+        that is a strict prefix of what was already sent (Deepgram briefly
+        retracting words it will re-confirm) would visibly truncate the
+        composer; real rewordings still pass."""
         txt = self._latest_interim
-        if txt and txt != self._last_interim_sent:
-            self._last_interim_sent = txt
-            return txt
-        return None
+        if not txt or txt == self._last_interim_sent:
+            return None
+        if self.dictation_mode and self._last_interim_sent:
+            new, old = _norm_words(txt), _norm_words(self._last_interim_sent)
+            if len(new) < len(old) and old[: len(new)] == new:
+                return None
+        self._last_interim_sent = txt
+        return txt
 
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
         """Wait up to `timeout` seconds for the next is_final transcript.
@@ -367,6 +411,13 @@ class DeepgramSTT(STTProvider):
         degrades to the live partial instead of a dropped turn."""
         return self._latest_interim
 
+    @property
+    def has_pending_finals(self) -> bool:
+        """Finalized transcript(s) sitting in the queue, not yet drained —
+        barge-in speech evidence (each mid-speech is_final clears
+        ``latest_interim``, so the queue is where the proof lives)."""
+        return not self._transcript_queue.empty()
+
     async def finish(self) -> str | None:
         """Signal end of audio and wait for final transcript.
 
@@ -389,6 +440,16 @@ class DeepgramSTT(STTProvider):
                     parts.append(text)
             except asyncio.QueueEmpty:
                 break
+
+        if self.dictation_mode:
+            # A tail the user saw but Deepgram never finalized (stop hit
+            # mid-window) must still commit — the client's stop() waits
+            # ≤1.8s for exactly this trailing final.
+            leftover = self._shown_interim()
+            if leftover:
+                parts.append(leftover)
+                self._latest_interim = ""
+                self._last_interim_sent = ""
 
         transcript = " ".join(parts).strip() if parts else None
         if transcript:
@@ -429,30 +490,53 @@ class DeepgramSTT(STTProvider):
     async def feed_during_opening(self) -> None:
         """Send KeepAlive during long opening TTS (10+ seconds).
 
-        KeepAlive keeps the WebSocket alive without feeding audio.
-        Silence bytes would train the model to expect silence, causing
-        empty transcripts on first real speech after the opening.
+        Socket-level belt only. The opening loop ALSO feeds each discarded
+        frame as silence via ``feed_during_tts`` — KeepAlive alone kept the
+        socket alive but left the streaming model's audio timeline stale,
+        and the first 1-2 real utterances after the opening returned empty
+        transcripts (live-hit 2026-08-14; the silence feed fixed it,
+        verified live the same night — an older theory here claimed silence
+        would "train the model to expect silence"; the live test came out
+        the other way).
         """
         await self.send_keep_alive()
 
-    async def recover_after_opening(self, language: str) -> bool:
-        """Check WebSocket health after opening TTS, reconnect if needed."""
+    async def keepalive(self) -> None:
+        """Guard-task keepalive: the protocol KeepAlive message (rate-limited
+        internally via ``send_keep_alive``)."""
+        await self.send_keep_alive()
+
+    async def ensure_alive(self, language: str, *, clear_queue: bool = False) -> bool:
+        """Health probe + reconnect with the ACTIVE params (language passed by
+        the pipeline; rate/interims/endpointing stored from the last start()).
+
+        ``clear_queue`` only applies to the healthy path — after an opening
+        (echo artifacts) pass True; after a barged-in playback or from the
+        guard task pass False (the queue may hold the interrupting
+        utterance's finals — audit F6).
+        """
         if self._is_open:
-            self.clear_queue()
-            logger.info("STT still alive after opening TTS")
+            if clear_queue:
+                self.clear_queue()
+            logger.debug("Deepgram STT healthy")
             return True
-        # Connection died during opening — reconnect
+        # Connection died — reconnect with the same negotiated rate (F5).
+        skipped = self._send_skips
         with contextlib.suppress(Exception):
             await self.close()
         try:
             await self.start(
-                language=language, interim_results=self._interim_results,
+                language=language, sample_rate=self._active_rate,
+                interim_results=self._interim_results,
                 endpointing_ms=self._endpointing_override,
             )
-            logger.info("STT reconnected after opening TTS")
+            logger.info(
+                "Deepgram STT reconnected mid-call"
+                + (f" ({skipped} frames dropped while dead)" if skipped else "")
+            )
             return True
         except Exception as e:
-            logger.warning(f"STT reconnect after opening failed: {e}")
+            logger.warning(f"Deepgram STT reconnect failed: {e}")
             return False
 
     @property
@@ -477,6 +561,16 @@ class DeepgramSTT(STTProvider):
 
     # ── Event handlers ────────────────────────────────────────────
 
+    def _shown_interim(self) -> str:
+        """The richer of the live interim and the last one actually sent to the
+        client — dictation paints whichever was delivered last, and a not-yet-
+        popped newer interim only ever shows MORE. Used by dictation mode to
+        decide what "the user already saw" for the never-drop guarantees."""
+        latest, sent = self._latest_interim, self._last_interim_sent
+        if len(_norm_words(sent)) > len(_norm_words(latest)):
+            return sent
+        return latest
+
     async def _on_transcript(self, _conn, result, **kwargs) -> None:
         """Handle transcript events from Deepgram."""
         try:
@@ -484,21 +578,61 @@ class DeepgramSTT(STTProvider):
             is_final = result.is_final
 
             if transcript and is_final:
-                self._log_transcript("Deepgram final", transcript)
+                self._last_result_at = time.monotonic()
+                committed = transcript
+                if self.dictation_mode:
+                    # Never drop painted words: if the shown interim extends
+                    # this final (Deepgram sometimes finalizes only the head of
+                    # a window on non-English languages), commit exactly what
+                    # the user saw — the window's audio is consumed with its
+                    # final, so the tail would never be re-delivered.
+                    shown = self._shown_interim()
+                    fin, intr = _norm_words(transcript), _norm_words(shown)
+                    if len(intr) > len(fin) and intr[: len(fin)] == fin:
+                        committed = shown
+                        logger.info(
+                            "Deepgram short final — committing shown interim "
+                            f"(+{len(intr) - len(fin)} word(s))"
+                        )
+                self._log_transcript("Deepgram final", committed)
                 self._latest_interim = ""  # utterance committed → clear live partial
                 self._last_interim_sent = ""
-                await self._transcript_queue.put(transcript)
+                await self._transcript_queue.put(committed)
                 self._transcript_ready.set()
+                self._emit_partial_final(transcript)
             elif transcript and not is_final:
+                self._last_result_at = time.monotonic()
                 self._latest_interim = transcript
                 logger.debug(f"Deepgram interim: \"{transcript}\"")
             elif is_final and not transcript:
-                logger.debug("Deepgram final: (empty)")
+                shown = self._shown_interim() if self.dictation_mode else ""
+                if shown:
+                    # An empty final orphans the painted interim: the base the
+                    # composer commits onto never advances, and the next
+                    # window's interim REPLACES everything shown (the Greek
+                    # vanishing-words bug, 2026-09-01). Promote what the user
+                    # saw instead. Duplex/call pipelines never take this path
+                    # (dictation_mode is chat-relay-only): a promoted noise
+                    # interim would be false barge-in evidence there.
+                    self._log_transcript(
+                        "Deepgram empty final — committing shown interim", shown)
+                    self._latest_interim = ""
+                    self._last_interim_sent = ""
+                    await self._transcript_queue.put(shown)
+                    self._transcript_ready.set()
+                else:
+                    logger.debug("Deepgram final: (empty)")
         except (IndexError, AttributeError) as e:
             logger.warning(f"Failed to parse Deepgram result: {e}")
 
-    async def _on_error(self, _conn, error, **kwargs) -> None:
-        """Handle errors from Deepgram."""
+    async def _on_error(self, _conn, error, _gen: int = 0, **kwargs) -> None:
+        """Handle errors from Deepgram (generation-guarded like _on_close)."""
+        if _gen != self._connection_gen:
+            logger.info(
+                f"Deepgram error on stale gen={_gen} "
+                f"(current={self._connection_gen}) — ignoring: {str(error)[:120]}"
+            )
+            return
         logger.error(f"Deepgram error: {error}")
         self._fatal_error = f"Deepgram speech-to-text error: {str(error)[:200]}"
 

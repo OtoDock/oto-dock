@@ -163,7 +163,9 @@ class RemoteBgSubagentMixin:
             if aid in info.bg_supervisors:
                 continue  # already supervised (carried over from a prior turn)
             info.thread_consumers.setdefault(aid, asyncio.Queue())
-            reg.register_spawn(aid, aid)
+            from core.events.bg_command_state import shorten_label
+            reg.register_spawn(
+                aid, aid, label=shorten_label(p.get("description", "")))
             info.bg_supervisors[aid] = asyncio.create_task(
                 self._supervise_remote_bg_subagent(info, aid),
                 name=f"remote-codex-bgsup-{info.session_id[:8]}-{aid[-6:]}",

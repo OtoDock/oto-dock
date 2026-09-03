@@ -25,6 +25,65 @@ function bundleAnimeIife(): Plugin {
   }
 }
 
+// three.js ships ESM-only (upstream dropped the UMD build), so the kit's
+// script-tag artifact is bundled the same way as anime: one IIFE, global
+// `THREE`, with a curated addon set attached under THREE.* — camera controls
+// (Orbit/Map), the EffectComposer post-processing chain (bloom is the kit's
+// signature "wow" lever), fat lines, and RoundedBoxGeometry — everything a
+// mini-app needs for impressive scenes while staying inside the artifact
+// CSP (no loaders/workers/WASM). NEVER add examples/jsm/lines/webgpu/*
+// (it drags the whole WebGPU renderer in). The same package pin feeds BOTH
+// surfaces: the dashboard map imports `three` as ESM (tree-shaken into its
+// lazy chunk) and mini-apps load this global build — the Tailwind dual-path
+// precedent. Version bumps hit both at once.
+function bundleThreeIife(): Plugin {
+  const entry = 'otodock-three-kit-entry'
+  return {
+    name: 'otodock:bundle-three-iife',
+    apply: 'build',
+    async closeBundle() {
+      const { rolldown } = await import('rolldown')
+      const bundle = await rolldown({
+        input: entry,
+        plugins: [
+          {
+            name: 'otodock:three-kit-entry',
+            resolveId(id: string) {
+              if (id === entry) return entry
+              return null
+            },
+            load(id: string) {
+              if (id !== entry) return null
+              return (
+                "export * from 'three';\n" +
+                "export { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';\n" +
+                "export { MapControls } from 'three/examples/jsm/controls/MapControls.js';\n" +
+                "export { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';\n" +
+                "export { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';\n" +
+                "export { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';\n" +
+                "export { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';\n" +
+                "export { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';\n" +
+                "export { Pass, FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';\n" +
+                "export { Line2 } from 'three/examples/jsm/lines/Line2.js';\n" +
+                "export { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';\n" +
+                "export { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';\n" +
+                "export { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';\n"
+              )
+            },
+          },
+        ],
+      })
+      await bundle.write({
+        format: 'iife',
+        name: 'THREE',
+        file: path.resolve(__dirname, 'dist/ui-kit/three.min.js'),
+        minify: true,
+      })
+      await bundle.close()
+    },
+  }
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -59,6 +118,7 @@ export default defineConfig({
       ],
     }),
     bundleAnimeIife(),
+    bundleThreeIife(),
   ],
   resolve: {
     alias: {
@@ -84,6 +144,12 @@ export default defineConfig({
         target: 'http://localhost:8400',
         changeOrigin: true,
         ws: true,
+      },
+      // Wake-word wasm/model bundle — served by the proxy from
+      // proxy/assets/kws (outside dist, see config.KWS_ASSETS_DIR).
+      '/kws-assets': {
+        target: 'http://localhost:8400',
+        changeOrigin: true,
       },
     },
   },

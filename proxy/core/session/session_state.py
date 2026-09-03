@@ -204,7 +204,8 @@ class SubagentRegistry:
 
     __slots__ = (
         "spawned", "completed", "pending_stops",
-        "task_to_tuid", "workflow_tuids", "chat_id", "_all_done_event",
+        "task_to_tuid", "labels", "workflow_tuids", "chat_id",
+        "_all_done_event",
     )
 
     def __init__(self) -> None:
@@ -212,17 +213,26 @@ class SubagentRegistry:
         self.completed: set[str] = set()       # task_ids marked done (⊆ spawned)
         self.pending_stops: set[str] = set()   # SubagentStop that raced ahead of task_started
         self.task_to_tuid: dict[str, str] = {}  # task_id → spawning tool_use_id
+        # task_id → model-facing label ('"probe auth flow" [a7b95…]' for CLI
+        # agents — the description from ``task_started`` plus the agentId the
+        # model already holds as its SendMessage handle; bare description for
+        # Codex subs). Composed by the registering layer; consumed by the
+        # completion nudges. Empty → the nudge degrades to count-only.
+        self.labels: dict[str, str] = {}
         self.workflow_tuids: set[str] = set()  # tool_use_ids of active Workflow tools
         self.chat_id: str = ""                 # set by the pump for hook-endpoint routing
         self._all_done_event = asyncio.Event()
 
-    def register_spawn(self, task_id: str, tool_use_id: str) -> None:
+    def register_spawn(self, task_id: str, tool_use_id: str,
+                       label: str = "") -> None:
         """Record a subagent spawn (CLI ``task_started``, local_agent only)."""
         if not task_id:
             return
         self.spawned.add(task_id)
         if tool_use_id:
             self.task_to_tuid[task_id] = tool_use_id
+        if label:
+            self.labels[task_id] = label
         # Reconcile a SubagentStop that arrived before its task_started.
         if task_id in self.pending_stops:
             self.pending_stops.discard(task_id)
@@ -252,6 +262,10 @@ class SubagentRegistry:
     def tuid_for(self, task_id: str) -> str:
         """Resolve a task_id to its spawning tool_use_id (dashboard key)."""
         return self.task_to_tuid.get(task_id, "")
+
+    def label_for(self, task_id: str) -> str:
+        """Model-facing label for a tracked subagent ("" when never captured)."""
+        return self.labels.get(task_id, "")
 
     @property
     def has_pending(self) -> bool:
@@ -294,6 +308,7 @@ class SubagentRegistry:
         self.task_to_tuid = {
             t: u for t, u in self.task_to_tuid.items() if t in pending
         }
+        self.labels = {t: l for t, l in self.labels.items() if t in pending}
         self.pending_stops.clear()          # a Stop with no task_started is stale across turns
         self.workflow_tuids.clear()
         self.chat_id = ""
@@ -496,6 +511,34 @@ def resolve_bg_command_frame(session_id: str, data: dict) -> bool:
     return False
 
 
+def reconcile_background_snapshot(session_id: str, data: dict) -> bool:
+    """Apply a ``system/background_tasks_changed`` snapshot (CLI ≥2.1.243) to
+    BOTH registries: any PENDING entry absent from the snapshot's task list is
+    resolved done (its completion frame was lost — idle router windows,
+    truncated drains). Additions are ignored — ``task_started`` remains the
+    authoritative spawn signal (a snapshot row carries no tool_use_id to bind
+    a badge to). Returns True when the frame was a snapshot (callers suppress
+    it from chat blocks). Only ever called in stream order by the single
+    reader that owns the session's stdout/event-queue."""
+    if (data.get("type") != "system"
+            or data.get("subtype") != "background_tasks_changed"):
+        return False
+    alive = {t.get("task_id") for t in (data.get("tasks") or [])
+             if isinstance(t, dict)}
+    reg = _subagent_registries.get(session_id)
+    if reg is not None:
+        for task_id in list(reg.spawned - reg.completed):
+            if task_id not in alive:
+                reg.mark_done(task_id)
+    from core.events.bg_command_state import _bg_command_registries
+    bgreg = _bg_command_registries.get(session_id)
+    if bgreg is not None:
+        for task_id in list(bgreg.spawned - bgreg.completed):
+            if task_id not in alive:
+                resolve_bg_command(session_id, task_id, "completed")
+    return True
+
+
 def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
     """Clear a DEAD session's dashboard liveness — agent badges and
     background-command spinners — everywhere they could outlive it.
@@ -534,6 +577,8 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
     bgreg = _bg_command_registries.pop(session_id, None)
     if bgreg is not None and bgreg.chat_id:
         chats.add(bgreg.chat_id)
+    from core.events import wake_capture as _wake
+    _wake.forget_session(session_id)
     for cid, live in list(_chat_streaming_state.items()):
         if live.get("session_id") == session_id:
             chats.add(cid)
@@ -857,6 +902,16 @@ def _deserialize_security_ctx(d: dict):
     for _tup in ("session_allowed_roots", "available_scopes"):
         if isinstance(kw.get(_tup), list):
             kw[_tup] = tuple(kw[_tup])
+    # knowledge_libraries is a tuple of (slug, subdir, writable) TRIPLES —
+    # restore both levels or the reloaded context stops comparing equal. A
+    # PRE-SUBDIR persisted pair (slug, writable) — a session that survived
+    # the upgrade restart — normalizes to (slug, '', writable): the old
+    # rows were whole-folder attachments, which IS subdir ''.
+    if isinstance(kw.get("knowledge_libraries"), list):
+        kw["knowledge_libraries"] = tuple(
+            (p[0], "", p[1]) if len(p) == 2 else tuple(p)
+            for p in kw["knowledge_libraries"]
+        )
     return SecurityContext(**kw)
 
 
@@ -1124,13 +1179,32 @@ async def wait_for_question(
 
 
 def resolve_question(request_id: str, answers: dict) -> bool:
-    """Resolve a pending question with the user's answers. True if it existed."""
+    """Resolve a pending question with the user's answers. True if it existed.
+
+    The bool IS the "did a live waiter take this answer" signal — responder
+    paths need it: a False means the held server-request is gone (session
+    reaped / released), so the answer must be re-routed rather than dropped.
+    """
     event = _question_events.get(request_id)
     if event is None:
         return False
     _question_answers[request_id] = answers if isinstance(answers, dict) else {}
     event.set()
     return True
+
+
+def has_pending_question(session_id: str) -> bool:
+    """Whether this session holds an unanswered ``request_user_input``.
+
+    The question waiters are keyed by request_id; the session index
+    (``_session_permission_requests``, shared with permissions) is the only way
+    back from a session id. Idle reapers consult this: a turn blocked on a human
+    answer is byte-idle but not abandoned.
+    """
+    return any(
+        rid in _question_events
+        for rid in _session_permission_requests.get(session_id, ())
+    )
 
 
 def resolve_session_permissions(session_id: str, approved: bool = False) -> int:

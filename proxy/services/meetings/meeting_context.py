@@ -174,6 +174,11 @@ async def build_meeting_agent_config(
         session_scope=vis.mount_scope,
         config_visible=vis.config_visible,
         available_scopes=vis.available_scopes,
+        # PINNED False: meetings record the real convener, so a naive
+        # provenance thread would grant a manager-convened agent-scope
+        # meeting knowledge RW — meetings are conversation, not curated
+        # schedules, and stay outside the knowledge_rw opt-in.
+        knowledge_rw=False,
     )
 
     # Pass user_sub + user_role so manifest agent_context blocks
@@ -189,6 +194,20 @@ async def build_meeting_agent_config(
         user_sub=user_sub_for_creds or "",
         user_role=task_role or "",
         delegation_targets=resolved_targets,
+        # Pre-resolved off-loop like the chat/task builders (providers are
+        # no-I/O): participants get the layered delegation roster too, and
+        # the meetings block follows the creator's access in user-scope
+        # meetings (agent-scope passes "" → roster fallback).
+        delegation_roster=await asyncio.to_thread(
+            dynamic_context.build_delegation_roster, resolved_targets,
+        ),
+        meetings_access=await asyncio.to_thread(
+            dynamic_context.build_meetings_access,
+            user_sub_for_creds or "", task_role or "",
+        ),
+        # Agent-scope participants are no-user sessions and may read their
+        # delegation targets during the meeting (the edge is the grant).
+        nouser_reads=not user_sub_for_creds,
     )
 
     agent_prompt = config.build_agent_prompt(

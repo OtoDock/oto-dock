@@ -31,7 +31,9 @@ from core.config.config_builder import (
 )
 from services.engines.subscription_pool import NoSubscriptionError
 from core.session.history_seed import consume_pending_seed_digest
-from core.config.task_config_builder import resolve_task_identity
+from core.config.task_config_builder import (
+    resolve_task_identity, task_allows_knowledge_rw,
+)
 from core.session import warmup_registry, visibility as _vis
 from core import execution_mode
 from core.session import interactive_session
@@ -154,6 +156,7 @@ class WarmupController:
             self._pre_warmed_model = ""
             old_role = self._pre_warmed_role or "manager"
             self._pre_warmed_role = ""
+            self._pre_warmed_at = 0.0
             try:
                 old_layer = get_execution_layer(old_agent, user_sub=self.user_sub, role=old_role) if old_agent else None
                 if old_layer:
@@ -221,11 +224,13 @@ class WarmupController:
             self._pre_warmed_exec_path = resolve_execution_path(agent, requested_exec_path)
             self._pre_warmed_model = agent_cfg.model
             self._pre_warmed_role = pw_effective_role
+            self._pre_warmed_at = time.monotonic()
             # Track as a reapable pre-warm: if the user never sends, the fast TTL
             # reaper frees its slot + subscription (vs. holding the full idle window).
             from core.session import prewarm_session_registry as _prewarm
             await _prewarm.register(new_sid, agent=agent, user_sub=self.user_sub,
-                                    role=pw_effective_role, exec_path=self._pre_warmed_exec_path)
+                                    role=pw_effective_role, exec_path=self._pre_warmed_exec_path,
+                                    model=agent_cfg.model)
 
             await self._send({"type": "pre_warmup_ready", "session_id": new_sid})
             logger.info(
@@ -339,15 +344,15 @@ class WarmupController:
         # Resolve execution layer — use frontend override if provided, else agent default
         requested_exec_path = msg.get("execution_path", "")
         requested_model = msg.get("model", "")
-        logger.info(f"WS dashboard warmup: agent={agent}, requested_exec_path='{requested_exec_path}', model='{requested_model}'")
+        # Per-chat interactive override — the frontend's
+        # interactive toggle. '' = unset (use stored/resolver default).
+        requested_exec_mode = msg.get("execution_mode", "")
+        logger.info(f"WS dashboard warmup: agent={agent}, requested_exec_path='{requested_exec_path}', model='{requested_model}', execution_mode='{requested_exec_mode}'")
         warmup_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
         self.layer = get_execution_layer(agent, execution_path=requested_exec_path, user_sub=self.user_sub, role=warmup_role)
         effective_exec_path = resolve_execution_path(agent, requested_exec_path)  # actual path for storage (never "remote")
         permission_mode = msg.get("permission_mode", "default")
         requested_model = msg.get("model", "")  # frontend sends current selection
-        # Per-chat interactive override — the frontend's
-        # interactive toggle. '' = unset (use stored/resolver default).
-        requested_exec_mode = msg.get("execution_mode", "")
         # Dashboard light/dark mode → seeds Claude's TUI theme (interactive only).
         requested_theme = msg.get("theme", "")
         cid = msg.get("chat_id")
@@ -737,13 +742,41 @@ class WarmupController:
                         and await w_layer.is_session_alive(self._pre_warmed_sid)
                         and await _prewarm.claim(self._pre_warmed_sid)
                     )
+                    reuse_sid = None
+                    reuse_note = ""
                     if pw_reuse_ok:
                         reuse_sid = self._pre_warmed_sid
+                        if self._pre_warmed_at:
+                            reuse_note = (
+                                f", pre-warmed "
+                                f"{time.monotonic() - self._pre_warmed_at:.1f}s ago"
+                            )
                         self._pre_warmed_sid = None
                         self._pre_warmed_agent = None
                         self._pre_warmed_exec_path = ""
                         self._pre_warmed_model = ""
                         self._pre_warmed_role = ""
+                        self._pre_warmed_at = 0.0
+                    elif not wants_interactive and w_layer is not None:
+                        # DETACHED pre-warm fallback: wake-word detection fires
+                        # an HTTP pre-warm with no WS connection to remember it
+                        # on — claim by full key from the global registry.
+                        claimed = await _prewarm.claim_by_key(
+                            user_sub=self.user_sub, agent=w_agent,
+                            model=w_target_model, role=w_role,
+                            exec_path=effective_exec_path,
+                        )
+                        if claimed is not None:
+                            c_sid, c_age = claimed
+                            if await w_layer.is_session_alive(c_sid):
+                                reuse_sid = c_sid
+                                reuse_note = f", detached pre-warm {c_age:.1f}s old"
+                            else:
+                                # Claimed a dead one — close through the layer
+                                # so its slot/subscription accounting frees.
+                                with contextlib.suppress(Exception):
+                                    await w_layer.close_session(c_sid)
+                    if reuse_sid is not None:
                         # Fresh-resolve the target for the badge + pin (new
                         # chat → no existing pin); fall back to local on any error.
                         try:
@@ -763,6 +796,7 @@ class WarmupController:
                         logger.info(
                             f"WS dashboard warmup (pre-warmed reuse): session={reuse_sid[:8]}, "
                             f"chat={wcid}, agent={w_agent}, model={chat_model}"
+                            f"{reuse_note}"
                         )
                     else:
                         new_sid = str(uuid.uuid4())
@@ -1098,6 +1132,34 @@ class WarmupController:
         # sessions must see the current state so editor/viewer demotions
         # take effect without forcing the user to reconnect.
         effective_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+
+        # Spawn-collision guard (incident 2026-08-06): a LIVE interactive
+        # session already owns this session id — a second runtime on the same
+        # id (the observed headless pump twin) forks the transcript, and the
+        # stale twin's eventual close() tears down the SHARED permission +
+        # satellite secret state under the survivor. Reuse the live session
+        # instead of spawning. The mode-switch flow is unaffected:
+        # _handle_switch_execution_mode closes the old session BEFORE
+        # re-warming, so nothing live is registered under the sid there.
+        live_isess = interactive_session.get(sid)
+        if live_isess is not None and live_isess.alive:
+            logger.warning(
+                f"refusing headless spawn: live interactive session exists for {sid}"
+            )
+            reuse_layer = get_execution_layer(
+                agent, execution_path=exec_path, user_sub=self.user_sub,
+                role=effective_role, execution_target=live_isess.target,
+            )
+            if adopt:
+                self.session_id = sid
+                self.layer = reuse_layer
+                self.session_execution_target = live_isess.target
+                self.session_fallback_reason = None
+            return _SpawnResult(
+                session_id=sid, layer=reuse_layer,
+                execution_target=live_isess.target, fallback_reason=None,
+                interactive=True,
+            )
         # Task re-warm: a `task-{run_id}` chat ALWAYS rebuilds in the task's
         # stored scope/identity (agent-scope → no user, agent role; user-scope
         # → the creator), never the viewer's. Resolved from the run row here
@@ -1108,8 +1170,13 @@ class WarmupController:
         if chat_id.startswith("task-"):
             run = task_store.get_run(chat_id.removeprefix("task-"))
             if run:
+                # The re-warm rebuilds the SAME task fire, so the
+                # knowledge-RW opt-in follows the run's stored task shape
+                # (scheduled/one-time/trigger; delegate stays False).
                 task_identity = resolve_task_identity(
                     agent, run.get("scope") or "agent", run.get("created_by"),
+                    allow_knowledge_rw=task_allows_knowledge_rw(
+                        run.get("task_type")),
                 )
         agent_cfg = await build_agent_config(
             agent_name=agent, user=self.user, user_sub=self.user_sub,
@@ -1350,3 +1417,65 @@ class WarmupController:
                 pending_history_seed="resume_failed",
             )
         return res
+
+
+async def spawn_detached_prewarm(
+    *, agent: str, user: dict, user_sub: str,
+    requested_model: str = "", permission_mode: str = "default",
+) -> str | None:
+    """Pre-warm a session OUTSIDE any WS connection (wake-word detection fires
+    this over HTTP before the dashboard navigates to the chat).
+
+    Mirrors ``_handle_pre_warmup``'s spawn path minus the connection-scoped
+    bookkeeping: the session is registered in the global pre-warm registry
+    (with its model), and the next dashboard warmup for the same
+    (user, agent, model, role, exec_path) claims it via ``claim_by_key`` in
+    ``_spawn_tail``; unclaimed → the TTL reaper frees it. Returns the
+    session_id, or None when skipped (remote/interactive) or not spawnable.
+    """
+    role = _effective_agent_role(user_sub, agent, fallback_user=user)
+    new_sid = str(uuid.uuid4())
+    try:
+        agent_cfg = await build_agent_config(
+            agent_name=agent, user=user, user_sub=user_sub,
+            user_role=role, permission_mode=permission_mode,
+            client_type="dashboard", resume=False,
+            model=requested_model,
+            execution_path=resolve_execution_path(agent, ""),
+            session_id=new_sid,
+        )
+        # Same skips as the WS pre-warm: a remote pre-warm spends the
+        # satellite's budget for a chat that may never come; an interactive
+        # cold-start never reuses a -p pre-warm.
+        if (agent_cfg.execution_target or "local") != "local":
+            logger.info(f"detached pre-warm: skipped (remote target) agent={agent}")
+            return None
+        if _resolve_session_interactive(agent_cfg):
+            logger.info(f"detached pre-warm: skipped (interactive) agent={agent}")
+            return None
+        from core.concurrency import acquire_chat_slot
+        adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
+                                      user_sub=user_sub)
+        if not adm:
+            logger.info(f"detached pre-warm: no slot ({adm.user_message})")
+            return None
+        layer = get_execution_layer(agent, user_sub=user_sub, role=role)
+        await layer.start_session(new_sid, agent_cfg)
+        _tz = get_user_tz(user_sub)
+        if _tz:
+            set_session_user_tz(new_sid, _tz)
+        from core.session import prewarm_session_registry as _prewarm
+        await _prewarm.register(new_sid, agent=agent, user_sub=user_sub,
+                                role=role,
+                                exec_path=resolve_execution_path(agent, ""),
+                                model=agent_cfg.model)
+        logger.info(
+            f"detached pre-warm: created session={new_sid[:8]}, agent={agent}, "
+            f"model={agent_cfg.model}, role={role}"
+        )
+        return new_sid
+    except Exception as e:
+        logger.error(f"detached pre-warm failed: {e}", exc_info=True)
+        from core.concurrency import release_chat_slot
+        release_chat_slot(new_sid)
+        return None

@@ -1,17 +1,32 @@
 """Excel (XLSX) read and write handlers for the file-tools MCP.
 
 Provides read_xlsx (enhanced with range, formula view, metadata) and
-handle_write_xlsx (27 operations covering full spreadsheet functionality).
+handle_write_xlsx (28 operations covering full spreadsheet functionality).
 """
 
 import contextlib
+import datetime
+import os
 import re
 import uuid
 from copy import copy
 from pathlib import Path
 
 from equations import latex_to_png
-from shared import _dropped_note, _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
+from isolation import run_parse
+from shared import (
+    _checked_resolved,
+    _dropped_note,
+    _normalize_operations,
+    _op_type,
+    _preresolve_image_ops,
+    _push_preview,
+    _resolve_path,
+    _to_agents_relative,
+    _WORKER_TMP_SUFFIX,
+    _WRITE_OP_ADVICE,
+    logger,
+)
 
 # ---------------------------------------------------------------------------
 # Read
@@ -23,6 +38,16 @@ def _escape_cell(v) -> str:
     break table alignment and throw off the model's column counting."""
     if v is None:
         return ""
+    # Compact date/time rendering — str(datetime) shows a reloaded date cell
+    # (which comes back as a midnight datetime) as '2026-03-27 00:00:00'.
+    if isinstance(v, datetime.datetime):
+        if (v.hour, v.minute, v.second, v.microsecond) == (0, 0, 0, 0):
+            return v.strftime("%Y-%m-%d")
+        return v.strftime(
+            "%Y-%m-%d %H:%M:%S" if v.second or v.microsecond else "%Y-%m-%d %H:%M"
+        )
+    if isinstance(v, datetime.time):
+        return v.strftime("%H:%M:%S" if v.second or v.microsecond else "%H:%M")
     return str(v).replace("|", "\\|").replace("\r", "").replace("\n", "⏎")
 
 
@@ -83,15 +108,19 @@ def _equation_latex(text: str) -> str | None:
 
 def _iter_comments(ws):
     """Yield (coordinate, comment) for every commented cell, skipping cells
-    whose comment attribute is unreadable (covered merged cells)."""
-    for row in ws.iter_rows():
-        for c in row:
-            try:
-                cm = c.comment
-            except Exception:
-                continue
-            if cm is not None and (cm.text or "").strip():
-                yield c.coordinate, cm
+    whose comment attribute is unreadable (covered merged cells).
+
+    Iterates only materialized cells: iter_rows() would CREATE cells across
+    the full used range, which on a stray-formatted sheet (max bound at
+    XFD1048576) means millions of synthesized cells."""
+    for key in sorted(ws._cells):
+        c = ws._cells[key]
+        try:
+            cm = c.comment
+        except Exception:
+            continue
+        if cm is not None and (cm.text or "").strip():
+            yield c.coordinate, cm
 
 
 def _anchor_cell(img) -> tuple[int, int] | None:
@@ -130,6 +159,120 @@ def _describe_anchor(img) -> tuple[str | None, str | None]:
     return ref, None
 
 
+# Rendered-window ceiling: Worksheet.cell() CREATES cells on access, so the
+# grid loop materializes shown_rows × n_cols Cell objects — one stray
+# formatted cell at XFD1048576 turns an unranged read into ~8M synthesized
+# cells and a multi-GB climb unless bounded here.
+_WINDOW_CELL_BUDGET = 100_000
+
+# Full-DOM openpyxl memory per byte of uncompressed sheet XML (measured
+# 10–30×; 20 keeps honest headroom without refusing mid-size files).
+_DOM_PER_XML_BYTE = 20
+
+
+def _sheet_xml_sizes(path: str) -> tuple[dict[str, int], int] | None:
+    """(uncompressed bytes per sheet NAME, sharedStrings bytes) from the zip
+    directory — no decompression. None when the file isn't a readable zip
+    (encrypted/odd container: let openpyxl raise its own error)."""
+    import zipfile
+    from xml.etree import ElementTree
+
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    PNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    try:
+        with zipfile.ZipFile(path) as zf:
+            sizes = {i.filename: i.file_size for i in zf.infolist()}
+            rels = {}
+            for rel in ElementTree.fromstring(
+                zf.read("xl/_rels/workbook.xml.rels")
+            ).findall(f"{PNS}Relationship"):
+                target = rel.get("Target", "").lstrip("/")
+                if not target.startswith("xl/"):
+                    target = "xl/" + target
+                rels[rel.get("Id")] = target
+            by_name = {}
+            for sh in ElementTree.fromstring(zf.read("xl/workbook.xml")).findall(
+                f"{NS}sheets/{NS}sheet"
+            ):
+                member = rels.get(sh.get(f"{RNS}id"), "")
+                by_name[sh.get("name")] = sizes.get(member, 0)
+            return by_name, sizes.get("xl/sharedStrings.xml", 0)
+    except Exception:
+        return None
+
+
+def _preflight_density(path: str) -> None:
+    """Refuse workbooks whose full-DOM load alone would blow the parse
+    budget — BEFORE loading, with the offending sheet named. Sparse
+    stray-formatted files have tiny XML and pass through to the
+    window-budget check, which is the correct guard for them."""
+    from isolation import worker_rss_budget_bytes
+
+    info = _sheet_xml_sizes(path)
+    if info is None:
+        return
+    by_name, shared = info
+    total = sum(by_name.values()) + shared
+    budget = worker_rss_budget_bytes()
+    if total * _DOM_PER_XML_BYTE <= budget:
+        return
+    biggest = max(by_name.items(), key=lambda kv: kv[1], default=("?", 0))
+    raise ValueError(
+        f"workbook is too dense to read as a grid: its sheets total "
+        f"{total // (1024 * 1024)}MB of uncompressed data (largest sheet: "
+        f"'{biggest[0]}'), beyond the {budget // (1024 * 1024)}MB parse "
+        f"budget. Export the range you need as a smaller file or CSV and "
+        f"read that."
+    )
+
+
+def _stream_values_window(
+    path: str,
+    sheet_name: str,
+    r1: int,
+    c1: int,
+    r2: int,
+    c2: int,
+    anchors: dict[tuple[int, int], tuple[int, int]],
+) -> dict[tuple[int, int], object]:
+    """Cached values for the rendered window via ONE read_only streaming pass.
+
+    ReadOnlyWorksheet random access re-parses the sheet XML from the top on
+    every .cell() call, and a second full-DOM load doubles peak memory — so
+    the window is materialized in a single iter_rows sweep. Merged-cell
+    anchors that sit OUTSIDE the window are fetched with targeted single-cell
+    sweeps, capped: past the cap those cells fall back to formula text."""
+    from openpyxl import load_workbook
+
+    out: dict[tuple[int, int], object] = {}
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return out
+        ws = wb[sheet_name]
+        for r_idx, row in enumerate(
+            ws.iter_rows(min_row=r1, max_row=r2, min_col=c1, max_col=c2, values_only=True),
+            start=r1,
+        ):
+            for c_off, v in enumerate(row):
+                if v is not None:
+                    out[(r_idx, c_off + c1)] = v
+        outside = set()
+        for (r, c), (ar, ac) in anchors.items():
+            if r1 <= r <= r2 and c1 <= c <= c2 and not (r1 <= ar <= r2 and c1 <= ac <= c2):
+                outside.add((ar, ac))
+        for ar, ac in sorted(outside)[:50]:
+            for row in ws.iter_rows(
+                min_row=ar, max_row=ar, min_col=ac, max_col=ac, values_only=True
+            ):
+                if row and row[0] is not None:
+                    out[(ar, ac)] = row[0]
+    finally:
+        wb.close()
+    return out
+
+
 def read_xlsx(
     path: str,
     sheet: str | None,
@@ -145,11 +288,13 @@ def read_xlsx(
     from openpyxl import load_workbook
     from openpyxl.utils import get_column_letter
 
-    # Two loads: cached values AND formula text. A file written by openpyxl
-    # carries no cached values, so a pure data_only read renders every formula
-    # cell blank — fall back to the formula text instead.
+    _preflight_density(path)
+
+    # Formula text and structure (comments, merged ranges, validations) need
+    # the full DOM. Cached values do NOT — they stream from a read_only pass
+    # over just the rendered window (a second full-DOM load doubled peak
+    # memory).
     wb_form = load_workbook(path, read_only=False, data_only=False)
-    wb_vals = None if show_formulas else load_workbook(path, read_only=False, data_only=True)
 
     sheets = wb_form.sheetnames
     result = [f"**XLSX**: {Path(path).name} — Sheets: {', '.join(sheets)}"]
@@ -157,7 +302,6 @@ def read_xlsx(
 
     target = sheet if sheet and sheet in sheets else sheets[0]
     ws_form = wb_form[target]
-    ws_vals = wb_vals[target] if wb_vals is not None else None
 
     dims = ws_form.dimensions if ws_form.dimensions else "empty"
 
@@ -179,22 +323,41 @@ def read_xlsx(
     else:
         result.append(f"### Sheet: {target} (range: {dims})")
 
+    total_rows = max(0, max_row_bound - min_row + 1)
+    n_cols = max(0, max_col_bound - min_col + 1)
+    shown_rows = min(total_rows, max_rows)
+    if shown_rows * n_cols > _WINDOW_CELL_BUDGET:
+        eff = (
+            f"{get_column_letter(min_col)}{min_row}:"
+            f"{get_column_letter(max_col_bound)}{max_row_bound}"
+        )
+        raise ValueError(
+            f"the read window {eff} spans {n_cols:,} columns × {shown_rows:,} "
+            f"rows (over the {_WINDOW_CELL_BUDGET:,}-cell grid budget) — an "
+            f"oversized used range usually means stray formatting far "
+            f"below/right of the real data. Pass start_cell/end_cell to read "
+            f"the real range (sheet reports: {dims})."
+        )
+
     anchors = _merged_anchor_map(ws_form)
+    vals_window: dict[tuple[int, int], object] = {}
+    if not show_formulas and shown_rows > 0 and n_cols > 0:
+        vals_window = _stream_values_window(
+            path, target, min_row, min_col,
+            min_row + shown_rows - 1, max_col_bound, anchors,
+        )
 
     def cell_text(r: int, c: int) -> str:
         ar, ac = anchors.get((r, c), (r, c))
         if show_formulas:
             return _escape_cell(ws_form.cell(row=ar, column=ac).value)
-        v = ws_vals.cell(row=ar, column=ac).value
+        v = vals_window.get((ar, ac))
         if v is None:
             f = ws_form.cell(row=ar, column=ac).value
             if isinstance(f, str) and f.startswith("="):
                 return _escape_cell(f)  # formula with no cached value
         return _escape_cell(v)
 
-    total_rows = max(0, max_row_bound - min_row + 1)
-    n_cols = max(0, max_col_bound - min_col + 1)
-    shown_rows = min(total_rows, max_rows)
     if shown_rows > 0 and n_cols > 0:
         result.extend(_grid_lines(cell_text, min_row, min_col, shown_rows, n_cols))
     if total_rows > shown_rows:
@@ -211,7 +374,11 @@ def read_xlsx(
             for dv in dv_list:
                 info = f"  - {dv.sqref}: {dv.type}"
                 if dv.type == "list" and dv.formula1:
-                    info += f" = {dv.formula1.strip(chr(34))}"
+                    # Verbatim + tagged: a quote-stripped render made the
+                    # broken literal '"=Name"' and the correct reference
+                    # 'Name' look identical.
+                    kind = "literal" if dv.formula1.startswith('"') else "reference"
+                    info += f" = {kind}: {dv.formula1}"
                 if dv.prompt:
                     info += f' ("{dv.prompt}")'
                 result.append(info)
@@ -304,8 +471,6 @@ def read_xlsx(
         pass
 
     wb_form.close()
-    if wb_vals is not None:
-        wb_vals.close()
     return "\n".join(result)
 
 
@@ -340,6 +505,40 @@ def _parse_cell_ref(cell_str: str):
     return column_index_from_string(m.group(1)), int(m.group(2))
 
 
+def _strip_leading_eq(s: str) -> str:
+    """openpyxl serializes formula1/attr_text verbatim into the XML, where a
+    leading '=' is invalid ST_Formula — but agents habitually write '=Name'."""
+    return s[1:] if s.startswith("=") else s
+
+
+# A single-item list value is a reference only on an explicit '=' or a
+# full-string sheet-qualified range — a bare contains('!') test would turn
+# the literal ["Yes!"] into a broken reference.
+_SHEET_RANGE_RE = re.compile(
+    r"(?:'(?:[^']|'')+'|[^\W\d][\w.]*)!"
+    r"\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?"
+)
+
+# Typo-guard candidate shapes: only identifier-shaped references are checked
+# against the workbook's defined names — 'B2' is a valid relative cell
+# reference, not a name typo, and anything with '(' is a function call.
+_BARE_NAME_RE = re.compile(r"[^\W\d][\w.]*")
+_A1_REF_RE = re.compile(r"[A-Za-z]{1,3}\d+")
+
+
+def _sqref_intersects(sqref_a, sqref_b) -> bool:
+    """True when any member range of one MultiCellRange overlaps any member
+    of the other. Plain min/max bounds arithmetic — DV sqrefs are sheet-local
+    (title-less), so CellRange's title-aware set ops don't apply."""
+    for a in sqref_a.ranges:
+        for b in sqref_b.ranges:
+            if (
+                a.min_col <= b.max_col and b.min_col <= a.max_col
+                and a.min_row <= b.max_row and b.min_row <= a.max_row
+            ):
+                return True
+    return False
+
 # Formula safety
 _UNSAFE_FUNCTIONS = {"INDIRECT", "WEBSERVICE", "DGET", "RTD"}
 
@@ -364,13 +563,202 @@ def _validate_formula(formula: str) -> str | None:
     return None
 
 
+# Named number-format presets (case-insensitive lookup). Anything not listed
+# passes through verbatim as a raw Excel format code.
+_NUMBER_FORMAT_PRESETS = {
+    "date": "dd/mm/yyyy",
+    "date-iso": "yyyy-mm-dd",
+    "datetime": "dd/mm/yyyy hh:mm",
+    "time": "hh:mm",
+    "percent": "0.00%",
+    "number": "#,##0.00",
+    "integer": "#,##0",
+    "currency": "€#,##0.00",
+    "currency:usd": "$#,##0.00",
+    "currency:gbp": "£#,##0.00",
+    "text": "@",
+}
+
+
+def _resolve_number_format(nf):
+    """Preset name → Excel format code; anything else passes through verbatim."""
+    if isinstance(nf, str):
+        return _NUMBER_FORMAT_PRESETS.get(nf.strip().casefold(), nf)
+    return nf
+
+
+# Strict ISO shapes — full-string matches, then VALIDATED by parsing
+# ("2026-13-45" matches the regex but is not a date). re.ASCII: without it \d
+# matches e.g. Arabic-Indic digits, which then fail fromisoformat and warn as
+# "invalid ISO" for strings that were never meant as dates.
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+_ISO_DATETIME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?", re.ASCII
+)
+_ISO_TIME_RE = re.compile(r"\d{2}:\d{2}(?::\d{2})?", re.ASCII)
+# Excel has no timezones — silently dropping the offset would corrupt data.
+_ISO_TZ_RE = re.compile(
+    r"(?:\d{4}-\d{2}-\d{2}[T ])?\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})",
+    re.ASCII,
+)
+# Ambiguous day/month order ('27/03/2026') — NEVER guessed, warned instead.
+_AMBIGUOUS_DATE_RE = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", re.ASCII)
+
+_TEMPORAL_KINDS = ("date", "datetime", "time")
+
+# Decided display for auto-converted values: European dd/mm/yyyy.
+_AUTO_DISPLAY = {"date": "dd/mm/yyyy", "datetime": "dd/mm/yyyy hh:mm"}
+
+
+def _auto_display_format(kind: str, value) -> str:
+    if kind == "time":
+        return "hh:mm:ss" if value.second or value.microsecond else "hh:mm"
+    return _AUTO_DISPLAY[kind]
+
+
+def _coerce_cell_value(value, explicit_type=None):
+    """(coerced value, kind) — kind ∈ date/datetime/time, a text-warned-*
+    marker, or None (untouched).
+
+    ONLY strings are ever examined: numbers, bools and None pass through
+    byte-identical (raw Excel serials must keep working), as do formula
+    strings and anything under explicit type "text". Explicit types
+    date/datetime/time accept the SAME strict ISO — they never unlock
+    guessing, they just turn a silent text landing into a warning."""
+    if not isinstance(value, str) or explicit_type == "text" or value.startswith("="):
+        return value, None
+    if _ISO_TZ_RE.fullmatch(value):
+        return value, "text-warned-tz"
+    try:
+        if _ISO_DATETIME_RE.fullmatch(value):
+            parsed = datetime.datetime.fromisoformat(value)
+            # Excel's 1900 date system starts at 1900-01-01 — earlier dates
+            # save as serial <= 0 and silently corrupt ('1899-12-31' came
+            # back as time(0, 0)).
+            if parsed.year < 1900:
+                return value, "text-warned-pre1900"
+            return parsed, "datetime"
+        if _ISO_DATE_RE.fullmatch(value):
+            parsed = datetime.date.fromisoformat(value)
+            if parsed.year < 1900:
+                return value, "text-warned-pre1900"
+            return parsed, "date"
+        if _ISO_TIME_RE.fullmatch(value):
+            return datetime.time.fromisoformat(value), "time"
+    except ValueError:
+        return value, "text-warned-invalid"
+    if _AMBIGUOUS_DATE_RE.fullmatch(value):
+        return value, "text-warned-ambiguous"
+    if explicit_type in _TEMPORAL_KINDS:
+        return value, "text-warned-invalid"
+    return value, None
+
+
+def _set_coerced(cell, value, kind, fmt=None, raw=None):
+    """Assign a coerced value with format discipline: an explicit per-cell
+    format always wins; a coerced date/datetime/time on a General cell gets
+    the decided display format; a pre-existing explicit format (template
+    workbooks) is NEVER overridden — openpyxl stamps its own ISO-ish default
+    on datetime assignment, so the prior format is captured and restored.
+    Exception: a Text-formatted target ('@' — pre-existing or requested via
+    fmt) keeps the RAW string — a date serial displayed through '@' is
+    exactly the incident symptom. Returns the effective kind for tallying."""
+    prior = cell.number_format
+    fmt = _resolve_number_format(fmt) if fmt else None
+    if kind in _TEMPORAL_KINDS and (fmt or prior) == "@" and raw is not None:
+        cell.value = raw
+        if fmt:
+            cell.number_format = fmt
+        return "text-warned-textfmt"
+    cell.value = value
+    if fmt:
+        cell.number_format = fmt
+    elif kind in _TEMPORAL_KINDS:
+        cell.number_format = (
+            _auto_display_format(kind, value) if prior == "General" else prior
+        )
+    return kind
+
+
+# Aggregate coercion reporting — one line per op (a 500-cell write must not
+# emit 500 lines): conversions to notes, warned-text kinds to errors with a
+# count and ONE example cell ref.
+_COERCE_WARN_TEXT = {
+    "text-warned-ambiguous": (
+        "look like dates but were written as TEXT (e.g. {ex}) — write ISO "
+        '2026-03-27, or pass type: "date"'
+    ),
+    "text-warned-tz": (
+        "carry a timezone suffix and were written as TEXT (e.g. {ex}) — "
+        "Excel has no timezones; convert and drop the offset"
+    ),
+    "text-warned-invalid": (
+        "are not valid ISO dates/times and were written as TEXT (e.g. {ex}) "
+        "— write strict ISO like 2026-03-27, 2026-03-27T14:30 or 14:30"
+    ),
+    "text-warned-pre1900": (
+        "predate Excel's 1900 date system and were written as TEXT (e.g. "
+        "{ex}) — Excel cannot store dates before 1900-01-01 as real dates"
+    ),
+    "text-warned-textfmt": (
+        "target Text-formatted cells ('@') and were written as TEXT (e.g. "
+        "{ex}) — clear the cell's Text format or pass format: 'date' to "
+        "store real dates"
+    ),
+}
+
+
+def _tally_coercion(tally: dict, kind: str, value, ref: str) -> None:
+    if kind in _TEMPORAL_KINDS:
+        tally["converted"] += 1
+    else:
+        tally["warned"].setdefault(kind, [0, value, ref])[0] += 1
+
+
+def _flush_coercion(tally: dict, idx: int, ot: str, sheet: str, notes, errors) -> None:
+    if tally["converted"]:
+        notes.append(
+            f"{ot} on '{sheet}': {tally['converted']} ISO date/time value(s) "
+            f"written as real dates (dd/mm/yyyy)"
+        )
+    for kind, (n, val, ref) in sorted(tally["warned"].items()):
+        errors.append(
+            f"Op #{idx} {ot}: {n} value(s) "
+            + _COERCE_WARN_TEXT[kind].format(ex=f"'{val}' at {ref}")
+        )
+
+
 # ---------------------------------------------------------------------------
 # Write — main handler
 # ---------------------------------------------------------------------------
 
 
 async def handle_write_xlsx(args: dict) -> str:
-    """Create or modify an Excel workbook with batched operations."""
+    """Create or modify an Excel workbook with batched operations.
+
+    Thin parent wrapper: path resolution and the preview push are
+    session-bound and stay here; the whole op loop (which full-DOM-loads an
+    existing workbook — the same allocation profile that took the read path
+    down) runs in a bounded worker child."""
+    path = await _resolve_path(args["path"], writing=True)
+    ops, dropped = _normalize_operations(args.get("operations"))
+    await _preresolve_image_ops(ops)
+    try:
+        msg = await run_parse(
+            _write_xlsx_core, path, ops, dropped,
+            bool(args.get("create_new", False)),
+            _advice=_WRITE_OP_ADVICE,
+        )
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path + _WORKER_TMP_SUFFIX)
+        raise
+    await _push_preview(path)
+    return msg
+
+
+def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
+    """Worker core: op application + atomic save + readback message."""
     from openpyxl import Workbook, load_workbook
     from openpyxl.chart import (
         AreaChart,
@@ -395,12 +783,9 @@ async def handle_write_xlsx(args: dict) -> str:
         get_column_letter,
         range_boundaries,
     )
+    from openpyxl.worksheet.cell_range import MultiCellRange
     from openpyxl.worksheet.datavalidation import DataValidation
     from openpyxl.worksheet.table import Table, TableStyleInfo
-
-    path = await _resolve_path(args["path"], writing=True)
-    ops, dropped = _normalize_operations(args.get("operations"))
-    create_new = args.get("create_new", False)
 
     chart_warning = None
     if Path(path).exists() and not create_new:
@@ -431,7 +816,12 @@ async def handle_write_xlsx(args: dict) -> str:
     # note instead.
     touched: dict[str, list[int]] = {}
     structural: list[str] = []
+    notes: list[str] = []
     eq_tmp_files: list[str] = []
+    # (op index, formula1) of list validations added by reference — checked
+    # against the workbook's defined names after ALL ops ran, so op order
+    # (define_name after add_data_validation) doesn't matter.
+    dv_name_refs: list[tuple[int, str]] = []
 
     def _touch(ws, row1: int, col1: int, row2: int | None = None, col2: int | None = None):
         row2 = row2 if row2 is not None else row1
@@ -505,20 +895,29 @@ async def handle_write_xlsx(args: dict) -> str:
 
             elif ot == "write_cells":
                 ws = _get_sheet(wb, op)
+                tally = {"converted": 0, "warned": {}}
                 # Format 1: individual cells
                 cells_list = op.get("cells")
                 if cells_list and isinstance(cells_list, list):
                     for c in cells_list:
                         ref = c.get("cell", "")
                         if ref:
-                            ws[ref] = c.get("value", "")
+                            val, kind = _coerce_cell_value(
+                                c.get("value", ""), c.get("type")
+                            )
+                            kind = _set_coerced(
+                                ws[ref], val, kind, c.get("format"),
+                                raw=c.get("value"),
+                            )
+                            if kind is not None:
+                                _tally_coercion(tally, kind, c.get("value"), ref)
                             try:
                                 col, row = _parse_cell_ref(ref)
                                 _touch(ws, row, col)
                             except ValueError:
                                 pass
                 else:
-                    # Format 2: 2D array
+                    # Format 2: 2D array (no per-cell type here; strict ISO only)
                     start = op.get("start_cell", "A1")
                     data = op.get("data", [])
                     start_col, start_row = _parse_cell_ref(start)
@@ -526,14 +925,27 @@ async def handle_write_xlsx(args: dict) -> str:
                     for ri, row in enumerate(data):
                         n_cols = max(n_cols, len(row))
                         for ci, val in enumerate(row):
-                            ws.cell(
-                                row=start_row + ri,
-                                column=start_col + ci,
-                                value=val,
-                            )
+                            cval, kind = _coerce_cell_value(val)
+                            if kind is None:
+                                ws.cell(
+                                    row=start_row + ri,
+                                    column=start_col + ci,
+                                    value=cval,
+                                )
+                            else:
+                                kind = _set_coerced(
+                                    ws.cell(row=start_row + ri, column=start_col + ci),
+                                    cval, kind, raw=val,
+                                )
+                                _tally_coercion(
+                                    tally, kind, val,
+                                    f"{get_column_letter(start_col + ci)}"
+                                    f"{start_row + ri}",
+                                )
                     if data and n_cols:
                         _touch(ws, start_row, start_col,
                                start_row + len(data) - 1, start_col + n_cols - 1)
+                _flush_coercion(tally, idx, ot, ws.title, notes, errors)
 
             elif ot == "set_formula":
                 ws = _get_sheet(wb, op)
@@ -765,8 +1177,10 @@ async def handle_write_xlsx(args: dict) -> str:
                         side = Side(style="thin")
                         border = Border(left=side, right=side, top=side, bottom=side)
 
-                # Number format
+                # Number format — named preset or raw Excel code
                 nf = op.get("number_format")
+                if nf:
+                    nf = _resolve_number_format(nf)
 
                 # Protection
                 prot = None
@@ -819,10 +1233,41 @@ async def handle_write_xlsx(args: dict) -> str:
 
                 if dv_type == "list":
                     values = op.get("values", [])
+                    if (
+                        isinstance(values, list)
+                        and len(values) == 1
+                        and (
+                            str(values[0]).startswith("=")
+                            or _SHEET_RANGE_RE.fullmatch(str(values[0]))
+                        )
+                    ):
+                        # The incident shape: values: ["=SupplierList"] was
+                        # quote-wrapped into a literal one-item text list.
+                        values = str(values[0])
                     if isinstance(values, list):
-                        dv.formula1 = '"' + ",".join(str(v) for v in values) + '"'
+                        items = [str(v).replace('"', '""') for v in values]
+                        joined = ",".join(items)
+                        dv.formula1 = '"' + joined + '"'
+                        if len(joined) > 255:
+                            errors.append(
+                                f"Op #{idx} add_data_validation: Warning: "
+                                f"literal list is {len(joined)} chars — Excel "
+                                f"caps in-formula lists at 255; put the items "
+                                f"in cells and reference the range instead"
+                            )
+                        if any("," in str(v) for v in values):
+                            errors.append(
+                                f"Op #{idx} add_data_validation: Warning: "
+                                f"literal items containing commas are split "
+                                f"into separate entries by Excel; put the "
+                                f"items in cells and reference the range "
+                                f"instead"
+                            )
                     else:
-                        dv.formula1 = str(values)  # cell range reference
+                        # Named range or sheet-qualified range reference
+                        ref = _strip_leading_eq(str(values))
+                        dv.formula1 = ref
+                        dv_name_refs.append((idx, ref))
                 elif dv_type in ("whole", "decimal"):
                     dv.operator = op.get("operator", "between")
                     if op.get("min") is not None:
@@ -840,7 +1285,7 @@ async def handle_write_xlsx(args: dict) -> str:
                     if op.get("max"):
                         dv.formula2 = str(op["max"])
                 elif dv_type == "custom":
-                    dv.formula1 = op.get("formula", "")
+                    dv.formula1 = _strip_leading_eq(str(op.get("formula", "")))
 
                 if op.get("allow_blank") is not None:
                     dv.allow_blank = op["allow_blank"]
@@ -855,7 +1300,53 @@ async def handle_write_xlsx(args: dict) -> str:
                     dv.promptTitle = op.get("prompt_title", "")
 
                 dv.add(dv_range)
+                # Re-running a corrected op must replace the rule on the same
+                # cells, not stack a second one — stacked same-sqref rules of
+                # any type put Excel into repair.
+                sq = str(dv.sqref)
+                ws.data_validations.dataValidation = [
+                    r for r in ws.data_validations.dataValidation
+                    if str(r.sqref) != sq
+                ]
+                for existing in ws.data_validations.dataValidation:
+                    if _sqref_intersects(dv.sqref, existing.sqref):
+                        errors.append(
+                            f"Op #{idx} add_data_validation: new rule "
+                            f"overlaps existing validation at "
+                            f"{existing.sqref} — Excel allows one rule per "
+                            f"cell; use remove_data_validation first"
+                        )
                 ws.add_data_validation(dv)
+
+            elif ot == "remove_data_validation":
+                ws = _get_sheet(wb, op)
+                rules = ws.data_validations.dataValidation
+                if op.get("range"):
+                    target = MultiCellRange(op["range"])
+                    keep = [
+                        r for r in rules
+                        if not _sqref_intersects(r.sqref, target)
+                    ]
+                    removed = len(rules) - len(keep)
+                    ws.data_validations.dataValidation = keep
+                    if removed == 0:
+                        errors.append(
+                            f"Op #{idx} remove_data_validation: no "
+                            f"validation rules intersect {op['range']}"
+                        )
+                elif op.get("all"):
+                    removed = len(rules)
+                    ws.data_validations.dataValidation = []
+                else:
+                    errors.append(
+                        f"Op #{idx} remove_data_validation: provide range "
+                        f"or all: true"
+                    )
+                    continue
+                notes.append(
+                    f"remove_data_validation on '{ws.title}': "
+                    f"{removed} rule(s) removed"
+                )
 
             elif ot == "conditional_format":
                 ws = _get_sheet(wb, op)
@@ -902,9 +1393,14 @@ async def handle_write_xlsx(args: dict) -> str:
                 from openpyxl.workbook.defined_name import DefinedName
 
                 name = op["name"]
-                sheet_name = op.get("sheet", wb.sheetnames[0])
-                cell_range = op["range"]
-                ref = f"'{sheet_name}'!{cell_range}"
+                cell_range = _strip_leading_eq(str(op["range"]))
+                if "!" in cell_range:
+                    # Already sheet-qualified — prefixing again produces an
+                    # invalid double-qualified reference.
+                    ref = cell_range
+                else:
+                    sheet_name = op.get("sheet", wb.sheetnames[0])
+                    ref = f"'{sheet_name}'!{cell_range}"
                 defn = DefinedName(name, attr_text=ref)
                 wb.defined_names.add(defn)
 
@@ -952,15 +1448,38 @@ async def handle_write_xlsx(args: dict) -> str:
                         ws.cell(row=data_start_row, column=data_start_col + 1 + si,
                                 value=s.get("name", f"Series {si + 1}"))
 
-                    # Write data rows
+                    # Write data rows — same value coercion as write_cells
+                    # (headers stay verbatim: a date-shaped series NAME must
+                    # not turn into a date cell under titles_from_data).
+                    tally = {"converted": 0, "warned": {}}
                     for ri, cat in enumerate(categories):
-                        ws.cell(row=data_start_row + 1 + ri, column=data_start_col, value=cat)
+                        cval, kind = _coerce_cell_value(cat)
+                        kind = _set_coerced(
+                            ws.cell(row=data_start_row + 1 + ri, column=data_start_col),
+                            cval, kind, raw=cat,
+                        )
+                        if kind is not None:
+                            _tally_coercion(
+                                tally, kind, cat,
+                                f"{get_column_letter(data_start_col)}"
+                                f"{data_start_row + 1 + ri}",
+                            )
                         for si, s in enumerate(series_list):
                             vals = s.get("values", [])
                             if ri < len(vals):
-                                ws.cell(row=data_start_row + 1 + ri,
-                                        column=data_start_col + 1 + si,
-                                        value=vals[ri])
+                                vval, vkind = _coerce_cell_value(vals[ri])
+                                vkind = _set_coerced(
+                                    ws.cell(row=data_start_row + 1 + ri,
+                                            column=data_start_col + 1 + si),
+                                    vval, vkind, raw=vals[ri],
+                                )
+                                if vkind is not None:
+                                    _tally_coercion(
+                                        tally, vkind, vals[ri],
+                                        f"{get_column_letter(data_start_col + 1 + si)}"
+                                        f"{data_start_row + 1 + ri}",
+                                    )
+                    _flush_coercion(tally, idx, ot, ws.title, notes, errors)
 
                     # Build references
                     num_rows = len(categories)
@@ -1025,9 +1544,7 @@ async def handle_write_xlsx(args: dict) -> str:
 
             elif ot == "add_image":
                 ws = _get_sheet(wb, op)
-                img_path = await _resolve_path(
-                    op.get("image_path") or op.get("path") or op.get("image", "")
-                )
+                img_path = _checked_resolved(op.get("image_path", ""))
                 img = XlImage(img_path)
                 if op.get("width"):
                     img.width = int(op["width"])
@@ -1096,14 +1613,35 @@ async def handle_write_xlsx(args: dict) -> str:
             errors.append(f"Op #{idx} {ot}: {exc}")
             logger.warning(f"write_xlsx op #{idx} '{ot}' failed: {exc}")
 
-    # Save even if some operations failed (partial success)
+    # Typo guard: a list validation referencing a defined name that exists
+    # nowhere in the workbook renders as a dead dropdown with no error
+    # anywhere. Excel names are case-insensitive — compare casefolded.
+    if dv_name_refs:
+        known = {str(n).casefold() for n in wb.defined_names}
+        for ws_named in wb.worksheets:
+            known |= {str(n).casefold() for n in ws_named.defined_names}
+        for op_idx, ref in dv_name_refs:
+            if "(" in ref or not _BARE_NAME_RE.fullmatch(ref):
+                continue
+            if _A1_REF_RE.fullmatch(ref):
+                continue
+            if ref.casefold() not in known:
+                errors.append(
+                    f"Op #{op_idx} add_data_validation: Warning: list "
+                    f"references '{ref}' but no defined name in the workbook "
+                    f"matches it — the dropdown will be empty"
+                )
+
+    # Save even if some operations failed (partial success). Atomic: a
+    # killed worker must never leave the user's workbook truncated.
     try:
-        wb.save(path)
+        tmp = path + _WORKER_TMP_SUFFIX
+        wb.save(tmp)
+        os.replace(tmp, path)
     finally:
         for tmp_path in eq_tmp_files:
             with contextlib.suppress(OSError):
                 Path(tmp_path).unlink()
-    await _push_preview(path)
 
     msg = f"Workbook saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)
@@ -1112,6 +1650,8 @@ async def handle_write_xlsx(args: dict) -> str:
             "\nStructural changes (cell coordinates shifted accordingly):\n"
             + "\n".join(f"  - {s}" for s in structural)
         )
+    if notes:
+        msg += "\nNotes:\n" + "\n".join(f"  - {n}" for n in notes)
     if errors:
         msg += f"\n\nWarnings/Errors ({len(errors)}):\n" + "\n".join(f"  - {e}" for e in errors)
 

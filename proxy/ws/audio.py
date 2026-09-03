@@ -42,8 +42,10 @@ async def ws_audio_stt_handler(websocket: WebSocket):
     sampwidth = 2  # 16-bit PCM
 
     try:
-        # 1. First frame: init + token (validated before any audio is accepted).
-        init = await websocket.receive_json()
+        # 1. First frame: init + token (validated before any audio is
+        # accepted). Bounded — an unauthenticated client must not park the
+        # socket open forever waiting for a frame it never sends.
+        init = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
         if not isinstance(init, dict) or init.get("type") != "init":
             await websocket.close(code=_CLOSE_BAD_INIT)
             return
@@ -80,6 +82,11 @@ async def ws_audio_stt_handler(websocket: WebSocket):
         # its own endpointing (advanced.chat_endpointing_ms) so low-latency call
         # tuning never tightens chat commits; unset → the provider's call value.
         chat_endpointing = (row.get("advanced") or {}).get("chat_endpointing_ms")
+        # Dictation semantics: the composer paints interims as committed text,
+        # so the provider must never let painted words die with an empty/short
+        # final (it promotes the shown interim instead). Chat-relay-only — the
+        # call/duplex pipelines share the provider class and must not get this.
+        getattr(provider, "enable_dictation_mode", lambda: None)()
         try:
             await provider.start(
                 language, sample_rate=sample_rate, interim_results=True,
@@ -189,7 +196,8 @@ async def ws_audio_tts_handler(websocket: WebSocket):
 
     try:
         # 1. First frame: init + token (validated before any synthesis).
-        init = await websocket.receive_json()
+        # Bounded like the STT twin — no unauthenticated socket parking.
+        init = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
         if not isinstance(init, dict) or init.get("type") != "init":
             await websocket.close(code=_CLOSE_BAD_INIT)
             return
@@ -255,6 +263,19 @@ async def ws_audio_tts_handler(websocket: WebSocket):
                 if max_chars and total_chars > max_chars:
                     await websocket.send_json({"type": "error", "code": "max_chars",
                                                "message": "Maximum speech length reached"})
+                    provider.cancel()
+                    break
+                # Same per-user character budget as the HTTP TTS routes —
+                # without it, looping mint → WS → per-session cap would
+                # burn provider spend past the admin's per-minute limit.
+                ok, retry = await asyncio.to_thread(
+                    audio_service.check_tts_rate, user_sub, len(text),
+                )
+                if not ok:
+                    await websocket.send_json({
+                        "type": "error", "code": "rate_limited",
+                        "message": f"TTS character budget exceeded — retry in {retry}s",
+                    })
                     provider.cancel()
                     break
                 await provider.send_text_chunk(text)

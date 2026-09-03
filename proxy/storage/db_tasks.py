@@ -190,7 +190,9 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
               session_id: str | None = None, chat_id: str | None = None,
               scope_user_sub: str | None = None,
               created_by: str | None = None,
-              exclude_task_type: str | None = None) -> list[dict]:
+              exclude_task_type: str | None = None,
+              agents_filter: list[str] | None = None,
+              edge_agents_filter: list[str] | None = None) -> list[dict]:
     """List task runs with optional scope filtering.
 
     scope_user_sub: when set, only returns runs where scope='agent' OR
@@ -199,6 +201,13 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     exclude_task_type: drop one run class from the listing (the dashboard
     excludes 'delegate' — delegations live in the chat history, not the
     Tasks page; direct task_id queries and schedules-mcp include them).
+    agents_filter: restrict to these agents IN SQL (the caller's accessible
+    set) — must constrain the same query that pages/counts, or LIMIT/total
+    go wrong. None = unconstrained; [] = no reach, no rows.
+    edge_agents_filter: extra agents a NO-USER caller may read via its
+    delegation edges — agent-scope rows only (never other users' user-scope
+    runs), OR-ed onto agents_filter in the same paged query. Only
+    meaningful alongside agents_filter.
 
     Each row carries a computed ``unread`` bool — the run chat's last response
     landed after its read marker (same rule as ``list_chats``; the marker is
@@ -214,6 +223,17 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     if agent:
         conditions.append("tr.agent=%s")
         params.append(agent)
+    if agents_filter is not None:
+        if edge_agents_filter:
+            conditions.append(
+                "(tr.agent = ANY(%s) OR (tr.agent = ANY(%s) "
+                "AND tr.scope IS DISTINCT FROM 'user'))"
+            )
+            params.append(list(agents_filter))
+            params.append(list(edge_agents_filter))
+        else:
+            conditions.append("tr.agent = ANY(%s)")
+            params.append(list(agents_filter))
     if status:
         conditions.append("tr.status=%s")
         params.append(status)
@@ -298,7 +318,9 @@ def count_active_delegate_runs(created_by: str) -> int:
 def get_run_count(agent: str | None = None, status: str | None = None,
                   scope_user_sub: str | None = None,
                   created_by: str | None = None,
-                  exclude_task_type: str | None = None) -> int:
+                  exclude_task_type: str | None = None,
+                  agents_filter: list[str] | None = None,
+                  edge_agents_filter: list[str] | None = None) -> int:
     conditions = []
     params: list[Any] = []
     if exclude_task_type:
@@ -307,6 +329,17 @@ def get_run_count(agent: str | None = None, status: str | None = None,
     if agent:
         conditions.append("agent=%s")
         params.append(agent)
+    if agents_filter is not None:
+        if edge_agents_filter:
+            conditions.append(
+                "(agent = ANY(%s) OR (agent = ANY(%s) "
+                "AND scope IS DISTINCT FROM 'user'))"
+            )
+            params.append(list(agents_filter))
+            params.append(list(edge_agents_filter))
+        else:
+            conditions.append("agent = ANY(%s)")
+            params.append(list(agents_filter))
     if status:
         conditions.append("status=%s")
         params.append(status)
@@ -365,7 +398,9 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                         community_template_item_slug: str | None = None,
                         target_chat_id: str | None = None,
                         max_runs: int | None = None,
-                        until_at: str | None = None) -> None:
+                        until_at: str | None = None,
+                        override_model: str | None = None,
+                        override_execution_path: str | None = None) -> None:
     """Insert a dynamic_tasks row.
 
     ``community_template`` + ``community_template_item_slug`` are populated
@@ -376,6 +411,11 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
     ``target_chat_id`` runs the task's turn inside that existing chat
     (chat-surface delegation + continuations); ``max_runs``/``until_at``
     bound recurring continuations.
+
+    ``override_model`` / ``override_execution_path`` pin this task's runs to
+    a specific model / execution layer. Empty (the default) = inherit the
+    agent's default at fire time; the caller validates against the agent's
+    envelope before writing.
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -387,15 +427,17 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                 on_complete_chat_id, continue_session, use_persistent, scope,
                 notification_mode, notify_severity, user_tz,
                 community_template, community_template_item_slug,
-                target_chat_id, max_runs, until_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                target_chat_id, max_runs, until_at,
+                override_model, override_execution_path)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (task_id, agent, name, prompt, llm_mode, task_type, schedule, run_at,
              delay_seconds, interval_seconds, timeout_seconds, now, created_by,
              on_complete_agent, on_complete_prompt, on_complete_session_id,
              on_complete_chat_id, continue_session, use_persistent, scope,
              notification_mode, notify_severity, user_tz,
              community_template, community_template_item_slug,
-             target_chat_id, max_runs, until_at),
+             target_chat_id, max_runs, until_at,
+             override_model or "", override_execution_path or ""),
         )
         conn.commit()
 
@@ -446,6 +488,22 @@ def count_user_visible_dynamic_tasks_by_agent(user_sub: str) -> dict[str, int]:
             "WHERE scope='agent' OR (scope='user' AND created_by=%s) "
             "GROUP BY agent",
             (user_sub,),
+        ).fetchall()
+        return {r["agent"]: r["cnt"] for r in rows}
+
+
+def count_recent_runs_by_agent(since: str, user_sub: str) -> dict[str, int]:
+    """{agent: run_count} for task runs started since ``since`` that this
+    user may see — agent-scoped (shared) + their OWN user-scoped, the same
+    predicate as :func:`count_user_visible_dynamic_tasks_by_agent`. Feeds the
+    agents-map heat (task half); ``idx_runs_started_at`` keeps it cheap."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT agent, COUNT(*) AS cnt FROM task_runs "
+            "WHERE started_at >= %s "
+            "AND (scope='agent' OR (scope='user' AND created_by=%s)) "
+            "GROUP BY agent",
+            (since, user_sub),
         ).fetchall()
         return {r["agent"]: r["cnt"] for r in rows}
 
@@ -549,6 +607,11 @@ _EDITABLE_TASK_COLUMNS = {
     "notify_severity",
     "task_type",  # auto-derived by the service helper when timing fields change
     "user_tz",  # IANA timezone snapshot — change forces re-register with new trigger TZ
+    # Per-task execution overrides — retune a live schedule onto another
+    # model / engine, or pass "" to fall back to the agent's default. Both
+    # are re-validated against the agent's envelope by the API layer.
+    "override_model",
+    "override_execution_path",
 }
 
 

@@ -115,7 +115,7 @@ class TestMidTurnReattach:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
@@ -184,6 +184,60 @@ class TestBgNudgeServerTurn:
                     ("event", "bg_nudge"),
                     ("assistant", "reviewed"),
                 ]
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+    def test_bg_nudge_with_labels_names_the_agents(self, temp_db,
+                                                   monkeypatch):
+        """A labels-carrying payload (monitors ≥ this round) names WHICH
+        agents finished in the composed review prompt and persists the
+        labels in the event row."""
+        import json as _json
+        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.session.session_state import _dashboard_notify_queues
+
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"content": "reviewed"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        labels = ['"probe auth flow" [a7b954]', '"scan fs" [b1c2d3]']
+        nudge_text = (
+            'Your 2 background agent(s) have completed: '
+            '"probe auth flow" [a7b954]; "scan fs" [b1c2d3]. '
+            "Please review the results and continue."
+        )
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+
+                _dashboard_notify_queues[sid].put_nowait({
+                    "type": "bg_nudge", "count": 2,
+                    "chat_id": chat_id, "session_id": sid,
+                    "labels": labels,
+                })
+
+                await ws.expect({"type": "bg_agents_complete", "count": 2})
+                # Drain the rest of the turn without pinning every frame —
+                # the un-labeled twin above covers the full sequence.
+                while True:
+                    frame = await ws.next_frame()
+                    if frame.get("type") == "done":
+                        break
+                await ws.expect({"type": "chat_status", "chat_id": chat_id,
+                                 "status": "ready"})
+
+                assert [p for _s, p, _k in layer.messages] == [nudge_text]
+                msgs = temp_db.get_chat_messages(chat_id)
+                ev = next(m for m in msgs
+                          if (m["event_type"] or "") == "bg_nudge")
+                assert _json.loads(ev["event_data"])["labels"] == labels
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
@@ -332,7 +386,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "ready"})
                 await ws.expect({"type": "turn_complete", "chat_id": chat_id,
-                                 "title": f"{slug} finished",
+                                 "title": "WS Dash Test finished",  # display name (harness agent), not slug
                                  "body": "Response ready"})
                 ws.client_send({"type": "close"})
             ws.no_more_frames()

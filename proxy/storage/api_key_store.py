@@ -200,6 +200,7 @@ def cleanup_user_api_keys(user_sub: str) -> int:
     """Delete all keys for a user. Used on user deletion."""
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM user_api_keys WHERE user_sub=%s", (user_sub,))
+        conn.commit()
         return cur.rowcount
 
 

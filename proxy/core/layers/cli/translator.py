@@ -24,12 +24,20 @@ from core.layers.cli.helpers import (
     _SKIP_INLINE_TOOLS,
 )
 from core.session.session_state import get_subagent_registry
-from core.events.bg_command_state import get_bg_command_registry, TERMINAL_STATUSES
+from core.events.bg_command_state import (
+    get_bg_command_registry, shorten_label, TERMINAL_STATUSES,
+)
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger("cli-translator")
+
+
+# Sessions already warned about a context-window mismatch (see
+# _warn_context_window_drift). Module-level because the translator itself is
+# rebuilt every turn — a per-instance flag would fire once per TURN.
+_ctx_window_warned: set[str] = set()
 
 
 # The CLI's fixed `--resume` handshake reply. String-matching CLI-synthesized
@@ -240,6 +248,15 @@ class ClaudeCLIEventTranslator:
         if subtype in _SILENT_SYSTEM_SUBTYPES:
             return []
 
+        if subtype == "background_tasks_changed":
+            # 2.1.243+: a full pending-set snapshot on every membership
+            # change. Reconcile-only (heals a LOST completion frame) and
+            # suppressed from chat blocks — task_started/task_updated stay
+            # the spawn/complete signals.
+            from core.session.session_state import reconcile_background_snapshot
+            reconcile_background_snapshot(self.session_id, data)
+            return []
+
         if subtype == "thinking_tokens":
             # Adaptive-effort models (Opus 4.7+) don't stream thinking CONTENT
             # — the CLI sends this per-chunk token-estimate ping instead (one
@@ -328,7 +345,12 @@ class ClaudeCLIEventTranslator:
             )]
 
         if task_type == "local_agent":
-            reg.register_spawn(data.get("task_id", ""), tool_use_id)
+            task_id = data.get("task_id", "")
+            # Nudge label: description (the Task tool's own summary) plus the
+            # agentId the model already holds as its SendMessage handle.
+            desc = shorten_label(data.get("description", ""))
+            label = f'"{desc}" [{task_id}]' if desc else task_id
+            reg.register_spawn(task_id, tool_use_id, label=label)
         elif task_type == "local_bash":
             # Backgrounded shell command: bind its shell id (task_id) to the
             # spawning Bash tool_use_id (gates the completion wait — task producer
@@ -338,19 +360,24 @@ class ClaudeCLIEventTranslator:
             # badge. The pill's collapsed line is the description; it expands to
             # the real command (staged at the Bash tool_use's content_block_stop
             # — see _bg_bash_commands). Completion arrives via task_updated.
-            get_bg_command_registry(self.session_id).register_spawn(
-                data.get("task_id", ""), tool_use_id,
-            )
+            task_id = data.get("task_id", "")
             desc = data.get("description", "")
-            # The real command was staged at the Bash tool_use's
-            # content_block_stop — task_started only carries the description.
-            # An empty miss is fine: the dashboard pill falls back to the
-            # paired Bash tool card's input (pairBgCommandBlocks).
+            command = self._bg_bash_commands.pop(tool_use_id, "")
+            # Nudge label: the shell id FIRST — it's the handle the model saw
+            # in its Bash result ("running in background with ID: bXXX") and
+            # what BashOutput/KillShell take — plus the command for recognition.
+            text = shorten_label(command or desc)
+            label = f"{task_id} — {text}" if text else task_id
+            get_bg_command_registry(self.session_id).register_spawn(
+                task_id, tool_use_id, label=label,
+            )
+            # An empty command miss is fine: the dashboard pill falls back to
+            # the paired Bash tool card's input (pairBgCommandBlocks).
             return [ClaudeStreamChunk(
                 event_type="bg_command_start",
                 event_data={
                     "tool_use_id": tool_use_id,
-                    "command": self._bg_bash_commands.pop(tool_use_id, ""),
+                    "command": command,
                     "description": desc,
                 },
                 session_id=self.actual_session_id,
@@ -790,6 +817,7 @@ class ClaudeCLIEventTranslator:
 
         # Metadata
         context_max = _extract_context_window(data)
+        self._warn_context_window_drift(data)
         meta: dict = {
             "cost_usd": data.get("total_cost_usd", 0.0),
             "duration_ms": data.get("duration_ms", 0),
@@ -809,6 +837,38 @@ class ClaudeCLIEventTranslator:
         ))
 
         return chunks
+
+    def _warn_context_window_drift(self, data: dict) -> None:
+        """Warn once per session when the CLI's reported context window
+        disagrees with the model registry.
+
+        A CLI build that predates a model reports its generic default
+        contextWindow for it, so the gauge — and the CLI's own auto-compact —
+        run against the wrong window. The registry never overrides the gauge
+        (the live CLI is the truth for what the process actually enforces);
+        this is the tripwire that makes a stale CLI on the execution target
+        visible in the proxy log.
+        """
+        sid = self.actual_session_id or ""
+        if not sid or sid in _ctx_window_warned:
+            return
+        import config as app_config
+        for model_id, usage in (data.get("modelUsage") or {}).items():
+            if not isinstance(usage, dict):
+                continue
+            entry = app_config.MODEL_REGISTRY.get(model_id)
+            reported = usage.get("contextWindow", 0)
+            if entry and reported and reported != entry.get("context_window"):
+                if len(_ctx_window_warned) > 4096:
+                    _ctx_window_warned.clear()
+                _ctx_window_warned.add(sid)
+                logger.warning(
+                    "Session %s: CLI reports context window %s for %s "
+                    "(registry: %s) — the execution target's CLI likely "
+                    "predates this model",
+                    sid, reported, model_id, entry.get("context_window"),
+                )
+                return
 
     def reset_for_settle(self) -> None:
         """Reset per-turn parsing state on settle entry (after result).

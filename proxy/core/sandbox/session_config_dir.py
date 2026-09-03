@@ -32,6 +32,58 @@ _HOOKS_DIR = app_config.BASE_DIR / "hooks"
 _INTERCEPTOR_SRC = Path(__file__).resolve().parent.parent / "stdio_path_interceptor.py"
 
 
+def _write_no_follow(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write ``data`` to ``path`` refusing to follow a symlink at the leaf.
+
+    The ``.claude``/``.codex`` trees sit inside agent-WRITABLE binds, so an
+    agent can replace ``settings.json`` (or a hook script) with a symlink
+    between sessions — a plain ``write_text`` would then write host-side at
+    the symlink's target as the proxy uid. An existing symlink is unlinked
+    and the file recreated; ``O_NOFOLLOW`` closes the race. Mode is set via
+    ``fchmod`` on the open fd (no separate follow-prone chmod on the path).
+    """
+    try:
+        if path.is_symlink():
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                 0o644)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(data)
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _verified_session_dir(agent_name: str, *parts: str) -> Path:
+    """Build ``agents/<agent>/parts...`` refusing symlinked components.
+
+    Same invariant as ``sandbox._verified_literal_path``: the dir chain lives
+    under agent-writable binds, so verify realpath == literal BEFORE mkdir
+    (a follow-prone ``mkdir -p`` would create dirs at a planted symlink's
+    target) and again after. Raises on tampering — a session must fail
+    loudly rather than write its config through a redirected path.
+    """
+    root_real = Path(os.path.realpath(app_config.get_agent_dir(agent_name)))
+    expected = root_real.joinpath(*parts)
+    if os.path.realpath(expected) != str(expected):
+        raise RuntimeError(
+            f"Refusing session config dir {expected}: a path component is a "
+            f"symlink (possible tampering)"
+        )
+    expected.mkdir(parents=True, exist_ok=True)
+    if os.path.realpath(expected) != str(expected):
+        raise RuntimeError(
+            f"Refusing session config dir {expected}: path changed "
+            f"underneath the build (possible tampering)"
+        )
+    return expected
+
+
 def _copy_hook_lf(src: Path, dst: Path) -> None:
     """Copy a hook/interceptor script into a sandbox, normalizing to LF and
     forcing the executable bit. A stray CR in the shebang
@@ -40,9 +92,9 @@ def _copy_hook_lf(src: Path, dst: Path) -> None:
     (``/usr/bin/env: 'python3\\r': No such file or directory``) and silently
     bypasses enforcement. Normalize defensively so an editor/git CRLF can never
     break hook execution inside the sandbox (vs ``shutil.copy2``, which copies
-    bytes + perms verbatim)."""
-    dst.write_bytes(src.read_bytes().replace(b"\r\n", b"\n"))
-    os.chmod(dst, 0o755)
+    bytes + perms verbatim). Writes via ``_write_no_follow`` — the dst lives
+    in an agent-writable tree, so a planted symlink must not be followed."""
+    _write_no_follow(dst, src.read_bytes().replace(b"\r\n", b"\n"), mode=0o755)
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +261,11 @@ def ensure_persistent_claude_dir(
 
     Returns the host path to the .claude/ directory.
     """
-    agent_dir = app_config.get_agent_dir(agent_name)
-
     if username and scope == "user":
-        claude_dir = agent_dir / "users" / username / ".claude"
+        claude_dir = _verified_session_dir(
+            agent_name, "users", username, ".claude")
     else:
-        claude_dir = agent_dir / "workspace" / ".claude"
-
-    claude_dir.mkdir(parents=True, exist_ok=True)
+        claude_dir = _verified_session_dir(agent_name, "workspace", ".claude")
 
     # Defensive cleanup: Claude Code CLI's built-in auto-memory (slash
     # ``/memory`` command + auto-imports from ``MEMORY.md``) writes to
@@ -245,9 +294,8 @@ def ensure_persistent_claude_dir(
         sandbox_claude_dir = "/workspace/.claude"
     settings = _build_sandbox_cli_settings(sandbox_claude_dir)
 
-    (claude_dir / "settings.json").write_text(
-        json.dumps(settings, indent=2) + "\n"
-    )
+    _write_no_follow(claude_dir / "settings.json",
+                     (json.dumps(settings, indent=2) + "\n").encode())
 
     # Copy hook scripts into .claude/ dir (LF-normalized + executable — see
     # _copy_hook_lf; a CRLF shebang silently breaks hook execution).
@@ -293,14 +341,11 @@ def ensure_persistent_codex_dir(
 
     Returns the host path to the .codex/ directory.
     """
-    agent_dir = app_config.get_agent_dir(agent_name)
-
     if username and scope == "user":
-        codex_dir = agent_dir / "users" / username / ".codex"
+        codex_dir = _verified_session_dir(
+            agent_name, "users", username, ".codex")
     else:
-        codex_dir = agent_dir / "workspace" / ".codex"
-
-    codex_dir.mkdir(parents=True, exist_ok=True)
+        codex_dir = _verified_session_dir(agent_name, "workspace", ".codex")
 
     # Write hooks.json (Codex hook format) — always sandbox-internal paths
     if username and scope == "user":
@@ -309,9 +354,8 @@ def ensure_persistent_codex_dir(
         sandbox_codex_dir = "/workspace/.codex"
     hooks = _build_codex_hooks(sandbox_codex_dir)
 
-    (codex_dir / "hooks.json").write_text(
-        json.dumps(hooks, indent=2) + "\n"
-    )
+    _write_no_follow(codex_dir / "hooks.json",
+                     (json.dumps(hooks, indent=2) + "\n").encode())
 
     # Copy hook scripts into .codex/ dir (LF-normalized + executable — see _copy_hook_lf).
     for script_name in ("permission_gate.py", "tool_result_forwarder.py"):
@@ -448,7 +492,7 @@ def prepare_mcp_config_for_sandbox(
                     ref_path = Path(arg)
                     if ref_path.exists():
                         ref_dst = Path(host_config_dir) / ref_path.name
-                        shutil.copy2(ref_path, ref_dst)
+                        _write_no_follow(ref_dst, ref_path.read_bytes())
                         args[i] = f"{sandbox_config_dir}/{ref_path.name}"
 
         # Credential broker: inject the per-(session, mcp) capability
@@ -492,13 +536,16 @@ def prepare_mcp_config_for_sandbox(
                 interceptor_path=f"{sandbox_config_dir}/{_INTERCEPTOR_SRC.name}",
             )
 
-        # Write rewritten config
+        # Write rewritten config. No-follow: this per-session copy carries
+        # broker tokens / inline bearers and the destination dir is
+        # agent-writable — a planted symlink must never redirect it.
         dst = Path(host_config_dir) / src.name
-        dst.write_text(_json.dumps(config_data, indent=2))
+        _write_no_follow(dst, _json.dumps(config_data, indent=2).encode())
     except Exception:
-        # Fallback: simple copy without rewriting
+        # Fallback: simple copy without rewriting (same no-follow rule —
+        # falling back to a follow-prone copy would void the guard above).
         dst = Path(host_config_dir) / src.name
-        shutil.copy2(src, dst)
+        _write_no_follow(dst, src.read_bytes())
 
     # Return sandbox-internal path
     return f"{sandbox_config_dir}/{src.name}"
@@ -528,14 +575,18 @@ def materialize_ssh_keys_for_sandbox(
     """
     dst = Path(host_config_dir) / "ssh"
     shutil.rmtree(dst, ignore_errors=True)
+    # rmtree refuses (ignores) a symlink — an agent-planted ``ssh`` link
+    # would survive it, pass mkdir(exist_ok=True) via its target, and the
+    # key material below would land host-side at the target. Remove it.
+    if dst.is_symlink():
+        dst.unlink()
 
     copied = 0
     for key, src in sorted(collect_authorized_ssh_keys(agent_name).items()):
         if copied == 0:
             dst.mkdir(parents=True, exist_ok=True)
             os.chmod(dst, 0o700)
-        shutil.copy2(src, dst / key)
-        os.chmod(dst / key, 0o600)
+        _write_no_follow(dst / key, src.read_bytes(), mode=0o600)
         copied += 1
     return copied > 0
 
@@ -566,7 +617,7 @@ def collect_authorized_ssh_keys(agent_name: str) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for inst in mcp_store.get_mcp_instances_for_agent("ssh-hosts", agent_name):
         key = ((inst.get("field_values") or {}).get("key_name") or "").strip()
-        if not key or os.path.basename(key) != key:
+        if not key or os.path.basename(key) != key or key in (".", ".."):
             continue
         src = keys_dir / key
         if src.is_file():

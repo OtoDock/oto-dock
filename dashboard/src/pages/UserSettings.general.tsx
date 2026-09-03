@@ -4,7 +4,11 @@ import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, fetchCurrentUser } from '../api/auth'
 import { deletePasskey, listPasskeys, passkeySupported, registerPasskey, renamePasskey, type PasskeyInfo } from '../api/webauthn'
 import { useTheme } from '../contexts/ThemeContext'
+import { useActivityDisplay, setActivityDisplay, type ActivityDisplayMode } from '../hooks/useActivityDisplay'
 import { useClearMyMemory } from '../api/memory'
+import { useMyAudioPrefs, useUpdateMyAudioPrefs } from '../api/userAudio'
+import { useWakeKeywords } from '../api/wakeWord'
+import { useChatAudioCapability } from '../hooks/useChatAudioCapability'
 import StrongConfirmModal from '../components/StrongConfirmModal'
 
 // ---------------------------------------------------------------------------
@@ -526,6 +530,28 @@ export function TwoFactorSection() {
 
 export function AppearanceSection() {
   const { theme, setTheme } = useTheme()
+  const activityDisplay = useActivityDisplay()
+
+  const activityOptions: { value: ActivityDisplayMode; label: string; icon: React.ReactNode }[] = [
+    {
+      value: 'compact',
+      label: 'Compact',
+      icon: (
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h10M4 18h16" />
+        </svg>
+      ),
+    },
+    {
+      value: 'detailed',
+      label: 'Detailed',
+      icon: (
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+        </svg>
+      ),
+    },
+  ]
 
   const themeOptions: { value: 'system' | 'light' | 'dark'; label: string; icon: React.ReactNode }[] = [
     {
@@ -579,6 +605,91 @@ export function AppearanceSection() {
           </button>
         ))}
       </div>
+      <div className="mt-6">
+        <h3 className="text-sm font-medium text-p-text mb-1">Chat activity</h3>
+        <p className="text-sm text-p-text-secondary mb-3">
+          Compact folds tool activity into expandable summaries.
+        </p>
+        <div className="flex gap-2">
+          {activityOptions.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => setActivityDisplay(opt.value)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                activityDisplay === opt.value
+                  ? 'bg-brand text-white'
+                  : 'bg-white dark:bg-p-surface border border-p-border-light text-p-text-secondary hover:text-p-text'
+              }`}
+            >
+              {opt.icon}
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function WakeWordSection() {
+  const { data: prefs } = useMyAudioPrefs()
+  const update = useUpdateMyAudioPrefs()
+  const { data: capability } = useChatAudioCapability()
+  const enabled = prefs?.wake_word_enabled === true
+  const { data: kw } = useWakeKeywords(enabled)
+  const duplexOk = capability?.duplex?.available === true
+
+  const wakeable = (kw?.agents ?? []).filter((a) => a.wakeable)
+  const platformTarget = kw?.agents?.find((a) => a.slug === kw?.platform_target)
+
+  return (
+    <div className="mb-8">
+      <h2 className="text-lg font-medium text-p-text mb-3">Wake word</h2>
+      <p className="text-sm text-p-text-secondary mb-3">
+        Say “Hey OtoDock” — or “Hey” plus an agent’s name — on any dashboard
+        page to start a voice conversation. Detection runs entirely on this
+        device: audio never leaves it until a conversation actually starts,
+        and the microphone is only active while the dashboard is open.
+      </p>
+      <div className="flex gap-2">
+        {([false, true] as const).map((value) => (
+          <button
+            key={String(value)}
+            onClick={() => update.mutate({ wake_word_enabled: value })}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+              enabled === value
+                ? 'bg-brand text-white'
+                : 'bg-white dark:bg-p-surface border border-p-border-light text-p-text-secondary hover:text-p-text'
+            }`}
+          >
+            {value ? 'On' : 'Off'}
+          </button>
+        ))}
+      </div>
+      {enabled && !duplexOk && (
+        <p className="text-xs text-p-text-light mt-2">
+          Voice conversations are currently unavailable
+          {capability?.duplex?.reason ? ` (${capability.duplex.reason})` : ''} —
+          the wake word will activate once they are.
+        </p>
+      )}
+      {enabled && duplexOk && kw?.enabled === false && (
+        <p className="text-xs text-p-text-light mt-2">
+          Wake word is not active
+          {kw?.reason ? ` (${kw.reason})` : ''} — add an agent to your
+          account and it will start listening.
+        </p>
+      )}
+      {enabled && kw?.enabled && (
+        <p className="text-xs text-p-text-light mt-2">
+          {platformTarget
+            ? <>“Hey OtoDock” opens {platformTarget.display_name} (your favorite agent). </>
+            : null}
+          {wakeable.length > 0 && (
+            <>Also listening for: {wakeable.map((a) => `“Hey ${a.display_name}”`).join(', ')}.</>
+          )}
+        </p>
+      )}
     </div>
   )
 }
@@ -635,4 +746,4 @@ function MyMemorySection() {
   )
 }
 
-export { MyMemorySection }
+export { MyMemorySection, WakeWordSection }

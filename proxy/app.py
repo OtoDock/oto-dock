@@ -16,6 +16,8 @@ WebSocket routes:
   - /ws/phone-management   config push to the phone daemon
   - /v1/satellite          paired remote machines
   - /ws/audio/stt, /ws/audio/tts   chat-audio speech sessions
+  - /ws/duplex, /ws/duplex-engine/{id}   full-duplex chat voice bridge
+  - /v1/twilio/media/{server_id}   Twilio media stream, bridged to the phone daemon
 
 Client adapters (adapters/): handle client-specific behavior (prompt context,
 file display, task result delivery) for phone, dashboard, etc.
@@ -76,6 +78,7 @@ from api.tasks import continuations as continuations_router
 from api.events import triggers as triggers_router
 from api.agents import agents as agents_router
 from api.agents import chats as chats_router
+from api.departments import departments as departments_router
 from api.notifications import notifications as notifications_router
 from api.mcp import credentials as credentials_router
 from api.auth import oauth as oauth_router
@@ -98,7 +101,9 @@ from api.auth import setup as setup_router
 from api.phone import phone as phone_router
 from api.phone import phone_relay as phone_relay_router
 from api.phone import phone_usage as phone_usage_router
+from api.phone import twilio_relay as twilio_relay_router
 from api.audio import audio as audio_router
+from api.duplex import duplex as duplex_router
 from api.admin import title_generation as title_generation_router
 from api.internal import internal as internal_router
 from api.agent_data import memory as memory_router
@@ -128,6 +133,7 @@ app.include_router(billing_router.router)
 app.include_router(account_router.router)
 app.include_router(agents_router.router)
 app.include_router(chats_router.router)
+app.include_router(departments_router.router)
 app.include_router(notifications_router.router)
 app.include_router(credentials_router.router)
 # claude_oauth and openai_oauth use the same `/v1/oauth/{provider}/*` prefix
@@ -153,7 +159,9 @@ app.include_router(meetings_router.router)
 app.include_router(phone_router.router)
 app.include_router(phone_relay_router.router)
 app.include_router(phone_usage_router.router)
+app.include_router(twilio_relay_router.router)
 app.include_router(audio_router.router)
+app.include_router(duplex_router.router)
 app.include_router(title_generation_router.router)
 app.include_router(internal_router.router)
 app.include_router(memory_router.router)
@@ -169,6 +177,7 @@ from ws.dashboard import ws_dashboard_handler
 from ws.phone_management import ws_phone_management_handler
 from ws.satellite import ws_satellite_handler
 from ws.audio import ws_audio_stt_handler, ws_audio_tts_handler
+from ws.duplex import ws_duplex_handler, ws_duplex_engine_handler
 
 app.add_api_websocket_route("/ws/phone", ws_phone_handler)
 app.add_api_websocket_route("/ws/dashboard", ws_dashboard_handler)
@@ -176,6 +185,12 @@ app.add_api_websocket_route("/ws/phone-management", ws_phone_management_handler)
 app.add_api_websocket_route("/v1/satellite", ws_satellite_handler)
 app.add_api_websocket_route("/ws/audio/stt", ws_audio_stt_handler)
 app.add_api_websocket_route("/ws/audio/tts", ws_audio_tts_handler)
+app.add_api_websocket_route("/ws/duplex", ws_duplex_handler)
+app.add_api_websocket_route("/ws/duplex-engine/{duplex_id}", ws_duplex_engine_handler)
+# Twilio's media WebSocket enters through the public proxy and is bridged to
+# the phone daemon (see api/phone/twilio_relay.py — daemon-side signature auth).
+app.add_api_websocket_route(
+    "/v1/twilio/media/{server_id}", twilio_relay_router.ws_twilio_media_relay)
 
 
 # --- Dashboard static files ---
@@ -185,6 +200,25 @@ if config.DASHBOARD_ENABLED and config.DASHBOARD_DIST.exists():
         "/assets",
         StaticFiles(directory=str(config.DASHBOARD_DIST / "assets")),
         name="dashboard-assets",
+    )
+
+
+class _ImmutableStaticFiles(StaticFiles):
+    """Static files with far-future immutable caching — for versioned-path
+    assets only (the wake-word wasm/model bundle: ~18 MB the browser must
+    never re-download; the version directory in the URL is the cache buster)."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+
+
+if config.DASHBOARD_ENABLED and config.KWS_ASSETS_DIR.exists():
+    app.mount(
+        "/kws-assets",
+        _ImmutableStaticFiles(directory=str(config.KWS_ASSETS_DIR)),
+        name="kws-assets",
     )
 
 
@@ -223,7 +257,10 @@ async def dashboard_legacy_redirect(path: str):
 @app.get("/{path:path}", include_in_schema=False)
 async def spa_catchall(path: str):
     """Serve the React SPA for client-side routing on the subdomain."""
-    if path.startswith(("v1/", "auth/", "ws/", "api/", "assets/", "wopi/", "collabora/")):
+    # kws-assets/ included: a worker importScripts miss must 404 loudly, never
+    # serve index.html-as-JS (same discipline as ui-kit below).
+    if path.startswith(("v1/", "auth/", "ws/", "api/", "assets/", "wopi/",
+                        "collabora/", "kws-assets/")):
         raise HTTPException(status_code=404, detail="Not found")
     if path == "health":
         return JSONResponse({"status": "ok", "service": "otodock"})

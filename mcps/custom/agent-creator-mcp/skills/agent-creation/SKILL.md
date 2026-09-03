@@ -46,8 +46,31 @@ improvising.
 ├── notifications.json  # optional — scheduled notifications
 ├── setup.md            # optional — one-time setup guide for a manager
 ├── user-setup.md       # optional — per-user onboarding
+├── dashboards.json     # optional — mini-app dashboards to seed + pin
+├── dashboards/         # optional — the dashboards' *.html files
 └── context/            # optional — *.md / *.txt, always loaded
 ```
+
+### `dashboards.json` — template-shipped dashboards
+
+```json
+{"dashboards": [{
+  "slug": "team-board", "title": "Team Board", "file": "board.html",
+  "visibility": "agent", "auto_pin_for_new_users": true
+}]}
+```
+
+Ships a ready-made mini-app dashboard with the agent (≤4 per template, ≤1MB
+each, bare `*.html` names under `dashboards/`; `{agent_slug}` is
+substituted). `visibility: "agent"` = ONE shared dashboard pinned for every
+user of the installed agent; `"user"` = each user gets their own personal
+copy — the installer now, later joiners automatically when
+`auto_pin_for_new_users` (default true). The visibility must be one the
+template's mode offers (an `"agent"` dashboard on a Personal-only template
+is a validation error). HTML-only: seeded dashboards carry no action
+buttons (nothing to approve); the installed agent can re-pin with actions
+later. Author them mobile-responsive with Tailwind, exactly like `pin_app`
+apps (see the display-mcp miniapp-authoring skill).
 
 ## `agent.json`
 

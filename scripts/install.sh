@@ -121,6 +121,15 @@ else
 # The bundled PostgreSQL initialises with this password on first run.
 POSTGRES_PASSWORD=${_pw}
 
+# The phone/voice service ships enabled by default (it idles until you
+# configure telephony in the dashboard). To run without it, remove the
+# phone overlay from this line:
+COMPOSE_FILE=docker-compose.yml:docker-compose.phone.yml
+
+# FreePBX/Asterisk telephony only (Twilio needs nothing here): the address
+# your PBX reaches this server on, for the raw audio socket:
+#OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10
+
 # Uncomment if users browse to this server by name/IP rather than localhost —
 # it drives login cookies, OAuth redirects, and links in notifications:
 #DASHBOARD_PUBLIC_URL=http://your-server:8400
@@ -201,11 +210,15 @@ if [ "$(cat /proc/sys/vm/swappiness 2>/dev/null || echo 0)" -gt 10 ]; then
     fi
 fi
 
-# --- 6. Fetch the compose file and start ------------------------------------
-# The compose file pins the OtoDock release it shipped with, so the install is
-# reproducible; upgrading later is a one-line version bump (see the upgrade
-# docs). Fetched last on purpose: its presence is what marks this directory as
-# an install.
+# --- 6. Fetch the compose files and start ------------------------------------
+# The compose files pin the OtoDock release they shipped with, so the install
+# is reproducible; upgrading later is a one-line version bump (see the upgrade
+# docs). docker-compose.yml is fetched LAST on purpose: its presence is what
+# marks this directory as an install, so the overlay must already be in place
+# by then (a failed overlay fetch must not leave a half-marked install).
+say "downloading the phone service overlay (docker-compose.phone.yml)"
+fetch "$_raw/docker-compose.phone.yml" docker-compose.phone.yml
+
 say "downloading docker-compose.yml (release-pinned)"
 fetch "$_raw/docker-compose.yml" docker-compose.yml
 

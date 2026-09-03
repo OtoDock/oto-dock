@@ -19,6 +19,14 @@ import {
 // Execution Layers Section
 // ---------------------------------------------------------------------------
 
+// Mirrors the admin tab's STATUS_VARIANT — an expired row must never wear the
+// green pill it used to.
+const STATUS_CHIP: Record<string, string> = {
+  active: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+  expired: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+  disabled: 'bg-gray-200 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
+}
+
 function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const [expanded, setExpanded] = useState(false)
   const [showConnect, setShowConnect] = useState(false)
@@ -26,6 +34,11 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const [oauthState, setOauthState] = useState('')
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  // The expired row a Reconnect click is trying to revive — the backend
+  // matches by account identity, so if the user signs into a DIFFERENT
+  // account we must say so instead of leaving the dead row unexplained.
+  const [reconnectFor, setReconnectFor] = useState<Subscription | null>(null)
 
   // Block an install switch while the code-paste step is open (it would be lost).
   useEffect(() => {
@@ -58,7 +71,10 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   useEffect(() => stopPoll, [stopPoll])
 
   const userSubs = layer.user_subscriptions || []
-  const hasOwnSub = userSubs.length > 0
+  // "Your subscription" claims key on ACTIVE rows only — an expired row still
+  // lists (so it can be reconnected) but must not report a working setup.
+  const hasOwnSub = userSubs.some(s => s.status === 'active')
+  const hasExpiredSub = userSubs.some(s => s.status === 'expired')
   const supportsOAuth = layer.name === 'claude-code-cli' || layer.name === 'codex-cli'
 
   // Keep the auth user's `has_own_engine` fresh so the global "connect an AI
@@ -77,6 +93,23 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
     })()
   }, [hasOwnSub, supportsOAuth, setUser])
 
+  // After a Reconnect-driven exchange, verify the revived row IS the one the
+  // user clicked — signing into a different account creates a fresh row and
+  // leaves the expired one behind, which without this reads as "nothing
+  // happened".
+  const finishReconnect = useCallback((sub?: Subscription) => {
+    setReconnectFor(prev => {
+      if (prev && sub && sub.id !== prev.id) {
+        setNotice(
+          `You signed in as ${sub.oauth_email || 'a different account'}, so a new ` +
+          `subscription was added — “${prev.label || prev.oauth_email || 'the expired account'}” ` +
+          `is still expired. Reconnect that exact account to revive it, or remove it.`,
+        )
+      }
+      return null
+    })
+  }, [])
+
   const handleStartOAuth = useCallback(async () => {
     setError('')
     try {
@@ -94,7 +127,8 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             if (status.status === 'completed') {
               stopPoll()
               try {
-                await finishOpenAI.mutateAsync({ loginId: result.login_id, layer: layer.name })
+                const fin = await finishOpenAI.mutateAsync({ loginId: result.login_id, layer: layer.name })
+                finishReconnect(fin?.subscription)
               } catch { /* finish may 404 if already consumed — subscription still saved */ }
               setShowConnect(false)
               setOauthStep('idle')
@@ -122,20 +156,28 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
     } catch (e) {
       setError((e as Error).message)
     }
-  }, [layer.name, isOpenAI, startOpenAI, startClaude, checkStatus, finishOpenAI, stopPoll])
+  }, [layer.name, isOpenAI, startOpenAI, startClaude, checkStatus, finishOpenAI, stopPoll, finishReconnect])
 
   const handleExchange = useCallback(async () => {
     if (!code.trim() || !oauthState) return
     setError('')
     try {
-      await exchangeClaude.mutateAsync({ code: code.trim(), state: oauthState, layer: layer.name })
+      const result = await exchangeClaude.mutateAsync({ code: code.trim(), state: oauthState, layer: layer.name })
+      finishReconnect(result?.subscription)
       setShowConnect(false)
       setOauthStep('idle')
       setCode('')
     } catch (e) {
       setError((e as Error).message)
     }
-  }, [code, oauthState, layer.name, exchangeClaude])
+  }, [code, oauthState, layer.name, exchangeClaude, finishReconnect])
+
+  const handleReconnect = useCallback((sub: Subscription) => {
+    setReconnectFor(sub)
+    setNotice('')
+    setShowConnect(true)
+    void handleStartOAuth()
+  }, [handleStartOAuth])
 
   const handleDelete = (sub: Subscription) => {
     if (confirm('Remove your subscription?')) {
@@ -161,16 +203,22 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           <div className="text-sm text-p-text-secondary">
             {hasOwnSub
               ? 'Using your subscription'
-              : layer.platform_available
-                ? 'Using platform subscription'
-                : 'No subscription available'}
+              : hasExpiredSub
+                ? 'Your subscription needs reconnecting'
+                : layer.platform_available
+                  ? 'Using platform subscription'
+                  : 'No subscription available'}
           </div>
         </div>
         <div className="flex items-center gap-2">
           {/* No "Your Account" chip when the user has their own subscription —
               the subtitle already says so, and the green badge looked cramped
-              on mobile. Platform / Not Connected remain informative. */}
-          {hasOwnSub ? null : layer.platform_available ? (
+              on mobile. Reconnect / Platform / Not Connected remain informative. */}
+          {hasOwnSub ? null : hasExpiredSub ? (
+            <span className="text-xs px-2 py-0.5 rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+              Reconnect Needed
+            </span>
+          ) : layer.platform_available ? (
             <span className="text-xs px-2 py-0.5 rounded-lg bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
               Platform
             </span>
@@ -197,36 +245,60 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                 <div className="min-w-0 flex flex-wrap items-center gap-x-2 gap-y-0.5">
                   <span className="text-sm font-medium text-p-text">{sub.label || 'Claude Subscription'}</span>
                   {sub.oauth_email && <span className="text-xs text-p-text-light truncate max-w-full">{sub.oauth_email}</span>}
-                  <span className="shrink-0 text-xs px-1.5 py-0.5 rounded-sm bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
+                  <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded-sm ${STATUS_CHIP[sub.status] || STATUS_CHIP.disabled}`}>
                     {sub.status}
                   </span>
                 </div>
-                <button
-                  onClick={() => handleDelete(sub)}
-                  className="shrink-0 text-xs text-red-500 hover:text-red-600 transition-colors"
-                >
-                  Remove
-                </button>
+                <div className="shrink-0 flex items-center gap-2">
+                  {sub.status === 'expired' && supportsOAuth && (
+                    <button
+                      onClick={() => handleReconnect(sub)}
+                      className="text-xs px-2 py-1 rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
+                    >
+                      Reconnect
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleDelete(sub)}
+                    className="text-xs text-red-500 hover:text-red-600 transition-colors"
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
+              {sub.status === 'expired' && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  This account's login expired — reconnect the same account to revive it.
+                </p>
+              )}
+              {sub.status === 'disabled' && (
+                <p className="mt-1 text-xs text-p-text-light">
+                  Disabled by an administrator.
+                </p>
+              )}
               {/* Per-account scope toggles. "Personal use" is for EVERY role —
                   with several accounts connected it benches one from the
                   owner's own sessions without disconnecting it (default on).
                   "Agent pool" (contribute to the shared platform pool) stays
                   admin-only, mirroring the server-side gate. */}
-              <div className="flex items-center gap-3 mt-1.5">
-                <label className="flex items-center gap-1 text-xs text-p-text-light cursor-pointer" title="Use this account for your own chats">
+              {/* Scope toggles only mean something on a usable row — an
+                  expired/disabled account can't serve sessions either way. */}
+              <div className={`flex items-center gap-3 mt-1.5 ${sub.status !== 'active' ? 'opacity-50' : ''}`}>
+                <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === 'active' ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Use this account for your own chats">
                   <input
                     type="checkbox"
                     checked={sub.use_personal}
+                    disabled={sub.status !== 'active'}
                     onChange={(e) => updateSub.mutate({ layer: layer.name, id: sub.id, use_personal: e.target.checked })}
                   />
                   Personal use
                 </label>
                 {isAdmin && (
-                  <label className="flex items-center gap-1 text-xs text-p-text-light cursor-pointer" title="Contribute this account to the shared agent pool">
+                  <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === 'active' ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Contribute this account to the shared agent pool">
                     <input
                       type="checkbox"
                       checked={sub.contribute_platform}
+                      disabled={sub.status !== 'active'}
                       onChange={(e) => updateSub.mutate({ layer: layer.name, id: sub.id, contribute_platform: e.target.checked })}
                     />
                     Agent pool
@@ -237,18 +309,24 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           ))}
 
           {/* Platform status */}
-          {!hasOwnSub && layer.platform_available && (
+          {!hasOwnSub && hasExpiredSub && (
+            <p className="text-sm text-p-text-light">
+              {isOpenAI ? 'ChatGPT' : 'Claude'} logins have a limited lifetime — reconnecting the
+              same account above revives it in place.
+            </p>
+          )}
+          {!hasOwnSub && !hasExpiredSub && layer.platform_available && (
             <p className="text-sm text-p-text-light">
               You're using platform API credentials provided by your administrator.
               Connect your own account to use your personal subscription instead.
             </p>
           )}
-          {!hasOwnSub && !layer.platform_available && !layer.allow_platform_auth && (
+          {!hasOwnSub && !hasExpiredSub && !layer.platform_available && !layer.allow_platform_auth && (
             <p className="text-sm text-p-text-light">
               Platform subscriptions are disabled for your account. Connect your own subscription to use this layer.
             </p>
           )}
-          {!hasOwnSub && !layer.platform_available && layer.allow_platform_auth && (
+          {!hasOwnSub && !hasExpiredSub && !layer.platform_available && layer.allow_platform_auth && (
             <p className="text-sm text-p-text-light">
               No platform subscriptions are configured. Connect your own subscription to use this layer.
             </p>
@@ -260,7 +338,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
               onClick={() => setShowConnect(true)}
               className="px-4 py-2 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
             >
-              {hasOwnSub ? 'Connect Different Account' : `Connect Your ${isOpenAI ? 'ChatGPT' : 'Claude'} Account`}
+              {userSubs.length > 0 ? 'Add Another Account' : `Connect Your ${isOpenAI ? 'ChatGPT' : 'Claude'} Account`}
             </button>
           )}
 
@@ -281,7 +359,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   {(isOpenAI ? startOpenAI.isPending : startClaude.isPending) ? 'Starting...' : 'Connect'}
                 </button>
                 <button
-                  onClick={() => setShowConnect(false)}
+                  onClick={() => { setShowConnect(false); setReconnectFor(null) }}
                   className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors"
                 >
                   Cancel
@@ -311,7 +389,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                 <svg className="animate-spin h-3.5 w-3.5 text-brand" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" /></svg>
                 Waiting for authentication...
               </div>
-              <button onClick={() => { stopPoll(); setShowConnect(false); setOauthStep('idle') }} className="text-xs text-p-text-secondary hover:text-p-text transition-colors">Cancel</button>
+              <button onClick={() => { stopPoll(); setShowConnect(false); setOauthStep('idle'); setReconnectFor(null) }} className="text-xs text-p-text-secondary hover:text-p-text transition-colors">Cancel</button>
             </div>
           )}
 
@@ -337,7 +415,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   {exchangeClaude.isPending ? 'Connecting...' : 'Connect'}
                 </button>
                 <button
-                  onClick={() => { setShowConnect(false); setOauthStep('idle'); setCode('') }}
+                  onClick={() => { setShowConnect(false); setOauthStep('idle'); setCode(''); setReconnectFor(null) }}
                   className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors"
                 >
                   Cancel
@@ -346,6 +424,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             </div>
           )}
 
+          {notice && <p className="text-xs text-amber-600 dark:text-amber-400">{notice}</p>}
           {error && <p className="text-xs text-red-500">{error}</p>}
         </div>
       )}

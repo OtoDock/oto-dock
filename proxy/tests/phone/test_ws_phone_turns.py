@@ -77,18 +77,47 @@ class FakeLayer:
         self.gate: asyncio.Event | None = None  # holds generation open when set
         self.cancelled: list[str] = []
         self.prompts: list[str] = []
+        # Graceful-abort knob: None = no abort() attribute behavior (falsy →
+        # hard fallback); True = the layer interrupts the turn itself.
+        self.abort_result: bool | None = None
+        self.aborted: list[str] = []
+        # Dead-process heal knobs (test_dead_process_respawns_in_place).
+        self.process_dead = False
+        self.resume_checked: list[str] = []
+        self.prepared: list[str] = []
+        self.started: list[tuple[str, object]] = []
 
     def session_lock(self, session_id: str):
         return self._locks.setdefault(session_id, asyncio.Lock())
 
     async def is_session_alive(self, session_id: str) -> bool:
-        return False
+        return True
+
+    async def is_session_process_dead(self, session_id: str) -> bool:
+        return self.process_dead
+
+    async def can_resume_session(self, session_id: str, *, agent_name="",
+                                 username="") -> bool:
+        self.resume_checked.append(session_id)
+        return True
+
+    async def prepare_resume(self, session_id: str) -> None:
+        self.prepared.append(session_id)
 
     async def start_session(self, session_id: str, config) -> None:
-        pass
+        self.started.append((session_id, config))
+        self.process_dead = False  # respawn revives the process
 
     async def close_session(self, session_id: str) -> None:
         pass
+
+    async def abort(self, session_id: str) -> bool:
+        self.aborted.append(session_id)
+        if self.abort_result and self.gate is not None:
+            # A real graceful interrupt makes the engine CLOSE the turn —
+            # release the gate so the producer drains to completion.
+            self.gate.set()
+        return bool(self.abort_result)
 
     async def send_message(self, session_id: str, prompt: str, **kwargs):
         self.prompts.append(prompt)
@@ -165,8 +194,9 @@ def phone_ws_env(monkeypatch):
                         lambda *a, **kw: None)
     monkeypatch.setattr(ws_phone.task_store, "update_chat",
                         lambda *a, **kw: None)
+    layer.persisted = []  # (chat_id, role, content) rows the handler wrote
     monkeypatch.setattr(ws_phone.task_store, "add_chat_message",
-                        lambda *a, **kw: None)
+                        lambda *a, **kw: layer.persisted.append(a))
 
     monkeypatch.setattr(ws_phone, "ChatStreamPump", FakePump)
     monkeypatch.setattr(ws_phone, "_active_pumps", {})
@@ -235,6 +265,83 @@ def test_abort_cancels_inflight_turn(phone_ws_env):
     asyncio.run(run())
 
 
+def test_abort_graceful_interrupt_leaves_producer_draining(phone_ws_env):
+    """When layer.abort() interrupts gracefully (CLI stdin control_request /
+    Codex interrupt), the producer is NOT hard-cancelled — the engine closes
+    the turn itself and the partial reply drains + persists; the daemon's
+    turn-id filter drops the tail. Parity with the duplex chat attach."""
+    ws, layer = phone_ws_env
+
+    async def run():
+        handler = await _run_handler(ws)
+        sid = await _warmup(ws)
+
+        layer.gate = asyncio.Event()
+        layer.abort_result = True
+        ws.push({"type": "chat", "prompt": "long question", "turn": 1})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "text" and f.get("turn") == 1)
+
+        ws.push({"type": "abort", "turn": 1})
+        done = await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 1)
+        assert done is not None
+        assert layer.aborted == [sid]
+        assert layer.cancelled == []  # no hard cancel — the turn drained
+
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+
+
+def test_interruption_note_rides_next_dispatch_raw_row_persisted(phone_ws_env):
+    """After a barge-in abort on a non-direct layer, the NEXT turn's dispatch
+    carries the duplex-style interruption note (with the heard-chars phrase
+    when barge_in_chars rides the chat frame) while the DB user row keeps the
+    RAW spoken words."""
+    ws, layer = phone_ws_env
+
+    async def run():
+        handler = await _run_handler(ws)
+        await _warmup(ws)
+
+        layer.gate = asyncio.Event()
+        layer.abort_result = True
+        ws.push({"type": "chat", "prompt": "tell me a story", "turn": 1})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "text" and f.get("turn") == 1)
+        ws.push({"type": "abort", "turn": 1})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 1)
+
+        ws.push({"type": "chat", "prompt": "actually the weather",
+                 "turn": 2, "barge_in_chars": 17})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 2)
+
+        dispatched = layer.prompts[-1]
+        assert dispatched.startswith(
+            "[The user interrupted your previous spoken reply")
+        assert "heard only the first 17 characters" in dispatched
+        assert dispatched.endswith("actually the weather")
+        # DB row: raw words only, no note.
+        user_rows = [a for a in layer.persisted if a[1] == "user"]
+        assert user_rows[-1][2] == "actually the weather"
+
+        # The note is one-shot: a further turn with no new interruption
+        # dispatches clean.
+        ws.push({"type": "chat", "prompt": "thanks", "turn": 3})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 3)
+        assert layer.prompts[-1] == "thanks"
+
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+
+
 def test_chat_during_active_turn_queues_behind_session_lock(phone_ws_env):
     """A follow-up chat while a turn streams (proxy-mode drain overlap) runs
     after the first completes; both keep their own turn ids."""
@@ -263,6 +370,50 @@ def test_chat_during_active_turn_queues_behind_session_lock(phone_ws_env):
 
         done_turns = [f["turn"] for f in ws.sent if f["type"] == "done"]
         assert done_turns == [1, 2]
+
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+
+
+def test_dead_process_respawns_in_place(phone_ws_env):
+    """A turn that finds the CLI process dead (hard abort between turns,
+    satellite-side death) respawns under the SAME session id — resume
+    checked BEFORE prepare_resume, phone-shape config with resume set — and
+    then runs normally instead of erroring into the corpse forever."""
+    ws, layer = phone_ws_env
+
+    async def run():
+        handler = await _run_handler(ws)
+        sid = await _warmup(ws)
+        started_at_warmup = len(layer.started)
+
+        layer.process_dead = True
+        ws.push({"type": "chat", "prompt": "still there?", "turn": 3})
+        done = await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 3)
+        assert done is not None
+
+        # Healed: resumability checked, dead entry cleared, respawned on the
+        # same id with resume riding the config.
+        assert layer.resume_checked == [sid]
+        assert layer.prepared == [sid]
+        heals = layer.started[started_at_warmup:]
+        assert len(heals) == 1
+        heal_sid, heal_cfg = heals[0]
+        assert heal_sid == sid
+        assert heal_cfg.resume is True
+        # And the turn actually dispatched on the healed session.
+        assert layer.prompts == ["still there?"]
+        errors = [f for f in ws.sent if f["type"] == "error"]
+        assert not errors
+
+        # A live process never triggers the heal machinery.
+        ws.push({"type": "chat", "prompt": "next", "turn": 4})
+        await ws.wait_for_frame(
+            lambda f: f["type"] == "done" and f.get("turn") == 4)
+        assert layer.resume_checked == [sid]  # unchanged
 
         ws.disconnect()
         await handler

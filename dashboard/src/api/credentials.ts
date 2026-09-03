@@ -28,6 +28,10 @@ export interface OAuthMeta {
   // picker. Single-flow MCPs send a one-element list.
   flows?: string[]
   pat_instructions_url?: string
+  pat_placeholder?: string
+  // Provider-specific copy for the PAT option in the flow picker;
+  // empty → the generic FLOW_DESCRIPTIONS fallback.
+  pat_description?: string
 }
 
 export interface OverridableConfigField {

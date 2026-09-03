@@ -130,6 +130,15 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             "agents": sorted(mcp_agents.get(name, [])),
         }
 
+        # Skill packages: provenance badge — does the package bundle
+        # executable scripts/ content? (Allowed since 2026-08-27; always
+        # surfaced.)
+        if m.category == "skill":
+            from services.community.skills_installer import package_has_scripts
+            entry["has_scripts"] = await asyncio.to_thread(
+                package_has_scripts, m.mcp_dir,
+            )
+
         # Instance config info (for MCPs with per-instance, per-agent config)
         if m.instances:
             entry["instances"] = {
@@ -531,7 +540,11 @@ class AgentMcpRequest(BaseModel):
 
 
 @router.get("/v1/agents/{name}/mcps")
-async def get_agent_mcps(name: str, user: UserContext = Depends(get_current_user)):
+async def get_agent_mcps(
+    name: str,
+    include_unauthorized: bool = False,
+    user: UserContext = Depends(get_current_user),
+):
     """List all MCPs visible to an agent with their manager-enabled state.
 
     Visibility = auto-mode MCPs (always available) + explicit-mode MCPs the admin
@@ -540,6 +553,13 @@ async def get_agent_mcps(name: str, user: UserContext = Depends(get_current_user
     currently enabled it for the agent. Both rows can be toggled by the manager;
     the only difference for `authorized_by="admin"` rows is the `via admin` UI
     hint shown next to them.
+
+    With ``include_unauthorized=true`` the response ALSO carries
+    platform-enabled explicit-mode MCPs that no instance authorizes for this
+    agent yet, flagged ``authorized: false`` — the set a manager can request
+    via the MCP-request queue but cannot self-enable. The default response is
+    unchanged (every default row is implicitly ``authorized: true``); the
+    dashboard MCPs tab keeps its exact shape.
     """
     _require_manage(user, name)
 
@@ -553,10 +573,9 @@ async def get_agent_mcps(name: str, user: UserContext = Depends(get_current_user
         await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, name)
     )
 
-    mcps = []
-    for m in visible:
+    def _row(m, *, authorized: bool) -> dict:
         cred = mcp_registry.get_credential_schema(m.name)
-        mcps.append({
+        return {
             "name": m.name,
             "label": m.label,
             "description": m.description,
@@ -567,9 +586,21 @@ async def get_agent_mcps(name: str, user: UserContext = Depends(get_current_user
             # where it applies — probing the options endpoint for every row
             # painted a 400 per non-capable MCP in the console.
             "has_service_account": bool(cred.get("has_service_account")) if cred else False,
-            "enabled": m.name in enabled_set,
+            "enabled": authorized and m.name in enabled_set,
             "authorized_by": "auto" if m.assignment_mode == "auto" else "admin",
-        })
+            "authorized": authorized,
+        }
+
+    mcps = [_row(m, authorized=True) for m in visible]
+
+    if include_unauthorized:
+        unauthorized = await asyncio.to_thread(
+            mcp_registry.get_unauthorized_explicit_mcps_for_agent, name,
+        )
+        mcps.extend(
+            _row(m, authorized=False)
+            for m in unauthorized if m.category != "skill"
+        )
 
     # Sort: core category first, then alphabetical by label.
     mcps.sort(key=lambda x: (x["category"] != "core", x["label"]))
@@ -743,9 +774,15 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
         if m.category == "skill" and m.name not in assigned_names
     ]
 
+    from services.community.skills_installer import package_has_scripts
+
     result = []
     for m in list(assigned) + visible_skill_pkgs:
         pkg_assigned = m.name in assigned_names
+        # Package-level provenance badge for STANDALONE packages only (an
+        # MCP dir would false-flag on its own server code).
+        pkg_has_scripts = (package_has_scripts(m.mcp_dir)
+                           if m.category == "skill" else False)
         for skill_def in m.skills:
             db_entry = skill_map.get(skill_def.id)
             result.append({
@@ -754,6 +791,7 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
                 "mcp_label": m.label,
                 "description": skill_def.description,
                 "standalone": m.category == "skill",
+                "has_scripts": pkg_has_scripts,
                 "loading": skill_def.loading,
                 "assigned": pkg_assigned,
                 # An unassigned package's skills are OFF regardless of rows.
@@ -1284,6 +1322,56 @@ async def get_mcp_auto_update_log(user: UserContext = Depends(get_current_user))
 _MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
 
 
+async def _extract_upload_zip(file: UploadFile, tmp):
+    """Zip-hardening ladder shared by the MCP and skills install endpoints:
+    size cap, .zip only, entry count, path traversal, total-declared-
+    uncompressed bomb cap. Returns the extraction root under ``tmp``."""
+    import zipfile
+
+    content = await file.read()
+    if len(content) > _MAX_UPLOAD_SIZE:
+        raise HTTPException(400, f"File too large (max {_MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
+
+    if not file.filename or not file.filename.endswith(".zip"):
+        raise HTTPException(400, "Only .zip files are accepted")
+
+    zip_path = tmp / "upload.zip"
+    zip_path.write_bytes(content)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            infos = zf.infolist()
+            if len(infos) > 10000:
+                raise HTTPException(400, "Zip has too many entries")
+            # The total DECLARED uncompressed size is the real bomb guard: a
+            # single huge member or many members both sum here and are capped.
+            # (A per-entry compression-ratio heuristic is intentionally NOT
+            # used — valid DEFLATE legitimately reaches ~1000:1 on repetitive
+            # content, so it false-positives without catching anything the
+            # total-size cap doesn't.)
+            total_uncompressed = 0
+            for info in infos:
+                if info.filename.startswith("/") or ".." in info.filename:
+                    raise HTTPException(400, f"Invalid path in zip: {info.filename}")
+                total_uncompressed += info.file_size
+                if total_uncompressed > config.MCP_ZIP_DECOMPRESSED_MAX:
+                    raise HTTPException(400, "Zip expands to more than the allowed size")
+            zf.extractall(tmp / "extracted")
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Invalid zip file")
+    return tmp / "extracted"
+
+
+def _zip_root_with(extracted, fname: str):
+    """Root discovery: the extract root itself, or one level down (the zip
+    contained a wrapping folder). None when ``fname`` is nowhere."""
+    if (extracted / fname).is_file():
+        return extracted
+    for sd in sorted(extracted.iterdir()):
+        if sd.is_dir() and (sd / fname).is_file():
+            return sd
+    return None
+
+
 @router.post("/v1/admin/mcps/install")
 async def install_mcp(
     file: UploadFile = File(...),
@@ -1298,60 +1386,59 @@ async def install_mcp(
     """
     import shutil
     import tempfile
-    import zipfile
     from pathlib import Path
     from services.community import community_installer
 
     _require_admin(user)
 
-    content = await file.read()
-    if len(content) > _MAX_UPLOAD_SIZE:
-        raise HTTPException(400, f"File too large (max {_MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
-
-    if not file.filename or not file.filename.endswith(".zip"):
-        raise HTTPException(400, "Only .zip files are accepted")
-
     tmp = Path(tempfile.mkdtemp(prefix="mcp-install-"))
     try:
-        zip_path = tmp / "upload.zip"
-        zip_path.write_bytes(content)
-
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                infos = zf.infolist()
-                if len(infos) > 10000:
-                    raise HTTPException(400, "Zip has too many entries")
-                # The total DECLARED uncompressed size is the real bomb guard: a
-                # single huge member or many members both sum here and are capped.
-                # (A per-entry compression-ratio heuristic is intentionally NOT
-                # used — valid DEFLATE legitimately reaches ~1000:1 on repetitive
-                # content, so it false-positives without catching anything the
-                # total-size cap doesn't.)
-                total_uncompressed = 0
-                for info in infos:
-                    if info.filename.startswith("/") or ".." in info.filename:
-                        raise HTTPException(400, f"Invalid path in zip: {info.filename}")
-                    total_uncompressed += info.file_size
-                    if total_uncompressed > config.MCP_ZIP_DECOMPRESSED_MAX:
-                        raise HTTPException(400, "Zip expands to more than the allowed size")
-                zf.extractall(tmp / "extracted")
-        except zipfile.BadZipFile:
-            raise HTTPException(400, "Invalid zip file")
-
-        extracted = tmp / "extracted"
-
-        # Find the folder with manifest.json — either the extract root or
-        # one level down (zip contained a wrapping folder).
-        mcp_root = extracted if (extracted / "manifest.json").is_file() else None
-        if mcp_root is None:
-            for sd in extracted.iterdir():
-                if sd.is_dir() and (sd / "manifest.json").is_file():
-                    mcp_root = sd
-                    break
+        extracted = await _extract_upload_zip(file, tmp)
+        mcp_root = _zip_root_with(extracted, "manifest.json")
         if mcp_root is None:
             raise HTTPException(400, "No manifest.json found in zip")
 
         return await community_installer.install_from_extracted_folder(mcp_root)
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@router.post("/v1/admin/skills/install")
+async def install_skill_zip(
+    file: UploadFile = File(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """Install or update a SKILL PACKAGE from a zip upload. Admin only.
+
+    Accepts BOTH formats:
+    - a platform skill package (``manifest.json`` at the root or one level
+      down) → the standalone skills installer (which enforces
+      ``category: "skill"`` — a non-skill manifest 400s here, and the MCP
+      endpoint above keeps rejecting skill packages: no cross-holes);
+    - a bare spec-standard skill folder (``SKILL.md`` at the root or one
+      level down) — SKILL.md IS the manifest per the Agent Skills spec, so
+      the package manifest is synthesized from its frontmatter.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from services.community import skills_installer
+
+    _require_admin(user)
+
+    tmp = Path(tempfile.mkdtemp(prefix="skill-install-"))
+    try:
+        extracted = await _extract_upload_zip(file, tmp)
+        pkg_root = _zip_root_with(extracted, "manifest.json")
+        if pkg_root is not None:
+            return await skills_installer.install_skill_package_from_extracted(
+                pkg_root)
+        skill_root = _zip_root_with(extracted, "SKILL.md")
+        if skill_root is None:
+            raise HTTPException(
+                400, "No manifest.json or SKILL.md found in zip")
+        return await skills_installer.install_bare_skill_folder(skill_root)
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

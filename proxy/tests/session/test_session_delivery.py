@@ -22,6 +22,23 @@ from core.session.session_state import _dashboard_notify_queues, set_pump_callba
 from storage import database as task_store
 
 
+# The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
+# the target session must be alive. Tests that exercise the ws route register
+# a fake alive CLI session alongside their notify queue.
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+
+@contextmanager
+def _alive_cli_session(sid):
+    from core.layers.cli import layer as _cli_layer
+    _cli_layer._persistent_sessions[sid] = SimpleNamespace(is_alive=True)
+    try:
+        yield
+    finally:
+        _cli_layer._persistent_sessions.pop(sid, None)
+
+
 class _FakeISession:
     """The slice of InteractiveSession the ladder touches: registry identity,
     liveness, and queue_prompt. Registered straight into the module registry so
@@ -87,12 +104,13 @@ class TestRungSelection:
             _dashboard_notify_queues["sid-w1"] = q
             persists = []
             try:
-                outcome = asyncio.run(deliver_prompt(
-                    "chat-w1", "the result", source="delegate_result",
-                    session_id="sid-w1", agent="pa",
-                    notify_payload={"type": "task_result_prompt"},
-                    persist_event=persists.append,
-                ))
+                with _alive_cli_session("sid-w1"):
+                    outcome = asyncio.run(deliver_prompt(
+                        "chat-w1", "the result", source="delegate_result",
+                        session_id="sid-w1", agent="pa",
+                        notify_payload={"type": "task_result_prompt"},
+                        persist_event=persists.append,
+                    ))
                 assert outcome.path == "ws"
                 assert persists == []                  # handler owns persistence
                 payload = q.get_nowait()
@@ -100,6 +118,32 @@ class TestRungSelection:
                 assert payload["chat_id"] == "chat-w1"
             finally:
                 _dashboard_notify_queues.pop("sid-w1", None)
+        finally:
+            _cleanup()
+
+    def test_ws_rung_skipped_for_dead_session(self, temp_db):
+        """Liveness gate (2026-09-02): a notify queue whose session is dead or
+        reaped must NOT take the ws route — the dashboard handler could not run
+        a turn on it (the 18:56 no-resume bug). The ladder runs instead and,
+        with no other rung available here, persists once and stores the
+        durable wake."""
+        try:
+            task_store.create_chat("chat-w2", "user-1", "pa")
+            q: asyncio.Queue = asyncio.Queue()
+            _dashboard_notify_queues["sid-w2"] = q
+            persists = []
+            try:
+                outcome = asyncio.run(deliver_prompt(
+                    "chat-w2", "the result", source="delegate_result",
+                    session_id="sid-w2", agent="pa",
+                    notify_payload={"type": "task_result_prompt"},
+                    persist_event=persists.append,
+                ))
+                assert outcome.path != "ws"
+                assert q.empty()                    # nothing routed to the socket
+                assert persists == ["chat-w2"]      # ladder persisted exactly once
+            finally:
+                _dashboard_notify_queues.pop("sid-w2", None)
         finally:
             _cleanup()
 

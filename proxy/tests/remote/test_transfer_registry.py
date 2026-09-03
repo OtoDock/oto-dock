@@ -216,3 +216,63 @@ async def test_recipient_scoping_uses_isolation_predicate(monkeypatch):
 
     config_path = _REAL_RESOLVE("agent-1", "config/prompt.md")
     assert config_path == frozenset({"sub-alice", "sub-root"})  # owner-tier
+
+
+@pytest.mark.asyncio
+async def test_begin_with_no_machines_completes_at_birth():
+    """A tracked transfer whose precise target set is EMPTY (the cheap
+    candidate gate over-approximated) must still reach a terminal — the
+    client was already told remote_push=true and waits for transfer_done
+    (2026-09-02: uploads hung on "Processing…" on installs with idle
+    satellites that don't hold the agent)."""
+    rec = _Recorder()
+    tr.set_broadcaster(rec)
+    tid = await tr.begin(
+        "agent-1", "workspace/rec.m4a", kind="upload", bytes_total=300,
+        machine_ids=[], transfer_id="t-empty",
+    )
+    assert tid == "t-empty"
+    assert tr.get(tid).done_at is not None
+    assert rec.types() == ["transfer_started", "transfer_done"]
+    done = rec.events[-1][0]
+    assert done["ok"] is True and done["transfer_id"] == "t-empty"
+
+
+@pytest.mark.asyncio
+async def test_fan_out_write_tracked_with_no_targets_emits_terminal(monkeypatch):
+    """fan_out_write used to `return` silently when the precise target set was
+    empty — with a transfer_id that stranded the client. It now registers the
+    zero-target transfer so the registry emits started + done."""
+    from services.remote import workspace_fanout as wf
+
+    rec = _Recorder()
+    tr.set_broadcaster(rec)
+    monkeypatch.setattr(wf, "fanout_targets", lambda *a, **k: [])
+
+    async def _no_idle(*a, **k):
+        return []
+    monkeypatch.setattr(wf, "idle_connected_targets", _no_idle)
+
+    await wf.fan_out_write(
+        "agent-1", "workspace/rec.m4a", b"abc", include_idle=True,
+        transfer_kind="upload", transfer_id="t-none",
+    )
+    assert rec.types() == ["transfer_started", "transfer_done"]
+    assert tr.get("t-none").done_at is not None
+
+
+@pytest.mark.asyncio
+async def test_fan_out_write_untracked_with_no_targets_stays_silent(monkeypatch):
+    """No transfer_id (hook/WOPI writes) → no registry traffic, as before."""
+    from services.remote import workspace_fanout as wf
+
+    rec = _Recorder()
+    tr.set_broadcaster(rec)
+    monkeypatch.setattr(wf, "fanout_targets", lambda *a, **k: [])
+
+    async def _no_idle(*a, **k):
+        return []
+    monkeypatch.setattr(wf, "idle_connected_targets", _no_idle)
+
+    await wf.fan_out_write("agent-1", "workspace/rec.m4a", b"abc", include_idle=True)
+    assert rec.types() == []

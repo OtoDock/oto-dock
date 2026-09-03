@@ -63,6 +63,10 @@ logger = logging.getLogger("claude-proxy.oauth-refresh-worker")
 # How often the loop wakes up.
 _INTERVAL_SECONDS = 60
 # Refresh threshold: tokens with less than this lifetime get refreshed.
+# Per-provider manifests can RAISE it via credentials.oauth.refresh
+# .min_remaining_seconds (see _refresh_threshold_for) — facebook's ~60-day
+# tokens must re-exchange while still valid, and a 5-minute window at day 60
+# dies on any proxy downtime.
 _REFRESH_THRESHOLD_SECONDS = 300
 # Failure backoff: first retry this long after a failure, doubling per
 # consecutive failure up to the cap (a permanently-broken token then costs
@@ -175,6 +179,29 @@ def _in_backoff(token_file: Path) -> bool:
     return state["dead"] or _monotonic() < state["next_attempt"]
 
 
+def _refresh_threshold_for(provider_id: str) -> int:
+    """Per-provider refresh threshold: the LARGEST
+    ``credentials.oauth.refresh.min_remaining_seconds`` any manifest declares
+    for this provider, floored at the global default. This is the one place
+    that knob is read — declared-but-ignored was fine for hourly-expiry
+    vendors, but token-as-refresh providers (facebook) need a window of days,
+    not minutes."""
+    best = _REFRESH_THRESHOLD_SECONDS
+    try:
+        from services.mcp import mcp_registry
+
+        for m in mcp_registry.get_mcps_by_provider(provider_id) or []:
+            oauth = (m.credentials.oauth or {}) if m.credentials else {}
+            try:
+                v = int((oauth.get("refresh") or {}).get("min_remaining_seconds") or 0)
+            except (TypeError, ValueError):
+                continue
+            best = max(best, v)
+    except Exception:
+        return _REFRESH_THRESHOLD_SECONDS
+    return best
+
+
 def _is_permanent_refresh_error(exc: Exception) -> bool:
     """invalid_grant means the grant was revoked/expired at the vendor —
     no retry can ever succeed. Relay-brokered refreshes surface it as a
@@ -241,7 +268,7 @@ async def _maybe_refresh_token_file(
         return False
 
     remaining = (expiry_dt - datetime.now(timezone.utc)).total_seconds()
-    if remaining > _REFRESH_THRESHOLD_SECONDS:
+    if remaining > _refresh_threshold_for(provider_id):
         return False
 
     if _in_backoff(token_file):

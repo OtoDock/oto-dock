@@ -66,11 +66,13 @@ interface Props {
    * "Getting ready…" warmup badge is unaffected (it still shows during spawn). */
   interactiveActive?: boolean
   /** A live interactive PTY's model can't be changed from here (use /model in
-   * the TUI), so the Model dropdown shows only the active model read-only. The
-   * popup still opens for the interactive switch. Also set for task-run
-   * chats: a run's model is a fact of the run (the agent's configured
-   * default), not a viewer choice — and the locked row renders the raw model
-   * id even when the layer's current catalog no longer lists it. */
+   * the TUI), so the Model dropdown shows only the active model read-only.
+   * The popup still opens for the interactive switch. Task-run chats are
+   * NOT locked any more (1.5): their picker follows the standard rule —
+   * the active engine's models while the run/session is alive, the
+   * cross-engine expansion + confirm once dead (follow-up turns resolve
+   * from the chat row; the backend gates in-flight runs + the continue
+   * tier authoritatively). */
   modelLocked?: boolean
   /** Task-run chats: the permission chip shows the RUN's stored mode (the
    * scheduler's 'auto' → Don't Ask) read-only — the popup lists only the
@@ -119,7 +121,8 @@ const MODE_OPTIONS = Object.entries(MODE_CONFIG).map(([value, c]) => ({ value, l
 
 // --- Model config (fallback for known models) ---
 const MODEL_LETTERS: Record<string, string> = {
-  'claude-fable-5': 'F',
+  'claude-fable-5-1': 'F',
+  'claude-fable-5': 'F',  // retired builtin — grandfathered history keeps its 'F'
   'claude-opus-5': 'O',
   'claude-opus-4-8[1m]': 'O',  // retired builtin — grandfathered history keeps its 'O'
   'claude-sonnet-5': 'S',
@@ -137,7 +140,7 @@ function getModelLetter(model: string): string {
 
 // Default fallback options (used when modelOptions prop not provided)
 const DEFAULT_MODEL_OPTIONS = [
-  { value: 'claude-fable-5', label: 'Fable 5 (1M)' },
+  { value: 'claude-fable-5-1', label: 'Fable 5.1 (1M)' },
   { value: 'claude-opus-5', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5 (1M)' },
 ]

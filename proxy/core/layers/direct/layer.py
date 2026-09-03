@@ -269,6 +269,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 mcp_sandbox_mounts=mcp_mounts,
                 config_visible=ctx.config_visible if ctx else None,
                 mount_shared=ctx.mount_shared if ctx else True,
+                knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)) if ctx else False,
                 mcp_dir_binds=stdio_dirs,
             )
             sandbox_builder = SandboxBuilder(sandbox_cfg)

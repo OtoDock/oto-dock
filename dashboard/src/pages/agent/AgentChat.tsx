@@ -14,12 +14,15 @@ import { useChatStream } from '../../hooks/useChatStream'
 import { useAgents, useExecutionLayers, useAgentTargetStatus } from '../../api/agents'
 import { useUserExecutionLayers } from '../../api/executionLayers'
 import { useChats, useTaskChats, fetchChatPage } from '../../api/chats'
+import { isDictationActive, onIdle as speechIdle } from '../../audio/speechActivity'
 import { computeModelGroups, visibleAgentPaths } from '../../lib/modelGroups'
 import { useRunByChat } from '../../api/runs'
 import TaskMetadata from '../../components/chat/TaskMetadata'
 import ChatMessages from '../../components/chat/ChatMessages'
+import { ChatFileProvider } from '../../components/chat/ChatFileContext'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
 import ChatInput, { PendingImage, PendingFile } from '../../components/chat/ChatInput'
+import { enqueueChatUpload, dequeueChatUpload } from '../../lib/chatUploadQueue'
 import TopBar from '../../components/chat/TopBar'
 import AppSettingsModal from '../../components/chat/AppSettingsModal'
 import { SetupBanner } from '../../components/PlatformSetupGuard'
@@ -44,14 +47,15 @@ import MeetingIndicator from '../../components/chat/MeetingIndicator'
 import ResponsiveDrawer from '../../components/ui/ResponsiveDrawer'
 import WorkspaceOverlay from '../../components/workspace/WorkspaceOverlay'
 import AppsOverlay from '../../components/apps/AppsOverlay'
+import ProjectsOverlay from '../../components/projects/ProjectsOverlay'
 import { useWorkspaceState } from '../../hooks/useWorkspaceState'
 import { canManageAgent, canEditAgent } from '../../lib/permissions'
 import { hasAgentScope, isPersonalOnly, isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { setNativeSwitchBusy } from '../../lib/nativeBridge'
 import { useChatStore, newChatKey } from '../../store/chatStore'
 import { useAgentPrefsStore } from '../../store/agentPrefsStore'
-import { useAudioPrefsStore } from '../../store/audioPrefsStore'
-import { useVoiceMode } from '../../hooks/useVoiceMode'
+import { useHydrateUiPrefs } from '../../api/userUiPrefs'
+import { useDuplexVoice } from '../../hooks/useDuplexVoice'
 import { useChatAudioCapability } from '../../hooks/useChatAudioCapability'
 import { useInteractiveChat, currentDashboardTheme, utf8ToB64, ptyPasteB64, withInteractiveTime } from '../../hooks/useInteractiveChat'
 import { useQueryClient } from '@tanstack/react-query'
@@ -85,7 +89,11 @@ export default function AgentChat() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const { user, logout } = useAuth()
-  const { data: agents } = useAgents()
+  const { data: agents, isError: agentsLoadFailed } = useAgents()
+  // Roam the server-side ui-prefs bag (per-agent interactive pick) into
+  // agentPrefsStore — once per session load (the guard lives in the store), so
+  // a fresh device inherits the user's sticky mode instead of the default.
+  useHydrateUiPrefs()
   // The favorite/landing agent (drives DefaultAgentRedirect). Only this agent
   // gets an EAGER pre-warm on the new-chat page; every other agent warms lazily
   // on the user's first composer interaction (see onEngage below).
@@ -174,6 +182,9 @@ export default function AgentChat() {
 
   const [historyOpen, setHistoryOpen] = useState(() => window.innerWidth >= 768)
   const [warmingUp, setWarmingUp] = useState(false)
+  // Live duplex session flag, readable from ws callbacks declared above the
+  // hook itself (the hook lands further down; refs dodge the TDZ).
+  const duplexActiveRef = useRef(false)
   // Interactive CLI state lives in
   // `useInteractiveChat`, created after useChatStream below since it needs `ws`.
 
@@ -318,6 +329,9 @@ export default function AgentChat() {
       pendingMessageRef.current = null
       pendingImagesRef.current = null
       pendingFilesRef.current = null
+      // A failed phone-mode mint must not leave the apps keep-open armed —
+      // the NEXT ordinary chat entry would re-open a panel the user closed.
+      keepAppsOnChatEntryRef.current = false
     },
     onTitleUpdated: () => refetchChats(),
     onChatMoved: () => {
@@ -340,6 +354,10 @@ export default function AgentChat() {
       setModel(data.model)
       setProcessAlive(false)
       setSessionId(null)
+      // The rebind zeroed context_used server-side; clear the gauge
+      // denominator too — the old engine's window would lie until the
+      // first turn on the new engine reports its own.
+      setContextMax(0)
       setPendingEngineSwitch(null)
       setEngineSwitchBusy(false)
       setEngineSwitchError(null)
@@ -356,20 +374,20 @@ export default function AgentChat() {
       // probe_liveness answer (fired when the model dropdown opens).
       setProcessAlive(data.process_alive)
     },
-    // Live rich view: new interactive-history rows persisted while the
-    // terminal ⇄ transcript toggle shows the transcript → refetch the newest
-    // page (same seed path as the toggle). Trailing debounce coalesces the
-    // per-batch nudges a busy turn produces.
+    // New interactive-history rows persisted → refetch the newest page (same
+    // seed path as the rich-view toggle). Applied in EVERY view, not just the
+    // transcript: `messages` must stay current while the terminal is shown or
+    // voice mode has nothing to speak (the list itself is hidden, seeding is
+    // pure state). Trailing debounce coalesces the per-batch nudges a busy
+    // turn produces.
     onChatRows: (data) => {
-      if (!showRichViewRef.current) return
       if (!chatId || data.chat_id !== chatId) return
       if (chatRowsTimerRef.current) window.clearTimeout(chatRowsTimerRef.current)
       chatRowsTimerRef.current = window.setTimeout(async () => {
         chatRowsTimerRef.current = null
         try {
           const { messages: rows, has_more } = await fetchChatPage(chatId, 50)
-          // Re-check: the user may have toggled back to the terminal.
-          if (showRichViewRef.current) seedDbHistory(rows, has_more)
+          seedDbHistory(rows, has_more)
         } catch { /* transient — the next nudge retries */ }
       }, 800)
     },
@@ -419,17 +437,31 @@ export default function AgentChat() {
       // subagent is still running (the LLM just said "launched" — the genuine
       // completion is the nudge turn). Mirrors the backend fire_ephemeral guard.
       // Visible tab only — a hidden tab pings via onTurnComplete (never both).
-      if (!meetingActive && !bgStillRunning && document.visibilityState === 'visible') {
+      if (!meetingActive && !bgStillRunning && document.visibilityState === 'visible'
+          && !duplexActiveRef.current && !isDictationActive()) {
         // Visible/foreground tab → in-app ping, on desktop AND the native app.
         // It's visibility-gated, so a BACKGROUNDED native app pings via FCM
         // instead (never both). Plays on the WebView media stream, so it's
         // audible even with the phone on silent (like a video's audio).
+        // Suppressed during a duplex session: the chime rode on top of the
+        // spoken reply and can leak into the open mic as a false barge-in.
+        // Suppressed during DICTATION too (1.5): its capture runs without
+        // AEC, so the chime would land in the transcript.
         chatNotif.playPing()
       }
       // Fire an interactive switch that was deferred so it wouldn't cut
       // this (now-finished) -p turn.
       interactive.flushDeferredSwitch(chatIdRef.current)
-      refetchChats()
+      // Turn end arrives while the reply's TTS tail is still PLAYING in a
+      // live voice session (the engine paces audio in real time, so several
+      // seconds of speech follow the done event). The refetch triggers a
+      // render burst that can starve the 250ms audio jitter buffer — the
+      // operator-reported ~1s mid-sentence gap right as the chat flips to
+      // finished. Nothing about the chat list is urgent while the agent is
+      // literally mid-sentence: run it when speech goes idle (immediately
+      // when nothing is speaking — the old fixed 2.5s only guessed the
+      // tail and only covered duplex).
+      speechIdle(() => refetchChats())
     },
     onTurnComplete: (_data) => {
       // Origin-routed end-of-turn ping: a hidden tab or a background chat
@@ -438,10 +470,13 @@ export default function AgentChat() {
       try {
         if ((window as any).Capacitor?.isNativePlatform?.()) return
       } catch { /* not native */ }
-      chatNotif.playPing()
-      refetchChats()
+      if (!duplexActiveRef.current && !isDictationActive()) chatNotif.playPing()
+      speechIdle(() => refetchChats())
     },
     enableDefensiveRefetch: true,
+    // The defensive history refetch remounts the whole message list — a
+    // hard cut for playing replay audio; wait out live speech.
+    deferHeavy: speechIdle,
     isViewedChatPtyLive: () => sessionInteractiveRef.current,
     onNotification: chatNotif.onNotification,
     onNotificationSilent: chatNotif.onNotificationSilent,
@@ -504,6 +539,11 @@ export default function AgentChat() {
   // when in-component handlers (handleSelectChat) have already triggered the load.
   // Idempotent across StrictMode double-effects.
   const lastResumedChatIdRef = useRef<string | null>(null)
+  // Which agent's NEW-chat view already had its exec-mode reset+seed (the
+  // lastResumedChatIdRef twin for the !urlChatId branch). Guards the URL
+  // effect's reset to once per new-chat visit; handleNewChat — which
+  // resets+seeds inline — pre-stamps it to skip the duplicate.
+  const newChatModeSeededRef = useRef<string | null>(null)
   const pendingFilesRef = useRef<Array<{ path: string; name: string }> | null>(null)
 
   // Draft text — persisted to localStorage so it survives chat nav + reload.
@@ -539,7 +579,8 @@ export default function AgentChat() {
     canRun: canRunLayer,
     streaming: viewedStreaming,
     warming,
-  }), [layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming])
+    activeModel: model,
+  }), [layers, agentExecutionPaths, chatActiveLayer, processAlive, canRunLayer, viewedStreaming, warming, model])
 
   // Centralized pendingEngineSwitch reset — the ONLY chat-exit clear. The
   // sidebar select path (handleSelectChat) pre-stamps lastResumedChatIdRef
@@ -582,14 +623,56 @@ export default function AgentChat() {
     // response the user watched arrive never counts as unread.
   }, [chatId, viewedStreaming])  // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Voice mode (hands-free): speak the streaming reply aloud, mic auto-sends, and
-  // a mic-press barges in. Resolves native-vs-platform TTS via the same
-  // capability/prefs as the SoundIcon, so it behaves identically across the
-  // browser, native Android, and the platform streaming WS.
-  const voiceModeEnabled = useAudioPrefsStore((s) => s.voiceModeEnabled)
-  const setVoiceModeEnabled = useAudioPrefsStore((s) => s.setVoiceModeEnabled)
+  // Full-duplex conversation mode (phone engine) — the only live voice mode
+  // (the half-duplex hands-free loop was retired in its favor; the mic is
+  // plain dictation now).
   const { data: audioCapability } = useChatAudioCapability()
-  const voiceMode = useVoiceMode(messages, viewedStreaming)
+  const duplexVoice = useDuplexVoice(chatId)
+  // Fresh-chat start: a duplex session attaches to an existing chat+session,
+  // so on a never-warmed chat the toggle first fires the normal warmup (the
+  // same one the first message runs) and starts the session once it lands.
+  const duplexPendingRef = useRef(false)
+  useEffect(() => {
+    if (duplexPendingRef.current && chatId && !warming) {
+      duplexPendingRef.current = false
+      duplexVoice.start()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId, warming])
+  // Exit note: after a live conversation ends, the next TYPED message IN THAT
+  // CHAT carries a short bracketed note so the engine drops the spoken-reply
+  // style (the duplex context told it the user hears replies aloud — that
+  // stopped being true the moment the session closed). Bound to the chat the
+  // session lived in: an armed note must never leak into another chat (it
+  // showed up as the first message of a brand-new chat in live testing).
+  const duplexLiveChatRef = useRef<string | null>(null)
+  const duplexExitNoteRef = useRef<string | null>(null)
+  // A session that never ran a turn (failed connect, instant close) never
+  // injected the spoken-mode context — a note would be wrong. 'thinking'
+  // marks the first dispatched utterance.
+  const duplexSawTurnRef = useRef(false)
+  useEffect(() => {
+    if (duplexVoice.phase === 'thinking') duplexSawTurnRef.current = true
+  }, [duplexVoice.phase])
+  useEffect(() => {
+    duplexActiveRef.current = duplexVoice.active
+    if (duplexVoice.active) {
+      // Captured at activation: on a chat switch the teardown flips active
+      // AFTER chatId already points at the new chat, so reading chatId at
+      // deactivation would bind the note to the wrong chat.
+      duplexLiveChatRef.current = chatId ?? null
+      duplexSawTurnRef.current = false
+    } else if (duplexLiveChatRef.current) {
+      // No note when the AGENT closed the session ([DUPLEX_COMPLETE]
+      // farewell) — it knows the spoken mode ended; the note is only for
+      // exits the agent didn't see (user toggle, idle timeout, drops).
+      if (duplexSawTurnRef.current && !duplexVoice.endedByAgent) {
+        duplexExitNoteRef.current = duplexLiveChatRef.current
+      }
+      duplexLiveChatRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duplexVoice.active])
   const setDraftInput = useCallback(
     (text: string) => {
       if (!draftKey) return
@@ -626,12 +709,24 @@ export default function AgentChat() {
     // so re-seeding never loses a real choice.
     setModel(stickyModel || agentDefaultModel)
     setMode(stickyMode || 'default')
-    // Seed the interactive toggle from the agent's sticky preference too, so a
-    // new chat (or a page refresh on /chat/<agent>) keeps the user's last
-    // interactive on/off choice. No-op unless an explicit value was set.
-    interactive.seedExecMode(prefs.lastInteractive[agentName] || '')
+    // (The interactive toggle's sticky seed lives in the dedicated effect
+    // below — it must also re-fire when the ui-prefs hydration lands.)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentName, urlChatId, agentDefaultModel])
+
+  // Seed the interactive toggle from the agent's sticky preference, so a new
+  // chat (or a page refresh on /chat/<agent>) keeps the user's last
+  // interactive on/off choice. SUBSCRIBED (not a getState snapshot): on a
+  // fresh device the sticky map is hydrated from the server ui-prefs AFTER
+  // mount, and the seed must re-fire when the roamed value lands. No-op
+  // unless an explicit value was set; a manual toggle rewrites the sticky to
+  // the value it just set, so the re-fire is idempotent.
+  const stickyInteractive = useAgentPrefsStore((s) => (agentName ? s.lastInteractive[agentName] ?? '' : ''))
+  useEffect(() => {
+    if (!agentName || urlChatId) return
+    interactive.seedExecMode(stickyInteractive)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentName, urlChatId, stickyInteractive])
 
   // Reconcile model ↔ chatActiveLayer for NEW chats. The seed effect above
   // sets ``model`` (a bare model_id) but doesn't set ``chatActiveLayer``,
@@ -710,11 +805,24 @@ export default function AgentChat() {
   // survive (that chat's ready is dropped by the staleness guard) and flip a
   // phantom "generating" UI on the NEXT chat's resume. Cleared on chat switch.
   const serverKickPendingRef = useRef<false | { chatId: string | null }>(false)
+  // A first send held because the AGENTS QUERY hadn't resolved yet (no
+  // explicit per-chat mode → the effective interactive mode is unknowable
+  // until the agent default arrives). The bubble + warming badge are shown at
+  // hold time; the flush effect below routes it once the query settles.
+  const heldForAgentsRef = useRef<{
+    text: string
+    images?: Array<{ base64: string; name: string }>
+    files?: Array<{ path: string; name: string }>
+  } | null>(null)
 
   // Poll paused while the sidebar's inline rename is open (a reorder from a
-  // refetch blurs the input into a half-typed commit — see useChats).
+  // refetch blurs the input into a half-typed commit — see useChats) AND
+  // while a duplex session is live (the 30s poll can land mid-reply and
+  // feed the render burst that starves TTS scheduling; turn end refetches
+  // via speechIdle anyway).
   const [renameEditing, setRenameEditing] = useState(false)
-  const { data: chats, refetch: refetchChats } = useChats(agentName, renameEditing)
+  const { data: chats, refetch: refetchChats } = useChats(
+    agentName, renameEditing || duplexVoice.active)
 
   // ---- Task mode ----
   // Task runs render on this page: a `task-…` chat id marks the open chat as
@@ -730,7 +838,8 @@ export default function AgentChat() {
   }, [searchParams])
   // The task-chat list also backs the row lookups below (origin / delegation
   // markers) — task chats never appear in the chat-mode list.
-  const { data: taskChats } = useTaskChats(agentName, tasksMode || isTaskChat)
+  const { data: taskChats } = useTaskChats(
+    agentName, tasksMode || isTaskChat, duplexVoice.active)
 
   // ---- Workspace overlay ----
   // Lifted to this page so the overlay can swap the message-area while
@@ -763,10 +872,25 @@ export default function AgentChat() {
   const homeActiveRows = useActiveChats(!chatId && !!agentName)
   const showHomeActive =
     !chatId && !!agentName && homeActiveRows.length > 0 && !workspace.state.open
+  // Phone-mode chat entries (a wake hit or the mic-button duplex start from
+  // the home page) KEEP the pinned-apps overlay showing (operator
+  // 2026-08-15: spoken mode wants the dashboards visible; a manual close
+  // still sticks). The ref is consumed by useAppsAutoOpen AT ITS CLOSE SITE
+  // — the only ordering-proof spot: the duplex mint sets internal chat
+  // state in one commit and react-router lands the URL rewrite in a later
+  // startTransition commit, so any effect-side "re-open after close"
+  // one-shot loses the race (live-hit 2026-08-14, the failed first fix).
+  const keepAppsOnChatEntryRef = useRef(false)
+  // Deep-link wake (?wake=1 on a concrete chat URL) must arm the keep at
+  // RENDER time: on a fresh mount the hook's close runs before ANY effect
+  // of this component, so an effect-set ref is always too late. The param
+  // is stripped by the consume effect in the same commit.
+  if (searchParams.get('wake') === '1') keepAppsOnChatEntryRef.current = true
   // Apps-UI open/close rules — arrival on HOME opens (incl. agent switch),
-  // entering any chat closes / never auto-opens. Extracted for direct unit
-  // coverage; the rules live in the hook's header comment.
-  useAppsAutoOpen(agentName, urlChatId, pinnedApps, setAppsOpen)
+  // entering any chat closes / never auto-opens (except a kept phone-mode
+  // entry). Extracted for direct unit coverage; the rules live in the
+  // hook's header comment.
+  useAppsAutoOpen(agentName, urlChatId, pinnedApps, setAppsOpen, keepAppsOnChatEntryRef)
   useEffect(() => {
     if (!appsActive) return
     return pushEscHandler(() => setAppsOpen(false))
@@ -789,6 +913,36 @@ export default function AgentChat() {
   const activeChatRow = chats?.find((c) => c.id === chatId)
     ?? taskChats?.find((c) => c.id === chatId)
 
+  // Dock overlay (staged feature — this block + the entry button strip from
+  // the public cut). Offered when the active chat participates in a
+  // delegation project OR carries a chat-scoped pinned dashboard; closes on
+  // chat switch like the find bar.
+  const [projectsOpen, setProjectsOpen] = useState(false)
+  // Every delegation participant gets the dock: orchestrators (stamped even
+  // without a project slug) and workers (chat- or task-surface — the lane
+  // graph falls back to lineage server-side when project_id is empty).
+  const isProjectChat =
+    !!activeChatRow?.project_id ||
+    activeChatRow?.delegate_role === 'orchestrator' ||
+    activeChatRow?.delegate_role === 'worker' ||
+    activeChatRow?.origin === 'delegated'
+  const { data: chatPins } = useChatPins(chatId ?? undefined)
+  const hasChatPin = !!chatPins?.chat || (chatPins?.files?.length ?? 0) > 0
+  const dockAvailable = isProjectChat || hasChatPin
+  useEffect(() => { setProjectsOpen(false) }, [chatId])
+  const projectsActive = projectsOpen && dockAvailable && !workspace.state.open && !appsOpen
+  // An agent pin/re-pin broadcasts file_updated for its apps/*.html — that's
+  // the signal a Dock pin appeared/changed (the toggle may need to show up
+  // while the overlay is closed, so this lives here, not in the overlay).
+  // File pin/unpin broadcasts carry the `pin` marker instead (any path).
+  const queryClient = useQueryClient()
+  useEffect(() => onFileUpdate((u) => {
+    if (u.pin || /(^|\/)apps\/[^/]+\.html$/.test(u.rel_path)) {
+      // Agents pin/write apps exactly at turn end — wait out live speech
+      // (immediate when nothing is playing).
+      speechIdle(() => queryClient.invalidateQueries({ queryKey: ['chat-pins'] }))
+    }
+  }), [queryClient])
 
   // Ctrl/Cmd+E toggles the workspace overlay.
   useEffect(() => {
@@ -830,6 +984,47 @@ export default function AgentChat() {
       setSearchParams(prev => { prev.delete('recover'); return prev }, { replace: true })
     }
   }, [searchParams, setSearchParams, workspace])
+
+  // Wake word: ?wake=1 (set by useWakeWord's navigate) auto-starts a duplex
+  // session on this agent's NEW chat — consume-and-strip like ?recover=1,
+  // then run the mic toggle's never-warmed branch once the dashboard socket
+  // is up (ws.send silently drops before that).
+  const [wakeRequested, setWakeRequested] = useState(false)
+  // Marks the CURRENT duplex session as wake-initiated (10 s silence guard).
+  const wakeInitiatedRef = useRef(false)
+  useEffect(() => {
+    if (searchParams.get('wake') === '1') {
+      setWakeRequested(true)
+      setSearchParams(prev => { prev.delete('wake'); return prev }, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
+  // (The wake ARM effect lives below handleNewChat — it reuses it for the
+  // stale-state reset and a dep-array reference above its declaration would
+  // be a TDZ error.)
+
+  // Wake-initiated sessions auto-close after 10 s of silence — the safety
+  // valve for a false trigger (TV speech wakes an empty room). Any sign of a
+  // real conversation (a caption, a dispatched turn) disarms it; a manual
+  // toggle never arms it.
+  useEffect(() => {
+    if (!wakeInitiatedRef.current) return
+    const phase = duplexVoice.phase
+    if (phase === 'off' || phase === 'error') { wakeInitiatedRef.current = false; return }
+    if (duplexVoice.caption || phase === 'thinking' || phase === 'speaking') {
+      wakeInitiatedRef.current = false // real conversation — guard off
+      return
+    }
+    if (phase !== 'listening') return
+    const timer = window.setTimeout(() => {
+      if (wakeInitiatedRef.current && duplexVoice.active) {
+        wakeInitiatedRef.current = false
+        duplexVoice.stop()
+        chatNotif.playPing()
+      }
+    }, 10_000)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duplexVoice.phase, duplexVoice.caption])
 
   // Debounce find input → findQuery (200ms)
   useEffect(() => {
@@ -874,8 +1069,19 @@ export default function AgentChat() {
     if (!ws.connected || !agentName) return
     if (!urlChatId) {
       lastResumedChatIdRef.current = null  // exited chat — clear tracking
+      // Entering the NEW-chat view: the previously-viewed chat's execution-
+      // mode override must NOT leak into the new chat (it ran new chats in
+      // the wrong mode both ways). Reset the interactive state, then re-seed
+      // the agent's sticky pick. Once per visit — the ref guard keeps a WS
+      // reconnect / re-render from clobbering a toggle made while composing.
+      if (newChatModeSeededRef.current !== agentName) {
+        newChatModeSeededRef.current = agentName
+        interactive.resetSession()
+        interactive.seedExecMode(useAgentPrefsStore.getState().lastInteractive[agentName] || '')
+      }
       return
     }
+    newChatModeSeededRef.current = null  // viewing a chat — re-arm for the next new-chat visit
     if (lastResumedChatIdRef.current === urlChatId) return  // already loaded
     lastResumedChatIdRef.current = urlChatId
 
@@ -886,6 +1092,7 @@ export default function AgentChat() {
     setMessages([])
     currentMsgRef.current = null
     pendingMessageRef.current = null
+    heldForAgentsRef.current = null  // a held first send must not flush into the opened chat
     thinkingBufRef.current = ''
     setChatId(urlChatId)
     setSessionId(null)
@@ -971,68 +1178,78 @@ export default function AgentChat() {
 
   // --- Handlers ---
 
-  // Upload a single pending file eagerly. Updates state in place (uploading/uploadedPath/error).
-  // Kicked off when the user picks the file, not when Send is clicked — so send is near-instant.
-  const uploadPendingFile = useCallback(async (file: PendingFile) => {
-    const form = new FormData()
-    form.append('file', file.file)
-    form.append('agent', agentName || '')
-    try {
-      const resp = await fetch('/v1/upload', {
-        method: 'POST',
-        body: form,
-        credentials: 'same-origin',
-        signal: file.abortController?.signal,
-      })
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ detail: 'Upload failed' }))
-        throw new Error(err.detail || `Upload failed: ${resp.status}`)
-      }
-      const data = await resp.json()
-      if (draftKey) {
-        useChatStore.getState().updatePendingFile(draftKey, file.id, {
-          uploading: false,
-          uploadedPath: data.path,
-          name: data.filename || file.name,
-        })
-      }
-    } catch (e: any) {
-      if (e?.name === 'AbortError') return  // User removed the file — no state update needed
-      if (draftKey) {
-        useChatStore.getState().updatePendingFile(draftKey, file.id, {
-          uploading: false,
-          error: e?.message || 'Upload failed',
-        })
-      }
-    }
-  }, [agentName, draftKey])
-
+  // Files upload eagerly on pick (not on Send — send stays near-instant),
+  // through the GLOBAL sequential queue (lib/chatUploadQueue): one wire chain
+  // for any number of picked files, XHR byte progress on each chip, and
+  // updates that survive chat navigation + the draft→chat re-key.
   const handleAddFiles = useCallback((files: PendingFile[]) => {
     if (!draftKey) return
-    // Tag each file with uploading=true + AbortController, add to state, kick off upload.
-    const tagged = files.map(f => ({
+    // Pre-errored entries (oversize — ChatInput tags them) render as error
+    // chips only: no upload, no abort controller. Everything else queues as
+    // uploading (queued files count as uploading so the send gate holds —
+    // a Send while file 3/3 waits would silently drop it from the message).
+    const tagged = files.map(f => f.error ? f : ({
       ...f,
       uploading: true as const,
+      queued: true as const,
       abortController: new AbortController(),
     }))
     useChatStore.getState().addPendingFiles(draftKey, tagged)
     for (const f of tagged) {
-      void uploadPendingFile(f)
+      if (f.error || !f.abortController) continue
+      enqueueChatUpload({
+        fileId: f.id, file: f.file, agent: agentName || '',
+        abort: f.abortController,
+      })
     }
-  }, [uploadPendingFile, draftKey])
+  }, [agentName, draftKey])
 
   const handleRemoveFile = useCallback((id: string) => {
     if (!draftKey) return
-    // Abort the in-flight upload BEFORE the mutator drops the entry — the
-    // mutator only removes by id, the abort logic stays here.
+    // Still queued → drop from the chain; in-flight → abort BEFORE the
+    // mutator removes the entry (the mutator only removes by id).
+    dequeueChatUpload(id)
     const target = useChatStore.getState().byChat[draftKey]?.pendingFiles.find(f => f.id === id)
     target?.abortController?.abort()
     useChatStore.getState().removePendingFile(draftKey, id)
   }, [draftKey])
 
+  // Re-queue a failed upload from its error chip (ChatInput only offers the
+  // affordance for retryable failures — oversize chips stay remove-only).
+  const handleRetryFile = useCallback((id: string) => {
+    if (!draftKey) return
+    const target = useChatStore.getState().byChat[draftKey]?.pendingFiles.find(f => f.id === id)
+    if (!target?.file) return
+    const abort = new AbortController()
+    useChatStore.getState().updatePendingFile(draftKey, id, {
+      error: undefined,
+      uploading: true, queued: true,
+      uploadSent: 0, uploadTotal: target.size,
+      abortController: abort,
+    })
+    enqueueChatUpload({
+      fileId: id, file: target.file, agent: agentName || '', abort,
+    })
+  }, [agentName, draftKey])
+
   const handleSend = useCallback(
     (text: string) => {
       if (!agentName) return
+      // Live conversation: a typed send rides the duplex socket as a
+      // SPOKEN-mode turn — the reply comes back as TTS, and none of the
+      // overlay-closing below runs (an open mini-app view survives the
+      // send). Attachments can't ride the frame — fall through to a
+      // normal typed send when any are pending, or if the socket is gone.
+      if (duplexActiveRef.current && pendingImages.length === 0
+          && pendingFiles.length === 0 && duplexVoice.sendTyped(text)) {
+        if (draftKey) useChatStore.getState().clearDraft(draftKey)
+        return
+      }
+      if (duplexExitNoteRef.current && duplexExitNoteRef.current === chatId) {
+        duplexExitNoteRef.current = null
+        text = '[The user left the live spoken conversation mode — this is '
+          + 'normal typed chat again; respond normally in text.]\n\n' + text
+      }
       abortedRef.current = false  // Reset abort guard on new send
       discardingRef.current = false  // User is sending — accept events
       // Draft persisted only as long as it's unsent. Clear immediately so a
@@ -1090,6 +1307,23 @@ export default function AgentChat() {
 
       const wsImages = images?.map(i => ({ base64: i.base64, name: i.name }))
       const wsFiles = uploadedFiles?.length ? uploadedFiles : undefined
+
+      // First send racing the agents query: with no explicit per-chat mode and
+      // the agents list still loading, the effective mode is UNKNOWABLE —
+      // `interactiveMode` computes false only because the agent default hasn't
+      // arrived, so routing now would commit a default-interactive agent's
+      // first send to headless. Hold the send exactly like a during-warmup
+      // queue (bubble + warming badge now, server-kick adoption armed); the
+      // flush effect below routes it when the query settles. A failed query
+      // never holds (routing falls back to what we have).
+      if (!sessionId && !warmingUp && agents === undefined && !agentsLoadFailed && !interactive.chatExecMode) {
+        addUserAndPlaceholder(text)
+        sentWithBubbleRef.current = text
+        setWarmingUp(true)
+        serverKickPendingRef.current = { chatId: chatId || null }
+        heldForAgentsRef.current = { text, images: wsImages, files: wsFiles }
+        return
+      }
 
       // Interactive CLI: the human drives the PTY directly. A live
       // session → write the line straight to the terminal; toggle-on with
@@ -1154,8 +1388,30 @@ export default function AgentChat() {
         pendingFilesRef.current = wsFiles || null
       }
     },
-    [agentName, sessionId, chatId, mode, model, chatActiveLayer, selectedLayer, ws, warmingUp, interactive.routeSend, interactive.setShowRichView, interactive.chatExecMode, pendingImages, pendingFiles, workspace, draftKey],
+    [agentName, sessionId, chatId, mode, model, chatActiveLayer, selectedLayer, ws, warmingUp, agents, agentsLoadFailed, interactive.routeSend, interactive.setShowRichView, interactive.chatExecMode, pendingImages, pendingFiles, workspace, draftKey, duplexVoice.sendTyped],
   )
+
+  // Flush a send held above once the agents query settles: route it with the
+  // now-known effective mode. The bubble/badge/kick-adoption were set at hold
+  // time, so the cold-start callback is a no-op and ctx.warmingUp is passed
+  // false (the "warmup" in flight is our own hold, not a real spawn).
+  useEffect(() => {
+    if (agents === undefined && !agentsLoadFailed) return
+    const held = heldForAgentsRef.current
+    if (!held || !agentName) return
+    heldForAgentsRef.current = null
+    const routed = interactive.routeSend(held.text, {
+      chatId, sessionId, warmingUp: false,
+      warmupParams: { agentName, chatId: chatId || undefined, mode, model, layer: chatActiveLayer ?? selectedLayer ?? undefined },
+      onColdStart: () => {},
+      images: held.images, files: held.files,
+    })
+    if (routed) return
+    // Not interactive → the normal server-owned headless first turn (same
+    // call as the un-held send path).
+    ws.warmup(agentName, chatId || undefined, mode, model, chatActiveLayer ?? selectedLayer ?? undefined, { text: held.text, images: held.images, files: held.files }, interactive.chatExecMode || undefined, currentDashboardTheme())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents, agentsLoadFailed, interactive.routeSend])
 
   const handleAbort = useCallback(() => {
     if (warmingUp) {
@@ -1163,6 +1419,7 @@ export default function AgentChat() {
       pendingMessageRef.current = null
       pendingImagesRef.current = null
       pendingFilesRef.current = null
+      heldForAgentsRef.current = null  // a send held on the agents query is cancelled too
       setWarmingUp(false)
       // Remove the user message bubble that was added on send
       setMessages((prev) => {
@@ -1212,8 +1469,12 @@ export default function AgentChat() {
     const prefs = useAgentPrefsStore.getState()
     const stickyInteractive = prefs.lastInteractive[agentName] || ''
     interactive.seedExecMode(stickyInteractive)
+    // Pre-stamp the URL effect's new-chat guard — this handler just did the
+    // reset+seed; the navigate below must not trigger a duplicate reset.
+    newChatModeSeededRef.current = agentName
     currentMsgRef.current = null
     pendingMessageRef.current = null
+    heldForAgentsRef.current = null  // a held first send belongs to the abandoned chat view
     setTotalCost(0)
     setLimitReached(false)
     setLimitWarning(null)
@@ -1264,6 +1525,44 @@ export default function AgentChat() {
     }
   }, [agentName, agentDefaultModel, preWarmPath, navigate, ws, workspace, currentAgent?.default_execution_mode, interactive.seedExecMode, interactive.resetSession, isFavoriteAgent])
 
+  // Wake word ARM (?wake=1 was consumed above into wakeRequested): start
+  // duplex on a FRESH chat of the route agent. Never trust the page's chatId
+  // state here — right after a wake navigation from another open chat it is
+  // STALE (nothing resets state for an EXTERNAL entry into the new-chat
+  // view), and starting on it attached duplex to the previous agent's dead
+  // interactive chat (live-hit 2026-08-14: session_dead → heal refused
+  // interactive_chat → spoken error, no reply). Stale state runs
+  // handleNewChat — the canonical full reset, and wake means "new chat" by
+  // decision — then the effect re-fires once chatId clears.
+  useEffect(() => {
+    if (!wakeRequested || !ws.connected || warming) return
+    if (!audioCapability?.duplex) return // capability still loading
+    if (urlChatId) {
+      // Explicit deep-link (?wake=1 on a concrete chat URL): start on that
+      // chat once the page state has synced to it.
+      if (chatId !== urlChatId) return
+      setWakeRequested(false)
+      if (!audioCapability.duplex.available || duplexVoice.active) return
+      // (Apps keep-open was armed at render time from the ?wake=1 param —
+      // the mount-commit close runs before any effect could set it here.)
+      wakeInitiatedRef.current = true
+      duplexVoice.start()
+      return
+    }
+    if (chatId) { handleNewChat(); return }
+    setWakeRequested(false)
+    if (!audioCapability.duplex.available || duplexVoice.active) return
+    if (!agentName) return
+    wakeInitiatedRef.current = true
+    keepAppsOnChatEntryRef.current = true // belt-and-braces beside the render-time arm
+    duplexPendingRef.current = true
+    ws.warmup(agentName, undefined, mode, model,
+      chatActiveLayer ?? selectedLayer ?? undefined, undefined,
+      interactive.chatExecMode || undefined,
+      currentDashboardTheme())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wakeRequested, ws.connected, warming, audioCapability, chatId, urlChatId, handleNewChat])
+
   // Lazy pre-warm: a non-favorite agent's new-chat page warms the moment the
   // user genuinely engages the composer (first keydown/pointerdown). Deduped by
   // the same guards as the eager effect so the favorite's eager warm (which
@@ -1284,10 +1583,14 @@ export default function AgentChat() {
       discardingRef.current = true
       if (workspace.state.open) workspace.closeWorkspace()
       setAppsOpen(false)
+      // A user-driven chat pick always closes the panel — disarm any stale
+      // phone-mode keep (an abandoned wake must not invert this close).
+      keepAppsOnChatEntryRef.current = false
       // Reset ALL state to prevent cross-chat leakage
       setMessages([])
       currentMsgRef.current = null
       pendingMessageRef.current = null
+      heldForAgentsRef.current = null  // a held first send must not flush into the selected chat
       thinkingBufRef.current = ''
       setChatId(selectedChatId)
       setSessionId(null)
@@ -1387,6 +1690,7 @@ export default function AgentChat() {
         if (!res.ok) return { status: 'denied', reason: 'could not start a chat' }
         const chat = (await res.json()).chat
         setAppsOpen(false)
+        keepAppsOnChatEntryRef.current = false // app-action chats close the panel
         handleSelectChat(chat.id)
         for (let i = 0; i < 6; i++) {
           await new Promise((r) => setTimeout(r, 700))
@@ -1435,15 +1739,17 @@ export default function AgentChat() {
     }
     ws.changeModel(modelId)
     setModel(modelId)
-    // Sticky for the same agent's next new chat.
-    if (agentName) useAgentPrefsStore.getState().setLastModel(agentName, modelId)
+    // Sticky for the same agent's next new chat — but never from a task
+    // chat: a one-off pick on a run's chat must not rewrite the user's
+    // default.
+    if (agentName && !isTaskChat) useAgentPrefsStore.getState().setLastModel(agentName, modelId)
     // Track the selected layer (drives warmup + the dropdown highlight) WITHOUT
     // collapsing the dropdown — a not-yet-started chat keeps every layer visible.
     // The committed chatActiveLayer is set only when the chat actually starts.
     if (!ws.streaming) {
       setSelectedLayer(layer)
     }
-  }, [ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming])
+  }, [ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming, isTaskChat])
 
   // Cross-engine switch confirm/cancel (EngineSwitchBanner + its dialog).
   const handleEngineSwitchConfirm = useCallback(() => {
@@ -1460,8 +1766,8 @@ export default function AgentChat() {
 
   // Interactive CLI toggle. No live session:
   // set the per-chat intent + persist it (the next send spawns the chosen mode).
-  // Live session: confirm (a running process is being restarted), then
-  // kill+rewarm in the target mode (deferred to turn-end if a -p turn streams).
+  // Live session: kill+rewarm in the target mode (deferred to turn-end if a -p
+  // turn streams); a turn in flight confirms first — the switch kills it.
   const handleInteractiveToggle = useCallback((next: boolean) => {
     // Sticky for the same agent's next new chat (the interactive twin of the
     // model/mode stickiness). Persist the EXPLICIT choice both ways so
@@ -1473,12 +1779,17 @@ export default function AgentChat() {
       interactive.toggle(next, chatId)
       return
     }
-    const ok = window.confirm(next
-      ? 'Switch this chat to the interactive terminal? The current session restarts (your conversation is kept).'
-      : 'Switch this chat to normal mode? The terminal closes and the conversation continues in chat (kept).')
-    if (!ok) return
+    // A live/streaming turn dies with the switch (switch_execution_mode kills
+    // the running process) — confirm before destroying a response in flight.
+    // Gate on the VIEWED chat's per-chat slice OR the connection-global flag
+    // so a turn started in another tab still warns. An IDLE live session
+    // switches without a prompt: the restart is lossless (the conversation is
+    // kept and reloaded). window.confirm is this page's existing confirm idiom.
+    if (viewedStreaming || ws.streaming) {
+      if (!window.confirm('Switching mode stops the current response. Switch anyway?')) return
+    }
     interactive.performSwitch(next, chatId, ws.streaming)
-  }, [interactive.toggle, interactive.performSwitch, sessionId, chatId, ws.streaming, agentName])
+  }, [interactive.toggle, interactive.performSwitch, sessionId, chatId, ws.streaming, viewedStreaming, agentName])
 
   // Interactive PTY died (the user quit the TUI with Ctrl+C/Ctrl+D, or it was
   // reaped). Leave the dead terminal for the DB rich view — reload chat_history
@@ -1544,40 +1855,48 @@ export default function AgentChat() {
       </div>
     </div>
   ) : (
-    <ChatMessages
-      messages={messages}
-      agentName={agentName}
-      agentDisplayName={agentDisplayName}
-      agentColor={agentColor}
-      chatId={chatId || undefined}
-      onPermissionRespond={handlePermissionRespond}
-      onPlanReviewResponse={resolvePlanReview}
-      onImplementPlan={handleImplementPlan}
-      onImplementPlanCodex={handleImplementPlanCodex}
-      onQuestionAnswer={handleQuestionAnswer}
-      onQuestionAnswerStructured={handleQuestionAnswerStructured}
-      onSendMessage={handleSendMessage}
-      onArtifactInteraction={sendArtifactInteraction}
-      onPlanFetched={handlePlanFetched}
-      onDismissPreview={(fileId, key) => {
-        // Drop the preview blocks from local UI state (ref-safe; `key` scopes
-        // to one frozen instance). The DocumentPreview component already
-        // called the dismiss API before invoking this.
-        dismissPreview(fileId, key)
-      }}
-      streaming={viewedStreaming}
-      queuedMessages={queuedMessages}
-      onCancelQueued={handleCancelQueued}
-      onLoadOlder={loadOlder}
-      hasMoreOlder={hasMoreOlder}
-      loadingOlder={loadingOlder}
-    />
+    // ChatFileProvider makes the markdown file-path chips clickable (resolve →
+    // preview); one mount here covers the normal view AND the rich-view overlay.
+    <ChatFileProvider chatId={chatId || undefined} agent={agentName}>
+      <ChatMessages
+        messages={messages}
+        agentName={agentName}
+        agentDisplayName={agentDisplayName}
+        agentColor={agentColor}
+        chatId={chatId || undefined}
+        onPermissionRespond={handlePermissionRespond}
+        onPlanReviewResponse={resolvePlanReview}
+        onImplementPlan={handleImplementPlan}
+        onImplementPlanCodex={handleImplementPlanCodex}
+        onQuestionAnswer={handleQuestionAnswer}
+        onQuestionAnswerStructured={handleQuestionAnswerStructured}
+        onSendMessage={handleSendMessage}
+        onArtifactInteraction={sendArtifactInteraction}
+        onPlanFetched={handlePlanFetched}
+        onDismissPreview={(fileId, key) => {
+          // Drop the preview blocks from local UI state (ref-safe; `key` scopes
+          // to one frozen instance). The DocumentPreview component already
+          // called the dismiss API before invoking this.
+          dismissPreview(fileId, key)
+        }}
+        streaming={viewedStreaming}
+        queuedMessages={queuedMessages}
+        onCancelQueued={handleCancelQueued}
+        onLoadOlder={loadOlder}
+        hasMoreOlder={hasMoreOlder}
+        loadingOlder={loadingOlder}
+      />
+    </ChatFileProvider>
   )
 
   // --- Render ---
 
+  // overflow-clip (both axes): the PresenceHalo canvas deliberately pokes
+  // past the viewport sides and bottom — clip (NOT hidden: clip doesn't
+  // create a scroll container) so no geometry bug can ever make the page
+  // itself pannable/scrollable; children own their scrolling.
   return (
-    <div ref={swipeRef} className="flex h-screen-safe bg-p-bg">
+    <div ref={swipeRef} className="flex h-screen-safe bg-p-bg overflow-clip">
       <ResponsiveDrawer open={historyOpen} onClose={() => setHistoryOpen(false)} width="w-64" widthPx={256}>
         <ChatHistory
           chats={chats || []}
@@ -1742,6 +2061,18 @@ export default function AgentChat() {
           <div className="flex-1 min-h-0 flex flex-col">
             <AppsOverlay agent={agentName} onSendPrompt={handleAppSendPrompt} topPadding={!showHomeActive} />
           </div>
+        ) : projectsActive && chatId && agentName ? (
+          <div className="flex-1 min-h-0 flex flex-col">
+            <ProjectsOverlay
+              agent={agentName}
+              chatId={chatId}
+              isProjectChat={isProjectChat}
+              pins={chatPins}
+              onSelectChat={(id) => { setProjectsOpen(false); handleSelectChat(id) }}
+              onClose={() => setProjectsOpen(false)}
+              onSendPrompt={handleAppSendPrompt}
+            />
+          </div>
         ) : !ws.connected ? (
           <div className="flex-1 flex items-center justify-center text-p-text-light text-sm">
             Connecting...
@@ -1883,11 +2214,16 @@ export default function AgentChat() {
               onToggleRichView={handleToggleRichView}
               hidePermissions={interactive.interactiveMode || interactive.sessionInteractive}
               interactiveActive={interactive.interactiveMode || interactive.sessionInteractive}
-              // A task run's model/permissions are the RUN's facts (agent
-              // default model, 'auto' posture) — display-only, never a
-              // viewer choice. The locked model row renders the raw id even
-              // when the catalog no longer lists that model.
-              modelLocked={interactive.sessionInteractive || isTaskChat}
+              // A task run's PERMISSIONS are the run's fact ('auto'
+              // posture) — display-only. Its MODEL (1.5) follows the same
+              // rule as every chat: while the run/session is alive the
+              // picker offers the active engine's models only
+              // (computeModelGroups), once dead the cross-engine expansion
+              // + confirm flow applies — follow-up turns resolve
+              // model/engine from the chat row, so the pick governs
+              // exactly those. Interactive PTY sessions stay locked (the
+              // terminal owns its process).
+              modelLocked={interactive.sessionInteractive}
               modeLocked={isTaskChat}
               leftSlot={interactive.sessionInteractive && chatId
                 ? <TerminalControlBar className="flex-1 min-w-0" send={(seq) => ws.sendPtyInput(chatId, utf8ToB64(seq))} />
@@ -1961,17 +2297,52 @@ export default function AgentChat() {
             pendingFiles={pendingFiles}
             onAddFiles={handleAddFiles}
             onRemoveFile={handleRemoveFile}
+            onRetryFile={handleRetryFile}
             workspaceOpen={workspace.state.open}
             onToggleWorkspace={workspace.toggleWorkspace}
             workspaceHasNewMessage={workspace.state.hasNewMessage}
             appsOpen={appsActive}
             onToggleApps={toggleApps}
+            projectsOpen={projectsActive}
+            dockKind={isProjectChat ? 'project' : 'chat'}
+            onToggleProjects={dockAvailable ? () => {
+              // Same reveal-intent shape as toggleApps (visibility, not flag).
+              if (projectsActive) { setProjectsOpen(false); return }
+              if (workspace.state.open) workspace.closeWorkspace()
+              setAppsOpen(false)
+              setProjectsOpen(true)
+            } : undefined}
             voice={{
-              ttsAvailable: !!audioCapability && audioCapability.tts !== 'unavailable',
-              live: voiceModeEnabled,
-              onSetLive: setVoiceModeEnabled,
-              speaking: voiceMode.speaking,
-              onBargeIn: voiceMode.cancel,
+              duplex: {
+                available: !!audioCapability?.duplex?.available,
+                active: duplexVoice.active,
+                phase: duplexVoice.phase,
+                caption: duplexVoice.caption,
+                endReason: duplexVoice.endReason,
+                getLevels: duplexVoice.getLevels,
+                onToggle: () => {
+                  if (duplexVoice.active) { duplexVoice.stop(); return }
+                  if (chatId) { duplexVoice.start(); return }
+                  if (!agentName) return
+                  // Never-warmed chat: run the normal warmup first (no
+                  // message payload — the same shape the install-retry path
+                  // uses), then start once chatId + session land. A
+                  // phone-mode start from the home keeps the dashboards
+                  // panel showing through the chat entry (operator rule —
+                  // the only phone entry not derivable from the URL).
+                  keepAppsOnChatEntryRef.current = true
+                  duplexPendingRef.current = true
+                  ws.warmup(agentName, undefined, mode, model,
+                    chatActiveLayer ?? selectedLayer ?? undefined, undefined,
+                    interactive.chatExecMode || undefined,
+                    currentDashboardTheme())
+                },
+                muted: duplexVoice.muted,
+                onToggleMute: duplexVoice.toggleMute,
+                onHold: duplexVoice.hold,
+                onRelease: duplexVoice.release,
+                onReleaseWithDraft: duplexVoice.releaseWithDraft,
+              },
             }}
           />
         </div>

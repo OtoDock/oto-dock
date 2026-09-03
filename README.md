@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-Apache-2.0" src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.5.0-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
@@ -190,8 +190,8 @@ bash install.sh
 
 The installer checks Docker, writes a `.env` with a generated database
 password, handles the Ubuntu 24.04+ host step automatically when the host
-needs it, downloads the release-pinned `docker-compose.yml`, and starts the
-stack. Everything lands in the folder you run it from, and it performs
+needs it, downloads the release-pinned `docker-compose.yml` plus the
+phone-service overlay, and starts the stack. Everything lands in the folder you run it from, and it performs
 fresh installs only: it stops rather than touch an existing install.
 
 Then open **http://localhost:8400**. A fresh install greets you with the
@@ -218,6 +218,8 @@ covers them all.
  mcps/        MCP tool servers: OtoDock's custom set (files, memory, tasks,
               meetings, notifications, …) + community mirrors
  audio/       Speech package — STT / TTS / voice activity, provider-agnostic
+ phone/       Telephony daemon — live calls over Twilio or FreePBX/Asterisk
+ satellite/   Remote-machine agent — pairs your own hardware to the platform
  scripts/     Install, compose, backup/restore, and maintainer tooling
 ```
 
@@ -225,9 +227,8 @@ Agents run as Claude Code / Codex processes inside per-session kernel
 sandboxes, talk to their tools over MCP, and stream every step back to the
 dashboard. PostgreSQL holds the platform state.
 
-**Roadmap:** remote machines, phone calls, the Android app, Projects & the
-Dock, and more integrations (Google Workspace, Slack, Linear,
-Microsoft 365, Zoom, and more). What each brings:
+**Roadmap:** the Android app and more integrations (Google Workspace,
+Slack, Linear, Microsoft 365, Zoom, and more). What each brings:
 [docs.otodock.io/roadmap](https://docs.otodock.io/roadmap).
 
 ## Community

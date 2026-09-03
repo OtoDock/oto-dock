@@ -88,8 +88,12 @@ def get_token_dir(
 # An account label becomes a FILENAME component; constrain it so a caller-
 # supplied '/' or '..' can't escape token_dir (cross-user token read / revoke /
 # delete). The label originates from request bodies and from vendor userinfo
-# (display name / email), so it is NOT trusted.
-_ACCOUNT_LABEL_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,128}$")
+# (display name / email), so it is NOT trusted. INTERNAL spaces are allowed
+# (users type labels like "OtoDock Marketing"); leading/trailing ones are not
+# (invisible in the UI, and "{label}.json" round-trips are whitespace-exact).
+_ACCOUNT_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9._@+-](?:[A-Za-z0-9._@+ -]{0,126}[A-Za-z0-9._@+-])?$"
+)
 
 
 def validate_account_label(account_label: str) -> str:
@@ -298,6 +302,29 @@ def persist_oauth_account(
     for svc in services:
         for s in by_key.get(svc, []):
             if s not in seen:
+                seen.add(s)
+                final_scopes.append(s)
+
+    # Incremental-auth providers (google): oauth_start always sends the
+    # incremental param, so a re-consent by the same vendor account grants
+    # the UNION of previously granted + newly requested scopes. When the
+    # target token file already exists — same provider + label, possibly
+    # connected through a DIFFERENT MCP sharing the provider_id — record
+    # that union, not just this MCP's slice: readers like workspace-mcp's
+    # google.auth pass the file's `scopes` on refresh, and a narrowed
+    # record would narrow the refreshed token and break the other MCP.
+    _incremental = False
+    try:
+        from auth.oauth_providers import get_provider
+        _incremental = getattr(
+            get_provider(provider_id), "supports_incremental_auth", False,
+        )
+    except KeyError:
+        pass
+    if _incremental:
+        prior = read_account_token(token_dir, account_label) or {}
+        for s in prior.get("scopes") or []:
+            if isinstance(s, str) and s and s not in seen:
                 seen.add(s)
                 final_scopes.append(s)
 

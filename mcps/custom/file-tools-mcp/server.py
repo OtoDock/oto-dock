@@ -160,10 +160,20 @@ TOOLS = [
             "intended cells.\n\n"
             "SHEETS: create_sheet, delete_sheet, rename_sheet (old_name, new_name), "
             "copy_sheet (source, new_name), protect_sheet (password, allow_* flags).\n"
-            "CELLS: write_cells — either cells: [{cell: 'B2', value: ...}, ...] "
-            "for individual cells, OR a 2D row-major array data: [[...row...], ...] "
+            "CELLS: write_cells — either cells: [{cell: 'B2', value: ..., "
+            "type?, format?}, ...] for individual cells, OR a 2D row-major "
+            "array data: [[...row...], ...] "
             "with start_cell: 'B2' (data[0][0] lands AT start_cell, data[0][1] "
-            "one column to its right), "
+            "one column to its right). DATES: write strict ISO strings "
+            "('2026-03-27', '2026-03-27T14:30', '14:30') — they auto-convert "
+            "to real Excel dates displayed dd/mm/yyyy; ambiguous forms like "
+            "'27/03/2026' are NEVER guessed and land as TEXT with a warning "
+            "(so do timezone-suffixed, pre-1900 or invalid ISO strings). "
+            "Per-cell type "
+            "('date'/'datetime'/'time' — same strict ISO, warns on non-ISO; "
+            "'text' opts out) and format (preset name or raw code — wins "
+            "over the automatic date display); numbers and formulas are "
+            "never touched. "
             "set_formula (cell, formula — validated, blocks unsafe functions), "
             "merge_cells (range), unmerge_cells (range), clear_range (range, clear_styles), "
             "copy_range (source_range, target_start, target_sheet — copies data AND styles).\n"
@@ -173,10 +183,21 @@ TOOLS = [
             "auto_column_width (columns list or all), freeze_panes (cell).\n"
             "FORMATTING: set_style (range + bold/italic/underline/strikethrough/"
             "font_size/font_color/font_name/fill_color/border/number_format/"
-            "alignment/wrap_text/text_rotation/protection).\n"
+            "alignment/wrap_text/text_rotation/protection; number_format "
+            "takes a preset name — date (dd/mm/yyyy), date-iso, datetime, "
+            "time, percent, number, integer, currency (€), currency:usd, "
+            "currency:gbp, text — or any raw Excel format code verbatim).\n"
             "FEATURES: create_table (range, name, style — native Excel table with auto-styles), "
             "add_data_validation (range, validation_type: list/whole/decimal/date/textLength/custom, "
-            "values for dropdowns, operator+min/max for numbers), "
+            "values for dropdowns — an ARRAY of literal items, OR a STRING "
+            "referencing a named range or sheet-qualified range "
+            "('=SupplierList', \"'Data'!$B$2:$B$50\"; a one-item array in "
+            "either shape counts as a reference too); re-adding a rule of "
+            "any type on the same range REPLACES it; operator+min/max for "
+            "numbers), "
+            "remove_data_validation (range — removes every rule whose cells "
+            "intersect it, even partially; accepts multi-range strings like "
+            "'B2:B50 D2:D50' — OR all: true to clear the sheet's rules), "
             "conditional_format (range, rule_type: color_scale/data_bar/icon_set/cell_is/formula, params), "
             "auto_filter (range), add_chart (chart_type: bar/line/pie/scatter/area, "
             "data_range — categories in the FIRST COLUMN and one series per "
@@ -189,7 +210,9 @@ TOOLS = [
             "comment; picture and comment persist across later edits; the "
             "readback grid shows the cell as [equation]; re-running "
             "add_equation at the same cell REPLACES that equation), "
-            "define_name (name, range — creates named range).\n\n"
+            "define_name (name, range — creates named range; a range "
+            "containing '!' is used as-is, a bare range is qualified with "
+            "the op's sheet).\n\n"
             "CAVEAT: openpyxl cannot round-trip charts — editing an existing "
             "workbook that contains charts drops them (a warning is emitted "
             "in the result).\n\n"
@@ -678,19 +701,26 @@ async def _handle_read_document(args: dict) -> str:
     sheet = args.get("sheet")
     max_rows = int(args.get("max_rows", 500))
 
+    # Parses run in bounded, deadline-limited worker children (isolation.py):
+    # a pathological document surfaces as a clean error below instead of
+    # ballooning the shared server, and the event loop stays free for every
+    # other session while a parse runs.
     try:
+        from isolation import run_parse
+
         if ext == ".pdf":
             from pdf import read_pdf
 
-            return read_pdf(path, pages)
+            return await run_parse(read_pdf, path, pages)
         elif ext in (".docx", ".doc"):
             from word import read_docx
 
-            return read_docx(path)
+            return await run_parse(read_docx, path)
         elif ext in (".xlsx", ".xls"):
             from excel import read_xlsx
 
-            return read_xlsx(
+            return await run_parse(
+                read_xlsx,
                 path,
                 sheet,
                 max_rows,
@@ -701,7 +731,7 @@ async def _handle_read_document(args: dict) -> str:
         elif ext in (".pptx", ".ppt"):
             from powerpoint import read_pptx
 
-            return read_pptx(path)
+            return await run_parse(read_pptx, path)
         else:
             return f"Error: Unsupported format '{ext}'. Supported: .pdf, .docx, .xlsx, .pptx"
     except Exception as exc:

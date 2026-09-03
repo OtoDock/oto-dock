@@ -115,6 +115,9 @@ def _mk_session(*, armed=True, chat_id="chat-i1") -> InteractiveSession:
     s._loop = asyncio.get_running_loop()
     s._closing = False
     s._closed = False
+    s.target = "local"
+    s._midturn_tail_handle = None
+    s._midturn_tail_task = None
     s._title_armed = armed
     s._title_chars = 0
     s._title_tools = 0

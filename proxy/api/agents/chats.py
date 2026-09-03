@@ -43,6 +43,12 @@ class UpdateChatRequest(BaseModel):
     title: str | None = None
 
 
+class ResolvePathRequest(BaseModel):
+    # POST body, not a query string — path strings carry backslashes/unicode
+    # that query strings mangle.
+    path: str
+
+
 # --- Endpoints ---
 
 
@@ -237,11 +243,61 @@ def _widget_chat_visible(u: UserContext, chat: dict) -> bool:
     return is_shared_chat_owner(owner) and _widget_shows_agent(u, chat.get("agent", ""))
 
 
+def _shape_active_row(u: UserContext, chat: dict, status: str) -> dict | None:
+    """One Active-now widget row, or None when the viewer must not see it.
+
+    Shared by the streaming set and the warming backfill so BOTH re-derive
+    per-viewer visibility from the CHAT ROW with the same gates:
+
+    - Task rows (``task-run-…`` ids) click through to the per-agent Task
+      History, which scopes runs like /v1/tasks/runs (audit=false):
+      agent-scoped runs for anyone with agent access, user-scoped runs only
+      for their creator — deliberately NO admin bypass (the admin audit page
+      is the full-view surface). Gate the row on the RUN's visibility so the
+      widget never emits a row whose destination page is empty. Task rows are
+      labeled by the task's NAME, matching the sidebar's task mode; the chat
+      title (prompt first line / LLM upgrade) is the fallback for runs whose
+      task row is already gone.
+    - Chat rows follow ``_widget_chat_visible`` (assignment-scoped, no admin
+      bypass).
+    """
+    from core.session.visibility import is_shared_chat_owner
+    cid = chat.get("id", "")
+    title = chat.get("title") or ""
+    if cid.startswith("task-run-"):
+        run = task_store.get_run(cid.removeprefix("task-"))
+        if not run or not _widget_shows_agent(u, run.get("agent", "")):
+            return None
+        if (run.get("scope") or "agent") == "user" and \
+                run.get("created_by") != u.acting_sub:
+            return None
+        dyn = task_store.get_dynamic_task(run.get("task_id") or "")
+        if dyn and dyn.get("name"):
+            title = dyn["name"]
+    elif not _widget_chat_visible(u, chat):
+        return None
+    return {
+        "id": cid,
+        "agent": chat.get("agent", ""),
+        "title": title,
+        "status": status,
+        # Task-run chats are created with the DEFAULT source_type
+        # ('chat') — their durable marker is the id prefix. The widget
+        # renders task rows purple and routes them to the run view,
+        # so report them as what they are.
+        "source_type": ("task" if cid.startswith("task-run-")
+                        else chat.get("source_type") or ""),
+        "owner_is_shared": is_shared_chat_owner(chat.get("user_sub", "")),
+        "last_response_at": chat.get("last_response_at"),
+    }
+
+
 @router.get("/v1/chats/active")
 async def list_active_chats(
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Chats with an OPEN TURN right now, across every agent this user may see.
+    """Chats with an OPEN TURN or an in-flight WARMUP right now, across every
+    agent this user may see.
 
     The seed for the sidebar's cross-agent "Active now" widget: the client
     keeps rows live from the ``chat_status`` WS broadcasts it already
@@ -259,7 +315,7 @@ async def list_active_chats(
     """
     u = require_auth(user)
     from core.session.session_state import streaming_chat_ids as pump_streaming
-    from core.session import interactive_session
+    from core.session import interactive_session, warmup_registry
     from core.session.visibility import is_shared_chat_owner
 
     rows: list[dict] = []
@@ -271,42 +327,29 @@ async def list_active_chats(
         chat = task_store.get_chat(cid)
         if not chat:
             continue
-        title = chat.get("title") or ""
-        if cid.startswith("task-run-"):
-            # Task rows click through to the per-agent Task History, which
-            # scopes runs like /v1/tasks/runs (audit=false): agent-scoped runs
-            # for anyone with agent access, user-scoped runs only for their
-            # creator — deliberately NO admin bypass (the admin audit page is
-            # the full-view surface). Gate the row on the RUN's visibility so
-            # the widget never emits a row whose destination page is empty.
-            run = task_store.get_run(cid.removeprefix("task-"))
-            if not run or not _widget_shows_agent(u, run.get("agent", "")):
-                continue
-            if (run.get("scope") or "agent") == "user" and \
-                    run.get("created_by") != u.acting_sub:
-                continue
-            # Task rows are labeled by the task's NAME, matching the sidebar's
-            # task mode; the chat title (prompt first line / LLM upgrade) is
-            # the fallback for runs whose task row is already gone.
-            dyn = task_store.get_dynamic_task(run.get("task_id") or "")
-            if dyn and dyn.get("name"):
-                title = dyn["name"]
-        elif not _widget_chat_visible(u, chat):
+        row = _shape_active_row(u, chat, "streaming")
+        if row:
+            rows.append(row)
+
+    # Warming backfill: chats registered as warming have NO open turn yet, so
+    # the streaming sets above miss them — but the title is already persisted
+    # (_persist_first_prompt runs before the warmup frame goes out), which is
+    # exactly the metadata the client's placeholder row needs. The registry
+    # entry's user_sub is the WARMER, not the audience — visibility comes from
+    # the chat row via the same gates as the streaming set. A registry entry
+    # with no DB row is skipped. `seen` keeps the streaming row when a turn
+    # opened between the two snapshots (unregister precedes kick/submit, but
+    # stay defensive).
+    for cid in warmup_registry.inflight_chat_ids():
+        if not cid or cid in seen:
             continue
-        rows.append({
-            "id": cid,
-            "agent": chat.get("agent", ""),
-            "title": title,
-            "status": "streaming",
-            # Task-run chats are created with the DEFAULT source_type
-            # ('chat') — their durable marker is the id prefix. The widget
-            # renders task rows purple and routes them to the run view,
-            # so report them as what they are.
-            "source_type": ("task" if cid.startswith("task-run-")
-                            else chat.get("source_type") or ""),
-            "owner_is_shared": is_shared_chat_owner(chat.get("user_sub", "")),
-            "last_response_at": chat.get("last_response_at"),
-        })
+        seen.add(cid)
+        chat = task_store.get_chat(cid)
+        if not chat:
+            continue
+        row = _shape_active_row(u, chat, "warming")
+        if row:
+            rows.append(row)
 
     # Finished-unread backfill: recent responses nobody opened yet stay in the
     # widget across page reloads (status 'finished' — the client renders the
@@ -487,6 +530,219 @@ async def get_chat_pins(
         return out
 
     return await asyncio.to_thread(_load)
+
+
+# --- resolve-path: live file-path chips (chat markdown → previewable file) ---
+
+# Collabora document types the workspace preview stack renders via
+# ``/v1/documents/wopi-url``. The proxy has NO existing extension
+# classification (the dashboard's ``lib/fileTypes.ts`` DOCUMENT_EXTENSIONS is
+# frontend-only; ``wopi.py`` gates on location, not extension), so this small
+# module-level set is defined here, matching Collabora's doc types.
+_COLLABORA_DOC_EXTENSIONS = frozenset({
+    ".docx", ".doc", ".odt", ".rtf",
+    ".xlsx", ".xls", ".ods", ".csv",
+    ".pptx", ".ppt", ".odp",
+})
+
+# Agent-tree top-level segments a chip path may name directly. Deliberately
+# NOT path_policy_v2._SANDBOX_VIRTUAL_SEGMENTS — ``screenshots`` is not a
+# preview surface for chips.
+_RESOLVE_TREE_SEGMENTS = ("workspace", "users", "knowledge", "config")
+
+
+def _normalize_chip_path(raw: str) -> str:
+    """Normalize FIRST (backslash→slash, drive-letter lowercase, ``//``
+    collapse — ``services.path_policy_v2.normalize_path``), THEN reject NUL /
+    empty / ``..`` / empty segments. The order is load-bearing: a ``/``-split
+    segment check on the raw string misses backslash-carried ``..``
+    (``workspace\\..\\config\\x``). Returns ``""`` for a rejected path."""
+    from services.path_policy_v2 import normalize_path
+    if not raw or not isinstance(raw, str) or "\x00" in raw:
+        return ""
+    normalized = normalize_path(raw)
+    if not normalized:
+        return ""
+    segs = normalized.split("/")
+    # A leading '/' yields one empty head segment (legitimate absolute form);
+    # any OTHER empty segment (``//host`` UNC heads included) or ``..`` rejects.
+    body = segs[1:] if normalized.startswith("/") else segs
+    if any(s in ("", "..") for s in body):
+        return ""
+    return normalized
+
+
+def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
+    """Fold a satellite-host absolute (or ``~/``-rooted) path into an
+    agent-tree-relative candidate using the chat machine's reported
+    capabilities. Returns ``""`` whenever the rule does not apply — local
+    target, unknown machine, empty ``agents_dir`` (legacy satellites report
+    ``""``; an empty prefix would over-match any ``/{agent}/…`` path), or a
+    path outside the reported tree."""
+    import json as _json
+    from services.path_policy_v2 import _is_under, expand_tilde, normalize_path
+    from storage import remote_store
+
+    target = (chat.get("execution_target") or "").strip()
+    if not target or target == "local":
+        # create_chat's INSERT does not stamp execution_target on every path —
+        # fall back to the agent-default resolution before skipping the rule.
+        try:
+            target, _reason = remote_store.resolve_execution_target(agent)
+        except Exception:
+            return ""
+    # The offline sentinel still names the intended machine; the fold is pure
+    # prefix translation against the platform-synced tree — reachability-free.
+    target = (target or "").removeprefix("__offline__:")
+    if not target or target == "local":
+        return ""
+    machine = remote_store.get_remote_machine(target)
+    if not machine:
+        return ""
+    caps_raw = machine.get("capabilities") or "{}"
+    try:
+        caps = _json.loads(caps_raw) if isinstance(caps_raw, str) else dict(caps_raw or {})
+    except (ValueError, TypeError):
+        return ""
+    # Capability values go through normalize_path too — Windows satellites
+    # report raw backslashed ``C:\…`` values a plain startswith never matches.
+    agents_dir = normalize_path(str(caps.get("agents_dir") or ""))
+    if not agents_dir:
+        return ""
+    home_dir = normalize_path(str(caps.get("home_dir") or ""))
+    target_os = (str(caps.get("os") or "").strip().lower()) or "linux"
+    path = normalized
+    if path == "~" or path.startswith("~/"):
+        if not home_dir:
+            return ""
+        path, _was = expand_tilde(path, home_dir)
+        path = normalize_path(path)
+    base = agents_dir.rstrip("/") + "/" + agent
+    # Case-insensitive prefix compare keyed on the machine's reported OS being
+    # windows/darwin (NOT on drive-letter presence — macOS is case-insensitive
+    # with no drive letter). _is_under only case-folds for compare, so the
+    # length-based slice below stays valid.
+    if not _is_under(path, base, target_os):
+        return ""
+    return path[len(base):].lstrip("/")
+
+
+def _chip_path_candidates(
+    agent: str, chat: dict, normalized: str, username: str,
+) -> list[str]:
+    """Agent-tree-relative candidates for a normalized chip path, in the
+    audited order: sandbox-virtual strip → platform-host absolute (this
+    chat's agent ONLY, even for admins) → satellite fold → relative forms
+    (same spirit as hooks._file_pin_candidates). Purely lexical — the caller
+    gates each candidate through safe_agent_path."""
+    from services.path_policy_v2 import _WINDOWS_DRIVE_RE, normalize_path
+    candidates: list[str] = []
+
+    def _add(cand: str) -> None:
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    is_tilde = normalized == "~" or normalized.startswith("~/")
+    is_abs = normalized.startswith("/") or bool(_WINDOWS_DRIVE_RE.match(normalized))
+
+    if normalized.startswith("/"):
+        # Sandbox-virtual: /workspace/…, /users/{u}/…, /knowledge/…, /config/…
+        if normalized[1:].split("/", 1)[0] in _RESOLVE_TREE_SEGMENTS:
+            _add(normalized.lstrip("/"))
+    if is_abs:
+        # Platform-host absolute under str(AGENTS_DIR)/{agent}/ only — another
+        # agent's tree is never a match; the chip resolves only against the
+        # chat's own agent.
+        import config
+        base = normalize_path(str(config.AGENTS_DIR)).rstrip("/") + "/" + agent + "/"
+        if normalized.startswith(base):
+            _add(normalized[len(base):])
+    if is_abs or is_tilde:
+        _add(_satellite_fold_candidate(agent, chat, normalized))
+    if not is_abs and not normalized.startswith("~"):
+        # Relative (no leading slash/drive/tilde).
+        _add("workspace/" + normalized)
+        if username:  # get_username_by_sub may return None → skip
+            _add(f"users/{username}/workspace/{normalized}")
+        if normalized.split("/", 1)[0] in _RESOLVE_TREE_SEGMENTS:
+            _add(normalized)
+    return candidates
+
+
+@router.post("/v1/chats/{chat_id}/resolve-path")
+async def resolve_chat_path(
+    chat_id: str,
+    req: ResolvePathRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Resolve a file-path string from this chat's markdown to a live file in
+    the chat agent's tree (the clickable file-chip backend).
+
+    Pure translation + existence/permission check: it NEVER serves bytes and
+    NEVER mints tokens — serving stays on the existing endpoints (files GET,
+    ``/v1/documents/wopi-url``, ``/v1/media/token``). Chat-scoped so the
+    chat's agent + execution_target drive the satellite-prefix fold.
+
+    Every non-match — malformed path, traversal, role/OAuth denial,
+    directory, missing file, deleted agent — returns 200 ``{found: false}``
+    (no existence/role oracle). Only the chat 404/403 escape as status codes.
+    Agent-tree candidate matching stays case-exact (platform storage is
+    Linux); case-insensitivity applies only to the satellite-prefix fold.
+    Read-only by construction: the gate never passes ``writing=True``.
+    """
+    u = require_auth(user)
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    if not can_access_chat(u, chat):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    agent = chat.get("agent", "")
+    normalized = _normalize_chip_path(req.path)
+    if not normalized:
+        return {"found": False}
+
+    from api.agents._common import _get_agent_dir
+    from api.agents.files import safe_agent_path
+    try:
+        agent_dir = _get_agent_dir(agent)
+    except HTTPException:
+        return {"found": False}  # deleted agent — same no-oracle contract
+
+    username = task_store.get_username_by_sub(u.sub) or ""
+    for candidate in _chip_path_candidates(agent, chat, normalized, username):
+        # ONE gate per candidate: safe_agent_path normalizes, confines after
+        # symlink resolution, and runs the OAuth + role checks internally. It
+        # raises 400/403 — it never returns "no" — so every HTTPException is
+        # "not a match", which is what keeps the {found: false} contract.
+        try:
+            resolved, _uname = safe_agent_path(
+                agent_dir, agent, candidate, u, writing=False)
+        except HTTPException:
+            continue
+        if not resolved.is_file():
+            continue  # directories → found:false (v1 previews files only)
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            continue  # vanished between checks — not a match
+        rel = resolved.relative_to(agent_dir.resolve()).as_posix()
+        # previewable mirrors the /v1/documents/wopi-url confinement (workspace/
+        # + users/ only) so the client never requests a preview that endpoint
+        # would reject, AND the extension must be a Collabora document type.
+        previewable = (
+            resolved.suffix.lower() in _COLLABORA_DOC_EXTENSIONS
+            and rel.split("/", 1)[0] in ("workspace", "users")
+        )
+        return {
+            "found": True,
+            "agent": agent,
+            "path": rel,
+            "filename": resolved.name,
+            "size": size,
+            "previewable": previewable,
+        }
+    return {"found": False}
 
 
 @router.post("/v1/chats")

@@ -177,6 +177,54 @@ def test_building_agents_renders_for_manager(temp_db):
     assert "/users/{u}/" in text
 
 
+def _agent_persona_path(slug: str):
+    import config as _config
+    p = _config.get_agent_dir(slug) / "config" / "agent.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def test_building_agents_flags_an_unconfigured_persona(temp_db):
+    """A dashboard-created agent is seeded with ``# Name`` and nothing else,
+    and that empty state is otherwise invisible (the prompt builder only
+    bails on a MISSING persona). The manager-facing section says so until
+    someone writes it — and the notice self-erases the moment it has body."""
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    persona = _agent_persona_path("pa")
+
+    persona.write_text("# PA\n\n")
+    text = build_permission_context(
+        _ctx(role="manager", username="alice"),
+        assigned_mcp_names=("agent-config-mcp",),
+        execution_path="claude-code-cli",
+    )
+    assert "persona is still empty" in text
+    assert "update_persona" in text
+
+    persona.write_text("# PA\n\nYou are a careful ops assistant.\n")
+    text2 = build_permission_context(
+        _ctx(role="manager", username="alice"),
+        assigned_mcp_names=("agent-config-mcp",),
+        execution_path="claude-code-cli",
+    )
+    assert "persona is still empty" not in text2
+    # The persona/memory split stays stated either way.
+    assert "/config/agent.md" in text2
+
+
+def test_unconfigured_persona_never_nags_a_non_manager(temp_db):
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    _agent_persona_path("pa").write_text("# PA\n\n")
+    for role in ("editor", "viewer"):
+        text = build_permission_context(
+            _ctx(role=role, username="alice"),
+            assigned_mcp_names=("agent-config-mcp",),
+            execution_path="claude-code-cli",
+        )
+        assert "persona is still empty" not in text
+        assert "# Building Agents" not in text
+
+
 def test_building_agents_mentions_config_mcp_when_enabled(temp_db):
     agent_store.create_agent("pa", "PA", default_scope="user")
     text = build_permission_context(
@@ -232,6 +280,41 @@ def test_building_agents_skipped_for_agent_scope(temp_db):
         execution_path="claude-code-cli",
     )
     assert "# Building Agents" not in text
+
+
+def test_folders_ro_library_row_mentions_bulletin(temp_db):
+    """2026-09-01: the RO library row tells the agent its bulletin is
+    auto-loaded (the RW row already mentioned bulletins; RO said nothing)."""
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    ctx = SecurityContext(
+        role="manager", username="alice", agent="pa", is_admin_agent=False,
+        display_name="Alice", email="alice@example.com",
+        knowledge_libraries=[("srcagent", "marketing", False)],
+    )
+    text = build_permission_context(
+        ctx, assigned_mcp_names=(), execution_path="claude-code-cli",
+    )
+    folders = text.split("\n# Folders\n")[1].split("\n# File Permissions\n")[0]
+    row = [ln for ln in folders.splitlines()
+           if "/knowledge/shared/srcagent/marketing/" in ln][0]
+    assert "(RO)" in row
+    assert "auto-loaded into your context" in row
+
+
+def test_building_agents_mentions_shared_libraries_and_bulletin(temp_db):
+    """2026-09-01: manager sessions get the standing hint that shared
+    knowledge libraries + bulletins are the multi-agent collaboration
+    mechanism (so agents can recommend the setup)."""
+    agent_store.create_agent("pa", "PA", default_scope="user")
+    text = build_permission_context(
+        _ctx(role="manager", username="alice"),
+        assigned_mcp_names=("agent-config-mcp",),
+        execution_path="claude-code-cli",
+    )
+    bs = text.split("# Building Agents")[1]
+    assert "shared knowledge libraries" in bs
+    assert "`bulletin/` file is auto-loaded" in bs
+    assert "Agent Settings → Shared Knowledge" in bs
 
 
 def test_building_agents_default_scope_close(temp_db):
@@ -470,7 +553,10 @@ def test_folders_personal_only_drops_shared(temp_db):
                   available_scopes=("user",), config_visible=True),
         assigned_mcp_names=(), execution_path="claude-code-cli",
     )
-    folders = text.split("\n# Folders\n")[1].split("\n# File Permissions\n")[0]
+    # Slice ends at # Building Agents: since 2026-09-01 that section carries
+    # an unconditional shared-libraries bullet (personal-only agents can
+    # attach libraries too), which legitimately mentions `/knowledge/shared/`.
+    folders = text.split("\n# Folders\n")[1].split("\n# Building Agents\n")[0]
     assert "/users/alice/workspace/` (RW)" in folders
     assert "/config/` (RW)" in folders          # manager still curates persona
     # No shared workspace / knowledge bullets.

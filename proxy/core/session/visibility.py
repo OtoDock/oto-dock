@@ -143,6 +143,24 @@ def is_shared_only(agent_name: str) -> bool:
     return not collaborative and default_scope == "agent"
 
 
+def nouser_read_targets(user) -> set[str]:
+    """Agents a NO-USER session may additionally READ: its delegation roster
+    (``agent_delegation_targets``, either source — merged observe semantics,
+    2026-08-15: a wired edge that already lets the agent delegate work IS the
+    read grant; the separate per-edge observe flag is retired).
+
+    Empty for every other principal: user-backed sessions follow the USER's
+    access (locked rule 1 — an edge never widens a chat session), and
+    service callers are unfiltered anyway. Every consuming surface clamps
+    edge reads to the target's AGENT-SCOPE rows, and an edge never grants
+    writes or fire authority (rule 2).
+    """
+    if not (getattr(user, "is_no_user_session", False) and user.agent):
+        return set()
+    from storage import agent_store
+    return set(agent_store.get_delegation_targets(user.agent))
+
+
 def chat_history_owner(agent_name: str, user_sub: str) -> str:
     """The ``chats.user_sub`` owner for a dashboard chat on this agent.
 

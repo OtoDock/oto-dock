@@ -4,6 +4,7 @@ import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask } f
 import { useAgents } from '../api/agents'
 import { useAdminUsers } from '../api/runs'
 import { formatNextRun, formatCronDescription, formatIntervalDescription } from '../lib/format'
+import { TaskModelChip } from '../components/common/TaskModelChip'
 
 export default function Schedules() {
   const [agentFilter, setAgentFilter] = useState('')
@@ -118,7 +119,10 @@ export default function Schedules() {
                 <tr key={task.id} className="border-b border-p-border-light hover:bg-p-surface-hover">
                   <td className="px-4 py-3">
                     <div className="font-medium text-p-text">{task.name}</div>
-                    <div className="text-xs text-p-text-light font-mono">{task.id}</div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                      <TaskModelChip task={task} />
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-p-text-secondary">{task.agent}</td>
                   <td className="px-4 py-3 text-xs text-p-text-secondary">
@@ -189,7 +193,10 @@ export default function Schedules() {
               <div>
                 <p className="text-sm font-medium text-p-text">{task.name}</p>
                 <p className="text-xs text-p-text-secondary">{task.agent}</p>
-                <p className="text-xs text-p-text-light font-mono mt-0.5">{task.id}</p>
+                <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                  <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                  <TaskModelChip task={task} />
+                </div>
               </div>
               <div className="flex gap-1 shrink-0">
                 <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${

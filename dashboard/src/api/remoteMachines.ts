@@ -36,7 +36,15 @@ export interface RemoteMachine {
       server?: 'x11' | 'wayland' | 'quartz' | 'windows' | 'none'
       session_active_unlocked?: boolean
     }
+    // Per-CLI {version, path} the satellite's pin reconcile resolved
+    // (0.5.107+; keys are bin names 'claude'/'codex'). Absent on older
+    // satellites and in the short auth→reconcile window after a connect.
+    cli_status?: Record<string, { version?: string | null; path?: string | null }>
   }
+  // The platform's pinned CLI versions (same for every machine; carried
+  // per-machine because the list hook returns machines only). Judged
+  // against capabilities.cli_status for the drift-highlighted chips.
+  cli_pins?: Record<string, string>
   assigned_agents: string[]
   created_at: string
   // Auto-update fields.
@@ -45,6 +53,11 @@ export interface RemoteMachine {
   last_update_at?: string | null
   last_update_error?: string | null
   pending_update?: boolean
+  // Rollback budget for the target named in update_rollback_target: at 2
+  // consecutive rollbacks the proxy stops auto-pushing that target until
+  // "Update now" (see MachineUpdateControls' paused notice).
+  update_rollback_count?: number
+  update_rollback_target?: string | null
   // Per-machine filesystem-access policy. When true, the
   // path framework admits any path the satellite-user's OS account
   // can reach. When false, only the agent tree + the OS user's home

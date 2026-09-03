@@ -1,0 +1,27 @@
+# Template unit for a bare-metal (host-process) install. `scripts/dev-setup.sh
+# --phone --service` generates and enables this automatically with your
+# checkout's paths and user — edit by hand only if you manage the unit yourself.
+[Unit]
+Description=OtoDock phone server — FreePBX AudioSocket to STT/LLM/TTS pipeline
+After=network.target otodock-proxy.service
+
+[Service]
+Type=simple
+# --- Edit these for your installation ---
+User=otodock
+Group=otodock
+WorkingDirectory=/opt/otodock/phone
+EnvironmentFile=/opt/otodock/config.env
+ExecStart=/opt/otodock/phone/venv/bin/python main.py
+# -----------------------------------------
+Restart=on-failure
+RestartSec=10
+
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=otodock-phone
+
+[Install]
+WantedBy=multi-user.target

@@ -160,6 +160,12 @@ class FakeExecutionLayer:
         self.steer_accepts = False
         # Graceful-abort scripting (N1): the real default is a hard kill.
         self.abort_graceful = False
+        # Stop-and-send scripting (R7.2): the real default is unsupported.
+        # ``on_interrupt_for_queued`` lets a test act as the CLI closing the
+        # interrupted turn (e.g. release the turn generator's gate).
+        self.queued_interrupts: list[str] = []
+        self.interrupt_for_queued_accepts = False
+        self.on_interrupt_for_queued = None
 
     async def start_session(self, sid: str, agent_cfg) -> None:
         if self.start_gate is not None:
@@ -196,6 +202,12 @@ class FakeExecutionLayer:
     async def steer(self, sid: str, text: str) -> bool:
         self.steered.append((sid, text))
         return self.steer_accepts
+
+    async def interrupt_for_queued(self, sid: str) -> bool:
+        self.queued_interrupts.append(sid)
+        if self.on_interrupt_for_queued is not None:
+            self.on_interrupt_for_queued(sid)
+        return self.interrupt_for_queued_accepts
 
     async def compact(self, sid: str) -> dict | None:
         return None

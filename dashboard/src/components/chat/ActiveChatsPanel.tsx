@@ -1,11 +1,9 @@
-import { useState } from 'react'
+import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAgents } from '../../api/agents'
 import { useActiveChats, type ActiveChatRow } from '../../hooks/useActiveChats'
+import { useCollapsePref } from '../../hooks/useCollapsePref'
 import { useChatStore } from '../../store/chatStore'
-
-// Collapsed row cap; the rest sit behind a "+N more" expander.
-const VISIBLE_CAP = 6
 
 interface Props {
   currentAgent?: string
@@ -19,8 +17,8 @@ interface Props {
       above the agent's dashboards, mirroring the project dock composition. */
   variant?: 'sidebar' | 'home'
   /** Sidebar only: which list renders BELOW the strip. The own-agent dedup
-      follows it — task view keeps own live chats (no chat list below to
-      duplicate) and drops own tasks (they render in the task list). */
+      is symmetric to it — chat view drops own chats and keeps own live
+      tasks; task view drops own tasks and keeps own live chats. */
   tasksMode?: boolean
 }
 
@@ -32,30 +30,60 @@ interface Props {
  * already receives (see useActiveChats); the currently-viewed chat is
  * excluded — viewing it IS watching it (same rule as ChatRow's precedence).
  *
- * The SIDEBAR variant additionally drops the current agent's own rows that
- * the LIST BELOW already shows live-styled — the dedup follows the sidebar
- * mode: chat view drops all own-agent rows (chats sit in the history list;
- * own tasks pulse the tasks toggle instead), task view drops only own-agent
- * TASK rows (they render in the task list) and keeps own live chats.
+ * The SIDEBAR variant additionally suppresses SYMMETRICALLY: hide only what
+ * the LIST BELOW already shows live-styled. Chat view lists chats → own-agent
+ * CHAT rows drop, own live TASKS stay in the strip (the task list isn't on
+ * screen; the pulsing tasks toggle alone doesn't say WHICH task runs). Task
+ * view lists tasks → own-agent TASK rows drop, own live chats stay.
  * Everything from other agents stays. The HOME variant keeps all rows — the
  * front page has no list to duplicate against.
+ *
+ * One orphan exemption: chat view, own-agent CHAT rows whose owner is shared
+ * (`ownerIsShared` — legacy `agent::` rows a visibility flip left behind).
+ * Unless the agent is still shared-only, the chat list below filters those
+ * chats OUT, so "the list already shows it" is false and the row stays. Task
+ * rows are never orphaned (the task list filters on task_runs scope, not chat
+ * owner), so task mode keeps the plain symmetric rule.
+ *
+ * Space discipline (2026-08-15): the header is a persisted collapse toggle
+ * (useCollapsePref — home starts COLLAPSED so the front page belongs to the
+ * dashboards, sidebar starts OPEN; a pulsing dot on the collapsed header
+ * still signals a generating session) and the rows sit in a height-capped
+ * inner-scroll container (~3 rows; the home variant goes two-up on md+ and
+ * caps at ~2 grid rows). This replaced the old 6-row "+N more" expander.
  */
 export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect, onNavigate, variant = 'sidebar', tasksMode = false }: Props) {
   const navigate = useNavigate()
+  const { data: agents } = useAgents()
+  const agentMeta = useMemo(() => new Map((agents || []).map((a) => [a.name, a])), [agents])
+  const keepOrphan = (r: ActiveChatRow) => {
+    if (tasksMode || r.sourceType === 'task' || !r.ownerIsShared) return false
+    const a = agentMeta.get(r.agent)
+    // Meta missing OR fields missing → suppress. The widest-mode soft-fall
+    // of lib/visibility's modeOfAgent is the WRONG default here (it would
+    // re-introduce the duplicate row for shared-only agents while fields
+    // are absent), hence the explicit presence checks.
+    if (!a || a.collaborative === undefined || a.default_scope === undefined) return false
+    return !(a.collaborative === false && a.default_scope === 'agent')
+  }
   const rows = useActiveChats().filter((r) =>
     r.id !== activeChatId &&
     (variant !== 'sidebar' || r.agent !== currentAgent ||
-      (tasksMode && r.sourceType !== 'task')))
-  const { data: agents } = useAgents()
-  const [expanded, setExpanded] = useState(false)
+      (tasksMode ? r.sourceType !== 'task' : r.sourceType === 'task') ||
+      keepOrphan(r)))
+  // Persisted per surface and SHARED across mounted copies (the sidebar
+  // renders twice inside ResponsiveDrawer). Home starts collapsed — the
+  // front page is the dashboards' space; the sidebar starts open.
+  const [open, toggleOpen] = useCollapsePref(
+    variant === 'home' ? 'active-now-home' : 'active-now-sidebar',
+    variant !== 'home',
+  )
 
   if (rows.length === 0) return null
 
-  const agentMeta = new Map((agents || []).map((a) => [a.name, a]))
-  const visible = expanded ? rows : rows.slice(0, VISIBLE_CAP)
-  const hidden = rows.length - visible.length
+  const anyLive = rows.some((r) => r.phase === 'streaming')
 
-  const open = (row: ActiveChatRow) => {
+  const openRow = (row: ActiveChatRow) => {
     // Clicking IS seeing: retire the finished-unread row immediately (the
     // chat page confirms via chat_read).
     useChatStore.getState().setUnread(row.id, false)
@@ -72,10 +100,36 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
 
   const body = (
     <>
-      <p className="px-3 py-1 text-[10px] font-semibold text-p-text-light uppercase tracking-wider">
-        Active now
-      </p>
-      {visible.map((row) => {
+      {/* Collapsible header — same typography as the old static label. The
+          collapsed home strip still signals liveness via the pulsing dot. */}
+      <button
+        type="button"
+        onClick={toggleOpen}
+        aria-expanded={open}
+        className="w-full flex items-center gap-1.5 px-3 py-1 text-[10px] font-semibold text-p-text-light uppercase tracking-wider text-left cursor-pointer select-none transition-colors hover:text-p-text-secondary"
+      >
+        <svg
+          className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
+          fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+        Active now · {rows.length}
+        {!open && anyLive && (
+          <span className="w-1.5 h-1.5 rounded-full bg-brand animate-pulse motion-reduce:animate-none shrink-0" />
+        )}
+      </button>
+      {open && (
+      <div
+        className={
+          // Height-capped with inner scroll (~3 single-col rows; the home
+          // strip on desktop goes 2-up and caps at ~2 grid rows = 4 cards).
+          variant === 'home'
+            ? 'grid grid-cols-1 md:grid-cols-2 gap-x-2 max-h-34 md:max-h-23 overflow-y-auto'
+            : 'max-h-34 overflow-y-auto'
+        }
+      >
+      {rows.map((row) => {
         const meta = agentMeta.get(row.agent)
         const isTask = row.sourceType === 'task'
         // Unified live language (operator ask, 2026-07-11 — same as the chat
@@ -105,9 +159,9 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
         return (
           <div
             key={row.id}
-            onClick={() => open(row)}
+            onClick={() => openRow(row)}
             title={phaseTitle}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm mb-0.5 cursor-pointer
+            className={`min-w-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm mb-0.5 cursor-pointer
                         transition-colors text-p-text-secondary hover:bg-p-surface-hover ${phaseClass}`}
           >
             {showDot && (
@@ -129,23 +183,17 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
           </div>
         )
       })}
-      {hidden > 0 && (
-        <button
-          onClick={() => setExpanded(true)}
-          className="w-full px-3 py-1 text-[10px] text-p-text-light hover:text-p-text-secondary text-left transition-colors"
-        >
-          +{hidden} more
-        </button>
+      </div>
       )}
     </>
   )
 
   if (variant === 'home') {
     return (
-      <div className="px-4 pt-14 shrink-0" data-testid="active-chats-home">
-        {/* 5xl matches the column the pinned dashboards center themselves in,
-            so the platform panel and the mini app below read as one page. */}
-        <div className="max-w-5xl mx-auto mt-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface px-2 pt-1.5 pb-1">
+      <div className="px-2 pt-14 shrink-0" data-testid="active-chats-home">
+        {/* Flat px-2 matches the AppsOverlay frame inset (p-2) below, so the
+            platform panel and the full-width mini app read as one page. */}
+        <div className="mt-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface px-2 pt-1.5 pb-1">
           {body}
         </div>
       </div>

@@ -28,6 +28,13 @@ logger = logging.getLogger("claude-proxy.delegation")
 # manifest declares the same default so the admin config editor shows it.
 DEFAULT_MAX_PARALLEL_SPAWNS = 4
 
+# Delegation-chain ceiling (``MAX_DELEGATION_DEPTH``, same config surface).
+# Introduced with symmetric department topology (2026-09-02): edges can now
+# form up-down cycles, and no other layer bounds a serial A→B→A ping-pong —
+# the concurrency cap only limits PARALLEL lanes.
+DEFAULT_MAX_DELEGATION_DEPTH = 4
+_CHAIN_WALK_HARD_CAP = 32  # defensive bound on the ancestry walk itself
+
 
 @dataclass
 class SpawnAuthz:
@@ -48,6 +55,66 @@ def _max_parallel_spawns() -> int:
     except (TypeError, ValueError):
         return DEFAULT_MAX_PARALLEL_SPAWNS
     return value if value > 0 else DEFAULT_MAX_PARALLEL_SPAWNS
+
+
+def _max_delegation_depth() -> int:
+    raw = mcp_store.get_mcp_config_values("delegation-mcp").get("MAX_DELEGATION_DEPTH")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_DELEGATION_DEPTH
+    return value if value > 0 else DEFAULT_MAX_DELEGATION_DEPTH
+
+
+def check_delegation_chain(parent_chat_id: str, source_agent: str,
+                           target_agent: str) -> None:
+    """Refuse delegation cycles and over-deep chains (FRESH spawns only).
+
+    Walks the delegating lane's ancestry via ``chats.parent_chat_id`` — each
+    hop's ``agent`` is an ancestor. Two refusals:
+    - CYCLE: the target already sits in this lane's ancestry (A→B→A) — its
+      result flows back on completion, so re-delegating upward only ping-pongs.
+      Self-delegation (source == target) stays allowed: parallelizing yourself
+      is a supported pattern and cannot ping-pong (results return to the same
+      agent's lane).
+    - DEPTH: the chain would exceed ``MAX_DELEGATION_DEPTH`` hops (default 4,
+      admin-tunable via mcp_config_values['delegation-mcp']).
+
+    Continues are exempt by design: they extend an EXISTING lane whose spawn
+    already passed this check, and a cycle can't be built from continues alone
+    (the worker being continued had to be spawned first).
+
+    A cookie / master-key caller has no delegating chat — it is a chain root,
+    nothing to walk.
+    """
+    if not parent_chat_id:
+        return
+    ancestors: list[str] = []
+    cid: str = parent_chat_id
+    while cid and len(ancestors) < _CHAIN_WALK_HARD_CAP:
+        chat = task_store.get_chat(cid)
+        if not chat:
+            break
+        ancestors.append(chat.get("agent") or "")
+        cid = chat.get("parent_chat_id") or ""
+    if target_agent != source_agent and target_agent in ancestors:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{target_agent}' is already in this delegation "
+                   f"chain ({' → '.join(reversed(ancestors))} → {target_agent}). "
+                   "Its result flows back to it automatically when this lane "
+                   "completes — fold your answer into your own result instead "
+                   "of delegating back up the chain.",
+        )
+    max_depth = _max_delegation_depth()
+    if len(ancestors) > max_depth:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Delegation chain too deep ({len(ancestors)} hops, max "
+                   f"{max_depth}). Finish this work in the current lane, or "
+                   "ask an admin to raise MAX_DELEGATION_DEPTH for "
+                   "delegation-mcp.",
+        )
 
 
 def authorize_spawn(

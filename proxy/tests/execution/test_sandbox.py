@@ -307,6 +307,67 @@ class TestSandboxBuilderAgentTask:
         )
         assert knowledge_ro
 
+    def test_knowledge_credentials_rw_over_ro_root(self, tmp_agents):
+        """Agent-scope MCP credentials (knowledge/.credentials) stack RW on
+        top of the RO knowledge root — MCP processes write-check and
+        self-refresh tokens in place (workspace-mcp refused to boot on the
+        plain RO mount). RW child must come AFTER the RO root in argv."""
+        agents_dir, mcps_dir = tmp_agents
+        agent_dir = str(agents_dir / "personal-assistant")
+        cred_dir = agents_dir / "personal-assistant" / "knowledge" / ".credentials"
+        cred_dir.mkdir(parents=True)
+        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
+        sb = SandboxBuilder(cfg)
+        cmd = sb.build_command_prefix(["claude"])
+        bind_pairs = list(zip(cmd, cmd[1:]))
+        assert any(
+            a == "--ro-bind" and b == f"{agent_dir}/knowledge"
+            for a, b in bind_pairs
+        ), "knowledge root must stay RO"
+        assert any(
+            a == "--bind" and b == f"{agent_dir}/knowledge/.credentials"
+            for a, b in bind_pairs
+        ), "knowledge/.credentials must be RW"
+        root_idx = cmd.index(f"{agent_dir}/knowledge")
+        cred_idx = cmd.index(f"{agent_dir}/knowledge/.credentials")
+        assert root_idx < cred_idx, "RW child must shadow the RO root"
+
+    def test_no_credentials_bind_when_dir_absent(self, tmp_agents):
+        """No .credentials dir on disk (no bound account) → no bind emitted;
+        bwrap cannot create a mountpoint under an RO parent."""
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
+        sb = SandboxBuilder(cfg)
+        cmd = sb.build_command_prefix(["claude"])
+        agent_dir = str(agents_dir / "personal-assistant")
+        assert f"{agent_dir}/knowledge/.credentials" not in " ".join(cmd)
+
+    def test_symlinked_credentials_dir_refused(self, tmp_agents, tmp_path):
+        """A symlinked knowledge/.credentials (plantable by an owner-tier
+        session holding /knowledge RW) must NOT be bound — bwrap resolves bind
+        sources, so binding it would RW-mount the symlink's TARGET into the
+        next agent-scope sandbox (host escape). The bind is refused entirely."""
+        agents_dir, mcps_dir = tmp_agents
+        agent_dir = str(agents_dir / "personal-assistant")
+        knowledge = agents_dir / "personal-assistant" / "knowledge"
+        knowledge.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "escape-target"
+        outside.mkdir()
+        os.symlink(outside, knowledge / ".credentials")
+        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        assert f"{agent_dir}/knowledge/.credentials" not in " ".join(cmd)
+
+    def test_namespace_flags_isolate_ipc_and_uts(self, tmp_agents):
+        """Every sandbox unshares IPC (else same-uid agents share a SysV/POSIX
+        shm channel) and UTS."""
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        assert "--unshare-ipc" in cmd
+        assert "--unshare-uts" in cmd
+        assert "--unshare-pid" in cmd
+
 
 class TestSandboxBuilderMCPs:
     def test_assigned_mcp_dirs_identity_mounted(self, tmp_agents):
@@ -919,18 +980,34 @@ class TestNetnsPreflight:
         resolv.write_text("nameserver 8.8.8.8\n")
         assert _sandbox_mod._host_resolv_has_loopback_ns(str(resolv)) is False
 
-    def _failing_probe(self, monkeypatch):
+    def _failing_probe(self, monkeypatch, tmp_path=None):
         # All tools present; the `unshare -Urn true` capability probe fails.
         real_which = _shutil.which
         monkeypatch.setattr(_sandbox_mod.shutil, "which",
                             lambda tool: real_which(tool) or f"/usr/bin/{tool}")
         monkeypatch.setattr(_sandbox_mod.os, "access", lambda *a, **k: True)
+        if tmp_path is not None:
+            # Hermetic: don't let the HOST's Debian sysctl steer the message.
+            monkeypatch.setattr(_sandbox_mod, "_DEBIAN_USERNS_SYSCTL",
+                                tmp_path / "missing-debian-sysctl")
 
         class _Probe:
             returncode = 1
             stderr = b"unshare: unshare failed: Operation not permitted"
         monkeypatch.setattr(_sandbox_mod.subprocess, "run",
                             lambda *a, **k: _Probe())
+
+    def _happy_gates(self, monkeypatch, tmp_path):
+        # Tools present + one-level probe passes; keep the resolv side effects
+        # inside tmp so the success path is exercisable from tests.
+        real_which = _shutil.which
+        monkeypatch.setattr(_sandbox_mod.shutil, "which",
+                            lambda tool: real_which(tool) or f"/usr/bin/{tool}")
+        monkeypatch.setattr(_sandbox_mod.os, "access", lambda *a, **k: True)
+        monkeypatch.setattr(_sandbox_mod, "_host_resolv_has_loopback_ns",
+                            lambda *a, **k: False)
+        monkeypatch.setattr(_sandbox_mod, "netns_resolv_path",
+                            lambda: tmp_path / "netns-resolv.conf")
 
     def test_probe_failure_names_apparmor_restriction(self, monkeypatch, tmp_path):
         # Ubuntu 24.04+ (sysctl = 1): the error must name the sysctl and the
@@ -949,7 +1026,7 @@ class TestNetnsPreflight:
 
     def test_probe_failure_generic_without_restriction(self, monkeypatch, tmp_path):
         # Sysctl absent (non-Ubuntu kernel): the generic message, no AppArmor blame.
-        self._failing_probe(monkeypatch)
+        self._failing_probe(monkeypatch, tmp_path)
         monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL",
                             tmp_path / "missing-sysctl")
         with pytest.raises(RuntimeError) as exc:
@@ -957,6 +1034,65 @@ class TestNetnsPreflight:
         msg = str(exc.value)
         assert "apparmor_restrict_unprivileged_userns" not in msg
         assert "cannot create" in msg
+
+    def test_probe_failure_names_debian_knob(self, monkeypatch, tmp_path):
+        # kernel.unprivileged_userns_clone=0 (Debian hardening): name the knob
+        # and its remedy instead of the generic message.
+        self._failing_probe(monkeypatch)
+        monkeypatch.setattr(_sandbox_mod, "_APPARMOR_USERNS_SYSCTL",
+                            tmp_path / "missing-sysctl")
+        debian = tmp_path / "unprivileged_userns_clone"
+        debian.write_text("0\n")
+        monkeypatch.setattr(_sandbox_mod, "_DEBIAN_USERNS_SYSCTL", debian)
+        with pytest.raises(RuntimeError) as exc:
+            _sandbox_mod.netns_preflight()
+        assert "unprivileged_userns_clone" in str(exc.value)
+
+    def test_unshare_missing_probes_with_bwrap_instead(self, monkeypatch, tmp_path):
+        # `unshare` absent used to SKIP the capability probe (host boots, every
+        # spawn fails). Now it must fall back to probing with bwrap itself.
+        self._happy_gates(monkeypatch, tmp_path)
+        calls = []
+
+        class _OK:
+            returncode = 0
+            stderr = b""
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv[0])
+            if argv[0] == "unshare":
+                raise FileNotFoundError("unshare")
+            return _OK()
+
+        monkeypatch.setattr(_sandbox_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
+        _sandbox_mod.netns_preflight()  # must not raise
+        assert calls[0] == "unshare" and "bwrap" in calls
+
+    def test_nested_probe_failure_warns_never_fatal(self, monkeypatch, tmp_path, caplog):
+        # A host can pass the one-level gate yet deny the NESTED level (what
+        # the Codex engine's inner bwrap needs — the 2026-08-12 incident).
+        # Boot must proceed; the flag flips False and the warning names the
+        # doctor script.
+        self._happy_gates(monkeypatch, tmp_path)
+
+        class _OK:
+            returncode = 0
+            stderr = b""
+        monkeypatch.setattr(_sandbox_mod.subprocess, "run", lambda *a, **k: _OK())
+        monkeypatch.setattr(
+            _sandbox_mod, "_nested_sandbox_probe",
+            lambda: "bwrap: setting up uid map: Permission denied",
+        )
+        with caplog.at_level("WARNING"):
+            _sandbox_mod.netns_preflight()  # must not raise
+        assert _sandbox_mod.nested_sandbox_ok() is False
+        assert any("sandbox-doctor" in r.message for r in caplog.records)
+
+        # And a healthy nested probe flips it back True.
+        monkeypatch.setattr(_sandbox_mod, "_nested_sandbox_probe", lambda: None)
+        _sandbox_mod.netns_preflight()
+        assert _sandbox_mod.nested_sandbox_ok() is True
 
 
 class TestResolveSandboxEgress:

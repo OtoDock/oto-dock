@@ -294,6 +294,39 @@ def resolve_targets(scope: str, target: str | None) -> list[str]:
     return []
 
 
+# --- Agent identity in titles ---
+
+
+def agent_label(agent_slug: str | None) -> str:
+    """Human label for an agent in notification text: the display name when
+    the slug resolves, else the slug itself (never empty for a truthy slug).
+    Cached-dict read (``agent_store.get_agent``), safe on any thread."""
+    if not agent_slug:
+        return ""
+    try:
+        from storage import agent_store
+        row = agent_store.get_agent(agent_slug)
+    except Exception:
+        row = None
+    return (row or {}).get("display_name") or agent_slug
+
+
+def push_title(title: str, agent_slug: str | None) -> str:
+    """Title for the NATIVE push channel (FCM / Web Push), where there is no
+    card header to say which agent a notification came from: prefix the
+    agent's display name ("Alpha · Task done"). In-app surfaces keep the raw
+    title — the panel/toast render an agent header instead. Skipped when the
+    title already names the agent (display name OR slug, case-insensitive),
+    so end-of-turn titles like "Alpha finished" are never double-labelled."""
+    label = agent_label(agent_slug)
+    if not label:
+        return title
+    lowered = (title or "").lower()
+    if label.lower() in lowered or (agent_slug or "").lower() in lowered:
+        return title
+    return f"{label} · {title}"
+
+
 # --- Notification firing ---
 
 
@@ -424,30 +457,44 @@ async def fire_ephemeral(
     origin_away = False
     if chat_id and not cli_attached:
         origin = _chat_turn_origin.get(chat_id)
+    # One INFO line per alert with the routing decision — the only way to
+    # diagnose "I never got the end-of-turn notification" from the proxy log
+    # (2026-09-03): which device started the turn, whether it is still
+    # connected/active, and which leg the alert took.
+    _origin_desc = (
+        f"{origin[1]}:{origin[0][:8]}" if origin else ("cli" if cli_attached else "none"))
+
+    def _route(leg: str) -> None:
+        logger.info(
+            "turn_complete: chat=%s user=%s origin=%s interactive=%s → %s",
+            (chat_id or "")[:8], user_sub[:8], _origin_desc, interactive, leg,
+        )
+
     if origin:
         conn_id, platform = origin
         conn = get_connection(user_sub, conn_id)
         if platform != "android":
             if not conn:
-                logger.debug(
-                    f"turn_complete dropped: origin browser connection gone (chat={chat_id})"
-                )
+                _route("dropped (origin browser connection gone)")
                 return
             await _safe_put(conn.queue, frame)
             if not conn.away:
+                _route("frame to the origin browser")
                 return
             # Origin dashboard visibly open but input-idle: the frame above
             # keeps the local toast/sound, and the alert ALSO falls through
             # to the presence/FCM path so the phone hears about it.
             origin_away = True
         elif conn and conn.active:
-            return  # app in the foreground — the open view shows the result
+            _route("silent (Android app in the foreground shows the result)")
+            return
         # app-origin backgrounded / away browser-origin → overlay / FCM below
     if interactive or cli_attached:
         active = get_active_connections(user_sub)
         if active:
             for c in active:
                 await _safe_put(c.queue, frame)
+            _route(f"frame to {len(active)} active connection(s)")
             return
         if interactive and not cli_attached:
             # No active presence → the FCM leg below runs; idle-but-open web
@@ -463,6 +510,7 @@ async def fire_ephemeral(
                     continue
                 await _safe_put(c.queue, frame)
     elif (not origin or origin_away) and has_active_connection(user_sub):
+        _route("silent (an active dashboard connection covers it)")
         return  # legacy rule: an engaged device's in-app ping covers it
 
     try:
@@ -489,17 +537,22 @@ async def fire_ephemeral(
             except Exception:
                 pass  # link is best-effort — the push itself still matters
         subscriptions = await asyncio.to_thread(ns.get_push_subscriptions, user_sub)
+        _tokens = 0
+        _ok = 0
         for sub in subscriptions:
             if sub["platform"] == "android":
-                await send_fcm(sub["subscription_data"], {
+                _tokens += 1
+                if await send_fcm(sub["subscription_data"], {
                     "title": title,
                     "body": body,
                     "severity": "info",
                     "ephemeral": True,
                     "click_url": click_url,
                     "install_id": _install_id(),
-                })
-        logger.debug(f"Ephemeral FCM sent to {user_sub}: {title}")
+                }):
+                    _ok += 1
+        _route(f"native push — android tokens={_tokens} sent={_ok}"
+               + ("" if _tokens else " (no Android push registration for this user)"))
     except ImportError:
         logger.debug("push_sender not available yet, skipping ephemeral push")
     except Exception as e:
@@ -660,7 +713,9 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
         else:
             click_url = "/"
         await send_to_user(user_sub, {
-            "title": delivery["title"],
+            # Native push has no agent header → the display name rides the
+            # title (in-app rows keep the raw title + a header, see push_title).
+            "title": push_title(delivery["title"], _agent),
             "body": delivery["body"],
             "delivery_id": delivery["id"],
             "severity": delivery["severity"],

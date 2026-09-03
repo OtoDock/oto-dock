@@ -33,10 +33,21 @@ self.addEventListener('push', (event) => {
   event.waitUntil(self.registration.showNotification(data.title || 'OtoDock', options))
 })
 
+// A click_url is only safe to navigate if it is a plain absolute path — a
+// notification's source is untrusted, so reject scheme/host/protocol-relative
+// values before navigating the authenticated tab (same rule as the native
+// twin's safeClickPath in useFcmPush.ts).
+function safeClickPath(u) {
+  if (typeof u !== 'string' || !u) return null
+  if (!u.startsWith('/') || u.startsWith('//')) return null
+  if (u.includes('://') || u.includes('\\')) return null
+  return u
+}
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
-  const url = event.notification.data?.url || '/'
+  const url = safeClickPath(event.notification.data?.url) || '/'
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {

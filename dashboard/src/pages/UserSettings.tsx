@@ -2,7 +2,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { AudioPrefsSection } from '../components/audio/AudioPrefsSection'
 import { ScrollableTabs } from '../components/ScrollableTabs'
-import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection } from './UserSettings.general'
+import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection } from './UserSettings.general'
 import { IntegrationsTab } from './UserSettings.integrations'
 import { MyMachinesSection } from './UserSettings.machines'
 import { ExecutionLayersSection } from './UserSettings.aiEngines'
@@ -85,6 +85,7 @@ export default function UserSettings() {
             {/* Security — only for local auth users (SSO providers manage it) */}
             {isLocal && <SecuritySection />}
             <AppearanceSection />
+            <WakeWordSection />
             <MyMemorySection />
           </>
         )}

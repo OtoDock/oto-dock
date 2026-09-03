@@ -9,10 +9,15 @@ export interface ActiveChatRow {
   agent: string
   title: string
   phase: 'streaming' | 'warming' | 'finished'
-  /** From the seed metadata: 'task' rows render purple and click through to
-      the agent's task history instead of the chat page. Undefined until the
-      seed supplies it (store-only rows) — treated as a plain chat. */
+  /** 'task' rows render purple and click through to the run view instead of
+      the chat page. Derived from the durable `task-run-` id prefix first,
+      the seed's source_type second — so a live task classifies correctly
+      before its seed row exists. Undefined (store-only, non-task rows) is
+      treated as a plain chat. */
   sourceType?: string
+  /** Backend `owner_is_shared`: legacy `agent::`-owned rows a visibility flip
+      left behind. Undefined until the seed row supplies it. */
+  ownerIsShared?: boolean
 }
 
 // How long a just-finished row lingers before it leaves the panel — so a chat
@@ -21,19 +26,29 @@ export interface ActiveChatRow {
 // until the viewer actually opens it — finishing must not hide a result the
 // user never saw (operator ask, 2026-07-11).
 export const FINISHED_LINGER_MS = 4_000
-// Foreign active ids (streaming per the store, unknown to the last seed —
-// e.g. a chat that STARTED after the seed) trigger one seed refetch, at most
-// this often.
+// Active ids with no seed metadata (a chat that went live after the last
+// seed) re-trigger the seed fetch — bounded per id: attempts spaced at least
+// this far apart, at most RESEED_MAX_ATTEMPTS in total. A warming chat's
+// first refetch can legitimately return empty (the endpoint's warming set
+// races the registry write), so a single shot is not enough — but an id the
+// server will NEVER include (visibility-filtered) must not poll forever.
 const RESEED_MIN_INTERVAL_MS = 2_000
+const RESEED_MAX_ATTEMPTS = 4
+// MODULE-scoped, not per-mount: the hook is live in ~4-6 places at once
+// (ResponsiveDrawer double-mounts its children, ChatHistory mounts it twice,
+// plus home + AppFrame) and every instance resolves against the same
+// ['active-chats'] cache — per-mount maps would multiply the per-id cap by
+// the mount census. Exported for tests only.
+export const _reseedAttempts = new Map<string, { count: number; lastAt: number }>()
 
 /** Live cross-agent active-chats feed.
  *
  * No polling: the WS events the client already ingests (`chat_status`,
  * `chat_status_snapshot`, `warmup_*`) keep `chatStore` current for EVERY chat
  * this user may see; a single `GET /v1/chats/active` seed supplies the
- * metadata (title/agent) those events don't carry. Foreign chats that start
- * mid-session re-seed once (debounced). Rows whose turn closes linger briefly
- * as `finished`, then drop.
+ * metadata (title/agent) those events don't carry. Chats that start
+ * mid-session re-seed with a bounded per-id retry (see `_reseedAttempts`).
+ * Rows whose turn closes linger briefly as `finished`, then drop.
  *
  * `enabled=false` returns [] without fetching — for conditional consumers
  * (AppFrame enables it only when the app declares the `active_chats` feed).
@@ -66,42 +81,53 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
   }, [seed.data])
 
   // Seed rows the store has no slice for yet (page just loaded, snapshot not
-  // processed): trust the server — it asserted "streaming". A slice that
-  // exists and says ready/failed WINS over a stale seed row. Seed rows the
-  // server reports as 'finished' (finished-unread backfill) never count as
-  // active — they render through the finished path below.
+  // processed): trust the server — but ONLY its 'streaming' assertion. A
+  // slice that exists and says ready/failed WINS over a stale seed row.
+  // 'finished' rows (finished-unread backfill) render through the finished
+  // path below. 'warming' rows are metadata-only: warmup frames are
+  // per-socket, never broadcast, so a non-initiating tab has no store slice
+  // to retire the row with — asserting it as active would paint a phantom
+  // that lingers after a failed warmup. Their title/agent still feed
+  // metaById, which is what the initiating tab's placeholder row needs.
   const activePairs = useMemo(() => {
     const pairs = new Map<string, 'streaming' | 'warming'>()
     for (const { id, phase } of storeActive) pairs.set(id, phase)
     for (const row of seed.data || []) {
-      if (row.status === 'finished') continue
+      if (row.status !== 'streaming') continue
       if (!pairs.has(row.id) && !byChat[row.id]) pairs.set(row.id, 'streaming')
     }
     return pairs
   }, [storeActive, seed.data, byChat])
 
-  // Re-seed (debounced) when an active id has no SEED metadata — any chat
-  // that went live after the last seed. The store's WS slice carries the
-  // agent but never the TITLE, so gating this on "store knows the agent"
-  // (the old condition) left own-agent rows renderable but permanently
-  // titled "New chat" — visible in the sidebar's task mode, where own live
-  // chats stay in the strip (chat mode dedups them into the list below).
-  // Once per id: the seed enumerates currently-streaming ids server-side,
-  // so a single refetch after the id appears either supplies the metadata
-  // or never will (visibility-filtered) — retrying would be polling.
-  const lastReseedRef = useRef(0)
-  const reseededIdsRef = useRef(new Set<string>())
+  // Re-seed when an active id has no SEED metadata — any chat that went live
+  // after the last seed. The store's WS slice carries the agent but never the
+  // TITLE, so without the seed the row stays "New chat". A one-shot burn is
+  // not enough (the Bug A shape): the refetch fired while the chat was still
+  // warming used to return empty and permanently spend the id's only chance —
+  // when the turn actually opened, nothing retried. Now each unresolved id
+  // may retry on every status transition (this effect re-runs on activePairs)
+  // AND on a short timer (covers "no transition arrives"), spaced and capped
+  // by the module-scoped attempt map above.
   useEffect(() => {
     if (!enabled) return
-    const unknown = [...activePairs.keys()].filter(
-      (id) => !metaById.has(id) && !reseededIdsRef.current.has(id),
-    )
-    if (unknown.length === 0) return
-    const now = Date.now()
-    if (now - lastReseedRef.current < RESEED_MIN_INTERVAL_MS) return
-    lastReseedRef.current = now
-    for (const id of unknown) reseededIdsRef.current.add(id)
-    void seed.refetch()
+    const attempt = () => {
+      const now = Date.now()
+      let due = false
+      for (const id of activePairs.keys()) {
+        if (metaById.has(id)) continue
+        const rec = _reseedAttempts.get(id) || { count: 0, lastAt: 0 }
+        if (rec.count >= RESEED_MAX_ATTEMPTS) continue
+        if (now - rec.lastAt < RESEED_MIN_INTERVAL_MS) continue
+        _reseedAttempts.set(id, { count: rec.count + 1, lastAt: now })
+        due = true
+      }
+      // One refetch covers every due id; sibling mounts see the updated map
+      // synchronously, so concurrent instances stay within the shared cap.
+      if (due) void seed.refetch()
+    }
+    attempt()
+    const t = setInterval(attempt, RESEED_MIN_INTERVAL_MS + 100)
+    return () => clearInterval(t)
   }, [activePairs, metaById, seed, enabled])
 
   // Finished retention: ids that WERE shown and just left the active set stay
@@ -148,7 +174,11 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
       shown.add(id)
       rows.push({
         id, agent, title: meta?.title || 'New chat', phase,
-        sourceType: meta?.source_type,
+        // The id prefix is the durable task marker (scheduler chats are
+        // `task-run-…`), so classification never waits on the seed — a live
+        // task with no seed row yet must not render (or filter) as a chat.
+        sourceType: id.startsWith('task-run-') ? 'task' : meta?.source_type,
+        ownerIsShared: meta?.owner_is_shared,
       })
     }
     for (const [id, phase] of activePairs) add(id, phase)

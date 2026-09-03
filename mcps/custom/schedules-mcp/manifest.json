@@ -1,8 +1,8 @@
 {
   "name": "schedules-mcp",
   "label": "Schedules",
-  "description": "Scheduled, one-time, and trigger-fired background tasks",
-  "version": "1.0.0",
+  "description": "Scheduled, one-time, and trigger-fired background tasks, each pinnable to its own model / execution layer",
+  "version": "1.2.1",
   "category": "core",
 
   "server": {
@@ -21,7 +21,6 @@
   "env": {},
   "agent_env": {
     "SCHEDULES_MCP_AGENT": "${agent_name}",
-    "SCHEDULES_MCP_ALLOW_ALL": "false",
     "PROXY_TASK_OWNER": "${session.task_owner}",
     "PROXY_TASK_USERNAME": "${session.task_username}",
     "PROXY_TASK_SCOPE": "${session.task_scope}"

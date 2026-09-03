@@ -1,5 +1,6 @@
 """Password hashing and strength validation."""
 
+import contextlib
 import secrets
 
 import bcrypt
@@ -48,6 +49,20 @@ def verify_password(plain: str, hashed: str) -> bool:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
+
+
+# A fixed valid bcrypt hash (of a random secret) used only to burn the same
+# ~cost-12 CPU time on the "no such account" path as a real verify does, so
+# login response time doesn't reveal whether an email maps to a local account.
+_DUMMY_HASH = bcrypt.hashpw(secrets.token_bytes(16), bcrypt.gensalt(rounds=12))
+
+
+def dummy_verify() -> None:
+    """Constant-time-equalizer: run a throwaway bcrypt compare so the
+    unknown-email / non-local / passwordless branches cost the same as a real
+    password check (defeats a login timing oracle for account existence)."""
+    with contextlib.suppress(Exception):
+        bcrypt.checkpw(b"otodock-timing-equalizer", _DUMMY_HASH)
 
 
 def check_password_strength(password: str) -> tuple[bool, str, int]:

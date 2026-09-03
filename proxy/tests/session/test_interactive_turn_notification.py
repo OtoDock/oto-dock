@@ -108,6 +108,8 @@ def _new_session(*, chat_id="chat-1", on_turn_complete=None, old=True,
     s._title_armed = True
     s._title_timer = None
     s._title_timer_spent = False
+    s._midturn_tail_handle = None
+    s._midturn_tail_task = None
     s._title_chars = 0
     s._title_tools = 0
     s._turn_complete_fired = False

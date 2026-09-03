@@ -22,6 +22,7 @@ DEFAULT_PREFS = {
     "tts_mode": "auto",
     "tts_voice_map": {},
     "stt_language": None,
+    "wake_word_enabled": False,
 }
 
 _MODES = ("native", "platform", "auto")
@@ -66,6 +67,9 @@ def upsert_prefs(user_sub: str, data: dict) -> dict:
         "tts_mode": data.get("tts_mode", current["tts_mode"]),
         "tts_voice_map": data.get("tts_voice_map", current["tts_voice_map"]),
         "stt_language": data.get("stt_language", current["stt_language"]),
+        "wake_word_enabled": bool(
+            data.get("wake_word_enabled", current["wake_word_enabled"])
+        ),
     }
     for mode_key in ("stt_mode", "tts_mode"):
         if merged[mode_key] not in _MODES:
@@ -74,13 +78,15 @@ def upsert_prefs(user_sub: str, data: dict) -> dict:
     with get_conn() as conn:
         row = conn.execute(
             """INSERT INTO user_audio_prefs
-               (user_sub, stt_mode, tts_mode, tts_voice_map, stt_language, updated_at)
-               VALUES (%s, %s, %s, %s, %s, %s)
+               (user_sub, stt_mode, tts_mode, tts_voice_map, stt_language,
+                wake_word_enabled, updated_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (user_sub) DO UPDATE SET
                    stt_mode = EXCLUDED.stt_mode,
                    tts_mode = EXCLUDED.tts_mode,
                    tts_voice_map = EXCLUDED.tts_voice_map,
                    stt_language = EXCLUDED.stt_language,
+                   wake_word_enabled = EXCLUDED.wake_word_enabled,
                    updated_at = EXCLUDED.updated_at
                RETURNING *""",
             (
@@ -89,6 +95,7 @@ def upsert_prefs(user_sub: str, data: dict) -> dict:
                 merged["tts_mode"],
                 json.dumps(merged["tts_voice_map"] or {}),
                 merged["stt_language"],
+                merged["wake_word_enabled"],
                 now,
             ),
         ).fetchone()

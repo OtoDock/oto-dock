@@ -82,6 +82,24 @@ def _collect_task_output(chat_id: str, after_id: int = 0) -> str:
     return "\n\n".join(parts)
 
 
+_DELEGATE_PREVIEW_CAP = 12000
+
+
+def _delegate_output_preview(output_text: str) -> str:
+    """Bound the delegate_result bubble payload (DB row + WS/pump frames).
+
+    Keeps the TAIL on overflow — the lane narration ends with the worker's
+    final summary, which is the part the delegating user needs — and says so
+    explicitly instead of cutting mid-word."""
+    if len(output_text) <= _DELEGATE_PREVIEW_CAP:
+        return output_text
+    return (
+        f"… [output truncated — showing the last {_DELEGATE_PREVIEW_CAP} "
+        "chars; open the worker chat for the full run]\n\n"
+        + output_text[-_DELEGATE_PREVIEW_CAP:]
+    )
+
+
 def _limit_notice(final_output: str) -> str | None:
     """Detect a provider usage-limit notice ending a run's output.
 
@@ -460,13 +478,19 @@ class TaskDefinition(BaseModel):
     target_chat_id: str | None = None
     # Delegation lineage for fresh task-surface workers: the delegating chat
     # and project stamped onto the run's chat row so the dock's lane graph and
-    # continuation authority can trace it. In-memory only, like the overrides.
+    # continuation authority can trace it. In-memory only.
     parent_chat_id: str | None = None
     project_id: str | None = None
-    # Delegate-spawn per-lane execution overrides (validated against the
-    # agent's envelope at spawn). In-memory only: delegates fire immediately
-    # with THIS object — not persisted on dynamic_tasks, so a proxy-restart
-    # retry re-resolves agent defaults. None = inherit.
+    # Per-lane execution overrides — validated against the agent's envelope on
+    # WRITE (delegate spawn, or task create/edit) via
+    # ``spawn_authz.validate_spawn_overrides``. None / "" = inherit the
+    # agent's default at fire time.
+    #
+    # model + execution_path PERSIST on ``dynamic_tasks`` (2026-08-16): a
+    # schedule fires long after its creating session is gone, so the pin has
+    # to survive a proxy restart. ``override_execution_mode`` stays in-memory
+    # only — it picks interactive-vs-headless for a delegate worker somebody
+    # is watching right now, which means nothing for an unattended run.
     override_model: str | None = None
     override_execution_path: str | None = None
     override_execution_mode: str | None = None
@@ -684,6 +708,10 @@ def _row_to_task(row: dict) -> TaskDefinition:
         target_chat_id=row.get("target_chat_id"),
         max_runs=row.get("max_runs"),
         until_at=row.get("until_at"),
+        # "" (the column default) means inherit — normalise to None so every
+        # `override or default` consumer reads the same way.
+        override_model=row.get("override_model") or None,
+        override_execution_path=row.get("override_execution_path") or None,
     )
 
 
@@ -834,6 +862,8 @@ async def add_dynamic_task(task: TaskDefinition) -> str:
         target_chat_id=task.target_chat_id,
         max_runs=task.max_runs,
         until_at=task.until_at,
+        override_model=task.override_model,
+        override_execution_path=task.override_execution_path,
     )
     _dynamic_task_ids.add(task.id)
     # Hydrate the in-memory task with the DB-side timestamp so _register_task
@@ -1194,7 +1224,11 @@ async def _do_deliver(session_id: str, agent: str, result_prompt: str, task: Tas
         # spawn↔result correlation key (the frontend keys the delegate block by it).
         # status (completed/failed/cancelled) drives the badge icon + lets the
         # frontend skip minting an empty bubble for a no-output terminal.
-        output_preview = (output_text or "")[:2000]
+        # The bubble keeps the TAIL on overflow: output_text is the whole lane
+        # narration and the worker's actual deliverable is its final message —
+        # a head cut always amputates it (the old silent [:2000] did exactly
+        # that). The result PROMPT to the parent agent stays uncapped.
+        output_preview = _delegate_output_preview(output_text or "")
         delegate_event = {
             "type": "delegate_result",
             "task_id": task.id,
@@ -1824,6 +1858,41 @@ async def _fire_task(task: TaskDefinition) -> None:
     asyncio.create_task(_execute_task(task, trigger_type="scheduled"))
 
 
+# ── Same-tick spawn spacing ─────────────────────────────────────────────
+# APScheduler fires every job due at the same instant concurrently, so tasks
+# sharing a fire time (several 06:30 digests) used to start their CLI +
+# sandbox + MCP handshakes in the same second — a burst that spikes RAM/CPU
+# on small hosts. Scheduled fires now RESERVE start slots at least
+# config.TASK_SPAWN_SPACING_SECONDS apart: reservation happens under a lock,
+# the sleep happens outside it, so concurrent fires wait in parallel and
+# wake staggered in reservation order. A lone fire reserves the current
+# instant and waits zero. Fire TIMES stay exact (run rows, next_run_time and
+# cron semantics untouched) — only the session start is deferred.
+_spawn_slot_lock = asyncio.Lock()
+_next_spawn_slot: float = 0.0
+
+
+async def _reserve_spawn_slot() -> float:
+    """Reserve the next task-session start slot; return seconds to wait."""
+    global _next_spawn_slot
+    spacing = float(getattr(config, "TASK_SPAWN_SPACING_SECONDS", 0) or 0)
+    if spacing <= 0:
+        return 0.0
+    async with _spawn_slot_lock:
+        now = asyncio.get_running_loop().time()
+        slot = max(now, _next_spawn_slot)
+        _next_spawn_slot = slot + spacing
+        return slot - now
+
+
+async def _spawn_spacing_gate(task_id: str) -> None:
+    wait = await _reserve_spawn_slot()
+    if wait > 0:
+        logger.info("Task %s: spacing session spawn by %.1fs (herd smoothing)",
+                    task_id, wait)
+        await asyncio.sleep(wait)
+
+
 def _determine_task_type(task: TaskDefinition, trigger_type: str) -> str:
     """Classify a task run — the delegate marker is EXPLICIT (stamped by the
     delegation spawn), never derived from use_persistent: the spawn cap and
@@ -1982,13 +2051,26 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: TaskDefinition) -> No
     Task-surface delegate workers keep the shared ``agent::`` owner for agent
     scope, the delegate name as seed title, the delegated origin (purple
     worker accent + LLM title upgrade) and the delegation lineage for the
-    dock's lane graph; plain runs use the ``task::`` owner convention."""
-    task_model = config.get_cli_model(task.agent)
+    dock's lane graph; plain runs use the ``task::`` owner convention.
+
+    The row is stamped with the lane this run will ACTUALLY use — the task's
+    override when it has one, else the agent default. Billing reads the model
+    off the chat row (``services/execution/stream_pump.py`` →
+    ``usage_records``), so stamping the default here would mis-attribute every
+    overridden run's tokens to the wrong model, and the chat header would lie
+    about what answered."""
+    task_path = task.override_execution_path or ""
+    # Layer-aware (mirrors task_config_builder's wire resolution): with a
+    # layer override, the agent-default model may be foreign to the run's
+    # engine — stamping it would 400 the provider AND mis-attribute usage.
+    task_model = (task.override_model
+                  or config.get_cli_model(task.agent, layer=task_path or None))
     if task.task_type == "delegate":
         worker_sub = (task.created_by if task.scope == "user"
                       else f"agent::{task.agent}")
         task_store.create_chat(chat_id, worker_sub, task.agent, "auto",
-                               model=task_model, origin="delegated",
+                               model=task_model, execution_path=task_path,
+                               origin="delegated",
                                parent_chat_id=task.parent_chat_id or "",
                                project_id=task.project_id or "",
                                delegate_role="worker",
@@ -1997,7 +2079,7 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: TaskDefinition) -> No
         user_sub = (task.created_by if task.scope == "user"
                     else f"task::{task.agent}")
         task_store.create_chat(chat_id, user_sub, task.agent, "auto",
-                               model=task_model)
+                               model=task_model, execution_path=task_path)
     task_store.update_run(run_id, chat_id=chat_id)
 
 
@@ -2011,6 +2093,11 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
     # slot, no usage pre-check (the driven turn bills like any chat turn).
     if task.task_type == "continuation":
         return await _fire_continuation(task)
+
+    # Scheduled fires only: manual Run-Now has a human waiting and event
+    # triggers should react immediately — neither is spaced.
+    if trigger_type == "scheduled":
+        await _spawn_spacing_gate(task.id)
 
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     # Session ID must be a valid UUID — Claude Code validates this for both
@@ -2245,7 +2332,9 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                     trigger_payload: dict | None = None) -> None:
     from core.session import session_state as _state
     from core.session.session_manager import get_execution_layer
-    from core.config.task_config_builder import build_task_agent_config, resolve_task_identity
+    from core.config.task_config_builder import (
+        build_task_agent_config, resolve_task_identity, task_allows_knowledge_rw,
+    )
     from core.events.task_producer import task_produce
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session.session_state import get_permission_queue
@@ -2264,7 +2353,15 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
     # needs the real user_sub to tell a user-scope task on the user's OWN
     # machine apart from an agent-scope task that must never land on a
     # user-paired machine.
-    _ident = resolve_task_identity(task.agent, task.scope, task.created_by)
+    _ident = resolve_task_identity(
+        task.agent, task.scope, task.created_by,
+        allow_knowledge_rw=task_allows_knowledge_rw(task.task_type),
+    )
+    # Exactly-once result delivery per run: the success path sets this right
+    # after its _deliver_task_result; the cancel/exception handlers then skip
+    # THEIR delivery (a failure after the result went out — e.g. session close
+    # raising — used to deliver the same result a second time).
+    result_delivered = False
     try:
         _slot_target = (await asyncio.to_thread(
             remote_store.resolve_execution_target, task.agent,
@@ -2284,6 +2381,7 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
         output_cursor = 0  # pre-run message cursor; set in step 1
         prompt_row_id = 0  # the driven prompt's own row; excluded from collection
         layer = None  # bound in step 2; guards the except cleanup if config build fails
+        pump = None  # bound in step 6 (headless only); step 7 reads last_error
         # Set when a graceful abort leaves the session warm (step 7): the
         # finally must then keep its session-index entry so the idle reaper
         # + /v1/session/current still see the live session.
@@ -2648,12 +2746,30 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                     f"Task run {run_id} stopped on a provider usage limit: {limit_line}"
                 )
 
+            # A run whose stream DIED on an engine/provider error (claude
+            # is_error result — e.g. "Not logged in"; codex turn failure —
+            # e.g. a cross-engine model 400) used to land as a deceptive
+            # `completed` with empty (or error-text) output and $0 cost.
+            # The pump breaks its loop on the ERROR event and records the
+            # message — terminal by construction, so consult it exactly like
+            # the limit notice. Empty output alone NEVER fails a run.
+            run_error = None
+            if final_status == "completed" and not limit_line:
+                run_error = (getattr(pump, "last_error", "") or "").strip() or None
+                if run_error:
+                    final_status = "failed"
+                    logger.warning(
+                        f"Task run {run_id} failed on an engine error: "
+                        f"{run_error[:300]}"
+                    )
+
             duration_ms = int((time.monotonic() - start) * 1000)
             await asyncio.to_thread(
                 task_store.update_run, run_id,
-                status="failed" if limit_line else "completed",
+                status="failed" if (limit_line or run_error) else "completed",
                 error_message=(
-                    f"Provider usage limit: {limit_line}" if limit_line else None
+                    f"Provider usage limit: {limit_line}" if limit_line
+                    else (run_error[:2000] if run_error else None)
                 ),
                 output_text=final_output[:10000] if final_output else "",
                 completed_at=now_iso(),
@@ -2665,23 +2781,45 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             logger.info(
                 f"Task completed: run={run_id}, task={task.id}, duration={duration_ms}ms"
             )
+            # Shared-library turn-end reconcile (see ChatStreamPump): a worker
+            # or scheduled run that deleted/wrote inside a library in its
+            # sandbox gets it propagated now, not at the next 5-min sweep.
+            try:
+                from services.knowledge import library_projector
+                library_projector.schedule_reconcile_for_agent(task.agent)
+            except Exception:
+                pass
+            if run_error and not final_output:
+                # Pre-output engine failure: deliver a clearly-marked
+                # NON-EMPTY terminal so a delegating agent sees the failure
+                # (not an empty bubble) and doesn't re-delegate — twin of
+                # the exception path's fail_output synthesis.
+                final_output = (
+                    f'⚠ Task "{task.name}" failed on an engine error: '
+                    f'{run_error[:300]}'
+                )
             await _deliver_task_result(
                 task, final_status, final_output,
                 worker_chat_id=chat_id, output_cursor=output_cursor,
                 prompt_row_id=prompt_row_id, prompt_text=prompt,
             )
+            result_delivered = True
 
             # Fire completion notification ONLY for 'auto' mode. 'manual' agents
             # fire their own (system-injected prompt tells them to); 'none' is
             # fully silent. A usage-limited run warns instead for every mode but
             # 'none' — the agent that would have self-notified in 'manual' died
             # with the limit.
-            if limit_line:
+            if limit_line or run_error:
+                # Engine/limit failure: the agent that would have
+                # self-notified in 'manual' mode died with the error, so warn
+                # for every mode but 'none'.
                 if task.notification_mode != "none":
                     from services.notifications import notification_manager
                     asyncio.create_task(notification_manager.fire_notification(
-                        title=f"Task stopped: usage limit — {task.name}",
-                        body=limit_line[:200],
+                        title=(f"Task stopped: usage limit — {task.name}"
+                               if limit_line else f"Task failed: {task.name}"),
+                        body=(limit_line or run_error or "")[:200],
                         severity="warning",
                         scope=task.scope,
                         target=task.created_by if task.scope == "user" else task.agent,
@@ -2762,7 +2900,7 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             # so this no-ops for non-delegate tasks. A user-initiated Stop reports
             # "user_interrupted" with lane finalization (30s grace collects the
             # partial output + the user's redirect message, if any).
-            if task.on_complete_agent and not _shutting_down:
+            if task.on_complete_agent and not _shutting_down and not result_delivered:
                 if user_stop:
                     await _deliver_task_result(
                         task, "user_interrupted",
@@ -2804,11 +2942,17 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                 f'⚠ Delegated task "{task.name}" was stopped by the user.'
                 if user_stop else f'⚠ Delegated task "{task.name}" failed: {e}'
             )
-            await _deliver_task_result(
-                task, "user_interrupted" if user_stop else "failed", fail_output,
-                worker_chat_id=chat_id, output_cursor=output_cursor,
-                prompt_row_id=prompt_row_id, prompt_text=prompt,
-            )
+            if result_delivered:
+                logger.info(
+                    f"Task {task.id}: result already delivered — skipping the "
+                    f"failure re-delivery (post-delivery cleanup error)"
+                )
+            else:
+                await _deliver_task_result(
+                    task, "user_interrupted" if user_stop else "failed", fail_output,
+                    worker_chat_id=chat_id, output_cursor=output_cursor,
+                    prompt_row_id=prompt_row_id, prompt_text=prompt,
+                )
 
             # Failure safety net: fire warning notification for 'auto' and
             # 'manual' modes (a crashed agent can't notify itself). 'none' is

@@ -199,6 +199,8 @@ async def list_agents(
             "schedule_count": schedule_count,
             "trigger_count": trigger_count,
             "has_workspace": has_workspace,
+            "department_id": (agent_data.get("department_id", "") if agent_data else "") or "",
+            "department_level_id": (agent_data.get("department_level_id", "") if agent_data else "") or "",
         })
 
     return {"agents": agents}
@@ -243,6 +245,8 @@ async def get_agent_info(name: str, user: UserContext | None = Depends(get_curre
         "default_execution_mode": (
             agent_data.get("default_execution_mode", "") if agent_data else ""
         ),
+        "department_id": (agent_data.get("department_id", "") if agent_data else "") or "",
+        "department_level_id": (agent_data.get("department_level_id", "") if agent_data else "") or "",
     }
 
 
@@ -515,7 +519,32 @@ async def get_delegation_targets(name: str, user: UserContext | None = Depends(g
     if not u.can_manage_agent(name):
         raise HTTPException(403, "Manager role required for this agent")
 
-    targets = await asyncio.to_thread(agent_store.get_delegation_targets, name)
+    # ``targets`` = the MANUAL set (what the checkbox UI owns). Department-
+    # compiled edges are reported separately so the UI can render them
+    # checked-but-locked ("via <department>") and keep them OUT of the PUT
+    # payload — the compiler owns those rows.
+    detailed = await asyncio.to_thread(
+        agent_store.get_delegation_targets_detailed, name
+    )
+    targets = [d["target"] for d in detailed if d["source"] == "manual"]
+    compiled_targets = [d["target"] for d in detailed if d["source"] == "department"]
+    compiled = []
+    if compiled_targets:
+        from storage import db_departments
+        agent_row = agent_store.get_agent(name) or {}
+        dept = None
+        if agent_row.get("department_id"):
+            dept = await asyncio.to_thread(
+                db_departments.get_department, agent_row["department_id"]
+            )
+        compiled = [
+            {
+                "target": t,
+                "department_id": (dept or {}).get("id", ""),
+                "department_name": (dept or {}).get("name", ""),
+            }
+            for t in compiled_targets
+        ]
 
     # Build available list based on user's role
     all_slugs = sorted(agent_store.get_agent_slugs())
@@ -533,7 +562,11 @@ async def get_delegation_targets(name: str, user: UserContext | None = Depends(g
             "color": agent_data.get("color", "") if agent_data else "",
         })
 
-    return {"targets": targets, "available": available}
+    return {
+        "targets": targets,
+        "compiled": compiled,
+        "available": available,
+    }
 
 
 @router.get("/v1/agents/{name}/users")
@@ -562,7 +595,13 @@ async def list_agent_users(name: str, user: UserContext | None = Depends(get_cur
 async def set_delegation_targets(
     name: str, req: DelegationTargetsRequest, user: UserContext | None = Depends(get_current_user),
 ):
-    """Set delegation targets for an agent (replace all)."""
+    """Set delegation targets for an agent (replace all).
+
+    A wired edge also grants this agent's NO-USER sessions read visibility
+    into the target's agent-scope activity (merged observe semantics), so
+    the per-target reach check below doubles as the read-grant authority —
+    a manager never grants more than they can see themselves.
+    """
     u = require_auth(user)
     require_agent_access(u, name)
     if not u.can_manage_agent(name):
@@ -579,6 +618,10 @@ async def set_delegation_targets(
             raise HTTPException(403, f"No access to agent '{target}'")
 
     await asyncio.to_thread(agent_store.set_delegation_targets, name, req.targets)
+    # Un-checking a manual edge that a department also wants must let the
+    # compiler immediately re-assert it as source='department'.
+    from services.departments import edge_compiler
+    await asyncio.to_thread(edge_compiler.recompile)
     return {"status": "saved", "agent": name, "targets": req.targets}
 
 

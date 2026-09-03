@@ -25,6 +25,7 @@ import config
 
 PURPOSE_STT = "audio_stt"
 PURPOSE_TTS = "audio_tts"
+PURPOSE_DUPLEX = "duplex_session"
 _TTL = 300  # 5 minutes
 
 # One-time-use guard: jti → expiry. In-process (single proxy worker in v1);
@@ -59,6 +60,33 @@ def create_ws_audio_token(
         "expires_at": payload["exp"],
         "max_seconds": payload["max_seconds"],
         "max_chars": payload["max_chars"],
+    }
+
+
+def create_duplex_token(sub: str, *, chat_id: str, max_seconds: int) -> dict:
+    """Mint a token for one full-duplex conversation session (``/ws/duplex``).
+
+    Same discipline as the audio tokens (HS256, one-time ``jti``, token in the
+    FIRST WS frame), plus the CHAT the session may attach to — the bridge
+    enforces per-user chat access against these claims; the daemon's master
+    key never grants user access. ``max_seconds`` is the whole-session budget
+    (the bridge enforces it with a timer, not per-modality caps).
+    """
+    now = int(time.time())
+    payload = {
+        "sub": sub,
+        "purpose": PURPOSE_DUPLEX,
+        "jti": uuid.uuid4().hex,
+        "chat_id": chat_id,
+        "max_seconds": int(max_seconds),
+        "iat": now,
+        "exp": now + _TTL,
+    }
+    token = jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return {
+        "ws_token": token,
+        "expires_at": payload["exp"],
+        "max_seconds": payload["max_seconds"],
     }
 
 

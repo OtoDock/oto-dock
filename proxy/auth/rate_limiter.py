@@ -64,7 +64,15 @@ def check_rate_limit(bucket: str, key: str) -> tuple[bool, int]:
         return False, int(blocked_until - now)
 
     if now - entry["first_at"] > rule["window"]:
-        del _attempts[(bucket, key)]
+        # Window lapsed and no active block → reset the COUNTING window but
+        # KEEP block_count. Deleting the entry here (the old behaviour) wiped
+        # the escalation history every window, so a patient attacker who
+        # spaced attempts one window apart always faced the base block and
+        # the documented exponential backoff never materialized. _cleanup
+        # still forgets a genuinely idle key after max_block.
+        entry["count"] = 0
+        entry["first_at"] = now
+        entry["blocked_until"] = 0
         return True, 0
 
     if entry["count"] < rule["max"]:
@@ -83,7 +91,11 @@ def record_attempt(bucket: str, key: str) -> None:
     now = time.time()
     entry = _attempts.get((bucket, key))
     rule = _rule(bucket)
-    if not entry or now - entry["first_at"] > rule["window"]:
+    # Never roll the window (which would zero blocked_until) while a block is
+    # still being served — a single probe during the block would otherwise
+    # lift it. While blocked, just keep counting on the existing entry.
+    blocked = bool(entry) and entry.get("blocked_until", 0) > now
+    if not entry or (now - entry["first_at"] > rule["window"] and not blocked):
         _attempts[(bucket, key)] = {
             "count": 1, "first_at": now, "blocked_until": 0,
             "block_count": entry.get("block_count", 0) if entry else 0,
@@ -174,4 +186,5 @@ def record_failed_attempt(ip: str, sub: str | None):
 def record_successful_login(ip: str, sub: str):
     """Clear rate limiting on successful login."""
     clear_ip_attempts(ip)
+    db.clear_failed_logins(sub)
     db.reset_login_attempts(sub)

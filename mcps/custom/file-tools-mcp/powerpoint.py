@@ -5,11 +5,26 @@ Enhanced reader with shape inventory, chart data, speaker notes.
 formatting, transitions, connectors, hyperlinks, and slide management.
 """
 
+import contextlib
 import copy
+import os
 from pathlib import Path
 
 from equations import latex_to_png
-from shared import _dropped_note, _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
+from isolation import run_parse
+from shared import (
+    _checked_resolved,
+    _dropped_note,
+    _normalize_operations,
+    _op_type,
+    _preresolve_image_ops,
+    _push_preview,
+    _resolve_path,
+    _to_agents_relative,
+    _WORKER_TMP_SUFFIX,
+    _WRITE_OP_ADVICE,
+    logger,
+)
 
 # ---------------------------------------------------------------------------
 # Shape type mapping
@@ -227,16 +242,34 @@ def read_pptx(path: str) -> str:
 
 
 async def handle_write_pptx(args: dict) -> str:
+    """Thin parent wrapper: path resolution and the preview push are
+    session-bound and stay here; the op loop (which DOM-loads an existing
+    presentation) runs in a bounded worker child."""
+    path = await _resolve_path(args["path"], writing=True)
+    ops, dropped = _normalize_operations(args.get("operations"))
+    await _preresolve_image_ops(ops)
+    try:
+        msg = await run_parse(
+            _write_pptx_core, path, ops, dropped,
+            bool(args.get("create_new", False)),
+            _advice=_WRITE_OP_ADVICE,
+        )
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path + _WORKER_TMP_SUFFIX)
+        raise
+    await _push_preview(path)
+    return msg
+
+
+def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
+    """Worker core: op application + atomic save + result message."""
     from pptx import Presentation
     from pptx.chart.data import CategoryChartData, XyChartData
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     from pptx.oxml import parse_xml
     from pptx.oxml.ns import qn
     from pptx.util import Inches, Pt
-
-    path = await _resolve_path(args["path"], writing=True)
-    ops, dropped = _normalize_operations(args.get("operations"))
-    create_new = args.get("create_new", False)
 
     if Path(path).exists() and not create_new:
         prs = Presentation(path)
@@ -608,9 +641,7 @@ async def handle_write_pptx(args: dict) -> str:
 
             elif ot == "add_image":
                 slide = _get_slide(prs, op)
-                img_path = await _resolve_path(
-                    op.get("image_path") or op.get("path") or op.get("image", "")
-                )
+                img_path = _checked_resolved(op.get("image_path", ""))
                 left = Inches(float(op.get("left", 1)))
                 top = Inches(float(op.get("top", 1)))
                 width = Inches(float(op["width"])) if op.get("width") else None
@@ -621,7 +652,6 @@ async def handle_write_pptx(args: dict) -> str:
                 # LaTeX equation as a 4×-oversampled PNG picture (pptx has no
                 # reliable native-math write path — python-pptx renders
                 # appended OMML as nothing).
-                import os
                 import tempfile
 
                 slide = _get_slide(prs, op)
@@ -967,9 +997,11 @@ async def handle_write_pptx(args: dict) -> str:
             errors.append(f"Op #{idx} {ot}: {exc}")
             logger.warning(f"write_pptx op #{idx} '{ot}' failed: {exc}")
 
-    # Save even with partial success
-    prs.save(path)
-    await _push_preview(path)
+    # Save even with partial success. Atomic: a killed worker must never
+    # leave the user's presentation truncated.
+    tmp = path + _WORKER_TMP_SUFFIX
+    prs.save(tmp)
+    os.replace(tmp, path)
 
     msg = f"Presentation saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)

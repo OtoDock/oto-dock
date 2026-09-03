@@ -160,6 +160,30 @@ def test_pin_agent_scope_session_is_shared(agent_tree):
     assert row["rel_path"] == "workspace/apps/board.html"
 
 
+def test_pin_shared_viewer_human_rejected(agent_tree):
+    """H3 (2026-08-11): a VIEWER's chat on a shared-only agent (agent-scope
+    mount, human present) must not create, replace, or hard-delete the TEAM
+    dashboard — the proxy writes the file itself, so the viewer's read-only
+    workspace mount doesn't guard this path. Service sessions (no human)
+    keep full authority: scheduled refresh tasks ARE the update path."""
+    sid_viewer = "sid-viewer-shared"
+    session_state.set_session_security(sid_viewer, SecurityContext(
+        role="viewer", username="alice", agent=AGENT, is_admin_agent=False,
+        session_scope="agent"))
+    try:
+        r = _pin({"slug": "team", "html": "<p>t</p>"}, sid=sid_viewer)
+        assert r.status_code == 403
+        assert "editor or manager" in r.json()["detail"]
+        # An editor+ human on the same shared mount still pins…
+        assert _pin({"slug": "team", "html": "<p>t</p>"},
+                    sid=SID_SHARED).status_code == 200
+        # …and the viewer cannot hard-delete the team dashboard either.
+        assert _hook("unpin", {"slug": "team"},
+                     sid=sid_viewer).status_code == 403
+    finally:
+        session_state._session_security.pop(sid_viewer, None)
+
+
 def test_pin_upsert_and_metadata_only_update(agent_tree):
     first = _pin({"slug": "brief", "html": "<p>v1</p>", "title": "V1"}).json()
     again = _pin({"slug": "brief", "html": "<p>v2</p>"}).json()
@@ -872,3 +896,142 @@ def test_user_delete_cascades_personal_rows(agent_tree):
     task_store.delete_user("alice-sub")
     assert task_store.get_app(personal) is None      # FK CASCADE
     assert task_store.get_app(shared) is not None    # shared rows survive
+
+
+# ───────────────── S1: explicit visibility (ownership) ──────────────────────
+
+
+def test_pin_visibility_agent_from_human_chat(agent_tree):
+    """An editor+ human chat (user mount) pins the TEAM dashboard with an
+    explicit visibility="agent" — the S1 fix for "multi-user dashboards
+    need an agent-scope session"."""
+    r = _pin({"slug": "team-brief", "html": "<p>t</p>", "visibility": "agent"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["scope"] == "shared"
+    assert body["path"] == "/workspace/apps/team-brief.html"
+    row = task_store.get_app(body["app_id"])
+    assert row["username"] == "" and row["owner_sub"] is None
+
+
+def test_pin_visibility_agent_viewer_rejected(agent_tree):
+    sid = "sid-viewer-vis"
+    session_state.set_session_security(sid, SecurityContext(
+        role="viewer", username="alice", agent=AGENT, is_admin_agent=False))
+    try:
+        r = _pin({"slug": "team-v", "html": "<p>t</p>", "visibility": "agent"},
+                 sid=sid)
+        assert r.status_code == 403
+        assert "editor or manager" in r.json()["detail"]
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+def test_pin_visibility_user_needs_a_user(agent_tree):
+    r = _pin({"slug": "solo", "html": "<p>x</p>", "visibility": "user"},
+             sid=SID_SHARED)
+    assert r.status_code == 400
+    assert "needs a session with a user" in r.json()["detail"]
+
+
+def test_pin_visibility_mode_gate(agent_tree):
+    """A Personal-only agent's mode offers no "agent" visibility."""
+    from storage import agent_store
+    agent_store.create_agent("apps-personal-only", "PO",
+                             collaborative=False, default_scope="user")
+    sid = "sid-po"
+    session_state.set_session_security(sid, SecurityContext(
+        role="manager", username="alice", agent="apps-personal-only",
+        is_admin_agent=False))
+    try:
+        r = _pin({"slug": "nope", "html": "<p>x</p>", "visibility": "agent"},
+                 sid=sid)
+        assert r.status_code == 400
+        assert "does not offer" in r.json()["detail"]
+    finally:
+        session_state._session_security.pop(sid, None)
+
+
+def test_default_visibility_follows_mode(agent_tree):
+    """No visibility arg: an editor+ chat on an agent-FIRST collaborative
+    agent defaults to the shared pin (the mode default); a viewer on the
+    same agent stays personal (the clamp)."""
+    from storage import agent_store
+    agent_store.create_agent("apps-agent-first", "AF",
+                             collaborative=True, default_scope="agent")
+    sid_m, sid_v = "sid-af-m", "sid-af-v"
+    session_state.set_session_security(sid_m, SecurityContext(
+        role="manager", username="alice", agent="apps-agent-first",
+        is_admin_agent=False))
+    session_state.set_session_security(sid_v, SecurityContext(
+        role="viewer", username="alice", agent="apps-agent-first",
+        is_admin_agent=False))
+    try:
+        r = _pin({"slug": "af-brief", "html": "<p>x</p>"}, sid=sid_m)
+        assert r.status_code == 200 and r.json()["scope"] == "shared"
+        r = _pin({"slug": "af-mine", "html": "<p>x</p>"}, sid=sid_v)
+        assert r.status_code == 200 and r.json()["scope"] == "personal"
+    finally:
+        for s in (sid_m, sid_v):
+            session_state._session_security.pop(s, None)
+
+
+def test_pin_same_slug_both_visibilities(agent_tree):
+    a = _pin({"slug": "dual", "html": "<p>team</p>", "visibility": "agent"}).json()
+    b = _pin({"slug": "dual", "html": "<p>mine</p>", "visibility": "user"}).json()
+    assert a["app_id"] != b["app_id"]
+    assert a["path"] == "/workspace/apps/dual.html"
+    assert b["path"] == "/users/alice/workspace/apps/dual.html"
+    # Unpin needs disambiguation when both namespaces hold the slug…
+    r = _hook("unpin", {"slug": "dual"})
+    assert r.status_code == 400
+    assert "both shared and personal" in r.json()["detail"]
+    # …and takes it.
+    assert _hook("unpin", {"slug": "dual", "visibility": "user"}).status_code == 200
+    assert _hook("unpin", {"slug": "dual"}).status_code == 200  # now unambiguous
+
+
+# ───────────────────────── S2: per-user hides ───────────────────────────────
+
+
+def test_hide_for_me_is_per_user(agent_tree):
+    app_id = _pin({"slug": "team-hide", "html": "<p>x</p>",
+                   "visibility": "agent"}).json()["app_id"]
+    task_store.upsert_user("bob-sub", "bob@test.com", "Bob", "member")
+    task_store.add_user_agent("bob-sub", AGENT, "viewer", "test")
+    bob = _user(sub="bob-sub", agent_roles={AGENT: "viewer"})
+    _as(bob)
+    assert client.post(f"/v1/apps/{app_id}/hide").status_code == 200
+    apps = {a["id"]: a for a in client.get(f"/v1/apps?agent={AGENT}").json()["apps"]}
+    assert apps[app_id]["hidden_for_me"] is True
+    # The row still RETURNS (the hidden affordance restores from it), and
+    # bob — a viewer — needed no manage rights to park it.
+    _as(_user())
+    apps = {a["id"]: a for a in client.get(f"/v1/apps?agent={AGENT}").json()["apps"]}
+    assert apps[app_id]["hidden_for_me"] is False   # alice unaffected
+    _as(bob)
+    assert client.post(f"/v1/apps/{app_id}/unhide").status_code == 200
+    apps = {a["id"]: a for a in client.get(f"/v1/apps?agent={AGENT}").json()["apps"]}
+    assert apps[app_id]["hidden_for_me"] is False
+
+
+def test_hide_personal_row_rejected(agent_tree):
+    app_id = _pin({"slug": "mine-hide", "html": "<p>x</p>",
+                   "visibility": "user"}).json()["app_id"]
+    r = client.post(f"/v1/apps/{app_id}/hide")
+    assert r.status_code == 400
+    assert "shared apps only" in r.json()["detail"]
+
+
+def test_hide_rows_cascade_on_hard_delete(agent_tree):
+    app_id = _pin({"slug": "gone", "html": "<p>x</p>",
+                   "visibility": "agent"}).json()["app_id"]
+    assert client.post(f"/v1/apps/{app_id}/hide").status_code == 200
+    _hook("unpin", {"slug": "gone", "visibility": "agent"})
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM pinned_app_user_hides WHERE app_id=%s",
+            (app_id,),
+        ).fetchone()["c"]
+    assert n == 0

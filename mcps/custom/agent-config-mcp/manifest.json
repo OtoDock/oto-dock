@@ -1,8 +1,8 @@
 {
   "name": "agent-config-mcp",
   "label": "Agent Self-Config",
-  "description": "Lets an agent inspect and modify its own settings — identity (display name, description, color), default model, default execution layer, default scope, and per-agent memory toggles — and mark post-install setup complete. Permission-aware: viewers see zero tools.",
-  "version": "1.1.0",
+  "description": "Lets an agent inspect and modify its own settings — its persona (config/agent.md), identity (display name, description, color), default model, default execution layer, default scope, and per-agent memory toggles — and mark post-install setup complete. Platform admins/creators additionally get self-scope company wiring: share this agent's knowledge folder as a shared knowledge library, attach/detach other agents' libraries, and assign the agent to a department (each such call requires in-chat approval). Permission-aware: viewers see zero tools.",
+  "version": "1.4.0",
   "category": "core",
 
   "server": {
@@ -39,6 +39,22 @@
       {
         "tool": "complete_setup",
         "tier": "standard"
+      },
+      {
+        "tool": "share_knowledge_folder",
+        "tier": "critical"
+      },
+      {
+        "tool": "attach_knowledge_library",
+        "tier": "critical"
+      },
+      {
+        "tool": "detach_knowledge_library",
+        "tier": "critical"
+      },
+      {
+        "tool": "set_department",
+        "tier": "critical"
       }
     ]
   },

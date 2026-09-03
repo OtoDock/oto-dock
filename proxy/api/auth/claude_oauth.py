@@ -159,16 +159,20 @@ async def oauth_exchange(
         rate_limit_tier = rate_limit_tier or fetched_tier
 
     # Build credential data in the same format as .credentials.json
-    credential_data = {
-        "oauth_token": {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": int((time.time() + expires_in) * 1000),
-            "scopes": scopes,
-            "subscriptionType": subscription_type,
-            "rateLimitTier": rate_limit_tier,
-        }
+    oauth_token = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": int((time.time() + expires_in) * 1000),
+        "scopes": scopes,
+        "subscriptionType": subscription_type,
+        "rateLimitTier": rate_limit_tier,
     }
+    # The login GRANT's own lifetime (finite — ~28 days for Claude logins):
+    # stored so the subscription_health sweep can warn before it lapses.
+    rt_expires_in = token_data.get("refresh_token_expires_in")
+    if rt_expires_in:
+        oauth_token["refreshTokenExpiresAt"] = int((time.time() + rt_expires_in) * 1000)
+    credential_data = {"oauth_token": oauth_token}
 
     # Build label from subscription type if not provided
     label = req.label
@@ -196,9 +200,13 @@ async def oauth_exchange(
     owner_sub = user.sub
     account = token_data.get("account") or {}
     identity = account.get("email_address") or account.get("uuid") or ""
+    # include_disabled: a reconnect on an admin-disabled row must MATCH it
+    # (and keep it disabled, below) — excluding it here would fork a second
+    # ACTIVE row for the same account, silently routing around the admin.
     existing = subscription_store.list_subscriptions(
         layer=req.layer,
         owner_sub=owner_sub,
+        include_disabled=True,
     )
     existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == "anthropic"]
 
@@ -224,12 +232,24 @@ async def oauth_exchange(
             )
 
     if match:
-        # Update the same account's subscription with fresh tokens
+        # Update the same account's subscription with fresh tokens. Under the
+        # sub's refresh lock: an in-flight refresh of the OLD (possibly dead)
+        # token must not interleave — its failure verdict would land on the
+        # just-written fresh grant. Same lock discipline as every rotation.
+        # An admin-DISABLED row keeps its status (credential refresh must not
+        # override the admin decision); anything else revives to active.
         sub_id = match["id"]
-        subscription_store.update_credential_data(sub_id, credential_data)
-        subscription_store.update_subscription(
-            sub_id, status="active", label=label, oauth_email=identity or None,
-        )
+        new_status = "disabled" if match.get("status") == "disabled" else "active"
+
+        def _apply_reconnect() -> None:
+            with subscription_pool._refresh_lock(sub_id):
+                subscription_store.update_credential_data(sub_id, credential_data)
+                subscription_store.update_subscription(
+                    sub_id, status=new_status, label=label, oauth_email=identity or None,
+                )
+                subscription_pool.clear_refresh_backoff(sub_id)
+
+        await asyncio.to_thread(_apply_reconnect)
         sub = subscription_store.get_subscription(sub_id)
         logger.info(f"Updated existing OAuth subscription {sub_id[:8]} with fresh tokens")
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —

@@ -296,6 +296,53 @@ def _dropped_note(dropped: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Worker-core plumbing (see isolation.py)
+# ---------------------------------------------------------------------------
+
+# Deterministic same-directory temp target for atomic worker saves: children
+# are routinely killed (RLIMIT_AS, deadline, daemon teardown), and a
+# deterministic name lets the PARENT clean the orphan up after a kill —
+# something a random mkstemp name can't offer once the child is gone.
+_WORKER_TMP_SUFFIX = ".otodock-tmp"
+
+# Parent-side path pre-resolution failures travel into sync worker cores as
+# marker strings, so the cores' per-op error containment (errors.append +
+# continue with the remaining ops) behaves exactly as the old inline awaits
+# did — a bad path in one op must never fail the whole call.
+_RESOLVE_ERR_PREFIX = "__RESOLVE_ERROR__:"
+
+
+async def _resolve_or_mark(path_value: str, *, writing: bool = False) -> str:
+    try:
+        return await _resolve_path(path_value, writing=writing)
+    except Exception as exc:
+        return _RESOLVE_ERR_PREFIX + (str(exc) or exc.__class__.__name__)
+
+
+def _checked_resolved(value):
+    """In-core: re-raise the parent's resolve failure at the op's use site."""
+    if isinstance(value, str) and value.startswith(_RESOLVE_ERR_PREFIX):
+        raise ValueError(value[len(_RESOLVE_ERR_PREFIX):])
+    return value
+
+
+async def _preresolve_image_ops(ops: list) -> None:
+    """Canonicalize add_image's `image_path|path|image` aliases (all three
+    write modules accept all three) to one pre-resolved `image_path`."""
+    for op in ops:
+        if _op_type(op) == "add_image":
+            src = op.get("image_path") or op.get("path") or op.get("image", "")
+            op.pop("path", None)
+            op.pop("image", None)
+            op["image_path"] = await _resolve_or_mark(src)
+
+
+_WRITE_OP_ADVICE = (
+    "Split the operation list into smaller calls or work on a smaller file"
+)
+
+
+# ---------------------------------------------------------------------------
 # LibreOffice lock (serialize concurrent headless calls)
 # ---------------------------------------------------------------------------
 

@@ -54,6 +54,20 @@ def test_shared_only_participant_in_user_meeting_runs_agent_scope(temp_db):
     assert vis.available_scopes == ("agent",)
 
 
+def test_manager_convened_agent_meeting_gets_no_knowledge_rw(temp_db):
+    # Meetings record the real convener (api/meetings records created_by), so
+    # a naive provenance thread would grant a manager-convened agent-scope
+    # meeting knowledge RW. The meeting path calls resolve_task_identity
+    # WITHOUT the opt-in, and meeting_context additionally pins the
+    # SecurityContext field False — knowledge stays RO end to end.
+    agent_store.create_agent("caller", "Caller", default_scope="agent",
+                             collaborative=False)
+    convener = "sub-mgr-host"
+    _mk_user(convener, "Mia", role="admin")  # even a platform admin
+    identity = resolve_task_identity("caller", "agent", convener)
+    assert identity.knowledge_rw is False
+
+
 def test_collaborative_participant_in_user_meeting_stays_user_scope(temp_db):
     # Control: a normal collaborative agent in a user meeting runs USER scope —
     # the creator's identity + credentials, mounting their per-user dirs.

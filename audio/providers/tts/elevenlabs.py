@@ -28,6 +28,7 @@ import base64
 import contextlib
 import json
 import logging
+import time
 import uuid
 from urllib.parse import urlencode
 
@@ -111,7 +112,9 @@ class _Context:
     only records parameters; the InitialiseContext frame goes out lazily on the
     first text chunk so a slow LLM doesn't burn the context inactivity window."""
 
-    __slots__ = ("id", "language", "sample_rate", "init_gen", "input_done", "buffer", "http_done")
+    __slots__ = ("id", "language", "sample_rate", "init_gen", "input_done",
+                 "buffer", "http_done", "sent", "retried",
+                 "ws_gen_at_start", "t_first_send")
 
     def __init__(self, *, language: str | None, sample_rate: int):
         self.id = uuid.uuid4().hex[:12]
@@ -121,6 +124,12 @@ class _Context:
         self.input_done = False
         self.buffer: list[str] = []          # HTTP-fallback text accumulator
         self.http_done = asyncio.Event()     # HTTP fallback: set at is_last
+        self.sent: list[str] = []  # WS path: text delivered — resynthesis source
+        self.retried = False       # one zero-audio resynthesis per context
+        # First-audio isolation stamps: socket generation when the context was
+        # created (fresh vs reused attribution) and the first text-send time.
+        self.ws_gen_at_start = -1
+        self.t_first_send = 0.0
 
 
 class ElevenLabsTTS(TTSProvider):
@@ -194,11 +203,14 @@ class ElevenLabsTTS(TTSProvider):
                     errors[key] = "must be a number"
         if "chunk_length_schedule" in settings:
             sched = settings["chunk_length_schedule"]
+            # Lower bound 20 (was 50): the phone bridge flushes ~20-char
+            # chunks — letting the first threshold drop to match trades a
+            # little prosody for first-audio latency (live-tunable per row).
             ok = isinstance(sched, list) and 1 <= len(sched) <= 4 and all(
-                isinstance(v, int) and 50 <= v <= 500 for v in sched
+                isinstance(v, int) and 20 <= v <= 500 for v in sched
             )
             if not ok:
-                errors["chunk_length_schedule"] = "must be a list of 1-4 integers between 50 and 500"
+                errors["chunk_length_schedule"] = "must be a list of 1-4 integers between 20 and 500"
         return errors
 
     # ── HTTP helpers ───────────────────────────────────────────────
@@ -260,14 +272,16 @@ class ElevenLabsTTS(TTSProvider):
             self._ws = None
             self._ws_bound = None
 
-    async def connect(self) -> None:
-        """Eagerly open the socket at the telephony default (8 kHz, current
-        voice) — call sites connect at call/session setup precisely to keep the
-        first utterance fast. A context needing a different binding (chat's
-        24 kHz) reconnects once, prewarmed from ``start_streaming_context``."""
+    async def connect(self, *, output_sample_rate: int | None = None) -> None:
+        """Eagerly open the socket — call sites connect at call/session setup
+        precisely to keep the first utterance fast. ``output_sample_rate`` lets
+        the session prewarm its REAL output binding (duplex streams 24 kHz;
+        the telephony default is 8 kHz) — without it the first turn of a
+        non-8 kHz session pays a fresh rebind connect."""
         self._cancelled = False
         if self.voice_id and _is_ws_model(self._model_id):
-            await self._ensure_ws(_Context(language=None, sample_rate=SAMPLE_RATE))
+            await self._ensure_ws(_Context(
+                language=None, sample_rate=output_sample_rate or SAMPLE_RATE))
 
     async def close(self) -> None:
         if self._prewarm_task is not None:
@@ -279,12 +293,15 @@ class ElevenLabsTTS(TTSProvider):
 
     # ── One-shot synthesis (greetings / fillers) ───────────────────
 
-    async def synthesize(self, text: str, *, language: str | None = None) -> bytes:
-        """One-shot REST synthesis to raw 8 kHz PCM (the ABC's telephony
-        contract). Uses the plain HTTP endpoint — works for every model,
-        including eleven_v3."""
+    async def synthesize(
+        self, text: str, *, language: str | None = None,
+        output_sample_rate: int | None = None,
+    ) -> bytes:
+        """One-shot REST synthesis to raw PCM (8 kHz telephony default;
+        ``output_sample_rate`` overrides). Uses the plain HTTP endpoint —
+        works for every model, including eleven_v3."""
         lang = _to_elevenlabs_lang(language)
-        params: dict = {"output_format": f"pcm_{SAMPLE_RATE}"}
+        params: dict = {"output_format": f"pcm_{output_sample_rate or SAMPLE_RATE}"}
         if lang and _accepts_language_code(self._model_id):
             params["language_code"] = lang
         body: dict = {"text": text, "model_id": self._model_id}
@@ -312,6 +329,7 @@ class ElevenLabsTTS(TTSProvider):
         if rate not in _PCM_RATES:
             raise ValueError(f"ElevenLabs has no pcm_{rate} output (choose from {_PCM_RATES})")
         self._ctx = _Context(language=_to_elevenlabs_lang(language), sample_rate=rate)
+        self._ctx.ws_gen_at_start = self._ws_gen
         self._cancelled = False
         # Prewarm the socket for this binding concurrently with LLM thinking
         # time (this method is sync per the ABC — the real open happens under
@@ -368,6 +386,11 @@ class ElevenLabsTTS(TTSProvider):
                     # Frames must end with whitespace or the server buffers wrong.
                     payload = text if text.endswith((" ", "\n")) else text + " "
                     await ws.send(json.dumps({"text": payload, "context_id": ctx.id}))
+                    # Record what the server actually got — the zero-audio
+                    # resynthesis path in receive_audio replays exactly this.
+                    ctx.sent.append(payload)
+                    if not ctx.t_first_send:
+                        ctx.t_first_send = time.monotonic()
                 if is_last:
                     await ws.send(json.dumps({"context_id": ctx.id, "flush": True}))
                 return
@@ -380,6 +403,33 @@ class ElevenLabsTTS(TTSProvider):
                     logger.warning(f"TTS send failed, reconnecting: {e}")
                     continue
                 logger.error(f"TTS send error: {e}")
+
+    async def _resynthesize(self, ctx: _Context):
+        """Zero-audio recovery: reconnect and replay the context's sent text.
+
+        Only called when NOTHING has been yielded — after any audio played a
+        replay would repeat speech (a truncated reply beats a stuttered
+        one). One attempt per context. The live-hit this fixes (2026-08-10):
+        the socket died mid-utterance before any audio and the whole reply
+        played as silence ("0 chunks, 0 bytes")."""
+        ctx.retried = True
+        logger.warning(
+            "ElevenLabs TTS produced no audio (socket died or context lost)"
+            " — reconnecting and resynthesizing (%d chars)",
+            sum(len(t) for t in ctx.sent),
+        )
+        try:
+            ws = await self._ensure_ws(ctx)
+            await ws.send(json.dumps(self._init_frame(ctx)))
+            ctx.init_gen = self._ws_gen
+            for t in list(ctx.sent):
+                await ws.send(json.dumps({"text": t, "context_id": ctx.id}))
+            if ctx.input_done:
+                await ws.send(json.dumps({"context_id": ctx.id, "flush": True}))
+            return ws
+        except Exception as e:
+            logger.error(f"TTS resynthesis reconnect failed: {e}")
+            return None
 
     async def receive_audio(self):
         ctx = self._ctx
@@ -394,9 +444,13 @@ class ElevenLabsTTS(TTSProvider):
         except Exception as e:
             if not self._cancelled:
                 logger.error(f"TTS receive connect error: {e}")
+                # A send-path _ensure_ws retry may have initialised the
+                # context on another socket — retire it best-effort.
+                self._fire_close_context(ctx)
             return
         stalled_s = 0.0
         yielded = 0
+        got_final = False
         while not self._cancelled and self._ctx is ctx:
             try:
                 # Short poll so cancel()/input_done state changes are noticed
@@ -419,11 +473,30 @@ class ElevenLabsTTS(TTSProvider):
                                 "ElevenLabs TTS: flushed audio drained "
                                 "(no isFinal) — ending utterance"
                             )
-                        else:
-                            logger.warning("ElevenLabs TTS: no frames after flush — ending utterance")
+                            break
+                        if (ctx.sent and not ctx.retried
+                                and not self._cancelled):
+                            # Flushed, waited, got NOTHING — the server-side
+                            # context is gone (e.g. the socket was swapped
+                            # by a send-path reconnect after the context
+                            # died silently). Same zero-audio recovery as
+                            # the closed-socket path.
+                            new_ws = await self._resynthesize(ctx)
+                            if new_ws is not None:
+                                ws = new_ws
+                                stalled_s = 0.0
+                                continue
+                        logger.warning("ElevenLabs TTS: no frames after flush — ending utterance")
                         break
                 continue
             except websockets.ConnectionClosed:
+                if (not self._cancelled and yielded == 0 and ctx.sent
+                        and not ctx.retried):
+                    new_ws = await self._resynthesize(ctx)
+                    if new_ws is not None:
+                        ws = new_ws
+                        stalled_s = 0.0
+                        continue
                 if not self._cancelled and not ctx.input_done:
                     logger.warning("ElevenLabs TTS socket closed mid-utterance")
                 break
@@ -440,14 +513,49 @@ class ElevenLabsTTS(TTSProvider):
                 except Exception:
                     continue
                 if chunk:
+                    if yielded == 0 and ctx.t_first_send:
+                        # First-audio isolation: synthesis span vs socket state
+                        # — attributes the text→audio leg (fresh connect vs
+                        # reused socket vs server-side first-generation wait).
+                        logger.info(
+                            "ElevenLabs TTS first audio: +%.0fms after first "
+                            "text (%d chars sent, socket %s)",
+                            (time.monotonic() - ctx.t_first_send) * 1000,
+                            sum(len(t) for t in ctx.sent),
+                            "fresh" if ctx.init_gen != ctx.ws_gen_at_start
+                            else "reused",
+                        )
                     yielded += 1
                     yield chunk
             if msg.get("isFinal"):
                 logger.debug("ElevenLabs TTS: isFinal received")
+                got_final = True
                 break
             if msg.get("error"):
+                if ("max_active_conversations" in str(msg.get("error", ""))
+                        and yielded == 0 and not ctx.retried
+                        and not self._cancelled):
+                    # The connection accumulated the server's 5-context cap.
+                    # A FRESH socket carries zero contexts: recycle it and
+                    # replay this utterance instead of playing silence.
+                    logger.warning(
+                        "ElevenLabs TTS context cap (1008) — recycling the "
+                        "socket and resynthesizing"
+                    )
+                    async with self._ws_lock:
+                        await self._close_ws_locked()
+                    new_ws = await self._resynthesize(ctx)
+                    if new_ws is not None:
+                        ws = new_ws
+                        stalled_s = 0.0
+                        continue
                 logger.error(f"ElevenLabs TTS error frame: {str(msg)[:200]}")
                 break
+        # Every exit except a server isFinal (or an explicit cancel(), which
+        # sends its own close) leaves the context registered server-side —
+        # see _fire_close_context.
+        if not got_final and not self._cancelled:
+            self._fire_close_context(ctx)
 
     async def _receive_http(self, ctx: _Context):
         """eleven_v3 streaming-context fallback: wait for the flush, then run
@@ -458,6 +566,8 @@ class ElevenLabsTTS(TTSProvider):
         text = "".join(ctx.buffer).strip()
         if not text:
             return
+        t_flush = time.monotonic()
+        first_logged = False
         body: dict = {"text": text, "model_id": self._model_id}
         if self._voice_settings:
             body["voice_settings"] = self._voice_settings
@@ -480,16 +590,44 @@ class ElevenLabsTTS(TTSProvider):
                         if self._cancelled or self._ctx is not ctx:
                             break
                         if chunk:
+                            if not first_logged:
+                                first_logged = True
+                                logger.info(
+                                    "ElevenLabs TTS first audio (HTTP): "
+                                    "+%.0fms after flush (%d chars)",
+                                    (time.monotonic() - t_flush) * 1000,
+                                    len(text),
+                                )
                             yield chunk
         except httpx.HTTPError as e:
             if not self._cancelled:
                 logger.error(f"TTS receive error: {e}")
 
+    def _fire_close_context(self, ctx: _Context | None) -> None:
+        """Best-effort ``close_context`` for a context the server never
+        finalized. The multi-context server does NOT retire a context on
+        flush-drain — it stays registered against the per-connection cap (5),
+        and five drained-but-unclosed utterances make every later reply play
+        as silence (code 1008 ``max_active_conversations``, live-hit
+        2026-08-24). Fire-and-forget; tolerant of a dead/racing socket."""
+        ws = self._ws
+        if ws is None or ctx is None or ctx.init_gen < 0:
+            return
+        frame = json.dumps({"context_id": ctx.id, "close_context": True})
+
+        async def _send_close() -> None:
+            # socket already gone — the reconnect path cleans up
+            with contextlib.suppress(Exception):
+                await ws.send(frame)
+
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(_send_close())
+
     def cancel(self) -> None:
         """Cancel the current streaming context (barge-in). Sync per the ABC:
         drop local state immediately (unblocks ``receive_audio``), then fire the
         close_context frame best-effort — tolerant of ``close()`` racing it."""
-        ctx, ws = self._ctx, self._ws
+        ctx = self._ctx
         self._cancelled = True
         self._ctx = None
         if ctx is not None:
@@ -497,16 +635,7 @@ class ElevenLabsTTS(TTSProvider):
         # Close the context whenever it was initialised — generation may still
         # be running server-side after the flush, and an already-finished
         # context tolerates the close.
-        if ws is not None and ctx is not None and ctx.init_gen >= 0:
-            frame = json.dumps({"context_id": ctx.id, "close_context": True})
-
-            async def _send_close() -> None:
-                # socket already gone — the reconnect path cleans up
-                with contextlib.suppress(Exception):
-                    await ws.send(frame)
-
-            with contextlib.suppress(RuntimeError):
-                asyncio.get_running_loop().create_task(_send_close())
+        self._fire_close_context(ctx)
         logger.debug("TTS streaming cancelled (barge-in)")
 
     # ── Voice discovery ────────────────────────────────────────────

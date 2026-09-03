@@ -23,7 +23,7 @@ PHONE_CONTEXT = (
     "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
     "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
     "- Don't spell out URLs, paths, or IPs unless asked.\n"
-    "- When using tools: say 'One moment' before, then summarize the result in 1-2 short sentences.\n"
+    "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
     "- To end the call (e.g. user says goodbye or the conversation is clearly over), append [CALL_COMPLETE] at the end of your final message. The system will strip it before speaking.\n"
 )
 
@@ -39,7 +39,7 @@ PHONE_OUTBOUND = (
     "- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n"
     "- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n"
     "- Don't spell out URLs, paths, or IPs unless asked.\n"
-    "- When using tools: say 'One moment' before, then summarize the result in 1-2 short sentences.\n"
+    "- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n"
     "- Complete the task you were given, politely and professionally.\n"
     "- If you need information from your manager during the call, emit [QUESTION: your question here] in your response. "
     "The system will relay the question while the call stays active.\n"

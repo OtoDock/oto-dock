@@ -23,7 +23,6 @@ Credential schemas are read from MCP manifests via mcp_registry.
 from __future__ import annotations
 
 import logging
-import shutil
 from dataclasses import dataclass, field
 
 import config
@@ -487,6 +486,10 @@ def _resolve_oauth_mcp(
             return {**env_injection_vars, **mcp_env_vars}
         return None
 
+    import os as _os
+    from pathlib import Path as _Path
+    from core.sandbox.sandbox import _verified_literal_path
+
     result: dict[str, str] = {}
     for env_var, subpath in cred_entries:
         # Destination paths MUST match the virtual paths resolved by
@@ -498,18 +501,36 @@ def _resolve_oauth_mcp(
         # Bwrap (local) + satellite path_translator (remote) map virtual→host
         # using the same convention; keeping the destination in lockstep
         # ensures the MCP can read the file at the env var's value.
+        # Symlink-refusing: both destinations live under agent-writable
+        # binds (users/<u>/.credentials rides the RW user dir, knowledge/
+        # .credentials rides owner-tier RW /knowledge) — an agent-planted
+        # symlink would otherwise receive REAL OAuth token copies host-side
+        # at its target before the sandbox is even built. Verify the whole
+        # chain is literal (also normalizes away a traversal-shaped manifest
+        # ``subpath``), refuse + skip on mismatch: the MCP just shows up
+        # unconnected.
+        root_real = _Path(_os.path.realpath(config.AGENTS_DIR / agent_name))
         if username and task_scope == "user":
-            dest_dir = (
-                config.AGENTS_DIR / agent_name / "users" / username
-                / ".credentials" / subpath
-            )
+            rel_parts = ("users", username, ".credentials",
+                         *_Path(subpath).parts)
         else:
-            dest_dir = (
-                config.AGENTS_DIR / agent_name / "knowledge"
-                / ".credentials" / subpath
+            rel_parts = ("knowledge", ".credentials", *_Path(subpath).parts)
+        dest_dir = _verified_literal_path(root_real, *rel_parts)
+        if dest_dir is None:
+            logger.error(
+                "Refusing credential materialization for %s/%s: destination "
+                "path contains a symlinked component (possible tampering)",
+                agent_name, mcp_name,
             )
-
+            continue
         dest_dir.mkdir(parents=True, exist_ok=True)
+        if _os.path.realpath(dest_dir) != str(dest_dir):
+            logger.error(
+                "Refusing credential materialization for %s/%s: destination "
+                "changed underneath the build (possible tampering)",
+                agent_name, mcp_name,
+            )
+            continue
         # Drop any other accounts' files left from a prior session —
         # workspace-mcp picks the first file alphabetically in
         # --single-user mode, so the dir must contain only the bound
@@ -518,7 +539,16 @@ def _resolve_oauth_mcp(
             if existing.name != source_file.name:
                 with contextlib.suppress(OSError):
                     existing.unlink()
-        shutil.copy2(source_file, dest_dir / source_file.name)
+        # No-follow token write (a leaf-level symlink must not redirect it).
+        token_dst = dest_dir / source_file.name
+        with contextlib.suppress(OSError):
+            if token_dst.is_symlink():
+                token_dst.unlink()
+        _fd = _os.open(token_dst,
+                       _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+                       | _os.O_NOFOLLOW, 0o600)
+        with _os.fdopen(_fd, "wb") as _f:
+            _f.write(source_file.read_bytes())
 
         result[env_var] = str(dest_dir)
 

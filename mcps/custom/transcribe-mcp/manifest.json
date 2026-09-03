@@ -1,0 +1,55 @@
+{
+  "name": "transcribe-mcp",
+  "label": "Transcribe",
+  "description": "Transcribe audio/video files and URLs to text with word-level timing; generate SRT subtitles.",
+  "version": "1.0.2",
+  "category": "custom",
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+  "credentials": {
+    "type": "none"
+  },
+  "instances": {
+    "delivery": "env",
+    "fields": [
+      {"key": "STT_PROVIDER_ID", "label": "STT provider", "input_type": "stt_provider_select", "required": false}
+    ],
+    "max_instances": 0
+  },
+  "config": [],
+  "env": {},
+  "agent_env": {},
+  "path_env": {
+    "TRANSCRIBE_WORKSPACE": {"role": "workspace"}
+  },
+  "assignment_mode": "explicit",
+  "requires_capability": "audio_transcribe",
+  "exclude_from": ["phone"],
+  "tool_arg_paths": {
+    "transcribe_audio_file": {
+      "file_path": {"mode": "read"}
+    },
+    "generate_subtitles": {
+      "transcript_json": {"mode": "read"},
+      "output_path": {"mode": "write"}
+    }
+  },
+  "skills": [
+    {
+      "id": "subtitle-burning",
+      "loading": "on_demand",
+      "file": "skills/subtitle-burning/SKILL.md",
+      "description": "Transcribe audio and burn styled subtitles into videos. Use when adding subtitles or captions to a video.",
+      "default_exclude_from": ["phone"]
+    }
+  ],
+  "permissions": {
+    "default_tier": "standard"
+  },
+  "patched": false,
+  "patch_note": null
+}

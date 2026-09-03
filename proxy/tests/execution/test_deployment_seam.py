@@ -331,3 +331,35 @@ def test_egress_phone_mcp_needs_no_daemon_carve(monkeypatch, registry):
     assert "9093" not in forwards
     assert "192.168.110.10" not in allow
     assert str(config.PORT) in forwards  # the proxy relay rides this
+
+
+# --------------------------------------------------------------------------- #
+# browser_session close-session URL — same seam, proxy→camoufox hop
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def camoufox_manifest(monkeypatch):
+    from services.mcp import mcp_registry
+    m = _Manifest(name="camoufox", port=8931)
+    monkeypatch.setattr(
+        mcp_registry, "get_manifest", lambda name: m if name == "camoufox" else None,
+    )
+    return m
+
+
+def test_browser_close_url_t1(t1, camoufox_manifest):
+    from services.infra import browser_session
+    assert browser_session._base_url() == "http://localhost:8931"
+
+
+def test_browser_close_url_t2_service_dns(t2, camoufox_manifest):
+    # The T2 bug this closes: a containerised proxy has no localhost route to
+    # the sidecar — close-session must go to the sibling's service-DNS name.
+    from services.infra import browser_session
+    assert browser_session._base_url() == "http://camoufox:8931"
+
+
+def test_browser_close_url_none_without_manifest(t2, monkeypatch):
+    from services.mcp import mcp_registry
+    from services.infra import browser_session
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: None)
+    assert browser_session._base_url() is None

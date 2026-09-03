@@ -307,6 +307,216 @@ class TestPeekSession:
         assert task_chat not in {s["chat_id"] for s in listed}
 
 
+class TestCrossAgentVisibility:
+    """C2: with ``?agent=<slug>|all``, reads follow the USER — the pools the
+    acting user could open in the dashboard on that agent (their chats, a
+    shared agent's shared pool, task-run chats via their RUN row). No-user
+    sessions' cross-agent reach is their delegation roster instead
+    (``TestNoUserEdgeReads``); without an edge, the 403 stands."""
+
+    def _alice_multi(self):
+        return UserContext(
+            sub="user-alice", email="alice@test.com", name="Alice",
+            role="member", is_api_key=True, session_id=PARENT_SESSION,
+            agent=AGENT, agents=[AGENT, "other"],
+            agent_roles={AGENT: "editor", "other": "viewer"},
+        )
+
+    def _seed_other(self, client):
+        mine, bobs = str(uuid.uuid4()), str(uuid.uuid4())
+        task_store.create_chat(mine, "user-alice", "other", title="Mine")
+        task_store.create_chat(bobs, "user-bob", "other", title="Bobs")
+        # Agent-scope task-run chat on "other" (+ its run row) — the dashboard
+        # shows it to ANY accessor via Task History; entitlement lives on the
+        # run, not the chat's synthetic ``task::`` owner.
+        task_store.create_chat("task-run-x", "task::other", "other",
+                               title="Nightly")
+        # Bob's user-scope run chat — private to its creator.
+        task_store.create_chat("task-run-y", "user-bob", "other",
+                               title="Bob task")
+        with task_store.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, agent, trigger_type, "
+                "status, scope, chat_id) VALUES ('run-x', 't-x', 'other', "
+                "'schedule', 'completed', 'agent', 'task-run-x')")
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, agent, trigger_type, "
+                "status, scope, created_by, chat_id) VALUES ('run-y', 't-y', "
+                "'other', 'schedule', 'completed', 'user', 'user-bob', "
+                "'task-run-y')")
+            conn.commit()
+        return mine, bobs
+
+    def test_agent_param_lists_user_derived_pools(self, client):
+        client.app_ref.state.user = self._alice_multi()
+        mine, bobs = self._seed_other(client)
+        r = client.get("/v1/delegation/sessions", params={"agent": "other"})
+        assert r.status_code == 200
+        ids = {s["chat_id"] for s in r.json()["sessions"]}
+        assert mine in ids
+        assert "task-run-x" in ids          # agent-scope run: any accessor
+        assert bobs not in ids              # another user's chat
+        assert "task-run-y" not in ids      # another user's user-scope run
+
+    def test_agent_all_spans_accessible_agents(self, client):
+        client.app_ref.state.user = self._alice_multi()
+        mine, _bobs = self._seed_other(client)
+        own_pa = str(uuid.uuid4())
+        task_store.create_chat(own_pa, "user-alice", AGENT)
+        # An agent outside alice's reach contributes nothing — even her own
+        # (stale) chats there.
+        agent_store.create_agent("hidden", "Hidden")
+        hidden_chat = str(uuid.uuid4())
+        task_store.create_chat(hidden_chat, "user-alice", "hidden")
+        r = client.get("/v1/delegation/sessions", params={"agent": "all"})
+        ids = {s["chat_id"] for s in r.json()["sessions"]}
+        assert {mine, own_pa} <= ids
+        assert hidden_chat not in ids
+
+    def test_shared_pool_listed_and_peekable(self, client):
+        agent_store.create_agent("shared-o", "SharedO", collaborative=False,
+                                 default_scope="agent")
+        ctx = self._alice_multi()
+        ctx.agents.append("shared-o")
+        ctx.agent_roles["shared-o"] = "viewer"
+        client.app_ref.state.user = ctx
+        shared = str(uuid.uuid4())
+        task_store.create_chat(shared, "agent::shared-o", "shared-o",
+                               title="Shared room")
+        task_store.add_chat_message(shared, "assistant", "shared history")
+        r = client.get("/v1/delegation/sessions", params={"agent": "shared-o"})
+        assert shared in {s["chat_id"] for s in r.json()["sessions"]}
+        p = client.get(f"/v1/delegation/sessions/{shared}/peek")
+        assert p.status_code == 200
+        assert p.json()["messages"][0]["content"] == "shared history"
+
+    def test_agent_param_403_for_inaccessible(self, client):
+        agent_store.create_agent("hidden", "Hidden")
+        assert client.get("/v1/delegation/sessions",
+                          params={"agent": "hidden"}).status_code == 403
+
+    def test_agent_param_403_for_no_user_session(self, client):
+        # No delegation edge wired → denied (a wired edge IS the read
+        # grant since the 2026-08-15 merge; none exists here).
+        client.app_ref.state.user = UserContext(
+            sub="session:svc-1", email="", name="", role="agent",
+            is_api_key=True, session_id="svc-1", agent=AGENT)
+        assert client.get("/v1/delegation/sessions",
+                          params={"agent": "other"}).status_code == 403
+
+    def test_peek_cross_agent_task_chat(self, client):
+        client.app_ref.state.user = self._alice_multi()
+        self._seed_other(client)
+        task_store.add_chat_message("task-run-x", "assistant", "nightly done")
+        r = client.get("/v1/delegation/sessions/task-run-x/peek")
+        assert r.status_code == 200
+        assert r.json()["messages"][0]["content"] == "nightly done"
+
+    def test_peek_foreign_chats_still_403(self, client):
+        client.app_ref.state.user = self._alice_multi()
+        _mine, bobs = self._seed_other(client)
+        # Another user's chat — and their user-scope run chat (run rule).
+        assert client.get(
+            f"/v1/delegation/sessions/{bobs}/peek").status_code == 403
+        assert client.get(
+            "/v1/delegation/sessions/task-run-y/peek").status_code == 403
+
+
+class TestNoUserEdgeReads:
+    """A delegation edge gives a NO-USER session agent-shape read reach
+    into the wired target — its shared ``agent::`` pool + its AGENT-SCOPE
+    task-run chats. Never per-user pools or user-scope runs (rule 1: there
+    is no user to follow), and only where an edge exists."""
+
+    def _nouser(self):
+        return UserContext(
+            sub="session:svc-1", email="", name="", role="agent",
+            is_api_key=True, session_id="svc-1", agent=AGENT)
+
+    def _wire(self):
+        agent_store.set_delegation_targets(AGENT, ["other"])
+
+    def _seed_other_pools(self):
+        task_store.create_chat("obs-shared", "agent::other", "other",
+                               title="Other autonomous")
+        task_store.add_chat_message("obs-shared", "assistant", "other history")
+        task_store.create_chat("obs-user", "user-bob", "other", title="Bob chat")
+        task_store.create_chat("task-run-x", "task::other", "other",
+                               title="Nightly")
+        task_store.add_chat_message("task-run-x", "assistant", "nightly done")
+        task_store.create_chat("task-run-y", "user-bob", "other",
+                               title="Bob task")
+        with task_store.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, agent, trigger_type, "
+                "status, scope, chat_id) VALUES ('run-x', 't-x', 'other', "
+                "'schedule', 'completed', 'agent', 'task-run-x')")
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, agent, trigger_type, "
+                "status, scope, created_by, chat_id) VALUES ('run-y', 't-y', "
+                "'other', 'schedule', 'completed', 'user', 'user-bob', "
+                "'task-run-y')")
+            conn.commit()
+
+    def test_edge_target_lists_agent_shape_pools(self, client):
+        self._wire()
+        self._seed_other_pools()
+        client.app_ref.state.user = self._nouser()
+        r = client.get("/v1/delegation/sessions", params={"agent": "other"})
+        assert r.status_code == 200
+        ids = {s["chat_id"] for s in r.json()["sessions"]}
+        assert "obs-shared" in ids          # target's shared pool
+        assert "task-run-x" in ids          # target's agent-scope run chat
+        assert "obs-user" not in ids        # per-user pool: no user to follow
+        assert "task-run-y" not in ids      # user-scope run chat
+
+    def test_all_spans_own_plus_targets(self, client):
+        self._wire()
+        self._seed_other_pools()
+        # Own-agent shared pool row (a no-user session's own chats live there).
+        task_store.create_chat("own-shared", f"agent::{AGENT}", AGENT,
+                               title="Own autonomous")
+        client.app_ref.state.user = self._nouser()
+        r = client.get("/v1/delegation/sessions", params={"agent": "all"})
+        assert r.status_code == 200
+        ids = {s["chat_id"] for s in r.json()["sessions"]}
+        assert {"own-shared", "obs-shared", "task-run-x"} <= ids
+        assert "obs-user" not in ids
+
+    def test_peek_edge_target_agent_shape_only(self, client):
+        self._wire()
+        self._seed_other_pools()
+        client.app_ref.state.user = self._nouser()
+        p = client.get("/v1/delegation/sessions/obs-shared/peek")
+        assert p.status_code == 200
+        assert p.json()["messages"][0]["content"] == "other history"
+        p = client.get("/v1/delegation/sessions/task-run-x/peek")
+        assert p.status_code == 200
+        assert p.json()["messages"][0]["content"] == "nightly done"
+        assert client.get(
+            "/v1/delegation/sessions/obs-user/peek").status_code == 403
+        assert client.get(
+            "/v1/delegation/sessions/task-run-y/peek").status_code == 403
+
+    def test_plain_roster_edge_grants_reads(self, client):
+        # A wired edge alone opens the target's agent-shape pools — the
+        # merged semantics (the old separate observe flag is retired).
+        agent_store.set_delegation_targets(AGENT, ["other"])
+        self._seed_other_pools()
+        client.app_ref.state.user = self._nouser()
+        r = client.get("/v1/delegation/sessions", params={"agent": "other"})
+        assert r.status_code == 200
+        ids = {s["chat_id"] for s in r.json()["sessions"]}
+        assert "obs-shared" in ids and "obs-user" not in ids
+
+    def test_unwired_agent_still_403(self, client):
+        # An agent OFF the roster stays invisible to a no-user session.
+        agent_store.set_delegation_targets(AGENT, [])
+        client.app_ref.state.user = self._nouser()
+        assert client.get("/v1/delegation/sessions",
+                          params={"agent": "other"}).status_code == 403
+
+
 class TestPresentationSplit:
     """Delegate runs leave the Tasks listing; task-run chats (delegated or
     not) live in the sidebar's Task history view, never the chat list."""

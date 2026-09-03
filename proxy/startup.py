@@ -73,9 +73,17 @@ async def lifespan(app: FastAPI):
         pump = _active_pumps.get(chat_id)
         if pump and not pump.is_done:
             if system:
+                # Only pumps whose producer DRAINS system_queue may accept —
+                # a task/scheduler pump would swallow the prompt forever while
+                # the delivery ladder thinks it succeeded (silent-loss hole
+                # from the 2026-09-02 delegate trace). Refusal makes the
+                # caller fall through to persistent/one-shot/direct delivery.
+                if not getattr(pump, "system_queue_consumer", False):
+                    return False
                 pump.system_queue.append(text)
             else:
-                pump.queue_message(text)
+                if pump.queue_message(text) < 0:
+                    return False  # queue full — don't pretend it was delivered
             return True
         return False
 
@@ -147,6 +155,16 @@ async def lifespan(app: FastAPI):
     # never overwritten by later updates or an admin's change.
     from storage import database as _db_seed
     _db_seed.seed_platform_timezone_if_unset()
+    # Department edge recompile at boot: compiled edges otherwise refresh only
+    # on a department/assignment write, so a semantics change in the compiler
+    # (e.g. the 2026-09-02 symmetric-adjacent upgrade) would never materialize
+    # on an existing install. Idempotent, DB-only, O(agents+edges); also
+    # self-heals drift from restored backups.
+    try:
+        from services.departments import edge_compiler as _edge_compiler
+        _edge_compiler.recompile()
+    except Exception:
+        logger.exception("startup department edge recompile failed (non-fatal)")
     # Startup recovery: PARK recovery-eligible in-flight runs (remote CLI,
     # pinned target) for satellite re-adopt (Mode C) instead of blind-failing
     # them; every other orphaned run + all orphaned meetings are failed so
@@ -270,16 +288,18 @@ async def lifespan(app: FastAPI):
     _caps = get_all_capabilities()
     for _path, _layer_caps in _caps.items():
         subscription_store.sync_builtin_models(_path, _layer_caps.get("models", []))
-    # One-time lossless remap of the retired Opus 4.8 builtin onto Opus 5:
-    # pricing is identical ($5/$25/$6.25/$0.50 per 1M), so moving pinned
-    # agents/chats over loses nothing — and without it a 4.8-pinned agent's
-    # NEW chats would silently fall back to the first enabled layer model
-    # (Fable 5, at 2x the price) because the retired builtin row no longer
-    # passes the model-allowed check. Idempotent; must never kill boot.
-    try:
-        subscription_store.remap_retired_model("claude-opus-4-8[1m]", "claude-opus-5")
-    except Exception:
-        logger.exception("retired-model remap failed (non-fatal)")
+    # Retired-builtin remaps (config.MODEL_SUCCESSORS): one-time lossless
+    # moves of every persisted pin of a retired id onto its successor —
+    # without them a pinned agent's NEW chats would silently fall back to the
+    # layer's first enabled model because the retired builtin row no longer
+    # passes the model-allowed check. Registry-driven: a new retirement is one
+    # MODEL_SUCCESSORS entry, no code here. Idempotent; must never kill boot.
+    for _old_id, _new_id in config.MODEL_SUCCESSORS.items():
+        try:
+            subscription_store.remap_retired_model(_old_id, _new_id)
+        except Exception:
+            logger.exception("retired-model remap %s → %s failed (non-fatal)",
+                             _old_id, _new_id)
     logger.info(f"Synced builtin models for {len(_caps)} execution layer(s)")
     # Initialize concurrency control (reads limits from DB)
     from core import concurrency
@@ -321,6 +341,9 @@ async def lifespan(app: FastAPI):
     from core.session import prewarm_session_registry
     _bg_tasks.append(asyncio.create_task(prewarm_session_registry.reap_loop()))
     logger.info("Pre-warm TTL reaper started")
+    from services.knowledge import library_projector
+    _bg_tasks.append(asyncio.create_task(library_projector.reconcile_loop()))
+    logger.info("Knowledge-library reconcile sweep started (300s interval)")
     # Start satellite heartbeat monitor
     from core.remote.satellite_connection import get_connection_manager
     _sat_cm = get_connection_manager()
@@ -449,6 +472,15 @@ async def lifespan(app: FastAPI):
                 await _qm.check_quotas()
             except Exception:
                 logger.exception("quota monitor sweep failed")
+            try:
+                # OAuth grant health: warn owners before a login grant's
+                # finite lifetime lapses (72h/24h out) and once when a row
+                # flips to expired. Self-throttled to 15 min; dedup stamps
+                # persist inside the credential blob.
+                from services.infra import subscription_health as _sub_health
+                await _sub_health.check_subscription_health()
+            except Exception:
+                logger.exception("subscription health sweep failed")
             try:
                 # Automatic MCP updates: once a week in a low-traffic window,
                 # apply available community-MCP updates (deferring in-use docker

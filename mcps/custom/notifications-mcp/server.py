@@ -88,6 +88,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Create a notification for a user. Notifications are delivered as push "
                 "notifications (phone/browser) and appear in the notification inbox. "
+                "Keep them SHORT — a notification is a headline plus one nudge; details "
+                "belong in the digest file, dashboard, or chat, never in the body. "
                 "Use severity carefully: 'danger' triggers an alarm that loops until dismissed."
             ),
             inputSchema={
@@ -95,11 +97,18 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "title": {
                         "type": "string",
+                        "maxLength": 100,
                         "description": "Short notification title (shown in push + inbox)",
                     },
                     "body": {
                         "type": "string",
-                        "description": "Notification body text with details",
+                        "maxLength": 480,
+                        "description": (
+                            "2-3 SHORT sentences, hard cap 480 characters "
+                            "(the server truncates anything longer). State "
+                            "what happened and the one action needed — no "
+                            "lists, no multi-paragraph reports."
+                        ),
                     },
                     "severity": {
                         "type": "string",
@@ -188,7 +197,9 @@ async def list_tools() -> list[Tool]:
                 "Each entry shows status (active or paused), severity, "
                 "schedule/run_at, and id. Use this to find a notification "
                 "before calling pause_notification, resume_notification, "
-                "or cancel_notification."
+                "or cancel_notification. With `agent`, reads another "
+                "accessible agent's notifications instead (read-only — "
+                "mutations stay same-agent)."
             ),
             inputSchema={
                 "type": "object",
@@ -197,6 +208,16 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "enum": AVAILABLE_SCOPES,
                         "description": "Filter by scope (optional)",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "Cross-agent read: an agent slug, or 'all' for "
+                            f"every agent your user can access. Omit for this "
+                            f"agent ({AGENT}). Sessions without a user see "
+                            "only this agent plus its wired delegation "
+                            "targets (read-only)."
+                        ),
                     },
                 },
             },
@@ -272,8 +293,8 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The notification ID to edit",
                     },
-                    "title": {"type": "string", "description": "New title (optional)"},
-                    "body": {"type": "string", "description": "New body text (optional)"},
+                    "title": {"type": "string", "maxLength": 100, "description": "New title (optional)"},
+                    "body": {"type": "string", "maxLength": 480, "description": "New body text (optional, 2-3 short sentences max — server truncates past 480 chars)"},
                     "severity": {
                         "type": "string",
                         "enum": ["info", "success", "warning", "danger"],
@@ -432,7 +453,10 @@ async def _handle_create(args: dict) -> list[TextContent]:
 
 
 async def _handle_list(args: dict) -> list[TextContent]:
-    params = {}
+    # Cross-agent read (server-side the proxy filters by the token identity):
+    # default = own agent; a slug reads that agent; "all" omits the filter.
+    target = args.get("agent") or AGENT
+    params = {} if target == "all" else {"agent": target}
     if "scope" in args:
         params["scope"] = args["scope"]
     try:

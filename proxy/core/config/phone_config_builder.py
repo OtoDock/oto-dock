@@ -126,6 +126,9 @@ async def build_phone_agent_config(
         target_os_user=target_path_policy["os_user"],
         target_user_dirs=target_path_policy["user_dirs"],
         target_device_grants=target_device_grants,
+        # PINNED False: phone calls carry no schedule provenance — the
+        # knowledge_rw opt-in is scheduler-fire-only.
+        knowledge_rw=False,
     )
 
     # MCP config — phone mode filters out tools that don't apply mid-call.

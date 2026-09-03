@@ -50,6 +50,22 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 SESSION_ID = os.environ.get("OTO_SESSION_ID", "")
 
+# visibility-modes: the agent's mode scopes filter pin_app's `visibility`
+# enum so the LLM can't pick an ownership this agent's mode lacks; the
+# default mirrors OTO_DEFAULT_SCOPE (the platform's effective default —
+# viewer-clamped server-side too). Same pattern as schedules-mcp.
+AVAILABLE_SCOPES = [
+    s for s in (os.environ.get("OTO_AVAILABLE_SCOPES", "") or "").split(":")
+    if s in ("user", "agent")
+] or ["user", "agent"]
+_DEFAULT_SCOPE = (
+    os.environ.get("OTO_DEFAULT_SCOPE")
+    or os.environ.get("PROXY_TASK_SCOPE")
+    or os.environ.get("OTO_SCOPE")
+    or "user"
+)
+SCOPE_DEFAULT = _DEFAULT_SCOPE if _DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABLE_SCOPES[0]
+
 
 # Max image dimension (matches Claude's limit)
 MAX_IMAGE_DIM = 1568
@@ -363,7 +379,17 @@ async def list_tools() -> list[Tool]:
                 '<script src="/ui-kit/tailwind.js"></script> (Tailwind v4 '
                 "utilities, runtime-compiled — RECOMMENDED for any rich/custom "
                 "layout; combine with the token vars via arbitrary values like "
-                "bg-[var(--p-surface)]; dark: variants follow the theme). "
+                "bg-[var(--p-surface)]; dark: variants follow the theme), "
+                '<script src="/ui-kit/three.min.js"></script> (3D — global '
+                "`THREE` incl. addons: OrbitControls/MapControls, "
+                "EffectComposer/RenderPass/UnrealBloomPass/OutputPass/"
+                "ShaderPass (bloom glow — the signature look for living "
+                "dashboards), Line2/LineGeometry/LineMaterial fat lines, "
+                "RoundedBoxGeometry. Sandbox limits: NO asset loaders "
+                "(GLTFLoader etc. — fetch is blocked), no workers/WASM "
+                "decoders, no WebXR; use procedural geometry + data:/blob:/"
+                "canvas textures, plain WebGL works fine — recipes in the "
+                "miniapp-authoring skill). "
                 "Inline <script> is allowed and runs sandboxed: client-side "
                 "interactivity (inputs, tabs, sliders, sorting, local "
                 "calculations) fully works, but the artifact CANNOT reach "
@@ -558,6 +584,22 @@ async def list_tools() -> list[Tool]:
                             "resolve from your session — never passed."
                         ),
                     },
+                    "visibility": {
+                        "type": "string",
+                        "enum": AVAILABLE_SCOPES,
+                        "default": SCOPE_DEFAULT,
+                        "description": (
+                            f"WHO sees it (default for this agent: "
+                            f"`{SCOPE_DEFAULT}`; orthogonal to `scope`). "
+                            "'agent' = one shared dashboard for every user "
+                            "of this agent (needs editor+ when a human "
+                            "drives the session); 'user' = the current "
+                            "user's personal dashboard. Omit for the "
+                            "agent's default; override only when the "
+                            "intent is explicit (e.g. \"pin this for the "
+                            "whole team\" / \"just for me\")."
+                        ),
+                    },
                 },
                 "required": ["slug"],
             },
@@ -568,12 +610,23 @@ async def list_tools() -> list[Tool]:
                 "Retire a pinned mini-app by slug (your scope) — removes the "
                 "registration, its actions manifest AND its approval; the "
                 "apps/<slug>.html workspace file stays. (The dashboard's X "
-                "only hides an app — pin_app(slug) restores those.)"
+                "only hides an app — pin_app(slug) restores those.) A slug "
+                "pinned both shared and personal needs `visibility` to pick "
+                "one; otherwise it auto-detects."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "slug": {"type": "string", "description": "The app's slug."},
+                    "visibility": {
+                        "type": "string",
+                        "enum": AVAILABLE_SCOPES,
+                        "description": (
+                            "Disambiguate when the slug exists both shared "
+                            "('agent') and personal ('user'). Omit to "
+                            "auto-detect."
+                        ),
+                    },
                 },
                 "required": ["slug"],
             },
@@ -1148,6 +1201,10 @@ async def _handle_pin_app(arguments: dict) -> list[TextContent]:
         "actions": arguments.get("actions"),
         "make_default": bool(arguments.get("make_default", False)),
         "scope": (arguments.get("scope") or "standing").strip().lower(),
+        # Ownership (S1). Empty = the proxy resolves the session's effective
+        # default — same value SCOPE_DEFAULT advertises, kept server-side so
+        # the two can't drift.
+        "visibility": (arguments.get("visibility") or "").strip().lower(),
     }
     data, err = await _post_hook("/v1/hooks/apps/pin", payload)
     if data is None:
@@ -1213,6 +1270,8 @@ async def _handle_file_pin_hook(op: str, arguments: dict) -> list[TextContent]:
 
 async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
     payload = {"session_id": SESSION_ID, "slug": (arguments.get("slug") or "").strip()}
+    if arguments.get("visibility"):
+        payload["visibility"] = arguments["visibility"].strip().lower()
     data, err = await _post_hook(f"/v1/hooks/apps/{op}", payload)
     if data is None:
         return [TextContent(type="text", text=f"Error ({op}): {err}")]

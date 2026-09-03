@@ -110,6 +110,18 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   const [idx, setIdx] = useState(initialIndex)
   const total = images.length
   const current = images[idx]
+  // Latest onClose in a ref: the mount-ONCE integrations below (history
+  // entry, Android globals, esc-stack) must never re-arm because a caller
+  // passed a new inline `onClose` identity on a re-render. With `[onClose]`
+  // deps, ANY single re-render of the host while the lightbox was open
+  // closed it "by itself": the history effect's cleanup ran the async
+  // `history.back()` for its old entry while the re-armed effect had already
+  // pushed a new one and attached a fresh popstate listener — the back()
+  // landed on that listener → onClose(). Dictation interims / streaming
+  // turns re-render hosts continuously, so the viewer died within a second
+  // (2026-08-13 operator report; reproduced with one synthetic input event).
+  const onCloseRef = useRef(onClose)
+  useEffect(() => { onCloseRef.current = onClose }, [onClose])
   const [imgDim, setImgDim] = useState<{ w: number; h: number } | null>(null)
   const imgRef = useRef<HTMLImageElement | null>(null)
   const outerRef = useRef<HTMLDivElement | null>(null)
@@ -262,7 +274,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   useEffect(() => {
     const HISTORY_KEY = 'otoLightbox'
     window.history.pushState({ [HISTORY_KEY]: true }, '', window.location.href)
-    const onPop = () => onClose()
+    const onPop = () => onCloseRef.current()
     window.addEventListener('popstate', onPop)
     return () => {
       window.removeEventListener('popstate', onPop)
@@ -271,7 +283,10 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
         window.history.back()
       }
     }
-  }, [onClose])
+    // Mount-once by design (see onCloseRef above): one history entry per
+    // lightbox lifetime — re-arming on onClose identity is the self-close bug.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Android back-gesture / back-button integration — same pattern as
   // WorkspaceOverlay's selection mode. MainActivity.handleBackAction's
@@ -286,22 +301,24 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
       __otodockLightboxClose?: () => void
     }
     w.__otodockLightboxActive = true
-    w.__otodockLightboxClose = () => onClose()
+    w.__otodockLightboxClose = () => onCloseRef.current()
     return () => {
       w.__otodockLightboxActive = false
       delete w.__otodockLightboxClose
     }
-  }, [onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
-    const pop = pushEscHandler(onClose)
+    const pop = pushEscHandler(() => onCloseRef.current())
     const prev = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     return () => {
       pop()
       document.body.style.overflow = prev
     }
-  }, [onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

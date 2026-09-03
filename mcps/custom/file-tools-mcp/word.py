@@ -6,10 +6,24 @@ search & replace, table manipulation, and mixed-formatting paragraphs.
 """
 
 import contextlib
+import os
 from pathlib import Path
 
 from equations import OMML_NS, latex_to_omml_element, omml_to_latex
-from shared import _dropped_note, _normalize_operations, _op_type, _push_preview, _resolve_path, _to_agents_relative, logger
+from isolation import run_parse
+from shared import (
+    _checked_resolved,
+    _dropped_note,
+    _normalize_operations,
+    _op_type,
+    _preresolve_image_ops,
+    _push_preview,
+    _resolve_path,
+    _to_agents_relative,
+    _WORKER_TMP_SUFFIX,
+    _WRITE_OP_ADVICE,
+    logger,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -379,16 +393,34 @@ def _search_replace_in_paragraph(paragraph, find: str, replace: str,
 
 
 async def handle_write_docx(args: dict) -> str:
+    """Thin parent wrapper: path resolution and the preview push are
+    session-bound and stay here; the op loop (which DOM-loads an existing
+    document) runs in a bounded worker child."""
+    path = await _resolve_path(args["path"], writing=True)
+    ops, dropped = _normalize_operations(args.get("operations"))
+    await _preresolve_image_ops(ops)
+    try:
+        msg = await run_parse(
+            _write_docx_core, path, ops, dropped,
+            bool(args.get("create_new", False)),
+            _advice=_WRITE_OP_ADVICE,
+        )
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path + _WORKER_TMP_SUFFIX)
+        raise
+    await _push_preview(path)
+    return msg
+
+
+def _write_docx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
+    """Worker core: op application + atomic save + result message."""
     from docx import Document
     from docx.enum.section import WD_ORIENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Inches, Pt, RGBColor
-
-    path = await _resolve_path(args["path"], writing=True)
-    ops, dropped = _normalize_operations(args.get("operations"))
-    create_new = args.get("create_new", False)
 
     if Path(path).exists() and not create_new:
         doc = Document(path)
@@ -670,9 +702,7 @@ async def handle_write_docx(args: dict) -> str:
             # =============================================================
 
             elif ot == "add_image":
-                img_path = await _resolve_path(
-                    op.get("image_path") or op.get("path") or op.get("image", "")
-                )
+                img_path = _checked_resolved(op.get("image_path", ""))
                 width = Inches(float(op.get("width_inches", 4.0)))
                 height = Inches(float(op["height_inches"])) if op.get("height_inches") else None
                 doc.add_picture(img_path, width=width, height=height)
@@ -927,9 +957,11 @@ async def handle_write_docx(args: dict) -> str:
             "op unless an intentional blank final page is desired."
         )
 
-    # Save even if some operations failed
-    doc.save(path)
-    await _push_preview(path)
+    # Save even if some operations failed. Atomic: a killed worker must
+    # never leave the user's document truncated.
+    tmp = path + _WORKER_TMP_SUFFIX
+    doc.save(tmp)
+    os.replace(tmp, path)
 
     msg = f"Document saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)

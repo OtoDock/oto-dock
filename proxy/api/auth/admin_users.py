@@ -77,9 +77,13 @@ async def admin_list_users(user: UserContext | None = Depends(get_current_user))
     # ``invite_pending`` = a local account still waiting on its invite link
     # (no password set yet), so the admin UI can badge it.
     for u in users:
+        # Pop the hash UNCONDITIONALLY (before the short-circuit): a non-local
+        # row skips the `and` operand, so folding the pop into the invite_pending
+        # expression left password_hash on any future non-local row that
+        # carried one. Compute the badge from the popped value.
+        _ph = u.pop("password_hash", None)
         u["invite_pending"] = (
-            (u.get("auth_provider") or "").startswith("local")
-            and not u.pop("password_hash", None)
+            (u.get("auth_provider") or "").startswith("local") and not _ph
         )
         for k in ("totp_secret_enc", "totp_recovery_enc"):
             u.pop(k, None)
@@ -148,6 +152,59 @@ async def admin_set_user_agents(
                 )
 
     return {"status": "updated", "agents": req.agents, "agent_roles": roles}
+
+
+class AddAgentRequest(BaseModel):
+    role: str = "viewer"  # "manager" | "editor" | "viewer"
+
+
+@router.post("/v1/admin/users/{sub}/agents/{agent}")
+async def admin_add_user_agent(
+    sub: str,
+    agent: str,
+    req: AddAgentRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Additively attach ONE agent to a user. Admin only.
+
+    The PUT sibling above is full-set-replace — fine for the admin users
+    page that edits the whole set, dangerous for one-click flows (a stale
+    client set would clobber other assignments). This is the primitive
+    behind the agents-map "add me" CTA: idempotent, touches nothing else,
+    and fires the same on-add side effects (dirs/quota via add_user_agent,
+    community seeding below).
+    """
+    u = require_admin(user)
+    target = task_store.get_user(sub)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not agent_store.agent_exists(agent):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if req.role not in ("manager", "editor", "viewer"):
+        raise HTTPException(status_code=400, detail=f"Invalid agent_role '{req.role}'")
+    if target["role"] != "admin" and agent_store.is_admin_only(agent):
+        raise HTTPException(
+            status_code=403, detail=f"Agent '{agent}' requires admin role"
+        )
+
+    inserted = await asyncio.to_thread(
+        task_store.add_user_agent, sub, agent, req.role, u.sub
+    )
+    if inserted:
+        logger.info(
+            f"Admin {mask_email(u.email)} added agent {agent} ({req.role}) to {sub}"
+        )
+        from services.community import community_agent_installer
+        try:
+            await asyncio.to_thread(
+                community_agent_installer.on_user_added_to_agent,
+                agent, sub, req.role,
+            )
+        except Exception:
+            logger.exception(
+                "on_user_added_to_agent failed for (%s, %s)", agent, sub,
+            )
+    return {"status": "added" if inserted else "already_assigned", "agent": agent}
 
 
 @router.put("/v1/admin/users/{sub}/role")
@@ -243,6 +300,24 @@ async def admin_delete_user(
     except Exception:
         logger.exception(
             "Service-agent-binding cleanup raised for user %s "
+            "(continuing with user delete)", sub,
+        )
+    # Revoke the user's API keys and user-scoped triggers. These tables carry
+    # NO foreign key to users(sub), so delete_user does NOT cascade them —
+    # without this an orphaned `otok_` key kept firing the user's surviving
+    # triggers (and, being un-revocable once the user row is gone, deleting the
+    # user was NOT the full revocation an operator expects). Best-effort:
+    # a failure here must not block the user delete.
+    try:
+        from storage import api_key_store, trigger_store
+        n_keys = await asyncio.to_thread(api_key_store.cleanup_user_api_keys, sub)
+        n_trig = await asyncio.to_thread(trigger_store.cleanup_user_triggers, sub)
+        if n_keys or n_trig:
+            logger.info("Revoked %d API key(s) + %d user trigger(s) for deleted "
+                        "user %s", n_keys, n_trig, sub)
+    except Exception:
+        logger.exception(
+            "API-key/trigger cleanup raised for user %s "
             "(continuing with user delete)", sub,
         )
     deleted = task_store.delete_user(sub)
@@ -359,6 +434,14 @@ async def admin_reset_password(
     target = await asyncio.to_thread(task_store.get_user, sub)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    # Owner protection — parity with role-change / delete. Without it a
+    # non-owner admin could reset the owner's password and (barring the
+    # owner's 2FA) log in as the owner, crossing the owner-above-admin
+    # boundary the rest of admin_users enforces. The owner resets their own
+    # password via /v1/users/me/password.
+    if target.get("is_owner") and not u.is_owner:
+        raise HTTPException(status_code=403,
+                            detail="Cannot reset the owner's password")
     if not (target.get("auth_provider", "").startswith("local")):
         raise HTTPException(status_code=400, detail="Cannot reset password for OIDC users")
 

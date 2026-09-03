@@ -69,9 +69,12 @@ async def get_dynamic_contexts(
     builder appends.
 
     ``kwargs`` accepts ``user_sub``, ``user_role``, ``session_ctx``,
-    ``delegation_targets``, ``trigger_payload``. All optional — missing
+    ``delegation_targets``, ``trigger_payload``, ``delegation_roster``,
+    ``meetings_access``, ``nouser_reads``. All optional — missing
     kwargs mean the corresponding tokens (or Python provider behaviors)
-    resolve to empty / no-op rather than erroring.
+    resolve to empty / no-op rather than erroring. Providers additionally
+    receive ``assigned_mcps`` (this session's full assigned list) so a block
+    can defer to another MCP's block instead of duplicating it.
 
     Async because manifest builder blocks invoke remote MCP tools.
     Python providers stay sync (no I/O) and are called directly inside
@@ -88,7 +91,15 @@ async def get_dynamic_contexts(
         builder = _providers.get(mcp_name)
         if builder:
             try:
-                text = builder(agent_name=agent_name, **kwargs)
+                text = builder(
+                    agent_name=agent_name,
+                    # A provider may need to know what ELSE is assigned — the
+                    # schedules block defers its model list to the delegation
+                    # block when both are present, instead of printing the
+                    # same layers line twice.
+                    assigned_mcps=assigned_mcp_names,
+                    **kwargs,
+                )
                 if text:
                     results.append((mcp_name, text))
             except Exception as e:
@@ -654,6 +665,44 @@ def build_delegation_roster(
     return roster
 
 
+def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
+    """Resolve the agents the acting USER can access, with their per-agent
+    role — the meetings participant set (the meetings API gates on user
+    access, NOT the delegation roster; see api/meetings/meetings.py).
+
+    Returns ``[{slug, display_name, description, role}, …]`` sorted by slug.
+    Empty for no-user sessions (``user_sub == ""``) — their reach is the
+    roster instead, and ``_meetings_mcp_context`` falls back to it. Admins
+    have no explicit rows; they get every agent tagged "admin".
+
+    Sync DB reads — call via ``asyncio.to_thread`` from the config builders
+    and pass the result through the ``meetings_access`` kwarg; NEVER call
+    from a context provider (providers are no-I/O by contract).
+    """
+    from storage import agent_store
+    from storage import database as task_store
+
+    if not user_sub:
+        return []
+    if user_role == "admin":
+        roles: dict[str, str] = {
+            slug: "admin" for slug in agent_store.get_agent_slugs()}
+    else:
+        roles = task_store.get_user_agent_roles(user_sub) or {}
+    rows: list[dict] = []
+    for slug in sorted(roles):
+        data = agent_store.get_agent(slug)
+        if not data:
+            continue
+        rows.append({
+            "slug": slug,
+            "display_name": data.get("display_name", slug),
+            "description": data.get("description", "") or "",
+            "role": roles[slug],
+        })
+    return rows
+
+
 def _fmt_roster_layers(layers: list[dict]) -> str:
     """One compact `layers:` line for an agent's roster entry."""
     rendered = []
@@ -678,6 +727,76 @@ def _fmt_roster_layers(layers: list[dict]) -> str:
     return " · ".join(rendered)
 
 
+def _department_line(
+    agent_name: str, self_data: dict, delegation_targets: list[str],
+) -> str:
+    """One compact department-membership line for the roster, or ''.
+
+    "You are in <Dept> at level <Head>. Same-level: a; level above: b;
+    level below: c." Buckets follow the SYMMETRIC topology (2026-09-02):
+    adjacent = one level either way, subtree = the whole department (listed
+    in the same above/below buckets, capped so a big mesh can't bloat the
+    prompt). Best-effort — a lookup failure must never break a prompt build."""
+    dept_id = self_data.get("department_id") or ""
+    level_id = self_data.get("department_level_id") or ""
+    if not dept_id or not level_id:
+        return ""
+    try:
+        from storage import agent_store, db_departments
+        dept = db_departments.get_department(dept_id)
+        if not dept:
+            return ""
+        levels = dept["levels"]
+        level = next((lv for lv in levels if lv["id"] == level_id), None)
+        if not level:
+            return ""
+        targets = set(delegation_targets)
+        same_level: list[str] = []
+        above: list[str] = []
+        below: list[str] = []
+        above_ids = {lv["id"] for lv in levels if lv["rank"] < level["rank"]}
+        below_ids = {lv["id"] for lv in levels if lv["rank"] > level["rank"]}
+        for a in agent_store.get_all_agents():
+            slug = a["slug"]
+            if slug == agent_name or slug not in targets:
+                continue
+            if (a.get("department_id") or "") != dept_id:
+                continue
+            member_level = a.get("department_level_id") or ""
+            if member_level == level_id:
+                same_level.append(slug)
+            elif member_level in above_ids:
+                above.append(slug)
+            elif member_level in below_ids:
+                below.append(slug)
+        line = (
+            f"\nYou are part of the **{dept['name']}** department "
+            f"at level **{level['name']}**."
+        )
+
+        def _bucket(slugs: list[str], cap: int = 15) -> str:
+            # A subtree (full-mesh) department can be large — cap the listing
+            # so the prompt stays compact; the wired-targets roster above
+            # carries the complete set anyway.
+            shown = ", ".join(f"`{s}`" for s in sorted(slugs)[:cap])
+            extra = len(slugs) - cap
+            return shown + (f" (+{extra} more)" if extra > 0 else "")
+
+        parts = []
+        if same_level:
+            parts.append("same-level: " + _bucket(same_level))
+        if above:
+            parts.append("level(s) above: " + _bucket(above))
+        if below:
+            parts.append("level(s) below: " + _bucket(below))
+        if parts:
+            line += " Department delegation — " + "; ".join(parts) + "."
+        return line
+    except Exception:
+        logger.exception("department roster line failed for %s", agent_name)
+        return ""
+
+
 def _delegation_mcp_context(
     agent_name: str,
     delegation_targets: list[str] | None = None,
@@ -689,10 +808,18 @@ def _delegation_mcp_context(
     enabled execution layers/models when the caller pre-resolved them
     (``delegation_roster`` kwarg — built off-loop by the config builders via
     ``build_delegation_roster``; this provider itself stays no-I/O beyond
-    the pre-existing agent-row reads). This section is shared context — also
-    used by meetings-mcp if enabled. A session-start "active parallel
-    sessions" block rides along — it covers layers with no per-turn prelude
-    injection (PTY, remote) on their first turn.
+    the pre-existing agent-row reads). This block is the WIRED reach
+    (delegation edges) only — meetings advertise the user-access set in
+    their own block (``_meetings_mcp_context``). A session-start "active
+    parallel sessions" block rides along — it covers layers with no
+    per-turn prelude injection (PTY, remote) on their first turn.
+
+    Deliberately NO session-start notice for received files (removed
+    2026-08-14 after the first live test): a stamped once-only notice is
+    fragile against warmup/parallel config builds racing to consume it,
+    while the prompt's workspace listing already shows
+    ``workspace/inbox/<sender>/…`` on every session — presence + sender
+    for free. Senders put context IN the files (README) when it matters.
     """
     sibling_block = ""
     from core.session import sibling_awareness
@@ -708,6 +835,11 @@ def _delegation_mcp_context(
 
     roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
 
+    # No-user sessions read EVERY wired target (a delegation edge is the
+    # read grant — merged observe semantics); the config builders pass
+    # False for user-backed sessions, which read via their user's access.
+    nouser_reads = bool(kwargs.get("nouser_reads"))
+
     def _agent_lines(slug: str, data: dict, *, is_self: bool) -> list[str]:
         name = data.get("display_name", slug)
         desc = data.get("description", "")
@@ -718,16 +850,29 @@ def _delegation_mcp_context(
             out.append(f"  layers: {_fmt_roster_layers(layers)}")
         return out
 
-    # Build agent roster: self first, then targets
+    # Build agent roster: self first, then targets. This is the WIRED set
+    # (delegation edges) — the meetings block advertises the user-access set
+    # separately, so the two reaches never blur.
     lines = [
         "## Available Agents\n",
-        "The following agents are available for cross-agent collaboration:\n",
+        "The following agents are wired as your delegation targets"
+        " (`delegate()` / `send_files()`):\n",
     ]
 
     # Self
     self_data = agent_store.get_agent(agent_name)
     if self_data:
         lines.extend(_agent_lines(agent_name, self_data, is_self=True))
+
+    # Department framing (agents map): one compact line when assigned. Peer
+    # lists are drawn ONLY from delegation_targets (already access-filtered
+    # and edge-backed), so the prompt never claims reach that spawn authz
+    # would refuse — with auto_delegation off, dept-mates simply don't
+    # appear. Buckets are capped inside _department_line (a subtree mesh can
+    # be the whole department since the 2026-09-02 symmetric topology).
+    dept_line = _department_line(agent_name, self_data or {}, delegation_targets)
+    if dept_line:
+        lines.append(dept_line)
 
     # Delegation targets (excluding self if present)
     for slug in delegation_targets:
@@ -748,6 +893,22 @@ def _delegation_mcp_context(
             "target's `layers:` line above; omit both to inherit the "
             "worker's defaults (recommended). Ignored with `continue_id`."
         )
+    lines.append(
+        "`send_files(target_agent, paths, …)` copies workspace files into a "
+        "target's `workspace/inbox/` — hand-off without making it act; "
+        "follow with `delegate()` when it should."
+    )
+    if nouser_reads:
+        lines.append(
+            "This session runs without a user: every delegation target "
+            "listed above is READABLE — pass its slug as the `agent` "
+            "argument of the list tools (schedules / triggers / "
+            "notifications / delegation `list_sessions`+`peek_session`) to "
+            "read its scheduled tasks, run history, sessions, triggers, "
+            "and notifications — agent-scope only, strictly read-only "
+            "(fire/mutations stay on your own agent; `delegate()` when "
+            "they should act)."
+        )
     if sibling_block:
         lines.extend(["", sibling_block])
     return "\n".join(lines)
@@ -756,33 +917,127 @@ def _delegation_mcp_context(
 register("delegation-mcp", _delegation_mcp_context)
 
 
+def _schedules_mcp_context(
+    agent_name: str,
+    **kwargs: Any,
+) -> str | None:
+    """Tell the agent which models/layers its own scheduled tasks may pin.
+
+    ``create_scheduled_task`` / ``create_one_time_task`` / ``edit_task`` accept
+    a per-task ``model``/``layer`` that overrides the agent's default for that
+    task alone. The valid ids are this agent's OWN enabled layers — the same
+    set ``spawn_authz.validate_spawn_overrides`` enforces — which until now
+    were rendered only by the delegation block. An agent with schedules-mcp
+    and no delegation-mcp could not see them at all.
+
+    Renders the agent's own ``layers:`` line from the pre-resolved
+    ``delegation_roster`` (self is always in it: both config builders prepend
+    the agent's own slug). When ``delegation-mcp`` is ALSO assigned, that
+    block already prints the same line under *(this is you)* — emit a pointer
+    instead of a second copy.
+    """
+    roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
+    layers = roster.get(agent_name) or []
+    if not layers:
+        return None
+
+    lines = ["## Scheduled-task Execution\n"]
+    if "delegation-mcp" in (kwargs.get("assigned_mcps") or []):
+        lines.append(
+            "Your own `layers:` line in **Available Agents** above lists the "
+            "execution layers and model ids your scheduled tasks may pin."
+        )
+    else:
+        lines.append(f"Your layers: {_fmt_roster_layers(layers)}")
+
+    lines.append(
+        "\nTasks run on your default model unless pinned. `model` / `layer` "
+        "on `create_scheduled_task`, `create_one_time_task` and `edit_task` "
+        "pin ONE task's runs to a different model or layer, leaving your "
+        "default untouched everywhere else — the lever for keeping a cheap "
+        "default while one demanding task runs on a stronger model (or the "
+        "reverse). Values outside the list above are rejected. Ask the user "
+        "before pinning unless they asked for it; `edit_task(model=\"\")` "
+        "clears a pin."
+    )
+    return "\n".join(lines)
+
+
+register("schedules-mcp", _schedules_mcp_context)
+
+
+# Cap on agents rendered into the meetings participant list — a big install's
+# full catalog belongs in the dashboard, not every system prompt.
+_MEETINGS_ACCESS_CAP = 24
+
+
 def _meetings_mcp_context(
     agent_name: str,
     delegation_targets: list[str] | None = None,
     **kwargs: Any,
 ) -> str | None:
-    """Inject meeting capability note when meetings-mcp is assigned."""
-    if not delegation_targets:
-        return None
+    """Inject the meeting capability note when meetings-mcp is assigned.
 
+    Participants follow the acting USER's access (the ``meetings_access``
+    kwarg, pre-resolved off-loop by the config builders via
+    ``build_meetings_access``) — the meetings API never gated on the
+    delegation roster. No-user sessions have no user to derive access from;
+    their reach IS the roster (the create endpoint clamps to it), so they
+    fall back to the roster-derived list.
+    """
     from storage import agent_store as _agent_store
 
+    access: list[dict] = kwargs.get("meetings_access") or []
+    if access:
+        peers = [a for a in access if a["slug"] != agent_name]
+        if not peers:
+            return None
+        shown = peers[:_MEETINGS_ACCESS_CAP]
+        lines = [
+            "## Meeting Rooms\n",
+            "You can start multi-agent meetings with `start_meeting(topic, agents)`.",
+            "Participants follow YOUR USER'S access (their role travels with "
+            "you) — not your delegation roster. You can invite:",
+        ]
+        for a in shown:
+            desc = a["description"].strip()
+            if len(desc) > 140:
+                desc = desc[:140].rstrip() + "…"
+            lines.append(
+                f"- **{a['display_name']}** (`{a['slug']}`) ({a['role']})"
+                f"{f' — {desc}' if desc else ''}"
+            )
+        if len(peers) > len(shown):
+            lines.append(f"- …and {len(peers) - len(shown)} more (see the dashboard's agents page).")
+        lines.extend([
+            "",
+            "Meetings are deliberate, observable communication — every turn "
+            "lands in a visible transcript. To hand WORK to another agent, "
+            "use `delegate()` (wired targets only), not a meeting.",
+        ])
+        return "\n".join(lines)
+
+    # No-user fallback: roster-derived (the create endpoint clamps a no-user
+    # session's participants to roster ∪ self).
+    if not delegation_targets:
+        return None
     peer_agents = [t for t in delegation_targets if t != agent_name]
     if not peer_agents:
         return None
-
     peer_names = []
     for slug in peer_agents:
         data = _agent_store.get_agent(slug)
         name = (data or {}).get("display_name", slug)
         peer_names.append(f"{name} (`{slug}`)")
-
     lines = [
         "## Meeting Rooms\n",
-        "You can start multi-agent meetings using `start_meeting(topic, agents)`.",
-        f"Available meeting participants: {', '.join(peer_names)}",
+        "You can start multi-agent meetings with `start_meeting(topic, agents)`.",
+        "This session has no user, so participants are limited to your wired "
+        f"delegation targets: {', '.join(peer_names)}",
         "",
-        "Use meetings for collaborative discussions when multiple perspectives are needed.",
+        "Meetings are deliberate, observable communication — every turn "
+        "lands in a visible transcript. To hand WORK to another agent, "
+        "use `delegate()`, not a meeting.",
     ]
     return "\n".join(lines)
 

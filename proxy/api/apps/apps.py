@@ -113,6 +113,21 @@ addEventListener('message', function(e){
   }
   addEventListener('load', report);
 })();
+// Scroll-position reporting: the host anchors overlay chrome (the solo-app
+// removal ✕) to the document's top-right and slides it away with the page —
+// the sandbox swallows scroll, so the frame reports its own offset
+// (rAF-throttled; fixed-height hosts that don't care simply ignore it).
+(function(){
+  var raf = 0;
+  function post(){
+    raf = 0;
+    parent.postMessage({source:'otodock-artifact', v:1, type:'scroll_pos',
+      y: Math.max(0, window.scrollY || 0)}, '*');
+  }
+  addEventListener('scroll', function(){
+    if (!raf) raf = requestAnimationFrame(post);
+  }, {passive:true});
+})();
 </script>"""
 
 # Minimum seconds between fires of the same button by the same user. Module
@@ -246,6 +261,9 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "approval_stale": stale,
             "can_approve": can_approve,
             "can_manage": _can_manage(row, u),
+            # S2: this viewer parked the shared row off their own strip
+            # (rows still return — the client's hidden affordance restores).
+            "hidden_for_me": bool(row.get("hidden_for_me")),
         })
     return out
 
@@ -258,14 +276,58 @@ async def list_apps(
     """The viewer's merged app list: shared rows first, then their own
     personal rows (each by position; order[0] is the default tab). Standing
     rows only — chat/project Dock pins serve through
-    ``GET /v1/chats/{chat_id}/pins``."""
+    ``GET /v1/chats/{chat_id}/pins``. Shared rows the viewer hid for
+    themselves (S2) still return, flagged ``hidden_for_me`` — the client
+    keeps them off the strip and offers restore."""
     u = require_auth(user)
     require_agent_access(u, agent)
 
     def _load() -> list[dict]:
-        return shape_app_rows(task_store.list_apps(agent, _viewer_username(u)), u)
+        return shape_app_rows(
+            task_store.list_apps(agent, _viewer_username(u), viewer_sub=u.sub), u,
+        )
 
     return {"apps": await asyncio.to_thread(_load)}
+
+
+@router.post("/v1/apps/{app_id}/hide")
+async def hide_app_for_me(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """S2 hide-for-me: park a SHARED standing app off the CALLER's strip
+    only — any role (this is the viewer's ✕; the team-wide soft-unpin stays
+    ``DELETE /v1/apps/{id}`` behind ``_can_manage``). Personal rows are
+    refused: their owner already has the real unpin."""
+    u = require_auth(user)
+    row = await asyncio.to_thread(task_store.get_app, app_id)
+    if not row or row.get("hidden") or not app_access(row, u):
+        raise HTTPException(status_code=404, detail="App not found")
+    if row.get("username"):
+        raise HTTPException(
+            status_code=400,
+            detail="hide-for-me applies to shared apps only — unpin your "
+                   "personal app instead",
+        )
+    if task_store.app_is_scoped(row):
+        raise HTTPException(status_code=400,
+                            detail="Dock pins cannot be hidden per-user")
+    await asyncio.to_thread(task_store.hide_app_for_user, app_id, u.sub)
+    return {"status": "ok"}
+
+
+@router.post("/v1/apps/{app_id}/unhide")
+async def unhide_app_for_me(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Restore a hide-for-me (S2). Idempotent."""
+    u = require_auth(user)
+    row = await asyncio.to_thread(task_store.get_app, app_id)
+    if not row or row.get("hidden") or not app_access(row, u):
+        raise HTTPException(status_code=404, detail="App not found")
+    await asyncio.to_thread(task_store.unhide_app_for_user, app_id, u.sub)
+    return {"status": "ok"}
 
 
 class ApproveRequest(BaseModel):

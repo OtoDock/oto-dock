@@ -86,6 +86,17 @@ class OAuthProvider(ABC):
     #: JSON key for the account's stable provider-side id.
     userinfo_id_field: str = "sub"
 
+    #: True when the vendor supports INCREMENTAL authorization — a re-consent
+    #: returns a grant covering the union of previously granted + newly
+    #: requested scopes (Google's ``include_granted_scopes=true``). The start
+    #: flow always sends the incremental param for such providers, and
+    #: ``persist_oauth_account`` records the scope UNION when overwriting an
+    #: existing token file. Both matter once several MCPs share one
+    #: provider_id: their email-derived account labels collide on ONE token
+    #: file, and without the union a second MCP's connect would replace it
+    #: with a token record missing the first MCP's scopes.
+    supports_incremental_auth: bool = False
+
     # ------------------------------------------------------------------
     # Abstract surface
     # ------------------------------------------------------------------

@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 from audio.capabilities import STTCapabilities, BillingUnit
 from audio.log_policy import log_transcript
@@ -59,6 +59,44 @@ class STTProvider(ABC):
     is_stub: ClassVar[bool] = False
 
     _is_open: bool = False
+
+    # Optional push hook: the receive loop invokes this with each FINAL
+    # transcript at the moment it is queued for ``drain_transcript``. Streaming
+    # UIs that render the ACCUMULATING utterance live need the push — during
+    # continuous speech, mid-utterance finals otherwise sit invisible in the
+    # queue until dispatch, so a polled ``latest_interim`` overlay alone resets
+    # the caption to each newest phrase. Consumers assign a plain sync callable
+    # (the duplex session forwards it as a caption frame); providers call it
+    # via ``_emit_partial_final`` so a raising callback can never kill the
+    # receive loop. Providers that implement streaming SHOULD emit this
+    # wherever they enqueue a final.
+    on_partial_final: Callable[[str], None] | None = None
+
+    def _emit_partial_final(self, text: str) -> None:
+        """Invoke ``on_partial_final`` defensively (see attribute docs)."""
+        cb = self.on_partial_final
+        if cb is None or not text:
+            return
+        try:
+            cb(text)
+        except Exception:
+            logging.getLogger(type(self).__module__).debug(
+                "on_partial_final callback failed", exc_info=True)
+
+    # Dictation mode — set ONLY by the chat-input STT relay (ws/audio.py).
+    # The composer paints interims as if committed, so a dictation provider
+    # must never let painted words die with an empty or truncated final
+    # (Deepgram does both on some languages) — it promotes the shown interim
+    # into the transcript queue instead. The call/duplex pipelines drain the
+    # SAME queue and use pending finals as barge-in speech evidence, so they
+    # must NOT get promotions (a noise interim would become dispatched turn
+    # text / false barge-in there) — hence opt-in per instance, which also
+    # survives ensure_alive() reconnects.
+    dictation_mode: bool = False
+
+    def enable_dictation_mode(self) -> None:
+        """Opt this instance into dictation semantics (see attribute docs)."""
+        self.dictation_mode = True
 
     # ── Construction from an audio_providers row ───────────────────
 
@@ -175,6 +213,19 @@ class STTProvider(ABC):
         """
         return ""
 
+    @property
+    def has_pending_finals(self) -> bool:
+        """Finalized-but-undrained transcript(s) waiting in the provider queue.
+
+        Speech evidence the barge-in pause checks MUST include: providers
+        finalize phrases DURING continuous speech (endpointing on a natural
+        comma pause), which CLEARS ``latest_interim`` — a real speaker with an
+        early-finalized phrase otherwise looks exactly like phantom VAD
+        (live-hit 2026-08-24: the confirm backstop resumed the reply over a
+        mid-sentence caller). Default: nothing pending.
+        """
+        return False
+
     def pop_fatal_error(self) -> str | None:
         """Fatal stream failure (auth/quota/connection) to surface to the
         client, returned ONCE then cleared; ``None`` while healthy. Consumers
@@ -183,6 +234,21 @@ class STTProvider(ABC):
         that hears nothing. Default: no fatal-error surface.
         """
         return None
+
+    @property
+    def last_result_monotonic(self) -> float:
+        """``time.monotonic()`` of the last NON-EMPTY interim or final this
+        provider delivered; 0.0 before the first. The pipeline's STT guard
+        compares it against accumulated caller-speech time to catch the
+        third liveness failure mode — an alive-but-MUTE session (socket
+        open, sends flowing, zero results while the caller speaks; live-hit
+        2026-08-14) — and force a reconnect. Streaming providers stamp
+        ``self._last_result_at`` in their result handlers; the default keeps
+        non-streaming providers exempt (0.0 with no speech accumulation ever
+        reaching the guard's threshold requires the pipeline's counter,
+        which only the call pipeline runs).
+        """
+        return getattr(self, "_last_result_at", 0.0)
 
     @abstractmethod
     async def close(self) -> None:
@@ -230,21 +296,47 @@ class STTProvider(ABC):
         Default: no-op.
         """
 
-    async def recover_after_opening(self, language: str) -> bool:
-        """Called after opening TTS ends.
+    # ── Liveness: keepalive, health, reconnect ─────────────────────
 
-        Provider checks its own health, reconnects if needed, and
-        clears any stale state.
+    @property
+    def is_open(self) -> bool:
+        """True while the streaming connection is believed healthy.
 
-        Args:
-            language: Language code for reconnection if needed.
+        The pipeline's STT guard polls this (a dead socket can't raise from
+        ``send_audio``/``keepalive`` — both log-and-return) and triggers
+        ``ensure_alive`` when it flips false mid-call.
+        """
+        return self._is_open
 
-        Returns:
-            True if the provider is ready to receive audio.
+    async def keepalive(self) -> None:
+        """Keep the streaming connection alive through send starvation.
 
-        Default: returns True (assumes healthy).
+        Called by the pipeline's guard task when no audio (real or silence)
+        has reached the provider for a few seconds — playback mute, opening
+        discard, inbound media gaps, held playback. Cloud providers send a
+        protocol keepalive or a zeros chunk; local models no-op.
+
+        Default: no-op.
+        """
+
+    async def ensure_alive(self, language: str, *, clear_queue: bool = False) -> bool:
+        """Health probe + reconnect from the provider's stored start() params.
+
+        ``clear_queue`` discards pending transcripts when the probe finds the
+        connection healthy — correct after an opening monologue (queue holds
+        echo artifacts), WRONG after a barged-in playback (queue holds the
+        interrupting utterance's finals) — so the caller must choose.
+        Reconnects always start from a fresh queue regardless.
+
+        Returns True if the provider is ready to receive audio.
+        Default: returns True (assumes healthy — local models).
         """
         return True
+
+    async def recover_after_opening(self, language: str) -> bool:
+        """Post-opening health check — thin wrapper over ``ensure_alive`` with
+        the opening semantics (clear stale echo transcripts when healthy)."""
+        return await self.ensure_alive(language, clear_queue=True)
 
     # ── Connection lifecycle properties ────────────────────────────
 

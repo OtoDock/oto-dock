@@ -15,6 +15,7 @@ import config
 from storage import notification_store
 from services.notifications import notification_manager
 from core.session.session_state import get_user_tz
+from core.session.visibility import nouser_read_targets
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -26,6 +27,21 @@ router = APIRouter()
 
 
 # --- Request models ---
+
+# A notification is a headline + nudge, not a report — agents kept writing
+# essay-length bodies that fill the whole panel on phones (operator call,
+# 2026-08-18: half the old de-facto size is the ceiling). The MCP schema
+# advertises the same caps so the model self-corrects at the tool layer;
+# these clamps are the defensive server-side floor for every other caller.
+NOTIFICATION_TITLE_MAX = 100
+NOTIFICATION_BODY_MAX = 480
+
+
+def _clamp_text(value: str, limit: int) -> str:
+    v = value.strip()
+    if len(v) <= limit:
+        return v
+    return v[: limit - 1].rstrip() + "…"
 
 
 class CreateNotificationRequest(BaseModel):
@@ -103,6 +119,17 @@ def _enforce_scope(user: UserContext, scope: str, agent: str | None = None) -> N
     if scope == "user":
         return  # any authenticated user
     elif scope == "agent":
+        # Writes never cross agents: an agent session (user-backed or not)
+        # creates agent-scope notifications only for ITS OWN agent — notifying
+        # another agent's users goes through delegation. ``agent`` here is the
+        # notification's target agent slug.
+        if user.is_session and agent != user.agent:
+            raise HTTPException(
+                status_code=403,
+                detail="Agent sessions can create agent-scope notifications "
+                       "only for their own agent (to reach another agent's "
+                       "users, delegate to it).",
+            )
         # A no-user / service session legitimately creates agent-scope work for
         # its own agent; a real user (cookie or USER_SESSION) is gated by role.
         if user.is_no_user_session or user.is_service:
@@ -137,7 +164,12 @@ async def create_notification(
     x_agent_name: str | None = Header(None, alias="X-Agent-Name"),
 ):
     u = require_auth(user)
-    _enforce_scope(u, req.scope)
+    req.title = _clamp_text(req.title, NOTIFICATION_TITLE_MAX)
+    req.body = _clamp_text(req.body, NOTIFICATION_BODY_MAX)
+    # Agent-scope recipient lives in ``target`` — thread it into the gate so
+    # the per-agent editor tier + the agent-session own-agent pin actually
+    # apply (calling without it left both dead on this path).
+    _enforce_scope(u, req.scope, req.target if req.scope == "agent" else None)
 
     acting = u.acting_sub
 
@@ -266,22 +298,38 @@ async def list_notifications(
         # surface (``audit=true``, admin only — the admin Notifications page) sees
         # every user's notifications so it can audit; every other caller —
         # INCLUDING an admin on an agent's settings tab — gets the user-view (own
-        # user-scoped + agent-scoped + global). ``agent`` narrows the agent-scoped
-        # items in user-view.
+        # user-scoped + agent-scoped + global). Keyed on is_service like
+        # /v1/tasks (H1/H2): a session JWT is api-key-shaped but must get the
+        # user-view exactly like a cookie caller. ``agent`` NARROWS the
+        # agent-scope class in every mode — it never replaces the access check
+        # (the old ternary let ``?agent=`` skip can_access_agent entirely).
+        # User/global rows are not agent-bound and ride along untouched.
         audit_view = audit and u.is_admin
-        if not u.is_api_key and not audit_view:
+        if not u.is_service and not audit_view:
+            # Delegation edges add the targets' agent-scope rows to a
+            # no-user caller's view (read-only — the authority helper keeps
+            # mutations/fire pinned to the caller's own agent).
+            edge_reach = nouser_read_targets(u)
             filtered = []
             for n in notifications:
                 if n["scope"] == "user" and n.get("target") == u.sub:
                     filtered.append(n)
-                elif n["scope"] == "agent" and (
-                    n.get("target") == agent if agent
-                    else u.can_access_agent(n.get("target", ""))
-                ):
-                    filtered.append(n)
+                elif n["scope"] == "agent":
+                    n_target = n.get("target", "") or ""
+                    if agent and n_target != agent:
+                        continue
+                    if u.can_access_agent(n_target) or n_target in edge_reach:
+                        filtered.append(n)
                 elif n["scope"] == "global":
                     filtered.append(n)
             notifications = filtered
+        elif agent:
+            # Master key / admin audit: ``agent`` narrows agent-scope rows the
+            # same way (the store has no agent filter — target IS the slug).
+            notifications = [
+                n for n in notifications
+                if n["scope"] != "agent" or (n.get("target") or "") == agent
+            ]
 
         # Hide one-time notifications that have already fired
         notifications = [
@@ -307,9 +355,13 @@ async def list_notifications(
             can_mutate = (
                 is_own_target  # user-scope: own
                 or (n["scope"] == "agent" and can_mutate_agent_scope)
+                # No-user session: its own agent's agent-scope rows (mirrors
+                # _check_notification_authority).
+                or (u.is_no_user_session and n["scope"] == "agent"
+                    and n_agent == u.agent)
             )
-            n["can_delete"] = not is_static and can_mutate and not u.is_api_key
-            n["can_fire"] = can_mutate or u.is_api_key
+            n["can_delete"] = not is_static and can_mutate and not u.is_service
+            n["can_fire"] = can_mutate or u.is_service
             # Pause/resume share the same authority as delete (only dynamic
             # notifications); the available action depends on enabled state.
             is_enabled = bool(n.get("enabled", True))
@@ -355,16 +407,7 @@ async def fire_notification_now(
     if not notif:
         raise HTTPException(status_code=404, detail="Notification not found")
 
-    # Permission check: own creator OR agent owner (manager/admin) OR
-    # agent editor on own creation. API key bypasses.
-    n_agent = notif.get("target") if notif["scope"] == "agent" else None
-    is_own = notif.get("created_by") == u.sub
-    can_manage = u.is_admin or (n_agent and u.can_manage_agent(n_agent))
-    can_edit_own = (
-        n_agent and u.can_edit_agent(n_agent) and is_own
-    )
-    if not (is_own or can_manage or can_edit_own or u.is_api_key):
-        raise HTTPException(status_code=403, detail="Not authorized")
+    _check_notification_authority(notif, u)
 
     deliveries = await notification_manager.fire_notification(
         title=notif["title"],
@@ -379,14 +422,28 @@ async def fire_notification_now(
 
 
 def _check_notification_authority(notif: dict, user: UserContext) -> None:
-    """Permission gate shared by pause/resume/delete (3-tier model):
-    creator, admin, agent manager (any), agent editor (only own), or API key.
+    """Permission gate shared by fire/pause/resume/edit/delete (3-tier model):
+    creator, admin, agent manager (any), agent editor (only own), or the
+    MASTER KEY — keyed on ``is_service``, never ``is_api_key`` (that blanket
+    let any agent session mutate any user's notification). A user-backed
+    session JWT resolves like a cookie caller; a no-user session may touch
+    only its OWN agent's agent-scope notifications.
     """
+    if user.is_service:
+        return
     n_agent = notif.get("target") if notif["scope"] == "agent" else None
+    if user.is_no_user_session:
+        if notif["scope"] == "agent" and n_agent == user.agent:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="This session may only manage its own agent's agent-scope "
+                   "notifications (to change another agent's, delegate to it).",
+        )
     is_own = notif.get("created_by") == user.sub
     can_manage = user.is_admin or (n_agent and user.can_manage_agent(n_agent))
     can_edit_own = n_agent and user.can_edit_agent(n_agent) and is_own
-    if not (is_own or can_manage or can_edit_own or user.is_api_key):
+    if not (is_own or can_manage or can_edit_own):
         raise HTTPException(status_code=403, detail="Not authorized for this notification")
 
 
@@ -460,6 +517,10 @@ async def _edit_notification_impl(
             status_code=400,
             detail="At least one editable field must be provided",
         )
+    if fields.get("title"):
+        fields["title"] = _clamp_text(fields["title"], NOTIFICATION_TITLE_MAX)
+    if fields.get("body"):
+        fields["body"] = _clamp_text(fields["body"], NOTIFICATION_BODY_MAX)
     non_null_timing = sum(
         1 for k in ("schedule", "run_at", "interval_seconds") if fields.get(k)
     )

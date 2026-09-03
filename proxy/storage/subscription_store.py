@@ -115,8 +115,16 @@ def list_platform_pool(layer: str | None = None, provider: str | None = None) ->
         return [_row_to_dict(r) for r in rows]
 
 
-def list_personal(layer: str | None, owner_sub: str, provider: str | None = None) -> list[dict]:
+def list_personal(
+    layer: str | None, owner_sub: str, provider: str | None = None,
+    *, any_status: bool = False,
+) -> list[dict]:
     """A user's own usable accounts: owner_sub matches, use_personal=TRUE, active.
+
+    ``any_status=True`` drops the active-only filter (still owner + personal) —
+    for classifiers that must SEE a dead row to explain it (an expired own
+    account is invisible to the default read, which is exactly why the block
+    reason used to misreport). Credential acquisition must never pass it.
 
     Returns [] for a falsy owner_sub so a blank/None sub can never match the
     ``owner_sub=''`` platform-infra rows.
@@ -126,8 +134,10 @@ def list_personal(layer: str | None, owner_sub: str, provider: str | None = None
     with get_conn() as conn:
         sql = (
             "SELECT * FROM execution_layer_subscriptions "
-            "WHERE owner_sub = %s AND use_personal = TRUE AND status = 'active'"
+            "WHERE owner_sub = %s AND use_personal = TRUE"
         )
+        if not any_status:
+            sql += " AND status = 'active'"
         params: list = [owner_sub]
         if layer:
             sql += " AND layer = %s"
@@ -427,6 +437,19 @@ def list_scope_bindings(scope_key: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def list_persisted_binding_sub_ids() -> set[str]:
+    """Distinct subscription ids with ANY persisted session binding. The
+    proactive unbound-row refresh treats these as bound: after a restart the
+    in-memory maps are empty until surviving sessions re-announce, and
+    refreshing a row that still feeds a live-but-unannounced session would
+    rotate a token the fan-out has no target for."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT subscription_id FROM subscription_session_bindings",
+        ).fetchall()
+        return {r["subscription_id"] for r in rows}
+
+
 def prune_stale_session_bindings(days: int = 7) -> int:
     """Delete bindings older than ``days`` — crash leftovers whose release
     never ran. Bounded staleness keeps an orphaned row from pinning a scope's
@@ -691,17 +714,19 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
 
     Rewrites every persisted pin of ``old_id`` to ``new_id``:
     ``agents.default_model`` (per-agent pin) and ``chats.model`` (per-chat
-    override). Task lanes need no third UPDATE — delegate-spawn
-    ``override_model`` is in-memory only, never persisted on dynamic_tasks
-    (see services/scheduler/scheduler.py), so a restart re-resolves agent
-    defaults which this remap already covers. Plain UPDATEs are idempotent:
-    after the first boot both match zero rows. ``updated_at`` is deliberately
-    NOT bumped (an administrative rewrite must not reorder chat lists).
+    override) and ``dynamic_tasks.override_model`` (the per-task pin — since
+    2026-08-16 a schedule's model choice PERSISTS, so a retired id would sit
+    on the row until the next fire and then 400 at validation). Delegate
+    spawns need no entry of their own: they write the same column. Plain
+    UPDATEs are idempotent: after the first boot all three match zero rows.
+    ``updated_at`` is deliberately NOT bumped (an administrative rewrite must
+    not reorder chat lists).
     Returns the total number of rows remapped.
     """
     with get_conn() as conn:
         remapped: dict[str, int] = {}
-        for table, col in (("agents", "default_model"), ("chats", "model")):
+        for table, col in (("agents", "default_model"), ("chats", "model"),
+                           ("dynamic_tasks", "override_model")):
             cur = conn.execute(
                 f"UPDATE {table} SET {col} = %s WHERE {col} = %s",  # noqa: S608 — table/col are literals above
                 (new_id, old_id),

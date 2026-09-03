@@ -113,6 +113,9 @@ export interface CommunitySkillEntry {
   size_bytes?: number
   deprecated?: boolean
   manifest_hash?: string
+  // The package bundles executable scripts/ content (registry-emitted;
+  // absent on registries generated before 2026-08-27).
+  has_scripts?: boolean
   // Augmentation added by the proxy (local platform state).
   installed: boolean
   installed_version: string | null
@@ -290,6 +293,17 @@ export interface McpRequest {
    *  install cascade. The admin Requests page groups rows with the same
    *  batch_id into one collapsible card. */
   batch_id: string | null
+  /** Derived at read time from the live registry (never persisted):
+   *  'auto' | 'explicit' when the MCP is installed, null when not. */
+  assignment_mode: 'auto' | 'explicit' | null
+  /** True on an OPEN request for an installed explicit-mode MCP that no
+   *  instance authorizes the agent for yet — the "not actually failed"
+   *  face of install_failed. Renders as the amber "Needs instance" chip
+   *  and unlocks the instance selector in the approve/retry dialog. */
+  needs_instance: boolean
+  /** How many instances exist for the MCP (0 → show create-instance
+   *  guidance instead of a selector). */
+  instance_count: number
   created_at: string
   updated_at: string
   resolved_at: string | null
@@ -373,14 +387,16 @@ export function useAdminMcpRequests(openOnly: boolean = false) {
   })
 }
 
-/** Admin approves a request. Also serves as retry for install_failed. */
+/** Admin approves a request. Also serves as retry for install_failed.
+ *  `instance_id` (explicit-mode MCPs only) attaches the agent to that
+ *  specific instance instead of the automatic pick. */
 export function useApproveMcpRequest() {
   const qc = useQueryClient()
-  return useMutation<McpRequest, Error, { id: number; admin_note?: string }>({
-    mutationFn: ({ id, admin_note = '' }) =>
+  return useMutation<McpRequest, Error, { id: number; admin_note?: string; instance_id?: number | null }>({
+    mutationFn: ({ id, admin_note = '', instance_id = null }) =>
       apiFetch(`/v1/admin/mcp-requests/${id}/approve`, {
         method: 'POST',
-        body: JSON.stringify({ admin_note }),
+        body: JSON.stringify({ admin_note, instance_id }),
       }).then(async r => {
         if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
         return r.json()

@@ -106,15 +106,110 @@ class TestSwitchEngineGates:
                 assert frame["message"] == "Chat not found."
         run_ws_scenario(scenario)
 
-    def test_task_chat_denied_even_for_admin(self, temp_db, monkeypatch):
-        # The task pipeline resolves its engine from dynamic_tasks/agent
-        # defaults, never chats.execution_path — a switch would flip the
-        # badge while runs continue on the old engine. Denied outright.
+    # ── Task-chat rule (1.5): a task-run chat switches like any chat once
+    # its RUN is over — follow-up turns resolve engine/model/seed from the
+    # chat row. The gates that replaced the old blanket deny: run not
+    # pending/running (the run lifecycle is invisible to session probes),
+    # the continue tier, TASK-identity credentials, and no active
+    # continuation targeting the chat.
+
+    @staticmethod
+    def _make_task_run(cid: str, *, status: str, scope: str = "user",
+                       created_by: str = "user-admin",
+                       agent: str = "") -> str:
+        from storage import database as task_store
+        run_id = cid.removeprefix("task-")
+        task_store.create_run(run_id, f"dyn-{run_id[:8]}", agent,
+                              "scheduled", None, "test prompt",
+                              scope=scope, created_by=created_by)
+        if status != "pending":
+            task_store.update_run(run_id, status=status)
+        return run_id
+
+    def test_task_chat_dead_run_switch_allowed(self, temp_db, monkeypatch):
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent()
         _enable_codex(slug)
         _grant("codex-cli")
         cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}")
+        self._make_task_run(cid, status="completed", agent=slug)
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "chat_history")
+                _switch(ws)
+                frame = await _drain_until(ws, "engine_switched")
+                assert frame["execution_path"] == "codex-cli"
+            from storage import database as task_store
+            chat = task_store.get_chat(cid)
+            assert chat["execution_path"] == "codex-cli"
+            assert chat["pending_history_seed"].startswith("engine_switch:")
+        run_ws_scenario(scenario)
+
+    def test_task_chat_running_or_pending_run_denied(self, temp_db,
+                                                     monkeypatch):
+        # A running/parked run reads DEAD to every session probe (spawn
+        # window, admission parking) — the run-status rung must deny with
+        # alive=True so the FE re-locks the picker.
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        _enable_codex(slug)
+        _grant("codex-cli")
+        for status in ("running", "pending"):
+            cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}")
+            self._make_task_run(cid, status=status, agent=slug)
+
+            async def scenario(cid=cid):
+                async with dashboard_connection(session_cookie()) as ws:
+                    await drain_startup(ws)
+                    ws.client_send({"type": "resume_chat", "chat_id": cid})
+                    await _drain_until(ws, "chat_history")
+                    _switch(ws)
+                    frame = await _drain_until(ws, "switch_engine_denied")
+                    assert frame.get("process_alive") is True
+            run_ws_scenario(scenario)
+
+    def test_task_chat_agent_scope_viewer_denied(self, temp_db, monkeypatch):
+        # Agent-scope task chats follow the continue tier: editor+ only. A
+        # per-agent viewer is denied even though the run is over.
+        from storage import database as task_store
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent(default_scope="agent", collaborative=False)
+        _enable_codex(slug)
+        task_store.set_user_agents("user-viewer", [slug], "user-admin",
+                                   agent_roles={slug: "viewer"})
+        cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}",
+                         user_sub=f"task::{slug}")
+        self._make_task_run(cid, status="completed", scope="agent",
+                            created_by=f"task::{slug}", agent=slug)
+
+        async def scenario():
+            cookie = session_cookie(sub="user-viewer", email="viewer@test.com",
+                                    role="member")
+            async with dashboard_connection(cookie) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "chat_history")
+                _switch(ws)
+                frame = await _drain_until(ws, "switch_engine_denied")
+                assert "editor" in frame["message"]
+        run_ws_scenario(scenario)
+
+    def test_task_chat_agent_scope_needs_platform_pool(self, temp_db,
+                                                       monkeypatch):
+        # Agent-scope follow-ups run on the PLATFORM POOL, not the viewer's
+        # personal subscription — a personal codex grant must not green-light
+        # the switch when the pool has nothing.
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        _enable_codex(slug)
+        _grant("codex-cli")  # personal (use_personal, no contribute_platform)
+        cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}",
+                         user_sub=f"task::{slug}")
+        self._make_task_run(cid, status="completed", scope="agent",
+                            created_by=f"task::{slug}", agent=slug)
 
         async def scenario():
             async with dashboard_connection(session_cookie()) as ws:
@@ -123,7 +218,35 @@ class TestSwitchEngineGates:
                 await _drain_until(ws, "chat_history")
                 _switch(ws)
                 frame = await _drain_until(ws, "switch_engine_denied")
-                assert "Task and phone chats" in frame["message"]
+                assert "platform pool" in frame["message"]
+        run_ws_scenario(scenario)
+
+    def test_continuation_target_chat_denied(self, temp_db, monkeypatch):
+        # A chat wired as an ACTIVE continuation target keeps its row
+        # coherent with the continuation's delivery ladder (a rebind NULLs
+        # session_id and the oneshot delivery would silently starve — see
+        # the plan doc's W2-F5; the pre-existing machine-removal starvation
+        # is ROADMAP'd, this deny closes the user-triggerable path).
+        from storage import database as task_store
+        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        slug = make_test_agent()
+        _enable_codex(slug)
+        _grant("codex-cli")
+        cid = _make_chat(slug)
+        task_store.create_dynamic_task(
+            f"dyn-{uuid.uuid4().hex[:8]}", slug, "wake", "continue", "chat",
+            "continuation", None, None, None, 300, "user-admin",
+            target_chat_id=cid,
+        )
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "resume_chat", "chat_id": cid})
+                await _drain_until(ws, "chat_history")
+                _switch(ws)
+                frame = await _drain_until(ws, "switch_engine_denied")
+                assert "follow-up" in frame["message"]
         run_ws_scenario(scenario)
 
     def test_non_owner_refused(self, temp_db, monkeypatch):

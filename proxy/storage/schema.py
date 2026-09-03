@@ -100,7 +100,15 @@ def init_tasks(conn) -> None:
             -- stop time — a chat must never wake itself forever.
             max_runs INTEGER,
             run_count INTEGER NOT NULL DEFAULT 0,
-            until_at TEXT
+            until_at TEXT,
+            -- Per-task execution overrides. Empty = inherit the agent's
+            -- default at fire time; the names match the TaskDefinition fields
+            -- the delegate path already carried in memory, and
+            -- core/config/task_config_builder.py consumes both. Validated
+            -- against the agent's envelope on WRITE
+            -- (spawn_authz.validate_spawn_overrides), never at fire time.
+            override_model TEXT DEFAULT '',
+            override_execution_path TEXT DEFAULT ''
         )
     """)
     # Template-idempotency partial indexes — one row per
@@ -237,6 +245,16 @@ def init_identity(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_webauthn_user "
         "ON webauthn_credentials(user_sub)"
     )
+    # --- Per-user roaming UI preferences (dashboard sticky prefs) ---
+    # Free-form JSON bag (storage/user_ui_prefs_store.py); first tenant is
+    # ``last_execution_mode`` — the per-agent interactive/headless pick.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_ui_prefs (
+            user_sub TEXT PRIMARY KEY REFERENCES users(sub) ON DELETE CASCADE,
+            data JSONB NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        )
+    """)
     # --- Credential tables ---
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_credentials (
@@ -700,7 +718,14 @@ def init_agents(conn) -> None:
             -- TRUE+agent=Shared+personal, FALSE+user=Personal-only, FALSE+agent=Shared-only.
             collaborative BOOLEAN NOT NULL DEFAULT TRUE,
             default_execution_mode TEXT NOT NULL DEFAULT ''
-                CHECK (default_execution_mode IN ('', 'interactive', '-p'))
+                CHECK (default_execution_mode IN ('', 'interactive', '-p')),
+            -- Departments (agents-map): ONE department per agent; '' =
+            -- unassigned. Both set together or both '' — enforced at the API
+            -- (PATCH /v1/agents) and self-healed by the edge compiler (a
+            -- dangling id simply compiles to no edges). No FK by design,
+            -- matching agent_delegation_targets.
+            department_id TEXT NOT NULL DEFAULT '',
+            department_level_id TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -709,10 +734,25 @@ def init_agents(conn) -> None:
         WHERE community_template IS NOT NULL
     """)
 
+    # Delegation edges are DIRECTIONAL (A→B and B→A are two rows) and carry a
+    # ``source``: 'manual' rows are owned by the agent-config checkbox UI /
+    # PUT delegation-targets; 'department' rows are owned exclusively by the
+    # department edge compiler (services/departments/edge_compiler.py) and are
+    # retracted/recreated wholesale on every recompile. One row per edge — a
+    # manual row wins a compiled INSERT (ON CONFLICT DO NOTHING), so an edge a
+    # user explicitly checked survives leaving a department.
+    # ``observe`` is RESERVED-UNUSED (2026-08-15 merge — same precedent as
+    # ``seen_at``): the edge ITSELF now grants agent_name's NO-USER sessions
+    # read visibility into target_agent's agent-scope activity, so the
+    # separate per-edge flag was retired without schema churn. Nothing reads
+    # or writes the column; INSERTs leave it at its DEFAULT.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS agent_delegation_targets (
             agent_name TEXT NOT NULL,
             target_agent TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual'
+                CHECK (source IN ('manual', 'department')),
+            observe BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY (agent_name, target_agent)
         )
     """)
@@ -736,6 +776,50 @@ def init_agents(conn) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
         )
+    """)
+
+def init_departments(conn) -> None:
+    """Company departments for the agents map (installation-wide, shared).
+
+    Departments are METADATA that compiles down to agent_delegation_targets
+    rows tagged source='department' — the map is a view, not new distributed
+    state. ``created_by_sub`` stores the creating user's ``acting_sub`` and is
+    the FIRST created_by-ownership gate on a platform-level object: creators
+    may edit/delete only departments they created; admins may edit/delete all
+    (proxy/api/departments/). Assignment lives ON the agent row
+    (agents.department_id / department_level_id), one department per agent.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS departments (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_by_sub TEXT NOT NULL DEFAULT '',
+            auto_delegation BOOLEAN NOT NULL DEFAULT TRUE,
+            reach TEXT NOT NULL DEFAULT 'adjacent'
+                CHECK (reach IN ('adjacent', 'subtree')),
+            -- Free-form map placement hint (JSON), owned by the map UI.
+            position_hint TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    # Levels are admin-named tiers (rank 0 = top, e.g. Head/Senior/Junior).
+    # Cap of 8 and rank uniqueness are enforced in db_departments (the only
+    # writer replaces a department's levels transactionally), not by
+    # constraint — a UNIQUE(department_id, rank) would make in-place
+    # reorders conflict mid-statement.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS department_levels (
+            id TEXT PRIMARY KEY,
+            department_id TEXT NOT NULL REFERENCES departments(id)
+                ON DELETE CASCADE,
+            rank INTEGER NOT NULL,
+            name TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_department_levels_dept
+        ON department_levels(department_id)
     """)
 
 def init_storage_quotas(conn) -> None:
@@ -952,9 +1036,45 @@ def init_audio_telephony(conn) -> None:
             tts_mode TEXT NOT NULL DEFAULT 'auto' CHECK (tts_mode IN ('native', 'platform', 'auto')),
             tts_voice_map JSONB NOT NULL DEFAULT '{}',
             stt_language TEXT,
+            wake_word_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             updated_at TEXT NOT NULL
         )
     """)
+
+
+def init_phone_call_log(conn) -> None:
+    """Per-call outcome rows for the admin call log (route detail view).
+
+    Written by the phone daemon's fire-and-forget teardown report
+    (``POST /v1/phone/calls/report``) — one row per call, including calls
+    that never warmed a session (PIN-refused, capacity-rejected). The
+    ``route_name`` snapshot survives route deletion (FK goes NULL).
+    Only attempt COUNTS are stored for PIN outcomes — never digits.
+    New table (no ALTER — see the phone_routes migration note above).
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS phone_call_log (
+            id SERIAL PRIMARY KEY,
+            route_id TEXT REFERENCES phone_routes(id) ON DELETE SET NULL,
+            route_name TEXT NOT NULL DEFAULT '',
+            phone_server_id INTEGER,
+            agent TEXT NOT NULL DEFAULT '',
+            direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+            from_number TEXT NOT NULL DEFAULT '',
+            to_number TEXT NOT NULL DEFAULT '',
+            transport TEXT NOT NULL DEFAULT '',
+            call_uuid TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL,
+            pin_attempts INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            duration_s INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phone_call_log_route ON phone_call_log(route_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phone_call_log_started ON phone_call_log(started_at)")
+
 
 def init_remote_machines(conn) -> None:
     """Satellite machines and their per-agent / per-user targets."""
@@ -984,6 +1104,14 @@ def init_remote_machines(conn) -> None:
             last_update_at TEXT,
             last_update_error TEXT,
             pending_update BOOLEAN NOT NULL DEFAULT FALSE,
+            -- Auto-update rollback budget, PER TARGET VERSION: how many
+            -- pushed updates to update_rollback_target came back rolled
+            -- back (the satellite reconnected below the target). At
+            -- ws/satellite.py::MAX_AUTO_UPDATE_ROLLBACKS automatic pushes of
+            -- that target stop; "Update now" still pushes; a successful
+            -- reconnect on the target (or a new target) resets the count.
+            update_rollback_count INTEGER NOT NULL DEFAULT 0,
+            update_rollback_target TEXT,
             -- Per-machine filesystem-access policy. When TRUE,
             -- agents running on this satellite can read/write any path the
             -- OS user can reach. When FALSE, agents are limited to the
@@ -1557,6 +1685,30 @@ def init_pinned_apps(conn) -> None:
     )
 
 
+def init_pinned_app_user_hides(conn) -> None:
+    """Per-user hides of SHARED pinned apps (S2 of the shared-dashboards
+    unit): a viewer removing a team dashboard from THEIR OWN strip must not
+    hide it for the team — ``pinned_apps.hidden`` is the global soft-unpin
+    (editor+ only), this table is the personal one (any role). One row =
+    "this user hid this shared app for themselves"; restore = delete the
+    row. Personal pins never get rows here (they already belong to one
+    user). Both FKs CASCADE so app hard-deletes and user deletes reap
+    hides for free. Whole-table CREATE in init (new-table pattern —
+    converges existing installs on startup, no migration needed)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pinned_app_user_hides (
+            app_id     TEXT NOT NULL REFERENCES pinned_apps(id) ON DELETE CASCADE,
+            user_sub   TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (app_id, user_sub)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_app_user_hides_user "
+        "ON pinned_app_user_hides (user_sub)"
+    )
+
+
 def init_pinned_files(conn) -> None:
     """Dock file pins (read-only file rows on the chat/project Dock)."""
     # One row per pinned FILE (``storage/db_file_pins.py``): the Dock renders
@@ -1668,6 +1820,127 @@ def init_file_sync(conn) -> None:
     """)
 
 
+def init_file_transfers(conn) -> None:
+    """Cross-agent file transfers (delegation-mcp ``send_files``).
+
+    One row per transfer call — the audit record + the per-creator quota
+    counter. ``seen_at`` (and its index) are RESERVED, unused since the
+    v1 session-start notice was removed 2026-08-14 — kept so installs
+    that created the table before the removal stay identical to fresh
+    ones, and a future "since last run" digest can rebuild on it."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_file_transfers (
+            id            TEXT PRIMARY KEY,
+            source_agent  TEXT NOT NULL,
+            target_agent  TEXT NOT NULL,
+            scope         TEXT NOT NULL,
+            owner_sub     TEXT NOT NULL DEFAULT '',
+            dest_dir      TEXT NOT NULL DEFAULT '',
+            file_count    INTEGER NOT NULL,
+            total_bytes   BIGINT NOT NULL,
+            note          TEXT NOT NULL DEFAULT '',
+            created_by    TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            seen_at       TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_transfers_unseen
+        ON agent_file_transfers (target_agent, seen_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_file_transfers_creator
+        ON agent_file_transfers (created_by, created_at)
+    """)
+
+
+def init_knowledge_libraries(conn) -> None:
+    """Shared knowledge libraries (promote-in-place, mirrored to consumers).
+
+    ``knowledge_libraries``: one row per shared SUBTREE of a source agent's
+    ``knowledge/`` folder — ``subdir = ''`` is the whole-folder share, a
+    non-empty ``subdir`` shares just that subtree. Subtrees of one agent are
+    kept disjoint at promote time (API validation), so any knowledge path
+    belongs to at most one library.
+    ``knowledge_library_attachments``: one row per (library, consumer);
+    ``writable`` gates mirror→source propagation and the satellite
+    write-back subtree rule. Mirrors are real files at
+    ``agents/<consumer>/knowledge/shared/<source>/<subdir>/`` (the slug
+    segment the write gates key on does not move) maintained by
+    ``services/knowledge/library_projector.py`` — these tables are the
+    single source of truth for which mirrors must exist.
+
+    Born with composite keys: the single-key v1 shape never reached a
+    released install (public latest at the time predates libraries), so
+    there is no migration — the two dev installs carrying v1 rows were
+    reset by hand (drop both tables; init recreates; re-share in the UI)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS knowledge_libraries (
+            source_agent  TEXT NOT NULL,
+            -- Library subtree relative to the source's knowledge/ root;
+            -- '' = the whole folder. Validated at promote (relative, no
+            -- dot/dotdot segments, first segment never memory/shared/
+            -- .credentials, disjoint from the agent's other libraries).
+            subdir        TEXT NOT NULL DEFAULT '',
+            created_by    TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            -- Human label for the library, set when it is shared. DISPLAY
+            -- ONLY for paths under knowledge/shared/ (the mirror folder is
+            -- keyed on ``source_agent``/``subdir``) — but it DOES drive the
+            -- library's bulletin filename (``bulletin/<name>.md`` inside
+            -- the subtree), so promote validates it as a filename too.
+            -- Deliberately not unique — every surface shows the owning
+            -- agent beside it. Empty = fall back to the agent's name.
+            name          TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (source_agent, subdir)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS knowledge_library_attachments (
+            source_agent    TEXT NOT NULL,
+            subdir          TEXT NOT NULL DEFAULT '',
+            consumer_agent  TEXT NOT NULL,
+            writable        BOOLEAN NOT NULL DEFAULT FALSE,
+            created_by      TEXT NOT NULL,
+            created_at      TEXT NOT NULL,
+            PRIMARY KEY (source_agent, subdir, consumer_agent)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_kl_attach_consumer
+        ON knowledge_library_attachments (consumer_agent)
+    """)
+    # library_mirror_state (storage/db_library_mirror_state.py): the
+    # projector's per-(consumer, source, file) merge base — the content hash
+    # last CONVERGED between that consumer's mirror and the source (the
+    # ``sync_state`` idea applied to shared libraries, 2026-09-03). It is what
+    # lets a reconcile tell "the mirror never had this file" (project it) from
+    # "the mirror had it and deleted it" (a deliberate delete → propagate) and
+    # "the source deleted it" (heal the mirror, never re-adopt). A CACHE +
+    # attribution hint, never a delete authority on its own: an absent row
+    # degrades to first-projection behaviour (heal), never to data loss.
+    # ``base_size``/``base_mtime`` are the rsync-style quick-check inputs
+    # (equal size + mtime ⇒ unchanged, no re-hash). No TTL: rows live while
+    # the pair converges; dropped when a file is gone on both sides or the
+    # attachment is torn down.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS library_mirror_state (
+            consumer_agent  TEXT NOT NULL,
+            source_agent    TEXT NOT NULL,
+            sub_rel         TEXT NOT NULL,
+            base_hash       TEXT NOT NULL,
+            base_size       BIGINT NOT NULL DEFAULT 0,
+            base_mtime      DOUBLE PRECISION NOT NULL DEFAULT 0,
+            updated_at      TEXT NOT NULL,
+            PRIMARY KEY (consumer_agent, source_agent, sub_rel)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_lib_mirror_state_source
+        ON library_mirror_state (source_agent, sub_rel)
+    """)
+
+
 # ---------------------------------------------------------------------------
 # Schema entry points
 # ---------------------------------------------------------------------------
@@ -1680,9 +1953,11 @@ def init_schema(conn) -> None:
     init_usage(conn)
     init_mcp(conn)
     init_agents(conn)
+    init_departments(conn)
     init_storage_quotas(conn)
     init_community_requests(conn)
     init_audio_telephony(conn)
+    init_phone_call_log(conn)
     init_remote_machines(conn)
     init_meetings(conn)
     init_execution_layers(conn)
@@ -1694,8 +1969,11 @@ def init_schema(conn) -> None:
     init_memory(conn)
     init_recover_bin(conn)
     init_pinned_apps(conn)
+    init_pinned_app_user_hides(conn)
     init_pinned_files(conn)
     init_file_sync(conn)
+    init_file_transfers(conn)
+    init_knowledge_libraries(conn)
     logger.info("PostgreSQL schema initialized (all tables created)")
 
 
@@ -1739,6 +2017,15 @@ def run_migrations(conn) -> None:
         "ALTER TABLE mcp_assignment_requests "
         "ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'mcp'"
     )
+    # 2026-08-29: satellite auto-update rollback budget (per target version).
+    conn.execute(
+        "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
+        "update_rollback_count INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute(
+        "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
+        "update_rollback_target TEXT"
+    )
     # 2026-07-11: chat/project-scoped pins (the Dock). The one-per-scope
     # partial unique indexes live HERE, not in init_pinned_apps: on a
     # pre-existing install the CREATE-IF-NOT-EXISTS no-ops before these
@@ -1764,6 +2051,51 @@ def run_migrations(conn) -> None:
     conn.execute(
         "ALTER TABLE chats "
         "ADD COLUMN IF NOT EXISTS pending_delegate_wake TEXT NOT NULL DEFAULT ''"
+    )
+    # 2026-08-12: departments (agents map). Every pre-existing delegation edge
+    # is a manual one; the CHECK stays in-CREATE only per convention.
+    conn.execute(
+        "ALTER TABLE agent_delegation_targets "
+        "ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'"
+    )
+    # 2026-08-14: D1 observe edge — no-user read grant, off for every
+    # pre-existing edge. 2026-08-15: superseded — the edge itself is the
+    # grant; the column stays reserved-unused (see the table doc above).
+    conn.execute(
+        "ALTER TABLE agent_delegation_targets "
+        "ADD COLUMN IF NOT EXISTS observe BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    conn.execute(
+        "ALTER TABLE agents "
+        "ADD COLUMN IF NOT EXISTS department_id TEXT NOT NULL DEFAULT ''"
+    )
+    # 2026-08-14: wake word — per-user opt-in (privacy: default OFF for
+    # every pre-existing user; enabling is a deliberate act).
+    conn.execute(
+        "ALTER TABLE user_audio_prefs "
+        "ADD COLUMN IF NOT EXISTS wake_word_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    conn.execute(
+        "ALTER TABLE agents "
+        "ADD COLUMN IF NOT EXISTS department_level_id TEXT NOT NULL DEFAULT ''"
+    )
+    # 2026-08-16: knowledge libraries carry a display name. Empty on every
+    # pre-existing row; the UI falls back to the source agent's name, so an
+    # install that upgrades mid-flight needs no data migration.
+    conn.execute(
+        "ALTER TABLE knowledge_libraries "
+        "ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''"
+    )
+    # 2026-08-16: per-task model + engine override. Empty on every
+    # pre-existing row = inherit the agent's default, which is exactly what
+    # those tasks did before the column existed.
+    conn.execute(
+        "ALTER TABLE dynamic_tasks "
+        "ADD COLUMN IF NOT EXISTS override_model TEXT DEFAULT ''"
+    )
+    conn.execute(
+        "ALTER TABLE dynamic_tasks "
+        "ADD COLUMN IF NOT EXISTS override_execution_path TEXT DEFAULT ''"
     )
     # 2026-07-13: cron day-of-week convention fix. Stored 5-field schedules
     # used to reach APScheduler verbatim, whose numeric day-of-week is
@@ -1811,6 +2143,14 @@ def run_migrations(conn) -> None:
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT cron_dow_std")
             logger.exception("cron dow migration failed — will retry next startup")
+
+    # Per-folder knowledge libraries (2026-08-24) ship with composite
+    # (source_agent, subdir[, consumer_agent]) keys from birth: the
+    # single-key v1 shape never reached ANY released install (public
+    # latest at the time was 1.4.0, which predates libraries entirely),
+    # so there is deliberately NO migration — the dev installs that
+    # carried v1 rows were reset by hand (operator decision 2026-08-24:
+    # drop the two tables before upgrading, recreate shares in the UI).
 
 
 # ---------------------------------------------------------------------------

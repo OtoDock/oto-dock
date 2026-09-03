@@ -470,16 +470,92 @@ class CreateRequestBody(BaseModel):
 
 class AdminResolveBody(BaseModel):
     admin_note: str = ""
+    # Approve only: attach the requesting agent to THIS instance of the MCP
+    # instead of the automatic pick (catch-all / already-attached / lowest-id).
+    # Rejected with 400 when the instance doesn't belong to the request's MCP
+    # or the MCP is auto-mode. None = today's automatic behavior, which also
+    # keeps the instance-save auto-retry hook's call shape unchanged.
+    instance_id: int | None = None
 
 
-def _augment_request_row(row: dict) -> dict:
-    """Normalise a request row for the API response (coerce the SERIAL ``id`` to int)."""
-    return {
+def _derive_mcp_display_info(mcp_names: set[str]) -> dict[str, dict]:
+    """Per-MCP registry+instance info for request rows — one manifest lookup
+    and (for explicit-mode) one instance query per DISTINCT MCP, never per
+    row, so the 200-row admin listing stays two queries deep. Synchronous;
+    call via ``asyncio.to_thread``."""
+    from services.mcp import mcp_registry
+    from storage import mcp_store
+
+    info: dict[str, dict] = {}
+    for name in mcp_names:
+        manifest = mcp_registry.get_manifest(name)
+        if manifest is None:
+            info[name] = {"assignment_mode": None, "instances": []}
+            continue
+        mode = getattr(manifest, "assignment_mode", "auto")
+        info[name] = {
+            "assignment_mode": mode,
+            "instances": mcp_store.get_mcp_instances(name) if mode == "explicit" else [],
+        }
+    return info
+
+
+def _augment_request_row(row: dict, mcp_info: dict[str, dict]) -> dict:
+    """Normalise a request row for the API response and add derived,
+    never-persisted display fields:
+
+    - ``assignment_mode`` — "auto" | "explicit" from the live manifest, or
+      ``None`` when the MCP isn't installed (nothing to derive from yet).
+    - ``needs_instance`` — True for an OPEN request on an installed
+      explicit-mode MCP that no instance currently authorizes the agent for.
+      This is the "not actually failed" half of ``install_failed``: the
+      install went fine, only admin instance work remains. Derived at read
+      time so it can never go stale — the moment an instance covers the
+      agent it flips off (and the instance-save hook usually auto-retries
+      the request in the same breath).
+    - ``instance_count`` — how many instances exist for the MCP (drives the
+      dashboard's selector-vs-create-guidance choice without an extra call).
+    """
+    from storage import mcp_request_store
+
+    out = {
         **row,
         # Coerce SERIAL id to int just in case psycopg returned ``str`` (it
         # doesn't normally, but the API contract is explicit).
         "id": int(row["id"]),
+        "assignment_mode": None,
+        "needs_instance": False,
+        "instance_count": 0,
     }
+    if (row.get("kind") or "mcp") != "mcp":
+        return out
+    info = mcp_info.get(row["mcp_name"]) or {"assignment_mode": None, "instances": []}
+    out["assignment_mode"] = info["assignment_mode"]
+    if info["assignment_mode"] != "explicit":
+        return out
+    instances = info["instances"]
+    out["instance_count"] = len(instances)
+    if row.get("status") in mcp_request_store.OPEN_STATES:
+        agent = row["agent_slug"]
+        covered = any(
+            i.get("assigned_to_all") or agent in (i.get("agents") or [])
+            for i in instances
+        )
+        out["needs_instance"] = not covered
+    return out
+
+
+async def _augmented_rows(rows: list[dict]) -> list[dict]:
+    """Augment request rows with the derived display fields (see
+    :func:`_augment_request_row`). Batches the registry/instance lookups per
+    distinct MCP and runs them off the event loop."""
+    names = {r["mcp_name"] for r in rows if (r.get("kind") or "mcp") == "mcp"}
+    info = await asyncio.to_thread(_derive_mcp_display_info, names) if names else {}
+    return [_augment_request_row(r, info) for r in rows]
+
+
+async def _augmented_row(row: dict) -> dict:
+    return (await _augmented_rows([row]))[0]
 
 
 @router.post("/v1/agents/{slug}/mcp-requests")
@@ -513,8 +589,14 @@ async def create_mcp_request(
     if body.kind not in ("mcp", "skill"):
         raise HTTPException(400, f"Invalid request kind: {body.kind!r}")
 
-    # Confirm catalog entry exists (defense against drive-by POSTs) — against
-    # the catalog matching the request kind.
+    # Confirm the target exists (defense against drive-by POSTs). Skills
+    # validate against the skills catalog. MCPs are accepted when they are
+    # EITHER installed on this platform — which covers zip/manual installs
+    # that were never published to the community catalog; approval skips the
+    # install step and runs the same instance-authorization cascade — OR
+    # present in the community catalog (the not-yet-installed case). The
+    # local manifest check answers first, so a catalog outage cannot 502 a
+    # request for an MCP that is already on disk.
     if body.kind == "skill":
         skills_registry = await community_catalog.fetch_skills_registry()
         if not any(s.get("name") == body.mcp_name
@@ -524,12 +606,19 @@ async def create_mcp_request(
                 f"Skill package '{body.mcp_name}' not found in skills catalog",
             )
     else:
-        try:
-            registry = await community_catalog.fetch_registry()
-        except Exception as exc:
-            raise HTTPException(502, f"Could not load community catalog: {exc}")
-        if not any(m.get("name") == body.mcp_name for m in registry.get("mcps", [])):
-            raise HTTPException(404, f"MCP '{body.mcp_name}' not found in community catalog")
+        from services.mcp import mcp_registry
+        installed = await asyncio.to_thread(mcp_registry.get_manifest, body.mcp_name)
+        if installed is None:
+            try:
+                registry = await community_catalog.fetch_registry()
+            except Exception as exc:
+                raise HTTPException(502, f"Could not load community catalog: {exc}")
+            if not any(m.get("name") == body.mcp_name for m in registry.get("mcps", [])):
+                raise HTTPException(
+                    404,
+                    f"MCP '{body.mcp_name}' is neither installed on this "
+                    f"platform nor in the community catalog",
+                )
 
     # Short-circuit when the MCP is already enabled on the agent — no need to
     # bother the admin.
@@ -568,11 +657,11 @@ async def create_mcp_request(
         except Exception as exc:
             logger.exception("Admin auto-approve failed for %s", row["id"])
             raise HTTPException(500, f"Auto-approve failed: {exc}")
-        return _augment_request_row(resolved)
+        return await _augmented_row(resolved)
 
     # Manager flow: queue + notify every admin.
     await community_installer.notify_request_created(row)
-    return _augment_request_row(row)
+    return await _augmented_row(row)
 
 
 @router.get("/v1/agents/{slug}/mcp-requests")
@@ -591,7 +680,7 @@ async def list_agent_mcp_requests(
     rows = await asyncio.to_thread(
         mcp_request_store.list_requests_for_agent, slug, requested_by,
     )
-    return {"requests": [_augment_request_row(r) for r in rows]}
+    return {"requests": await _augmented_rows(rows)}
 
 
 @router.post("/v1/agents/{slug}/mcp-requests/{request_id}/cancel")
@@ -610,7 +699,7 @@ async def cancel_mcp_request(
     if updated["agent_slug"] != slug:
         # Don't leak request IDs from other agents.
         raise HTTPException(404, f"Request {request_id} not found on agent {slug}")
-    return _augment_request_row(updated)
+    return await _augmented_row(updated)
 
 
 @router.get("/v1/admin/mcp-requests")
@@ -627,7 +716,7 @@ async def list_admin_mcp_requests(
         rows = await asyncio.to_thread(mcp_request_store.list_all_requests)
     pending = await asyncio.to_thread(mcp_request_store.count_pending)
     return {
-        "requests": [_augment_request_row(r) for r in rows],
+        "requests": await _augmented_rows(rows),
         "pending_count": pending,
     }
 
@@ -642,12 +731,16 @@ async def approve_mcp_request(
 
     Also serves as the retry endpoint when the request is in ``install_failed``
     state — re-runs the install path with the same request id.
+
+    ``body.instance_id`` (optional, explicit-mode MCPs only) attaches the
+    requesting agent to that specific instance instead of the automatic pick.
     """
     _require_admin(user)
     updated = await community_installer.approve_request(
         request_id, user.sub, admin_note=body.admin_note,
+        instance_id=body.instance_id,
     )
-    return _augment_request_row(updated)
+    return await _augmented_row(updated)
 
 
 @router.post("/v1/admin/mcp-requests/{request_id}/reject")
@@ -661,7 +754,7 @@ async def reject_mcp_request(
     updated = await community_installer.reject_request(
         request_id, user.sub, admin_note=body.admin_note,
     )
-    return _augment_request_row(updated)
+    return await _augmented_row(updated)
 
 
 # ---------------------------------------------------------------------------

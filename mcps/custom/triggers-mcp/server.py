@@ -291,7 +291,9 @@ async def list_tools() -> list[Tool]:
                 "List triggers visible to the current user. By default returns own "
                 "user-scoped triggers + all agent-scoped triggers for this agent. "
                 "Each row includes the webhook path, status (active/paused), "
-                "scope, linked task name, last_fired_at, and fired_count."
+                "scope, linked task name, last_fired_at, and fired_count. "
+                "With `agent`, reads another accessible agent's triggers instead "
+                "(read-only — mutations stay same-agent)."
             ),
             inputSchema={
                 "type": "object",
@@ -300,6 +302,16 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "enum": AVAILABLE_SCOPES,
                         "description": "Filter to one scope only",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "Cross-agent read: an agent slug, or 'all' for every "
+                            f"agent your user can access. Omit for this agent "
+                            f"({AGENT}). Sessions without a user see only this "
+                            "agent plus its wired delegation targets (read-only "
+                            "— fire stays own-agent)."
+                        ),
                     },
                 },
             },
@@ -549,14 +561,19 @@ async def _handle_list_subscriptions(args: dict) -> list[TextContent]:
 
 
 async def _handle_list(args: dict) -> list[TextContent]:
-    params: dict = {"agent": AGENT}
+    # Cross-agent read (server-side the proxy filters by the token identity):
+    # default = own agent; a slug reads that agent; "all" omits the filter.
+    target = args.get("agent") or AGENT
+    params: dict = {} if target == "all" else {"agent": target}
     if scope := args.get("scope"):
         params["scope"] = scope
     result = await _get("/v1/triggers", params=params)
     rows = result.get("triggers", [])
     if not rows:
-        return [TextContent(type="text", text="No triggers configured for this agent.")]
-    lines = [f"Triggers for {AGENT} ({len(rows)}):"]
+        where = "your accessible agents" if target == "all" else f"agent {target}"
+        return [TextContent(type="text", text=f"No triggers configured for {where}.")]
+    cross_agent = target != AGENT
+    lines = [f"Triggers for {target} ({len(rows)}):"]
     for r in rows:
         status = "active" if r.get("enabled") else "paused"
         scope = r.get("scope")
@@ -569,8 +586,9 @@ async def _handle_list(args: dict) -> list[TextContent]:
         if r.get("notify_enabled"):
             actions.append(f"notify({r.get('notify_severity')})")
         action_str = " + ".join(actions) or "—"
+        agent_tag = f" ({r.get('agent', '?')})" if cross_agent else ""
         lines.append(
-            f"  • {r.get('slug')} ({r.get('name')}) "
+            f"  • {r.get('slug')} ({r.get('name')}){agent_tag} "
             f"[{scope_label}] [{status}] fires={r.get('fired_count', 0)} "
             f"last={last} action={action_str} id={r.get('id', '')}"
         )

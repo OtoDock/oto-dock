@@ -205,6 +205,86 @@ class TestInteractiveSession:
         finally:
             await s.close()
 
+    async def test_abandoned_cold_flush_persists_breadcrumb(self, monkeypatch):
+        # Retry exhaustion is a DEFINITIVE loss (no turn ever opened with the
+        # flushed text) — the bytes must land in the chat as an
+        # undelivered_input system event before being dropped (field loss
+        # 2026-08-18: a prompt typed into the CLI's resume-from-summary
+        # picker vanished with no DB trace).
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 0.05)
+        monkeypatch.setattr(isess, "_COLD_RETRY_S", 0.15)
+        monkeypatch.setattr(isess, "_COLD_RETRY_MAX", 1)
+        captured = []
+        from core.session import transcript_tool_events as tte
+        monkeypatch.setattr(
+            tte, "persist_event",
+            lambda store, chat_id, block: captured.append((chat_id, block)),
+        )
+        prompt = b"please redeploy the internal install and verify the card\r"
+        s = await _register("sid-breadcrumb")
+        try:
+            s.write_input(prompt)
+            s._mark_ready()
+            await asyncio.sleep(1.5)
+            assert captured, "breadcrumb never persisted"
+            chat_id, block = captured[0]
+            assert chat_id == "chat-1"
+            assert block["subtype"] == "undelivered_input"
+            assert "redeploy the internal install" in block["message"]
+        finally:
+            await s.close()
+
+    async def test_user_input_cancel_persists_breadcrumb(self, monkeypatch):
+        # A user keypress during the cold-submit settle window cancels the
+        # pending Enter — the unconfirmed flush text gets a breadcrumb (in
+        # the dialog-swallowed case it is the ONLY surviving copy).
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 5.0)  # keep Enter pending
+        captured = []
+        from core.session import transcript_tool_events as tte
+        monkeypatch.setattr(
+            tte, "persist_event",
+            lambda store, chat_id, block: captured.append(block),
+        )
+        prompt = b"connect the analytics account and run the first GA4 report\r"
+        s = await _register("sid-cancel-crumb")
+        try:
+            s.write_input(prompt)
+            s._mark_ready()
+            await asyncio.sleep(0.1)
+            s.write_input(b"x")  # user drives → cancel branch
+            await asyncio.sleep(0.2)
+            assert captured and captured[0]["subtype"] == "undelivered_input"
+            assert "GA4 report" in captured[0]["message"]
+            assert s._cold_flush_pending == b""
+        finally:
+            await s.close()
+
+    async def test_breadcrumb_skips_short_residue(self, monkeypatch):
+        # Key residue (arrows, a stray Enter, short edits) must never become
+        # a chat row — the breadcrumb is length-gated.
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 5.0)
+        captured = []
+        from core.session import transcript_tool_events as tte
+        monkeypatch.setattr(
+            tte, "persist_event",
+            lambda store, chat_id, block: captured.append(block),
+        )
+        s = await _register("sid-short-crumb")
+        try:
+            s.write_input(b"ok\r")
+            s._mark_ready()
+            await asyncio.sleep(0.1)
+            s.write_input(b"x")
+            await asyncio.sleep(0.2)
+            assert captured == []
+        finally:
+            await s.close()
+
+    def test_breadcrumb_text_strips_terminal_framing(self):
+        raw = (b"\x1b[200~line one\nline two\x1b[201~\r"
+               b"\x1b[1;2H\x1b]0;title\x07")
+        assert isess._breadcrumb_text(raw) == "line one\nline two"
+
     async def test_ready_settle_floored_by_ready_min(self, monkeypatch):
         # READY_MIN_S: on a fresh session the first post-render quiet is
         # usually the MCP warm — the settle must not mark ready before
@@ -263,6 +343,75 @@ class TestInteractiveSession:
             assert isess.get("sid-viewed") is viewed   # viewer → spared
         finally:
             await viewed.close()
+
+    async def test_idle_reaper_spares_question_parked_under_cap(self):
+        # Parked on an unanswered AskUserQuestion: idle by every byte measure
+        # but waiting on a HUMAN — spared for ONE extra idle window
+        # (_QUESTION_PARK_TIMEOUT_MULT x the admin knob).
+        s = await _register("sid-qpark-spare")
+        try:
+            s._apply_turn_signal("end_turn", question_pending=True)
+            s.last_activity = time.monotonic() - 150  # > timeout, < 2x timeout
+            assert await isess.reap_idle(timeout_s=100) == 0
+            assert isess.get("sid-qpark-spare") is s
+        finally:
+            await s.close()
+
+    async def test_idle_reaper_reaps_question_parked_over_cap(self):
+        # Past the extra window an abandoned question no longer holds the slot —
+        # reaped as before (revival-on-answer covers a late reply).
+        s = await _register("sid-qpark-cap")
+        s._apply_turn_signal("end_turn", question_pending=True)
+        s.last_activity = time.monotonic() - (isess._QUESTION_PARK_TIMEOUT_MULT * 100 + 60)
+        assert await isess.reap_idle(timeout_s=100) == 1
+        assert isess.get("sid-qpark-cap") is None
+
+    async def test_idle_reaper_spares_open_turn(self):
+        # A byte-quiet stretch of a long unviewed turn can outlast the idle
+        # window — an open turn is spared; closing it reaps as before.
+        s = await _register("sid-turn-spare")
+        try:
+            s._turn_open = True
+            s.last_activity = time.monotonic() - 100  # > timeout, < turn ceiling
+            assert await isess.reap_idle(timeout_s=1) == 0
+            assert isess.get("sid-turn-spare") is s
+            s._turn_open = False
+            assert await isess.reap_idle(timeout_s=1) == 1
+            assert isess.get("sid-turn-spare") is None
+        finally:
+            if isess.get("sid-turn-spare") is not None:
+                await s.close()
+
+    async def test_idle_reaper_reaps_open_turn_past_turn_ceiling(self):
+        # A turn cannot legitimately outlive the per-turn ceiling
+        # (config.get_session_timeout()), so a STUCK _turn_open flag must not
+        # make the session immortal.
+        import config as _config
+        s = await _register("sid-turn-ceiling")
+        s._turn_open = True
+        s.last_activity = time.monotonic() - (_config.get_session_timeout() + 60)
+        assert await isess.reap_idle(timeout_s=1) == 1
+        assert isess.get("sid-turn-ceiling") is None
+
+    async def test_idle_reaper_spares_recent_hook_activity(self):
+        # PTY output stalled (satellite WS-down frames drop silently) but tool
+        # hooks keep firing for the session id → the CLI is working, spare it.
+        # Hook activity older than the window no longer spares.
+        from core.session import session_state
+        s = await _register("sid-hook-spare")
+        try:
+            s.last_activity = time.monotonic() - 10_000
+            session_state.record_hook_activity("sid-hook-spare")
+            assert await isess.reap_idle(timeout_s=1) == 0
+            assert isess.get("sid-hook-spare") is s
+            session_state._session_hook_activity["sid-hook-spare"] = (
+                time.monotonic() - 5_000)  # stale — outside the window
+            assert await isess.reap_idle(timeout_s=1) == 1
+            assert isess.get("sid-hook-spare") is None
+        finally:
+            session_state._session_hook_activity.pop("sid-hook-spare", None)
+            if isess.get("sid-hook-spare") is not None:
+                await s.close()
 
     async def test_close_is_idempotent(self):
         s = await _register("sid-idem")
@@ -380,6 +529,67 @@ class TestInteractiveSession:
             s._run_resume_tail()
             await asyncio.sleep(0)
             assert tailed == [1]
+        finally:
+            await s.close()
+
+    # -- mid-turn periodic tail (local incremental persistence) ---------------
+
+    async def test_midturn_tail_arms_on_open_and_cancels_on_close(self):
+        s = await _register("sid-midturn")
+        try:
+            assert s._midturn_tail_handle is None
+            s._set_turn_open(True)
+            assert s._midturn_tail_handle is not None
+            s._set_turn_open(False)
+            assert s._midturn_tail_handle is None
+        finally:
+            await s.close()
+
+    async def test_midturn_tail_never_arms_for_remote(self):
+        s = await _register("sid-midturn-remote")
+        try:
+            s.target = "machine-1"  # remote: satellite polling already persists mid-turn
+            s._set_turn_open(True)
+            assert s._midturn_tail_handle is None
+        finally:
+            await s.close()
+
+    async def test_midturn_tail_runner_tails_and_rearms_while_open(self):
+        s = await _register("sid-midturn-run")
+        try:
+            tailed = []
+            s._tail_and_maybe_complete = lambda: tailed.append(1) or _noop()
+            s._turn_open = True
+            s._run_midturn_tail()
+            await asyncio.sleep(0)
+            assert tailed == [1]
+            assert s._midturn_tail_handle is not None  # cycle re-armed
+            s._midturn_tail_handle.cancel()
+            s._midturn_tail_handle = None
+            # Turn closed → the runner stands down without tailing or re-arming.
+            s._turn_open = False
+            s._run_midturn_tail()
+            await asyncio.sleep(0)
+            assert tailed == [1]
+            assert s._midturn_tail_handle is None
+        finally:
+            await s.close()
+
+    async def test_midturn_tail_skips_beat_while_previous_inflight(self):
+        s = await _register("sid-midturn-busy")
+        try:
+            tailed = []
+            s._tail_and_maybe_complete = lambda: tailed.append(1) or _noop()
+            s._turn_open = True
+            s._midturn_tail_task = asyncio.get_running_loop().create_task(
+                asyncio.sleep(30))  # previous tail still off-thread
+            s._run_midturn_tail()
+            await asyncio.sleep(0)
+            assert tailed == []                        # beat skipped
+            assert s._midturn_tail_handle is not None  # but the cycle continues
+            s._midturn_tail_handle.cancel()
+            s._midturn_tail_handle = None
+            s._midturn_tail_task.cancel()
         finally:
             await s.close()
 
@@ -618,3 +828,77 @@ class TestDelegateWakeReplayOnRegister:
             assert len(s._prompt_queue) == 0
         finally:
             await s.close(reason="test-end")
+
+
+@pytest.mark.asyncio
+class TestSpawnCollisionGuard:
+    """5a spawn-collision guards (incident 2026-08-06): the warmup spawn
+    funnel must never start a second runtime for a session id a LIVE
+    interactive session already owns (the headless pump twin), and a composer
+    `chat` frame landing while the layer's liveness check says dead must be
+    delivered to the live PTY instead of re-warming. Exercised by direct
+    method calls on stub connections — the full `chat`-frame WS flow is
+    pinned by tests/session/test_ws_dashboard_*."""
+
+    async def test_warmup_funnel_refuses_spawn_over_live_interactive(
+            self, temp_db, caplog):
+        import ws.dashboard  # noqa: F401  (assembles the controller mixins first)
+        from ws.dashboard_warmup import WarmupController
+
+        live = await _register("sid-collide", chat_id="chat-collide")
+        try:
+            conn = WarmupController()
+            conn.user_sub = "user-guard"
+            conn.user = {"username": "guard", "role": "manager"}
+            with caplog.at_level("WARNING", logger="claude-proxy"):
+                res = await conn._create_or_resume_session(
+                    "sid-collide", "agent", "default", resume=True,
+                    adopt=False,
+                )
+            assert res.session_id == "sid-collide"
+            assert res.interactive is True
+            assert res.execution_target == live.target
+            assert "refusing headless spawn" in caplog.text
+            # Reused, not superseded — the live session keeps its PTY.
+            assert live.alive
+            assert isess.get("sid-collide") is live
+        finally:
+            await live.close()
+
+    async def test_chat_send_delivered_to_live_interactive(self, temp_db):
+        import ws.dashboard  # noqa: F401  (assembles the controller mixins first)
+        from storage import database as task_store
+        from ws.dashboard_chat import ChatController
+
+        task_store.create_chat("chat-deliver", "user-d", "agent",
+                               model="test-model")
+        live = await _register("sid-deliver", chat_id="chat-deliver")
+        try:
+            conn = ChatController()
+            conn.user_sub = "user-d"
+            conn.user = {"username": "duser", "role": "manager"}
+            conn.chat_id = "chat-deliver"
+            conn.agent_name = "agent"
+            conn.session_id = "sid-deliver"
+            sent = []
+
+            async def _send(frame):
+                sent.append(frame)
+
+            conn._send = _send
+            handled = await conn._deliver_chat_to_live_interactive(
+                {"text": "hello twin"})
+            assert handled is True
+            # The client is told the session is interactive (it sent `chat`
+            # believing it dead) — the re-attach frame shape.
+            ready = [f for f in sent if f.get("type") == "warmup_ready"]
+            assert ready and ready[0]["interactive"] is True
+            assert ready[0]["session_id"] == "sid-deliver"
+            # The prompt reached the PTY (buffered — the TUI is not ready yet).
+            assert b"hello twin" in b"".join(live._input_buffer)
+            # The user row persisted at send-time, attributed to the sender.
+            rows = task_store.get_chat_messages("chat-deliver")
+            assert any(r["role"] == "user" and r["content"] == "hello twin"
+                       and r["author_sub"] == "user-d" for r in rows)
+        finally:
+            await live.close()

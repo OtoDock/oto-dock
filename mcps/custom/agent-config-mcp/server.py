@@ -44,6 +44,9 @@ from mcp.types import TextContent, Tool
 AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
 ROLE = os.environ.get("OTO_ROLE", "")
 SCOPE = os.environ.get("OTO_SCOPE", "")
+# Non-empty for task-fired sessions (scheduled / one-time / trigger /
+# delegated worker): the "unattended" signal the persona write keys on.
+TASK_TYPE = os.environ.get("OTO_TASK_TYPE", "")
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
@@ -53,8 +56,16 @@ _READ_TOOLS = {
     "list_available_models",
     "list_context_files",
     "get_memory_settings",
+    "list_knowledge_libraries",
 }
 _WRITE_TOOLS = {
+    # Platform-role tools (admin/creator, server-enforced; CRITICAL tier —
+    # every call needs the human's in-chat approval):
+    "share_knowledge_folder",
+    "attach_knowledge_library",
+    "detach_knowledge_library",
+    "set_department",
+    "update_persona",
     "update_display_name",
     "update_description",
     "update_color",
@@ -411,6 +422,67 @@ async def _tool_list_context_files() -> str:
     return "\n".join(out)
 
 
+_PERSONA_MAX_BYTES = 64 * 1024
+
+
+async def _tool_update_persona(content: str) -> str:
+    """Replace ``config/agent.md`` — the agent's persona, prompt section 1.
+
+    Goes through the proxy's file API (not a raw filesystem write): that is
+    the only path that carries the manager/admin role check, the config-dir
+    git commit and the satellite fan-out. The sandbox route (Write/Edit on
+    ``/config/agent.md``) stays available for CLI layers, but Direct LLM has
+    no file tools at all — without this tool those agents can never author
+    their own persona.
+
+    Pinned to sessions with a human present and an owner-tier role — the
+    sandbox mount table's rule (``config/`` is owner-only) restated where
+    the tool can enforce it. "Human present" is ``OTO_ROLE`` non-empty and
+    no ``OTO_TASK_TYPE``: scope is NOT the signal, because a Shared-only
+    agent mounts agent-scope for HUMAN chats too (``OTO_SCOPE == "agent"``
+    with a manager driving); service sessions (phone / trigger) carry an
+    empty role, and task fires carry their creator's role but run
+    unattended. A no-user session reaching the file API would otherwise slip
+    past the role check on the proxy side, and rewriting an agent's soul is
+    not something an unattended session should do.
+    """
+    if not ROLE or TASK_TYPE:
+        return (
+            "❌ The persona can only be rewritten from a session with a "
+            "user present — this session has none. Ask a manager of this "
+            "agent to make the change from their own chat."
+        )
+    if ROLE not in ("manager", "admin"):
+        return (
+            "❌ Manager or admin role on this agent is required to rewrite "
+            "the persona."
+        )
+    text = (content or "").strip()
+    if not text:
+        return (
+            "❌ Refusing to write an empty persona — that is the state this "
+            "tool exists to fix. Send the full persona text."
+        )
+    if len(text.encode("utf-8")) > _PERSONA_MAX_BYTES:
+        return (
+            f"❌ Persona too large ({len(text.encode('utf-8'))} bytes; max "
+            f"{_PERSONA_MAX_BYTES}). The persona is role and judgment, not a "
+            "manual — long reference material belongs in `config/context/` "
+            "or `/knowledge/`."
+        )
+    await _request(
+        "PUT",
+        f"/v1/agents/{AGENT_NAME}/files/config/agent.md",
+        json={"content": text + "\n"},
+    )
+    return (
+        "✅ Persona written to `config/agent.md` "
+        f"({len(text.encode('utf-8'))} bytes). It loads first in every "
+        "session — this one keeps the prompt it started with, so the new "
+        "persona takes effect in the next new session."
+    )
+
+
 def _find_subtree(tree: dict, path_parts: list[str]) -> dict | None:
     """Descend the file-tree dict by name. Tree node shape:
     ``{name, type: "dir"|"file", children?: [...]}``.
@@ -700,6 +772,186 @@ async def _tool_complete_setup(summary: str = "", scope: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared knowledge libraries + departments (platform-role tools). The
+# proxy enforces admin/creator on every mutation (require_creator_interactive
+# — real-user-backed principals only); these tools sit in the CRITICAL
+# permission tier, so the human approves each call in chat before it runs.
+# ---------------------------------------------------------------------------
+
+def _lib_path(source: str, subdir: str) -> str:
+    return (f"/knowledge/shared/{source}/{subdir}/" if subdir
+            else f"/knowledge/shared/{source}/")
+
+
+def _lib_label(name: str, source: str, subdir: str) -> str:
+    where = f"{source}/{subdir}" if subdir else f"{source} (whole folder)"
+    return f'"{name}" ({where})' if name else where
+
+
+async def _tool_list_knowledge_libraries() -> str:
+    """This agent's library state + (for admins/creators) every library."""
+    state = await _request(
+        "GET", f"/v1/agents/{AGENT_NAME}/knowledge-attachments")
+    lines: list[str] = []
+    own = state.get("libraries") or []
+    if own:
+        lines.append("📚 This agent shares these knowledge libraries:")
+        for lib in own:
+            consumers = lib.get("consumers") or []
+            clist = ", ".join(
+                f"{c['consumer_agent']}{' (RW)' if c.get('writable') else ''}"
+                for c in consumers) or "no consumers yet"
+            lines.append(
+                f"  - {_lib_label(lib.get('name') or '', AGENT_NAME, lib.get('subdir') or '')} "
+                f"— attached to: {clist}")
+    else:
+        lines.append(
+            "This agent shares no knowledge libraries.")
+    attachments = state.get("attachments") or []
+    if attachments:
+        lines.append("Attached libraries:")
+        for a in attachments:
+            mode = "read-write" if a.get("writable") else "read-only"
+            sub = a.get("subdir") or ""
+            lines.append(
+                f"  - {_lib_label(a.get('name') or '', a['source_agent'], sub)} "
+                f"at {_lib_path(a['source_agent'], sub)} ({mode})")
+    else:
+        lines.append("No libraries attached to this agent.")
+    try:
+        allrows = await _request("GET", "/v1/knowledge-libraries")
+        libs = allrows.get("libraries") or []
+        if libs:
+            lines.append("All libraries on this installation:")
+            for lib in libs:
+                lines.append(
+                    f"  - {_lib_label(lib.get('name') or '', lib['source_agent'], lib.get('subdir') or '')} "
+                    f"({lib.get('consumers', 0)} consumer(s))")
+    except _ApiError:
+        pass  # non-admin/creator callers see only their own agent's state
+    return "\n".join(lines)
+
+
+async def _tool_share_knowledge_folder(enable: bool, name: str = "",
+                                       subdir: str = "") -> str:
+    """Promote / un-promote one of THIS agent's knowledge libraries."""
+    label = (name or "").strip()
+    sub = (subdir or "").strip().strip("/")
+    if enable and not label:
+        return (
+            "❌ Error: a library name is required when sharing — it is how "
+            "people identify this library in the dashboard. Ask the user "
+            "what to call it (e.g. 'Brand Guidelines'), then call again "
+            "with name set."
+        )
+    resp = await _request(
+        "PUT", f"/v1/agents/{AGENT_NAME}/knowledge-library",
+        json={"enabled": bool(enable), "name": label, "subdir": sub},
+    )
+    if resp.get("status") == "shared":
+        what = (f"knowledge subfolder '{sub}/'" if sub
+                else "whole knowledge folder")
+        return (
+            f"✅ This agent's {what} is now a shared knowledge "
+            f"library named \"{resp.get('name') or label}\". Attach it to "
+            "other agents from their agent settings (Shared knowledge) or "
+            "with attach_knowledge_library in the consumer agent's chat — "
+            f"they read it at {_lib_path(AGENT_NAME, sub)}."
+        )
+    detached = resp.get("detached_consumers") or []
+    tail = (
+        f" Detached consumers: {', '.join(detached)} — their mirrors are "
+        "being removed."
+    ) if detached else ""
+    what = f"library '{sub}/'" if sub else "whole-folder library"
+    return f"✅ The {what} is no longer shared.{tail}"
+
+
+async def _tool_attach_knowledge_library(source_agent: str, writable: bool,
+                                         subdir: str = "") -> str:
+    """Attach a shared library to THIS agent (or update its writable flag)."""
+    source_agent = (source_agent or "").strip()
+    sub = (subdir or "").strip().strip("/")
+    if not source_agent:
+        return "❌ Error: source_agent is required."
+    resp = await _request(
+        "PUT", f"/v1/agents/{AGENT_NAME}/knowledge-attachments",
+        json={"source_agent": source_agent, "writable": bool(writable),
+              "subdir": sub},
+    )
+    mode = "read-write" if resp.get("writable") else "read-only"
+    return (
+        f"✅ Library '{_lib_label('', source_agent, sub)}' attached {mode} at "
+        f"`{_lib_path(source_agent, sub)}`. Content materializes now; "
+        "sessions get the mount from their next start (already-running "
+        "ones won't see it)."
+    )
+
+
+async def _tool_detach_knowledge_library(source_agent: str,
+                                         subdir: str = "") -> str:
+    source_agent = (source_agent or "").strip()
+    sub = (subdir or "").strip().strip("/")
+    if not source_agent:
+        return "❌ Error: source_agent is required."
+    await _request(
+        "DELETE",
+        f"/v1/agents/{AGENT_NAME}/knowledge-attachments/{source_agent}"
+        + (f"?subdir={sub}" if sub else ""),
+    )
+    return (
+        f"✅ Library '{_lib_label('', source_agent, sub)}' detached — its "
+        "mirror is being removed from this agent."
+    )
+
+
+async def _tool_set_department(department: str, level: str) -> str:
+    """Assign THIS agent to a department + level (or clear with empty args).
+
+    Resolves names → ids via GET /v1/departments (case-insensitive)."""
+    department = (department or "").strip()
+    level = (level or "").strip()
+    if not department:
+        await _request(
+            "PATCH", f"/v1/agents/{AGENT_NAME}",
+            json={"department_id": "", "department_level_id": ""},
+        )
+        return "✅ Department assignment cleared."
+    depts = await _request("GET", "/v1/departments")
+    rows = depts if isinstance(depts, list) else depts.get("departments", [])
+    match = next(
+        (d for d in rows
+         if d.get("name", "").lower() == department.lower()
+         or d.get("id") == department),
+        None,
+    )
+    if match is None:
+        names = ", ".join(d.get("name", "?") for d in rows) or "none exist"
+        return f"❌ Error: no department '{department}'. Available: {names}."
+    levels = match.get("levels") or []
+    if not level and len(levels) == 1:
+        lvl = levels[0]
+    else:
+        lvl = next(
+            (l for l in levels
+             if l.get("name", "").lower() == level.lower()
+             or l.get("id") == level),
+            None,
+        )
+    if lvl is None:
+        lnames = ", ".join(l.get("name", "?") for l in levels)
+        return (f"❌ Error: no level '{level}' in '{match.get('name')}'. "
+                f"Levels: {lnames}.")
+    await _request(
+        "PATCH", f"/v1/agents/{AGENT_NAME}",
+        json={"department_id": match["id"], "department_level_id": lvl["id"]},
+    )
+    return (f"✅ Assigned to department '{match.get('name')}' at level "
+            f"'{lvl.get('name')}'. Delegation edges recompiled; sessions "
+            "pick the new roster up at their next start.")
+
+
+# ---------------------------------------------------------------------------
 # Tool schemas + MCP dispatch
 # ---------------------------------------------------------------------------
 
@@ -885,6 +1137,35 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    "update_persona": {
+        "description": (
+            "Replace this agent's persona — `config/agent.md`, the first "
+            "thing loaded into every session. Use it when the user says who "
+            "this agent should be, what it is for, how it should work, or "
+            "what standards it holds; facts about people, projects and "
+            "state go to memory instead. REPLACES the whole file, so send "
+            "the complete persona (the current one is at the top of your "
+            "own prompt). Write role, working style, judgment and "
+            "boundaries in the second person — never capability lists (each "
+            "tool ships its own instructions). Takes effect in the next new "
+            "session. Requires manager/admin role with a user present."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "The complete new persona in markdown. Usually 20–60 "
+                        "lines, starting with an `# <Agent name>` heading."
+                    ),
+                },
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+    },
     "get_memory_settings": {
         "description": (
             "Inspect this agent's memory toggle overrides (per-agent layer "
@@ -948,6 +1229,138 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "list_knowledge_libraries": {
+        "description": (
+            "Show this agent's shared-knowledge state: which libraries it "
+            "shares (whole folder or a knowledge subfolder, and to whom), "
+            "which libraries are attached here (at "
+            "/knowledge/shared/<source>/<subdir>/), and — for platform "
+            "admins/creators — every library on the installation. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+    },
+    "share_knowledge_folder": {
+        "description": (
+            "Share (or un-share) THIS agent's knowledge folder — or one of "
+            "its subfolders — as an installation-wide knowledge library that "
+            "other agents can attach. An agent can share several disjoint "
+            "subfolders as independent libraries. Platform admins/creators "
+            "only — the server rejects everyone else. Un-sharing detaches "
+            "that library's consumers and removes their mirrors."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enable": {
+                    "type": "boolean",
+                    "description": "true = share, false = un-share.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "The library's display name, e.g. 'Brand Guidelines' "
+                        "— how people pick it out in the dashboard, and the "
+                        "name of its bulletin file. REQUIRED when "
+                        "enable=true, ignored when un-sharing. Re-share with "
+                        "a different name to rename it. Never part of the "
+                        "mirror path (consumers read "
+                        "/knowledge/shared/<this-agent>/<subdir>/)."
+                    ),
+                },
+                "subdir": {
+                    "type": "string",
+                    "description": (
+                        "Knowledge subfolder to share, relative to this "
+                        "agent's knowledge/ root (e.g. 'marketing' or "
+                        "'docs/public'). Empty/omitted = the whole folder. "
+                        "Identifies the library on un-share too. Subtrees "
+                        "must be disjoint from the agent's other libraries."
+                    ),
+                },
+            },
+            "required": ["enable"],
+            "additionalProperties": False,
+        },
+    },
+    "attach_knowledge_library": {
+        "description": (
+            "Attach a shared knowledge library to THIS agent — its content "
+            "mirrors to /knowledge/shared/<source>/<subdir>/ (read-only "
+            "unless writable). Also updates the writable flag of an "
+            "existing attachment. Platform admins/creators only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_agent": {
+                    "type": "string",
+                    "description": "Slug of the agent sharing the library.",
+                },
+                "subdir": {
+                    "type": "string",
+                    "description": (
+                        "The library's subfolder as shown by "
+                        "list_knowledge_libraries; empty/omitted for a "
+                        "whole-folder library."
+                    ),
+                },
+                "writable": {
+                    "type": "boolean",
+                    "description": "true = edits here flow back to the source library. Default false (read-only).",
+                },
+            },
+            "required": ["source_agent"],
+            "additionalProperties": False,
+        },
+    },
+    "detach_knowledge_library": {
+        "description": (
+            "Detach a shared knowledge library from THIS agent and remove "
+            "its mirror. Platform admins/creators only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_agent": {
+                    "type": "string",
+                    "description": "Slug of the attached library's source agent.",
+                },
+                "subdir": {
+                    "type": "string",
+                    "description": (
+                        "The attachment's library subfolder; empty/omitted "
+                        "for a whole-folder library."
+                    ),
+                },
+            },
+            "required": ["source_agent"],
+            "additionalProperties": False,
+        },
+    },
+    "set_department": {
+        "description": (
+            "Assign THIS agent to a department + level on the company map "
+            "(names resolved case-insensitively), or clear the assignment "
+            "by passing an empty department. Wires delegation edges per "
+            "the department's structure. Platform admins/creators only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "department": {
+                    "type": "string",
+                    "description": "Department name or id; empty string clears the assignment.",
+                },
+                "level": {
+                    "type": "string",
+                    "description": "Level name or id within the department; may be omitted when the department has exactly one level.",
+                },
+            },
+            "required": ["department"],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -964,11 +1377,26 @@ _TOOL_HANDLERS = {
     "update_default_execution_mode": lambda args: _tool_update_default_execution_mode(args.get("mode", "")),
     "set_visibility_mode": lambda args: _tool_set_visibility_mode(args.get("mode", "")),
     "list_context_files": lambda args: _tool_list_context_files(),
+    "update_persona": lambda args: _tool_update_persona(args.get("content", "")),
     "get_memory_settings": lambda args: _tool_get_memory_settings(),
     "update_user_memory_enabled": lambda args: _tool_update_user_memory_enabled(args.get("enabled")),
     "update_agent_memory_enabled": lambda args: _tool_update_agent_memory_enabled(args.get("enabled")),
     "complete_setup": lambda args: _tool_complete_setup(
         args.get("summary", ""), args.get("scope", ""),
+    ),
+    "list_knowledge_libraries": lambda args: _tool_list_knowledge_libraries(),
+    "share_knowledge_folder": lambda args: _tool_share_knowledge_folder(
+        args.get("enable"), args.get("name", ""), args.get("subdir", ""),
+    ),
+    "attach_knowledge_library": lambda args: _tool_attach_knowledge_library(
+        args.get("source_agent", ""), args.get("writable", False),
+        args.get("subdir", ""),
+    ),
+    "detach_knowledge_library": lambda args: _tool_detach_knowledge_library(
+        args.get("source_agent", ""), args.get("subdir", ""),
+    ),
+    "set_department": lambda args: _tool_set_department(
+        args.get("department", ""), args.get("level", ""),
     ),
 }
 

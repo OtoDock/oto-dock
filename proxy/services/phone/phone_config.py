@@ -26,6 +26,90 @@ logger = logging.getLogger("phone_config")
 # Populated by phone_management.py on connect/disconnect.
 _management_clients: set = set()
 
+# Per-connection capability metadata (ws → the daemon's ``capabilities`` frame
+# payload, sans "type"). Pre-duplex daemons never send the frame → no entry.
+# Dict insertion order is connection order, so the LAST duplex-capable entry is
+# the newest daemon — v1's single-daemon pick; the duplex_open correlation ids
+# keep a real multi-daemon router possible without protocol change.
+_management_meta: dict = {}
+
+
+def set_management_capabilities(ws, caps: dict) -> None:
+    """Record a daemon's advertised capabilities (management ``capabilities``
+    frame). Called by phone_management.py; cleared on disconnect."""
+    _management_meta[ws] = caps or {}
+
+
+def clear_management_capabilities(ws) -> None:
+    _management_meta.pop(ws, None)
+
+
+def pick_duplex_client():
+    """Newest duplex-capable management connection, or None."""
+    for ws in reversed(list(_management_meta)):
+        caps = _management_meta.get(ws) or {}
+        if (caps.get("duplex") or {}).get("supported"):
+            return ws
+    return None
+
+
+def duplex_engine_available() -> bool:
+    """A connected phone daemon advertising duplex support. This is the
+    engine half of the duplex capability gate — provider/policy checks live
+    in ``audio_service.duplex_capability``."""
+    return pick_duplex_client() is not None
+
+
+def assemble_duplex_session_config(user_sub: str) -> dict:
+    """Per-session config for one duplex session (rides ``duplex_open``).
+
+    Identity-and-provider scope ONLY: the chat-context STT/TTS provider rows
+    with decrypted keys, the chat endpointing, and the user's dictation
+    language. Behaviour knobs (``phone_tts_buffer_chars``, ``phone_bargein_*``,
+    the turn-classifier language map + Groq credentials) ride the GLOBAL
+    config push — one source per knob, never duplicated here.
+    """
+    from storage import user_audio_prefs_store
+
+    stt = audio_provider_store.get_default_provider("stt", "chat") or {}
+    tts = audio_provider_store.get_default_provider("tts", "chat") or {}
+    adv = stt.get("advanced") or {}
+    try:
+        endpointing = int(adv.get("chat_endpointing_ms")
+                          or adv.get("call_endpointing_ms") or 1500)
+    except (TypeError, ValueError):
+        endpointing = 1500
+    prefs = user_audio_prefs_store.get_prefs(user_sub) or {}
+    # The user's per-language voice picks (the dashboard voice picker,
+    # ``tts_voice_map``) OVERLAY the provider row's voices map: the spoken
+    # conversation must use the same voice the user hears from every other
+    # chat TTS surface — without this the engine resolved the row/stock
+    # voice, so fillers AND replies played a different voice than the one
+    # the user chose (live-hit 2026-08-11). Only platform-source picks
+    # apply (``native`` is a browser/device voice the engine can't use).
+    voices = dict(tts.get("voices") or {})
+    for lang, pref in (prefs.get("tts_voice_map") or {}).items():
+        if (isinstance(pref, dict) and pref.get("source") == "platform"
+                and pref.get("voiceId")):
+            voices[str(lang).split("-", 1)[0].lower()] = pref["voiceId"]
+    return {
+        "stt": {
+            "id": stt.get("id"),
+            "provider_name": stt.get("provider_name", ""),
+            "advanced": adv,
+            "api_key": _provider_api_key(stt),
+        },
+        "tts": {
+            "id": tts.get("id"),
+            "provider_name": tts.get("provider_name", ""),
+            "voices": voices,
+            "advanced": tts.get("advanced") or {},
+            "api_key": _provider_api_key(tts),
+        },
+        "chat_endpointing_ms": endpointing,
+        "language": prefs.get("stt_language") or "",
+    }
+
 
 def _provider_api_key(provider: dict | None) -> str:
     """Resolve a provider's API key from infra_credentials (uniform inner key)."""
@@ -176,8 +260,17 @@ def assemble_phone_config() -> dict:
         if k.startswith("phone_"):
             settings[k.removeprefix("phone_")] = v
 
-    # Phone routes
+    # Phone routes. Inbound PINs ride the push in plaintext for local
+    # enforcement — the established contract for daemon secrets on the
+    # master-key-authenticated management WS (Twilio auth token, AMI secret,
+    # provider API keys below). The PIN never exists as a route column, so
+    # the raw rows themselves stay clean.
     routes = phone_route_store.get_all_routes()
+    for r in routes:
+        if r.get("direction") == "inbound":
+            pin = phone_route_store.get_route_pin(r["id"])
+            if pin:
+                r["pin"] = pin
 
     # Default-for-calls providers set the per-call default STT/TTS ids (below) +
     # the global endpointing fallback. Per-provider voices, advanced and API keys
@@ -215,9 +308,43 @@ def assemble_phone_config() -> dict:
     # deleted server drops out of get_all_servers → its secret leaves the list →
     # revoked. MUST be a list, never a set — json.dumps can't serialize a set, so
     # the config push (notify_phone_config_changed) would raise.
+    all_servers = phone_server_store.get_all_servers()
     register_secrets = sorted(
-        ensure_register_secret(s["id"]) for s in phone_server_store.get_all_servers()
+        ensure_register_secret(s["id"]) for s in all_servers
     )
+
+    # Per-server map, keyed by str(id) (JSON object keys): Twilio rows carry
+    # the media-plane credentials the daemon needs (signature validation,
+    # TwiML URLs, REST origination); Asterisk rows carry their AMI
+    # coordinates so a route on a NON-default server can still Originate
+    # (the flat ami_* settings below stay the default-server fallback for
+    # released daemons and single-server installs).
+    servers: dict[str, dict] = {}
+    for s in all_servers:
+        s_cfg = s.get("config") or {}
+        entry: dict = {"id": s["id"], "adapter_type": s.get("adapter_type", "")}
+        if entry["adapter_type"] == "twilio":
+            from services.phone.phone_adapters.twilio import (
+                resolve_twilio_public_base,
+            )
+            entry["account_sid"] = str(s_cfg.get("account_sid") or "")
+            # The RESOLVED base (always the dashboard public URL) — the
+            # daemon validates signatures and builds TwiML against the same
+            # base the adapter wrote into the numbers' VoiceUrls.
+            entry["public_base_url"] = resolve_twilio_public_base()
+            entry["auth_token"] = credential_store.get_infra_credentials(
+                phone_server_store.twilio_cred_name(s["id"]),
+            ).get(phone_server_store.TWILIO_AUTH_TOKEN_KEY, "")
+        else:
+            s_ami_host = s_cfg.get("ami_host") or s.get("host") or ""
+            if s_ami_host:
+                entry["ami_host"] = str(s_ami_host)
+                entry["ami_port"] = int(s_cfg.get("ami_port") or 5038)
+                entry["ami_username"] = str(s_cfg.get("ami_username") or "")
+                entry["ami_secret"] = credential_store.get_infra_credentials(
+                    phone_server_store.ami_cred_name(s["id"]),
+                ).get(phone_server_store.AMI_SECRET_KEY, "")
+        servers[str(s["id"])] = entry
 
     # Per-provider map (keyed by provider_id) so the phone server can resolve a
     # route's chosen STT/TTS provider: provider_name (→ registry class), the
@@ -245,6 +372,7 @@ def assemble_phone_config() -> dict:
         "version": int(time.time()),
         "routes": routes,
         "providers": providers,
+        "servers": servers,
         "default_stt_provider_id": stt_default["id"] if stt_default else None,
         "default_tts_provider_id": tts_default["id"] if tts_default else None,
         "credentials": {

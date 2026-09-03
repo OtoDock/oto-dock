@@ -244,3 +244,95 @@ async def test_watchdog_pins_to_the_interrupted_turn(monkeypatch):
     await asyncio.sleep(0.6)
     assert _sent_frame_types(layer) == ["interrupt_turn"]
     assert info.cli_dead is False
+
+
+# ---------------------------------------------------------------------------
+# interrupt_for_queued — stop-and-send: the graceful arm ONLY, send-then-
+# resolve, no watchdog, no hard fallback.
+# ---------------------------------------------------------------------------
+
+def _released(monkeypatch) -> list:
+    calls: list = []
+    monkeypatch.setattr(
+        remote_execution, "resolve_session_permissions",
+        lambda sid, approved: calls.append((sid, approved)),
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_interrupt_for_queued_fires_graceful_only(monkeypatch):
+    layer = _make_layer(soft_supported=True)
+    layer._cm.is_connected = MagicMock(return_value=True)
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    released = _released(monkeypatch)
+
+    assert await layer.interrupt_for_queued(info.session_id) is True
+    assert _sent_frame_types(layer) == ["interrupt_turn"]
+    # Send-THEN-resolve: permissions denied only after a successful send.
+    assert released == [(info.session_id, False)]
+    # No hard-abort machinery touched, process bookkeeping untouched.
+    assert info.cli_dead is False
+    layer._cm.arm_abort_acked.assert_not_called()
+    layer._cm.drop_grace_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_for_queued_gates_return_false(monkeypatch):
+    released_total: list = []
+    monkeypatch.setattr(
+        remote_execution, "resolve_session_permissions",
+        lambda sid, approved: released_total.append(sid),
+    )
+
+    # No live turn.
+    layer = _make_layer(soft_supported=True)
+    layer._cm.is_connected = MagicMock(return_value=True)
+    info = _make_info(turn_active=False)
+    layer._sessions[info.session_id] = info
+    assert await layer.interrupt_for_queued(info.session_id) is False
+
+    # Codex sessions take steer, never this path.
+    layer2 = _make_layer(soft_supported=True)
+    layer2._cm.is_connected = MagicMock(return_value=True)
+    info2 = _make_info(session_id="sess-2", execution_path="codex-cli")
+    layer2._sessions[info2.session_id] = info2
+    assert await layer2.interrupt_for_queued(info2.session_id) is False
+
+    # Old satellite (no soft interrupt support).
+    layer3 = _make_layer(soft_supported=False)
+    layer3._cm.is_connected = MagicMock(return_value=True)
+    info3 = _make_info(session_id="sess-3")
+    layer3._sessions[info3.session_id] = info3
+    assert await layer3.interrupt_for_queued(info3.session_id) is False
+
+    # Disconnected machine — send_fire_and_forget would silently no-op, so
+    # the gate must refuse rather than claim an interrupt landed.
+    layer4 = _make_layer(soft_supported=True)
+    layer4._cm.is_connected = MagicMock(return_value=False)
+    info4 = _make_info(session_id="sess-4")
+    layer4._sessions[info4.session_id] = info4
+    assert await layer4.interrupt_for_queued(info4.session_id) is False
+
+    # Unknown session.
+    assert await layer4.interrupt_for_queued("no-such") is False
+
+    for lyr in (layer, layer2, layer3, layer4):
+        assert _sent_frame_types(lyr) == []
+    # No blind denials on any refused path.
+    assert released_total == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_for_queued_send_failure_never_denies_blind(monkeypatch):
+    layer = _make_layer(soft_supported=True)
+    layer._cm.is_connected = MagicMock(return_value=True)
+    layer._cm.send_fire_and_forget = AsyncMock(side_effect=RuntimeError("ws died"))
+    info = _make_info()
+    layer._sessions[info.session_id] = info
+    released = _released(monkeypatch)
+
+    assert await layer.interrupt_for_queued(info.session_id) is False
+    # A failed send must NOT un-park the turn by denying its permission.
+    assert released == []

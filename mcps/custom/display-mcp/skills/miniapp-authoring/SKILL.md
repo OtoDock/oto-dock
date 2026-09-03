@@ -32,7 +32,7 @@ on the `display_ui` tool itself).
 
 **Full documents** — content starting with `<!doctype`/`<html` keeps its own markup and `<head>` (no tokens CSS / ui-kit), but the platform runtime is still injected before `</body>`, so theme events, auto-height, actions, feeds and links all keep working.
 
-**Design responsive** — the artifact renders on phones as well as desktop: fluid widths only (`width:100%` / `max-width`, never fixed pixel layouts), let content wrap, use Tailwind responsive variants (`sm:` `md:`) for multi-column layouts that must collapse on narrow screens, and give JS-drawn charts a percentage width with a sensible fixed height. In grid/flex layouts use FIXED gaps and padding (`px`/`rem`, never `%`) — percentage row-gaps in auto-height grids mis-resolve and make content overlap. And keep the html LEAN: every KB is time the user spends watching you generate — aggregate data before embedding it, skip decoration that the tokens CSS already provides.
+**Design responsive** — the artifact renders on phones as well as desktop: fluid widths only (`width:100%` / `max-width`, never fixed pixel layouts), let content wrap, use Tailwind responsive variants (`sm:` `md:`) for multi-column layouts that must collapse on narrow screens, and give JS-drawn charts a percentage width with a sensible fixed height. On desktop the app surface is the FULL tab width (wide, roughly 16:9) — design for wide: multi-column grids and side-by-side panels that collapse on mobile, never one narrow column floating in empty space. If a section is long-form reading where a website-like measure genuinely reads better, self-cap just that section (`max-width` + `margin-inline:auto`) — the platform never caps your width; responsiveness is on you. And keep your OUTERMOST horizontal padding near zero (0–4px): the host frame already insets the page ~10px from the phone's screen edge, so heavy wrapper padding makes the dashboard read narrower than the platform's own chrome (the composer card sits at 12px). In grid/flex layouts use FIXED gaps and padding (`px`/`rem`, never `%`) — percentage row-gaps in auto-height grids mis-resolve and make content overlap. And keep the html LEAN: every KB is time the user spends watching you generate — aggregate data before embedding it, skip decoration that the tokens CSS already provides.
 
 **Styling judgment**: load Tailwind BY DEFAULT and compose utilities over the token vars (`bg-[var(--p-surface)]`, `text-[var(--p-primary)]`) so custom styling stays native in both themes — the polish is what makes artifacts impressive, and the modest extra output tokens are worth it. Skip it only for the simplest cases — a single plain card, table, or chart — where the token primitives alone already look native and generate fastest.
 
@@ -59,11 +59,72 @@ on the `display_ui` tool itself).
 </script>
 ```
 
+**3D (`/ui-kit/three.min.js`)**: global `THREE` including a curated addon set — `OrbitControls` + `MapControls`, the post-processing chain (`EffectComposer`, `RenderPass`, `UnrealBloomPass`, `OutputPass`, `ShaderPass`), fat lines (`Line2`, `LineGeometry`, `LineMaterial`) and `RoundedBoxGeometry`. A living 3D scene is the kit's signature move for dashboards that should IMPRESS: an animated hero panel above the numbers, a glowing service graph, a slowly rotating data sculpture, a floor plan you can pan. Reach for it whenever motion or space adds real life to a dashboard — but don't force it on a surface that is honestly just a bar chart. The sandbox sets HARD limits, so design within them from the start:
+
+- **No asset loaders.** `connect-src` is 'none' — `GLTFLoader`, `FileLoader`, `OBJLoader` and every fetch/XHR-based loader fails silently-looking. No model files: build scenes from procedural geometry (`BoxGeometry`, `SphereGeometry`, `BufferGeometry` from typed arrays). `TextureLoader` works ONLY with `data:`/`blob:` URLs — canvas-generated `CanvasTexture` is the idiom.
+- **No workers, no WASM** (DRACO/KTX2/meshopt decoders are out), **no WebXR**. Plain WebGL/WebGL2 rendering works fine.
+- Guard init: `new THREE.WebGLRenderer()` inside try/catch with an HTML fallback message — some WebViews have no WebGL.
+- **The canvas is fluid**: width follows the container, height comes from a CLAMPED style — `height:clamp(240px, 36vh, 460px)` is the house default for a hero panel. NEVER a bare `aspect-ratio` (a 16/6 hero that looks right on a laptop grows monstrous on a 32" desktop — the 2D cards around it stay CSS-px sized, and the 3D must too). A `resize` handler is MANDATORY — update renderer size, `camera.aspect` + `updateProjectionMatrix()`, and (when used) `composer.setSize(w,h)` and every `LineMaterial.resolution` (see below). The frame resizes when the tab or device does; a 3D panel that skips this renders stretched or letterboxed.
+- **Frame for physical size, not screen fraction**: on a big canvas, pull the camera back so objects read laptop-sized instead of scaling up with the panel — in the resize handler, scale the camera's distance by `Math.min(1.5, Math.max(1, Math.sqrt(w * h / (1100 * 380))))` (reference ≈ a laptop-width hero). The platform's own 3D company map frames this way; a scene that skips it is the #1 "looks great on my laptop, huge on the office monitor" complaint.
+- Theme: read colors from the CSS vars like the ECharts idiom; on `otodock:theme` update materials in place (`mat.color.set(cssVar(...))`) — no renderer rebuild.
+- Mobile: touch just works on both control types — `OrbitControls` for orbit-a-scene, `MapControls` for pan-first surfaces (floor plans, boards). Cap `setPixelRatio(Math.min(devicePixelRatio, 2))`, scale object counts down on small screens (`matchMedia('(max-width: 640px)')`), and honor `prefers-reduced-motion`: keep interactivity but skip self-animation.
+
+The impressive idioms, all sandbox-safe:
+
+- **Bloom glow** — emissive materials + `UnrealBloomPass` (strength ~0.4–0.8) is the single biggest visual lever; it's what makes dark dashboards look alive.
+- **Fat lines** — network edges and flows drawn with `Line2` + `LineMaterial({ linewidth: 2-4 })`, impossible with 1px `Line`. FOOTGUN: `LineMaterial` needs `material.resolution.set(w, h)` at init AND in the resize handler, or the lines render at the wrong width.
+- **Instancing** — hundreds+ of similar objects go in ONE `InstancedMesh` (per-instance color via `setColorAt`), never N meshes; this is the difference between 60fps and a slideshow.
+- **Data textures** — draw heatmaps, gradients and labels onto an offscreen canvas and wrap it in `CanvasTexture`; that plus procedural geometry replaces every blocked loader.
+
+```html
+<div class="card"><div id="v" style="width:100%;height:clamp(240px,36vh,460px)"></div></div>
+<script src="/ui-kit/three.min.js"></script>
+<script>
+  var el = document.getElementById('v');
+  try {
+    var renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    el.appendChild(renderer.domElement);
+    var scene = new THREE.Scene();
+    var camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    var CAM_DIR = new THREE.Vector3(0, 2, 6);
+    camera.position.copy(CAM_DIR);
+    function cssVar(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+    var mat = new THREE.MeshStandardMaterial({ color: cssVar('--p-primary'),
+      emissive: cssVar('--p-primary'), emissiveIntensity: 0.35 });
+    var mesh = new THREE.Mesh(new THREE.RoundedBoxGeometry(2, 2, 2, 4, 0.25), mat);
+    scene.add(mesh);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    var key = new THREE.DirectionalLight(0xffffff, 1.6); key.position.set(3, 5, 4); scene.add(key);
+    var composer = new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene, camera));
+    composer.addPass(new THREE.UnrealBloomPass(new THREE.Vector2(1, 1), 0.55, 0.8, 0.75));
+    composer.addPass(new THREE.OutputPass());
+    var controls = new THREE.OrbitControls(camera, renderer.domElement);
+    function size(){ var w = el.clientWidth, h = el.clientHeight;
+      renderer.setSize(w, h); composer.setSize(w, h);
+      camera.aspect = w / h; camera.updateProjectionMatrix();
+      // Physical-size framing: bigger canvas → camera farther back.
+      var vs = Math.min(1.5, Math.max(1, Math.sqrt(w * h / (1100 * 380))));
+      camera.position.copy(CAM_DIR).multiplyScalar(vs); }
+    size(); addEventListener('resize', size);
+    addEventListener('otodock:theme', function(){
+      mat.color.set(cssVar('--p-primary')); mat.emissive.set(cssVar('--p-primary')); });
+    var still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    (function tick(){ requestAnimationFrame(tick);
+      if (!still) mesh.rotation.y += 0.004;
+      controls.update(); composer.render(); })();
+  } catch (e) { el.textContent = '3D not available on this device.'; }
+</script>
+```
+
 The Edit-then-refresh loop (edit the saved file, re-call `display_ui` with only `save_path`) is described in the display-tools skill; the same loop works for mini-apps — edit `apps/<slug>.html`, then re-pin the slug (`pin_app` with no `html`) — open tabs live-reload.
 
 ## Pinned mini-apps (`pin_app` / `unpin_app` / `list_apps`)
 
-A mini-app is a STANDING dashboard, pinned once and opened any time from the apps button on the chat page — it outlives every chat. Pin one when the user wants a recurring surface (morning brief, project status board, finance dashboard, home-control panel); a standing in-chat artifact covers "for this conversation", `pin_app` covers "for every visit". Scope follows your session: pinned from a personal-scope session it's the user's private app; from a shared/agent-scope session it's shared with every user of the agent. Once pinned, keep it fresh with a scheduled task instead of rebuilding on request.
+A mini-app is a STANDING dashboard, pinned once and opened any time from the apps button on the chat page — it outlives every chat. Pin one when the user wants a recurring surface (morning brief, project status board, finance dashboard, home-control panel); a standing in-chat artifact covers "for this conversation", `pin_app` covers "for every visit". Once pinned, keep it fresh with a scheduled task instead of rebuilding on request.
+
+**Who sees it — `visibility`** (orthogonal to `scope`, which picks WHERE it lives): `visibility="agent"` pins ONE shared dashboard for every user of this agent (its file lives in the shared `workspace/apps/`; needs editor+ when a human drives the session); `visibility="user"` pins the current user's personal dashboard (`users/<u>/workspace/apps/`). Omitted, it follows the agent's mode default — the tool schema shows this agent's default. Match intent: "pin this for the whole team" → `"agent"`; "just for me" → `"user"`. The same slug may exist in BOTH visibilities (two rows, two files) — re-pin with the SAME visibility to update; `unpin_app` auto-detects unless the slug is in both (then pass `visibility`). Users can hide a shared app from their OWN strip without affecting the team — that per-user hide is theirs, not yours; a re-pin never un-hides it for them.
 
 - **Authoring is the same sandbox as `display_ui`** (body fragment, tokens CSS auto-loaded, kit scripts available) with two HARD requirements because apps are seen daily on every device: load Tailwind and design mobile-responsive.
 - **Updating**: re-pin the same slug (check `list_apps` first) — open tabs live-reload; that is also how a scheduled task refreshes an app every morning. Editing the workspace file alone does not notify open tabs.
@@ -85,7 +146,7 @@ A mini-app is a STANDING dashboard, pinned once and opened any time from the app
 
 ## Scoped dashboards (`pin_app` with `scope`) — the Dock
 
-Besides standing apps, `pin_app` can bind a dashboard to a **chat** or a **delegation project** — it then lives on that chat's **Dock** (the panel button by the composer) instead of the apps strip:
+Besides standing apps, `pin_app` can bind a dashboard to a **chat** or a **delegation project** — it then lives on that chat's **Dock** (the panel button by the composer) instead of the apps strip. (`scope` picks WHERE the pin lives — the standing strip vs a Dock; `visibility` picks WHO sees it — don't conflate them. Multi-user project dashboards want `visibility="agent"` so every participant sees the pin.)
 
 - `scope="project"` — pin it from any chat of the project (ids resolve from YOUR session's chat, never passed). It renders beside the platform's live lane cards on the project view. **Default to NOT pinning one**: the platform's built-in delegation dock (orchestrator card + live lane cards) is the standard surface for every delegation, projects included. Reserve a pinned project dashboard for genuinely BIG projects — many lanes over hours/days where a plan overview with owners and progress bars adds something the lane cards don't. If you do pin one, keep it about the PLAN (the lane cards already show live per-worker state) and re-pin on every board change (the same Edit-the-file + slug-only re-pin loop).
 - `scope="chat"` — one progress dashboard for THIS chat. Use it for plan-scale single-chat work (a dev plan being executed, a research program, a long migration): milestones done/remaining, current phase, key numbers. Update it at milestones, not every message.

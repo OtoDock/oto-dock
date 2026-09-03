@@ -109,6 +109,42 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
 
 
+def _harden_service(
+    key: str, svc: dict, mcp_name: str,
+    declared_volumes: set[str], external_volumes: set[str],
+) -> list[str]:
+    """Apply the T2 sandbox hardening to ONE service dict, in place.
+
+    Runs for EVERY service of EVERY compose the T2 path touches — target or
+    sibling, build-form or already-pull-form. A compose shipped pull-form
+    (or a sibling service) must get the exact same treatment as the rewritten
+    target, or a hijacked catalog entry sidesteps the strip by simply not
+    declaring ``build:``. Returns human-readable change notes (empty = the
+    service was already clean).
+    """
+    changes: list[str] = []
+    dropped = [k for k in _DANGEROUS_COMPOSE_KEYS if k in svc]
+    for k in dropped:
+        svc.pop(k, None)
+    if dropped:
+        changes.append(f"stripped unsafe keys {sorted(dropped)}")
+        logger.warning(
+            "compose_rewrite: stripped unsafe keys %s from service %r (%s)",
+            sorted(dropped), key, mcp_name,
+        )
+    if "ports" in svc:
+        svc.pop("ports", None)
+        changes.append("removed published ports")
+    if isinstance(svc.get("volumes"), list):
+        healed = _rewrite_volumes(
+            svc["volumes"], mcp_name, declared_volumes, external_volumes,
+        )
+        if healed != svc["volumes"]:
+            svc["volumes"] = healed
+            changes.append("host binds → named volumes")
+    return changes
+
+
 def _is_host_bind_source(src: str) -> bool:
     """True if a short-form volume source is a host path (not a named volume).
 
@@ -266,26 +302,15 @@ def transform_compose_dict(
     for key, svc in services.items():
         if not isinstance(svc, dict):
             raise ValueError(f"service {key!r} is not a mapping")
-        # Strip container-escape / host-access keys a community compose must
-        # never set — privileged mode, host namespaces, raw devices, security-opt
-        # downgrades, etc. A malicious catalog compose can't request them.
-        dropped = [k for k in _DANGEROUS_COMPOSE_KEYS if k in svc]
-        for k in dropped:
-            svc.pop(k, None)
-        if dropped:
-            logger.warning(
-                "compose_rewrite: stripped unsafe keys %s from service %r (%s)",
-                dropped, key, mcp_name,
-            )
+        # Strip container-escape / host-access keys, published ports, and host
+        # binds from EVERY service — sibling services included (a malicious
+        # compose could otherwise carry its escape on a second, image-based
+        # service the target-only rewrite never touched).
+        _harden_service(key, svc, mcp_name, declared_volumes, external_volumes)
         if key == target:
             svc.pop("build", None)
             svc["image"] = image
             svc["container_name"] = container_name
-            svc.pop("ports", None)
-            if "volumes" in svc:
-                svc["volumes"] = _rewrite_volumes(
-                    svc["volumes"], mcp_name, declared_volumes, external_volumes,
-                )
             svc["networks"] = {_NET_KEY: {"aliases": [service_name]}}
         else:
             # Sibling services (already image-based) join the same network so
@@ -365,16 +390,21 @@ def ensure_pull_compose(manifest) -> bool:
             changes.append(
                 f"container_name {current} → {expected} (install identity changed)"
             )
-        if isinstance(svc.get("volumes"), list):
-            declared: set[str] = set()
-            external: set[str] = set()
-            healed = _rewrite_volumes(
-                svc["volumes"], manifest.name, declared, external,
-            )
-            if healed != svc["volumes"]:
-                svc["volumes"] = healed
-                _declare_volumes(data, declared, external)
-                changes.append("host binds → named volumes")
+        # (c) the sandbox hardening — a compose shipped ALREADY pull-form
+        #     never went through transform_compose_dict, so dangerous keys,
+        #     published ports, and host binds on ANY of its services (target
+        #     or sibling) would otherwise survive verbatim on T2.
+        declared: set[str] = set()
+        external: set[str] = set()
+        for skey, ssvc in services.items():
+            if not isinstance(ssvc, dict):
+                continue
+            for note in _harden_service(
+                skey, ssvc, manifest.name, declared, external,
+            ):
+                changes.append(f"{skey}: {note}")
+        if declared or external:
+            _declare_volumes(data, declared, external)
         if not changes:
             return False  # already pull-form and healthy — idempotent
         compose_path.write_text(

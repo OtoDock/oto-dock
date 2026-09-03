@@ -74,8 +74,10 @@ class TestPermissionMatrix:
             "list_enabled_mcps",
             "list_available_mcps",
             "list_community_mcps",
+            "list_community_skills",
             "request_mcp_install",
             "request_mcp_access",
+            "request_skill_install",
             "disable_mcp_for_agent",
             "get_request_status",
             "cancel_my_request",
@@ -124,6 +126,7 @@ class TestPermissionMatrix:
             "list_enabled_mcps",
             "list_available_mcps",
             "list_community_mcps",
+            "list_community_skills",
         }
 
     def test_list_tools_filters_to_enabled(self):
@@ -200,6 +203,70 @@ class TestToolBehavior:
         assert "schedules-mcp" in text
         assert "nextcloud" not in text  # disabled row filtered out
         assert "**pa**" in text
+
+    def test_list_available_mcps_two_sections(self, monkeypatch):
+        """The re-sourced listing (2026-08-16): registry-backed endpoint with
+        include_unauthorized, NOT the community catalog — zip installs must
+        appear. Rows split into enable-directly vs requires-admin."""
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa",
+            "OTO_SCOPE": "user",
+            "OTO_ROLE": "manager",
+            "PROXY_URL": "http://test",
+            "PROXY_API_KEY": "k",
+        })
+        payload = {"mcps": [
+            # zip-installed auto-mode MCP, not enabled → "Enable directly"
+            {"name": "bluesky-mcp", "category": "community",
+             "description": "Bluesky posting", "enabled": False,
+             "authorized": True},
+            # explicit-mode without instance coverage → "Requires admin"
+            {"name": "prometheus", "category": "community",
+             "description": "Metrics", "enabled": False,
+             "authorized": False},
+            # already enabled → not listed at all
+            {"name": "schedules-mcp", "category": "core",
+             "description": "Tasks", "enabled": True, "authorized": True},
+        ]}
+        seen: dict = {}
+        async def fake_request(self, method, url, **kw):
+            seen["url"] = str(url)
+            seen["params"] = kw.get("params")
+            return _mock_response(payload)
+        monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
+
+        out = asyncio.run(m.call_tool("list_available_mcps", {}))
+        text = out[0].text
+        # Sourced from the agent MCPs endpoint, not /v1/community/mcps.
+        assert "/v1/agents/pa/mcps" in seen["url"]
+        assert (seen["params"] or {}).get("include_unauthorized") == "true"
+        assert "Enable directly" in text
+        assert "Requires admin authorization" in text
+        assert "bluesky-mcp" in text
+        assert "prometheus" in text
+        assert "schedules-mcp" not in text  # enabled rows filtered out
+        # The direct section must come before the needs-admin section.
+        assert text.index("bluesky-mcp") < text.index("prometheus")
+
+    def test_list_available_mcps_all_enabled_message(self, monkeypatch):
+        m = _load_server({
+            "OTO_AGENT_NAME": "pa",
+            "OTO_SCOPE": "user",
+            "OTO_ROLE": "manager",
+            "PROXY_URL": "http://test",
+            "PROXY_API_KEY": "k",
+        })
+        payload = {"mcps": [
+            {"name": "schedules-mcp", "category": "core",
+             "description": "Tasks", "enabled": True, "authorized": True},
+        ]}
+        async def fake_request(self, method, url, **kw):
+            return _mock_response(payload)
+        monkeypatch.setattr(httpx.AsyncClient, "request", fake_request)
+
+        out = asyncio.run(m.call_tool("list_available_mcps", {}))
+        assert "already enabled" in out[0].text
+        assert "list_community_mcps" in out[0].text
 
     def test_list_community_mcps_filter_and_status(self, monkeypatch):
         m = _load_server({

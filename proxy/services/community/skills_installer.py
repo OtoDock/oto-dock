@@ -20,10 +20,16 @@ Hard invariants enforced here:
   ``allowed-tools`` etc. never reach disk (belt-and-braces with the
   scrub at materialization).
 
-v1 catalog policy — community skills carry NO executable content
-(``scripts/``): skill scripts run as trusted code, unsandboxed on
-satellites. Enforced at curation (prep-repo review), rejected here
-defensively.
+Executable content (``scripts/`` — the Agent Skills standard) is ALLOWED
+since 2026-08-27 (operator decision, plan
+the 1.5 skills-completion round): the agent can
+already write and run arbitrary code under its normal permission tiers,
+so skill scripts add provenance risk, not capability — controlled by the
+admin-gated install paths, catalog curation review, the frontmatter
+scrub, and the materializer's digest tamper-repair. ``has_scripts`` is
+computed here and surfaced as a badge wherever packages are listed, so
+the provenance is always visible. (The pre-1.5 v1 policy rejected
+non-empty ``scripts/`` outright.)
 """
 
 from __future__ import annotations
@@ -71,6 +77,14 @@ def _validate_skill_package(data: dict, pkg_root: Path) -> list[str]:
 
     if data["category"] != "skill":
         errors.append(f"category must be 'skill', got {data['category']!r}")
+    # The manifest name becomes the install FOLDER under mcps/skills/ — the
+    # same grammar gate the MCP installer applies, or a crafted name
+    # ("../../x", an absolute path) relocates _apply_extracted_files.
+    if not _is_safe_name(data["name"]):
+        errors.append(
+            f"invalid package name {data['name']!r} (lowercase letters/"
+            f"digits/hyphens/underscores only)"
+        )
     server = data.get("server") or {}
     # Tested invariant: anything else would gain code execution under a
     # lower-risk label (plan §3).
@@ -87,20 +101,31 @@ def _validate_skill_package(data: dict, pkg_root: Path) -> list[str]:
             errors.append(f"invalid skill id: {sid!r}")
             continue
         rel = sk.get("file", "")
-        f = (pkg_root / rel) if rel else None
-        if f is None or not f.is_file() or ".." in Path(rel).parts:
+        # Must stay a RELATIVE path resolving inside the package — an
+        # absolute value survives the join (`pkg_root / "/etc/x"` IS
+        # "/etc/x") and the scrub step would rewrite that file in place.
+        f = (pkg_root / rel) if rel and not Path(rel).is_absolute() else None
+        try:
+            inside = bool(f) and f.resolve().is_relative_to(pkg_root.resolve())
+        except OSError:
+            inside = False
+        if f is None or not inside or not f.is_file() or ".." in Path(rel).parts:
             errors.append(f"skill {sid}: file {rel!r} not found in package")
 
     if any(p.is_file() for p in pkg_root.rglob(".env")):
         errors.append("package must not contain .env files")
-    # v1 content policy — no executable payloads in community skills.
-    for sub in pkg_root.rglob("scripts"):
-        if sub.is_dir() and any(sub.iterdir()):
-            errors.append(
-                f"community skill packages must not bundle scripts/ "
-                f"({sub.relative_to(pkg_root)}) — v1 catalog policy",
-            )
     return errors
+
+
+def package_has_scripts(pkg_root: Path) -> bool:
+    """True when the package bundles executable content (any non-empty
+    ``scripts/`` dir — the Agent Skills convention). Surfaced as a
+    provenance badge in the catalog browser / admin Skills page / request
+    queue; not a rejection since 2026-08-27 (see module docstring)."""
+    return any(
+        sub.is_dir() and any(sub.iterdir())
+        for sub in pkg_root.rglob("scripts")
+    )
 
 
 def _check_collisions(data: dict) -> None:
@@ -189,16 +214,83 @@ async def install_skill_package_from_extracted(
             await asyncio.to_thread(shutil.rmtree, backup_dir, True)
 
     await _emit(progress_cb, "done", 100, "Installed")
-    logger.info("skill package %s %s (%s -> %s)",
+    has_scripts = package_has_scripts(target_dir)
+    logger.info("skill package %s %s (%s -> %s%s)",
                 name, "updated" if is_update else "installed",
-                old_version, version)
+                old_version, version,
+                ", bundles scripts" if has_scripts else "")
     return {
         "status": "updated" if is_update else "installed",
         "name": name,
         "version": version,
         "old_version": old_version,
         "kind": "skill",
+        "has_scripts": has_scripts,
     }
+
+
+async def install_bare_skill_folder(
+    skill_root: Path, *, progress_cb: ProgressCb = None,
+) -> dict:
+    """Install a spec-standard BARE skill folder (SKILL.md at its root, no
+    package manifest) by synthesizing the package around it.
+
+    SKILL.md IS the manifest per the Agent Skills spec — its frontmatter
+    ``name`` + ``description`` are authoritative (a zip's wrapping folder
+    name is not trusted). The folder is restaged into the package layout
+    (``manifest.json`` + ``skills/<name>/…``) and handed to the normal
+    installer, which validates, collision-checks, and scrubs as usual.
+    """
+    from services.mcp.skill_format import parse_frontmatter
+
+    skill_md = skill_root / "SKILL.md"
+    if not skill_md.is_file():
+        raise HTTPException(400, "SKILL.md not found in skill folder")
+    fm, _body = parse_frontmatter(skill_md.read_text())
+    name = str(fm.get("name") or "").strip()
+    description = str(fm.get("description") or "").strip()
+    if not SKILL_ID_RE.fullmatch(name or "") or len(name) > SKILL_ID_MAX_LEN:
+        raise HTTPException(
+            400,
+            "SKILL.md frontmatter must carry a spec-valid `name` (lowercase "
+            f"letters/digits/hyphens, ≤{SKILL_ID_MAX_LEN} chars); got: {name!r}",
+        )
+    if not description:
+        raise HTTPException(
+            400, "SKILL.md frontmatter must carry a `description`")
+
+    meta = fm.get("metadata") or {}
+    version = (str(meta.get("version") or "").strip()
+               if isinstance(meta, dict) else "")
+    manifest = {
+        "name": name,
+        "label": name.replace("-", " ").title(),
+        "description": description,
+        "version": version or "1.0.0",
+        "category": "skill",
+        "server": {"runtime": "none", "transport": "none"},
+        "skills": [{
+            "id": name,
+            "loading": "on_demand",
+            "file": f"skills/{name}/SKILL.md",
+            "description": description,
+        }],
+    }
+    stage = Path(tempfile.mkdtemp(prefix="skill-bare-install-"))
+    try:
+        pkg_root = stage / name
+        target = pkg_root / "skills" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # symlinks can't survive zipfile extraction (they land as regular
+        # files), and the materializer refuses them anyway — plain copy.
+        await asyncio.to_thread(
+            shutil.copytree, skill_root, target, symlinks=False)
+        (pkg_root / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n")
+        return await install_skill_package_from_extracted(
+            pkg_root, progress_cb=progress_cb)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 async def install_skill_package_from_catalog(

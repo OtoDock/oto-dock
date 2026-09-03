@@ -14,6 +14,7 @@ this router owns everything "audio".
 import asyncio
 import contextlib
 import io
+import json
 import logging
 import wave
 from dataclasses import asdict
@@ -31,11 +32,13 @@ from audio.streaming import tts_stream
 from audio.streaming import lang
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from services.media import audio_service
+from services.media import wake_keywords
 from services.media import ws_audio_token
 from storage import audio_provider_store
 from storage import credential_store
 from storage import database as task_store
 from storage import user_audio_prefs_store
+from storage import user_ui_prefs_store
 from storage.audio_provider_store import (
     CREDENTIAL_INNER_KEY as AUDIO_CREDENTIAL_KEY,
     ProviderDefaultDisabledError,
@@ -104,6 +107,7 @@ class AudioPrefsUpdate(BaseModel):
     tts_mode: str | None = None
     tts_voice_map: dict | None = None
     stt_language: str | None = None
+    wake_word_enabled: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +404,52 @@ async def update_my_audio_prefs(
     return prefs
 
 
+@router.get("/v1/users/me/wake-keywords")
+async def get_my_wake_keywords(user: UserContext | None = Depends(get_current_user)):
+    """Pre-encoded wake keywords for the browser's on-device spotter — the
+    user's ADDED agents' display names (admins included — never the
+    platform-wide access set) + the platform word compiled to their
+    favorite. Derivation only; the per-user opt-in is client-gated."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return await asyncio.to_thread(wake_keywords.build_for_user, user)
+
+
+# ---------------------------------------------------------------------------
+# Per-user roaming UI preferences — free-form JSON bag (audio-prefs pattern;
+# first tenant: last_execution_mode, the per-agent interactive/headless pick)
+# ---------------------------------------------------------------------------
+
+_UI_PREFS_MAX_BYTES = 8192
+
+
+@router.get("/v1/users/me/ui-prefs")
+async def get_my_ui_prefs(user: UserContext | None = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return await asyncio.to_thread(user_ui_prefs_store.get_prefs, user.sub)
+
+
+@router.put("/v1/users/me/ui-prefs")
+async def update_my_ui_prefs(
+    req: dict, user: UserContext | None = Depends(get_current_user),
+):
+    """Shallow-merge upsert: the provided top-level keys overwrite the stored
+    ones; every other stored key is kept."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if len(json.dumps(req)) > _UI_PREFS_MAX_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"ui-prefs payload too large (max {_UI_PREFS_MAX_BYTES} bytes)"
+        )
+    try:
+        return await asyncio.to_thread(
+            user_ui_prefs_store.upsert_prefs, user.sub, req,
+        )
+    except ValueError as e:  # merged-bag ceiling (see user_ui_prefs_store)
+        raise HTTPException(status_code=413, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Chat audio runtime endpoints (sound icon / mic icon / transcribe) — user-facing
 # ---------------------------------------------------------------------------
@@ -432,7 +482,9 @@ async def get_audio_capability(
         audio_service.resolve_chat_audio_capability,
         has_native_tts=has_native_tts, has_native_stt=has_native_stt,
     )
-    return asdict(cap)
+    resp = asdict(cap)
+    resp["duplex"] = await asyncio.to_thread(audio_service.duplex_capability)
+    return resp
 
 
 @router.post("/v1/audio/tts/synthesize")

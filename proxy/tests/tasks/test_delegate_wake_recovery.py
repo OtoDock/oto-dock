@@ -26,6 +26,23 @@ from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
 
 
+# The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
+# the target session must be alive. Tests that exercise the ws route register
+# a fake alive CLI session alongside their notify queue.
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+
+@contextmanager
+def _alive_cli_session(sid):
+    from core.layers.cli import layer as _cli_layer
+    _cli_layer._persistent_sessions[sid] = SimpleNamespace(is_alive=True)
+    try:
+        yield
+    finally:
+        _cli_layer._persistent_sessions.pop(sid, None)
+
+
 def _task() -> TaskDefinition:
     return TaskDefinition(id="task-1", name="sub", agent="pa", prompt="p", scope="agent")
 
@@ -104,10 +121,11 @@ class TestFailedDeliveryRecovery:
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-ok"] = q
         try:
-            asyncio.run(scheduler._do_deliver(
-                "sess-ok", "pa", "wake", _task(),
-                chat_id="chat-ok", output_text="OUT",
-            ))
+            with _alive_cli_session("sess-ok"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-ok", "pa", "wake", _task(),
+                    chat_id="chat-ok", output_text="OUT",
+                ))
             assert task_store.claim_pending_delegate_wake("chat-ok") == []
         finally:
             _dashboard_notify_queues.pop("sess-ok", None)

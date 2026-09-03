@@ -61,6 +61,38 @@ describe('cleanUserMessageText', () => {
     expect(cleanUserMessageText(`${STAMP}\n\ntest`)).toBe('test')
   })
 
+  it('strips a leading duplex-context system-reminder block', () => {
+    // ws/duplex_attach.py::_build_prompt shape — the block is prepended to
+    // the FIRST spoken turn after each attach; the interactive tailer
+    // persists the PTY-typed prompt verbatim.
+    const row =
+      '<system-reminder>\nYou are in a live spoken conversation. Keep ' +
+      'replies short.\n</system-reminder>\n\nwhat is on my calendar today'
+    expect(cleanUserMessageText(row)).toBe('what is on my calendar today')
+  })
+
+  it('hides a row that is ONLY a system-reminder block', () => {
+    const row = '<system-reminder>\ncontext only\n</system-reminder>'
+    expect(cleanUserMessageText(row)).toBeNull()
+  })
+
+  it('strips a time stamp that sat between the block and the text', () => {
+    const row =
+      `<system-reminder>\nctx\n</system-reminder>\n\n${STAMP}\n\nhello`
+    expect(cleanUserMessageText(row)).toBe('hello')
+  })
+
+  it('keeps a message that quotes a system-reminder mid-text', () => {
+    const text =
+      'why does <system-reminder>this</system-reminder> show in my history?'
+    expect(cleanUserMessageText(text)).toBe(text)
+  })
+
+  it('keeps a message starting with an unclosed system-reminder mention', () => {
+    const text = '<system-reminder> is a tag the platform injects'
+    expect(cleanUserMessageText(text)).toBe(text)
+  })
+
   it('hides a harness-injected task-notification row', () => {
     const row =
       '<task-notification>\n<task-id>bhfa2mjno</task-id>\n' +

@@ -161,6 +161,29 @@ async def test_settle_resolved_command_still_nudges(clean_registries):
 
 
 @pytest.mark.asyncio
+async def test_wake_covered_cohort_skips_review_turn(clean_registries):
+    """The CLI's own self-wake review turn (≥2.1.243) covered the cohort —
+    captured inline during settle or via a drain — so the producer must NOT
+    send a second review (double cost, re-telling the model what it just
+    reviewed). The unsurfaced tally clears without a nudge."""
+    from core.events import wake_capture
+    sid = "tp-wake-covered"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1")
+    bgreg.mark_done("cmd-a", surfaced=False)
+    wake_capture.note_captured(sid)
+    try:
+        layer = _FakeLayer(turns=[[_bg_cmd_start()], []])
+        events = await _run(layer, sid)
+        assert layer.prompts == ["do the task"]   # no review turn
+        assert not _nudges(events)
+        assert bgreg.unsurfaced_count == 0        # cleared as covered
+    finally:
+        wake_capture.forget_session(sid)
+
+
+@pytest.mark.asyncio
 async def test_pending_command_drain_resolves_then_nudges(clean_registries):
     """Still-running command at turn end: the producer's post-turn DRAIN
     resolves it (which requires the session lock to be free between sends —
@@ -367,3 +390,51 @@ async def test_no_bg_work_no_nudge(clean_registries):
     events = await _run(layer, sid)
     assert layer.prompts == ["do the task"]
     assert not _nudges(events)
+
+
+@pytest.mark.asyncio
+async def test_nudge_names_finished_commands(clean_registries):
+    """Labels captured at spawn ride the review nudge, so the model can tell
+    WHICH command finished (2026-08-27 dogfooding find)."""
+    sid = "tp-cmd-labels"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t1", label="cmd-a — sleep 5 && echo X")
+    bgreg.mark_done("cmd-a", surfaced=False)
+
+    layer = _FakeLayer(turns=[[_bg_cmd_start()], []])
+    await _run(layer, sid)
+
+    assert "1 background command(s) (cmd-a — sleep 5 && echo X)" in layer.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_nudge_names_finished_agents(clean_registries):
+    sid = "tp-agent-labels"
+    clean_registries.append(sid)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-a", "t1", label='"probe auth" [sub-a]')
+    reg.mark_done("sub-a")
+
+    layer = _FakeLayer(turns=[[_bg_sub_start()], []])
+    await _run(layer, sid)
+
+    assert '1 background agent(s) ("probe auth" [sub-a])' in layer.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_stall_nudge_warns_of_still_running_siblings(clean_registries):
+    """THE dogfooding scenario (staggered jobs): the stall nudge fires for the
+    finished agents while a command still runs — it must say so, or the model
+    reads the still-running job's output file as final."""
+    sid = "tp-still-running"
+    clean_registries.append(sid)
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-stuck", "t1", label="cmd-stuck — sleep 999")
+
+    layer = _FakeLayer(turns=[[_bg_sub_start(), _bg_cmd_start()], []])
+    await _run(layer, sid, bg_stall_nudge=0.05, bg_cmd_ceiling=0.4)
+
+    assert len(layer.prompts) == 2
+    assert "1 background job(s) are still running" in layer.prompts[1]
+    assert "do not treat their output as final" in layer.prompts[1]

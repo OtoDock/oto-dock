@@ -15,6 +15,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { safeHref } from '../../lib/safeUrl'
 import { useQueryClient } from '@tanstack/react-query'
 import type {
   AccountSummary,
@@ -86,6 +87,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     availableFlows[0] || 'authorization_code',
   )
   const [patValue, setPatValue] = useState('')
+  const [patLabel, setPatLabel] = useState('')
 
   // Device-code polling state. Persisted to sessionStorage so
   // a popup close / page refresh resumes the poll instead of losing it.
@@ -298,9 +300,10 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         mcpName: integration.mcp_name,
         token: patValue.trim(),
         services: selectedServices,
-        accountLabel: account?.account_label || '',
+        accountLabel: account?.account_label || patLabel.trim(),
       })
       setPatValue('')
+      setPatLabel('')
       onDone()
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Failed to save token'
@@ -346,6 +349,8 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
   const isPatFlow = selectedFlow === 'personal_access_token'
   const isDeviceCodeFlow = selectedFlow === 'device_code'
   const patUrl = integration.oauth_meta?.pat_instructions_url || ''
+  const patPlaceholder =
+    integration.oauth_meta?.pat_placeholder || 'Paste your token…'
 
   // Microsoft tenant-admin consent: only render the banner / button
   // when the provider is microsoft AND a service requiring admin
@@ -400,7 +405,10 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
                     {FLOW_LABELS[flow] || flow}
                   </div>
                   <div className="text-xs text-p-text-light">
-                    {FLOW_DESCRIPTIONS[flow] || ''}
+                    {(flow === 'personal_access_token' &&
+                      integration.oauth_meta?.pat_description) ||
+                      FLOW_DESCRIPTIONS[flow] ||
+                      ''}
                   </div>
                 </div>
               </label>
@@ -502,10 +510,10 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
                 <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
                   1. Visit{' '}
                   <a
-                    href={
+                    href={safeHref(
                       deviceCode.verification_uri_complete ||
                       deviceCode.verification_uri
-                    }
+                    )}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline font-medium"
@@ -555,23 +563,37 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             <p className="text-xs text-p-text-light">
               Generate a token at{' '}
               <a
-                href={patUrl}
+                href={safeHref(patUrl)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="underline text-brand hover:text-brand-hover"
               >
                 {patUrl}
-              </a>{' '}
-              with the scopes for the services you selected.
+              </a>
+              {services.length > 0
+                ? ' with the scopes for the services you selected.'
+                : '.'}
             </p>
           )}
           <textarea
             value={patValue}
             onChange={(e) => setPatValue(e.target.value)}
-            placeholder="ghp_… or github_pat_…"
+            placeholder={patPlaceholder}
             rows={3}
             className="w-full px-3 py-2 text-sm font-mono border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
           />
+          <input
+            type="text"
+            value={patLabel}
+            onChange={(e) => setPatLabel(e.target.value)}
+            placeholder="Account label (optional)"
+            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
+          />
+          <p className="text-xs text-p-text-light">
+            Set a label to keep this token as its own separate account. If you
+            leave it empty, the account&apos;s own name is used, and saving
+            replaces the token of the account with that name.
+          </p>
           <div className="flex gap-2">
             <button
               onClick={handlePatSave}

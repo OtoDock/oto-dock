@@ -12,16 +12,19 @@ WebSocket (``notify_phone_config_changed``).
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+import config
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from services.phone import phone_adapters
 from storage import credential_store
 from storage import database as task_store
+from storage import phone_call_log_store
 from storage import phone_route_store
 from storage import phone_server_store
 from storage import trigger_store
@@ -33,10 +36,12 @@ router = APIRouter()
 # Call-only platform settings (``phone_`` prefix stripped on the wire).
 _PHONE_SETTING_PREFIX = "phone_"
 
-# AMI secret storage helpers (shared with the config push via the store).
+# Secret storage helpers (shared with the config push via the store).
 AMI_SECRET_KEY = phone_server_store.AMI_SECRET_KEY
+TWILIO_AUTH_TOKEN_KEY = phone_server_store.TWILIO_AUTH_TOKEN_KEY
 _ami_cred_name = phone_server_store.ami_cred_name
 _register_cred_name = phone_server_store.register_cred_name
+_twilio_cred_name = phone_server_store.twilio_cred_name
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +107,7 @@ class PhoneServerCreate(BaseModel):
     credentials: dict = {}
     is_default: bool = False
     ami_secret: str | None = None  # stored encrypted, not on the row
+    twilio_auth_token: str | None = None  # stored encrypted, not on the row
 
 
 class PhoneServerUpdate(BaseModel):
@@ -190,11 +196,27 @@ async def _assert_did_available(
 # Routes CRUD
 # ---------------------------------------------------------------------------
 
+def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
+    """Boolean-flag masking (the ``_decorate_server`` pattern): the PIN value
+    itself never appears in any API response."""
+    return [
+        {
+            **r,
+            "pin_configured": (
+                r["direction"] == "inbound"
+                and bool(phone_route_store.get_route_pin(r["id"]))
+            ),
+        }
+        for r in routes
+    ]
+
+
 @router.get("/v1/admin/phone/routes")
 async def list_phone_routes(user: UserContext | None = Depends(get_current_user)):
     """List all phone routes."""
     require_admin(user)
     routes = await asyncio.to_thread(phone_route_store.get_all_routes)
+    routes = await asyncio.to_thread(_decorate_routes_with_pin, routes)
     return {"routes": routes}
 
 
@@ -309,6 +331,18 @@ async def update_phone_route(
     existing = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Route not found")
+    if (data.get("direction") == "outbound"
+            and existing["direction"] == "inbound"
+            and await asyncio.to_thread(phone_route_store.get_route_pin, route_id)):
+        # A silent flip would strand the encrypted credential AND disarm the
+        # PIN without anyone noticing — make the admin remove it first.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This route has a PIN configured. Remove the PIN before "
+                "changing the route to outbound."
+            ),
+        )
     if data.get("trigger_slug"):
         # Resolve effective agent (post-edit) before validating the trigger
         # belongs to it — the same PUT may rebind both fields.
@@ -401,6 +435,11 @@ async def delete_phone_route(
             logger.warning("Deprovision failed for route %s (deleting anyway): %s", route_id, e)
 
     await asyncio.to_thread(phone_route_store.delete_route, route_id)
+    # Best-effort: drop the route's encrypted PIN credential with it.
+    try:
+        await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
+    except Exception:
+        logger.warning("PIN credential cleanup failed for route %s", route_id)
     logger.info(f"Admin {mask_email(u.email)} deleted phone route: {route_id}")
     await notify_phone_config_changed()
     resp = {"status": "deleted"}
@@ -410,13 +449,91 @@ async def delete_phone_route(
 
 
 # ---------------------------------------------------------------------------
+# Route PIN (inbound access code) — write-only secret sub-resource, the
+# phone-server ami-secret/twilio-auth-token shape. Encrypted at rest
+# (infra_credentials sidecar), surfaced only as ``pin_configured``.
+# ---------------------------------------------------------------------------
+
+_PIN_RE = re.compile(r"^\d{4,6}$")
+
+
+@router.put("/v1/admin/phone/routes/{route_id}/pin")
+async def set_phone_route_pin(
+    route_id: str,
+    req: SecretSet,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Set the route's inbound PIN (4-6 digits). The value is never echoed
+    back, never logged, and never appears in route responses."""
+    u = require_admin(user)
+    route = await asyncio.to_thread(phone_route_store.get_route, route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+    if route["direction"] != "inbound":
+        raise HTTPException(
+            status_code=400, detail="PIN protection is for inbound routes only")
+    if not _PIN_RE.fullmatch(req.value or ""):
+        raise HTTPException(
+            status_code=400, detail="The PIN must be 4 to 6 digits")
+    await asyncio.to_thread(phone_route_store.set_route_pin, route_id, req.value)
+    logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
+    await notify_phone_config_changed()
+    return {"status": "ok", "pin_configured": True}
+
+
+@router.delete("/v1/admin/phone/routes/{route_id}/pin")
+async def delete_phone_route_pin(
+    route_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    u = require_admin(user)
+    route = await asyncio.to_thread(phone_route_store.get_route, route_id)
+    if not route:
+        raise HTTPException(status_code=404, detail="Route not found")
+    await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
+    logger.info(f"Admin {mask_email(u.email)} removed the PIN on phone route {route_id}")
+    await notify_phone_config_changed()
+    return {"status": "ok", "pin_configured": False}
+
+
+# ---------------------------------------------------------------------------
+# Call log (per-route detail view)
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/phone/call-log")
+async def get_phone_call_log(
+    route_id: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Newest-first call rows (optionally one route's) with outcomes —
+    including PIN failures/cooldowns and capacity rejects."""
+    require_admin(user)
+    limit = max(1, min(int(limit), config.MAX_PAGE_SIZE))
+    offset = max(0, int(offset))
+    calls, total = await asyncio.to_thread(
+        phone_call_log_store.list_calls, route_id or None,
+        offset=offset, limit=limit,
+    )
+    return {"calls": calls, "total": total}
+
+
+# ---------------------------------------------------------------------------
 # Phone servers CRUD
 # ---------------------------------------------------------------------------
 
 def _decorate_server(server: dict) -> dict:
-    """Attach the AMI-secret-configured flag the pill UI renders."""
+    """Attach the secret-configured flags the pill UI renders."""
     creds = credential_store.get_infra_credentials(_ami_cred_name(server["id"]))
-    return {**server, "ami_secret_configured": bool(creds.get(AMI_SECRET_KEY, ""))}
+    twilio_creds = credential_store.get_infra_credentials(
+        _twilio_cred_name(server["id"]))
+    return {
+        **server,
+        "ami_secret_configured": bool(creds.get(AMI_SECRET_KEY, "")),
+        "twilio_auth_token_configured": bool(
+            twilio_creds.get(TWILIO_AUTH_TOKEN_KEY, "")),
+    }
 
 
 @router.get("/v1/admin/phone-servers")
@@ -440,7 +557,7 @@ async def create_phone_server(
             status_code=400,
             detail=f"Adapter type {req.adapter_type!r} is disabled on this install",
         )
-    data = req.model_dump(exclude={"ami_secret"})
+    data = req.model_dump(exclude={"ami_secret", "twilio_auth_token"})
     try:
         server = await asyncio.to_thread(phone_server_store.create_server, data)
     except Exception as e:  # unique name collision, etc.
@@ -449,6 +566,12 @@ async def create_phone_server(
         await asyncio.to_thread(
             credential_store.set_infra_credentials,
             _ami_cred_name(server["id"]), {AMI_SECRET_KEY: req.ami_secret},
+        )
+    if req.twilio_auth_token:
+        await asyncio.to_thread(
+            credential_store.set_infra_credentials,
+            _twilio_cred_name(server["id"]),
+            {TWILIO_AUTH_TOKEN_KEY: req.twilio_auth_token},
         )
     logger.info(f"Admin {mask_email(u.email)} created phone server: {server['name']} ({server['adapter_type']})")
     await notify_phone_config_changed()
@@ -488,6 +611,7 @@ async def delete_phone_server(
         raise HTTPException(status_code=404, detail="Phone server not found")
     await asyncio.to_thread(credential_store.delete_infra_credentials, _ami_cred_name(server_id))
     await asyncio.to_thread(credential_store.delete_infra_credentials, _register_cred_name(server_id))
+    await asyncio.to_thread(credential_store.delete_infra_credentials, _twilio_cred_name(server_id))
     logger.info(f"Admin {mask_email(u.email)} deleted phone server: {server_id}")
     await notify_phone_config_changed()
     return {"status": "deleted"}
@@ -532,6 +656,36 @@ async def delete_phone_server_ami_secret(
     u = require_admin(user)
     await asyncio.to_thread(credential_store.delete_infra_credentials, _ami_cred_name(server_id))
     logger.info(f"Admin {mask_email(u.email)} deleted AMI secret for phone server: {server_id}")
+    await notify_phone_config_changed()
+    return {"status": "deleted"}
+
+
+@router.put("/v1/admin/phone-servers/{server_id}/twilio-auth-token")
+async def set_phone_server_twilio_auth_token(
+    server_id: int, req: SecretSet,
+    user: UserContext | None = Depends(get_current_user),
+):
+    u = require_admin(user)
+    server = await asyncio.to_thread(phone_server_store.get_server, server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Phone server not found")
+    await asyncio.to_thread(
+        credential_store.set_infra_credentials,
+        _twilio_cred_name(server_id), {TWILIO_AUTH_TOKEN_KEY: req.value},
+    )
+    logger.info(f"Admin {mask_email(u.email)} set Twilio auth token for phone server: {server_id}")
+    await notify_phone_config_changed()
+    return {"status": "saved"}
+
+
+@router.delete("/v1/admin/phone-servers/{server_id}/twilio-auth-token")
+async def delete_phone_server_twilio_auth_token(
+    server_id: int, user: UserContext | None = Depends(get_current_user),
+):
+    u = require_admin(user)
+    await asyncio.to_thread(
+        credential_store.delete_infra_credentials, _twilio_cred_name(server_id))
+    logger.info(f"Admin {mask_email(u.email)} deleted Twilio auth token for phone server: {server_id}")
     await notify_phone_config_changed()
     return {"status": "deleted"}
 

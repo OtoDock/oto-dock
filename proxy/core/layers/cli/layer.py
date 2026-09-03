@@ -108,12 +108,17 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
 
     et = chunk.event_type
 
+    # CLI-synthesized interrupt noise: on a graceful interrupt the CLI can
+    # emit a "[ede_diagnostic] result_type=… stop_reason=…" marker — as
+    # assistant text (invisible before N1 — the hard kill never persisted
+    # partial turns), or as an is_error RESULT when the interrupt lands
+    # mid-tool-use (stop_reason=tool_use; live-hit 2026-08-11: a duplex
+    # barge-in during a web search rendered "Error: [ede_diagnostic] …" in
+    # the chat). Never user-facing content; drop it on BOTH paths.
+    _ede_noise = bool(chunk.text) and chunk.text.lstrip().startswith("[ede_diagnostic]")
+
     if et == "text" and chunk.text:
-        # CLI-synthesized interrupt noise: on a graceful interrupt the CLI can
-        # emit a "[ede_diagnostic] result_type=… stop_reason=…" marker as
-        # assistant text (invisible before N1 — the hard kill never persisted
-        # partial turns). Never user-facing content; drop it.
-        if not chunk.text.lstrip().startswith("[ede_diagnostic]"):
+        if not _ede_noise:
             events.append(CommonEvent(type=TEXT, data={"content": chunk.text}))
 
     elif et == "thinking":
@@ -191,7 +196,7 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
         events.append(CommonEvent(type=METADATA, data=chunk.event_data))
 
     # Error flag — can coexist with any event type
-    if chunk.is_error and chunk.text:
+    if chunk.is_error and chunk.text and not _ede_noise:
         events.append(CommonEvent(type=ERROR, data={"message": chunk.text}))
 
     # Done flag — turn boundary, always last
@@ -295,6 +300,7 @@ class CLIExecutionLayer(ExecutionLayer):
             extra_ro_binds=cli_install_ro_binds(app_config.CLAUDE_BIN),
             config_visible=ctx.config_visible if ctx else None,
             mount_shared=ctx.mount_shared if ctx else True,
+            knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)) if ctx else False,
             # The PRE-sandbox build file (sessions/) still carries host
             # mcps/ paths — scanned for the per-MCP dir binds.
             mcp_config_path=config.mcp_config_path,
@@ -511,6 +517,24 @@ class CLIExecutionLayer(ExecutionLayer):
         await interrupt_persistent_session(session_id)
         return False
 
+    async def interrupt_for_queued(self, session_id: str) -> bool:
+        """Stop-and-send: graceful-ONLY interrupt for a queued typed message.
+
+        Same stdin ``control_request {interrupt}`` as ``abort``'s graceful
+        path, but with NO killpg fallback and NO watchdog — if there is no
+        live turn (or the pipe is dead) the message just waits for the
+        natural turn end. The pending-permission release mirrors ``abort``:
+        a turn parked on a hook permission cannot close otherwise, and a
+        user typing instead of clicking the card is redirecting the agent.
+        """
+        session = _persistent_sessions.get(session_id)
+        if session is None or not session.is_alive:
+            return False
+        if not await session.interrupt_turn():
+            return False
+        resolve_session_permissions(session_id, approved=False)
+        return True
+
     async def close_session(self, session_id: str) -> None:
         """Close and remove the persistent session."""
         # Best-effort: writeback any credential_dir files to central location
@@ -603,13 +627,20 @@ class CLIExecutionLayer(ExecutionLayer):
 
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
         """Drain an idle CLI session's stdout to resolve background-command
-        completions (badge clear + registry). Used post-turn by the bg-command
-        monitor — bg bash has no completion hook, so this active read is the only
-        signal. Safe under the shared PersistentSession lock (no double reader)."""
+        completions (badge clear + registry) and capture self-wake turns.
+        Used post-turn by the bg monitors — bg bash has no completion hook,
+        so this active read is the only signal. Safe under the shared
+        PersistentSession lock (no double reader)."""
         session = _persistent_sessions.get(session_id)
         if session is None:
             return False
         return await session.drain_bg_commands(budget=budget)
+
+    async def session_self_wakes(self, session_id: str) -> bool:
+        """Claude ≥2.1.243 self-wakes after background completions — the bg
+        monitors give that wake a grace window before nudging (codex layers
+        have no such method → no grace)."""
+        return session_id in _persistent_sessions
 
     async def is_session_process_dead(self, session_id: str) -> bool:
         """Check if session exists in pool but its CLI process has died."""

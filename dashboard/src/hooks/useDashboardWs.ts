@@ -88,10 +88,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const currentChatId = useRef<string | null>(null)
   const reconnectedRef = useRef(false)
   // title_updated fallback-invalidation bounds (see the handler): once per
-  // chat id + a min interval so rename bursts can't refetch-storm the
-  // Active-now seed; plus the debounce for the task-list invalidation.
+  // chat id + a PER-ID cooldown so rename bursts can't refetch-storm the
+  // Active-now seed; plus the debounce for the task-list invalidation. The
+  // cooldown must be per id, never shared — a global timestamp let a rename
+  // burst on chat X swallow the only frame chat Y ever gets.
   const titleInvalidatedIds = useRef<Set<string>>(new Set())
-  const lastTitleInvalidateAt = useRef(0)
+  const lastTitleInvalidateAt = useRef<Map<string, number>>(new Map())
   const taskChatsInvalidateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Track last reported IANA timezone so we can re-send on visibility change
   // when the user crosses time zones (laptop closed in Athens, opened in NYC).
@@ -778,17 +780,19 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               }))
             if (!matched) {
               // No row to patch — the frame beat the chat's appearance in the
-              // widget cache (and the one-shot store reseed may already be
-              // spent for this id). Refetch the seed, BOUNDED like the reseed
-              // discipline: once per chat id + a min interval, so a rename
-              // burst (task-definition rename fans one frame per live run)
-              // can't turn into a refetch storm. Renamed idle chats hit this
-              // too — the per-id set is what keeps that cheap.
+              // widget cache. Refetch the seed, BOUNDED: once per chat id +
+              // a per-id 5s cooldown, so a rename burst (task-definition
+              // rename fans one frame per live run) can't turn into a
+              // refetch storm — and can't swallow another chat's only frame,
+              // which a shared timestamp did. Renamed idle chats hit this
+              // too — the per-id set is what keeps that cheap. If the burned
+              // invalidate's refetch races empty (chat still warming), the
+              // hook's bounded reseed retry is the backstop.
               const now = Date.now()
               if (!titleInvalidatedIds.current.has(msg.chat_id) &&
-                  now - lastTitleInvalidateAt.current > 5000) {
+                  now - (lastTitleInvalidateAt.current.get(msg.chat_id) ?? 0) > 5000) {
                 titleInvalidatedIds.current.add(msg.chat_id)
-                lastTitleInvalidateAt.current = now
+                lastTitleInvalidateAt.current.set(msg.chat_id, now)
                 queryClient.invalidateQueries({ queryKey: ['active-chats'] })
               }
             }
