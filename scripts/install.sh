@@ -77,6 +77,17 @@ if ! docker info >/dev/null 2>&1; then
   'docker' group?  (sudo usermod -aG docker \$USER — then log out and back in.)"
 fi
 
+# Architecture — the release images publish linux/amd64 + linux/arm64 manifests.
+# Anything else has no matching manifest, and the failure would otherwise surface
+# much later as an opaque "no match for platform" pull error.
+_arch="$(uname -m)"
+case "$_arch" in
+    x86_64|amd64|aarch64|arm64) ;;
+    *) fail "unsupported CPU architecture '$_arch'. The release images are built for
+  x86-64 and arm64 only. To run on this host, build from source instead:
+      https://github.com/OtoDock/oto-dock/blob/main/CONTRIBUTING.md" ;;
+esac
+
 # --- 2. Install directory ----------------------------------------------------
 # The install lands right here, in the directory the script is run from —
 # give it a folder of its own first (mkdir otodock && cd otodock). OTODOCK_DIR

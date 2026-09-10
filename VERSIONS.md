@@ -26,6 +26,24 @@ NODE_IMAGE=node:24.18.0-slim
 
 Pinned to exact minor+patch. For CI gold standard, bump these to digest pins (`@sha256:...`) when the deployment matures.
 
+## Published image architectures
+
+| Image | linux/amd64 | linux/arm64 |
+|-------|-------------|-------------|
+| `otodock-proxy` | yes | yes |
+| `otodock-file-tools` | yes | yes |
+| `otodock-phone` | yes | **no** |
+
+The release tags are manifest lists, so `docker pull` resolves per host and no
+Compose change is needed on either architecture.
+
+`otodock-phone` is amd64-only: `silero-vad-lite` (pinned in the
+compatibility-locked table below) publishes no aarch64 wheel, and its sdist
+hardcodes a `linux-x64` static ONNX Runtime, so an arm64 build links against the
+wrong architecture. Telephony is an optional overlay
+(`docker-compose.phone.yml`), so arm64 hosts run the rest of the platform
+normally; `OTODOCK_PHONE=0 scripts/compose.sh …` skips it in the source flow.
+
 ## Runtime binary versions
 
 These are what the platform installer installs on the host machine (every install path that provisions a host runs `scripts/install-baseline-tools.{sh,ps1}`).
