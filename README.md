@@ -241,8 +241,8 @@ See all features at [otodock.io/features](https://otodock.io/features).
 
 ## Quick start
 
-A Linux server with Docker is all you need (4 GB RAM minimum, see the
-[sizing guide](https://docs.otodock.io/getting-started/installation#how-much-ram)).
+A Linux server with Docker is all you need (x86-64 or arm64, 4 GB RAM minimum,
+see the [sizing guide](https://docs.otodock.io/getting-started/installation#how-much-ram)).
 Create a folder for the install, then run the script in it:
 
 ```bash

@@ -41,7 +41,10 @@ FROM ${NODE_IMAGE} AS node
 # (The ~18 MB wake-word wasm/model bundle is NOT here — it ships inside
 # proxy/assets/kws via the `COPY proxy/` below, deliberately outside dist/ so
 # `cap sync` never copies it into the APK.)
-FROM ${NODE_IMAGE} AS dashboard
+# Pinned to $BUILDPLATFORM: dist/ is arch-neutral JS, so there is no reason to
+# rebuild (or, under QEMU, emulate) this stage per target architecture. The
+# `node` stage above must NOT do this — it donates target-arch binaries.
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS dashboard
 WORKDIR /build
 COPY dashboard/package.json dashboard/package-lock.json ./
 RUN npm ci
