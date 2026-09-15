@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from auth.providers import get_current_user, require_auth, UserContext
 from auth import claude_oauth
 from services.engines import subscription_pool
-from storage import subscription_store
+from storage.billing import subscription_store
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -158,6 +158,21 @@ async def oauth_exchange(
         subscription_type = fetched_type
         rate_limit_tier = rate_limit_tier or fetched_tier
 
+    # A grant Claude Code cannot run on is refused HERE, before any store
+    # write: stored active it would be selected (and scope-stickily reused)
+    # while every turn fails inside the CLI, and a reconnect with a
+    # downgraded grant must never overwrite a good row's tokens. Public
+    # issue #3. The 400 detail is what both connect forms display.
+    refusal = claude_oauth.grant_refusal(scopes, subscription_type)
+    if refusal:
+        account = token_data.get("account") or {}
+        logger.warning(
+            "Claude OAuth exchange refused for %s: scopes=%s subscriptionType=%s",
+            account.get("email_address") or account.get("uuid") or "<no identity>",
+            scopes, subscription_type or "-",
+        )
+        raise HTTPException(400, refusal)
+
     # Build credential data in the same format as .credentials.json
     oauth_token = {
         "accessToken": access_token,
@@ -277,6 +292,9 @@ async def oauth_exchange(
     # A freshly (re)connected account may be the replacement that sessions
     # stuck on a delisted/removed subscription are waiting for.
     subscription_pool.schedule_rebind("claude oauth connect")
+    # The account's window bars show right after the connect.
+    from services.engines import subscription_windows
+    subscription_windows.schedule_poll(str(sub.get("id") or ""))
     return {
         "subscription": sub,
         "subscription_type": subscription_type,

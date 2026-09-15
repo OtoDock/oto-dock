@@ -29,6 +29,43 @@ REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 
 # All scopes from the CLI (union of console + claude.ai scopes)
 SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+# The one scope inference needs. The authorization server DOWNGRADES the
+# grant for an Anthropic Console (API) account: it answers the request above
+# with `org:create_api_key user:file_upload user:profile` and
+# `subscriptionType: api_individual` — a "create an API key" grant that
+# Claude Code treats as not logged in.
+INFERENCE_SCOPE = "user:inference"
+_CONSOLE_SUBSCRIPTION_TYPES = frozenset({"api_individual"})
+
+
+def grant_refusal(scopes: list[str], subscription_type: str) -> str:
+    """Why a freshly exchanged login grant cannot serve Claude Code, or ``""``.
+
+    Refuses a grant whose reported scopes lack :data:`INFERENCE_SCOPE`, and a
+    grant that reports no scopes at all but a Console subscription type. A
+    grant that reports neither is trusted — the exchange must keep working if
+    the token endpoint ever stops sending the ``scope`` field. The reason is
+    the message the dashboard shows under the code box, so it names what was
+    granted and the two things that do work.
+    """
+    granted = [s for s in (scopes or []) if s]
+    sub_type = (subscription_type or "").strip()
+    if granted and INFERENCE_SCOPE in granted:
+        return ""
+    if not granted and sub_type not in _CONSOLE_SUBSCRIPTION_TYPES:
+        return ""
+    what = (
+        f"scopes {', '.join(granted)}" if granted else "no inference scope"
+    )
+    if sub_type:
+        what += f"; subscription type {sub_type}"
+    return (
+        "This Anthropic account granted Console (API) access only "
+        f"({what}), not a Claude subscription — Claude Code would answer "
+        "every turn with \"Not logged in\". Connect an account that has a "
+        "Claude subscription, or add this account's API key as an API-key "
+        "credential instead."
+    )
 
 
 def generate_pkce() -> tuple[str, str]:

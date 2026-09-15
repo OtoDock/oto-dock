@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from storage import database as task_store
-from storage import agent_store
+from storage.agents import agent_store
 from core.session.session_manager import get_execution_layer
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, PRODUCER_DONE,
@@ -928,12 +928,13 @@ async def start_meeting(meeting_id: str) -> None:
     # budget. Block before spawning any session if already over. Best-effort —
     # the reason surfaces on the meeting (summary + failed status).
     try:
-        from services.billing import usage_service
+        from services.billing import pool_caps, usage_service
+        from services.engines import subscription_pool
         m_scope = meeting.get("scope", "user")
         blocked_reason = ""
+        host_chat = task_store.get_chat(meeting["parent_chat_id"]) or {}
+        host_agent = host_chat.get("agent") or meeting.get("moderator", "")
         if m_scope == "agent":
-            host_chat = task_store.get_chat(meeting["parent_chat_id"]) or {}
-            host_agent = host_chat.get("agent") or meeting.get("moderator", "")
             if host_agent:
                 ls = await asyncio.to_thread(usage_service.check_agent_limit, host_agent)
                 if not ls["allowed"]:
@@ -946,6 +947,23 @@ async def start_meeting(meeting_id: str) -> None:
             )
             if not ls["allowed"]:
                 blocked_reason = "User usage limit exceeded"
+        # The subscription pool cap, on the host agent's engine (a participant
+        # on another engine is refused by the pool at its own spawn).
+        if not blocked_reason and host_agent:
+            host_layer = (agent_store.get_agent(host_agent) or {}).get(
+                "execution_path", "claude-code-cli")
+            if m_scope == "agent":
+                cap = await asyncio.to_thread(pool_caps.evaluate, "platform", "", host_layer)
+                cap_sub = None
+            else:
+                cap_sub = meeting.get("created_by") or ""
+                cap = await asyncio.to_thread(pool_caps.evaluate, "user", cap_sub, host_layer)
+            if not cap.allowed and (
+                cap.on_reached != "continue"
+                or not await asyncio.to_thread(
+                    subscription_pool.cap_continue_available, host_layer, cap_sub)
+            ):
+                blocked_reason = cap.short_reason()
         if blocked_reason:
             logger.warning(f"Meeting {meeting_id} blocked by usage limit: {blocked_reason}")
             await _notify_meeting_failed(meeting_id, blocked_reason)
@@ -990,21 +1008,37 @@ async def start_meeting(meeting_id: str) -> None:
     # target — BEFORE acquiring slots, so we reserve only the LOCAL participants
     # against the local ceiling G (a participant routed to a satellite is bounded
     # by THAT satellite's budget, not the proxy's). Building a config spawns
-    # nothing and takes no slot/subscription (that's start_session), so it is
-    # safe before the atomic acquire.
-    try:
-        _cfgs = await asyncio.gather(
-            *[build_meeting_agent_config(slug, meeting, session_id_map[slug])
-              for slug in participants]
-        )
-    except Exception as e:
-        logger.error(f"Meeting {meeting_id}: failed to build participant configs: {e}", exc_info=True)
-        await _notify_meeting_failed(
-            meeting_id,
-            f"The meeting could not start: failed to prepare participant sessions ({str(e)[:200]}).",
-        )
+    # nothing and takes no slot, so it is safe before the atomic acquire — but
+    # it DOES take a pool seat per participant (the subscription acquire lives
+    # in the builder), which only start_session's bind lets a close release:
+    # every exit below that abandons a built config returns its seat
+    # (config_builder.release_config_seat).
+    from core.config.config_builder import release_config_seat
+    _built = await asyncio.gather(
+        *[build_meeting_agent_config(slug, meeting, session_id_map[slug])
+          for slug in participants],
+        return_exceptions=True,
+    )
+    _build_err = next((r for r in _built if isinstance(r, BaseException)), None)
+    if _build_err is not None:
+        from services.engines.subscription_pool import NoSubscriptionError
+        logger.error(f"Meeting {meeting_id}: failed to build participant configs: {_build_err}",
+                     exc_info=_build_err)
+        for slug, r in zip(participants, _built):
+            if not isinstance(r, BaseException):
+                release_config_seat(session_id_map[slug], r)
+        if isinstance(_build_err, NoSubscriptionError):
+            # The pool refused a participant (its subscription cap, or a
+            # user-scope block): the reason is the message, not a crash.
+            await _notify_meeting_failed(
+                meeting_id, f"The meeting could not start: {_build_err}")
+        else:
+            await _notify_meeting_failed(
+                meeting_id,
+                f"The meeting could not start: failed to prepare participant sessions ({str(_build_err)[:200]}).",
+            )
         return
-    agent_cfgs = dict(zip(participants, _cfgs))
+    agent_cfgs = dict(zip(participants, _built))
     sid_targets = {session_id_map[slug]: (cfg.execution_target or "local")
                    for slug, cfg in agent_cfgs.items()}
     sid_paths = {session_id_map[slug]: (cfg.execution_path or "")
@@ -1015,6 +1049,8 @@ async def start_meeting(meeting_id: str) -> None:
     adm = await acquire_meeting_slots(all_sids, targets=sid_targets, exec_paths=sid_paths)
     if not adm:
         logger.error(f"Meeting {meeting_id}: denied — {adm.user_message}")
+        for slug, cfg in agent_cfgs.items():
+            release_config_seat(session_id_map[slug], cfg)
         await _notify_meeting_failed(
             meeting_id,
             adm.user_message or "The platform cannot start the meeting right now.",
@@ -1090,13 +1126,19 @@ async def start_meeting(meeting_id: str) -> None:
         # populated only after a fully-successful gather and is always empty
         # here (the pre-fix rollback closed nothing, orphaning every sibling
         # that spawned before the failing participant).
+        from services.engines import subscription_pool as _pool
         for slug in participants:
             sid = session_id_map[slug]
             layer = _meeting_session_layers.pop(sid, None)
-            if layer is None:
-                continue  # never reached start_session — nothing to close
-            with contextlib.suppress(Exception):
-                await layer.close_session(sid)
+            # A participant that spawned and bound owns its seat: closing it
+            # releases it. One that never bound (never reached start_session,
+            # or whose start_session raised) still holds the build's seat.
+            was_bound = _pool.session_bound(sid)
+            if layer is not None:
+                with contextlib.suppress(Exception):
+                    await layer.close_session(sid)
+            if not was_bound:
+                release_config_seat(sid, agent_cfgs[slug])
         release_meeting_slots(all_sids)
         await _notify_meeting_failed(
             meeting_id,

@@ -35,7 +35,8 @@ async def record_platform_write(agent_slug: str, rel_path: str, writer: str | No
     """Versioned-sync bookkeeping for a platform-side write: retire any tombstone
     (the path is live again) and record the author (username slug) for cross-user
     conflict attribution. Best-effort; runs regardless of remote targets."""
-    from storage import file_tombstones_store, file_author_store
+    from storage.files import file_tombstones_store
+    from storage.files import file_author_store
     await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
     if writer:
         await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
@@ -45,7 +46,8 @@ async def record_platform_write(agent_slug: str, rel_path: str, writer: str | No
 async def tombstone_path(agent_slug: str, rel_path: str) -> None:
     """Record a delete tombstone + forget the author for one platform file path,
     so an idle satellite APPLIES the delete (never resurrects it) at next sync."""
-    from storage import file_tombstones_store, file_author_store
+    from storage.files import file_tombstones_store
+    from storage.files import file_author_store
     await asyncio.to_thread(
         file_tombstones_store.record, agent_slug, rel_path, time.time(), origin="dashboard",
     )
@@ -195,7 +197,7 @@ async def delete_platform_file(agent_slug: str, agent_dir: Path, target: Path) -
         except OSError:
             content = b""
         if content:
-            from storage import recover_bin_store
+            from storage.files import recover_bin_store
             await asyncio.to_thread(
                 recover_bin_store.capture, agent_slug, rel, content, "deleted",
             )

@@ -11,7 +11,7 @@ import logging
 
 import config
 
-from storage import credential_store
+from storage.identity import credential_store
 from storage import database as task_store
 
 from .asterisk_freepbx import AsteriskFreePBXAdapter

@@ -24,7 +24,7 @@ SID = "11111111-2222-4333-8444-555555555555"
 
 @pytest.fixture
 def agent(temp_db):
-    from storage import agent_store
+    from storage.agents import agent_store
     slug = f"pcb-{uuid.uuid4().hex[:6]}"
     agent_store.create_agent(slug, "Support")
     persona = config.get_agent_dir(slug) / "config" / "agent.md"
@@ -185,3 +185,18 @@ def test_execution_target_resolver_passes_role_and_user(monkeypatch):
     assert seen == {"sub": "u1", "role": "manager"}
     pcb.resolve_phone_execution_target("a")
     assert seen == {"sub": None, "role": "viewer"}
+
+
+@pytest.mark.asyncio
+async def test_pool_refusal_fails_the_build(agent, stubs, monkeypatch):
+    """A pool cap refusal must reach the call handler (the warmup fails),
+    never a spawn on whatever credential file the agent dir still holds."""
+    from services.engines import subscription_pool
+
+    def _refuse(*a, **k):
+        raise subscription_pool.NoSubscriptionError("pool_cap")
+    monkeypatch.setattr(subscription_pool, "resolve_subscription_env", _refuse)
+    with pytest.raises(subscription_pool.NoSubscriptionError):
+        await pcb.build_phone_agent_config(
+            agent, route_identity=_identity(agent), session_id=SID, call_type="inbound",
+        )

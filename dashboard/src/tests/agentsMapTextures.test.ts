@@ -144,7 +144,7 @@ describe('the map wires the late texture in', () => {
     // Teeth for the actual bug: the fix is only real if the loader CALLS the
     // patch. Re-adding assetsTick to the dynamic effect instead would rebuild
     // every agent chip's CSS3D DOM on a texture arrival.
-    const src = await import('@/components/agents-map/AgentsMap3D?raw')
+    const src = await import('@/components/agents-map/useMapRenderer?raw')
       .then((m) => m.default as string)
     const woodLoader = src.slice(src.indexOf('load(woodUrl'))
     const callSite = woodLoader.indexOf('applyWoodTexture(bag.dynamic')

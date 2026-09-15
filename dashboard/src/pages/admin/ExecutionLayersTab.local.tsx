@@ -125,13 +125,20 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
         </button>
         {manageable && (
           <button
-            onClick={() => {
-              const busy = rows.reduce((n, e) => n + e.active_sessions, 0)
-              if (busy > 0) {
-                alert(`Cannot remove: ${busy} active sessions`)
-                return
+            onClick={async () => {
+              // The server judges "in use" on its live bindings (the counter
+              // shown here can read stale) and answers 409 only for sessions
+              // really running — the admin may still remove it and let them move.
+              if (!confirm('Remove this local endpoint from every engine?')) return
+              try {
+                await del.mutateAsync({ group: g.group })
+              } catch (e) {
+                const err = e as Error & { status?: number }
+                if (err.status !== 409) return
+                if (confirm(`${err.message}\n\nRemove it anyway? Its running sessions move to another subscription, or stop until one is connected.`)) {
+                  del.mutate({ group: g.group, force: true })
+                }
               }
-              if (confirm('Remove this local endpoint from every engine?')) del.mutate({ group: g.group })
             }}
             className="text-xs text-red-500 hover:text-red-600 transition-colors sm:opacity-0 sm:group-hover:opacity-100"
           >

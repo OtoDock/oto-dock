@@ -16,8 +16,8 @@ import time
 from dataclasses import dataclass
 
 from audio.providers import registry
-from storage import audio_provider_store
-from storage import credential_store
+from storage.prefs import audio_provider_store
+from storage.identity import credential_store
 from storage import database as task_store
 
 # Browser playback rate — chat requests this rate from the TTS provider directly

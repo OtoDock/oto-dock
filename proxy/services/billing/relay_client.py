@@ -137,7 +137,7 @@ ACCOUNT_TOKEN_KEY = "account_token"
 
 def get_account_token() -> str:
     """The per-install OtoDock account-connect token, or '' if not connected."""
-    from storage import credential_store
+    from storage.identity import credential_store
 
     return (credential_store.get_infra_credentials(EVENTS_FORWARD_SECRET_SLUG) or {}).get(
         ACCOUNT_TOKEN_KEY, "",
@@ -147,7 +147,7 @@ def get_account_token() -> str:
 def store_account_token(token: str) -> None:
     """Persist the account-connect token (per-key upsert — leaves the event-forward
     secret in the shared bundle untouched)."""
-    from storage import credential_store
+    from storage.identity import credential_store
 
     credential_store.set_infra_credentials(
         EVENTS_FORWARD_SECRET_SLUG, {ACCOUNT_TOKEN_KEY: token},
@@ -156,7 +156,7 @@ def store_account_token(token: str) -> None:
 
 def clear_account_token() -> None:
     """Drop ONLY the account-connect token (not the whole otodock-relay bundle)."""
-    from storage import credential_store
+    from storage.identity import credential_store
 
     credential_store.delete_infra_credential_key(
         EVENTS_FORWARD_SECRET_SLUG, ACCOUNT_TOKEN_KEY,
@@ -451,7 +451,7 @@ def hosted_oauth_active(mcp_name: str, manifest, flow: str = "") -> bool:
     (NOT :func:`is_available`) so a connected install whose relay isn't live yet
     still routes here and surfaces the explicit "not available" error.
     """
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     oa = manifest.hosted.oauth_app if manifest.hosted else None
     if not (oa and oa.available):

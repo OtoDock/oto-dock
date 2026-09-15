@@ -1,3 +1,5 @@
+import type { LimitPayload } from '../api/usage'
+
 // Codex per-thread long-running goal (GOAL_UPDATE / restore.goal / live_state.goal).
 export interface ThreadGoal {
   objective: string
@@ -170,8 +172,8 @@ export interface WsCallbacks {
   onAborted?: (data: { session_id?: string }) => void
   onQueueEditReturn?: (data: { index: number; text: string }) => void
   onUserMessage?: (content: string) => void
-  onLimitWarning?: (data: { monthly?: any; weekly?: any }) => void
-  onLimitReached?: (data: { monthly?: any; weekly?: any }) => void
+  onLimitWarning?: (data: LimitPayload) => void
+  onLimitReached?: (data: LimitPayload) => void
   onPlanStatus?: (data: { filename: string; status: string }) => void
   onLiveState?: (data: {
     streaming: boolean

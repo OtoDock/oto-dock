@@ -24,7 +24,9 @@ from auth import webhook_providers  # noqa: E402
 from auth.webhook_providers.generic import GenericWebhookProvider  # noqa: E402
 from services.webhooks import webhook_dispatcher  # noqa: E402
 from services.webhooks.event_normalizer import resolve_catalog_keys  # noqa: E402
-from storage import credential_store, trigger_store, webhook_subscription_store  # noqa: E402
+from storage.identity import credential_store # noqa: E402
+from storage.automation import trigger_store # noqa: E402
+from storage.automation import webhook_subscription_store # noqa: E402
 
 _CATALOG = [
     {

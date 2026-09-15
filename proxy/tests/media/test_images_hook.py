@@ -32,7 +32,7 @@ def _post_hook_images(payload: dict, session_id: str = "sess-1") -> object:
     The endpoint takes the session_id from the body, not the header. We mock
     verify_session_match to a no-op so the call doesn't need a real session.
     """
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match"):
         return client.post(
             "/v1/hooks/images",
             json=payload,

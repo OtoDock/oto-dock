@@ -30,6 +30,10 @@ interface Props {
   // {<id>: {answers: [...]}} and calls onAnswerStructured instead of onAnswer.
   requestId?: string
   onAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
+  // A live interactive terminal owns the dialog: the answer is typed in the
+  // TUI's own picker (a card answer would only be held until the parked turn
+  // ends). Render WHAT is asked, nothing to click.
+  readOnly?: boolean
 }
 
 function parseQuestions(toolInput: any): QuestionItem[] {
@@ -48,7 +52,7 @@ function parseQuestions(toolInput: any): QuestionItem[] {
   return [{ question: JSON.stringify(toolInput, null, 2) }]
 }
 
-export default function QuestionDialog({ toolInput, answered, onAnswer, requestId, onAnswerStructured }: Props) {
+export default function QuestionDialog({ toolInput, answered, onAnswer, requestId, onAnswerStructured, readOnly }: Props) {
   const questions = parseQuestions(toolInput)
   const [activeTab, setActiveTab] = useState(0)
   const [selections, setSelections] = useState<Record<number, Set<number>>>({})
@@ -61,6 +65,43 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
         <div className="flex items-center gap-2">
           <span>&#10003;</span>
           <span>Questions answered</span>
+        </div>
+      </div>
+    )
+  }
+
+  if (readOnly) {
+    return (
+      <div
+        data-testid="question-readonly"
+        className="my-2 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 overflow-hidden"
+      >
+        <div className="p-4 space-y-3">
+          {questions.map((qi, idx) => (
+            <div key={idx}>
+              {qi.header && (
+                <p className="text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wide mb-1">
+                  {qi.header}
+                </p>
+              )}
+              <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{qi.question}</p>
+              {Array.isArray(qi.options) && qi.options.length > 0 && (
+                <ul className="mt-1.5 space-y-1">
+                  {qi.options.map((opt, oi) => (
+                    <li key={oi} className="text-sm text-gray-700 dark:text-gray-300">
+                      <span className="font-medium">{opt.label}</span>
+                      {opt.description && (
+                        <span className="text-xs text-gray-500 dark:text-gray-400"> · {opt.description}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Answer in the terminal. The agent is waiting there.
+          </p>
         </div>
       </div>
     )

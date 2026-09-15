@@ -1,10 +1,10 @@
-"""Tests for storage/file_tombstones_store.py — explicit delete tombstones.
+"""Tests for storage/files/file_tombstones_store.py — explicit delete tombstones.
 
 Run individually (the conftest DB pool exhausts if test files run together):
     proxy/venv/bin/python -m pytest tests/storage/test_file_tombstones_store.py
 """
 
-from storage import file_tombstones_store as ts
+from storage.files import file_tombstones_store as ts
 
 A = "agent-x"
 

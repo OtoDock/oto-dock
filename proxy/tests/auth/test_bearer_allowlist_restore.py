@@ -5,7 +5,7 @@ re-adds any vendor-official defaults an admin deleted, without duplicating
 rows or touching admin-added custom entries.
 """
 
-from storage import bearer_allowlist
+from storage.identity import bearer_allowlist
 from storage.pg import get_conn
 
 

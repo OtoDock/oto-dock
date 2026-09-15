@@ -8,8 +8,11 @@ green tests, and explains where different kinds of contributions live.
 - **Platform code** (proxy, dashboard, first-party MCPs, audio) — this repo.
 - **New agents for the catalog** — [OtoDock/community-agents](https://github.com/OtoDock/community-agents).
 - **New MCP tool servers for the catalog** — [OtoDock/community-mcps](https://github.com/OtoDock/community-mcps).
-- **Bugs & ideas** — GitHub issues here. For anything security-sensitive,
-  use [SECURITY.md](SECURITY.md) instead of a public issue.
+- **Bugs & ideas** — GitHub issues here; the issue forms ask for what a
+  maintainer needs first (version, install kind, logs). Questions go to
+  [Discussions](https://github.com/OtoDock/oto-dock/discussions/categories/q-a).
+  For anything security-sensitive, use [SECURITY.md](SECURITY.md) instead
+  of a public issue.
 
 ## Dev setup
 
@@ -92,8 +95,8 @@ npx vitest run                      # unit tests
 
 - Keep PRs focused — one concern per PR reviews quickly.
 - CI runs automatically on every PR (proxy + audio suites against a
-  disposable Postgres, dashboard type-check/build/tests) and must be green —
-  merging is blocked until it is.
+  disposable Postgres, the satellite and phone suites, dashboard
+  type-check/build/tests) and must be green — merging is blocked until it is.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.
 - **AI-assisted contributions** are welcome — much of OtoDock is built that

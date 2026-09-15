@@ -57,7 +57,7 @@ from services.community.community_installer import (
 )
 from services.mcp import mcp_registry
 from services.mcp.mcp_manifest_types import SKILL_ID_MAX_LEN, SKILL_ID_RE
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("claude-proxy.skills-installer")
 

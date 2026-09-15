@@ -7,6 +7,8 @@ import {
   AgentMcpsNotVisibleError,
 } from '../../api/mcps'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
+import McpCategoryFilter, { matchesMcpCategory, type McpCategoryFilterValue } from '../../components/McpCategoryFilter'
+import McpIcon from '../../components/McpIcon'
 import { ServiceAccountBindingDropdown } from '../../components/ServiceAccountBindingDropdown'
 import { useAuth } from '../../contexts/AuthContext'
 import { canManageAgent } from '../../lib/permissions'
@@ -25,6 +27,7 @@ export default function AgentMcps() {
   const [saved, setSaved] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState<McpCategoryFilterValue>('all')
   // When the backend rejects a name (admin revoked between fetch and save),
   // surface the offending names in a banner so the manager understands what
   // changed. We re-fetch automatically; the banner stays for ~5s.
@@ -87,13 +90,16 @@ export default function AgentMcps() {
   }
 
   const q = query.trim().toLowerCase()
-  const filteredMcps = q
-    ? mcpData.mcps.filter(m =>
-        (m.label || '').toLowerCase().includes(q) ||
-        (m.description || '').toLowerCase().includes(q) ||
-        m.name.toLowerCase().includes(q),
-      )
-    : mcpData.mcps
+  const categoryCounts: Record<string, number> = {}
+  for (const m of mcpData.mcps) categoryCounts[m.category] = (categoryCounts[m.category] ?? 0) + 1
+  const filteredMcps = mcpData.mcps.filter(m =>
+    matchesMcpCategory(m.category, categoryFilter) && (
+      !q ||
+      (m.label || '').toLowerCase().includes(q) ||
+      (m.description || '').toLowerCase().includes(q) ||
+      m.name.toLowerCase().includes(q)
+    ),
+  )
   // Per-MCP bundled-skill counts — rendered as a "provides N skills →" chip
   // linking to the Skills tab (the single skill-control surface).
   const skillCounts = new Map<string, number>()
@@ -141,6 +147,7 @@ export default function AgentMcps() {
                 </button>
               )}
             </div>
+            <McpCategoryFilter value={categoryFilter} onChange={setCategoryFilter} counts={categoryCounts} />
             <button
               onClick={() => setShowBrowse(true)}
               className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text hover:bg-p-surface-hover transition-colors"
@@ -174,6 +181,7 @@ export default function AgentMcps() {
                   onChange={() => handleToggle(mcp.name)}
                   className="w-4 h-4 rounded-sm border-gray-300 text-brand focus:ring-brand accent-brand"
                 />
+                <McpIcon size="sm" name={mcp.name} label={mcp.label} category={mcp.category} author={mcp.author} hasIcon={mcp.icon} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center flex-wrap gap-1">
                     <span className="text-sm text-p-text">{mcp.label}</span>

@@ -36,7 +36,9 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from core.config.config_builder import build_agent_config, is_hard_fail_target
+from core.config.config_builder import (
+    build_agent_config, is_hard_fail_target, release_config_seat,
+)
 from core.config.task_config_builder import (
     resolve_task_identity, task_allows_knowledge_rw,
 )
@@ -120,11 +122,15 @@ async def resume_dead_session_headless(
 
     sid = dead_sid
     if not can_resume:
-        # No conversation data → fresh session. Release the old slot
-        # (prepare_resume removed the session from the registry) and clear
-        # any stuck liveness badges from its dead background work.
+        # No conversation data → fresh session. Release the old slot and the
+        # old binding (prepare_resume removed the session from the registry;
+        # a fresh id never meets the binding a resume would have handed over
+        # at bind time) and clear any stuck liveness badges from its dead
+        # background work.
         from core.concurrency import release_chat_slot
+        from services.engines import subscription_pool
         release_chat_slot(dead_sid)
+        subscription_pool.release_subscription(dead_sid)
         clear_session_liveness(dead_sid, reason="resume_failed")
         sid = str(uuid.uuid4())
 
@@ -148,13 +154,17 @@ async def resume_dead_session_headless(
         execution_path=exec_path, chat_id=chat_id, session_id=sid,
         task_identity=task_identity, pinned_target=pinned,
     )
+    # Every exit below abandons the spawn after the build acquired its pool
+    # seat — give it back, or the counter drifts up one per refused heal.
     if is_hard_fail_target(agent_cfg.execution_target):
         # Pinned remote machine offline with fallback disabled — surface it;
         # migrating the session off its workspace would be worse.
+        release_config_seat(sid, agent_cfg)
         raise RuntimeError("session_machine_offline")
     if _resolve_session_interactive(agent_cfg, exec_mode):
-        # v1 scope guard — nothing acquired or mutated yet beyond
-        # prepare_resume, which is what a refused dashboard resume does too.
+        # v1 scope guard — nothing mutated yet beyond prepare_resume, which
+        # is what a refused dashboard resume does too.
+        release_config_seat(sid, agent_cfg)
         raise ResumeUnavailable("interactive_chat")
     agent_cfg.interactive = False
 
@@ -163,6 +173,7 @@ async def resume_dead_session_headless(
                                   execution_path=agent_cfg.execution_path,
                                   user_sub=user_sub)
     if not adm:
+        release_config_seat(sid, agent_cfg)
         raise RuntimeError(adm.user_message)
 
     resolved_layer = get_execution_layer(
@@ -175,6 +186,7 @@ async def resume_dead_session_headless(
     except Exception:
         from core.concurrency import release_chat_slot
         release_chat_slot(sid)
+        release_config_seat(sid, agent_cfg)
         raise
 
     # Per-turn time injection needs the session's TZ; no client_info frame

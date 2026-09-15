@@ -95,14 +95,14 @@ def _set_username(sub: str, username: str) -> None:
 
 def _pin(payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match"):
         return client.post("/v1/hooks/apps/pin", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
 
 def _hook(op: str, payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match"):
         return client.post(f"/v1/hooks/apps/{op}", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
@@ -925,7 +925,7 @@ def test_data_feed_manifest_runtime_and_no_exec(agent_tree):
 
 
 def test_delete_agent_removes_app_rows(agent_tree):
-    from storage import agent_store
+    from storage.agents import agent_store
     _pin({"slug": "s", "html": "<p>s</p>"}, sid=SID_SHARED)
     _pin({"slug": "m", "html": "<p>m</p>"})
     agent_store.create_agent(AGENT, AGENT)
@@ -979,7 +979,7 @@ def test_pin_visibility_user_needs_a_user(agent_tree):
 
 def test_pin_visibility_mode_gate(agent_tree):
     """A Personal-only agent's mode offers no "agent" visibility."""
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent("apps-personal-only", "PO",
                              collaborative=False, default_scope="user")
     sid = "sid-po"
@@ -999,7 +999,7 @@ def test_default_visibility_follows_mode(agent_tree):
     """No visibility arg: an editor+ chat on an agent-FIRST collaborative
     agent defaults to the shared pin (the mode default); a viewer on the
     same agent stays personal (the clamp)."""
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent("apps-agent-first", "AF",
                              collaborative=True, default_scope="agent")
     sid_m, sid_v = "sid-af-m", "sid-af-v"

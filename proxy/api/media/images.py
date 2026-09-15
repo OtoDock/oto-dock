@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import config
-from api.hooks.hooks import _classify_and_pull
+from api.hooks.paths import _classify_and_pull
 from api.sessions.sessions import verify_session_match
 from core.session.session_state import get_session_security
 
@@ -67,7 +67,7 @@ async def create_temp_image_url(
     """Mint a short-lived public URL for one specific image file.
 
     Accepts the same path forms as ``/v1/hooks/*`` endpoints (see
-    ``api/hooks._classify_and_pull``):
+    ``api/hooks/paths.py::_classify_and_pull``):
       1. Real host-absolute path
       2. Agent-relative (``personal-assistant/users/.../foo.png``)
       3. Sandbox-virtual (``/users/<u>/workspace/.../foo.png``) — what stdio

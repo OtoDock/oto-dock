@@ -498,3 +498,36 @@ def test_context_window_match_and_unknown_model_stay_silent(caplog):
             "modelUsage": {"some-custom-model": {"contextWindow": 12345}},
         })
     assert not [r for r in caplog.records if "context window" in r.message]
+
+
+# ---------------------------------------------------------------------------
+# rate_limit_event — the account's window state, for the pool, not the chat
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_INFO = {
+    "status": "allowed", "resetsAt": 1787796000, "rateLimitType": "five_hour",
+    "overageStatus": "rejected", "overageDisabledReason": "out_of_credits",
+    "isUsingOverage": False,
+    "unifiedWindows": {"five_hour": {"utilization": 0.14, "resetsAt": 1787796000},
+                       "seven_day": {"utilization": 0.03, "resetsAt": 1788328800}},
+}
+
+
+def test_rate_limit_event_becomes_a_rate_limit_chunk():
+    from core.layers.cli.settle import chunk_is_content
+    t = ClaudeCLIEventTranslator("s1")
+    out = t.feed({"type": "rate_limit_event", "rate_limit_info": _RATE_LIMIT_INFO,
+                  "uuid": "u1", "session_id": "cli-1"})
+    assert len(out) == 1
+    chunk = out[0]
+    assert chunk.event_type == "rate_limit"
+    assert chunk.event_data == _RATE_LIMIT_INFO
+    assert chunk.text == "" and not chunk.is_done and not chunk.is_error
+    # Not content: it must never prove a turn is streaming.
+    assert not chunk_is_content(chunk)
+
+
+def test_rate_limit_event_without_info_is_dropped():
+    t = ClaudeCLIEventTranslator("s1")
+    assert t.feed({"type": "rate_limit_event"}) == []
+    assert t.feed({"type": "rate_limit_event", "rate_limit_info": "bad"}) == []

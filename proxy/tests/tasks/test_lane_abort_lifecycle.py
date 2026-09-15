@@ -258,6 +258,7 @@ def test_lane_pump_wedged_states(monkeypatch):
 async def test_settle_prior_lane_waits_healthy_and_reaps_wedged(monkeypatch):
     from core.events.stream_pump import _active_pumps
     from services.scheduler import scheduler as sched
+    from services.scheduler import lanes
 
     waited: list[str] = []
     reaped: list[str] = []
@@ -271,8 +272,8 @@ async def test_settle_prior_lane_waits_healthy_and_reaps_wedged(monkeypatch):
         reaped.append(chat_id)
         _active_pumps.pop(chat_id, None)
 
-    monkeypatch.setattr(sched, "_await_lane_quiescence", _fake_wait)
-    monkeypatch.setattr(sched, "_reap_prior_lane_pump", _fake_reap)
+    monkeypatch.setattr(lanes, "_await_lane_quiescence", _fake_wait)
+    monkeypatch.setattr(lanes, "_reap_prior_lane_pump", _fake_reap)
 
     # No pump at all → nothing happens.
     assert await sched._settle_prior_lane("lane-none", "run-1") is False
@@ -283,12 +284,12 @@ async def test_settle_prior_lane_waits_healthy_and_reaps_wedged(monkeypatch):
     pump.session_id = "settle-sess-1"
     pump.is_done = False
     _active_pumps["lane-healthy"] = pump
-    monkeypatch.setattr(sched, "_lane_pump_wedged", lambda p: False)
+    monkeypatch.setattr(lanes, "_lane_pump_wedged", lambda p: False)
     assert await sched._settle_prior_lane("lane-healthy", "run-1") is False
     assert waited == ["lane-healthy"] and reaped == []
 
     # Wedged pump → reaped immediately, reuse vetoed.
     _active_pumps["lane-wedged"] = pump
-    monkeypatch.setattr(sched, "_lane_pump_wedged", lambda p: True)
+    monkeypatch.setattr(lanes, "_lane_pump_wedged", lambda p: True)
     assert await sched._settle_prior_lane("lane-wedged", "run-1") is True
     assert reaped == ["lane-wedged"]

@@ -98,7 +98,7 @@ def test_catalog_toml_line_escapes_windows_paths():
 
 
 def test_model_rows_round_trip_through_the_subscription_env(monkeypatch):
-    from storage import subscription_store
+    from storage.billing import subscription_store
 
     monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [
         {"model_id": "qwen3.6-35b-a3b", "provider": "ollama", "context_window": 131_072},

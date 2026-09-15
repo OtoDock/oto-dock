@@ -15,8 +15,8 @@ from fastapi.testclient import TestClient
 from auth.providers import UserContext, get_current_user
 from services.media import audio_service, duplex_service, ws_audio_token
 from services.phone import phone_config
-from storage import audio_provider_store
-from storage import credential_store
+from storage.prefs import audio_provider_store
+from storage.identity import credential_store
 from storage import database as task_store
 
 
@@ -277,7 +277,7 @@ def test_session_config_overlays_user_voice_picks(temp_db):
     not the chosen one). Native-source picks (device voices the engine
     can't synthesize with) and malformed entries are ignored; languages
     the user never picked keep the row's voice."""
-    from storage import user_audio_prefs_store
+    from storage.prefs import user_audio_prefs_store
 
     p = audio_provider_store.create_provider({
         "provider_type": "tts", "provider_name": "elevenlabs",

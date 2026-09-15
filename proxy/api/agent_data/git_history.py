@@ -20,7 +20,7 @@ import config as app_config
 from auth.providers import UserContext, get_current_user, require_auth
 from services.infra import git_writer
 from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 

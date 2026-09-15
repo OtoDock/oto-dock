@@ -13,7 +13,7 @@ import logging
 
 from services.billing import relay_client
 from services.mcp import mcp_registry
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("claude-proxy.hosted-instances")
 

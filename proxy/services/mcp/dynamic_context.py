@@ -247,8 +247,8 @@ def _build_token_map(
     Tokens that cannot be resolved are simply absent from the map. The
     substitution loop renders absent tokens as the empty string.
     """
-    from storage import agent_store
-    from storage import credential_store
+    from storage.agents import agent_store
+    from storage.identity import credential_store
     from storage import database as task_store
     from services.oauth import credential_resolver
 
@@ -620,7 +620,8 @@ def build_delegation_roster(
     """
     import config as app_config
     from api.agents._common import _get_execution_paths
-    from storage import agent_store, subscription_store
+    from storage.agents import agent_store
+    from storage.billing import subscription_store
 
     models_by_layer: dict[str, list[str]] = {}
 
@@ -679,7 +680,7 @@ def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
     and pass the result through the ``meetings_access`` kwarg; NEVER call
     from a context provider (providers are no-I/O by contract).
     """
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
 
     if not user_sub:
@@ -742,7 +743,8 @@ def _department_line(
     if not dept_id or not level_id:
         return ""
     try:
-        from storage import agent_store, db_departments
+        from storage.agents import agent_store
+        from storage.agents import db_departments
         dept = db_departments.get_department(dept_id)
         if not dept:
             return ""
@@ -831,7 +833,7 @@ def _delegation_mcp_context(
     if not delegation_targets:
         return sibling_block or None
 
-    from storage import agent_store
+    from storage.agents import agent_store
 
     roster: dict[str, list[dict]] = kwargs.get("delegation_roster") or {}
 
@@ -985,7 +987,7 @@ def _meetings_mcp_context(
     their reach IS the roster (the create endpoint clamps to it), so they
     fall back to the roster-derived list.
     """
-    from storage import agent_store as _agent_store
+    from storage.agents import agent_store as _agent_store
 
     access: list[dict] = kwargs.get("meetings_access") or []
     if access:
@@ -1066,7 +1068,7 @@ def _ssh_hosts_context(
     if is_remote and not target_admin_paired:
         return None
 
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     instances = mcp_store.get_mcp_instances_for_agent("ssh-hosts", agent_name)
     if not instances:

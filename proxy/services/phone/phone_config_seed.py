@@ -67,6 +67,12 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     # these defaults in code and are never emitted.
     "audio_wake_word_platform_boost": "2.0",
     "audio_wake_word_platform_threshold": "0.20",
+    # The same pair for the AGENT-NAME lines (2026-09-11, measured on an
+    # operator's real recordings: an accented "hey personal assistant" went
+    # from 14 % to 30 % recall with these riders and a beam of 8, with zero
+    # false fires on control speech; boost above 3 pollutes the beam).
+    "audio_wake_word_agent_boost": "2.0",
+    "audio_wake_word_agent_threshold": "0.20",
     # Chat STT defaults (per-VAD/limits for the WS session)
     "audio_chat_stt_max_seconds": "60",
     "audio_tts_max_chars_per_request": "5000",

@@ -32,7 +32,7 @@ import asyncio
 import logging
 
 import config
-from storage import agent_store
+from storage.agents import agent_store
 from services.mcp import mcp_registry
 from services.mcp import dynamic_context
 from services.engines import subscription_pool
@@ -347,6 +347,10 @@ async def _build_external_config(
         extra_env.update(sub_env)
         if execution_path == "direct-llm":
             extra_env["_USER_SUB"] = ""
+    except subscription_pool.NoSubscriptionError:
+        # The pool refused the spawn (its subscription cap): the call must not
+        # start on whatever credential file the agent dir still holds.
+        raise
     except Exception as e:
         logger.warning(f"Phone subscription acquisition error: {e}")
 

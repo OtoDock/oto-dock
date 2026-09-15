@@ -29,14 +29,14 @@ Unified event format across layers:
 
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 import config
 from core import log_queue
 from startup import lifespan
 from middleware import register_middlewares
+from static_assets import PrecompressedStaticFiles, is_hashed_asset, negotiated_file_response
 
 # --- Logging ---
 
@@ -79,6 +79,7 @@ from api.mcp import credentials as credentials_router
 from api.auth import oauth as oauth_router
 from api.mcp import mcps as mcps_router
 from api.mcp import community as community_router
+from api.mcp import icons as mcp_icons_router
 from api.mcp import local_templates as local_templates_router
 from api.media import uploads as uploads_router
 from api.media import images as images_router
@@ -140,6 +141,7 @@ app.include_router(openai_oauth_router.router)
 app.include_router(oauth_router.router)
 app.include_router(mcps_router.router)
 app.include_router(community_router.router)
+app.include_router(mcp_icons_router.router)
 app.include_router(local_templates_router.router)
 app.include_router(execution_layers_router.router)
 app.include_router(uploads_router.router)
@@ -190,29 +192,25 @@ app.add_api_websocket_route(
 
 # --- Dashboard static files ---
 
+# The build writes .br/.gz siblings next to every text asset and the mount
+# serves whichever the client accepts (static_assets.py). Vite content-hashes
+# the file names, so those are immutable for a year; the unhashed favicon
+# copied from public/ stays revalidated.
 if config.DASHBOARD_ENABLED and config.DASHBOARD_DIST.exists():
     app.mount(
         "/assets",
-        StaticFiles(directory=str(config.DASHBOARD_DIST / "assets")),
+        PrecompressedStaticFiles(
+            directory=str(config.DASHBOARD_DIST / "assets"), immutable=is_hashed_asset),
         name="dashboard-assets",
     )
 
-
-class _ImmutableStaticFiles(StaticFiles):
-    """Static files with far-future immutable caching — for versioned-path
-    assets only (the wake-word wasm/model bundle: ~18 MB the browser must
-    never re-download; the version directory in the URL is the cache buster)."""
-
-    def file_response(self, *args, **kwargs):
-        resp = super().file_response(*args, **kwargs)
-        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        return resp
-
-
+# The wake-word wasm/model bundle (~18 MB the browser must never re-download):
+# the version directory in the URL is the cache buster, so every file is
+# immutable.
 if config.DASHBOARD_ENABLED and config.KWS_ASSETS_DIR.exists():
     app.mount(
         "/kws-assets",
-        _ImmutableStaticFiles(directory=str(config.KWS_ASSETS_DIR)),
+        PrecompressedStaticFiles(directory=str(config.KWS_ASSETS_DIR), immutable=True),
         name="kws-assets",
     )
 
@@ -250,7 +248,7 @@ async def dashboard_legacy_redirect(path: str):
 # SPA catch-all: serve index.html for all paths that don't match API/auth/ws routes.
 # This MUST be registered last so it doesn't shadow other routes.
 @app.get("/{path:path}", include_in_schema=False)
-async def spa_catchall(path: str):
+async def spa_catchall(path: str, request: Request):
     """Serve the React SPA for client-side routing on the subdomain."""
     # kws-assets/ included: a worker importScripts miss must 404 loudly, never
     # serve index.html-as-JS (same discipline as ui-kit below).
@@ -269,9 +267,17 @@ async def spa_catchall(path: str):
             # @font-face fetches are CORS-mode requests (unlike script/style/
             # img) — without this header the kit woff2s are CORS-blocked and
             # artifacts silently fall back to system fonts. Public static
-            # assets, no credentials: '*' is correct.
-            return FileResponse(str(safe), headers={"Access-Control-Allow-Origin": "*"})
-        return FileResponse(str(safe))
+            # assets, no credentials: '*' is correct. The kit JS (echarts,
+            # three, tailwind) has precompressed siblings like /assets; the
+            # kit names are stable across releases, so no immutable caching.
+            return negotiated_file_response(
+                safe, safe.stat(), request.headers,
+                extra_headers={"Access-Control-Allow-Origin": "*"})
+        # Unhashed names that keep their URL across releases (the wake-word
+        # worker, the manifest, the APKs): revalidate on every load (a 304
+        # on the ETag), or a browser's heuristic freshness keeps running the
+        # previous file after the page reloaded onto a new build.
+        return FileResponse(str(safe), headers={"Cache-Control": "no-cache"})
     # /ui-kit/* are subresources of sandboxed artifact iframes (echarts, tokens
     # CSS, fonts) — a miss must 404 loudly, not serve index.html with 200
     # (a <script src> would silently load HTML-as-JS on a build/copy mistake).
@@ -288,7 +294,7 @@ if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Starting OtoDock proxy on {config.HOST}:{config.PORT}")
-    from storage import agent_store as _as
+    from storage.agents import agent_store as _as
     try:
         logger.info(f"Agents: {', '.join(_as.get_agent_slugs())}")
     except Exception as e:

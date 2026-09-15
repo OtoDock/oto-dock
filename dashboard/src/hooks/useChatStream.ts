@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { useDashboardWs } from './useDashboardWs'
 import type { ThreadGoal } from './useDashboardWs.types'
+import type { LimitPayload } from '../api/usage'
 import { useChatStore } from '@/store/chatStore'
 import { getDeviceLocation } from '../lib/geolocation'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
@@ -32,8 +33,11 @@ const SUBSCRIPTION_REASONS = new Set([
 
 export function warmupFailSubtype(
   reason: string | undefined,
-): 'no_subscription' | 'target_unavailable' | 'session_error' {
+): 'no_subscription' | 'pool_cap' | 'target_unavailable' | 'session_error' {
   if (reason && SUBSCRIPTION_REASONS.has(reason)) return 'no_subscription'
+  // The pool's subscription cap refused the spawn: its own card, with the
+  // cap's wording and a way to the Usage tab.
+  if (reason === 'pool_cap') return 'pool_cap'
   if (reason === 'target_unavailable') return 'target_unavailable'
   return 'session_error'
 }
@@ -164,7 +168,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   const [permissionPending, setPermissionPending] = useState(false)
   const [aborting, setAborting] = useState(false)
   const [limitReached, setLimitReached] = useState(false)
-  const [limitWarning, setLimitWarning] = useState<{ monthly?: any; weekly?: any } | null>(null)
+  // Which budget blocked (the platform periods, the own API-key `self`
+  // periods, or the pool cap) — what the composer's banner names.
+  const [limitReachedInfo, setLimitReachedInfo] = useState<LimitPayload | null>(null)
+  const [limitWarning, setLimitWarning] = useState<LimitPayload | null>(null)
 
   // Plans panel state
   const [sessionPlans, setSessionPlans] = useState<SessionPlan[]>([])
@@ -1121,8 +1128,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       setLimitWarning(data)
       setTimeout(() => setLimitWarning(null), 10000)
     },
-    onLimitReached: (_msg) => {
+    onLimitReached: (msg) => {
       if (discardingRef.current) return
+      setLimitReachedInfo(msg)
       setLimitReached(true)
     },
     onUrl: (data) => {
@@ -2184,7 +2192,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     cacheStats,
     permissionPending, setPermissionPending,
     aborting, setAborting,
-    limitReached, setLimitReached,
+    limitReached, setLimitReached, limitReachedInfo,
     limitWarning, setLimitWarning,
     sessionPlans, setSessionPlans,
     currentTodos, setCurrentTodos,

@@ -10,7 +10,7 @@ if str(_PROXY_DIR) not in sys.path:
 
 import config
 from services.engines import subscription_pool
-from storage import subscription_store
+from storage.billing import subscription_store
 import ws.dashboard  # noqa: F401  — the chat module is imported through the WS package
 from ws.dashboard_chat import _codex_provider_switch_blocker
 

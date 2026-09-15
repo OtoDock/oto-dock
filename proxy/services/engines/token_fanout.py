@@ -266,6 +266,15 @@ async def _push_remote(
 async def _tick() -> None:
     from services.engines import subscription_pool as pool
     try:
+        # Provider windows FIRST: a fresh reading of each account's 5-hour /
+        # weekly state lets the rebind and rebalance passes below converge in
+        # this tick instead of the next. Runs before the boot-grace return
+        # too, so a restart never starves the idle accounts' samples.
+        from services.engines import subscription_windows as _windows
+        await _windows.poll_due()
+    except Exception:
+        logger.exception("window poll pass failed")
+    try:
         # Selection-change convergence: re-home sessions bound to delisted
         # subscriptions BEFORE freshening, so the pass below keeps the account
         # each session will actually keep using — and so a rebind whose write
@@ -301,7 +310,7 @@ async def _tick() -> None:
     if pool.within_boot_grace():
         return
     try:
-        from storage import subscription_store as _store
+        from storage.billing import subscription_store as _store
         persisted = await asyncio.to_thread(_store.list_persisted_binding_sub_ids)
         rows = await asyncio.to_thread(_store.list_subscriptions)
     except Exception:

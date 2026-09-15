@@ -285,8 +285,16 @@ def temp_db():
     # agent_store cache is the load-bearing one — its API normally
     # invalidates itself on writes, but TRUNCATE goes around the API.
     try:
-        from storage import agent_store as _agent_store
+        from storage.agents import agent_store as _agent_store
         _agent_store._invalidate_cache()
+    except Exception:
+        pass
+
+    # The pool-cap readings are cached per pool for 30 s; a cap row or a
+    # sample written by the previous test must not be served to the next.
+    try:
+        from services.billing import pool_caps as _pool_caps
+        _pool_caps.clear_cache()
     except Exception:
         pass
 

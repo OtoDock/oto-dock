@@ -1,4 +1,6 @@
-import { useMyUsage, PeriodUsage } from '../api/usage'
+import { useState } from 'react'
+import { useMyUsage, useMyLimits, useSetMyLimit, PeriodUsage, UsageLimit } from '../api/usage'
+import { MyPoolCapSection } from '../components/usage/PoolCapSection'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 
 export function UsageBar({ period }: { period: PeriodUsage | null }) {
@@ -29,6 +31,82 @@ export function UsageBar({ period }: { period: PeriodUsage | null }) {
   )
 }
 
+// The user's own API-key budget: a monthly and a weekly dollar cap on the
+// spend of their own keys (user_self limits), set by the user alone.
+export function MyLimitForm({ limits, onClose }: { limits: UsageLimit[]; onClose: () => void }) {
+  const setLimit = useSetMyLimit()
+  const current = (period: string) => {
+    const l = limits.find(x => x.period === period)
+    return l && l.cost_limit_usd != null ? String(l.cost_limit_usd) : ''
+  }
+  const [monthly, setMonthly] = useState(() => current('monthly'))
+  const [weekly, setWeekly] = useState(() => current('weekly'))
+
+  const handleSave = () => {
+    const m = monthly.trim() === '' ? null : parseFloat(monthly)
+    const w = weekly.trim() === '' ? null : parseFloat(weekly)
+    setLimit.mutate({ period: 'monthly', cost_limit_usd: m == null || isNaN(m) ? null : m })
+    setLimit.mutate({ period: 'weekly', cost_limit_usd: w == null || isNaN(w) ? null : w })
+    onClose()
+  }
+
+  return (
+    <div className="flex flex-wrap items-end gap-3">
+      <div>
+        <div className="text-xs text-p-text-secondary mb-1">Monthly ($)</div>
+        <input type="number" min="0" step="1" placeholder="No cap" aria-label="Monthly ($)"
+          value={monthly} onChange={e => setMonthly(e.target.value)}
+          className="w-24 px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text" />
+      </div>
+      <div>
+        <div className="text-xs text-p-text-secondary mb-1">Weekly ($)</div>
+        <input type="number" min="0" step="1" placeholder="No cap" aria-label="Weekly ($)"
+          value={weekly} onChange={e => setWeekly(e.target.value)}
+          className="w-24 px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text" />
+      </div>
+      <button onClick={handleSave} className="px-3 py-1.5 text-xs rounded-sm bg-brand text-white hover:bg-brand-hover">
+        Save
+      </button>
+      <button onClick={onClose} className="px-3 py-1.5 text-xs rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface">
+        Cancel
+      </button>
+    </div>
+  )
+}
+
+export function MyApiKeysSection({ selfLimits }: { selfLimits: { monthly: PeriodUsage; weekly: PeriodUsage } }) {
+  const { data: limitsData } = useMyLimits()
+  const [editing, setEditing] = useState(false)
+  return (
+    <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4 space-y-4 mb-4">
+      <div className="flex items-baseline justify-between">
+        <div>
+          <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">My API keys</div>
+          <div className="text-xs text-p-text-light mt-0.5">
+            What your own Anthropic or OpenAI API keys spend, and the cap you set on it.
+          </div>
+        </div>
+        <button onClick={() => setEditing(e => !e)} className="text-xs text-brand hover:underline">
+          {editing ? 'Close' : 'Set cap'}
+        </button>
+      </div>
+      <div>
+        <div className="text-xs text-p-text-light mb-1">This month</div>
+        <UsageBar period={selfLimits.monthly} />
+      </div>
+      <div>
+        <div className="text-xs text-p-text-light mb-1">This week</div>
+        <UsageBar period={selfLimits.weekly} />
+      </div>
+      {editing && (
+        <div className="pt-3 border-t border-p-border-light">
+          <MyLimitForm limits={limitsData?.limits ?? []} onClose={() => setEditing(false)} />
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function UsageSection() {
   const { data: usage, isLoading } = useMyUsage()
 
@@ -47,10 +125,7 @@ export function UsageSection() {
     <div className="mb-8">
       <h2 className="text-lg font-medium text-p-text mb-3">Usage</h2>
       <p className="text-sm text-p-text-secondary mb-4">
-        Usage is estimated at standard API pricing. Your <strong>own-subscription</strong> chats
-        and tasks aren’t charged or capped here — your provider enforces those. Any
-        {' '}<strong>Platform API</strong> usage (when you borrow the platform’s API keys /
-        direct-LLM) counts toward the budget below.
+        Your subscription costs are measured at the equivalent API cost.
       </p>
 
       {/* Period summaries */}
@@ -59,7 +134,7 @@ export function UsageSection() {
           <div>
             <div className="flex items-baseline justify-between mb-1">
               <span className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">This Month · Platform API</span>
-              <span className="text-xs text-p-text-light">Own subscription: ${(usage.monthly.self_used ?? 0).toFixed(2)}</span>
+              <span className="text-xs text-p-text-light">Own accounts: ${(usage.monthly.self_used ?? 0).toFixed(2)}</span>
             </div>
             <UsageBar period={usage.monthly} />
           </div>
@@ -68,7 +143,7 @@ export function UsageSection() {
           <div>
             <div className="flex items-baseline justify-between mb-1">
               <span className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">This Week · Platform API</span>
-              <span className="text-xs text-p-text-light">Own subscription: ${(usage.weekly.self_used ?? 0).toFixed(2)}</span>
+              <span className="text-xs text-p-text-light">Own accounts: ${(usage.weekly.self_used ?? 0).toFixed(2)}</span>
             </div>
             <UsageBar period={usage.weekly} />
           </div>
@@ -77,6 +152,14 @@ export function UsageSection() {
           <div className="text-sm text-p-text-light">No usage data yet.</div>
         )}
       </div>
+
+      {/* The user's own subscription accounts and the cap on them. */}
+      <div className="mb-4">
+        <MyPoolCapSection />
+      </div>
+
+      {/* Own API keys: the self-paid subset of "Own accounts" that is real money. */}
+      {usage.self_limits && <MyApiKeysSection selfLimits={usage.self_limits} />}
 
       {/* Daily chart */}
       {usage.daily_chart.length > 0 && (

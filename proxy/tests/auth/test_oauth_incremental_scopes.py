@@ -70,7 +70,7 @@ def _persist(monkeypatch, tmp_path, *, provider_id: str, mcp_name: str,
     """Run persist_oauth_account with everything except the token file stubbed."""
     import config as _config
     from services.mcp import mcp_registry
-    from storage import credential_store
+    from storage.identity import credential_store
     from storage import database as task_store
 
     monkeypatch.setattr(_config, "SESSIONS_DIR", tmp_path, raising=False)

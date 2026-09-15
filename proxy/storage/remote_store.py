@@ -455,7 +455,7 @@ def set_browser_extension_token(machine_id: str, token: str | None) -> None:
     """Store (Fernet, credential-store key) or clear (None) the machine's
     Playwright Extension token. The endpoint validates the token shape and
     the mode; the store persists verbatim."""
-    from storage import credential_store
+    from storage.identity import credential_store
     enc = credential_store.encrypt_secret(token) if token else None
     with get_conn() as conn:
         conn.execute(
@@ -485,7 +485,7 @@ def get_target_browser_settings(target_kind: str, target_value: str) -> BrowserT
     token = None
     enc = row["browser_extension_token_enc"]
     if enc:
-        from storage import credential_store
+        from storage.identity import credential_store
         try:
             token = credential_store.decrypt_secret(enc)
         except Exception:
@@ -804,7 +804,7 @@ def delete_remote_machine(machine_id: str) -> bool:
 
     if deleted:
         # Invalidate agent cache since execution_target may have changed
-        from storage.agent_store import _invalidate_cache
+        from storage.agents.agent_store import _invalidate_cache
         _invalidate_cache()
 
     return deleted
@@ -881,7 +881,7 @@ def set_agent_remote_target(
         )
         conn.commit()
 
-    from storage.agent_store import _invalidate_cache
+    from storage.agents.agent_store import _invalidate_cache
     _invalidate_cache()
 
 
@@ -899,7 +899,7 @@ def remove_agent_remote_target(agent_slug: str) -> None:
         )
         conn.commit()
 
-    from storage.agent_store import _invalidate_cache
+    from storage.agents.agent_store import _invalidate_cache
     _invalidate_cache()
 
 
@@ -1078,12 +1078,12 @@ def resolve_execution_target(
     user-level overrides (their own paired machine) are still honored.
     """
     from services.remote.remote_status import is_reachable
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as _db
 
     # The Direct LLM engine runs in-process on the server, never on a
     # satellite (session_manager.get_layer routes it local unconditionally
-    # and remote_execution refuses it), so a direct-llm agent's target is
+    # and remote_session_start refuses it), so a direct-llm agent's target is
     # local whatever its pin or the user's override says. Deciding it HERE
     # covers every builder (chat, task, meeting, phone), the dashboard's
     # pin/mismatch logic and the scheduler in one place — before the fix each

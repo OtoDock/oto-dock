@@ -37,7 +37,8 @@ from auth.providers import (
     require_creator_interactive,
 )
 from services.infra.path_confinement import PathOutsideRoot, resolve_under
-from storage import agent_store, db_knowledge_libraries
+from storage.agents import agent_store
+from storage.knowledge import db_knowledge_libraries
 
 from api.agents._router import router
 

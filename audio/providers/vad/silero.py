@@ -1,8 +1,9 @@
-"""Silero VAD Lite wrapper with IDLE/SPEAKING state machine.
+"""Silero VAD wrapper with IDLE/SPEAKING state machine.
 
-Uses silero-vad-lite (ONNX, no torch dependency) for CPU-only inference.
-Buffers incoming PCM into Silero's 32 ms analysis window (256 samples at
-8 kHz, 512 at 16 kHz — the model derives it from the sample rate).
+Runs the bundled Silero model on ONNX Runtime (``silero_model.py``; no torch)
+for CPU-only inference. Buffers incoming PCM into Silero's 32 ms analysis
+window (256 samples at 8 kHz, 512 at 16 kHz — the model derives it from the
+sample rate).
 
 Supports two sensitivity modes:
   - Normal: standard threshold + short debounce (listening phase)
@@ -24,6 +25,7 @@ import time
 
 from audio.constants import SAMPLE_RATE, SAMPLE_WIDTH
 from audio.providers.vad.base import VadEvent, VadState
+from audio.providers.vad.silero_model import SileroModel
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +78,10 @@ class SileroVad:
         self._bargein_chunks_since_reset = 0
         self._BARGEIN_RESET_INTERVAL = 30  # ~1s (30 chunks × 32ms)
 
-        # Load Silero VAD ONNX model; the analysis window (32 ms) is derived
-        # from the sample rate by the model itself.
-        self._model = self._new_model()
+        # One ONNX session per instance; the analysis window (32 ms) is derived
+        # from the sample rate by the model itself. Every "fresh model" reset
+        # below zeroes its recurrent state, which is the whole of its memory.
+        self._model = SileroModel(self._sample_rate)
         self._chunk_bytes = self._model.window_size_samples * SAMPLE_WIDTH
         logger.info(
             f"Silero VAD loaded (threshold={threshold}, "
@@ -90,10 +93,9 @@ class SileroVad:
             f"rate={self._sample_rate})"
         )
 
-    def _new_model(self):
-        """Fresh Silero model at this instance's rate (LSTM state reset)."""
-        from silero_vad_lite import SileroVAD
-        return SileroVAD(self._sample_rate)
+    def _reset_model(self) -> None:
+        """Fresh Silero state at this instance's rate (LSTM state reset)."""
+        self._model.reset()
 
     def set_bargein_mode(self, enabled: bool) -> None:
         """Switch between normal and barge-in sensitivity.
@@ -112,7 +114,7 @@ class SileroVad:
             self._probable_fired = False
             self._bargein_chunks_since_reset = 0
             # Always reset Silero on mode transitions
-            self._model = self._new_model()
+            self._reset_model()
             logger.debug(f"VAD: Silero state reset (bargein={'on' if enabled else 'off'})")
 
     def reset(self) -> None:
@@ -125,7 +127,7 @@ class SileroVad:
         self._bargein_mode = False
         self._early_speech_count = 0
         self._probable_fired = False
-        self._model = self._new_model()
+        self._reset_model()
 
     def process(self, audio_bytes: bytes) -> VadEvent:
         """Feed raw PCM bytes and return any state transition event."""
@@ -182,7 +184,7 @@ class SileroVad:
                 self._bargein_chunks_since_reset += 1
                 if self._bargein_chunks_since_reset >= self._BARGEIN_RESET_INTERVAL:
                     self._bargein_chunks_since_reset = 0
-                    self._model = self._new_model()
+                    self._reset_model()
                     # Re-run this chunk on the fresh model
                     probability = self._model.process(float32_audio)
                     is_speech = probability >= active_threshold and energy_ok
@@ -262,7 +264,7 @@ class SileroVad:
                         # Reset Silero internal state so next speech detection
                         # starts fresh — prevents LSTM hidden state from getting
                         # stuck on "not speech" after processing silence.
-                        self._model = self._new_model()
+                        self._reset_model()
                         logger.debug(f"VAD: SPEECH_END (silence={active_silence_ms}ms)")
                         return VadEvent.SPEECH_END
 

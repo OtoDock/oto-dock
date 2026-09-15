@@ -28,7 +28,7 @@ from core.config.task_config_builder import (
     TaskIdentity, resolve_task_identity, task_allows_knowledge_rw,
 )
 from ws.dashboard import _rewarm_chat_allowed, _task_continue_allowed
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 

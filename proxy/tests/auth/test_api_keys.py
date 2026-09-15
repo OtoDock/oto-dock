@@ -169,7 +169,7 @@ def test_verify_bearer_for_agent_rejects_missing_permission(temp_db):
     from services.infra import api_key_manager as akm
     # Bypass the validator (which would reject empty perms) by constructing
     # the row directly with no permissions.
-    from storage import api_key_store
+    from storage.identity import api_key_store
     raw, prefix = akm._generate_raw_key()
     api_key_store.create_agent_api_key(
         agent="agent-x", name="No-perm", key_hash=akm._hash_key(raw),
@@ -182,7 +182,7 @@ def test_verify_bearer_for_agent_rejects_missing_permission(temp_db):
 
 def test_verify_bearer_updates_last_used(temp_db):
     from services.infra import api_key_manager as akm
-    from storage import api_key_store
+    from storage.identity import api_key_store
     row, raw = akm.create_agent_key(
         agent="agent-x", name="GH", permissions=["triggers"], created_by="user-admin",
     )
@@ -313,7 +313,7 @@ def test_validate_agent_permissions_rejects_disabled(temp_db):
 def test_revocation_is_soft(temp_db):
     """Revoke flips revoked_at but doesn't delete the row (audit trail)."""
     from services.infra import api_key_manager as akm
-    from storage import api_key_store
+    from storage.identity import api_key_store
     row, _ = akm.create_agent_key(
         agent="agent-x", name="GH", permissions=["triggers"], created_by="user-admin",
     )
@@ -336,7 +336,7 @@ def test_double_revocation_is_idempotent(temp_db):
 
 def test_listing_excludes_revoked_by_default(temp_db):
     from services.infra import api_key_manager as akm
-    from storage import api_key_store
+    from storage.identity import api_key_store
     row1, _ = akm.create_agent_key(
         agent="agent-x", name="A1", permissions=["triggers"], created_by="user-admin",
     )

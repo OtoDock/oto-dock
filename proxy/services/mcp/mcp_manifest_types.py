@@ -598,6 +598,11 @@ class McpManifest:
     exclude_from: list[str]
     skills: list[SkillDef]
     server_name: str = ""  # key used in mcpServers (defaults to name)
+    # Who wrote the server code the entry wraps and where it lives (the
+    # community catalog contract). Empty on bundled manifests: the category
+    # already says "built into the platform".
+    author: str = ""
+    author_url: str = ""
     assignment_mode: str = "auto"  # "auto" (managers can add) or "explicit" (admin assigns)
     # Platform feature this MCP needs before it is assignable / loadable. None for
     # almost every MCP (→ always available, no cost). Known tokens: "audio_transcribe"

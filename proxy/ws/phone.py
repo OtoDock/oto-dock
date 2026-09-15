@@ -22,8 +22,8 @@ from websockets.exceptions import ConnectionClosed
 
 import config
 from storage import database as task_store
-from storage import trigger_store
-from storage import phone_route_store
+from storage.automation import trigger_store
+from storage.phone import phone_route_store
 from core.events.common_events import (
     CommonEvent, ERROR, PRODUCER_DONE,
 )
@@ -333,7 +333,14 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         session_id=session_id,
                     )
                     heal_cfg.resume = can_resume
-                    await layer.start_session(session_id, heal_cfg)
+                    try:
+                        await layer.start_session(session_id, heal_cfg)
+                    except Exception:
+                        # The build's seat (and the dead session's stale
+                        # binding under this id) would otherwise stay counted.
+                        from core.config.config_builder import release_config_seat
+                        release_config_seat(session_id, heal_cfg)
+                        raise
                     if (not can_resume
                             and layer.capabilities.name != "direct-llm"):
                         # History unrecoverable — seed the fresh session with
@@ -485,6 +492,10 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 # honours the flag only on routes that actually have a PIN.
                 pin_verified = bool(msg.get("pin_verified", False))
 
+                # Seat accounting for the except path (see release_config_seat).
+                from core.config.config_builder import release_config_seat
+                agent_cfg = None
+                phone_started = False
                 try:
                     # Identity FIRST (services/phone/phone_identity.py): the
                     # route decides who the caller is, which decides the role,
@@ -552,6 +563,11 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                                 phone_mode=phone_mode, trigger_payload=None,
                                 route_identity=route_identity, session_id=session_id,
                             )
+                            # Built only to read execution_path: the seat the
+                            # build acquired goes straight back (keep_binding:
+                            # the id is the live pre-warmed session's).
+                            from core.config.config_builder import release_config_seat
+                            release_config_seat(session_id, _cfg, keep_binding=True)
                             chat_id = str(uuid.uuid4())
                             first_turn = True
                             task_store.create_chat(
@@ -620,6 +636,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     adm = await acquire_chat_slot(session_id, target=phone_target,
                                                   execution_path=agent_cfg.execution_path)
                     if not adm:
+                        release_config_seat(session_id, agent_cfg)
                         await _send({
                             "type": "error",
                             "data": {"message": adm.user_message},
@@ -627,6 +644,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         continue
 
                     await layer.start_session(session_id, agent_cfg)
+                    phone_started = True
                     remember_call_identity(session_id, route_identity.label)
                     # A read-only call is activity too (the retention sweep
                     # keys on the tree's newest mtime).
@@ -669,6 +687,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     logger.error(f"WS warmup failed: {e}", exc_info=True)
                     from core.concurrency import release_chat_slot
                     release_chat_slot(session_id)
+                    if agent_cfg is not None and not phone_started:
+                        # Built, then the spawn failed before binding.
+                        release_config_seat(session_id, agent_cfg)
                     await _send({
                         "type": "error",
                         "data": {"message": f"Warmup failed: {e}"},

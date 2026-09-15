@@ -8,7 +8,7 @@ import asyncio
 import logging
 
 import config
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 from storage import remote_store
 from services.mcp import mcp_registry
@@ -17,6 +17,36 @@ from services.engines import subscription_pool
 from auth.path_policy import SecurityContext, build_permission_context
 from core.execution_layer import AgentConfig
 from core.config.task_config_builder import TaskIdentity
+
+
+def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> None:
+    """Return the pool seat a built ``AgentConfig`` holds when the spawn is
+    abandoned before the layer's ``start_session`` bound it — a skipped
+    pre-warm, a slot denial, an offline target, a failed start. The seat was
+    taken inside :func:`build_agent_config` (or a sibling builder); nothing
+    else gives it back, and a seat leaked here is the "stale
+    ``active_sessions``" an admin could not delete past. Same scope key the
+    layers stamp at bind, so the acquire-window claim is dropped with it.
+
+    A binding already under ``session_id`` predates this spawn — the layers
+    never fail after binding, so it belongs to the dead session this spawn
+    was re-warming and nothing else will release it: released here too,
+    unless ``keep_binding`` says the id is a LIVE session's (a task round
+    riding an already-warm session, a phone reconnect reusing its pre-warmed
+    session). No-op without a subscription.
+    """
+    sub_id = getattr(cfg, "subscription_id", "") or ""
+    if not sub_id:
+        return
+    if not keep_binding and subscription_pool.session_bound(session_id):
+        subscription_pool.release_subscription(session_id)
+    subscription_pool.release_unbound_seat(
+        sub_id,
+        subscription_pool.credential_scope_key(
+            getattr(cfg, "execution_target", "") or "local",
+            getattr(cfg, "sandbox_host_claude_dir", "") or "",
+        ),
+    )
 
 
 def _resolve_target_fields(resolved: tuple[str, str | None]) -> dict:
@@ -188,7 +218,7 @@ async def build_agent_config(
     # (target_kind/target_label also feed the SecurityContext + AgentConfig.)
     if execution_path == "direct-llm":
         # The Direct LLM engine never runs on a satellite (session_manager
-        # routes it local, remote_execution refuses it): neither a pin nor a
+        # routes it local, remote_session_start refuses it): neither a pin nor a
         # default machine may shape the placement prompt, the device-MCP set
         # or the security context. The resolver already answers local for a
         # direct-llm AGENT; this covers a chat whose execution_path override
@@ -491,7 +521,7 @@ async def build_agent_config(
     # (attach/detach lands at the next session build). Fail-safe empty:
     # mirror writes then deny at the policy layer, nothing widens.
     try:
-        from storage import db_knowledge_libraries as _db_kl
+        from storage.knowledge import db_knowledge_libraries as _db_kl
         _kl_rows = await asyncio.to_thread(
             _db_kl.attachments_for_consumer, agent_name)
         _knowledge_libraries = tuple(
@@ -604,6 +634,8 @@ async def build_agent_config(
                 f"Phone route user session for {agent_name}: no subscription for "
                 f"the tied user — using the platform pool"
             )
+        except subscription_pool.NoSubscriptionError:
+            raise
         except Exception as e:
             logger.warning(f"Subscription pool fallback error for {agent_name}: {e}")
     # User-scoped work with no resolved credentials → surface a clean, actionable

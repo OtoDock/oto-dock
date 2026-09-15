@@ -139,7 +139,7 @@ def test_startup_docker_mcps_skips_in_t2(monkeypatch):
     mcp_state / manifests or shelling out — a raise from either proves it failed.
     """
     from core.config import deployment
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_SOCKPROX)
     monkeypatch.setattr(
@@ -158,7 +158,7 @@ def test_startup_docker_mcps_skips_in_t2(monkeypatch):
 def test_startup_docker_mcps_runs_in_t1(monkeypatch):
     """T1 (bare-metal): startup proceeds to read mcp_state (no early return)."""
     from core.config import deployment
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     monkeypatch.setattr(deployment, "in_docker_compose", lambda: False)
 
@@ -393,7 +393,7 @@ def _drive_startup(monkeypatch, manifest, *, env_changed=False,
     """Run startup_docker_mcps against one fake running docker MCP."""
     from core.config import deployment
     from services.mcp import compose_rewrite, mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     monkeypatch.setattr(deployment, "current_mode", lambda: deployment.MANAGED_LOCAL)
     monkeypatch.setattr(docker_manager, "_warn_foreign_mcp_leftovers", lambda: None)

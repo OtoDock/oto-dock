@@ -364,7 +364,7 @@ def _check_library_mirror_write(rel: str, agent: str) -> None:
                    "library mirrors",
         )
     src, sub_rel = parts[2], "/".join(parts[3:])
-    from storage import db_knowledge_libraries
+    from storage.knowledge import db_knowledge_libraries
     att = db_knowledge_libraries.attachment_covering(src, agent, sub_rel)
     if att is None or not att["writable"]:
         raise HTTPException(
@@ -787,7 +787,7 @@ async def list_recover_bin(
     """
     u = require_auth(user)
     require_agent_access(u, name)
-    from storage import recover_bin_store
+    from storage.files import recover_bin_store
     entries = await asyncio.to_thread(
         recover_bin_store.list_for,
         name, u.sub, u.can_edit_agent(name), u.can_manage_agent(name), u.is_admin,
@@ -825,7 +825,7 @@ async def restore_recover_bin(
     """
     u = require_auth(user)
     require_agent_access(u, name)
-    from storage import recover_bin_store
+    from storage.files import recover_bin_store
 
     agent_dir = _get_agent_dir(name)
     agent_root = Path(os.path.realpath(agent_dir))
@@ -936,7 +936,7 @@ async def discard_recover_bin(
     """
     u = require_auth(user)
     require_agent_access(u, name)
-    from storage import recover_bin_store
+    from storage.files import recover_bin_store
 
     is_edit = u.can_edit_agent(name)
     is_mgr = u.can_manage_agent(name)
@@ -1127,7 +1127,7 @@ async def delete_agent_path(
         # no notification). Skip symlinks — the loop above already rejected
         # escaping ones, and intra-scope symlinks aren't real content. capture()
         # enforces the size cap internally.
-        from storage import recover_bin_store
+        from storage.files import recover_bin_store
         _root_resolved = agent_dir.resolve()
         _bin_skipped = 0
         for _child in target.rglob("*"):

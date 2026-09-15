@@ -48,7 +48,7 @@ async def test_user_paired_resolves_owner_and_per_agent_role():
          patch("storage.database.get_username_by_sub", return_value="alice"), \
          patch("storage.database.get_user_agent_roles",
                return_value={"agent-1": "editor", "agent-2": "viewer"}), \
-         patch("storage.sync_state_store.agents_for_machine",
+         patch("storage.files.sync_state_store.agents_for_machine",
                return_value={"agent-1", "agent-2"}):
         await layer.sync_all_agents_on_reconnect("m1")
     by_agent = {a: (u, r) for a, u, r in calls}
@@ -64,7 +64,7 @@ async def test_admin_paired_resolves_admin_shared():
          patch("storage.database.get_user", return_value={"role": "admin"}), \
          patch("storage.database.get_username_by_sub", return_value="adminuser"), \
          patch("storage.database.get_user_agent_roles", return_value={}), \
-         patch("storage.sync_state_store.agents_for_machine", return_value={"agent-1"}):
+         patch("storage.files.sync_state_store.agents_for_machine", return_value={"agent-1"}):
         await layer.sync_all_agents_on_reconnect("m1")
     # admin-PAIRED → no per-user filter (None); platform-admin owner → role "admin".
     assert calls == [("agent-1", None, "admin")]
@@ -83,7 +83,7 @@ async def test_platform_admin_owner_user_paired_uses_per_agent_role():
          patch("storage.database.get_username_by_sub", return_value="adminuser"), \
          patch("storage.database.get_user_agent_roles",
                return_value={"agent-1": "viewer"}), \
-         patch("storage.sync_state_store.agents_for_machine", return_value={"agent-1"}):
+         patch("storage.files.sync_state_store.agents_for_machine", return_value={"agent-1"}):
         await layer.sync_all_agents_on_reconnect("m1")
     assert calls == [("agent-1", "adminuser", "viewer")]
 
@@ -98,7 +98,7 @@ async def test_platform_admin_owner_without_explicit_role_fails_closed():
          patch("storage.database.get_user", return_value={"role": "admin"}), \
          patch("storage.database.get_username_by_sub", return_value="adminuser"), \
          patch("storage.database.get_user_agent_roles", return_value={}), \
-         patch("storage.sync_state_store.agents_for_machine", return_value={"agent-1"}):
+         patch("storage.files.sync_state_store.agents_for_machine", return_value={"agent-1"}):
         await layer.sync_all_agents_on_reconnect("m1")
     assert calls == [("agent-1", "adminuser", "")]
 
@@ -137,6 +137,6 @@ async def test_no_synced_agents_is_noop():
                return_value={"registered_by": "s", "pairing_scope": "user"}), \
          patch("storage.database.get_user", return_value={"role": "user"}), \
          patch("storage.database.get_username_by_sub", return_value="u"), \
-         patch("storage.sync_state_store.agents_for_machine", return_value=set()):
+         patch("storage.files.sync_state_store.agents_for_machine", return_value=set()):
         await layer.sync_all_agents_on_reconnect("m1")
     assert calls == []

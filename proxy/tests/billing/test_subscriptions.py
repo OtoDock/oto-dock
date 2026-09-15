@@ -518,6 +518,120 @@ class TestHeadroomRoutingAndFailover:
         handle = sp.acquire_subscription("direct-llm", None, provider="anthropic")
         assert handle.subscription_id == "sub-b"
 
+    # -- Provider windows: drain the account that resets first ----------------
+
+    _FAR_MS = 4_102_444_800_000  # 2100-01-01, never inside the refresh runway
+
+    def _oauth(self, sid, **o):
+        return self._sub(sid, layer="claude-code-cli", auth_type="oauth", **o)
+
+    @staticmethod
+    def _window_row(*, seven=10.0, seven_in_days=3.0, five=5.0, five_in_hours=2.0,
+                    scoped=None, reached=""):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        return {
+            "observed_at": now.isoformat(), "source": "poll",
+            "five_hour_pct": five,
+            "five_hour_resets_at": (now + timedelta(hours=five_in_hours)).isoformat(),
+            "seven_day_pct": seven,
+            "seven_day_resets_at": (now + timedelta(days=seven_in_days)).isoformat(),
+            "data": {"scoped": scoped or [], "reached": reached, "plan": "max"},
+        }
+
+    def _two_oauth(self, mock_store, samples, *, cons=None):
+        from services.engines import subscription_pool as sp
+        sp._session_subscriptions.clear(); sp._throttled_until.clear()
+        sp._session_scope_keys.clear(); sp._scope_recent.clear()
+        mock_store.list_platform_pool.return_value = [self._oauth("sub-a"), self._oauth("sub-b")]
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {"accessToken": "tok", "expiresAt": self._FAR_MS}}
+        mock_store.get_subscription_consumption.side_effect = (
+            lambda sid, since: (cons or {"sub-a": 1.0, "sub-b": 1.0})[sid])
+        mock_store.latest_window_samples.return_value = samples
+        return sp
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_drains_the_account_that_resets_first(self, mock_store, _on):
+        """Quota left in a window when it closes is lost: the account whose
+        weekly window resets soonest is used first, even when it has consumed
+        more so far."""
+        sp = self._two_oauth(mock_store, {
+            "sub-a": self._window_row(seven=10.0, seven_in_days=5.0),
+            "sub-b": self._window_row(seven=60.0, seven_in_days=2.0),
+        }, cons={"sub-a": 1.0, "sub-b": 9.0})
+        handle = sp.acquire_subscription("claude-code-cli", None)
+        assert handle.subscription_id == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_exhausted_account_is_skipped(self, mock_store, _on):
+        sp = self._two_oauth(mock_store, {
+            "sub-a": self._window_row(seven=10.0, seven_in_days=5.0),
+            "sub-b": self._window_row(five=95.0, seven=60.0, seven_in_days=2.0),
+        })
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
+        # The vendor's reached flag counts the same way.
+        mock_store.latest_window_samples.return_value["sub-b"] = self._window_row(
+            seven=60.0, seven_in_days=2.0, reached="seven_day")
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_scoped_window_only_blocks_its_family(self, mock_store, _on):
+        from datetime import datetime, timedelta, timezone
+        until = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        sp = self._two_oauth(mock_store, {
+            "sub-a": self._window_row(seven=10.0, seven_in_days=5.0),
+            "sub-b": self._window_row(seven=55.0, seven_in_days=2.0, reached="scoped:fable",
+                                      scoped=[{"key": "fable", "label": "Fable", "pct": 100.0,
+                                               "resets_at": until, "active": True}]),
+        })
+        assert sp.acquire_subscription("claude-code-cli", None,
+                                       model="claude-fable-5-1").subscription_id == "sub-a"
+        assert sp.acquire_subscription("claude-code-cli", None,
+                                       model="claude-sonnet-5").subscription_id == "sub-b"
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_all_exhausted_falls_back_to_the_one_that_frees_first(self, mock_store, _on):
+        sp = self._two_oauth(mock_store, {
+            "sub-a": self._window_row(five=95.0, five_in_hours=1.0, seven=10.0, seven_in_days=1.0),
+            "sub-b": self._window_row(five=10.0, seven=99.0, seven_in_days=3.0),
+        })
+        # Neither has headroom; sub-a's session window frees in an hour,
+        # sub-b's week in three days.
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_sampled_subscription_beats_a_sample_less_key(self, mock_store, _on):
+        """A subscription drains before a pay-per-token key, whatever the
+        recorded cost says."""
+        sp = self._two_oauth(mock_store, {
+            "sub-b": self._window_row(seven=70.0, seven_in_days=2.0),
+        }, cons={"sub-a": 0.0, "sub-b": 50.0})
+        mock_store.list_platform_pool.return_value = [
+            self._sub("sub-a", layer="claude-code-cli", auth_type="api_key"),
+            self._oauth("sub-b"),
+        ]
+        mock_store.get_credential_data.side_effect = lambda sid: (
+            {"api_key": "k"} if sid == "sub-a"
+            else {"oauth_token": {"accessToken": "tok", "expiresAt": self._FAR_MS}})
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=False)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_windows_off_keeps_the_least_consumed_key(self, mock_store, _off):
+        sp = self._two_oauth(mock_store, {
+            "sub-a": self._window_row(seven=10.0, seven_in_days=5.0),
+            "sub-b": self._window_row(seven=60.0, seven_in_days=2.0),
+        }, cons={"sub-a": 1.0, "sub-b": 9.0})
+        assert sp.acquire_subscription("claude-code-cli", None).subscription_id == "sub-a"
+        mock_store.latest_window_samples.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Scope-sticky selection + persisted bindings
@@ -1738,8 +1852,59 @@ class TestSelectionRebindHooks:
                 "id": "A", "owner_sub": "u1", "active_sessions": 0,
             }
             store.delete_subscription.return_value = True
+            pool_mock.reconcile_active_sessions.return_value = (0, 0)
             self._run(api_mod.admin_delete_subscription(
                 "claude-code-cli", "A", user=self._admin()))
+            pool_mock.schedule_rebind.assert_called_once()
+
+    # --- the delete judges on LIVE sessions, not the stored counter (#3) ---
+
+    def test_admin_delete_proceeds_past_a_stale_counter(self):
+        import api.admin.execution_layers as api_mod
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod, "subscription_pool") as pool_mock:
+            store.get_subscription.return_value = {
+                "id": "A", "owner_sub": "u1", "active_sessions": 3,
+            }
+            store.delete_subscription.return_value = True
+            pool_mock.reconcile_active_sessions.return_value = (3, 0)
+            res = self._run(api_mod.admin_delete_subscription(
+                "claude-code-cli", "A", user=self._admin()))
+            assert res == {"deleted": True}
+            pool_mock.reconcile_active_sessions.assert_called_once_with("A")
+            store.delete_subscription.assert_called_once_with("A")
+
+    def test_admin_delete_refuses_live_sessions_without_force(self):
+        from fastapi import HTTPException
+        import api.admin.execution_layers as api_mod
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod, "subscription_pool") as pool_mock:
+            store.get_subscription.return_value = {
+                "id": "A", "owner_sub": "u1", "active_sessions": 2,
+            }
+            pool_mock.reconcile_active_sessions.return_value = (2, 2)
+            with pytest.raises(HTTPException) as exc:
+                self._run(api_mod.admin_delete_subscription(
+                    "claude-code-cli", "A", user=self._admin()))
+            assert exc.value.status_code == 409
+            assert "2 live session" in exc.value.detail
+            assert "force=true" in exc.value.detail
+            store.delete_subscription.assert_not_called()
+            pool_mock.schedule_rebind.assert_not_called()
+
+    def test_admin_delete_force_removes_and_rehomes(self):
+        import api.admin.execution_layers as api_mod
+        with patch.object(api_mod, "subscription_store") as store, \
+             patch.object(api_mod, "subscription_pool") as pool_mock:
+            store.get_subscription.return_value = {
+                "id": "A", "owner_sub": "u1", "active_sessions": 2,
+            }
+            store.delete_subscription.return_value = True
+            pool_mock.reconcile_active_sessions.return_value = (2, 2)
+            res = self._run(api_mod.admin_delete_subscription(
+                "claude-code-cli", "A", force=True, user=self._admin()))
+            assert res == {"deleted": True}
+            store.delete_subscription.assert_called_once_with("A")
             pool_mock.schedule_rebind.assert_called_once()
 
     def test_platform_auth_toggle_schedules_rebind(self):
@@ -1768,7 +1933,7 @@ class TestRestoreSessionBinding:
 
     def test_restores_maps_and_seat_from_persisted_row(self, temp_db):
         from services.engines import subscription_pool as sp
-        from storage import subscription_store as store
+        from storage.billing import subscription_store as store
 
         sub = store.add_subscription(
             "claude-code-cli", "anthropic", "oauth", owner_sub="u1",
@@ -1791,7 +1956,7 @@ class TestRestoreSessionBinding:
 
     def test_idempotent_when_binding_live(self, temp_db):
         from services.engines import subscription_pool as sp
-        from storage import subscription_store as store
+        from storage.billing import subscription_store as store
 
         sub = store.add_subscription(
             "claude-code-cli", "anthropic", "oauth", owner_sub="u1",
@@ -1808,3 +1973,452 @@ class TestRestoreSessionBinding:
         from services.engines import subscription_pool as sp
         self._clear_maps()
         assert sp.restore_session_binding("sess-never-bound") is None
+
+
+# ---------------------------------------------------------------------------
+# Seats of abandoned spawns + the honest live count (public issue #3)
+# ---------------------------------------------------------------------------
+
+
+class TestUnboundSeatAndLiveCount:
+    """A seat acquired by resolve_subscription_env is only released by a
+    later release_subscription when bind_session ran for that session id;
+    every spawn abandoned in between must give it back itself."""
+
+    def _reset(self, sp):
+        with sp._session_maps_lock:
+            sp._session_subscriptions.clear()
+            sp._session_binding_ctx.clear()
+            sp._session_scope_keys.clear()
+            sp._session_token_expiry.clear()
+            sp._scope_recent.clear()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_unbound_seat_decrements_and_drops_claim(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp._scope_recent["mach:/a/.codex"] = ("sub-S", time.time())
+        sp.release_unbound_seat("sub-S", "mach:/a/.codex")
+        mock_store.decrement_active_sessions.assert_called_once_with("sub-S")
+        assert "mach:/a/.codex" not in sp._scope_recent
+        # Never touches bindings; an empty subscription is a no-op.
+        mock_store.delete_session_binding.assert_not_called()
+        sp.release_unbound_seat("", "mach:/a/.codex")
+        mock_store.decrement_active_sessions.assert_called_once()
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_claim_of_another_subscription_is_kept(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp._scope_recent["mach:/a/.codex"] = ("sub-OTHER", time.time())
+        sp.release_unbound_seat("sub-S", "mach:/a/.codex")
+        mock_store.decrement_active_sessions.assert_called_once_with("sub-S")
+        assert sp._scope_recent["mach:/a/.codex"][0] == "sub-OTHER"
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_stale_binding_under_the_id_is_released_too(self, mock_store):
+        # The layers never fail after binding, so a binding already under an
+        # abandoned spawn's id belongs to the dead session it was re-warming:
+        # release_config_seat returns that seat AND the new one.
+        from types import SimpleNamespace
+        from core.config import config_builder
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp.bind_session("sess-b", "sub-OLD", layer="codex-cli", user_sub="",
+                        scope_key="mach:/a/.codex")
+        cfg = SimpleNamespace(subscription_id="sub-NEW", execution_target="mach",
+                              sandbox_host_claude_dir="/a/.codex")
+        config_builder.release_config_seat("sess-b", cfg)
+        decs = [c.args[0] for c in mock_store.decrement_active_sessions.call_args_list]
+        assert decs == ["sub-OLD", "sub-NEW"]
+        mock_store.delete_session_binding.assert_called_once_with("sess-b")
+        assert not sp.session_bound("sess-b")
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_keep_binding_returns_only_the_new_seat(self, mock_store):
+        # A task round riding a warm session / a phone reconnect reusing its
+        # pre-warmed session: the id is a LIVE session's — its binding stays.
+        from types import SimpleNamespace
+        from core.config import config_builder
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp.bind_session("sess-warm", "sub-S", layer="codex-cli", user_sub="",
+                        scope_key="mach:/a/.codex")
+        cfg = SimpleNamespace(subscription_id="sub-S", execution_target="mach",
+                              sandbox_host_claude_dir="/a/.codex")
+        config_builder.release_config_seat("sess-warm", cfg, keep_binding=True)
+        mock_store.decrement_active_sessions.assert_called_once_with("sub-S")
+        mock_store.delete_session_binding.assert_not_called()
+        assert sp.session_bound("sess-warm")
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_boot_grace_counts_persisted_bindings(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp.bind_session("s1", "sub-S")
+        mock_store.list_binding_session_ids.return_value = ["s1", "s-satellite"]
+        with patch.object(sp, "within_boot_grace", return_value=True):
+            assert sp.live_session_count("sub-S") == 2
+        with patch.object(sp, "within_boot_grace", return_value=False):
+            assert sp.live_session_count("sub-S") == 1
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_resolve_env_failure_after_acquire_returns_the_seat(self, mock_store):
+        # A failure between the acquire and the returned env (here the
+        # local-model catalog read) must not leave a seat nobody can release.
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_platform_pool.return_value = [{
+            "id": "sub-L", "layer": "codex-cli", "provider": "ollama",
+            "auth_type": "local_endpoint", "active_sessions": 0, "status": "active",
+        }]
+        mock_store.get_credential_data.return_value = {"endpoint_url": "http://x:11434"}
+        with patch("core.layers.codex.local_model_catalog.local_model_rows_json",
+                   side_effect=RuntimeError("db down")), \
+             patch("config.get_model_provider", return_value="ollama"):
+            with pytest.raises(RuntimeError):
+                sp.resolve_subscription_env("codex-cli", None, model="qwen-x",
+                                            sticky_scope="local:/a/.codex")
+        mock_store.increment_active_sessions.assert_called_once_with("sub-L")
+        mock_store.decrement_active_sessions.assert_called_once_with("sub-L")
+        assert "local:/a/.codex" not in sp._scope_recent
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_live_count_is_bindings_plus_fresh_claims(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp.bind_session("s1", "sub-S")
+        sp.bind_session("s2", "sub-S")
+        sp.bind_session("s3", "sub-T")
+        sp._scope_recent["k1"] = ("sub-S", time.time())
+        sp._scope_recent["k2"] = ("sub-S", time.time() - sp._SCOPE_RECENT_TTL_S - 1)
+        assert sp.live_session_count("sub-S") == 3
+        assert sp.live_session_count("sub-T") == 1
+        assert sp.live_session_count("sub-none") == 0
+        self._reset(sp)
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_reconcile_lowers_a_stale_counter_only(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        sp.bind_session("s1", "sub-S")
+        mock_store.get_subscription.return_value = {"id": "sub-S", "active_sessions": 4}
+        mock_store.lower_active_sessions.return_value = True
+        assert sp.reconcile_active_sessions("sub-S") == (4, 1)
+        mock_store.lower_active_sessions.assert_called_once_with("sub-S", 1)
+        # Reads lower than live (a seat the map does not see) → untouched.
+        mock_store.lower_active_sessions.reset_mock()
+        mock_store.get_subscription.return_value = {"id": "sub-S", "active_sessions": 0}
+        assert sp.reconcile_active_sessions("sub-S") == (0, 1)
+        mock_store.lower_active_sessions.assert_not_called()
+        self._reset(sp)
+
+    def test_release_config_seat_uses_the_layers_scope_key(self):
+        from types import SimpleNamespace
+        from core.config import config_builder
+        with patch.object(config_builder, "subscription_pool") as pool:
+            pool.credential_scope_key.side_effect = (
+                lambda t, d: f"{t}:{d}" if d else "")
+            pool.session_bound.return_value = False
+            cfg = SimpleNamespace(subscription_id="sub-S", execution_target="mach-1",
+                                  sandbox_host_claude_dir="/a/.codex")
+            config_builder.release_config_seat("sess-x", cfg)
+            pool.release_unbound_seat.assert_called_once_with(
+                "sub-S", "mach-1:/a/.codex")
+            pool.release_subscription.assert_not_called()
+            pool.release_unbound_seat.reset_mock()
+            config_builder.release_config_seat(
+                "sess-y", SimpleNamespace(subscription_id=""))
+            pool.release_unbound_seat.assert_not_called()
+
+    def test_prune_orphan_bindings(self, temp_db):
+        from storage.billing import subscription_store as store
+        live = store.add_subscription("codex-cli", "openai", "oauth", owner_sub="u1",
+                                      credential_data={})
+        store.upsert_session_binding("sess-live", live["id"], layer="codex-cli",
+                                     user_sub="", scope_key="k")
+        store.upsert_session_binding("sess-ghost", "vanished-sub", layer="codex-cli",
+                                     user_sub="", scope_key="k")
+        assert store.prune_orphan_session_bindings() == 1
+        assert store.get_session_binding("sess-live") is not None
+        assert store.get_session_binding("sess-ghost") is None
+        assert store.prune_orphan_session_bindings() == 0
+
+    def test_lower_active_sessions_never_raises(self, temp_db):
+        from storage.billing import subscription_store as store
+        sub = store.add_subscription("codex-cli", "openai", "oauth", owner_sub="u1",
+                                     credential_data={})
+        for _ in range(3):
+            store.increment_active_sessions(sub["id"])
+        assert store.lower_active_sessions(sub["id"], 1) is True
+        assert store.get_subscription(sub["id"])["active_sessions"] == 1
+        assert store.lower_active_sessions(sub["id"], 2) is False
+        assert store.get_subscription(sub["id"])["active_sessions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Pool caps at the acquisition chokepoint
+# ---------------------------------------------------------------------------
+
+
+class TestPoolCapEnforcement:
+    """``acquire_subscription(enforce_caps=True)`` against the pool's
+    subscription cap (services.billing.pool_caps): ``stop`` refuses BOTH
+    scopes, ``continue`` drops the OAuth accounts and takes a key, nothing
+    left raises the same, and the live-session re-homing passes
+    ``enforce_caps=False``."""
+
+    def _sub(self, sid, auth="oauth", owner="admin-1", **o):
+        base = {"id": sid, "layer": "claude-code-cli", "provider": "anthropic",
+                "auth_type": auth, "owner_sub": owner, "is_primary": 0,
+                "status": "active", "active_sessions": 0}
+        base.update(o)
+        return base
+
+    @staticmethod
+    def _status(*, scope, allowed, on_reached="stop", hits=("week_pct",)):
+        from services.billing.pool_caps import CapStatus
+        s = CapStatus(scope=scope, target="u" if scope == "user" else "",
+                      layer="claude-code-cli", configured=True, accounts=1,
+                      on_reached=on_reached, allowed=allowed,
+                      hits=[] if allowed else list(hits))
+        s.caps["week_pct"], s.readings["week_pct"] = 50.0, 52.0
+        return s
+
+    @staticmethod
+    def _reset(sp):
+        sp._session_subscriptions.clear()
+        sp._scope_recent.clear()
+        sp._throttled_until.clear()
+
+    def _creds(self, mock_store):
+        future_ms = int((time.time() + 7200) * 1000)
+
+        def _cred(sid):
+            if sid.startswith("key"):
+                return {"api_key": "sk-key"}
+            return {"oauth_token": {"accessToken": "tok", "expiresAt": future_ms}}
+        mock_store.get_credential_data.side_effect = _cred
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_stop_refuses_both_scopes_without_borrowing(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own", owner="u")]
+        mock_store.list_platform_pool.return_value = [self._sub("key-1", "api_key")]
+        mock_store.get_user_allow_platform_auth.return_value = True
+        self._creds(mock_store)
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", allowed=False)):
+            with pytest.raises(sp.NoSubscriptionError) as ei:
+                sp.acquire_subscription("claude-code-cli", "u")
+        assert ei.value.reason == "pool_cap"
+        assert str(ei.value).startswith("Your Claude subscription cap is reached: the week is at 52%")
+        assert "User Settings → Usage" in str(ei.value)
+        mock_store.list_platform_pool.assert_not_called()
+        mock_store.increment_active_sessions.assert_not_called()
+
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="platform", allowed=False)) as ev:
+            with pytest.raises(sp.NoSubscriptionError) as ei:
+                sp.acquire_subscription("claude-code-cli", None)
+        ev.assert_called_once_with("platform", "", "claude-code-cli")
+        assert "The agent pool's Claude subscription cap is reached" in str(ei.value)
+        assert "Setup → Usage" in str(ei.value)
+        mock_store.increment_active_sessions.assert_not_called()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_continue_drops_oauth_and_takes_a_key(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [
+            self._sub("own", owner="u"), self._sub("key-own", "api_key", owner="u")]
+        mock_store.list_platform_pool.return_value = [
+            self._sub("pool-oauth"), self._sub("key-pool", "api_key")]
+        self._creds(mock_store)
+        cont = dict(allowed=False, on_reached="continue")
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", **cont)):
+            h = sp.acquire_subscription("claude-code-cli", "u")
+        assert h.subscription_id == "key-own" and h.auth_type == "api_key"
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="platform", **cont)):
+            h = sp.acquire_subscription("claude-code-cli", None)
+        assert h.subscription_id == "key-pool"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_continue_borrows_when_the_user_owns_only_oauth(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own", owner="u")]
+        mock_store.list_platform_pool.return_value = [self._sub("key-pool", "api_key")]
+        mock_store.get_user_allow_platform_auth.return_value = True
+        self._creds(mock_store)
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", allowed=False,
+                                                    on_reached="continue")):
+            h = sp.acquire_subscription("claude-code-cli", "u")
+        assert h.subscription_id == "key-pool"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_continue_with_nothing_left_names_the_missing_key(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_personal.return_value = [self._sub("own", owner="u")]
+        mock_store.get_user_allow_platform_auth.return_value = False
+        self._creds(mock_store)
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", allowed=False,
+                                                    on_reached="continue")):
+            with pytest.raises(sp.NoSubscriptionError) as ei:
+                sp.acquire_subscription("claude-code-cli", "u")
+        assert ei.value.reason == "pool_cap"
+        assert "There is no API key to continue on" in str(ei.value)
+        mock_store.list_platform_pool.return_value = [self._sub("pool-oauth")]
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="platform", allowed=False,
+                                                    on_reached="continue")):
+            with pytest.raises(sp.NoSubscriptionError) as ei:
+                sp.acquire_subscription("claude-code-cli", None)
+        assert "Setup → AI Engines" in str(ei.value)
+        mock_store.increment_active_sessions.assert_not_called()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_enforce_caps_false_and_a_failed_evaluation_spawn_as_before(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_platform_pool.return_value = [self._sub("pool-oauth")]
+        self._creds(mock_store)
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="platform", allowed=False)) as ev:
+            h = sp.acquire_subscription("claude-code-cli", None, enforce_caps=False)
+        assert h.subscription_id == "pool-oauth"
+        ev.assert_not_called()
+        with patch.object(sp._pool_caps, "evaluate", side_effect=RuntimeError("db")):
+            h = sp.acquire_subscription("claude-code-cli", None)
+        assert h.subscription_id == "pool-oauth"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_rehoming_never_evaluates_the_cap(self, mock_store):
+        from services.engines import subscription_pool as sp
+        self._reset(sp)
+        mock_store.list_platform_pool.return_value = [self._sub("pool-oauth")]
+        mock_store.get_subscription.return_value = self._sub("old")
+        self._creds(mock_store)
+        replacements: dict = {}
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="platform", allowed=False)) as ev, \
+             patch("services.engines.token_fanout.session_target", return_value=None):
+            sp._move_scope_group("old", "claude-code-cli", "", ["s1"], cause="delisted",
+                                 reason="", replacements=replacements, moved=[],
+                                 stuck_log=lambda *_: None)
+        ev.assert_not_called()
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_block_reason_reads_the_cap_first(self, mock_store):
+        from services.engines import subscription_pool as sp
+        mock_store.list_personal.return_value = [self._sub("own", owner="u")]
+        mock_store.get_user_allow_platform_auth.return_value = False
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", allowed=False)):
+            assert sp.user_scope_block_reason("claude-code-cli", "u") == "pool_cap"
+        with patch.object(sp._pool_caps, "evaluate",
+                          return_value=self._status(scope="user", allowed=True)):
+            assert sp.user_scope_block_reason("claude-code-cli", "u") == "auth_off"
+
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_cap_continue_available(self, mock_store):
+        from services.engines import subscription_pool as sp
+        mock_store.list_personal.return_value = [self._sub("own", owner="u")]
+        mock_store.get_user_allow_platform_auth.return_value = True
+        mock_store.list_platform_pool.return_value = [self._sub("pool-oauth")]
+        assert not sp.cap_continue_available("claude-code-cli", "u")
+        assert not sp.cap_continue_available("claude-code-cli", None)
+        mock_store.list_platform_pool.return_value = [self._sub("key-pool", "api_key")]
+        assert sp.cap_continue_available("claude-code-cli", "u")
+        assert sp.cap_continue_available("claude-code-cli", None)
+        mock_store.get_user_allow_platform_auth.return_value = False
+        assert not sp.cap_continue_available("claude-code-cli", "u")
+        mock_store.list_personal.return_value = [self._sub("key-own", "api_key", owner="u")]
+        assert sp.cap_continue_available("claude-code-cli", "u")
+
+    def test_pool_cap_error_message_default(self):
+        from services.engines.subscription_pool import NoSubscriptionError
+        err = NoSubscriptionError("pool_cap")
+        assert err.reason == "pool_cap" and "Usage page" in str(err)
+        assert str(NoSubscriptionError("pool_cap", "custom")) == "custom"
+
+
+class TestStickyYieldsToExhaustion:
+    """A scope pin the vendor will refuse is no pin: when another candidate
+    can serve the spawn's model the spawn goes there and a rebalance pass
+    is scheduled; when every candidate is out of window the pin holds."""
+
+    def _sub(self, sid):
+        return {"id": sid, "layer": "claude-code-cli", "provider": "anthropic",
+                "auth_type": "oauth", "owner_sub": "", "is_primary": 0,
+                "status": "active", "active_sessions": 0}
+
+    @staticmethod
+    def _row(**o):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        row = {"observed_at": now.isoformat(), "source": "poll",
+               "five_hour_pct": 5.0, "five_hour_resets_at": (now + timedelta(hours=2)).isoformat(),
+               "seven_day_pct": 10.0, "seven_day_resets_at": (now + timedelta(days=3)).isoformat(),
+               "data": {"scoped": [], "reached": "", "plan": "max"}}
+        row.update(o)
+        return row
+
+    def _pool(self, mock_store, rows):
+        from services.engines import subscription_pool as sp
+        sp._session_subscriptions.clear(); sp._session_binding_ctx.clear()
+        sp._session_scope_keys.clear(); sp._scope_recent.clear(); sp._throttled_until.clear()
+        mock_store.list_platform_pool.return_value = [self._sub("sub-a"), self._sub("sub-b")]
+        mock_store.get_credential_data.return_value = {
+            "oauth_token": {"accessToken": "tok", "expiresAt": int((time.time() + 7200) * 1000)}}
+        mock_store.get_subscription_consumption.side_effect = lambda sid, since: 0.0
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: rows[sid] for sid in ids if sid in rows}
+        sp.bind_session("sess-live", "sub-a", layer="claude-code-cli",
+                        user_sub="", scope_key="local:/agents/dev/.claude")
+        return sp
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_exhausted_pin_yields_when_another_account_can_serve(self, mock_store, _on):
+        sp = self._pool(mock_store, {"sub-a": self._row(five_hour_pct=97.0), "sub-b": self._row()})
+        with patch.object(sp, "schedule_rebalance") as reb:
+            h = sp.acquire_subscription("claude-code-cli", None, model="claude-fable-5-1",
+                                        sticky_scope="local:/agents/dev/.claude")
+        assert h.subscription_id == "sub-b"
+        reb.assert_called_once_with("sticky account exhausted")
+        assert sp._scope_recent["local:/agents/dev/.claude"][0] == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_pin_holds_when_every_account_is_out_for_the_model(self, mock_store, _on):
+        fable_full = {"scoped": [{"key": "fable", "label": "Fable", "pct": 100.0,
+                                  "resets_at": "2099-01-01T00:00:00+00:00", "active": True}],
+                      "reached": "scoped:fable", "plan": "max"}
+        sp = self._pool(mock_store, {"sub-a": self._row(five_hour_pct=97.0),
+                                     "sub-b": self._row(data=fable_full)})
+        with patch.object(sp, "schedule_rebalance") as reb:
+            h = sp.acquire_subscription("claude-code-cli", None, model="claude-fable-5-1",
+                                        sticky_scope="local:/agents/dev/.claude")
+        assert h.subscription_id == "sub-a"
+        reb.assert_not_called()
+        # A Sonnet spawn in the same scope has somewhere to go.
+        with patch.object(sp, "schedule_rebalance") as reb:
+            h = sp.acquire_subscription("claude-code-cli", None, model="claude-sonnet-5",
+                                        sticky_scope="local:/agents/dev/.claude")
+        assert h.subscription_id == "sub-b"
+        reb.assert_called_once()
+        sp._session_subscriptions.clear(); sp._session_binding_ctx.clear()
+        sp._session_scope_keys.clear(); sp._scope_recent.clear()

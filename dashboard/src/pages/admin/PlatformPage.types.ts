@@ -18,6 +18,9 @@ export interface PlatformSettings {
   session_retention_days: string
   // Automatic MCP updates (weekly; community MCPs)
   mcp_auto_update_enabled: boolean
+  // Read each OAuth account's session and weekly usage from the vendor
+  // (default ON): the pool routes on it, the AI Engines cards show it.
+  subscription_windows_enabled: boolean
   // Storage quotas (MB / file-count; 0 = unlimited). storage_quotas_enforced
   // reflects the kernel tier — false means measurement + warnings only.
   quota_shared_folder_mb: string

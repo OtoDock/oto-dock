@@ -1392,7 +1392,7 @@ def resolve_sandbox_config(
     # the nested kernel-RO overlay is lost, and the path-policy subtree gate
     # remains as defense-in-depth for that degraded window.
     try:
-        from storage import db_knowledge_libraries
+        from storage.knowledge import db_knowledge_libraries
         knowledge_libraries = [
             (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
             for a in db_knowledge_libraries.attachments_for_consumer(agent_name)

@@ -202,14 +202,33 @@ class TestAugmentManifestChange:
         )
         assert out["update_available"] is False
 
-    def test_docker_not_flagged_via_manifest_hash(self):
-        # Docker uses the version signal, not manifest_hash.
+    def test_docker_flagged_via_manifest_hash_under_the_same_tag(self):
+        # A docker catalog edit under the same image tag is an integration
+        # update too (the converge re-fetches the folder); the version signal
+        # still wins when the tag moved.
         out = community_catalog.augment_entry(
-            self._entry(runtime="docker", version="1.0.0"),
+            self._entry(runtime="docker", version="1.0.0", source="docker:notion"),
             installed_versions={"notion-mcp": "1.0.0"},
             enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
         )
+        assert out["update_available"] is True
+        out = community_catalog.augment_entry(
+            self._entry(runtime="docker", version="1.0.0", source="docker:notion"),
+            installed_versions={"notion-mcp": "1.0.0"},
+            enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "aaaa"},
+        )
         assert out["update_available"] is False
+
+    def test_git_and_remote_sources_never_flag_via_manifest_hash(self):
+        # No converge path for these: a hash mismatch would badge an update
+        # nobody can run.
+        for source in ("git+https://example.com/x.git@v1", "remote:mcp.example.com"):
+            out = community_catalog.augment_entry(
+                self._entry(runtime="python", version="1.0.0", source=source),
+                installed_versions={"notion-mcp": "1.0.0"},
+                enabled_for_agents={}, installed_manifest_hashes={"notion-mcp": "bbbb"},
+            )
+            assert out["update_available"] is False, source
 
 
 class TestDetectionScopedToCommunity:

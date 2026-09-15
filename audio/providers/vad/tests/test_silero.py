@@ -1,13 +1,13 @@
 """SileroVad tests — constructs the bundled ONNX model and runs offline.
 
-silero-vad-lite bundles its own model, so this needs no external file or
+The model ships inside the package, so this needs no external file or
 network. Silence must not trigger SPEECH_START. Skipped entirely on lean
 installs without the ``localmodels`` extra (e.g. the proxy venv).
 """
 
 import pytest
 
-pytest.importorskip("silero_vad_lite")
+pytest.importorskip("onnxruntime")
 
 from audio.providers.vad.base import VadEvent, VadState
 from audio.providers.vad.silero import SileroVad

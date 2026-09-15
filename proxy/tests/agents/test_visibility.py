@@ -9,7 +9,7 @@ scope, and the chat-history owner.
 from __future__ import annotations
 
 from core.session.visibility import resolve_visibility
-from storage import agent_store
+from storage.agents import agent_store
 
 
 # Four agents, one per mode.
@@ -173,7 +173,7 @@ def test_user_scope_manager_task_keeps_config(temp_db):
 # ---------------------------------------------------------------------------
 
 def test_per_agent_toggle_disables_memory(temp_db):
-    from storage import memory_store
+    from storage.agents import memory_store
     _seed_modes()
     memory_store.set_agent_toggle("ps", "agent_memory_enabled", False)
     v = resolve_visibility("ps", username="alice", user_role="manager")

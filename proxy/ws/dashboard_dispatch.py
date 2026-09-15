@@ -11,7 +11,8 @@ import contextlib
 import base64
 import logging
 import config
-from storage import database as task_store, notification_store
+from storage import database as task_store
+from storage.automation import notification_store
 from services.notifications import notification_manager
 from core.session.session_state import (
     set_session_mode,
@@ -394,7 +395,7 @@ class ClientMessageDispatcher:
                 away=bool(msg.get("away")),
             )
         elif msg_type == "ping":
-            await self._send({"type": "pong"})
+            await self._pong()
         elif msg_type == "close":
             logger.info(f"WS dashboard close: session={self.session_id}, chat={self.chat_id}")
             return "close"
@@ -575,7 +576,8 @@ class ClientMessageDispatcher:
         from api.agents._common import _get_execution_paths
         from services.engines import subscription_pool
         from services.notifications import notification_manager as _nm
-        from storage import agent_store, subscription_store
+        from storage.agents import agent_store
+        from storage.billing import subscription_store
         from core.session import history_seed, session_delivery, warmup_registry
         from core.session.session_manager import get_execution_layer
         from ws.dashboard import _effective_agent_role, chat_process_alive

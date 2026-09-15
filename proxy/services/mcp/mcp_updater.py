@@ -32,7 +32,7 @@ from fastapi import HTTPException
 
 from services.mcp import mcp_registry
 from storage import database as task_store
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("claude-proxy.mcp-updater")
 
@@ -348,19 +348,40 @@ async def detect_available_updates() -> dict:
             results[mcp_name] = info
 
     # Docker MCPs — compare the installed version against the catalog version
-    # tag. Community only, same rationale as above (a custom docker MCP —
+    # tag, then the integration manifest (a catalog edit under the same image
+    # tag: the converge re-fetches the folder and recreates the container).
+    # Community only, same rationale as above (a custom docker MCP —
     # file-tools — updates via platform releases, and a name collision with a
     # catalog entry must never produce a converge offer for it).
+    docker_targets = [
+        (name, m) for name, m in manifests.items()
+        if m.category == "community" and m.server.runtime == "docker"
+    ]
+
+    def _docker_hashes() -> dict:
+        out: dict[str, str | None] = {}
+        for dname, dm in docker_targets:
+            try:
+                data = json.loads((Path(dm.mcp_dir) / "manifest.json").read_text())
+                out[dname] = community_catalog.normalized_manifest_hash(data)
+            except Exception:
+                out[dname] = None
+        return out
+    docker_hashes = await asyncio.to_thread(_docker_hashes) if docker_targets else {}
+
     docker_checked = 0
-    for name, m in manifests.items():
-        if m.category != "community":
-            continue
-        if m.server.runtime != "docker":
-            continue
+    for name, m in docker_targets:
         docker_checked += 1
         entry = catalog.get(name)
         latest = entry.get("version") if entry else None
-        if latest and latest != m.version:
+        catalog_hash = entry.get("manifest_hash") if entry else None
+        installed_hash = docker_hashes.get(name)
+        if latest == m.version and catalog_hash and installed_hash and catalog_hash != installed_hash:
+            results[name] = {
+                "current": m.version, "latest": m.version,
+                "registry": "catalog", "package": name, "reason": "manifest",
+            }
+        elif latest and latest != m.version:
             results[name] = {
                 "current": m.version, "latest": latest,
                 "registry": "catalog", "package": name, "reason": "package",

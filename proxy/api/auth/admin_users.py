@@ -15,8 +15,8 @@ import config
 from auth.license import check_seat_limit
 from auth.password import check_password_strength, generate_temp_password, hash_password
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
-from storage import agent_store
-from storage import credential_store
+from storage.agents import agent_store
+from storage.identity import credential_store
 from storage import database as task_store
 
 from api.auth._common import _build_user_response
@@ -246,7 +246,7 @@ async def admin_update_role(
         if len(safe_agents) != len(current_agents):
             task_store.set_user_agents(sub, safe_agents, u.sub)
             logger.info(f"Removed high-clearance agents from {sub} after role change to {req.role}")
-        from storage import subscription_store
+        from storage.billing import subscription_store
         cleared = subscription_store.clear_contribute_platform_for_owner(sub)
         if cleared:
             logger.info(f"Cleared platform-pool contribution on {cleared} sub(s) for demoted user {sub}")
@@ -309,7 +309,8 @@ async def admin_delete_user(
     # user was NOT the full revocation an operator expects). Best-effort:
     # a failure here must not block the user delete.
     try:
-        from storage import api_key_store, trigger_store
+        from storage.identity import api_key_store
+        from storage.automation import trigger_store
         n_keys = await asyncio.to_thread(api_key_store.cleanup_user_api_keys, sub)
         n_trig = await asyncio.to_thread(trigger_store.cleanup_user_triggers, sub)
         if n_keys or n_trig:
@@ -319,6 +320,20 @@ async def admin_delete_user(
         logger.exception(
             "API-key/trigger cleanup raised for user %s "
             "(continuing with user delete)", sub,
+        )
+    # The user's own usage caps: their pool cap row and their limit rows
+    # (``user_self`` set by them, ``user_override`` set by an admin). Keyed by
+    # sub with no FK, so a re-created account must not inherit them.
+    try:
+        from storage.billing import subscription_store
+        await asyncio.to_thread(subscription_store.delete_pool_cap, "user", sub)
+        for limit_type in ("user_self", "user_override"):
+            await asyncio.to_thread(
+                task_store.delete_usage_limits_for_target, limit_type, sub,
+            )
+    except Exception:
+        logger.exception(
+            "Usage cap cleanup raised for user %s (continuing with user delete)", sub,
         )
     deleted = task_store.delete_user(sub)
     if not deleted:

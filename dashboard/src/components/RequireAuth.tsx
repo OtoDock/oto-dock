@@ -2,6 +2,8 @@ import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useFcmPush } from '../hooks/useFcmPush'
 import { useWakeWord } from '../hooks/useWakeWord'
+import { useBuildWatch } from '../hooks/useBuildWatch'
+import WakeDiagBadge from './WakeDiagBadge'
 import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
 
@@ -18,6 +20,10 @@ export default function RequireAuth() {
   // Inert unless the user's wake-word opt-in (default OFF) and every other
   // gate in the hook pass; yields the mic to duplex/dictation.
   useWakeWord(navigate, !!user)
+
+  // Pages without a dashboard socket learn about a new build when they
+  // return to the foreground (chat pages learn it over the socket).
+  useBuildWatch(!!user)
 
   if (loading) {
     return (
@@ -67,5 +73,13 @@ export default function RequireAuth() {
     return <Navigate to="/setup-2fa" replace />
   }
 
-  return <Outlet />
+  // The wake-word diagnostics badge renders beside the outlet (not inside a
+  // page) so it survives the wake navigation; it is null unless the
+  // recorder is on.
+  return (
+    <>
+      <Outlet />
+      <WakeDiagBadge />
+    </>
+  )
 }

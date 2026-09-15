@@ -416,7 +416,7 @@ def test_edit_rejects_immutable_scope(temp_db):
     """Scope is not in _EDITABLE_TRIGGER_COLUMNS — silently dropped."""
     _seed_user("user-test")
     from services.scheduler import trigger_manager as tm
-    from storage import trigger_store
+    from storage.automation import trigger_store
     row = tm.register_trigger(
         name="X",
         scope="user", agent="agent-x", created_by="user-test",
@@ -468,7 +468,7 @@ def test_edit_change_task_id_validates_scope(temp_db):
 def test_pause_resume_round_trip(temp_db):
     _seed_user("user-test")
     from services.scheduler import trigger_manager as tm
-    from storage import trigger_store
+    from storage.automation import trigger_store
     row = tm.register_trigger(
         name="X",
         scope="user", agent="agent-x", created_by="user-test",
@@ -487,7 +487,7 @@ def test_pause_resume_round_trip(temp_db):
 def test_delete_removes_row(temp_db):
     _seed_user("user-test")
     from services.scheduler import trigger_manager as tm
-    from storage import trigger_store
+    from storage.automation import trigger_store
     row = tm.register_trigger(
         name="X",
         scope="user", agent="agent-x", created_by="user-test",
@@ -593,7 +593,7 @@ def test_cleanup_user_triggers_removes_user_scoped_only(temp_db):
     _seed_user("user-alice", "alice")
     _seed_user("user-bob", "bob")
     from services.scheduler import trigger_manager as tm
-    from storage import trigger_store
+    from storage.automation import trigger_store
     # Alice's user trigger
     a = tm.register_trigger(
         name="Alice", scope="user", agent="agent-x", created_by="user-alice",
@@ -670,7 +670,7 @@ def test_trigger_task_survives_post_fire_cleanup(temp_db):
 def test_cleanup_agent_triggers_removes_all_for_agent(temp_db):
     _seed_user("user-test")
     from services.scheduler import trigger_manager as tm
-    from storage import trigger_store
+    from storage.automation import trigger_store
     a = tm.register_trigger(
         name="X", scope="user", agent="agent-x", created_by="user-test",
         notify_enabled=True, notify_title="X", notify_body="Y",

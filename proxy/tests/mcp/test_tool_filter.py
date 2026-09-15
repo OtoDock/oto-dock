@@ -84,7 +84,7 @@ class TestGetToolFilter:
         with patch.dict(
             mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
-            "storage.mcp_store.get_tool_filter_regex", return_value="^x_.*",
+            "storage.mcp.mcp_store.get_tool_filter_regex", return_value="^x_.*",
         ):
             assert mcp_registry.get_tool_filter("some-mcp") is None
 
@@ -96,7 +96,7 @@ class TestGetToolFilter:
         with patch.dict(
             mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
-            "storage.mcp_store.get_tool_filter_regex", return_value="",
+            "storage.mcp.mcp_store.get_tool_filter_regex", return_value="",
         ):
             assert mcp_registry.get_tool_filter("some-mcp") is None
 
@@ -108,7 +108,7 @@ class TestGetToolFilter:
         with patch.dict(
             mcp_registry._manifests, {"some-mcp": manifest}, clear=False,
         ), patch(
-            "storage.mcp_store.get_tool_filter_regex",
+            "storage.mcp.mcp_store.get_tool_filter_regex",
             return_value="^(mail|calendar)_.*",
         ):
             tf = mcp_registry.get_tool_filter("some-mcp")

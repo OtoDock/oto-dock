@@ -23,6 +23,8 @@ import {
 } from '../api/community'
 import { useAgentMcps, useSetAgentMcps } from '../api/mcps'
 import { useAuth } from '../contexts/AuthContext'
+import { safeHref } from '../lib/safeUrl'
+import McpIcon from './McpIcon'
 
 interface Props {
   open: boolean
@@ -303,7 +305,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   return (
     <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface p-3 flex flex-col gap-2">
       <div className="flex items-start gap-2">
-        <Icon mcp={mcp} />
+        <McpIcon name={mcp.name} label={mcp.label} category="community" author={mcp.author} hasIcon={!!mcp.icon_url} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
             <h4 className="text-sm font-medium text-p-text truncate">{mcp.label}</h4>
@@ -313,6 +315,19 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
             <span className="text-[10px] text-p-text-light">
               {mcp.installed_version || mcp.version ? `v${mcp.installed_version || mcp.version}` : 'latest'}
             </span>
+            {/* Where the server code comes from — the catalog entry's upstream project. */}
+            {mcp.author && (
+              <a
+                href={safeHref(mcp.author_url)}
+                target="_blank"
+                rel="noreferrer"
+                onClick={e => { if (!safeHref(mcp.author_url)) e.preventDefault() }}
+                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:underline"
+                title={`Server code by ${mcp.author}`}
+              >
+                by {mcp.author}
+              </a>
+            )}
             {mcp.patched && (
               <span
                 className="text-[10px] px-1 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
@@ -617,22 +632,5 @@ function Pill({ tone, children }: { tone: 'green' | 'amber' | 'gray'; children: 
     gray: 'bg-gray-100 dark:bg-gray-800 text-p-text-light',
   }[tone]
   return <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${classes}`}>{children}</span>
-}
-
-// ---------------------------------------------------------------------------
-// Icon — uses the first letter of the label, colored by category. Falls back
-// to a real icon image if the registry entry supplies one.
-// ---------------------------------------------------------------------------
-
-function Icon({ mcp }: { mcp: CommunityMcpEntry }) {
-  // The registry's icon_url is a relative path inside the catalog repo. The
-  // platform doesn't proxy it, so we just render a first-letter avatar —
-  // same shape an absent icon should produce.
-  const letter = (mcp.label || mcp.name).charAt(0).toUpperCase()
-  return (
-    <div className="w-8 h-8 rounded-md bg-brand/15 text-brand flex items-center justify-center shrink-0 font-semibold text-sm">
-      {letter}
-    </div>
-  )
 }
 

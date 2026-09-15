@@ -14,6 +14,71 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.6.1] — 2026-09-15
+
+### Added
+- **The release images ship for arm64 as well as x86-64.** Raspberry Pi 5,
+  Ampere and Graviton servers and other arm64 Linux hosts pull the same tags,
+  the phone service included. The installer refuses an unsupported CPU with
+  a clear message. Thanks to suranyami for the pipeline and the field test (#2).
+- **The pool reads each account's usage from Claude and ChatGPT.** New work
+  goes to the account whose weekly window resets first, and an account out of
+  window for the model is skipped. Both windows show on the AI Engines cards.
+  Owners get a notification at 90% and when a weekly limit is reached.
+- **Caps on subscription usage.** Each user can cap their own accounts, and
+  an admin the agent pool: a share of the weekly windows or dollars, per day
+  and per week. At the cap the work stops or continues on API keys, as you
+  choose. Set on the Usage pages.
+- **Users can connect their own Anthropic or OpenAI API key** in User
+  Settings → AI Engines and cap what it spends per week or month.
+- **Every MCP shows its icon and the project it wraps** in the community
+  browser, the admin MCP Servers page and an agent's MCPs tab, and the lists
+  filter by category.
+- **Issue forms and a pull request template on the public repositories.** A
+  bug report asks for the version, the install kind and the logs.
+
+### Changed
+- **A platform setting can stop OtoDock reading subscription usage from the
+  provider** (on by default). Off, the pool balances by recorded cost as before.
+- **The dashboard downloads less and opens faster.** Its scripts and styles
+  arrive compressed and stay cached until the next release. The first screen
+  carries a third of the code it did.
+- **A docker community MCP whose catalog manifest changed under the same image
+  tag now shows an integration update**, as node and python MCPs already did.
+  Docker MCPs installed before this release show one such update once.
+- **The phone service's voice detection runs on the ONNX Runtime it already
+  ships.** Same Silero model, same behaviour, one native dependency fewer. A
+  bare-metal phone install picks it up by re-running its setup script.
+
+### Fixed
+- **An open dashboard reloads itself after an update.** A page kept running
+  the previous build until reloaded by hand; it now reloads once, after any
+  sign-in, meeting or upload still in progress.
+- **The wake word hears the first attempt, and agent names wake as easily as
+  "Hey OtoDock".** The spotter forgot the start of a phrase about one attempt
+  in twelve. A listener whose engine failed to load is rebuilt, and a "Record
+  diagnostics" switch keeps the last thirty seconds on the device.
+- **Connecting an Anthropic Console account is refused with the reason.** Such
+  a login carries no inference scope, so every turn failed with "Not logged
+  in". The connect form now points at an API-key credential instead (#3).
+- **Subscription seat counts stay honest.** Abandoned spawns leaked one seat
+  each and blocked Remove until a restart. Seats now return, and Remove
+  judges on live sessions or can be forced (#3).
+- **An agent-scoped run the pool refuses fails with the reason** instead of
+  starting on a stale credential file. The task run, meeting or call says why.
+- **Chat fixes.** An interactive terminal's questions and plan approvals park
+  the chat as "needs your input" instead of freezing it. A first prompt is no
+  longer typed twice into an open dialog. A chat reattaching to a running
+  turn after a reconnect works again.
+- **A satellite started from inside Claude Code spawns clean CLIs**, so its
+  chats persist. Inherited session variables had made every terminal there a
+  nested child that kept no transcript.
+
+### Security
+- **File tools render PDFs with WeasyPrint 70.** The renderer no longer
+  loads EPS images and keeps the original URL fetcher for stylesheets and
+  metadata (CVE-2026-55073).
+
 ## [1.6.0] — 2026-09-09
 
 ### Added
@@ -703,7 +768,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...v1.4.0

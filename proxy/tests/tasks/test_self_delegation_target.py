@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 

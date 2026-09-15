@@ -87,14 +87,14 @@ def _mk_chat(sid: str | None = None, owner: str = "alice-sub",
 
 def _pin(payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match"):
         return client.post("/v1/hooks/apps/pin", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
 
 def _hook(op: str, payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match"):
         return client.post(f"/v1/hooks/apps/{op}", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 

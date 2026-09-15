@@ -27,7 +27,7 @@ from services.delegation.spawn_authz import (
 from services.delegation import file_transfer, lane_status
 from services.scheduler import scheduler
 from storage import database as task_store
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("claude-proxy.delegation-api")
 router = APIRouter()
@@ -103,7 +103,7 @@ def _model_served_by_layer(model: str, layer: str) -> bool:
     errors — this guards cross-layer poison, it is not the registry's
     gatekeeper (twin of ws/dashboard._model_allowed_for_path)."""
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         return any(
             (m.get("model_id") or "") == model
             for m in subscription_store.list_models(layer)
@@ -121,7 +121,7 @@ def _model_is_cross_layer_poison(model: str, layer: str) -> bool:
     try:
         if _model_served_by_layer(model, layer):
             return False
-        from storage import subscription_store
+        from storage.billing import subscription_store
         return any(
             (m.get("model_id") or "") == model
             and (m.get("layer") or "") != layer
@@ -693,7 +693,7 @@ async def list_delegation_sessions(
             raise HTTPException(403, f"No access to agent '{agent}'")
 
         def _gather_cross() -> list[dict]:
-            from storage import agent_store as _agent_store
+            from storage.agents import agent_store as _agent_store
             if nouser_slugs is not None:
                 slugs = nouser_slugs
             elif agent == "all":

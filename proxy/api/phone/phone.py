@@ -22,13 +22,13 @@ from pydantic import BaseModel
 import config
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from services.phone import phone_adapters
-from storage import agent_store
-from storage import credential_store
+from storage.agents import agent_store
+from storage.identity import credential_store
 from storage import database as task_store
-from storage import phone_call_log_store
-from storage import phone_route_store
-from storage import phone_server_store
-from storage import trigger_store
+from storage.phone import phone_call_log_store
+from storage.phone import phone_route_store
+from storage.phone import phone_server_store
+from storage.automation import trigger_store
 from services.phone.phone_config import ensure_ami_user, ensure_register_secret, notify_phone_config_changed
 
 logger = logging.getLogger("claude-proxy")

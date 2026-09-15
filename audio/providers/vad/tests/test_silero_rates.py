@@ -1,14 +1,13 @@
 """SileroVad rate parameterization — model mocked, runs on lean installs too.
 
-The sibling module needs the real ``silero_vad_lite`` (localmodels extra) and
-is skipped on the proxy venv; these tests pin the wrapper's rate contract
+The sibling modules need the real onnxruntime (localmodels extra) and are
+skipped on the proxy venv; these tests pin the wrapper's rate contract
 everywhere: the analysis window is derived from the model at the instance's
-rate, and every internal reset re-creates the model at that SAME rate — a
-hardcoded-8k reset would silently break a 16 kHz duplex session mid-stream.
+rate, one model serves the instance for its whole life, and every internal
+reset zeroes that model's state instead of building a new one (a
+hardcoded-8k rebuild would silently break a 16 kHz duplex session
+mid-stream, and a session rebuild per reset was the old binding's cost).
 """
-
-import sys
-import types
 
 import pytest
 
@@ -22,18 +21,21 @@ class _FakeModel:
         self.sample_rate = sample_rate
         self.window_size_samples = int(sample_rate * 0.032)
         self.processed: list = []
+        self.resets = 0
         _FakeModel.instances.append(self)
 
     def process(self, float32_audio):
         self.processed.append(len(float32_audio))
         return 0.0
 
+    def reset(self):
+        self.resets += 1
+
 
 @pytest.fixture()
 def vad_cls(monkeypatch):
-    fake_mod = types.ModuleType("silero_vad_lite")
-    fake_mod.SileroVAD = _FakeModel
-    monkeypatch.setitem(sys.modules, "silero_vad_lite", fake_mod)
+    # Patch the module that reads the name, never the facade.
+    monkeypatch.setattr("audio.providers.vad.silero.SileroModel", _FakeModel)
     _FakeModel.instances = []
     from audio.providers.vad.silero import SileroVad
     return SileroVad
@@ -70,9 +72,12 @@ def test_process_consumes_window_sized_chunks_at_16k(vad_cls):
     assert len(vad._buffer) == 100 * SAMPLE_WIDTH
 
 
-def test_resets_recreate_model_at_instance_rate(vad_cls):
+def test_resets_zero_the_one_model_at_instance_rate(vad_cls):
     vad = _make(vad_cls, sample_rate=16000)
     vad.set_bargein_mode(True)
     vad.reset()
-    assert {m.sample_rate for m in _FakeModel.instances} == {16000}
-    assert len(_FakeModel.instances) == 3  # init + bargein toggle + reset
+    assert len(_FakeModel.instances) == 1
+    model = _FakeModel.instances[0]
+    assert model.sample_rate == 16000
+    assert model.resets == 2  # bargein toggle + reset; construction is not a reset
+    assert vad._model is model

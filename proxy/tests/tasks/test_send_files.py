@@ -38,7 +38,10 @@ from services.delegation.file_transfer import (
     prefetch_remote_sources,
     validate_send_path,
 )
-from storage import agent_store, db_file_transfers, mcp_store, remote_store
+from storage.agents import agent_store
+from storage.files import db_file_transfers
+from storage.mcp import mcp_store
+from storage import remote_store
 from storage import database as task_store
 
 

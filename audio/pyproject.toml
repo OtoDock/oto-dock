@@ -14,8 +14,8 @@ requires-python = ">=3.13"
 # where a private/unstable upstream API is used:
 #   - cartesia: 3.x exposes a public context/push API with a dict output_format —
 #     the old private `cartesia._types.OutputFormat` import is gone; hold <4.
-#   - silero-vad-lite: exact-pin — runtime VAD semantics, not a public API.
-#     Drift between proxy/phone could change detection.
+#   - Silero VAD is the vendored models/silero_vad.onnx on onnxruntime (no
+#     package): swapping the model file is a tuning change, see models/README.md.
 # CORE — cloud STT/TTS providers. Used by BOTH the proxy (cloud chat audio:
 # /v1/audio/*) and the phone server. Kept deliberately lean so the proxy image
 # does NOT carry the on-box model stack (ONNX/transformers, ~250 MB) it never
@@ -37,9 +37,8 @@ dependencies = [
 # The proxy's chat-audio path is cloud-only and does NOT need these, so the proxy
 # installs the lean core and the phone installs ``oto-audio[localmodels]``.
 localmodels = [
-    "onnxruntime>=1.23,<2.0",   # Silero VAD + Smart Turn ONNX inference
+    "onnxruntime>=1.23,<2.0",   # Silero VAD (vendored models/silero_vad.onnx) + Smart Turn ONNX inference
     "transformers>=5.5,<6.0",   # Smart Turn mel features (WhisperFeatureExtractor; its config is vendored at models/whisper_feature_extractor/ — offline, HF Hub only as fallback). >=5.5 clears the model-loading RCE CVEs; our path is numpy-only (no torch) and yields bit-identical mel features on the vendored config across 4.57→5.x.
-    "silero-vad-lite==0.2.1",   # exact-pin: runtime-semantics VAD dep
 ]
 # Heavy local PROVIDER engines ship as importable stubs in the core install;
 # install the extra to enable the real implementation. Footprint noted in

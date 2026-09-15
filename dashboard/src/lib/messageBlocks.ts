@@ -400,18 +400,29 @@ export function dbMessagesToDisplay(
       }
     }
   }
-  // Post-process: mark question blocks as answered if a user message follows
+  // Post-process: mark question blocks as answered, and plan-approval
+  // blocks as resolved, once a LATER MESSAGE follows them (the user's answer
+  // in a headless chat). Later blocks in the SAME assistant message are
+  // recorded apart (`followedInTurn`): an interactive terminal's picker
+  // answer writes no user row and the agent's continuation lands as sibling
+  // blocks, so the renderer counts them for interactive chats only. A
+  // headless turn always closes with a metadata block, which would
+  // otherwise answer every open question the moment the history is rebuilt.
   for (let i = 0; i < displayMsgs.length; i++) {
     const msg = displayMsgs[i]
     if (msg.role !== 'assistant') continue
-    const hasQuestion = msg.blocks.some(b => b.type === 'question' && !b.answered)
-    if (!hasQuestion) continue
-    const hasFollowUp = displayMsgs.slice(i + 1).some(m => m.role === 'user')
-    if (hasFollowUp) {
-      msg.blocks = msg.blocks.map(b =>
-        b.type === 'question' ? { ...b, answered: true } : b
-      )
-    }
+    const laterMessage = i < displayMsgs.length - 1
+    msg.blocks = msg.blocks.map((b, k) => {
+      const laterSibling = k < msg.blocks.length - 1
+      if (!laterMessage && !laterSibling) return b
+      if (b.type === 'question' && !b.answered) {
+        return laterMessage ? { ...b, answered: true } : { ...b, followedInTurn: true }
+      }
+      if (b.type === 'plan' && b.action === 'exit' && !b.resolved) {
+        return laterMessage ? { ...b, resolved: true } : { ...b, followedInTurn: true }
+      }
+      return b
+    })
   }
   // Post-process: mark delegate blocks completed. Primary key: task_id
   // (stable + unique) — a delegate_result with a given task_id completes the

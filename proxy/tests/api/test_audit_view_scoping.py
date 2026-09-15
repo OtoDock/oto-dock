@@ -26,11 +26,11 @@ if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
 from auth.providers import UserContext  # noqa: E402
-from storage import agent_store  # noqa: E402
+from storage.agents import agent_store  # noqa: E402
 from storage import database as task_store  # noqa: E402
-from storage import notification_store  # noqa: E402
-from storage import trigger_store  # noqa: E402
-from storage import webhook_subscription_store  # noqa: E402
+from storage.automation import notification_store  # noqa: E402
+from storage.automation import trigger_store  # noqa: E402
+from storage.automation import webhook_subscription_store  # noqa: E402
 
 AG = "shared-agent"
 OTHER = "other-agent"
@@ -123,7 +123,7 @@ class TestTriggersEndpointScoping:
 
 class TestNotificationsEndpointScoping:
     def _seed(self):
-        from storage import notification_store
+        from storage.automation import notification_store
         agent_store.create_agent(AG, "Shared", created_by="user-admin")
         notification_store.create_notification("n-ag", "b", scope="agent", target=AG, created_by="user-admin")
         notification_store.create_notification("n-m", "b", scope="user", target=M, created_by=M)

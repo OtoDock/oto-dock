@@ -38,7 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 import config
-from storage import credential_store
+from storage.identity import credential_store
 from storage import database as task_store
 from services.billing import relay_client
 from services.mcp import mcp_registry

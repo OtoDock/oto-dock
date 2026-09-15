@@ -13,7 +13,7 @@ from app import app
 from auth.providers import UserContext, get_current_user
 from services.infra import turnstile
 from storage import database as db
-from storage.credential_store import _encrypt
+from storage.identity.credential_store import _encrypt
 
 client = TestClient(app)
 

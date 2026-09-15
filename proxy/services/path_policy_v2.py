@@ -6,7 +6,7 @@ and what host path should the caller actually use?". Used by:
   * ``auth.path_policy.check_tool_access`` on every native-tool call
     (Read / Edit / Glob / etc.) — replaces the old remote short-circuit
     so satellite-host paths now get policy-checked.
-  * ``api.hooks.hooks`` ``/v1/hooks/resolve-path`` — batched hook
+  * ``api.hooks.paths`` ``/v1/hooks/resolve-path`` — batched hook
     used by the satellite stdio interceptor and by Docker MCPs.
 
 Edge cases are covered one-for-one by the tests in

@@ -118,7 +118,7 @@ def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
             meeting_agent = block.get("_meeting_agent")
             event_data = ""
             if meeting_agent:
-                from storage import agent_store
+                from storage.agents import agent_store
                 ad = agent_store.get_agent(meeting_agent)
                 event_data = json.dumps({
                     "agent_slug": meeting_agent,
@@ -996,7 +996,7 @@ class ChatStreamPump:
                     meeting_agent = event.data.get("meeting_agent")
                     event_data_str = ""
                     if meeting_agent:
-                        from storage import agent_store as _agent_store
+                        from storage.agents import agent_store as _agent_store
                         ad = _agent_store.get_agent(meeting_agent)
                         event_data_str = json.dumps({
                             "agent_slug": meeting_agent,

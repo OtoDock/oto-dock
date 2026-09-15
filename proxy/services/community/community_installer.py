@@ -398,7 +398,7 @@ async def install_from_extracted_folder(
     # would silently re-disable an MCP that was already enabled). For Docker
     # MCPs the .env regeneration below also runs only when enabled, so order
     # matters.
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     if is_update and prior_enabled is not None:
         await asyncio.to_thread(mcp_store.set_mcp_enabled, mcp_name, prior_enabled)
     elif not is_update:
@@ -500,7 +500,7 @@ def _uv_bin_if_present() -> str | None:
 
 def _existing_enabled_state(mcp_name: str) -> bool | None:
     """Return the current ``mcp_state.enabled`` for an MCP, or ``None`` if no row exists."""
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     state = mcp_store.get_mcp_state(mcp_name)
     return state.get("enabled") if state else None
 
@@ -711,7 +711,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
     a fresh ``install_from_catalog`` (env re-inject is idempotent and a
     running container is left alone).
     """
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     notes: list[str] = []
     prior = _existing_enabled_state(mcp_name)
@@ -791,7 +791,8 @@ async def approve_request(
     explicit-mode; for a not-yet-installed MCP the admin approves without it
     and the needs-instance retry offers the selector.
     """
-    from storage import mcp_request_store, mcp_store
+    from storage.mcp import mcp_request_store
+    from storage.mcp import mcp_store
 
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
@@ -973,7 +974,7 @@ def _ensure_agent_authorized_for_instance_mcp(
     The ``human_log`` is a one-line description suitable for appending to
     the request's ``install_log``.
     """
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     manifest = mcp_registry.get_manifest(mcp_name)
     # ``getattr`` with default so test-stub manifests (bare ``object()``)
@@ -1015,7 +1016,7 @@ def _ensure_agent_authorized_for_instance_mcp(
 
 async def reject_request(request_id: int, admin_sub: str, admin_note: str = "") -> dict:
     """Reject a pending request; notifies the requester with the admin's note."""
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
         raise HTTPException(404, f"Request {request_id} not found")
@@ -1036,7 +1037,7 @@ async def reject_request(request_id: int, admin_sub: str, admin_note: str = "") 
 
 async def cancel_request(request_id: int, user_sub: str) -> dict:
     """Cancel an open pending request. Only the original requester may cancel."""
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
         raise HTTPException(404, f"Request {request_id} not found")
@@ -1102,7 +1103,7 @@ async def notify_batch_created(
     install batch. Skips the requester if they happen to be an admin (admin
     self-installs auto-approve inline anyway — they don't need to be told).
     """
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
 
     rows = await asyncio.to_thread(mcp_request_store.list_requests_by_batch, batch_id)
     if not rows:
@@ -1151,7 +1152,7 @@ async def _maybe_notify_batch_complete(request: dict) -> None:
     batch_id = request.get("batch_id")
     if not batch_id:
         return
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
 
     all_done = await asyncio.to_thread(
         mcp_request_store.all_in_batch_terminal, batch_id,

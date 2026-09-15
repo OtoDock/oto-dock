@@ -1,0 +1,39 @@
+--- a/sherpa-onnx/csrc/keyword-spotter-transducer-impl.h	2026-09-11 04:21:52.602376974 +0000
++++ b/sherpa-onnx/csrc/keyword-spotter-transducer-impl.h	2026-09-11 04:21:52.626379079 +0000
+@@ -202,10 +202,16 @@
+       // assume frameshift is 0.01 second
+       float trailing_silence = num_trailing_blanks * 4 * 0.01;
+ 
+-      // it resets automatically after detecting 1.5 seconds of silence
++      // it resets automatically after detecting 1.5 seconds of silence.
++      // OtoDock patch: drop the stale decoder prefix only and KEEP the
++      // encoder states. A full Reset() here wiped the cached frames of a
++      // phrase whose onset preceded the reset but whose first token had
++      // not been emitted yet (a dead window of ~160 ms before every
++      // automatic reset, measured 2026-09-11). Explicit resets from the
++      // API keep the full behaviour.
+       float threshold = 1.5;
+       if (trailing_silence > threshold) {
+-        Reset(s);
++        ResetDecoderOnly(s);
+       }
+     }
+ 
+@@ -342,6 +348,17 @@
+     InitKeywords(is);
+   }
+ 
++  // Fresh decoder hypotheses at the trie root; encoder states untouched.
++  void ResetDecoderOnly(OnlineStream *stream) const {
++    auto r = decoder_->GetEmptyResult();
++    SHERPA_ONNX_CHECK_EQ(r.hyps.Size(), 1);
++
++    SHERPA_ONNX_CHECK(stream->GetContextGraph() != nullptr);
++    r.hyps.begin()->second.context_state = stream->GetContextGraph()->Root();
++
++    stream->SetKeywordResult(r);
++  }
++
+   void InitOnlineStream(OnlineStream *stream) const {
+     auto r = decoder_->GetEmptyResult();
+     SHERPA_ONNX_CHECK_EQ(r.hyps.Size(), 1);

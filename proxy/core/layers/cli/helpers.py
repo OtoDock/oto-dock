@@ -40,7 +40,7 @@ class ClaudeStreamChunk:
     session_id: str = ""
     is_error: bool = False
     error_message: str = ""
-    event_type: str = "text"  # text | thinking | tool_start | tool_end | tool_info | task_spawn | subagent_end | workflow_started | workflow_progress | workflow_ended | delegate_spawn | metadata | system | plan_mode | permission_prompt | todo_update
+    event_type: str = "text"  # text | thinking | tool_start | tool_end | tool_info | task_spawn | subagent_end | workflow_started | workflow_progress | workflow_ended | delegate_spawn | metadata | system | plan_mode | permission_prompt | todo_update | rate_limit
     event_data: dict = field(default_factory=dict)
 
 

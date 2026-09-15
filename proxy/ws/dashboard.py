@@ -26,7 +26,7 @@ from typing import NamedTuple
 from fastapi import WebSocket, WebSocketDisconnect
 
 from storage import database as task_store
-from storage import notification_store
+from storage.automation import notification_store
 from services.notifications import notification_manager
 from auth.providers import validate_session_jwt, session_iat_after_password_change
 
@@ -97,7 +97,7 @@ def _build_chat_restore(chat_id: str) -> dict:
         # sends {slug, display_name, color} objects and the frontend renders
         # that shape (MeetingIndicator crashed the whole app on the string
         # form). Enrich to the same object shape the orchestrator emits.
-        from storage import agent_store as _agent_store
+        from storage.agents import agent_store as _agent_store
         enriched = []
         for p in participants:
             if isinstance(p, dict):
@@ -427,7 +427,7 @@ def _model_allowed_for_path(model: str, exec_path: str) -> bool:
     if not model or not exec_path:
         return True
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         return any(
             (m.get("model_id") or "") == model
             for m in subscription_store.list_models(exec_path)
@@ -659,6 +659,8 @@ class DashboardConnection(
       {"type": "queue_removed", "index": N}
       {"type": "queue_sent", "text": "..."}
       {"type": "user_message", "content": "..."}
+      {"type": "server_info", "build_id": "...", "version": "..."}   (last of the connect-time frames)
+      {"type": "pong", "build_id": "..."}   (reply to ping; the build id lets a stale page reload)
     """
 
     def __init__(self, websocket: WebSocket, *, user_sub: str, user: dict):
@@ -863,6 +865,17 @@ class DashboardConnection(
             })
         except Exception:
             logger.exception("chat-status snapshot on connect failed")
+
+        # Which build the server serves — LAST of the connect-time frames on
+        # purpose: a page that is stale reloads on receipt, i.e. closes this
+        # socket, and the frames above have all been sent by then (a close
+        # earlier in this unguarded region would leak the notify-queue
+        # registration until the cleanup below runs). Every deploy restarts
+        # the proxy, so every client reconnects and sees this.
+        try:
+            await self.websocket.send_json(self._server_info_frame())
+        except Exception:
+            logger.exception("server_info on connect failed")
 
         try:
             ws_closing = False
@@ -1069,6 +1082,26 @@ class DashboardConnection(
                 await self.websocket.send_json(data)
         except Exception:
             pass
+
+    @staticmethod
+    def _server_info_frame() -> dict:
+        import config
+        from static_assets import dashboard_build_id
+
+        return {
+            "type": "server_info",
+            "build_id": dashboard_build_id(),
+            "version": config.PINNED_OTODOCK_VERSION or "",
+        }
+
+    async def _pong(self) -> None:
+        """The reply to a client ``ping`` — from BOTH the idle dispatcher and
+        the chat-stream pump loop, so the build id reaches a page during a
+        turn too (a dashboard-only rebuild restarts nothing; the pong is the
+        only signal a streaming page gets)."""
+        from static_assets import dashboard_build_id
+
+        await self._send({"type": "pong", "build_id": dashboard_build_id()})
 
     async def _send_error(self, msg: str):
         await self._send({"type": "error", "message": msg})

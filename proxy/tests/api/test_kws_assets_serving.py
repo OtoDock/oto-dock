@@ -19,7 +19,11 @@ from fastapi.testclient import TestClient
 
 import config
 
-KWS_VERSION_DIR = "1.13.5-gigaspeech-3.3M"
+# The directory name is the immutable-cache buster: a rebuilt engine (the
+# -r2 suffix = revision of the engine patch applied by scripts/build-wasm-kws.sh)
+# MUST ship in a new directory, and the previous one stays through the
+# release so an already-open dashboard keeps its old URL working.
+KWS_VERSION_DIR = "1.13.5-gigaspeech-3.3M-r2"
 
 BUNDLE_FILES = (
     "sherpa-onnx-kws.js",

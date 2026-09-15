@@ -32,7 +32,8 @@ class TestPaymentClassification:
     def test_own_vs_borrowed_split(self, temp_db):
         """A user mixing their OWN claude sub with the admin's borrowed codex API
         + hosted relay: self=own only, platform=borrowed only, 'default'=neither."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
 
         own = subscription_store.add_subscription(
             "claude-code-cli", "anthropic", "oauth", owner_sub="user-1")
@@ -57,7 +58,8 @@ class TestPaymentClassification:
 
     def test_own_api_key_is_self_paid(self, temp_db):
         """A user's OWN api_key (owner_sub == user) is self-paid, not platform."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
 
         own_key = subscription_store.add_subscription(
             "codex-cli", "openai", "api_key", owner_sub="user-1")
@@ -82,7 +84,8 @@ class TestPaymentClassification:
 class TestUserLimitGating:
     def test_own_sub_user_never_blocked(self, temp_db):
         """Heavy own-subscription usage never trips the platform-auth budget."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
         from services.billing import usage_service
 
         own = subscription_store.add_subscription(
@@ -95,7 +98,8 @@ class TestUserLimitGating:
 
     def test_borrowed_usage_blocks(self, temp_db):
         """Borrowed platform-credential usage over the limit blocks."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
         from services.billing import usage_service
 
         admin_api = subscription_store.add_subscription(
@@ -111,7 +115,8 @@ class TestUserLimitGating:
 class TestAdminUsersSplit:
     def test_split_columns(self, temp_db):
         """get_all_users_usage returns total + platform + self per user."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
 
         db.upsert_user("user-1", "u1@x.test", "U1", "member")
         own = subscription_store.add_subscription(
@@ -131,7 +136,8 @@ class TestAdminUsersSplit:
 class TestNullSafety:
     def test_agent_scope_null_user_sub(self, temp_db):
         """A scope='agent' row with NULL user_sub must not crash the basis join."""
-        from storage import database as db, subscription_store
+        from storage import database as db
+        from storage.billing import subscription_store
 
         admin_api = subscription_store.add_subscription(
             "codex-cli", "openai", "api_key", owner_sub="admin", contribute_platform=True)

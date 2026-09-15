@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import storage.subscription_store  # noqa: F401 — ensure `storage.subscription_store` attr exists for monkeypatch
+import storage.billing.subscription_store  # noqa: F401 — ensure `storage.billing.subscription_store` attr exists for monkeypatch
 from services.phone import phone_config
 
 
@@ -33,7 +33,7 @@ def store(monkeypatch):
     m = MagicMock()
     m.get_credential_data.return_value = {}
     m.list_platform_pool.return_value = []
-    monkeypatch.setattr("storage.subscription_store", m)
+    monkeypatch.setattr("storage.billing.subscription_store", m)
     return m
 
 

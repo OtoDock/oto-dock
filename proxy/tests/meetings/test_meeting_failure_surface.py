@@ -160,3 +160,78 @@ async def test_usage_limit_block_notifies():
         await MO.start_meeting("m1")
 
     notify.assert_awaited_once_with("m1", "User usage limit exceeded")
+
+
+@pytest.mark.asyncio
+async def test_pool_cap_block_notifies_with_the_cap_reason():
+    from services.billing import pool_caps, usage_service
+    from storage.agents import agent_store
+    notify = AsyncMock()
+    status = pool_caps.CapStatus(scope="platform", target="", layer="codex-cli",
+                                 configured=True, accounts=1, allowed=False,
+                                 hits=["day_usd"])
+    status.caps["day_usd"], status.readings["day_usd"] = 5.0, 6.1
+    with patch.object(MO.task_store, "get_meeting",
+                      return_value=_pending_meeting_row()), \
+         patch.object(MO.task_store, "get_chat", return_value={"agent": "host"}), \
+         patch.object(agent_store, "get_agent",
+                      return_value={"execution_path": "codex-cli"}), \
+         patch.object(usage_service, "check_agent_limit",
+                      return_value={"allowed": True}), \
+         patch.object(pool_caps, "evaluate", return_value=status) as ev, \
+         patch.object(MO, "_notify_meeting_failed", new=notify):
+        await MO.start_meeting("m1")
+
+    ev.assert_called_once_with("platform", "", "codex-cli")
+    notify.assert_awaited_once_with(
+        "m1", "Subscription pool cap reached (today is at $6.10 of the $5 cap)")
+
+
+@pytest.mark.asyncio
+async def test_pool_cap_continue_with_a_key_lets_the_meeting_start():
+    from services.billing import pool_caps, usage_service
+    from services.engines import subscription_pool
+    from storage.agents import agent_store
+    notify = AsyncMock()
+    status = pool_caps.CapStatus(scope="user", target="u-1", layer="claude-code-cli",
+                                 configured=True, accounts=1, allowed=False,
+                                 on_reached="continue", hits=["week_pct"])
+    status.caps["week_pct"], status.readings["week_pct"] = 50.0, 60.0
+    row = _pending_meeting_row(scope="user", created_by="u-1")
+    with patch.object(MO.task_store, "get_meeting", return_value=row), \
+         patch.object(MO.task_store, "get_chat", return_value={"agent": "host"}), \
+         patch.object(MO.task_store, "get_user", return_value={"role": "member"}), \
+         patch.object(MO.task_store, "update_meeting"), \
+         patch.object(agent_store, "get_agent",
+                      return_value={"execution_path": "claude-code-cli"}), \
+         patch.object(usage_service, "check_user_limit",
+                      return_value={"allowed": True}), \
+         patch.object(pool_caps, "evaluate", return_value=status), \
+         patch.object(subscription_pool, "cap_continue_available",
+                      return_value=True) as avail, \
+         patch.object(MO, "build_meeting_agent_config",
+                      new=AsyncMock(side_effect=RuntimeError("stop here"))), \
+         patch.object(MO, "_notify_meeting_failed", new=notify):
+        await MO.start_meeting("m1")
+
+    avail.assert_called_once_with("claude-code-cli", "u-1")
+    # Past the pre-check: the (stubbed) build is what failed, not the cap.
+    assert "failed to prepare participant sessions" in notify.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_participant_pool_refusal_is_the_meeting_reason():
+    from services.engines.subscription_pool import NoSubscriptionError
+    notify = AsyncMock()
+    err = NoSubscriptionError("pool_cap", "The agent pool's Claude subscription cap is reached: x.")
+    with patch.object(MO.task_store, "get_meeting",
+                      return_value=_pending_meeting_row()), \
+         patch.object(MO.task_store, "get_chat", return_value={}), \
+         patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO, "build_meeting_agent_config",
+                      new=AsyncMock(side_effect=err)), \
+         patch.object(MO, "_notify_meeting_failed", new=notify):
+        await MO.start_meeting("m1")
+
+    notify.assert_awaited_once_with(
+        "m1", "The meeting could not start: The agent pool's Claude subscription cap is reached: x.")

@@ -9,15 +9,18 @@ everyone who self-hosts it.
 
 ## Supported versions
 
-Security fixes ship for the latest minor release line. Upgrading is
-`docker compose pull && docker compose up -d` — see the
+Security fixes ship for the latest release line only — the newest entry on
+the [Releases](https://github.com/OtoDock/oto-dock/releases) page and the
+patch releases that follow it. Upgrading is moving the version pinned in
+`docker-compose.yml` to the new release (`git pull` on a source checkout),
+then `docker compose pull && docker compose up -d` — see the
+[upgrade guide](https://docs.otodock.io/administration/upgrading) and the
 [CHANGELOG](CHANGELOG.md) before you pull.
 
-| Version | Supported |
-| ------- | --------- |
-| 1.1.x   | ✅        |
-| 1.0.x   | ✅        |
-| < 1.0   | ❌        |
+| Version                  | Supported |
+| ------------------------ | --------- |
+| The latest release line  | ✅        |
+| Earlier release lines    | ❌        |
 
 ## Reporting a vulnerability
 

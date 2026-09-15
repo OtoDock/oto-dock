@@ -167,7 +167,7 @@ def _create_dynamic_task(*, task_id, schedule, agent="support-bot"):
 
 
 def _create_notification(*, nid, schedule):
-    from storage import notification_store
+    from storage.automation import notification_store
     return notification_store.create_notification(
         notification_id=nid,
         title="Test",

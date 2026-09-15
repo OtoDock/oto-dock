@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 import config
-from storage import notification_store
+from storage.automation import notification_store
 from services.notifications import notification_manager
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
@@ -105,7 +105,7 @@ def _enforce_scope(user: UserContext, scope: str, agent: str | None = None) -> N
     # admin broadcast, not a mode scope — it passes through to its own check.
     if scope in ("user", "agent") and agent:
         from core.session.visibility import available_scopes_for
-        from storage import agent_store as _as
+        from storage.agents import agent_store as _as
         _row = _as.get_agent(agent) or {}
         _avail = available_scopes_for(
             bool(_row.get("collaborative", True)), _row.get("default_scope") or "user",

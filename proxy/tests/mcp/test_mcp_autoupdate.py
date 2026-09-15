@@ -9,7 +9,7 @@ import datetime as dt
 import pytest
 
 from services.mcp import mcp_autoupdate as au
-from storage import mcp_autoupdate_store as log_store
+from storage.mcp import mcp_autoupdate_store as log_store
 
 
 # --- stand-in manifests --------------------------------------------------

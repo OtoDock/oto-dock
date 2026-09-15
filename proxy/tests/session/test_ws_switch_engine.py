@@ -48,13 +48,13 @@ def _make_chat(agent: str, *, chat_id: str | None = None,
 
 def _enable_codex(slug: str) -> None:
     import json
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.update_agent(slug, execution_path="claude-code-cli",
                              execution_paths=json.dumps(["codex-cli"]))
 
 
 def _grant(layer: str, sub: str = "user-admin") -> None:
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subscription_store.add_subscription(
         layer, "openai" if layer == "codex-cli" else "anthropic", "api_key",
         owner_sub=sub, use_personal=True,
@@ -495,7 +495,7 @@ class TestSwitchEngineHappyPath:
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent()
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.update_agent(slug, execution_path="claude-code-cli",
                                  execution_paths=_json.dumps(["direct-llm"]))
         _grant("direct-llm")

@@ -17,6 +17,7 @@ import asyncio
 import json
 
 from services.scheduler import scheduler
+from services.scheduler import delivery, lanes
 from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
 
@@ -78,8 +79,8 @@ class TestDelegateDelivery:
 
         async def _fail(*a, **k):
             return None
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _fail)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
 
         asyncio.run(scheduler._do_deliver(
             "sess-1", "pa", "echo prompt", _task(),
@@ -128,8 +129,8 @@ class TestDelegateDelivery:
 
         async def _none(*a, **k):
             return None
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _ok)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _none)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _ok)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _none)
 
         asyncio.run(scheduler._do_deliver(
             "sess-2", "pa", "echo prompt", _task(),
@@ -260,7 +261,7 @@ class TestLaneFinalization:
             captured.update(kw, result_prompt=result_prompt)
             done.set()
 
-        monkeypatch.setattr(scheduler, "_do_deliver", _fake_do_deliver)
+        monkeypatch.setattr(delivery, "_do_deliver", _fake_do_deliver)
 
         async def _run():
             await scheduler._deliver_task_result(task, status, output, **lane_kw)
@@ -364,7 +365,7 @@ class TestOneshotSecurityContext:
     callback turn fail-closes with "Session is no longer active"."""
 
     def test_oneshot_config_carries_security_context(self, temp_db, monkeypatch):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("pa", "PA", collaborative=True,
                                  default_scope="user")
 
@@ -449,7 +450,7 @@ class TestTaskStallWatchdog:
         return asyncio.run(coro)
 
     def test_healthy_completion_passes_through(self, monkeypatch):
-        monkeypatch.setattr(scheduler, "_WATCHDOG_SLICE_S", 0.05)
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.05)
 
         async def _go():
             turn = asyncio.create_task(asyncio.sleep(0.01))
@@ -462,8 +463,8 @@ class TestTaskStallWatchdog:
         self._run(_go())
 
     def test_alive_process_below_ceiling_keeps_leash(self, monkeypatch):
-        monkeypatch.setattr(scheduler, "_WATCHDOG_SLICE_S", 0.02)
-        monkeypatch.setattr(scheduler, "_STALL_PROBE_SECS", 0.0)
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.02)
+        monkeypatch.setattr(lanes, "_STALL_PROBE_SECS", 0.0)
 
         async def _go():
             hang = asyncio.get_event_loop().create_future()
@@ -486,7 +487,7 @@ class TestTaskStallWatchdog:
         self._run(_go())
 
     def test_hard_stale_turn_is_reaped(self, monkeypatch):
-        monkeypatch.setattr(scheduler, "_WATCHDOG_SLICE_S", 0.02)
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.02)
         import config as _config
         monkeypatch.setattr(_config, "CLAUDE_TIMEOUT", 5)
 
@@ -508,8 +509,8 @@ class TestTaskStallWatchdog:
         self._run(_go())
 
     def test_dead_process_past_probe_is_reaped(self, monkeypatch):
-        monkeypatch.setattr(scheduler, "_WATCHDOG_SLICE_S", 0.02)
-        monkeypatch.setattr(scheduler, "_STALL_PROBE_SECS", 0.0)
+        monkeypatch.setattr(lanes, "_WATCHDOG_SLICE_S", 0.02)
+        monkeypatch.setattr(lanes, "_STALL_PROBE_SECS", 0.0)
 
         async def _go():
             hang = asyncio.get_event_loop().create_future()
@@ -581,7 +582,7 @@ class TestInterruptDeferral:
         async def _fake_quiescence(chat_id, **kw):
             waited.update(kw, chat_id=chat_id)
 
-        monkeypatch.setattr(scheduler, "_await_lane_quiescence", _fake_quiescence)
+        monkeypatch.setattr(lanes, "_await_lane_quiescence", _fake_quiescence)
 
         captured: dict = {}
         done = asyncio.Event()
@@ -590,7 +591,7 @@ class TestInterruptDeferral:
             captured.update(kw, result_prompt=result_prompt)
             done.set()
 
-        monkeypatch.setattr(scheduler, "_do_deliver", _fake_do_deliver)
+        monkeypatch.setattr(delivery, "_do_deliver", _fake_do_deliver)
 
         task = TaskDefinition(
             id="dyn-i2", name="lane", agent="pa", prompt="p", scope="agent",
@@ -723,8 +724,8 @@ class TestPumpedEchoTurn:
         async def _capture(sid, agent, text, **k):
             seen.update(k)
             return ""
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _capture)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _capture)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _capture)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _capture)
 
         asyncio.run(scheduler._do_deliver(
             "sess-k", "pa", "echo prompt", _task(),
@@ -740,8 +741,8 @@ class TestPumpedEchoTurn:
 
         async def _none(*a, **k):
             return None
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _pumped)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _none)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _pumped)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _none)
 
         asyncio.run(scheduler._do_deliver(
             "sess-e", "pa", "echo prompt", _task(),

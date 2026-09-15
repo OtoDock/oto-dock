@@ -45,7 +45,9 @@ from dataclasses import dataclass
 
 import requests
 
-from storage import subscription_store
+from storage.billing import subscription_store
+from services.billing import pool_caps as _pool_caps
+from services.engines import subscription_windows as _windows
 
 logger = logging.getLogger(__name__)
 
@@ -385,10 +387,12 @@ _ACTIVITY_AUTH_TYPES = frozenset({"oauth", "local_endpoint"})
 
 
 class NoSubscriptionError(Exception):
-    """Raised when USER-scoped work resolves to no usable credentials, so the
-    dashboard can show an actionable message instead of a cryptic provider 401.
+    """Raised when a spawn resolves to no usable credentials, so the dashboard
+    can show an actionable message instead of a cryptic provider 401.
     ``reason`` ∈ {auth_off, admin_oauth_only, no_pool, none, throttled,
-    own_sub_expired} (see ``user_scope_block_reason``)."""
+    own_sub_expired} for user-scoped work (see ``user_scope_block_reason``),
+    or ``pool_cap`` for either scope when the pool's subscription cap refused
+    the spawn (``message`` carries the cap's own wording)."""
 
     _MESSAGES = {
         "throttled": "Your subscription is briefly resting after the provider reported "
@@ -404,11 +408,13 @@ class NoSubscriptionError(Exception):
                    "account in your User Settings, or ask an administrator to add one.",
         "none": "No usable subscription for this execution layer. "
                 "Connect your account in your User Settings.",
+        "pool_cap": "The subscription cap on this pool is reached. It clears as the "
+                    "accounts' windows reset; change the cap on the Usage page.",
     }
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, message: str = ""):
         self.reason = reason
-        super().__init__(self._MESSAGES.get(reason, self._MESSAGES["none"]))
+        super().__init__(message or self._MESSAGES.get(reason, self._MESSAGES["none"]))
 
 
 @dataclass
@@ -432,10 +438,66 @@ class SubscriptionHandle:
     claude_creds_blob: dict | None = None
 
 
+def _window_readings(candidates: list[dict], now=None) -> dict:
+    """The effective provider-window reading per OAuth candidate that has a
+    sample (``services.engines.subscription_windows``); empty when the
+    platform setting is off or nothing has been read yet."""
+    if not _windows.is_enabled():
+        return {}
+    ids = [c["id"] for c in candidates if c.get("auth_type") == "oauth"]
+    if not ids:
+        return {}
+    try:
+        readings = _windows.latest_readings(subscription_store, ids, now)
+    except Exception:
+        logger.debug("Pool: window sample read failed", exc_info=True)
+        return {}
+    return readings if isinstance(readings, dict) else {}
+
+
+def _window_exhausted_overall(sub_id: str) -> bool:
+    """Is the account past its overall spill marks for every model (the
+    exhaustion that moves a pinned scope)?"""
+    reading = _window_readings([{"id": sub_id, "auth_type": "oauth"}]).get(sub_id)
+    return reading is not None and _windows.exhausted_overall(reading)
+
+
+def _window_exhausted_for(sub_id: str, model: str) -> bool:
+    """Is the account out of window for a spawn of ``model`` — overall, or
+    its per-model weekly window (``""`` = overall only)?"""
+    reading = _window_readings([{"id": sub_id, "auth_type": "oauth"}]).get(sub_id)
+    return reading is not None and _windows.exhausted(reading, model)
+
+
+def _group_model(session_ids: list[str]) -> str:
+    """The model the sessions of one credential scope run (the chat rows
+    carry it; the binding context does not), so a scope is judged and
+    re-homed against the right per-model window. The first row with a
+    model wins — a scope's sessions share one agent, so one model."""
+    from storage import database as task_store
+    for sid in session_ids:
+        try:
+            row = task_store.get_chat_by_session(sid)
+        except Exception:
+            continue
+        model = (row or {}).get("model") or ""
+        if model:
+            return model
+    return ""
+
+
+_FAR_FUTURE = float("inf")
+
+
+def _epoch_or_inf(dt) -> float:
+    return dt.timestamp() if dt is not None else _FAR_FUTURE
+
+
 def _select(
     candidates: list[dict],
     *,
     allowed_auth: frozenset[str] | None,
+    model: str = "",
 ) -> SubscriptionHandle | None:
     """Try candidates in priority order, claiming the first that yields usable
     credentials. ``candidates`` is already ordered (least-active first) by the
@@ -447,29 +509,53 @@ def _select(
     enforced HERE, on the same list the usable-credential check reads, so an
     excluded auth type (notably ``oauth``) can never slip through a later branch.
 
-    Ordering: a real BYO credential always beats the hosted relay (credit cost +
-    latency); within that, route to the LEAST-CONSUMED account — recent burn
-    (the ~5h window, tracking the provider's rolling reset) first, the 7-day
-    total as tiebreak (weekly caps). The store's least-active order breaks
-    remaining ties (stable sort). Subscriptions currently throttled
-    (recently hit a provider limit) are skipped so the next chat/turn fails over
-    to a fresh account.
+    Ordering — drain first: a real BYO credential always beats the hosted
+    relay (credit cost + latency); within that, the account whose WEEKLY
+    window resets soonest comes first (quota left in a window when it closes
+    is lost, so the account that closes first is used up first; the vendor's
+    own reading, see ``subscription_windows``), accounts without a reading
+    after every account with one (a subscription drains before a
+    pay-per-token key), and equal reset instants fall back to the
+    LEAST-CONSUMED key — recent burn (~5h) first, the 7-day total as tiebreak —
+    so accounts that reset together still spread. The store's least-active
+    order breaks remaining ties (stable sort). Subscriptions currently
+    throttled (a recent provider limit) or EXHAUSTED for this spawn's
+    ``model`` (a window past its spill mark, the vendor's reached flag, or the
+    model family's own weekly window) are skipped so the spawn fails over to
+    an account with headroom.
     """
     auth_ok = [
         c for c in candidates
         if allowed_auth is None or c.get("auth_type") in allowed_auth
     ]
-    pool = [c for c in auth_ok if not _is_throttled(c["id"])]
+    # Read the samples for ONE candidate too: the sticky path selects from a
+    # single-row list and the exhaustion check must still see it.
+    readings = _window_readings(auth_ok)
+    exhausted = {
+        c["id"] for c in auth_ok
+        if c["id"] in readings and _windows.exhausted(readings[c["id"]], model)
+    }
+    pool = [c for c in auth_ok
+            if not _is_throttled(c["id"]) and c["id"] not in exhausted]
+    fallback = False
     if not pool:
-        # Every eligible sub is briefly resting (recent provider limit/overload).
-        # Throttling should DE-PRIORITISE, not eliminate: rather than hard-block the
-        # user — fatal for a single-account install over a transient 529 — fall back
-        # to the resting set. The provider's own retry/limit response then governs
-        # (a transient overload usually clears on the immediate retry; a real limit
-        # surfaces the real provider error instead of a misleading "no subscription").
-        # auth_ok already enforces allowed_auth, so a borrowing user still never gets
-        # an OAuth sub here.
+        # Every eligible sub is briefly resting (recent provider limit/overload)
+        # or has no window headroom. Both should DE-PRIORITISE, not eliminate:
+        # rather than hard-block the user — fatal for a single-account install
+        # over a transient 529 — fall back to the resting set, ordered by the
+        # account that frees first. The provider's own retry/limit response
+        # then governs (a transient overload usually clears on the immediate
+        # retry; a real limit surfaces the real provider error instead of a
+        # misleading "no subscription"). auth_ok already enforces allowed_auth,
+        # so a borrowing user still never gets an OAuth sub here.
         pool = auth_ok
+        fallback = True
+        if exhausted:
+            logger.warning(
+                f"Pool: every candidate is out of window for {model or 'this spawn'} "
+                f"({', '.join(sorted(s[:8] for s in exhausted))}) — using the one "
+                f"that frees first; the provider may refuse until it resets"
+            )
     if not pool:
         return None
     if len(pool) > 1:
@@ -485,7 +571,17 @@ def _select(
             )
             for c in pool
         }
+
+        def _instant(s: dict) -> float:
+            reading = readings.get(s["id"])
+            if reading is None:
+                return _FAR_FUTURE
+            if fallback:
+                return _epoch_or_inf(_windows.frees_at(reading, model))
+            return _epoch_or_inf(_windows.weekly_reset(reading))
+
         pool.sort(key=lambda s: (s.get("auth_type") == "relay",
+                                 _instant(s),
                                  *consumption.get(s["id"], (0.0, 0.0))))
     else:
         pool.sort(key=lambda s: s.get("auth_type") == "relay")
@@ -582,12 +678,21 @@ def _select_sticky(
     candidates: list[dict],
     *,
     allowed_auth: frozenset[str] | None,
+    model: str = "",
 ) -> SubscriptionHandle | None:
     """Reuse the scope's committed account IF it is still in this acquisition's
     candidate list (same eligibility the normal path enforces — a delisted or
     non-borrowable pin falls through to fresh selection; the rebind fan-out
-    re-homes the scope's live sessions in that case). Throttling is deliberately
-    NOT honored here: the shared-file constraint dominates a resting account."""
+    re-homes the scope's live sessions in that case). Throttling is
+    deliberately NOT honored here: the shared-file constraint dominates a
+    briefly resting account (``rebalance_scopes`` moves the whole scope).
+    Window EXHAUSTION for the spawn's model is: a pin the vendor will refuse
+    is no pin — when another candidate can serve the model, the spawn goes
+    there and a rebalance pass is scheduled so the scope's other sessions
+    follow onto the same account (the new spawn's credential file already
+    points them there; the pass formalizes the bindings). Live-observed
+    2026-09-11: sessions kept spawning onto an account at 96 % of its
+    session window for a tick while the other account had headroom."""
     if not sticky_scope:
         return None
     pinned = _sticky_subscription_id(sticky_scope)
@@ -596,7 +701,20 @@ def _select_sticky(
     match = [c for c in candidates if c["id"] == pinned]
     if not match:
         return None
-    handle = _select(match, allowed_auth=allowed_auth)
+    if _window_exhausted_for(pinned, model):
+        others = [
+            c for c in candidates
+            if c["id"] != pinned and (allowed_auth is None or c.get("auth_type") in allowed_auth)
+            and not (c.get("auth_type") == "oauth" and _window_exhausted_for(c["id"], model))
+        ]
+        if others:
+            logger.info(
+                f"Pool: scope-sticky account {pinned[:8]} is out of window for "
+                f"{model or 'this spawn'} — spawning on the pool's pick and moving the scope"
+            )
+            schedule_rebalance("sticky account exhausted")
+            return None
+    handle = _select(match, allowed_auth=allowed_auth, model=model)
     if handle:
         logger.info(
             f"Pool: scope-sticky reuse of subscription {pinned[:8]} "
@@ -605,12 +723,32 @@ def _select_sticky(
     return handle
 
 
+def _cap_status(layer: str, user_sub: str | None):
+    """The pool cap this spawn is subject to (``services.billing.pool_caps``):
+    the user's own pool for user scope, the platform pool for agent scope.
+    None when the evaluation itself fails — a cap read must never take a
+    spawn down with it."""
+    try:
+        if user_sub:
+            return _pool_caps.evaluate("user", user_sub, layer)
+        return _pool_caps.evaluate("platform", "", layer)
+    except Exception:
+        logger.warning("Pool: cap evaluation failed, spawn proceeds uncapped", exc_info=True)
+        return None
+
+
+def _rows_without_login(candidates: list[dict]) -> list[dict]:
+    return [c for c in candidates if c.get("auth_type") != "oauth"]
+
+
 def acquire_subscription(
     layer: str,
     user_sub: str | None,
     *,
     provider: str = "",
     sticky_scope: str = "",
+    model: str = "",
+    enforce_caps: bool = True,
 ) -> SubscriptionHandle | None:
     """Select and acquire a subscription for a new session.
 
@@ -627,56 +765,98 @@ def acquire_subscription(
     every spawn/re-warm, so without stickiness two same-scope sessions could
     fight over the file with different accounts.
 
+    ``model`` (the spawn's model id, when known) lets the selection honour a
+    per-model weekly window: an account whose "Fable" window is full is
+    skipped for a Fable spawn and still serves a Sonnet one.
+
+    ``enforce_caps``: the pool's subscription cap (``services.billing.pool_caps``)
+    gates NEW spawns only. On a hit, ``stop`` raises ``NoSubscriptionError
+    ("pool_cap")`` for BOTH scopes (an agent-scope spawn that acquired nothing
+    would otherwise start on whatever credential file its scope dir still
+    holds); ``continue`` drops the OAuth accounts from the candidates so an
+    API key, the relay or a local endpoint takes the spawn, and raises the
+    same when none is there. The re-homing of LIVE sessions (the delisting
+    rebind and the scope rebalance) passes ``False``: a cap never moves or
+    strands a running session.
+
     Returns None when nothing is available (caller surfaces the block; see
     ``user_scope_block_reason`` for the user-facing reason).
     """
     user_sub = user_sub or None  # treat "" as agent-scope; never match owner_sub='' infra
 
+    drop_oauth = False
+    cap = _cap_status(layer, user_sub) if enforce_caps else None
+    if cap is not None and not cap.allowed:
+        scope_name = "user" if user_sub else "platform"
+        if cap.on_reached != "continue":
+            logger.info(
+                f"Pool: {scope_name} pool cap reached on layer={layer} "
+                f"({cap.hit_text()}) — spawn refused"
+            )
+            raise NoSubscriptionError("pool_cap", cap.blocked_message())
+        logger.info(
+            f"Pool: {scope_name} pool cap reached on layer={layer} "
+            f"({cap.hit_text()}) — OAuth accounts excluded, continuing on a key"
+        )
+        drop_oauth = True
+
     handle: SubscriptionHandle | None = None
     if user_sub:
         # 1. The user's own usable accounts (any auth type, incl. their own OAuth)
         personal = subscription_store.list_personal(layer, user_sub, provider or None)
-        handle = _select_sticky(sticky_scope, personal, allowed_auth=None) \
-            or _select(personal, allowed_auth=None)
+        if drop_oauth:
+            personal = _rows_without_login(personal)
+        handle = _select_sticky(sticky_scope, personal, allowed_auth=None, model=model) \
+            or _select(personal, allowed_auth=None, model=model)
         if not handle:
             # 2. Platform fallback, gated by the per-user Platform Auth toggle
             if not subscription_store.get_user_allow_platform_auth(user_sub):
                 logger.info(f"Pool: user {user_sub[:8]} has platform auth disabled, no subscription available")
-                return None
-            # 3. Borrow ONLY admin API-type credentials — never an admin OAuth sub
-            platform = subscription_store.list_platform_pool(layer, provider or None)
-            handle = _select_sticky(sticky_scope, platform,
-                                    allowed_auth=_USER_BORROWABLE_AUTH_TYPES) \
-                or _select(platform, allowed_auth=_USER_BORROWABLE_AUTH_TYPES)
-            if handle:
-                # Defense-in-depth: a user-scope handle must never be an OAuth subscription.
-                assert handle.auth_type in _USER_BORROWABLE_AUTH_TYPES, (
-                    f"user-scope acquired non-borrowable auth_type={handle.auth_type}"
-                )
             else:
-                logger.warning(f"Pool: no borrowable platform credentials for user {user_sub[:8]}, layer={layer}")
-                return None
+                # 3. Borrow ONLY admin API-type credentials — never an admin OAuth sub
+                platform = subscription_store.list_platform_pool(layer, provider or None)
+                handle = _select_sticky(sticky_scope, platform,
+                                        allowed_auth=_USER_BORROWABLE_AUTH_TYPES, model=model) \
+                    or _select(platform, allowed_auth=_USER_BORROWABLE_AUTH_TYPES, model=model)
+                if handle:
+                    # Defense-in-depth: a user-scope handle must never be an OAuth subscription.
+                    assert handle.auth_type in _USER_BORROWABLE_AUTH_TYPES, (
+                        f"user-scope acquired non-borrowable auth_type={handle.auth_type}"
+                    )
+                else:
+                    logger.warning(f"Pool: no borrowable platform credentials for user {user_sub[:8]}, layer={layer}")
     else:
         # AGENT-SCOPE: the full platform pool (OAuth subscriptions allowed)
         platform = subscription_store.list_platform_pool(layer, provider or None)
-        handle = _select_sticky(sticky_scope, platform, allowed_auth=None) \
-            or _select(platform, allowed_auth=None)
+        if drop_oauth:
+            platform = _rows_without_login(platform)
+        handle = _select_sticky(sticky_scope, platform, allowed_auth=None, model=model) \
+            or _select(platform, allowed_auth=None, model=model)
 
-    if handle and sticky_scope:
+    if handle is None:
+        if drop_oauth:
+            # ``continue`` with nothing to continue on: say so, rather than
+            # the generic "connect an account" classification.
+            raise NoSubscriptionError("pool_cap", cap.blocked_message(no_key=True))
+        return None
+
+    if sticky_scope:
         # Stickiness can only bridge sessions whose candidate lists overlap. A
         # Shared-only agent's chats share ONE credential dir across ALL users
         # (sender-pays: each user's session runs on their own account), so two
         # users concurrently active on such an agent land different accounts on
         # the same file — the last-write-wins flap stickiness exists to prevent.
         # Surface it loudly; the full fix is per-payer credential delivery
-        # for shared scopes.
+        # for shared scopes. Under a cap's ``continue`` the switch to a key
+        # is the point, so it is only noted.
         held = _sticky_subscription_id(sticky_scope)
         if held and held != handle.subscription_id:
-            logger.warning(
+            (logger.info if drop_oauth else logger.warning)(
                 f"Pool: credential scope {sticky_scope!r} is live on subscription "
                 f"{held[:8]} but this spawn selected {handle.subscription_id[:8]} "
-                f"(different payer) — concurrent sessions on this scope may "
-                f"contend over the shared credential file"
+                f"({'pool cap, continuing on a key' if drop_oauth else 'different payer'})"
+                f" — concurrent sessions on this scope may contend over the "
+                f"shared credential file"
             )
         # Commit the scope to this account for the acquire→bind window, so a
         # concurrent same-scope spawn can't pick a different one meanwhile.
@@ -685,10 +865,26 @@ def acquire_subscription(
     return handle
 
 
+def cap_continue_available(layer: str, user_sub: str | None, *, provider: str = "") -> bool:
+    """Under a pool cap's ``continue``, is there a non-OAuth credential the
+    spawn could take? User scope: an own key or endpoint, else a borrowable
+    platform credential; agent scope: a non-OAuth row in the pool. No
+    acquisition, no token mint (the friendly gates ask before recycling)."""
+    if user_sub:
+        own = subscription_store.list_personal(layer, user_sub, provider or None)
+        if _rows_without_login(own):
+            return True
+        return borrowable_pool_available(layer, user_sub, provider=provider)
+    return bool(_rows_without_login(subscription_store.list_platform_pool(layer, provider or None)))
+
+
 def user_scope_block_reason(layer: str, user_sub: str, *, provider: str = "") -> str:
     """Classify why a user-scoped acquisition found no credentials, for the
     dashboard "no subscription" message. Cheap; called only on the terminal
     blocked path. Returns one of:
+      'pool_cap'         — the user's own pool is at its subscription cap
+                           (checked first: a capped user owns working accounts
+                           and would otherwise read as auth_off / no_pool)
       'throttled'        — the user owns a sub for this layer but it's resting
                            (recent provider rate-limit/overload) — transient, retry
       'own_sub_expired'  — the user's own account(s) here are expired (dead
@@ -702,6 +898,9 @@ def user_scope_block_reason(layer: str, user_sub: str, *, provider: str = "") ->
     whose own row expired but who can borrow an admin api_key row still gets a
     working session and never reaches this.
     """
+    cap = _cap_status(layer, user_sub)
+    if cap is not None and not cap.allowed:
+        return "pool_cap"
     # The user DOES own a sub here, it's just resting — never tell them to "connect
     # an account". (With _select's throttled-fallback this rarely reaches a block,
     # but keep the classification honest for any caller.)
@@ -826,6 +1025,82 @@ def release_subscription(session_id: str) -> None:
     if sub_id:
         subscription_store.decrement_active_sessions(sub_id)
         logger.info(f"Pool: released subscription {sub_id[:8]} for session {session_id[:8]}")
+
+
+def release_unbound_seat(subscription_id: str, sticky_scope: str = "") -> None:
+    """Give back a seat ``resolve_subscription_env`` took that no session will
+    ever bind — a spawn abandoned after its config was built (a skipped
+    pre-warm, a slot denial, an offline target, a failed ``start_session``)
+    or a task round that rode an already-warm session. ``release_subscription``
+    cannot do it: it finds no binding and decrements nothing, which is how
+    ``active_sessions`` drifted up one seat per such path (public issue #3's
+    "stale counter"). The acquire-window claim the spawn left on its scope
+    is dropped with the seat — nothing will bind from it, so it must not
+    steer a concurrent same-scope spawn. Never touches bindings: the
+    callers know whether a binding under their session id is a live
+    session's (keep it) or a dead one's (``release_subscription``)."""
+    if not subscription_id:
+        return
+    with _session_maps_lock:
+        claim = _scope_recent.get(sticky_scope) if sticky_scope else None
+        if claim and claim[0] == subscription_id:
+            _scope_recent.pop(sticky_scope, None)
+    subscription_store.decrement_active_sessions(subscription_id)
+    logger.info(
+        f"Pool: released unbound seat on subscription {subscription_id[:8]} "
+        f"(spawn abandoned before bind)"
+    )
+
+
+def session_bound(session_id: str) -> bool:
+    """Whether the live map holds a binding for ``session_id``."""
+    with _session_maps_lock:
+        return session_id in _session_subscriptions
+
+
+def live_session_count(sub_id: str) -> int:
+    """Seats ``sub_id`` really holds right now: sessions bound to it in the
+    live map plus fresh acquire-window claims (a spawn between its acquire
+    and its bind). The honest counterpart of the store's ``active_sessions``
+    counter, which only moves by increments and decrements and reads stale
+    after any unbalanced path. Within the post-boot grace window the
+    persisted bindings count too: a satellite session that has not
+    re-announced yet is invisible to the maps but alive. Known slack: the
+    claims exist only for CLI sticky spawns and one claim covers a scope,
+    so a direct-llm, phone or meeting spawn is invisible between its
+    acquire and its bind (seconds) — a delete in that window under-counts
+    by one and the seat's release later floors at zero."""
+    now = time.time()
+    with _session_maps_lock:
+        live_ids = {sid for sid, s in _session_subscriptions.items() if s == sub_id}
+        claims = sum(
+            1 for sub, ts in _scope_recent.values()
+            if sub == sub_id and now - ts <= _SCOPE_RECENT_TTL_S
+        )
+    if within_boot_grace():
+        try:
+            live_ids |= set(subscription_store.list_binding_session_ids(sub_id))
+        except Exception:
+            logger.debug("live_session_count: persisted bindings unreadable", exc_info=True)
+    return len(live_ids) + claims
+
+
+def reconcile_active_sessions(sub_id: str) -> tuple[int, int]:
+    """Lower the store's ``active_sessions`` for ``sub_id`` to
+    :func:`live_session_count` when it reads HIGHER; never raise it (a seat
+    the live map does not see — a satellite session not yet re-announced
+    after a restart — is re-taken by ``restore_session_binding`` itself).
+    Returns ``(stored, live)``. Used where a stale counter would otherwise
+    refuse an admin action (the subscription delete)."""
+    row = subscription_store.get_subscription(sub_id) or {}
+    stored = int(row.get("active_sessions") or 0)
+    live = live_session_count(sub_id)
+    if stored > live and subscription_store.lower_active_sessions(sub_id, live):
+        logger.info(
+            f"Pool: reconciled active_sessions of subscription {sub_id[:8]} "
+            f"{stored} → {live} (no live session backed the difference)"
+        )
+    return stored, live
 
 
 def bind_session(
@@ -1186,7 +1461,7 @@ def _move_scope_group(
     *,
     cause: str,
     reason: str,
-    replacements: dict[tuple[str, str, str], SubscriptionHandle | None],
+    replacements: dict[tuple[str, str, str, str], SubscriptionHandle | None],
     moved: list[str],
     stuck_log,
     require_unthrottled: bool = False,
@@ -1214,9 +1489,15 @@ def _move_scope_group(
         )
         return
     old_row = subscription_store.get_subscription(old_sub)
-    rkey = (layer, scope_sub, (old_row or {}).get("provider") or "")
+    # The sessions' model: a replacement must be able to serve it — moving
+    # Fable sessions onto an account whose Fable window is full trades one
+    # refusal for another (live-observed 2026-09-11).
+    model = _group_model(sids)
+    rkey = (layer, scope_sub, (old_row or {}).get("provider") or "", model)
     if rkey not in replacements:
-        handle = acquire_subscription(layer, scope_sub or None, provider=rkey[2])
+        # Live sessions are re-homed, never capped: a cap gates new spawns only.
+        handle = acquire_subscription(layer, scope_sub or None, provider=rkey[2],
+                                      model=model, enforce_caps=False)
         if handle is not None:
             # Cancel acquire's built-in +1 either way: counters move per
             # session below, only for writes that actually land.
@@ -1228,7 +1509,13 @@ def _move_scope_group(
                 # everything else rests) — leave the sessions alone rather
                 # than "swap" onto themselves.
                 handle = None
-            elif require_unthrottled and _is_throttled(handle.subscription_id):
+            elif require_unthrottled and (
+                _is_throttled(handle.subscription_id)
+                or _window_exhausted_for(handle.subscription_id, model)
+            ):
+                # Hopping onto another limited or exhausted account is pure
+                # churn: credential-file rewrites on live sessions every
+                # cooldown, for nothing.
                 handle = None
         replacements[rkey] = handle
     handle = replacements[rkey]
@@ -1236,7 +1523,8 @@ def _move_scope_group(
         stuck_log(
             f"Pool: subscription {old_sub[:8]} {cause} with no eligible "
             f"replacement for {len(sids)} bound session(s) (layer={layer}, "
-            f"scope={'user' if scope_sub else 'agent'}) — they keep their "
+            f"scope={'user' if scope_sub else 'agent'}"
+            + (f", model={model}" if model else "") + ") — they keep their "
             f"current credentials until one is connected"
         )
         return
@@ -1355,10 +1643,11 @@ def rebalance_scopes(*, reason: str = "") -> int:
     that are still SELECTED but shouldn't keep serving a scope:
 
       - REACTIVE: the account is resting on a real provider rate/usage limit
-        (``_throttled_hard``) — without this, scope-stickiness deliberately
-        keeps reusing the limited account (the shared-file constraint beats a
-        resting account for NEW spawns) and every session in the scope errors
-        until the provider window resets.
+        (``_throttled_hard``), or the vendor's own window reading says it is
+        exhausted (``subscription_windows``) — without this, scope-stickiness
+        deliberately keeps reusing the limited account (the shared-file
+        constraint beats a resting account for NEW spawns) and every session
+        in the scope errors until the provider window resets.
       - PROACTIVE (drift): the account's recent burn is far above the coldest
         eligible candidate (``DRIFT_ABS_FLOOR_USD`` + ``DRIFT_RATIO`` on the
         5h window) — the always-busy-agent case where the pin otherwise never
@@ -1400,7 +1689,7 @@ def _rebalance_scopes(*, reason: str) -> int:
             groups.setdefault((old_sub, layer, scope_sub, scope_key), []).append(sid)
 
         moved: list[str] = []
-        replacements: dict[tuple[str, str, str], SubscriptionHandle | None] = {}
+        replacements: dict[tuple[str, str, str, str], SubscriptionHandle | None] = {}
         stuck_log = logger.info if reason else logger.debug
         now_mono = time.monotonic()
         since_short, _ = _consumption_window_starts()
@@ -1410,14 +1699,25 @@ def _rebalance_scopes(*, reason: str) -> int:
                 continue
             with _session_maps_lock:
                 recent = _scope_recent.get(scope_key)
-            if recent and time.time() - recent[1] <= _SCOPE_RECENT_TTL_S:
-                # A spawn just claimed this scope (acquire→bind window): moving
-                # the scope NOW would race the spawn's own credential-file
-                # write. Skip WITHOUT stamping the cooldown — the next tick
-                # retries once the spawn has bound.
+            if recent and recent[0] == old_sub and time.time() - recent[1] <= _SCOPE_RECENT_TTL_S:
+                # A spawn just claimed this scope on THIS account
+                # (acquire→bind window): moving the scope NOW would race the
+                # spawn's own credential-file write. Skip WITHOUT stamping the
+                # cooldown — the next tick retries once the spawn has bound. A
+                # claim on ANOTHER account is a sticky pin that yielded to
+                # exhaustion (``_select_sticky``): the rest of the scope must
+                # follow it, and its file already carries that account.
                 continue
+            # The scope's model decides which windows count: a Fable scope on
+            # an account whose Fable window is full moves even while the
+            # overall windows have room.
+            model = _group_model(sids)
             if old_sub in _throttled_hard and _is_throttled(old_sub):
                 cause = "rate-limited"
+            elif _window_exhausted_for(old_sub, model):
+                # The vendor's own reading says the account is out of window
+                # for what these sessions run.
+                cause = "window exhausted" + (f" for {model}" if model else "")
             else:
                 burn = subscription_store.get_subscription_consumption(
                     old_sub, since_short)
@@ -1428,6 +1728,7 @@ def _rebalance_scopes(*, reason: str) -> int:
                 candidates = [
                     c for c in _eligible_candidates(layer, scope_sub, provider)
                     if c["id"] != old_sub and not _is_throttled(c["id"])
+                    and not _window_exhausted_for(c["id"], model)
                 ]
                 if not candidates:
                     continue
@@ -1530,84 +1831,94 @@ def resolve_subscription_env(
         execution_path, user_sub, provider=resolved_provider,
         sticky_scope=sticky_scope if execution_path in (
             "claude-code-cli", "codex-cli") else "",
+        model=model,
     )
     if not sub_handle:
         return "", {}
 
-    # Stamp the expiry of the token THIS spawn will freeze into its env —
-    # bind_session (called by the layer moments later in the same spawn flow)
-    # snapshots it per session so the re-warm worker / turn-start guard track
-    # the frozen token's real runway, not the store's latest.
-    if sub_handle.oauth_expires_at_ms:
-        _issued_token_expiry[sub_handle.subscription_id] = sub_handle.oauth_expires_at_ms
-    else:
-        _issued_token_expiry.pop(sub_handle.subscription_id, None)
-
-    # 3. Map credentials to layer-specific env vars
-    env: dict[str, str] = {}
-    if execution_path == "claude-code-cli":
-        if sub_handle.api_key:
-            env["ANTHROPIC_API_KEY"] = sub_handle.api_key
-        # OAuth rides a session-file blob, never CLAUDE_CODE_OAUTH_TOKEN env:
-        # env is frozen at exec (a rotation could never reach a live CLI) and
-        # it outranks the credential file in the CLI's auth priority, which
-        # would defeat the file-based fan-out. The layer pops this and writes
-        # ``.credentials.json`` into the session's CLAUDE_CONFIG_DIR.
-        if sub_handle.claude_creds_blob:
-            import json as _json
-            env["_CLAUDE_CREDS_BLOB"] = _json.dumps(sub_handle.claude_creds_blob)
-    elif execution_path == "codex-cli":
-        if sub_handle.auth_type == "local_endpoint":
-            # A key on a LOCAL endpoint rides its own variable: CODEX_API_KEY
-            # would switch Codex into API-key auth against its built-in
-            # OpenAI provider, not the custom one the layer writes.
-            if sub_handle.api_key:
-                env["_CODEX_LOCAL_API_KEY"] = sub_handle.api_key
-        elif sub_handle.api_key:
-            # Codex CLI uses CODEX_API_KEY for API key auth
-            env["CODEX_API_KEY"] = sub_handle.api_key
-        # ChatGPT OAuth token — layer writes it to .codex/auth.json
-        if sub_handle.oauth_access_token:
-            env["_CODEX_OAUTH_TOKEN"] = sub_handle.oauth_access_token
-        # Full Codex auth blob for auth.json reconstruction (has id_token, account_id, etc.)
-        if sub_handle.codex_auth_blob:
-            import json as _json
-            env["_CODEX_AUTH_BLOB"] = _json.dumps(sub_handle.codex_auth_blob)
-        if sub_handle.endpoint_url:
-            env["_CODEX_ENDPOINT_URL"] = sub_handle.endpoint_url
-            # The provider (ollama / openai_compatible) picks the AGENTS.md
-            # note that tells the model whether its MCP tools reach it
-            # (helpers.local_provider_note). Popped by the layers like the URL.
-            env["_CODEX_ENDPOINT_PROVIDER"] = sub_handle.provider or ""
-            # The provider's codex-cli model rows (id + context window) feed
-            # the per-session model catalog that makes Codex defer its MCP
-            # tools (core/layers/codex/local_model_catalog). Read HERE, off
-            # the event loop (this resolver runs under to_thread), so the
-            # layers never touch the store on the loop. Popped like the URL.
-            from core.layers.codex.local_model_catalog import (
-                LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
-            )
-            env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(sub_handle.provider or "")
-    else:
-        # Direct LLM and other layers use generic provider env vars.
-        env["_PROVIDER"] = sub_handle.provider
-        if sub_handle.auth_type == "relay":
-            # Hosted relay: mint a per-user token + point the adapter at this
-            # provider's relay endpoint (the vendor key never reaches the install).
-            # Fail-soft — if the relay is unavailable / out of credit / over seat,
-            # surface no creds (clean "no LLM credentials" error) and release the
-            # pool slot we took.
-            creds = relay_llm_credentials(sub_handle.provider, user_sub)
-            if not creds:
-                subscription_store.decrement_active_sessions(sub_handle.subscription_id)
-                return "", {}
-            env["_API_KEY"], env["_ENDPOINT_URL"] = creds
+    # Everything after the acquire runs under one guard: a failure here
+    # (a DB read for the local-model catalog, a relay mint) used to leave
+    # the seat taken with no handle for anyone to release — the builder
+    # swallowed the exception and reported no subscription.
+    try:
+        # Stamp the expiry of the token THIS spawn will freeze into its env —
+        # bind_session (called by the layer moments later in the same spawn flow)
+        # snapshots it per session so the re-warm worker / turn-start guard track
+        # the frozen token's real runway, not the store's latest.
+        if sub_handle.oauth_expires_at_ms:
+            _issued_token_expiry[sub_handle.subscription_id] = sub_handle.oauth_expires_at_ms
         else:
-            if sub_handle.api_key:
-                env["_API_KEY"] = sub_handle.api_key
-            if sub_handle.endpoint_url:
-                env["_ENDPOINT_URL"] = sub_handle.endpoint_url
+            _issued_token_expiry.pop(sub_handle.subscription_id, None)
 
+        # 3. Map credentials to layer-specific env vars
+        env: dict[str, str] = {}
+        if execution_path == "claude-code-cli":
+            if sub_handle.api_key:
+                env["ANTHROPIC_API_KEY"] = sub_handle.api_key
+            # OAuth rides a session-file blob, never CLAUDE_CODE_OAUTH_TOKEN env:
+            # env is frozen at exec (a rotation could never reach a live CLI) and
+            # it outranks the credential file in the CLI's auth priority, which
+            # would defeat the file-based fan-out. The layer pops this and writes
+            # ``.credentials.json`` into the session's CLAUDE_CONFIG_DIR.
+            if sub_handle.claude_creds_blob:
+                import json as _json
+                env["_CLAUDE_CREDS_BLOB"] = _json.dumps(sub_handle.claude_creds_blob)
+        elif execution_path == "codex-cli":
+            if sub_handle.auth_type == "local_endpoint":
+                # A key on a LOCAL endpoint rides its own variable: CODEX_API_KEY
+                # would switch Codex into API-key auth against its built-in
+                # OpenAI provider, not the custom one the layer writes.
+                if sub_handle.api_key:
+                    env["_CODEX_LOCAL_API_KEY"] = sub_handle.api_key
+            elif sub_handle.api_key:
+                # Codex CLI uses CODEX_API_KEY for API key auth
+                env["CODEX_API_KEY"] = sub_handle.api_key
+            # ChatGPT OAuth token — layer writes it to .codex/auth.json
+            if sub_handle.oauth_access_token:
+                env["_CODEX_OAUTH_TOKEN"] = sub_handle.oauth_access_token
+            # Full Codex auth blob for auth.json reconstruction (has id_token, account_id, etc.)
+            if sub_handle.codex_auth_blob:
+                import json as _json
+                env["_CODEX_AUTH_BLOB"] = _json.dumps(sub_handle.codex_auth_blob)
+            if sub_handle.endpoint_url:
+                env["_CODEX_ENDPOINT_URL"] = sub_handle.endpoint_url
+                # The provider (ollama / openai_compatible) picks the AGENTS.md
+                # note that tells the model whether its MCP tools reach it
+                # (helpers.local_provider_note). Popped by the layers like the URL.
+                env["_CODEX_ENDPOINT_PROVIDER"] = sub_handle.provider or ""
+                # The provider's codex-cli model rows (id + context window) feed
+                # the per-session model catalog that makes Codex defer its MCP
+                # tools (core/layers/codex/local_model_catalog). Read HERE, off
+                # the event loop (this resolver runs under to_thread), so the
+                # layers never touch the store on the loop. Popped like the URL.
+                from core.layers.codex.local_model_catalog import (
+                    LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
+                )
+                env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(sub_handle.provider or "")
+        else:
+            # Direct LLM and other layers use generic provider env vars.
+            env["_PROVIDER"] = sub_handle.provider
+            if sub_handle.auth_type == "relay":
+                # Hosted relay: mint a per-user token + point the adapter at this
+                # provider's relay endpoint (the vendor key never reaches the install).
+                # Fail-soft — if the relay is unavailable / out of credit / over seat,
+                # surface no creds (clean "no LLM credentials" error) and release the
+                # pool slot we took.
+                creds = relay_llm_credentials(sub_handle.provider, user_sub)
+                if not creds:
+                    subscription_store.decrement_active_sessions(sub_handle.subscription_id)
+                    return "", {}
+                env["_API_KEY"], env["_ENDPOINT_URL"] = creds
+            else:
+                if sub_handle.api_key:
+                    env["_API_KEY"] = sub_handle.api_key
+                if sub_handle.endpoint_url:
+                    env["_ENDPOINT_URL"] = sub_handle.endpoint_url
+
+    except Exception:
+        release_unbound_seat(sub_handle.subscription_id, sticky_scope if execution_path in (
+            "claude-code-cli", "codex-cli") else "")
+        raise
     return sub_handle.subscription_id, env
 
 

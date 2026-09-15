@@ -76,7 +76,7 @@ def _read_agent_mode(agent_name: str) -> tuple[bool, str]:
     missing row or a startup-time lookup race never blocks session start.
     """
     try:
-        from storage import agent_store
+        from storage.agents import agent_store
         row = agent_store.get_agent(agent_name) or {}
         collaborative = bool(row.get("collaborative", True))
         default_scope = row.get("default_scope") or "user"
@@ -90,7 +90,7 @@ def _read_agent_mode(agent_name: str) -> tuple[bool, str]:
 def _read_memory_toggles(agent_name: str) -> tuple[bool, bool]:
     """Return effective ``(user, agent)`` memory toggles (master AND per-agent)."""
     try:
-        from storage import memory_store
+        from storage.agents import memory_store
         settings = memory_store.get_settings()
         toggles = memory_store.get_agent_toggles(agent_name)
         memory_user = bool(
@@ -162,7 +162,7 @@ def nouser_read_targets(user) -> set[str]:
         return set()
     if not (getattr(user, "is_no_user_session", False) and user.agent):
         return set()
-    from storage import agent_store
+    from storage.agents import agent_store
     return set(agent_store.get_delegation_targets(user.agent))
 
 

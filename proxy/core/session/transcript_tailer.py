@@ -323,9 +323,15 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
     MCP is skipped (the delegation endpoint writes its own ``delegate_spawn``
     row); everything else → a pending ``tool`` block awaiting its result.
 
-    ``AskUserQuestion`` additionally registers in ``open_questions`` (batch
-    state): the harness blocks the turn on it, so an id still unanswered at
-    batch end folds the batch to a turn CLOSE (see ``_process_lines``)."""
+    ``AskUserQuestion`` and ``ExitPlanMode`` additionally register in
+    ``open_questions`` (batch state): the TUI blocks the turn on their
+    dialogs (the question cards; the plan approval), so an id still
+    unanswered at batch end folds the batch to a turn CLOSE (see
+    ``_process_lines``). The CLI journals the dialog's ``tool_use`` line
+    while the native dialog is open in most runs and only with the answer in
+    others (2.1.263) — the live state is parked from the permission hook
+    either way (``InteractiveSession.park_on_native_dialog``); the
+    ``tool_result`` on answer / approve / reject unparks."""
     name = block.get("name", "")
     tuid = block.get("id", "")
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
@@ -360,6 +366,10 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
                      "action": "enter" if name == "EnterPlanMode" else "exit"}
         if name == "ExitPlanMode":
             evt["tool_input"] = tool_input
+            # The plan approval parks the TUI exactly like a question:
+            # the turn stays open on the dialog until the human answers.
+            if tuid:
+                open_questions.add(tuid)
         persist_event(task_store, chat_id, evt)
         return 1
 
@@ -475,11 +485,12 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     # "tool_use" (mid-turn), "end_turn" (turn closed), None (nothing
     # turn-relevant in the batch — tool_result-only lines don't count).
     last_signal: str | None = None
-    # AskUserQuestion ids asked this batch and not yet answered. The harness
-    # BLOCKS the turn on the question (no further assistant lines until the
-    # tool_result), so an id still open at batch end means the CLI is parked
-    # on the question dialog — the batch folds to a turn close below, the
-    # interactive twin of headless's turn ending after the question card.
+    # AskUserQuestion / ExitPlanMode ids asked this batch and not yet
+    # answered. The harness BLOCKS the turn on the dialog (no further
+    # assistant lines until the tool_result), so an id still open at batch
+    # end means the CLI is parked on the question cards or the plan
+    # approval — the batch folds to a turn close below, the interactive twin
+    # of headless's turn ending after the question / plan-review card.
     open_questions: set[str] = set()
     # compact_boundary seen this batch (see the system-line handler below).
     # compact_trigger carries compactMetadata.trigger ("manual" | "auto") so
@@ -717,11 +728,12 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                 last_assistant_text = "".join(msg_text_parts)
                 last_signal = "end_turn" if sr == "end_turn" else "tool_use"
 
-    # Question fold: an AskUserQuestion still unanswered at batch end means the
-    # harness is blocked on the dialog — close the turn (headless parity: the
-    # -p pump's turn ends right after the question card) so the live dot
-    # clears and the "needs your input" ping can fire. The answer's Enter
-    # triggers the submit tails and the continuing assistant lines reopen.
+    # Question fold: an AskUserQuestion or ExitPlanMode still unanswered at
+    # batch end means the harness is blocked on the dialog — close the turn
+    # (headless parity: the -p pump's turn ends right after the question /
+    # plan-review card) so the live dot clears and the "needs your input"
+    # ping can fire. The answer's Enter triggers the submit tails and the
+    # continuing assistant lines reopen.
     # Never overrides a REAL later signal: "user" (question dismissed, new
     # prompt) and "end_turn" (ESC interrupt marker / real end) win — those
     # paths must not read as question-parked.

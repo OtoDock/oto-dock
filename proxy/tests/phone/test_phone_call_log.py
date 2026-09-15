@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext, get_current_user
-from storage import phone_call_log_store, phone_route_store
+from storage.phone import phone_call_log_store
+from storage.phone import phone_route_store
 from storage.pg import get_conn
 
 

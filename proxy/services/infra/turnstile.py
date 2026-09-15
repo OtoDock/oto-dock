@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import config
 from storage import database as db
-from storage.credential_store import _decrypt, _encrypt
+from storage.identity.credential_store import _decrypt, _encrypt
 
 logger = logging.getLogger("claude-proxy")
 

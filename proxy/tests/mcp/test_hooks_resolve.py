@@ -1,4 +1,4 @@
-"""Regression tests for `api/hooks._resolve_hook_path` path-form contract.
+"""Regression tests for `api/hooks/paths.py::_resolve_hook_path` path-form contract.
 
 The MCP framework v2 cleanup changed file-tools to post agents-relative paths
 to `/v1/hooks/document-preview`, `/v1/hooks/file`, and `/v1/hooks/file-written`
@@ -13,7 +13,7 @@ instead of host-absolute. The resolver must accept all three documented forms:
 import pytest
 
 import config
-from api.hooks import hooks
+from api.hooks import paths
 
 
 @pytest.fixture
@@ -30,13 +30,13 @@ def tmp_agents_dir(tmp_path, monkeypatch):
 def test_form1_real_host_path_returned(tmp_agents_dir):
     """Form 1: real host path should be returned as-is."""
     real = tmp_agents_dir / "personal-assistant" / "users" / "alice" / "workspace" / "report.docx"
-    resolved = hooks._resolve_hook_path("session-x", str(real))
+    resolved = paths._resolve_hook_path("session-x", str(real))
     assert resolved == real
 
 
 def test_form2_agents_relative_resolves_under_agents_dir(tmp_agents_dir):
     """Form 2: agents-relative path (post-v2 canonical for Docker MCPs)."""
-    resolved = hooks._resolve_hook_path(
+    resolved = paths._resolve_hook_path(
         "session-x",
         "personal-assistant/users/alice/workspace/report.docx",
     )
@@ -47,7 +47,7 @@ def test_form2_agents_relative_resolves_under_agents_dir(tmp_agents_dir):
 
 def test_form2_agents_relative_missing_file_falls_through(tmp_agents_dir):
     """Form 2 with a missing file should NOT match — caller will 404."""
-    resolved = hooks._resolve_hook_path(
+    resolved = paths._resolve_hook_path(
         "session-x",
         "personal-assistant/users/alice/workspace/nonexistent.docx",
     )
@@ -65,7 +65,7 @@ def test_form2_does_not_double_agent_dir(tmp_agents_dir):
     """
     # Simulate a session ctx for the agent so _sandbox_to_host would be invoked
     # if form 2 wasn't handled first.
-    resolved = hooks._resolve_hook_path(
+    resolved = paths._resolve_hook_path(
         "session-x",
         "personal-assistant/users/alice/workspace/report.docx",
     )
@@ -79,7 +79,7 @@ def test_form2_does_not_double_agent_dir(tmp_agents_dir):
 def test_to_agents_relative_strips_prefix(tmp_agents_dir):
     """`_to_agents_relative` strips the AGENTS_DIR prefix to produce form 2."""
     host = str(tmp_agents_dir) + "/personal-assistant/users/alice/workspace/report.docx"
-    rel = hooks._to_agents_relative(host)
+    rel = paths._to_agents_relative(host)
     assert rel == "/personal-assistant/users/alice/workspace/report.docx"
 
 
@@ -119,7 +119,7 @@ async def test_classify_rejects_out_of_tree_host_path(local_session, tmp_path):
     secret.write_text("JWT_SECRET=super-secret")
     assert secret.is_file()                   # form-1 would return it verbatim
 
-    host, resolution = await hooks._classify_and_pull(local_session, str(secret))
+    host, resolution = await paths._classify_and_pull(local_session, str(secret))
     assert host is None, f"out-of-tree path leaked: {host}"
 
 
@@ -127,7 +127,7 @@ async def test_classify_rejects_out_of_tree_host_path(local_session, tmp_path):
 async def test_classify_rejects_absolute_system_path(local_session):
     """A classic traversal target (/etc/passwd) must be denied on a local
     session regardless of whether it exists on the host."""
-    host, _resolution = await hooks._classify_and_pull(local_session, "/etc/passwd")
+    host, _resolution = await paths._classify_and_pull(local_session, "/etc/passwd")
     assert host is None
 
 
@@ -138,7 +138,7 @@ async def test_classify_allows_in_tree_own_file(local_session, tmp_agents_dir):
         tmp_agents_dir / "personal-assistant" / "users" / "alice"
         / "workspace" / "report.docx"
     )
-    host, _resolution = await hooks._classify_and_pull(local_session, str(own))
+    host, _resolution = await paths._classify_and_pull(local_session, str(own))
     assert host == own
 
 
@@ -151,7 +151,7 @@ async def test_classify_rejects_cross_user_in_tree_file(local_session, tmp_agent
     )
     bob_ws.mkdir(parents=True, exist_ok=True)
     (bob_ws / "secret.docx").write_text("bob's")
-    host, _resolution = await hooks._classify_and_pull(
+    host, _resolution = await paths._classify_and_pull(
         local_session, str(bob_ws / "secret.docx")
     )
     assert host is None

@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends
 
 from auth.providers import UserContext, get_current_user, require_auth
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 from api.agents._router import router
@@ -95,7 +95,7 @@ async def delegation_edges(user: UserContext | None = Depends(get_current_user))
     """
     u = require_auth(user)
 
-    from storage import db_departments
+    from storage.agents import db_departments
 
     edges = await asyncio.to_thread(agent_store.get_all_delegation_edges)
 

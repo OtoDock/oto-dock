@@ -39,7 +39,7 @@ def client(temp_db):
 
 @pytest.fixture
 def agent(temp_db):
-    from storage import agent_store
+    from storage.agents import agent_store
     # Primary claude-code-cli (the create default), nothing configured.
     agent_store.create_agent(SLUG, "Engine Gate Demo", created_by=ADMIN)
     return SLUG
@@ -66,7 +66,7 @@ def _assign_manager(sub: str) -> None:
 
 def _add_sub(layer: str, *, owner: str = "", personal: bool = True,
              pool: bool = False, auth_type: str = "api_key") -> None:
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subscription_store.add_subscription(
         layer, "openai" if layer == "codex-cli" else "anthropic", auth_type,
         owner_sub=owner, use_personal=personal, contribute_platform=pool,
@@ -75,7 +75,7 @@ def _add_sub(layer: str, *, owner: str = "", personal: bool = True,
 
 def _enabled_paths(slug: str) -> list[str]:
     from api.agents._common import _get_execution_paths
-    from storage import agent_store
+    from storage.agents import agent_store
     return _get_execution_paths(agent_store.get_agent(slug) or {})
 
 
@@ -133,7 +133,7 @@ class TestEnableGate:
         # A stored set the platform can no longer "configure" must stay
         # editable: reorders are a set-identity save (the MCP's
         # update_default_layer and the UI's toggle both send them).
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.update_agent(SLUG, execution_path="claude-code-cli",
                                  execution_paths=json.dumps(["codex-cli"]))
         _assign_manager(MEMBER)
@@ -146,7 +146,7 @@ class TestEnableGate:
         assert _enabled_paths(SLUG)[0] == "codex-cli"
 
     def test_uncheck_always_allowed(self, client, agent):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.update_agent(SLUG, execution_path="claude-code-cli",
                                  execution_paths=json.dumps(["codex-cli"]))
         _assign_manager(MEMBER)
@@ -244,6 +244,6 @@ class TestAvailabilityFlags:
         # Platform-Auth toggle (schema default FALSE) gates the borrow.
         _add_sub("codex-cli", owner=ADMIN, personal=False, pool=True)
         assert flags()["codex-cli"] is False
-        from storage import subscription_store
+        from storage.billing import subscription_store
         subscription_store.set_user_allow_platform_auth(MEMBER, True)
         assert flags()["codex-cli"] is True

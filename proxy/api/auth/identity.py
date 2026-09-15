@@ -159,7 +159,7 @@ def _must_enroll_2fa(db_user: dict | None) -> bool:
         return False
     if task_store.get_all_platform_settings().get("require_2fa", "") != "1":
         return False
-    from storage import webauthn_store
+    from storage.identity import webauthn_store
     return webauthn_store.count_credentials(db_user["sub"]) == 0
 
 
@@ -308,7 +308,7 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
     # step whenever enrolled (nice-to-have in passwordless mode, MANDATORY gate
     # in second_factor mode — there a passkey-only user must still do step 2).
     from api.auth.webauthn import passkey_login_mode, passkeys_enabled
-    from storage import webauthn_store
+    from storage.identity import webauthn_store
     pk_count = 0
     if passkeys_enabled():
         pk_count = await asyncio.to_thread(webauthn_store.count_credentials, result.sub)
@@ -533,7 +533,7 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
     # personal user-scoped chats. direct-llm (relay) is deliberately excluded —
     # it's the low-latency phone path, not a tool-capable chat engine.
     def _has_own_engine(sub: str) -> bool:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         rows = subscription_store.list_personal(None, sub)
         return any(r.get("layer") in ("claude-code-cli", "codex-cli") for r in rows)
 

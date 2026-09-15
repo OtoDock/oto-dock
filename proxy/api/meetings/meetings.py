@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user, require_auth
 from storage import database as task_store
-from storage import agent_store
+from storage.agents import agent_store
 
 router = APIRouter()
 
@@ -175,7 +175,7 @@ async def create_meeting(
     # the meetings-mcp already resolves scope from the (clamped) default.
     if req.scope in ("user", "agent"):
         from core.session.visibility import available_scopes_for
-        from storage import agent_store as _as
+        from storage.agents import agent_store as _as
         _row = _as.get_agent(moderator) or {}
         _avail = available_scopes_for(
             bool(_row.get("collaborative", True)), _row.get("default_scope") or "user",
@@ -216,7 +216,7 @@ async def create_meeting(
     # extra_mcps force-inject, which bypasses mcp_state at config build. A
     # MISSING state row means enabled (unscanned fresh install) — only an
     # explicit admin disable blocks.
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     state = await asyncio.to_thread(mcp_store.get_mcp_state, "meetings-mcp")
     if state is not None and not state.get("enabled"):
         raise HTTPException(

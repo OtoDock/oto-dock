@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { Suspense, useState, useRef } from 'react'
 import { Outlet, NavLink, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useSwipeGesture } from '../hooks/useSwipeGesture'
@@ -165,7 +165,12 @@ export default function Layout() {
 
         <SetupBanner />
         <main className="flex-1 overflow-auto p-4 md:p-6">
-          <Outlet />
+          {/* The admin pages are lazy routes. Router navigations run as
+              transitions, so the current page stays until the next chunk
+              resolves; this fallback shows only on a cold direct load. */}
+          <Suspense fallback={<div className="min-h-[40vh]" />}>
+            <Outlet />
+          </Suspense>
         </main>
       </div>
     </div>

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from services.memory import memory_nudge
-from storage import memory_store
+from storage.agents import memory_store
 
 
 def _reset_module():

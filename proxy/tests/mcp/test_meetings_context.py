@@ -11,7 +11,8 @@ Run: cd proxy && venv/bin/pytest tests/mcp/test_meetings_context.py -v
 from __future__ import annotations
 
 from services.mcp import dynamic_context
-from storage import agent_store, db_users
+from storage.agents import agent_store
+from storage.identity import db_users
 
 
 def _seed_agents():

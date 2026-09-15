@@ -9,7 +9,8 @@ if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
 import config
-from storage import agent_store, subscription_store
+from storage.agents import agent_store
+from storage.billing import subscription_store
 
 
 _MODELS = [

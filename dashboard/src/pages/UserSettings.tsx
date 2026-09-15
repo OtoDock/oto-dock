@@ -1,12 +1,16 @@
+import { lazy, Suspense } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { AudioPrefsSection } from '../components/audio/AudioPrefsSection'
 import { ScrollableTabs } from '../components/ScrollableTabs'
-import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection } from './UserSettings.general'
+import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection, NotificationsSection } from './UserSettings.general'
 import { IntegrationsTab } from './UserSettings.integrations'
 import { MyMachinesSection } from './UserSettings.machines'
 import { ExecutionLayersSection } from './UserSettings.aiEngines'
-import { UsageSection } from './UserSettings.usage'
+
+// The usage tab carries the charts library; it loads when the tab opens.
+const UsageSection = lazy(() =>
+  import('./UserSettings.usage').then(m => ({ default: m.UsageSection })))
 
 // ---------------------------------------------------------------------------
 // Main page with tabs (mirrors the admin Setup page layout)
@@ -85,6 +89,7 @@ export default function UserSettings() {
             {/* Security — only for local auth users (SSO providers manage it) */}
             {isLocal && <SecuritySection />}
             <AppearanceSection />
+            <NotificationsSection />
             <WakeWordSection />
             <MyMemorySection />
           </>
@@ -95,7 +100,11 @@ export default function UserSettings() {
         {tab === 'remote-machines' && user && <MyMachinesSection />}
         {tab === 'ai-engines' && <ExecutionLayersSection />}
         {tab === 'audio' && <AudioPrefsSection />}
-        {tab === 'usage' && <UsageSection />}
+        {tab === 'usage' && (
+          <Suspense fallback={<div className="min-h-[40vh]" />}>
+            <UsageSection />
+          </Suspense>
+        )}
       </div>
     </div>
   )

@@ -15,6 +15,7 @@ import { useInstallStore } from '@/store/installStore'
 import { useTransferStore } from '@/store/transferStore'
 import { useMachineUpdateStore } from '@/store/machineUpdateStore'
 import { emitFileUpdate } from '../lib/fileUpdates'
+import { noteServerBuild } from '../lib/buildId'
 import type { WsCallbacks } from './useDashboardWs.types'
 
 /**
@@ -876,6 +877,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             break
           case 'pong':
             pongReceived.current = true
+            // The build the server serves rides every pong (and the
+            // connect-time server_info): a page running an older build
+            // reloads once — lib/buildId decides.
+            if (typeof msg.build_id === 'string') noteServerBuild(msg.build_id)
+            break
+          case 'server_info':
+            noteServerBuild(msg.build_id)
             break
         }
         // Generic subscribers (after the switch + per-chat gating). A handler

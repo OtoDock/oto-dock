@@ -30,7 +30,7 @@ import logging
 from datetime import datetime, timezone
 
 from services.webhooks import subscription_manager
-from storage import webhook_subscription_store
+from storage.automation import webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.subscription-renewer")
 

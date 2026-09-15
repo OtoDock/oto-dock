@@ -253,7 +253,7 @@ def test_default_scope_empty_falls_back_to_user():
 def test_resolve_memory_and_scope_agent_scope_session(temp_db):
     """No username → forced to default_scope='agent' regardless of agent's row."""
     from core.sandbox.oto_env import resolve_memory_and_scope
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent("pa", "Personal Assistant", default_scope="user")
     # Even though pa's default_scope is "user", a session without a user
     # owner must default to agent.
@@ -263,7 +263,7 @@ def test_resolve_memory_and_scope_agent_scope_session(temp_db):
 
 def test_resolve_memory_and_scope_respects_agent_default(temp_db):
     from core.sandbox.oto_env import resolve_memory_and_scope
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent("ops", "Ops", default_scope="agent")
     mu, ma, ds = resolve_memory_and_scope("ops", username="alice")
     assert ds == "agent"
@@ -271,7 +271,8 @@ def test_resolve_memory_and_scope_respects_agent_default(temp_db):
 
 def test_resolve_memory_and_scope_master_toggle_off(temp_db):
     from core.sandbox.oto_env import resolve_memory_and_scope
-    from storage import agent_store, memory_store
+    from storage.agents import agent_store
+    from storage.agents import memory_store
     agent_store.create_agent("pa", "PA")
     memory_store.update_settings(user_memory_enabled=False)
     mu, ma, ds = resolve_memory_and_scope("pa", username="alice")

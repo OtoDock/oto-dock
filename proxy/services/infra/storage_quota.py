@@ -111,7 +111,8 @@ def iter_scopes() -> list[QuotaScope]:
     agent/user tables, so it works in both tiers (the soft tier needs no project
     rows).
     """
-    from storage import agent_store, database
+    from storage.agents import agent_store
+    from storage import database
     from core.session.visibility import is_shared_only
 
     scopes: list[QuotaScope] = []

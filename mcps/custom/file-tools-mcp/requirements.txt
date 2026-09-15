@@ -83,7 +83,7 @@ typing-extensions==4.15.0
 typing-inspection==0.4.2
 urllib3==2.7.0
 uvicorn==0.46.0
-weasyprint==68.1
+weasyprint==70.0
 webencodings==0.5.1
 xlsxwriter==3.2.9
 ziafont==0.11

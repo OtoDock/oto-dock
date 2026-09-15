@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from api.media.access import can_serve_token
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
 from services.media import media_pipeline
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy.media")

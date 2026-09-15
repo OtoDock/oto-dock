@@ -16,7 +16,8 @@ from fastapi.testclient import TestClient
 import config
 from app import app
 from auth.providers import UserContext, get_current_user
-from storage import agent_store, remote_store
+from storage.agents import agent_store
+from storage import remote_store
 from storage import database as task_store
 from storage.pg import get_conn
 

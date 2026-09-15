@@ -378,7 +378,7 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
 
     # The cross-layer model guard consults the layer's served models; the
     # switch_engine gate additionally requires `enabled` (admin disables).
-    from storage import subscription_store
+    from storage.billing import subscription_store
     monkeypatch.setattr(subscription_store, "list_models",
                         lambda path: [{"model_id": TEST_MODEL, "enabled": True}])
 
@@ -426,7 +426,7 @@ def set_username(sub: str, username: str) -> None:
 
 def make_test_agent(slug: str | None = None, **kwargs) -> str:
     """Create a real agent row (+ dirs under the test AGENTS_DIR)."""
-    from storage import agent_store
+    from storage.agents import agent_store
     slug = slug or f"wsdash-{uuid.uuid4().hex[:8]}"
     agent_store.create_agent(slug, "WS Dash Test", **kwargs)
     return slug
@@ -458,15 +458,19 @@ async def dashboard_connection(cookie: str | None):
 
 
 async def drain_startup(ws: FakeDashboardWebSocket) -> None:
-    """Consume the three connect-time frames every authenticated socket gets.
+    """Consume the four connect-time frames every authenticated socket gets.
 
-    Golden-frame change note: ``chat_status_snapshot`` was ADDED deliberately —
+    Golden-frame change notes: ``chat_status_snapshot`` was ADDED deliberately —
     the connect-time authoritative "streaming right now" set that makes the
     sidebar live-dots re-derivable after missed frames (empty set when nothing
-    is streaming, which still clears stale client dots)."""
+    is streaming, which still clears stale client dots). ``server_info`` was
+    ADDED last (2026-09-11): the build id a stale page reloads on — last on
+    purpose, so a reloading client closes the socket only after the other
+    connect-time frames went out."""
     await ws.expect({"type": "notification_count", "count": 0})
     await ws.expect({"type": "satellite_update_sync", "inflight": []})
     await ws.expect({"type": "chat_status_snapshot", "chat_ids": []})
+    await ws.expect({"type": "server_info", "build_id": ANY, "version": ANY})
 
 
 async def warm_new_chat(ws: FakeDashboardWebSocket, layer: FakeExecutionLayer,
@@ -508,7 +512,7 @@ async def sync_dispatch(ws: FakeDashboardWebSocket) -> None:
     previously sent client message has been fully processed — use before
     asserting side effects that happen AFTER a frame was emitted."""
     ws.client_send({"type": "ping"})
-    await ws.expect({"type": "pong"})
+    await ws.expect({"type": "pong", "build_id": ANY})
 
 
 def run_ws_scenario(scenario, timeout: float = 15.0) -> None:

@@ -11,6 +11,7 @@ import {
   UsageLimit,
 } from '../../api/usage'
 import { useAgents } from '../../api/agents'
+import { PlatformPoolCapSection } from '../../components/usage/PoolCapSection'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 
 // ---------------------------------------------------------------------------
@@ -777,6 +778,9 @@ export default function UsagePage() {
           </div>
         </div>
       )}
+
+      {/* Subscription pool: the agent pool's OAuth accounts and their cap. */}
+      <PlatformPoolCapSection />
 
       {/* Platform-Auth Budget (by role) */}
       <RoleDefaultsEditor limits={limits} />

@@ -15,8 +15,9 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.scheduler import scheduler
+from services.scheduler import firing
 from services.scheduler.scheduler import TaskDefinition
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 
@@ -279,7 +280,7 @@ class TestFireContinuation:
             seen.append(task.id)
             return ""
 
-        monkeypatch.setattr(scheduler, "_fire_continuation", _fake_fire)
+        monkeypatch.setattr(firing, "_fire_continuation", _fake_fire)
         task = _cont_task(fire_env["chat_id"], delay_seconds=60, id="dyn-route1")
         asyncio.run(scheduler._execute_task(task))
         assert seen == ["dyn-route1"]

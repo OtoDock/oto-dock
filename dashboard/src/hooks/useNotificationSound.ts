@@ -50,17 +50,29 @@ if (typeof document !== 'undefined') {
   events.forEach(e => document.addEventListener(e, handler, { capture: true, once: false }))
 }
 
+// One set of preloaded elements per page: the hook mounts at the auth root
+// (the wake word) and again on the chat page, and each mount used to fetch
+// the four files anew.
+let preloaded: Record<string, HTMLAudioElement> | null = null
+
+function preloadSounds(): Record<string, HTMLAudioElement> {
+  if (!preloaded) {
+    preloaded = {}
+    for (const [key, url] of Object.entries(SOUND_URLS)) {
+      const audio = new Audio(url)
+      audio.preload = 'auto'
+      preloaded[key] = audio
+    }
+  }
+  return preloaded
+}
+
 export function useNotificationSound() {
   const audioCache = useRef<Record<string, HTMLAudioElement>>({})
   const dangerLoop = useRef<{ stop: () => void } | null>(null)
 
-  // Preload audio files
   useEffect(() => {
-    for (const [key, url] of Object.entries(SOUND_URLS)) {
-      const audio = new Audio(url)
-      audio.preload = 'auto'
-      audioCache.current[key] = audio
-    }
+    audioCache.current = preloadSounds()
   }, [])
 
   const playSound = useCallback((key: string) => {

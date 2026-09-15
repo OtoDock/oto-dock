@@ -20,8 +20,15 @@ export type MessageBlock =
       approved?: boolean
       meetingAgent?: { slug: string; displayName: string; color: string }
     }
-  | { type: 'question'; toolName: string; toolInput: any; answered?: boolean; requestId?: string }
-  | { type: 'plan'; action: 'enter' | 'exit'; toolInput?: any; superseded?: boolean }
+  // `followedInTurn`: later blocks of the same assistant message follow the
+  // card (an interactive terminal's continuation after the picker answer,
+  // which writes no user row); the renderer treats it as answered on
+  // interactive chats only, since a headless turn's closing metadata block
+  // follows every card.
+  | { type: 'question'; toolName: string; toolInput: any; answered?: boolean; requestId?: string; followedInTurn?: boolean }
+  // `resolved`: a later message followed the approval card — an interactive
+  // terminal's read-only hint stands down (`followedInTurn` as above).
+  | { type: 'plan'; action: 'enter' | 'exit'; toolInput?: any; superseded?: boolean; resolved?: boolean; followedInTurn?: boolean }
   | { type: 'plan_review'; requestId: string; plan: string; toolInput: any; filename?: string; resolved?: boolean; action?: string }
   | { type: 'system'; subtype: string; agentName?: string; agentColor?: string; message?: string }
   | { type: 'images'; images: GalleryImage[] }

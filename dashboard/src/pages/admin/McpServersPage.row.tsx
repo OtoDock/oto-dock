@@ -3,7 +3,9 @@ import { useEnableMcp, useDisableMcp, useSetMcpConfig, useSetMcpToolFilter, useS
 import { useAgents } from '../../api/agents'
 import { useSetInfraCredentials } from '../../api/credentials'
 import McpInstanceManager, { ApiKeyRelayInfo } from '../../components/admin/McpInstanceManager'
+import McpIcon from '../../components/McpIcon'
 import { useAuth } from '../../contexts/AuthContext'
+import { safeHref } from '../../lib/safeUrl'
 
 const DOCKER_STATUS: Record<string, { label: string; color: string }> = {
   running: { label: 'Running', color: 'text-green-600 dark:text-green-400' },
@@ -125,6 +127,8 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
           }`} />
         </button>
 
+        <McpIcon name={mcp.name} label={mcp.label} category={mcp.category} author={mcp.author} hasIcon={mcp.icon} />
+
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm text-p-text">{mcp.label}</span>
@@ -166,6 +170,28 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                 <p className="text-sm text-p-text-secondary leading-relaxed">{mcp.description}</p>
                 <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-p-text-light">
                   <span>v{mcp.version || 'latest'}</span>
+                  {/* Where the server code comes from: the catalog entry's upstream
+                      project for community MCPs; core and custom ship with OtoDock. */}
+                  {mcp.category === 'community' ? (
+                    mcp.author && (
+                      <span>
+                        From{' '}
+                        {safeHref(mcp.author_url) ? (
+                          <a
+                            href={safeHref(mcp.author_url)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-brand hover:underline"
+                            onClick={e => e.stopPropagation()}
+                          >
+                            {mcp.author}
+                          </a>
+                        ) : mcp.author}
+                      </span>
+                    )
+                  ) : (
+                    <span>Built into OtoDock</span>
+                  )}
                   {mcp.source && <span className="font-mono truncate max-w-48">{mcp.source}</span>}
                 </div>
               </div>

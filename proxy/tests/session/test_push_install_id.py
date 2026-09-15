@@ -42,7 +42,7 @@ async def test_ephemeral_push_tags_install_id(monkeypatch):
         captured["payload"] = payload
 
     import services.notifications.push_sender as ps
-    from storage import notification_store as ns
+    from storage.automation import notification_store as ns
     monkeypatch.setattr(ps, "send_fcm", fake_send_fcm)
     monkeypatch.setattr(ns, "get_push_subscriptions",
                         lambda u: [{"platform": "android", "subscription_data": "tok"}])

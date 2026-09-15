@@ -65,7 +65,7 @@ def _seed_agent(slug: str = "test-agent"):
 
 def _create_request(mcp_name: str = "nextcloud", agent_slug: str = "test-agent",
                     requested_by: str = REQUESTER_SUB, reason: str = "") -> dict:
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     return mcp_request_store.create_request(mcp_name, agent_slug, requested_by, reason)
 
 
@@ -112,7 +112,7 @@ class TestCreateAndRead:
         _seed_agent()
         row = _create_request(reason="user asked to send email")
         assert row["reason"] == "user asked to send email"
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         fetched = mcp_request_store.get_request(row["id"])
         assert fetched is not None
         assert fetched["reason"] == "user asked to send email"
@@ -126,7 +126,7 @@ class TestCreateAndRead:
     def test_get_request_includes_join(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         fetched = mcp_request_store.get_request(row["id"])
         assert fetched is not None
         assert fetched["requested_by_name"] == "Manager User"
@@ -139,7 +139,7 @@ class TestCreateAndRead:
         with get_conn() as conn:
             conn.execute("DELETE FROM users WHERE sub=%s", (REQUESTER_SUB,))
             conn.commit()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         fetched = mcp_request_store.get_request(row["id"])
         assert fetched is not None
         assert fetched["requested_by"] == REQUESTER_SUB
@@ -158,7 +158,7 @@ class TestDuplicateGuard:
     def test_can_recreate_after_rejected(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "rejected", resolved_by=ADMIN_SUB)
         # Same (mcp, agent) pair is now requestable again.
         new_row = _create_request()
@@ -168,7 +168,7 @@ class TestDuplicateGuard:
     def test_can_recreate_after_cancelled(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "cancelled", resolved_by=REQUESTER_SUB)
         new_row = _create_request()
         assert new_row["id"] != row["id"]
@@ -178,7 +178,7 @@ class TestDuplicateGuard:
         (managers may want it again later — e.g. after an admin uninstall)."""
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "approved", resolved_by=ADMIN_SUB)
         mcp_request_store.update_status(row["id"], "installing")
         mcp_request_store.update_status(row["id"], "installed", resolved_by=ADMIN_SUB)
@@ -195,7 +195,7 @@ class TestStateMachine:
     def test_invalid_transition_raises(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         with pytest.raises(ValueError) as exc:
             mcp_request_store.update_status(row["id"], "installing")
         assert "Cannot transition from 'pending' to 'installing'" in str(exc.value)
@@ -203,7 +203,7 @@ class TestStateMachine:
     def test_terminal_transition_sets_resolved_fields(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         updated = mcp_request_store.update_status(
             row["id"], "rejected", resolved_by=ADMIN_SUB, admin_note="too risky",
         )
@@ -219,7 +219,7 @@ class TestStateMachine:
         until the install lands."""
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mid = mcp_request_store.update_status(
             row["id"], "approved", resolved_by=ADMIN_SUB,
         )
@@ -230,7 +230,7 @@ class TestStateMachine:
     def test_install_failed_can_retry_to_installing(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "approved", resolved_by=ADMIN_SUB)
         mcp_request_store.update_status(row["id"], "installing")
         mcp_request_store.update_status(row["id"], "install_failed", install_log="boom")
@@ -244,7 +244,7 @@ class TestAggregateQueries:
         _seed_agent("agent-1")
         _seed_agent("agent-2")
         _seed_agent("agent-3")
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         # Three requests, distinct (mcp, agent) pairs.
         mcp_request_store.create_request("nextcloud", "agent-1", REQUESTER_SUB)
@@ -260,7 +260,7 @@ class TestAggregateQueries:
     def test_open_requests_by_pair_returns_open_only(self, temp_db):
         _seed_agent("a1")
         _seed_agent("a2")
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         r_open = mcp_request_store.create_request("nextcloud", "a1", REQUESTER_SUB)
         r_terminal = mcp_request_store.create_request("nextcloud", "a2", REQUESTER_SUB)
@@ -331,7 +331,7 @@ class TestApprove:
         _seed_agent()
         row = _create_request()
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         # Confirm agent has no MCP enabled yet.
         assert mcp_store.get_manager_enabled_mcps("test-agent") == []
@@ -363,7 +363,7 @@ class TestApprove:
         row = _create_request()
         from services.community import community_installer
         from core.config import deployment
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         install_mock = AsyncMock(return_value=FAKE_INSTALL_RESULT)
         manifest_stub = _docker_manifest_stub("nextcloud")
@@ -407,7 +407,7 @@ class TestApprove:
         row = _create_request()
         from services.community import community_installer
         from core.config import deployment
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         mcp_store.set_mcp_enabled("nextcloud", False)
         with patch(
@@ -538,7 +538,7 @@ class TestApprove:
         assert updated["status"] == "install_failed"
         assert "npm boom" in updated["install_log"]
         # MCP must NOT be enabled when install fails.
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assert mcp_store.get_manager_enabled_mcps("test-agent") == []
 
     def test_retry_install_after_failure(self, temp_db):
@@ -601,7 +601,7 @@ class TestReject:
         from fastapi import HTTPException
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "approved", resolved_by=ADMIN_SUB)
         from services.community import community_installer
         with pytest.raises(HTTPException) as exc:
@@ -637,7 +637,7 @@ class TestCancel:
         from fastapi import HTTPException
         _seed_agent()
         row = _create_request()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         mcp_request_store.update_status(row["id"], "approved", resolved_by=ADMIN_SUB)
         from services.community import community_installer
         with pytest.raises(HTTPException) as exc:
@@ -667,7 +667,7 @@ class _StubAutoManifest:
 
 class TestExplicitInstanceAuthorization:
     def test_add_agent_to_instance_inserts(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _seed_agent()
         iid = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
@@ -682,7 +682,7 @@ class TestExplicitInstanceAuthorization:
         assert inst["field_values"] == {"PROM_URL": "http://prom:9090"}
 
     def test_add_agent_to_instance_idempotent(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
             "field_values": {},
@@ -692,7 +692,7 @@ class TestExplicitInstanceAuthorization:
         assert mcp_store.add_agent_to_instance(iid, "test-agent") is False
 
     def test_add_agent_to_instance_missing_returns_false(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assert mcp_store.add_agent_to_instance(999, "test-agent") is False
 
     def test_helper_not_applicable_for_auto_mode(self, temp_db):
@@ -719,7 +719,7 @@ class TestExplicitInstanceAuthorization:
 
     def test_helper_assigned_to_all_short_circuits(self, temp_db):
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "catchall",
             "field_values": {},
@@ -738,7 +738,7 @@ class TestExplicitInstanceAuthorization:
 
     def test_helper_already_in_instance_is_no_op(self, temp_db):
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
             "field_values": {},
@@ -756,7 +756,7 @@ class TestExplicitInstanceAuthorization:
 
     def test_helper_single_instance_attaches_agent(self, temp_db):
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
             "field_values": {"PROM_URL": "http://prom:9090"},
@@ -781,7 +781,7 @@ class TestExplicitInstanceAuthorization:
         """The same precedence rule the runtime uses in
         ``get_instance_for_agent_env_delivery`` — lowest id wins."""
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "primary",
             "field_values": {},
@@ -821,7 +821,7 @@ class TestExplicitInstanceAuthorization:
         _seed_agent()
         row = _create_request(mcp_name="prometheus")
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         with patch.object(
             community_installer, "install_from_catalog",
@@ -849,7 +849,7 @@ class TestExplicitInstanceAuthorization:
         _seed_agent()
         row = _create_request(mcp_name="prometheus")
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         iid = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
@@ -962,7 +962,7 @@ class TestNotifications:
         _seed_agent()
         row = _create_request()
         # Re-fetch to pick up the updated JOIN values.
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         row = mcp_request_store.get_request(row["id"])
 
         from services.community import community_installer
@@ -976,7 +976,7 @@ class TestNotifications:
         with get_conn() as conn:
             conn.execute("DELETE FROM users WHERE sub=%s", (REQUESTER_SUB,))
             conn.commit()
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         row = mcp_request_store.get_request(row["id"])
         from services.community import community_installer
         formatted = community_installer._format_requester(row)
@@ -1114,7 +1114,8 @@ class TestAdminAutoApprove:
         _seed_agent()
         from api.mcp.community import create_mcp_request, CreateRequestBody
         from services.community import community_installer
-        from storage import mcp_store, mcp_request_store
+        from storage.mcp import mcp_store
+        from storage.mcp import mcp_request_store
 
         fire_calls: list[dict] = []
         async def fake_fire(**kwargs):
@@ -1153,7 +1154,7 @@ class TestAdminAutoApprove:
         _seed_agent()
         from api.mcp.community import create_mcp_request, CreateRequestBody
         from services.community import community_installer
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         fire_calls: list[dict] = []
         async def fake_fire(**kwargs):
@@ -1217,7 +1218,7 @@ class TestInstanceUpdateById:
     directly so rename works without leaving the old row orphaned."""
 
     def test_update_renames_in_place(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "primary",
             "field_values": {"PROMETHEUS_URL": "http://a:9090"},
@@ -1239,7 +1240,7 @@ class TestInstanceUpdateById:
         assert rows[0]["field_values"]["PROMETHEUS_URL"] == "http://a:9090"
 
     def test_update_missing_id_returns_false(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         ok = mcp_store.update_mcp_instance_by_id(99999, "prometheus", {
             "instance_name": "ghost", "field_values": {},
             "agents": [], "assigned_to_all": False,
@@ -1249,7 +1250,7 @@ class TestInstanceUpdateById:
     def test_update_name_collision_raises(self, temp_db):
         """Renaming to a name that's already taken by another instance of
         the same MCP must raise — surfaces a 409 at the API layer."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "prod", "field_values": {},
             "agents": [], "assigned_to_all": False,
@@ -1271,7 +1272,7 @@ class TestInstanceUpdateById:
     def test_update_same_name_not_a_collision(self, temp_db):
         """Updating credentials without renaming is fine — the self-row
         is excluded from the collision check via ``id != %s``."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "prod",
             "field_values": {"PROMETHEUS_URL": "http://old:9090"},
@@ -1297,7 +1298,7 @@ class TestInstanceSaveContainerRefresh:
     def test_running_container_is_recreated(self, temp_db):
         from api.mcp.mcps import _refresh_container_after_instance_change
         from core.config import deployment
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("nextcloud", True)
         start_mock = _patchable_mock(return_value=True)
         with patch(
@@ -1323,7 +1324,7 @@ class TestInstanceSaveContainerRefresh:
     def test_stopped_container_gets_env_only(self, temp_db):
         from api.mcp.mcps import _refresh_container_after_instance_change
         from core.config import deployment
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("nextcloud", True)
         inject_mock = _patchable_mock(return_value=True)
         start_mock = _patchable_mock(return_value=True)
@@ -1350,7 +1351,7 @@ class TestInstanceSaveContainerRefresh:
     def test_disabled_or_nondocker_untouched(self, temp_db):
         from api.mcp.mcps import _refresh_container_after_instance_change
         from core.config import deployment
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         # Disabled docker MCP → no action.
         mcp_store.set_mcp_enabled("nextcloud", False)
         with patch(
@@ -1399,7 +1400,7 @@ class TestInstanceSaveAutoRetry:
         # Manually plant an install_failed row (the request that an
         # admin would have hit before they configured an instance).
         from storage.pg import get_conn
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1425,7 +1426,7 @@ class TestInstanceSaveAutoRetry:
 
         # Configure an instance with the agent already attached.
         from api.mcp.mcps import _retry_install_failed_for_instance
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default",
             "field_values": {"PROMETHEUS_URL": "http://localhost:9090"},
@@ -1456,7 +1457,8 @@ class TestInstanceSaveAutoRetry:
         catch-all covers them."""
         _seed_agent()
         from storage.pg import get_conn
-        from storage import mcp_request_store, mcp_store
+        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_store
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1503,7 +1505,7 @@ class TestInstanceSaveAutoRetry:
         _seed_agent("agent-a")
         _seed_agent("agent-b")
         from storage.pg import get_conn
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1534,7 +1536,8 @@ class TestEndToEnd:
         _seed_agent()
         row = _create_request()
         from services.community import community_installer
-        from storage import mcp_store, mcp_request_store
+        from storage.mcp import mcp_store
+        from storage.mcp import mcp_request_store
 
         # Sanity: nothing enabled yet, request is pending.
         assert row["status"] == "pending"
@@ -1581,7 +1584,7 @@ class TestBatchIdGrouping:
     used by the notification batcher work as expected."""
 
     def test_create_with_batch_id_persists(self, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent()
         row = mcp_request_store.create_request(
             "nextcloud", "test-agent", REQUESTER_SUB,
@@ -1590,7 +1593,7 @@ class TestBatchIdGrouping:
         assert row["batch_id"] == "batch-abc"
 
     def test_create_without_batch_id_defaults_null(self, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent()
         row = mcp_request_store.create_request(
             "nextcloud", "test-agent", REQUESTER_SUB,
@@ -1598,7 +1601,7 @@ class TestBatchIdGrouping:
         assert row["batch_id"] is None
 
     def test_list_requests_by_batch_returns_all(self, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent("agent-a")
         _seed_agent("agent-b")
         mcp_request_store.create_request(
@@ -1616,7 +1619,7 @@ class TestBatchIdGrouping:
         assert {r["mcp_name"] for r in rows} == {"nextcloud", "google-maps"}
 
     def test_all_in_batch_terminal_false_when_pending(self, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent()
         mcp_request_store.create_request(
             "nextcloud", "test-agent", REQUESTER_SUB, batch_id="batch-1",
@@ -1624,7 +1627,7 @@ class TestBatchIdGrouping:
         assert mcp_request_store.all_in_batch_terminal("batch-1") is False
 
     def test_all_in_batch_terminal_true_when_all_resolved(self, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent("agent-a")
         _seed_agent("agent-b")
         r1 = mcp_request_store.create_request(
@@ -1642,7 +1645,7 @@ class TestBatchIdGrouping:
 
     def test_all_in_batch_terminal_false_when_install_failed(self, temp_db):
         """``install_failed`` is NOT terminal — admin may retry."""
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         _seed_agent()
         r = mcp_request_store.create_request(
             "nextcloud", "test-agent", REQUESTER_SUB, batch_id="batch-mid",
@@ -1656,7 +1659,7 @@ class TestBatchIdGrouping:
 
     def test_all_in_batch_terminal_empty_batch_is_false(self, temp_db):
         """No rows for batch_id — return False (caller must skip)."""
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         assert mcp_request_store.all_in_batch_terminal("never-existed") is False
 
 
@@ -1688,7 +1691,7 @@ def _insert_dynamic_task(agent: str, *, scope: str = "user", created_by: str = R
 
 def _insert_trigger(agent: str, *, slug: str, scope: str = "user", created_by: str = REQUESTER_SUB,
                     item_slug: str | None = None) -> str:
-    from storage import trigger_store
+    from storage.automation import trigger_store
     trigger_id = f"trig-{agent}-{slug}-{created_by}"
     trigger_store.create_trigger(
         trigger_id=trigger_id, slug=slug, name=f"test-{slug}",
@@ -1706,7 +1709,7 @@ def _insert_trigger(agent: str, *, slug: str, scope: str = "user", created_by: s
 
 def _insert_notification(agent: str, *, scope: str = "user", target: str = REQUESTER_SUB,
                           item_slug: str | None = None) -> str:
-    from storage import notification_store
+    from storage.automation import notification_store
     notif_id = f"notif-{agent}-{scope}-{target}-{item_slug or 'manual'}"
     notification_store.create_notification(
         notification_id=notif_id, title="test", body="test",
@@ -1728,7 +1731,8 @@ class TestAgentDeleteCascade:
     previously orphaned."""
 
     def test_delete_agent_removes_dynamic_tasks(self, temp_db):
-        from storage import agent_store, database as db
+        from storage.agents import agent_store
+        from storage import database as db
         agent_store.create_agent("doomed", "Doomed")
         _insert_dynamic_task("doomed", scope="agent", created_by=ADMIN_SUB)
         _insert_dynamic_task("doomed", scope="user", created_by=REQUESTER_SUB)
@@ -1738,7 +1742,8 @@ class TestAgentDeleteCascade:
         assert db.list_dynamic_tasks(agent="doomed") == []
 
     def test_delete_agent_removes_triggers(self, temp_db):
-        from storage import agent_store, trigger_store
+        from storage.agents import agent_store
+        from storage.automation import trigger_store
         agent_store.create_agent("doomed", "Doomed")
         _insert_trigger("doomed", slug="t1", scope="agent", created_by=ADMIN_SUB)
         _insert_trigger("doomed", slug="t2", scope="user", created_by=REQUESTER_SUB)
@@ -1748,7 +1753,7 @@ class TestAgentDeleteCascade:
         assert trigger_store.list_triggers(agent="doomed") == []
 
     def test_delete_agent_removes_notifications_and_deliveries(self, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         from storage.pg import get_conn
 
         agent_store.create_agent("doomed", "Doomed")
@@ -1780,7 +1785,9 @@ class TestAgentDeleteCascade:
 
     def test_delete_agent_keeps_unrelated_agent_data(self, temp_db):
         """Deleting one agent must not touch another agent's rows."""
-        from storage import agent_store, database as db, trigger_store
+        from storage.agents import agent_store
+        from storage import database as db
+        from storage.automation import trigger_store
         agent_store.create_agent("keeper", "Keeper")
         agent_store.create_agent("doomed", "Doomed")
         _insert_dynamic_task("keeper", scope="agent", created_by=ADMIN_SUB)
@@ -1799,7 +1806,8 @@ class TestUserRemovalCascade:
     access. Agent-scope items stay."""
 
     def test_removing_user_from_agent_cleans_user_scope_tasks(self, temp_db):
-        from storage import agent_store, database as db
+        from storage.agents import agent_store
+        from storage import database as db
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})
@@ -1815,7 +1823,9 @@ class TestUserRemovalCascade:
         assert remaining[0]["scope"] == "agent"
 
     def test_removing_user_cleans_user_scope_triggers(self, temp_db):
-        from storage import agent_store, database as db, trigger_store
+        from storage.agents import agent_store
+        from storage import database as db
+        from storage.automation import trigger_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})
@@ -1829,7 +1839,9 @@ class TestUserRemovalCascade:
         assert remaining[0]["scope"] == "agent"
 
     def test_removing_user_cleans_user_scope_notifications(self, temp_db):
-        from storage import agent_store, database as db, notification_store
+        from storage.agents import agent_store
+        from storage import database as db
+        from storage.automation import notification_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})
@@ -1845,7 +1857,8 @@ class TestUserRemovalCascade:
 
     def test_other_user_scope_items_survive(self, temp_db):
         """Removing user A from agent X must NOT touch user B's items on X."""
-        from storage import agent_store, database as db
+        from storage.agents import agent_store
+        from storage import database as db
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})

@@ -112,6 +112,42 @@ class TestOperatorKeepSet:
         assert out == {}
 
 
+class TestNestedClaudeSessionVars:
+    NESTED = {
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_SESSION_ID": "951d24c9-becd-4204-9c0c-20656c02b949",
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+        "CLAUDE_CODE_MESSAGING_SOCKET": "/run/user/1000/cc-socks/3011490.sock",
+        "CLAUDE_PID": "3011490",
+        "CLAUDE_EFFORT": "xhigh",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "CLAUDE_CODE_EXECPATH": "/x/claude.exe",
+    }
+
+    def test_inherited_claude_session_identity_stripped(self):
+        # A satellite started from inside a Claude Code session inherits the
+        # parent CLI's identity; CLAUDE_CODE_CHILD_SESSION=1 makes a spawned
+        # TUI journal no transcript (T1 2026-09-10). None may reach the child.
+        out = curate_satellite_env({**self.NESTED, "PATH": "/bin", "HOME": "/h"})
+        assert out == {"PATH": "/bin", "HOME": "/h"}
+
+    def test_lowercase_variants_stripped_too(self):
+        out = curate_satellite_env({"claude_code_child_session": "1", "PATH": "/bin"})
+        assert out == {"PATH": "/bin"}
+
+    def test_keep_set_cannot_bring_them_back(self, monkeypatch):
+        # Identity, not a secret false positive — OTO_ENV_KEEP does not apply.
+        monkeypatch.setenv("OTO_ENV_KEEP", "CLAUDE_CODE_CHILD_SESSION")
+        out = curate_satellite_env({"CLAUDE_CODE_CHILD_SESSION": "1"})
+        assert out == {}
+
+    def test_other_claude_code_settings_pass(self):
+        # Only the nested-session identity is dropped; a deliberate Claude
+        # Code setting in the satellite's environment still reaches the CLI.
+        out = curate_satellite_env({"CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": "/c"})
+        assert out == {"CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": "/c"}
+
+
 class TestIsSecretName:
     @pytest.mark.parametrize("name,secret", [
         ("GH_TOKEN", True), ("AWS_SECRET_ACCESS_KEY", True),

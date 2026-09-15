@@ -11,7 +11,7 @@ unchanged, the dashboard's tool cards already render them):
 - ``Delete`` — destructive tier (prompts in ``default`` AND ``acceptEdits``,
   exactly ``rm``'s treatment; silent only in ``dontAsk`` / ``auto``)
 
-Two-pass gate, mirroring ``api.hooks.hooks.decide_tool_permission`` for the
+Two-pass gate, mirroring ``api.hooks.permission.decide_tool_permission`` for the
 CLI: Pass-1 is ``auth.path_policy.check_tool_access`` with the session's
 SecurityContext (RBAC, memory files, credentials, library mirrors), Pass-2
 is the tier × mode table above. Plan mode allows only the open tier. The

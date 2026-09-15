@@ -20,7 +20,9 @@ from fastapi import HTTPException
 
 import config
 from auth.providers import UserContext
-from storage import agent_store, db_knowledge_libraries, recover_bin_store
+from storage.agents import agent_store
+from storage.knowledge import db_knowledge_libraries
+from storage.files import recover_bin_store
 
 SRC = "kl-source"
 CON_A = "kl-con-a"          # collaborative consumer, RO attachment
@@ -244,7 +246,7 @@ class TestProjector:
 
     def test_reconcile_records_merge_base(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         rows = st.get_map(CON_B, SRC)
         assert set(rows) == {"index.md", "docs/brand.md"}
@@ -261,7 +263,7 @@ class TestProjector:
         is a deliberate delete → source + every other mirror lose the file,
         the source bytes land in the source's recover-bin."""
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         (_mirror(CON_B) / "index.md").unlink()  # RW mirror, plain rm
         _run(library_projector.reconcile_source(SRC))
@@ -284,7 +286,7 @@ class TestProjector:
         from services.knowledge import library_projector
         _run(library_projector.reconcile_source(SRC))
         # Simulate "never converged": drop the base row, then rm the mirror.
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         st.delete_many([(CON_B, SRC, "index.md")])
         (_mirror(CON_B) / "index.md").unlink()
         _run(library_projector.reconcile_source(SRC))
@@ -318,7 +320,7 @@ class TestProjector:
         row the mirror copy is removed instead (recover-bin only if it
         diverged from the base)."""
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         src = config.get_agent_dir(SRC) / "knowledge" / "index.md"
         src.unlink()  # source agent's sandbox rm — no chokepoint
@@ -348,7 +350,7 @@ class TestProjector:
 
     def test_new_rw_mirror_file_still_adopted(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         (_mirror(CON_B) / "docs" / "new.md").write_text("authored in the mirror")
         _run(library_projector.reconcile_source(SRC))
@@ -381,7 +383,7 @@ class TestProjector:
 
     def test_explicit_delete_drops_every_base_row(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         assert _run(library_projector.propagate_mirror_delete(CON_B, SRC, "index.md")) is True
         assert "index.md" not in st.get_map(CON_A, SRC)
@@ -392,7 +394,7 @@ class TestProjector:
 
     def test_teardown_drops_base_rows(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
-        from storage import db_library_mirror_state as st
+        from storage.knowledge import db_library_mirror_state as st
         _run(library_projector.reconcile_source(SRC))
         assert st.get_map(CON_A, SRC)
         _run(library_projector.detach_teardown(SRC, CON_A))

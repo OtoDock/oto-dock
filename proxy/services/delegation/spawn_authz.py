@@ -18,7 +18,8 @@ from fastapi import HTTPException
 
 from auth.providers import UserContext
 from core.session.visibility import SHARED_CHAT_OWNER_PREFIX, available_scopes_for
-from storage import agent_store, mcp_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy.delegation")
@@ -293,7 +294,7 @@ def validate_spawn_overrides(
         # the validator must accept exactly that set (an admin-disabled
         # model is disabled for spawn overrides too).
         try:
-            from storage import subscription_store
+            from storage.billing import subscription_store
             ok = any(
                 (m.get("model_id") or "") == model and m.get("enabled")
                 for m in subscription_store.list_models(exec_path)

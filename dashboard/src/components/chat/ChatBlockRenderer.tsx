@@ -119,6 +119,7 @@ export default function BlockRenderer({
   uiSuperseded,
   uiTitle,
   previewMode,
+  dialogsInTerminal,
 }: {
   block: MessageBlock
   blockId: string
@@ -135,6 +136,10 @@ export default function BlockRenderer({
   onQuestionAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
   onSendMessage?: (text: string) => void
   onPlanFetched?: (filename: string, content: string) => void
+  /** A live interactive terminal owns this chat's dialogs: question and plan
+   * cards render read-only — the answer / approval happens in the TUI, and a
+   * card answer would only be held until the parked turn ends. */
+  dialogsInTerminal?: boolean
   /** document_preview blocks: `key` scopes the removal to ONE instance (a
    * frozen "previous version" closing itself); undefined removes the file's
    * whole preview trail (the live block's close). */
@@ -261,10 +266,11 @@ export default function BlockRenderer({
       return (
         <QuestionDialog
           toolInput={block.toolInput}
-          answered={block.answered}
+          answered={Boolean(block.answered || (dialogsInTerminal && block.followedInTurn))}
           onAnswer={onQuestionAnswer || (() => {})}
           requestId={block.requestId}
           onAnswerStructured={onQuestionAnswerStructured}
+          readOnly={dialogsInTerminal}
         />
       )
 
@@ -274,8 +280,9 @@ export default function BlockRenderer({
           action={block.action}
           toolInput={block.toolInput}
           superseded={block.superseded}
-          onImplement={onImplementPlan}
-          onImplementCodex={onImplementPlanCodex}
+          onImplement={dialogsInTerminal ? undefined : onImplementPlan}
+          onImplementCodex={dialogsInTerminal ? undefined : onImplementPlanCodex}
+          readOnly={dialogsInTerminal && !(block.resolved || block.followedInTurn)}
           onSendMessage={onSendMessage}
           onPlanFetched={onPlanFetched}
         />

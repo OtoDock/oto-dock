@@ -13,9 +13,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from storage import credential_store
-from storage import agent_store
-from storage import mcp_store
+from storage.identity import credential_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 from services.mcp import mcp_registry
 from services.oauth import oauth_account_store
@@ -813,7 +813,7 @@ async def list_bearer_allowlist(
 ):
     """List approved (provider, host) pairs for OAuth bearer-token injection."""
     _require_admin(user)
-    from storage import bearer_allowlist
+    from storage.identity import bearer_allowlist
     rows = await asyncio.to_thread(bearer_allowlist.list_allowed)
     return {"entries": rows}
 
@@ -825,7 +825,7 @@ async def add_bearer_allowlist(
 ):
     """Approve a (provider, host_pattern) pair. Idempotent on conflict."""
     _require_admin(user)
-    from storage import bearer_allowlist
+    from storage.identity import bearer_allowlist
     if not body.provider_id.strip() or not body.host_pattern.strip():
         raise HTTPException(400, "provider_id and host_pattern required")
     added_by = "api-key" if user.is_api_key else user.sub
@@ -845,7 +845,7 @@ async def remove_bearer_allowlist(
     host are dropped (existing sessions keep their cached header until
     refresh)."""
     _require_admin(user)
-    from storage import bearer_allowlist
+    from storage.identity import bearer_allowlist
     ok = await asyncio.to_thread(bearer_allowlist.delete_allowed, row_id)
     if not ok:
         raise HTTPException(404, "Allowlist entry not found")
@@ -859,6 +859,6 @@ async def restore_bearer_allowlist_defaults(
     """Re-add any deleted vendor-official defaults. Idempotent — admin-added
     entries and existing defaults are untouched. Returns the refreshed list."""
     _require_admin(user)
-    from storage import bearer_allowlist
+    from storage.identity import bearer_allowlist
     rows = await asyncio.to_thread(bearer_allowlist.restore_defaults)
     return {"entries": rows}

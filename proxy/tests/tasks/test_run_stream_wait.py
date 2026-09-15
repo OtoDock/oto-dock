@@ -85,6 +85,7 @@ class TestQueuedRunVisibility:
     def test_chat_row_exists_while_run_still_pending(self, temp_db, monkeypatch):
         import asyncio
         from services.scheduler import scheduler
+        from services.scheduler import runner
 
         started = asyncio.Event()
         release = asyncio.Event()
@@ -93,7 +94,7 @@ class TestQueuedRunVisibility:
             started.set()
             await release.wait()
 
-        monkeypatch.setattr(scheduler, "_run_task", _parked_run_task)
+        monkeypatch.setattr(runner, "_run_task", _parked_run_task)
         monkeypatch.setattr(config, "get_cli_model",
                             lambda agent, layer=None: "test-model")
 

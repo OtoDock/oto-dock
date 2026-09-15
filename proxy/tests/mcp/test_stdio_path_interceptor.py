@@ -462,7 +462,7 @@ class TestResolveToolArgPathsEndpoint:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
@@ -470,7 +470,7 @@ class TestResolveToolArgPathsEndpoint:
         # Stub session-match auth so requests don't get rejected on
         # bearer-token shape.
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match", lambda *a, **kw: None,
         )
         return TestClient(app)
 
@@ -487,7 +487,7 @@ class TestResolveToolArgPathsEndpoint:
 
     def test_session_not_found(self, client, monkeypatch):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: None,
         )
         r = client.post("/v1/hooks/resolve-tool-arg-paths", json={
@@ -499,7 +499,7 @@ class TestResolveToolArgPathsEndpoint:
 
     def test_batched_response_preserves_order(self, client, monkeypatch):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: self._ctx(allow_full_fs=False),
         )
         body = {
@@ -534,7 +534,7 @@ class TestResolveToolArgPathsEndpoint:
 
     def test_write_mode_marks_remote_push(self, client, monkeypatch):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: self._ctx(allow_full_fs=True),
         )
         r = client.post("/v1/hooks/resolve-tool-arg-paths", json={
@@ -549,7 +549,7 @@ class TestResolveToolArgPathsEndpoint:
 
     def test_full_fs_admits_system_path(self, client, monkeypatch):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: self._ctx(allow_full_fs=True),
         )
         r = client.post("/v1/hooks/resolve-tool-arg-paths", json={

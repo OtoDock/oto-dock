@@ -20,7 +20,7 @@ from fastapi import File as FileParam
 from pydantic import BaseModel
 
 import config
-from storage import agent_store
+from storage.agents import agent_store
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
 from services.infra.path_confinement import (
     PathOutsideRoot, join_under, resolve_under, safe_agent_dir,

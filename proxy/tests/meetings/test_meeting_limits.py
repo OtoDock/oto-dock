@@ -15,7 +15,8 @@ from fastapi import HTTPException
 
 from api.meetings.meetings import create_meeting, CreateMeetingRequest
 from auth.providers import UserContext
-from storage import agent_store, mcp_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 
 

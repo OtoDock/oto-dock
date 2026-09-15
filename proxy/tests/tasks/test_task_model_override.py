@@ -27,7 +27,7 @@ if _proxy_root not in sys.path:
 
 from auth.providers import UserContext, get_current_user  # noqa: E402
 from services.scheduler import scheduler  # noqa: E402
-from storage import agent_store  # noqa: E402
+from storage.agents import agent_store  # noqa: E402
 from storage import database as task_store  # noqa: E402
 
 
@@ -49,7 +49,7 @@ def _admin():
 def client(temp_db, monkeypatch):
     """Tasks router + an agent with two enabled layers and a known model set."""
     from api.tasks import tasks as tasks_api
-    from storage import subscription_store
+    from storage.billing import subscription_store
 
     agent_store.create_agent(AGENT, "Briefer", collaborative=True,
                              default_scope="user")
@@ -191,7 +191,7 @@ class TestValidation:
 class TestEdit:
     def test_editable_columns_whitelist_contains_both(self):
         """Missing here = the update silently no-ops (helper drops unknowns)."""
-        from storage.db_tasks import _EDITABLE_TASK_COLUMNS
+        from storage.automation.db_tasks import _EDITABLE_TASK_COLUMNS
         assert "override_model" in _EDITABLE_TASK_COLUMNS
         assert "override_execution_path" in _EDITABLE_TASK_COLUMNS
 

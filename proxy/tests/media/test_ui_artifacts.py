@@ -75,7 +75,7 @@ def agent_tree(tmp_path, monkeypatch):
 
 def _post_ui(payload: dict) -> object:
     payload.setdefault("session_id", SID)
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match"):
         return client.post("/v1/hooks/ui", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
@@ -516,7 +516,7 @@ def test_hook_file_mints_durable_media_token(agent_tree):
     try:
         report = agent_tree / "users" / "alice" / "workspace" / "report.txt"
         report.write_text("hello")
-        with patch("api.hooks.hooks.verify_session_match"):
+        with patch("api.hooks.artifacts.verify_session_match"):
             r = client.post("/v1/hooks/file", json={
                 "session_id": SID, "path": str(report), "description": "d",
             }, headers={"Authorization": "Bearer dummy"})

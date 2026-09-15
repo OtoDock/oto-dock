@@ -1,7 +1,7 @@
 """Session management endpoints -- models, helpers, health, file serving, plan files,
 warmup, and session control (mode/model/thinking/permission).
 
-Also exports `verify_api_key` and `verify_session_match` for use by `api.hooks.hooks`.
+Also exports `verify_api_key` and `verify_session_match` for use by the `api.hooks` pieces.
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from storage import agent_store
+from storage.agents import agent_store
 from auth.path_policy import SecurityContext
 from services.infra.path_confinement import PathOutsideRoot, join_under, resolve_under
 from core.session.session_state import (
@@ -118,10 +118,17 @@ async def health():
     # community_mcps_version is omitted until it has a runtime source.
     from ws.satellite import MIN_SATELLITE_VERSION
     from core import log_queue, loop_watchdog
+    from static_assets import dashboard_build_id
     return {
         "status": "ok",
         "service": "otodock",
         "version": config.PINNED_OTODOCK_VERSION,
+        # The dashboard build this server serves (the stamp in dist/index.html;
+        # "" without a dist). A page without a dashboard socket asks here when
+        # it returns to the foreground and reloads once if its own stamp
+        # differs. Read per request: a dashboard-only rebuild must be seen
+        # without a restart (cached on the file's mtime/size).
+        "build": dashboard_build_id(),
         "claude_cli_version": config.PINNED_CLAUDE_CODE_VERSION,
         "codex_cli_version": config.PINNED_CODEX_VERSION,
         "satellite_min_version": MIN_SATELLITE_VERSION,

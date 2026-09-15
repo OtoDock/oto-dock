@@ -356,7 +356,7 @@ class TestAgentScopeOnUserPairedRefused:
         """user_sub=None routed to a user-paired machine → RuntimeError."""
         from core.session import session_manager
 
-        with patch("storage.agent_store.get_agent") as ga, \
+        with patch("storage.agents.agent_store.get_agent") as ga, \
              patch("storage.remote_store.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm:
             ga.return_value = {"execution_path": "claude-code-cli"}
@@ -380,7 +380,7 @@ class TestAgentScopeOnUserPairedRefused:
         """user_sub set → request proceeds even on user-paired machine."""
         from core.session import session_manager
 
-        with patch("storage.agent_store.get_agent") as ga, \
+        with patch("storage.agents.agent_store.get_agent") as ga, \
              patch("storage.remote_store.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm, \
              patch.object(session_manager, "_get_remote_layer") as grl:
@@ -405,7 +405,7 @@ class TestAgentScopeOnUserPairedRefused:
         """user_sub=None routed to an admin-shared machine → allowed."""
         from core.session import session_manager
 
-        with patch("storage.agent_store.get_agent") as ga, \
+        with patch("storage.agents.agent_store.get_agent") as ga, \
              patch("storage.remote_store.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm, \
              patch.object(session_manager, "_get_remote_layer") as grl:
@@ -444,6 +444,8 @@ def test_routing_modules_do_not_key_on_owner_role():
     routing_files = [
         "core/session/session_manager.py",
         "core/remote/remote_execution.py",
+        "core/remote/remote_session_start.py",
+        "core/remote/remote_resume.py",
         "ws/satellite.py",
         "api/agents/agents.py",
         "api/auth/auth.py",

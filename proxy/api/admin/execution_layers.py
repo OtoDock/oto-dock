@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import get_current_user, require_auth, require_admin, UserContext
-from storage import subscription_store
+from storage.billing import subscription_store
 from core.session.session_manager import get_all_capabilities
 from services.engines import subscription_pool
 from services.phone.phone_config import notify_phone_config_changed
@@ -114,6 +114,8 @@ _VALID_AUTH_TYPES = {"api_key", "local_endpoint", "oauth", "relay"}
 # Local providers reach the operator's own network — unavailable on hosted
 # OtoDock (no operator LAN). Rejected at add time when OTODOCK_CLOUD.
 _LOCAL_PROVIDERS = {"ollama", "openai_compatible"}
+# The vendor a user's own API key belongs to, per CLI engine.
+_USER_KEY_PROVIDERS = {"claude-code-cli": "anthropic", "codex-cli": "openai"}
 # Engines a local endpoint can serve (both dial OpenAI-compatible servers).
 _LOCAL_ENDPOINT_LAYERS = ("direct-llm", "codex-cli")
 _CLOUD_LOCAL_MSG = (
@@ -128,6 +130,22 @@ _RELAY_PROVIDERS = {"anthropic", "openai", "groq"}
 # ---------------------------------------------------------------------------
 # Admin: Layer overview
 # ---------------------------------------------------------------------------
+
+def _attach_windows(subs: list[dict]) -> None:
+    """Each OAuth row's effective 5-hour / weekly reading (``windows``), for
+    the bars on both AI Engines cards. Percentages only, so shared-by-another-
+    admin rows carry it too. Absent while the platform setting is off."""
+    from services.engines import subscription_windows
+    if not subscription_windows.is_enabled():
+        return
+    ids = [s["id"] for s in subs if s.get("auth_type") == "oauth" and s.get("id")]
+    readings = subscription_windows.latest(ids) if ids else {}
+    for s in subs:
+        if s.get("auth_type") != "oauth":
+            continue
+        w = readings.get(s.get("id"))
+        s["windows"] = subscription_windows.to_public(w) if w else None
+
 
 @router.get("/v1/admin/execution-layers")
 async def admin_list_layers(user: UserContext = Depends(get_current_user)):
@@ -149,6 +167,7 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
         ]
         for s in platform_subs:
             s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
+        _attach_windows(platform_subs)
         # Count personal accounts (without exposing details)
         personal_subs = subscription_store.list_subscriptions(
             layer=path, use_personal=True, include_disabled=True,
@@ -193,6 +212,7 @@ async def admin_list_subscriptions(
     subs = subscription_store.list_admin_managed(layer=layer)
     for s in subs:
         s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
+    _attach_windows(subs)
     return {"subscriptions": subs}
 
 
@@ -249,17 +269,20 @@ async def admin_add_subscription(
         if req.api_key:
             cred_data["api_key"] = req.api_key
 
-    sub = subscription_store.add_subscription(
-        layer=layer,
-        provider=req.provider,
-        auth_type=req.auth_type,
-        owner_sub=user.sub,
-        # Admin-added accounts default to BOTH personal use and pool contribution.
-        use_personal=True if req.use_personal is None else req.use_personal,
-        contribute_platform=True if req.contribute_platform is None else req.contribute_platform,
-        label=req.label,
-        credential_data=cred_data,
-    )
+    try:
+        sub = subscription_store.add_subscription(
+            layer=layer,
+            provider=req.provider,
+            auth_type=req.auth_type,
+            owner_sub=user.sub,
+            # Admin-added accounts default to BOTH personal use and pool contribution.
+            use_personal=True if req.use_personal is None else req.use_personal,
+            contribute_platform=True if req.contribute_platform is None else req.contribute_platform,
+            label=req.label,
+            credential_data=cred_data,
+        )
+    except subscription_store.SubscriptionExists:
+        raise HTTPException(409, "A credential of this kind already exists on this engine")
     subscription_pool.schedule_rebind("admin subscription add")
     # The phone's Groq turn classifier reuses the Direct LLM Groq key — push the
     # updated phone config so the change takes effect without a phone restart.
@@ -304,6 +327,7 @@ async def admin_update_subscription(
 async def admin_delete_subscription(
     layer: str,
     sub_id: str,
+    force: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
@@ -313,12 +337,19 @@ async def admin_delete_subscription(
     # Owner-or-infra only (see admin_update_subscription).
     if sub.get("owner_sub") not in ("", user.sub):
         raise HTTPException(403, "Not your subscription")
-    # Check it's not currently in use
-    if sub.get("active_sessions", 0) > 0:
+    # In use? Judged on the LIVE bindings, not the stored counter: the
+    # counter reads stale after an abandoned spawn, and a stale number used
+    # to refuse the delete until a restart (public issue #3). The reconcile
+    # writes the honest value back. Live sessions still block — unless the
+    # admin forces it, in which case the rebind fan-out re-homes them onto
+    # the remaining selection (or blocks them until one is connected).
+    _stored, live = subscription_pool.reconcile_active_sessions(sub_id)
+    if live > 0 and not force:
         raise HTTPException(
             409,
-            f"Subscription has {sub['active_sessions']} active sessions. "
-            "Wait for sessions to close or restart the service.",
+            f"Subscription has {live} live session(s). Wait for them to "
+            "close, or delete with force=true to move them to another "
+            "subscription.",
         )
     deleted = subscription_store.delete_subscription(sub_id)
     if not deleted:
@@ -445,16 +476,25 @@ async def admin_set_local_endpoint_engine(
 @router.delete("/v1/admin/execution-layers/local-endpoints/{group}")
 async def admin_delete_local_endpoint(
     group: str,
+    force: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
     _require_admin(user)
     g = _local_group(group)
     _require_group_owner(g, user)
-    busy = [layer for layer, e in g["engines"].items() if e.get("active_sessions", 0) > 0]
-    if busy:
+    # Same rule as the subscription delete: live bindings decide, the stored
+    # counter is reconciled first, and `force` deletes past live sessions
+    # (the rebind fan-out re-homes them).
+    busy = []
+    for layer, e in g["engines"].items():
+        _stored, live = subscription_pool.reconcile_active_sessions(e["id"])
+        if live > 0:
+            busy.append(f"{layer} ({live})")
+    if busy and not force:
         raise HTTPException(
-            409, f"Endpoint has active sessions on {', '.join(busy)}. "
-            "Wait for them to close or restart the service.",
+            409, f"Endpoint has live sessions on {', '.join(busy)}. Wait for "
+            "them to close, or delete with force=true to move them to another "
+            "subscription.",
         )
     for e in g["engines"].values():
         subscription_store.delete_subscription(e["id"])
@@ -657,6 +697,7 @@ async def user_list_layers(user: UserContext | None = Depends(get_current_user))
         user_subs = subscription_store.list_subscriptions(
             layer=path, owner_sub=user.sub, include_disabled=True,
         )
+        _attach_windows(user_subs)
         # "Platform available" = the user may borrow a platform API credential here
         # (Platform Auth on AND a borrowable admin sub exists — NOT admin OAuth).
         platform_available = subscription_pool.borrowable_pool_available(path, user.sub)
@@ -682,41 +723,39 @@ async def user_add_subscription(
     req: AddSubscriptionRequest,
     user: UserContext | None = Depends(get_current_user),
 ):
+    """A user's own API key on one of the two CLI engines (the vendor the
+    engine speaks). Local endpoints and the Direct LLM engine are admin
+    surfaces; an OAuth account arrives through its own exchange endpoint."""
     user = require_auth(user)
-    if layer not in _VALID_LAYERS:
-        raise HTTPException(400, f"Invalid layer: {layer}")
-    if req.provider not in _VALID_PROVIDERS:
-        raise HTTPException(400, f"Invalid provider: {req.provider}")
-    if req.auth_type not in ("api_key", "local_endpoint"):
-        raise HTTPException(400, "Only api_key and local_endpoint supported for user subscriptions")
-    if config.OTODOCK_CLOUD and req.provider in _LOCAL_PROVIDERS:
-        raise HTTPException(
-            400, "Local model endpoints are unavailable on hosted OtoDock — "
-            "they would need access to your own network.")
+    provider = _USER_KEY_PROVIDERS.get(layer)
+    if provider is None:
+        raise HTTPException(400, "API keys can be added on claude-code-cli or codex-cli")
+    if req.auth_type != "api_key":
+        raise HTTPException(400, "Only api_key is supported for user subscriptions")
+    if req.provider != provider:
+        raise HTTPException(400, f"provider must be {provider} for {layer}")
+    api_key = (req.api_key or "").strip()
+    if not api_key:
+        raise HTTPException(400, "api_key is required")
 
-    cred_data = {}
-    if req.auth_type == "api_key" and req.api_key:
-        cred_data["api_key"] = req.api_key
-    elif req.auth_type == "local_endpoint" and req.endpoint_url:
-        cred_data["endpoint_url"] = req.endpoint_url
-        if req.api_key:
-            cred_data["api_key"] = req.api_key
-
-    sub = subscription_store.add_subscription(
-        layer=layer,
-        provider=req.provider,
-        auth_type=req.auth_type,
-        owner_sub=user.sub,
-        use_personal=True if req.use_personal is None else req.use_personal,
-        # Only admins may contribute a personal account to the shared platform
-        # pool — and for an admin it DEFAULTS ON (so agent-scoped tasks work
-        # without the admin knowing to tick it); they can untick to opt out.
-        contribute_platform=(user.role == "admin") and (
-            True if req.contribute_platform is None else bool(req.contribute_platform)
-        ),
-        label=req.label,
-        credential_data=cred_data,
-    )
+    try:
+        sub = subscription_store.add_subscription(
+            layer=layer,
+            provider=provider,
+            auth_type="api_key",
+            owner_sub=user.sub,
+            use_personal=True if req.use_personal is None else req.use_personal,
+            # Only admins may contribute a personal account to the shared platform
+            # pool — and for an admin it DEFAULTS ON (so agent-scoped tasks work
+            # without the admin knowing to tick it); they can untick to opt out.
+            contribute_platform=(user.role == "admin") and (
+                True if req.contribute_platform is None else bool(req.contribute_platform)
+            ),
+            label=req.label,
+            credential_data={"api_key": api_key},
+        )
+    except subscription_store.SubscriptionExists:
+        raise HTTPException(409, "You already have an API key on this engine")
     subscription_pool.schedule_rebind("user subscription add")
     return sub
 

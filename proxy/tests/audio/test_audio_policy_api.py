@@ -62,7 +62,7 @@ def test_turn_classifier_active_from_direct_llm(client):
     assert client.get("/v1/admin/audio/turn-classifier").json() == {"active": False}
 
     # Add a Groq key to the Direct LLM layer → the classifier becomes active.
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subscription_store.add_subscription(
         layer="direct-llm", provider="groq", auth_type="api_key",
         owner_sub="", contribute_platform=True,

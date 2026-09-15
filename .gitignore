@@ -17,6 +17,8 @@ agents/
 !proxy/api/agents/
 # …and tests/agents/ is the agent-features test bucket, not runtime data:
 !proxy/tests/agents/
+# …and storage/agents/ is the agent-domain storage sub-package:
+!proxy/storage/agents/
 
 # ── Python ──
 __pycache__/
@@ -107,3 +109,8 @@ media-cache/
 *.log.*
 # tsc -b incremental state (subagent/type-check runs)
 *.tsbuildinfo
+
+# Wake-word engine bundle: compressed siblings are generated at build/deploy
+# time if ever, never committed (the bundle itself is committed).
+proxy/assets/kws/**/*.br
+proxy/assets/kws/**/*.gz

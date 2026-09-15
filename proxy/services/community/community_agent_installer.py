@@ -3,7 +3,7 @@
 End-to-end flow for installing a community-agents template (or a bundled
 template like PA-lite):
 
-1. Parse + validate template via :mod:`storage.community_agent_template_store`.
+1. Parse + validate template via :mod:`storage.agents.community_agent_template_store`.
 2. Pre-flight: every required MCP must exist either in the platform's local
    MCP registry OR in the community MCPs catalog. Hard-error otherwise.
 3. Resolve slug collision (return 409 with ``suggested_slug`` for caller).
@@ -44,7 +44,7 @@ from pathlib import Path
 import config
 from fastapi import HTTPException
 
-from storage.community_agent_template_store import (
+from storage.agents.community_agent_template_store import (
     CommunityAgentTemplate,
     TemplateValidationError,
     load_template_from_dict,
@@ -164,7 +164,7 @@ async def install_from_extracted_template(
         ``HTTPException(409)`` — slug collision; response body carries
             ``suggested_slug`` so the caller can retry.
     """
-    from storage import agent_store
+    from storage.agents import agent_store
 
     # Pre-flight: every required MCP + skill package must be resolvable.
     await _preflight_check_mcps(template.mcps)
@@ -496,7 +496,7 @@ async def _cascade_skill_packages(
     install — the agent works, minus that package.
     '''
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     ready: list[str] = []
     failed: list[dict] = []
@@ -512,7 +512,7 @@ async def _cascade_skill_packages(
                             "error": "not installed and no requester identity",
                         })
                         continue
-                    from storage import mcp_request_store
+                    from storage.mcp import mcp_request_store
                     row = await asyncio.to_thread(
                         mcp_request_store.create_request,
                         req.name, target_slug, installer_user_sub,
@@ -547,7 +547,7 @@ async def _cascade_skill_packages(
 
 def _propose_free_slug(base: str) -> str:
     """Return the first ``base-N`` slug that doesn't collide."""
-    from storage import agent_store
+    from storage.agents import agent_store
     n = 2
     while True:
         candidate = f"{base}-{n}"
@@ -767,7 +767,8 @@ async def _cascade_required_mcps(
     Returns ``{"created_requests": [...], "ready_mcps": [...]}``.
     """
     from services.mcp import mcp_registry
-    from storage import mcp_store, mcp_request_store
+    from storage.mcp import mcp_store
+    from storage.mcp import mcp_request_store
 
     created_requests: list[dict] = []
     ready_mcps: list[str] = []
@@ -884,7 +885,7 @@ async def _admin_inline_install(
     Returns the terminal row.
     """
     from services.community import community_installer
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
 
     row = await asyncio.to_thread(
         mcp_request_store.create_request,
@@ -906,7 +907,7 @@ async def _admin_inline_install(
 async def _seed_skills_for_mcp(agent_slug: str, mcp_name: str, skills: list[str]) -> None:
     """Seed per-skill rows for an MCP. Empty ``skills`` list = all default-on."""
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     manifest = await asyncio.to_thread(mcp_registry.get_manifest, mcp_name)
     if not manifest:
@@ -1090,7 +1091,7 @@ def _seed_trigger_with_paired_task(
     template's cleanup hook can wipe them together.
     """
     from storage import database as db
-    from storage import trigger_store
+    from storage.automation import trigger_store
     import psycopg
 
     # Stable IDs derived from template + agent (+ user for user-scope) so
@@ -1152,7 +1153,7 @@ def _seed_notifications(
     Later joiners pick up their user-scope notifications via
     :func:`on_user_added_to_agent`.
     """
-    from storage import notification_store
+    from storage.automation import notification_store
     import psycopg
 
     count = 0
@@ -1201,7 +1202,7 @@ def _seed_notifs_for_user(
     skip if the row already exists. (Tasks + triggers raise on PK conflict,
     so they don't need the pre-check.)
     """
-    from storage import notification_store
+    from storage.automation import notification_store
 
     count = 0
     for item in template.notifications:
@@ -1255,7 +1256,7 @@ def seed_user_setup_file(agent_slug: str, user_sub: str) -> int:
     by dropping ``config/user-setup.md``. Returns 1 when a copy was seeded.
     '''
     from storage import database as user_db
-    from storage import file_tombstones_store
+    from storage.files import file_tombstones_store
 
     username = user_db.get_username_by_sub(user_sub) or ""
     if not username:
@@ -1304,7 +1305,7 @@ def on_user_added_to_agent(
     when the template column is empty (e.g. an agent created directly via
     the API/admin rather than from a community template).
     """
-    from storage import agent_store
+    from storage.agents import agent_store
 
     # user-setup seeding runs BEFORE the community-template guard: it keys on
     # the canonical file's presence, not on template data, so manually

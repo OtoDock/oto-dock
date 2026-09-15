@@ -15,7 +15,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from storage import api_key_store
+from storage.identity import api_key_store
 from services.infra import api_key_manager
 from auth.providers import (
     UserContext,

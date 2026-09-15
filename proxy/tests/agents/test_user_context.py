@@ -19,7 +19,7 @@ def ctx_app(tmp_path, monkeypatch):
     from api.agents._router import router
     from auth.providers import UserContext, get_current_user
     from core.session import visibility
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
 
     agents_dir = tmp_path / "agents"

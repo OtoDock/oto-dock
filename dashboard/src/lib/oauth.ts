@@ -16,6 +16,12 @@ import { Capacitor } from '@capacitor/core'
 type DeepLinkResolver = (url: string) => void
 let pendingDeepLink: DeepLinkResolver | null = null
 
+/** True while a deep-link callback is awaited — a page reload in that
+ * window would drop the link silently (the resolver lives in memory). */
+export function deepLinkPending(): boolean {
+  return pendingDeepLink !== null
+}
+
 /** Called from Android native via evaluateJavascript when an otodock://oauth/* deep link fires. */
 ;(window as any)._handleDeepLink = (url: string) => {
   if (pendingDeepLink) {

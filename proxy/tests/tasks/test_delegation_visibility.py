@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.delegation import lane_status
-from storage import agent_store, mcp_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 
 

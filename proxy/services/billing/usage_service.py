@@ -128,8 +128,14 @@ def check_user_limit(user_sub: str, user_role: str) -> dict:
     Returns {
         allowed: bool,
         warning: bool,
-        periods: {monthly: {...}|None, weekly: {...}|None}
+        periods: {monthly: {...}|None, weekly: {...}|None,
+                  self: {monthly: {...}|None, weekly: {...}|None}}
     }
+
+    ``periods.self`` is the user's OWN dollar cap (``limit_type='user_self'``,
+    set by the user, no role fallback) over the spend of their own API keys
+    (``basis='self_api_key'``): their own money, gated at their own request.
+    Same thresholds; any period of either budget blocks.
 
     Future per-provider sub-limit hook: `usage_limits.limit_type` is TEXT
     so a future `'provider'` row needs no migration. Wiring would add a
@@ -137,27 +143,38 @@ def check_user_limit(user_sub: str, user_role: str) -> dict:
     `get_usage_aggregated(..., provider=<p>)`, and ANDs the result into
     `allowed`/`warning`. No surface area is exposed yet.
     """
-    result = {"allowed": True, "warning": False, "periods": {"monthly": None, "weekly": None}}
+    result = {"allowed": True, "warning": False,
+              "periods": {"monthly": None, "weekly": None,
+                          "self": {"monthly": None, "weekly": None}}}
 
-    for period, range_fn in [("monthly", _monthly_range), ("weekly", _weekly_range)]:
-        limit = _resolve_limit("user_override", user_sub, "role_default", user_role, period)
-        if limit is None:
-            continue
-        start, end = range_fn()
-        # User/role limits are a PLATFORM-AUTH budget: gate only usage paid by
-        # borrowed platform credentials. A user on their own subscription has
-        # platform=0 here, so they're never blocked (their provider enforces
-        # their own limits). See storage/database.py basis= classification.
-        agg = task_store.get_usage_aggregated(
-            user_sub=user_sub, scope="user", start=start, end=end, basis="platform",
-        )
-        used = agg["total_cost"]
-        period_info = _check_period(used, limit, start, end)
-        result["periods"][period] = period_info
+    def _apply(period_info: dict | None) -> None:
         if period_info and period_info["percent"] >= 100:
             result["allowed"] = False
         if period_info and period_info["percent"] >= 80:
             result["warning"] = True
+
+    for period, range_fn in [("monthly", _monthly_range), ("weekly", _weekly_range)]:
+        start, end = range_fn()
+        limit = _resolve_limit("user_override", user_sub, "role_default", user_role, period)
+        if limit is not None:
+            # User/role limits are a PLATFORM-AUTH budget: gate only usage paid by
+            # borrowed platform credentials. A user on their own subscription has
+            # platform=0 here, so they're never blocked (their provider enforces
+            # their own limits). See storage/database.py basis= classification.
+            agg = task_store.get_usage_aggregated(
+                user_sub=user_sub, scope="user", start=start, end=end, basis="platform",
+            )
+            period_info = _check_period(agg["total_cost"], limit, start, end)
+            result["periods"][period] = period_info
+            _apply(period_info)
+        own_limit = _resolve_limit("user_self", user_sub, None, None, period)
+        if own_limit is not None:
+            agg = task_store.get_usage_aggregated(
+                user_sub=user_sub, scope="user", start=start, end=end, basis="self_api_key",
+            )
+            period_info = _check_period(agg["total_cost"], own_limit, start, end)
+            result["periods"]["self"][period] = period_info
+            _apply(period_info)
 
     return result
 
@@ -193,6 +210,8 @@ def get_user_summary(user_sub: str, user_role: str, days: int = 30) -> dict:
     Each period reports the PLATFORM-paid spend as ``used`` (what the limit gates),
     plus ``self_used`` (the user's own-subscription estimate, reference only) and
     ``total_used`` (grand total). The limit bar tracks ``used`` / platform.
+    ``self_limits`` is the user's own API-key budget per period (``used`` =
+    own-key spend, ``limit`` = their ``user_self`` cap or None).
     """
     def _period(period: str, start: str, end: str) -> dict:
         platform = task_store.get_usage_aggregated(
@@ -213,11 +232,24 @@ def get_user_summary(user_sub: str, user_role: str, days: int = 30) -> dict:
         info["total_used"] = round(total, 4)
         return info
 
+    def _self_period(period: str, start: str, end: str) -> dict:
+        used = task_store.get_usage_aggregated(
+            user_sub=user_sub, scope="user", start=start, end=end, basis="self_api_key",
+        )["total_cost"]
+        limit = _resolve_limit("user_self", user_sub, None, None, period)
+        if limit is not None:
+            return _check_period(used, limit, start, end)
+        return {"limit": None, "used": round(used, 4), "percent": 0, "start": start, "end": end}
+
     m_start, m_end = _monthly_range()
     w_start, w_end = _weekly_range()
     return {
         "monthly": _period("monthly", m_start, m_end),
         "weekly": _period("weekly", w_start, w_end),
+        "self_limits": {
+            "monthly": _self_period("monthly", m_start, m_end),
+            "weekly": _self_period("weekly", w_start, w_end),
+        },
         "daily_chart": task_store.get_usage_daily(user_sub=user_sub, scope="user", days=days),
         "agent_breakdown": task_store.get_usage_by_agent(user_sub, m_start, m_end),
     }

@@ -22,6 +22,7 @@ import asyncio
 import pytest
 
 from services.scheduler import scheduler
+from services.scheduler import delivery
 from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
 
@@ -74,8 +75,8 @@ class TestPendingWakeStore:
 class TestFailedDeliveryRecovery:
     def test_failed_delivery_stores_wake(self, temp_db, monkeypatch):
         task_store.create_chat("chat-f", "user-1", "pa")
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _fail)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
 
         asyncio.run(scheduler._do_deliver(
             "sess-f", "pa", "THE WAKE PROMPT", _task(),
@@ -93,8 +94,8 @@ class TestFailedDeliveryRecovery:
         rung 2 can't select, so only the chat-scoped broadcast explains it."""
         from core.session.session_state import _dashboard_notify_queues
         task_store.create_chat("chat-b", "user-1", "pa")
-        monkeypatch.setattr(scheduler, "_deliver_via_persistent", _fail)
-        monkeypatch.setattr(scheduler, "_deliver_via_oneshot", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-bystander"] = q
         try:
@@ -155,7 +156,7 @@ class TestInteractiveRouting:
         return _FakeLayer()
 
     def _stub_env(self, monkeypatch, captured: dict):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("pa", "PA", collaborative=True,
                                  default_scope="user")
         from core.session import session_manager
@@ -180,7 +181,7 @@ class TestInteractiveRouting:
                 "interactive": base_cfg.interactive, "resume": base_cfg.resume,
             })
             return ""
-        monkeypatch.setattr(scheduler, "_rewarm_interactive_and_wake", _fake_rewarm)
+        monkeypatch.setattr(delivery, "_rewarm_interactive_and_wake", _fake_rewarm)
 
         out = asyncio.run(scheduler._deliver_via_oneshot(
             "11111111-2222-3333-4444-555555555555", "pa", "wake!",
@@ -204,7 +205,7 @@ class TestInteractiveRouting:
         async def _fake_echo(layer, session_id, chat_id, agent, result_prompt):
             echo_calls.append(chat_id)
             return ""
-        monkeypatch.setattr(scheduler, "_run_echo_turn_pumped", _fake_echo)
+        monkeypatch.setattr(delivery, "_run_echo_turn_pumped", _fake_echo)
 
         out = asyncio.run(scheduler._deliver_via_oneshot(
             "11111111-2222-3333-4444-555555555555", "pa", "wake!",
@@ -247,7 +248,7 @@ class TestRewarmInteractiveAndWake:
                     raise RuntimeError("spawn failed")
 
         monkeypatch.setattr(interactive_session, "get", lambda sid: isess)
-        monkeypatch.setattr(scheduler, "_WAKE_TURN_OPEN_S", 1.0)
+        monkeypatch.setattr(delivery, "_WAKE_TURN_OPEN_S", 1.0)
 
         async def _fake_close(sid, reason=""):
             closed.append(reason)

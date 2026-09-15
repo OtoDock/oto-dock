@@ -39,6 +39,12 @@ import contextlib
 
 logger = logging.getLogger("claude-proxy")
 
+
+def _record_rate_limit(session_id: str, info: dict) -> None:
+    """A ``rate_limit`` chunk: the account's window state, for the pool."""
+    from services.engines import subscription_windows as _sw
+    _sw.record_claude_event_async(session_id, info)
+
 _PROMPT_FILENAME = "system-prompt.md"
 
 # claude-code#63943: a graceful interrupt mid-thinking can persist an unsigned
@@ -999,6 +1005,10 @@ class PersistentSession:
             # The translator owns all per-turn state; we only observe the
             # raw event to handle the result-boundary book-keeping below.
             for chunk in translator.feed(data):
+                if chunk.event_type == "rate_limit":
+                    # The account's window state: for the pool, never the chat.
+                    _record_rate_limit(self.session_id, chunk.event_data)
+                    continue
                 if chunk_is_content(chunk):
                     gate.note_content()
                 yield chunk

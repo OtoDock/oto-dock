@@ -47,6 +47,21 @@ _SECRET_SUBSTRINGS = (
 # OTO_ENV_KEEP for the occasional false positive (e.g. SSH_KEY pointing to a path).
 _SECRET_SUFFIXES = ("_KEY",)
 
+# Claude Code's OWN session-identity variables. A satellite started from a
+# shell that is itself a Claude Code session (an agent's Bash tool, a
+# developer's `claude` terminal) inherits them, and a CLI spawned with
+# CLAUDE_CODE_CHILD_SESSION=1 treats itself as a nested child: it runs the
+# turn but journals NO session transcript, so the interactive tailer never
+# sees a line (T1, 2026-09-10: hooks fired, the reply rendered, no JSONL
+# anywhere). Never an operator setting — dropped unconditionally, and
+# OTO_ENV_KEEP cannot bring them back. The proxy's env_builder never
+# passed them (prefix allowlist); this deny-list did.
+_NESTED_CLAUDE_SESSION_VARS = frozenset({
+    "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_PID", "CLAUDE_EFFORT",
+    "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
+})
+
 
 def _operator_keep_set() -> set:
     """Operator-extensible allow-back set (empty by default). ``OTO_ENV_KEEP`` is a
@@ -76,6 +91,8 @@ def curate_satellite_env(environ=None) -> dict:
     keep = _operator_keep_set()
     out: dict = {}
     for name, value in src.items():
+        if name.upper() in _NESTED_CLAUDE_SESSION_VARS:
+            continue
         if name.upper() in keep:
             out[name] = value
             continue

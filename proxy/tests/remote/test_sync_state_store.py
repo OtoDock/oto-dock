@@ -1,10 +1,10 @@
-"""Tests for storage/sync_state_store.py — the per-(machine, agent, file) merge base.
+"""Tests for storage/files/sync_state_store.py — the per-(machine, agent, file) merge base.
 
 Run individually (the conftest DB pool exhausts if test files run together):
     proxy/venv/bin/python -m pytest tests/remote/test_sync_state_store.py
 """
 
-from storage import sync_state_store as ss
+from storage.files import sync_state_store as ss
 
 M, A = "machine-1", "agent-x"
 

@@ -255,7 +255,7 @@ class TestProviderSwitchBlockerOnRemote:
             lambda sid: "sub-local",
         )
         monkeypatch.setattr(
-            "storage.subscription_store.get_subscription",
+            "storage.billing.subscription_store.get_subscription",
             lambda sid: {"id": sid, "provider": bound_provider},
         )
         monkeypatch.setattr(

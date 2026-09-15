@@ -20,7 +20,7 @@ from fastapi import HTTPException
 
 from api.meetings.meetings import create_meeting, CreateMeetingRequest
 from auth.providers import UserContext
-from storage import agent_store
+from storage.agents import agent_store
 
 
 def _user(role_map: dict[str, str], sub: str = "u-1") -> UserContext:

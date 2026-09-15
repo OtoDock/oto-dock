@@ -13,7 +13,7 @@ def test_viewer_forced_to_local_when_agent_has_remote_target(temp_db):
     test_viewer_own_override_is_honored)."""
     from storage.remote_store import resolve_execution_target
 
-    with patch("storage.agent_store.get_agent",
+    with patch("storage.agents.agent_store.get_agent",
                return_value={"execution_target": "machine-admin"}), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
         target, reason = resolve_execution_target(
@@ -27,7 +27,7 @@ def test_manager_uses_agent_remote_target_when_online(temp_db):
     """Manager on agent with remote target — no fallback when online."""
     from storage.remote_store import resolve_execution_target
 
-    with patch("storage.agent_store.get_agent",
+    with patch("storage.agents.agent_store.get_agent",
                return_value={"execution_target": "machine-admin"}), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
         target, reason = resolve_execution_target(
@@ -55,11 +55,12 @@ def test_viewer_own_override_is_honored(temp_db):
 def test_agent_default_offline_hard_fail(temp_db):
     """Agent-default target offline, fallback-agent-default=false (default) →
     sentinel that warmup detects and rejects."""
-    from storage import remote_store, database as db
+    from storage import remote_store
+    from storage import database as db
 
     db.set_platform_setting("remote_fallback_agent_default", "0")
 
-    with patch("storage.agent_store.get_agent",
+    with patch("storage.agents.agent_store.get_agent",
                return_value={"execution_target": "machine-admin"}), \
          patch("services.remote.remote_status.is_reachable", return_value=False):
         target, reason = remote_store.resolve_execution_target(
@@ -71,11 +72,12 @@ def test_agent_default_offline_hard_fail(temp_db):
 
 def test_agent_default_offline_fallback_to_local(temp_db):
     """Same scenario but with remote_fallback_agent_default=true."""
-    from storage import remote_store, database as db
+    from storage import remote_store
+    from storage import database as db
 
     db.set_platform_setting("remote_fallback_agent_default", "1")
 
-    with patch("storage.agent_store.get_agent",
+    with patch("storage.agents.agent_store.get_agent",
                return_value={"execution_target": "machine-admin"}), \
          patch("services.remote.remote_status.is_reachable", return_value=False):
         target, reason = remote_store.resolve_execution_target(
@@ -94,7 +96,7 @@ def test_user_override_offline_soft_fallback_to_agent_default(temp_db):
     reachable_map = {"machine-mine": False, "machine-admin": True}
     with patch.object(remote_store, "get_user_remote_target",
                       return_value={"machine_id": "machine-mine"}), \
-         patch("storage.agent_store.get_agent",
+         patch("storage.agents.agent_store.get_agent",
                return_value={"execution_target": "machine-admin"}), \
          patch("services.remote.remote_status.is_reachable",
                side_effect=lambda mid: reachable_map.get(mid, False)):
@@ -107,7 +109,8 @@ def test_user_override_offline_soft_fallback_to_agent_default(temp_db):
 
 def test_user_override_offline_hard_fail_when_fallback_disabled(temp_db):
     """User's machine offline and fallback disabled → sentinel."""
-    from storage import remote_store, database as db
+    from storage import remote_store
+    from storage import database as db
 
     db.set_platform_setting("remote_fallback_user_override", "0")
     with patch.object(remote_store, "get_user_remote_target",

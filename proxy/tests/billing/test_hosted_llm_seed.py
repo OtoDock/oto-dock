@@ -9,7 +9,7 @@ DB-backed via the autouse ``temp_db`` fixture.
 from __future__ import annotations
 
 from storage import database as db
-from storage import subscription_store as ss
+from storage.billing import subscription_store as ss
 
 
 def _relay_providers() -> set[str]:

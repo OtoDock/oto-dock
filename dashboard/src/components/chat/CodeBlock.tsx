@@ -1,6 +1,29 @@
-import { useState, useCallback } from 'react'
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { lazy, Suspense, useState, useCallback, type CSSProperties } from 'react'
+
+// The highlighter (react-syntax-highlighter with every Prism grammar) loads
+// on the first fenced block a chat renders; a chat without code never loads
+// it. The fallback paints the same box the highlighter does, so the swap
+// changes colours, never layout.
+const CodeHighlighter = lazy(() => import('./CodeHighlighter'))
+
+// Shared by the highlighter (its customStyle) and the fallback <pre>.
+export const CODE_BODY_STYLE: CSSProperties = {
+  margin: 0,
+  borderRadius: 0,
+  padding: '1rem',
+  fontSize: '0.8125rem',
+  lineHeight: '1.5',
+}
+
+// vscDarkPlus's <pre>: background, text colour, mono stack, scrolling.
+const FALLBACK_STYLE: CSSProperties = {
+  ...CODE_BODY_STYLE,
+  background: '#1e1e1e',
+  color: '#d4d4d4',
+  fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", "Courier New", monospace',
+  whiteSpace: 'pre',
+  overflow: 'auto',
+}
 
 interface Props {
   language?: string
@@ -53,22 +76,10 @@ export default function CodeBlock({ language, children, inline }: Props) {
           )}
         </button>
       </div>
-      {/* Code content */}
-      <SyntaxHighlighter
-        language={language || 'text'}
-        style={vscDarkPlus}
-        customStyle={{
-          margin: 0,
-          borderRadius: 0,
-          padding: '1rem',
-          fontSize: '0.8125rem',
-          lineHeight: '1.5',
-        }}
-        showLineNumbers={false}
-        wrapLongLines={false}
-      >
-        {children}
-      </SyntaxHighlighter>
+      {/* Code content: plain text at once, colours when the highlighter lands */}
+      <Suspense fallback={<pre style={FALLBACK_STYLE}><code>{children}</code></pre>}>
+        <CodeHighlighter language={language || 'text'}>{children}</CodeHighlighter>
+      </Suspense>
     </div>
   )
 }

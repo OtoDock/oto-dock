@@ -251,6 +251,11 @@ class InteractiveSession:
     _cold_flush_seed = ""
     _cold_flush_attempts = 0
     _cold_flush_watcher: Optional[asyncio.TimerHandle] = None
+    # Monotonic stamp of the latest cold Enter (see _check_cold_flush).
+    _cold_flush_enter_at = 0.0
+    # The hook-driven park already pinged the open dialog (see
+    # park_on_native_dialog) — the transcript fold must not ping it again.
+    _native_park_pinged = False
 
     def __init__(
         self,
@@ -552,6 +557,7 @@ class InteractiveSession:
             self._cold_flush_pending = buf
             self._cold_flush_seed = self._pending_seed_digest
             self._cold_flush_attempts = 0
+            self._cold_flush_enter_at = 0.0  # stamped by the first Enter
             # Cold flush: send Enter only after the TUI's echo settles (the input
             # box has just rendered — a fixed short delay can miss it).
             self._emit_to_pty(buf, deferred_submit=True)
@@ -1034,19 +1040,49 @@ class InteractiveSession:
     def _arm_cold_flush_watch(self) -> None:
         if self._cold_flush_watcher is not None:
             self._cold_flush_watcher.cancel()
+        # The reference is the FIRST Enter of this flush: a retry or the
+        # Windows backstop Enter must not move it past a hook stamp that
+        # already proved the first Enter was accepted.
+        if self._cold_flush_enter_at <= 0:
+            self._cold_flush_enter_at = time.monotonic()
         self._cold_flush_watcher = self._loop.call_later(
             _COLD_RETRY_S, self._check_cold_flush,
         )
+
+    def _cold_flush_confirmed_by_hooks(self) -> bool:
+        """True when a hook of THIS session fired after the cold Enter — the
+        CLI is running a turn, so the prompt was accepted even if the
+        transcript has not shown the user line (yet, or at all)."""
+        if self._cold_flush_enter_at <= 0:
+            return False
+        from core.session.session_state import get_hook_activity
+        return get_hook_activity(self.session_id) >= self._cold_flush_enter_at
 
     def _check_cold_flush(self) -> None:
         """The cold Enter fired _COLD_RETRY_S ago. If the transcript never
         confirmed the turn (journaled user line → ``_turn_open``), the flush was
         swallowed by a still-booting composer — replay it. Bounded; stands down
         the moment the turn opens (:meth:`_set_turn_open`) or the user starts
-        driving (``write_input`` clears the pending flush on real input)."""
+        driving (``write_input`` clears the pending flush on real input).
+
+        A second confirmation source: hook activity. A PreToolUse / Stop /
+        SubagentStop hook stamped after the Enter proves the turn is running,
+        so the flush is done even when no transcript line has arrived — a
+        late satellite forward, or no transcript at all (a CLI that inherited
+        ``CLAUDE_CODE_CHILD_SESSION`` journals nothing). Re-emitting there
+        pasted the prompt into the open question dialog and answered it with
+        the Enter, then left a false undelivered-input breadcrumb (T1,
+        2026-09-10)."""
         self._cold_flush_watcher = None
         if (not self._cold_flush_pending or self._turn_open
                 or not self.alive or self._closing or self._closed):
+            return
+        if self._cold_flush_confirmed_by_hooks():
+            logger.info(
+                "interactive %s: cold first prompt confirmed by hook activity "
+                "— retry stands down", self.session_id[:8],
+            )
+            self._clear_cold_flush()
             return
         if self._cold_flush_attempts >= _COLD_RETRY_MAX:
             logger.warning(
@@ -1078,6 +1114,7 @@ class InteractiveSession:
     def _clear_cold_flush(self) -> None:
         self._cold_flush_pending = b""
         self._cold_flush_seed = ""
+        self._cold_flush_enter_at = 0.0
         if self._cold_flush_watcher is not None:
             self._cold_flush_watcher.cancel()
             self._cold_flush_watcher = None
@@ -1179,6 +1216,46 @@ class InteractiveSession:
                 # turn never stamps last_response_at / lights the unread dot.
                 self._turn_end_effects()
 
+    def park_on_native_dialog(self, tool_name: str) -> None:
+        """The permission hook saw the CLI open a dialog that blocks the turn
+        on the human — the AskUserQuestion cards (hook ``allow``), the
+        ExitPlanMode approval (hook ``defer``) or Codex's request_user_input
+        picker. Park the turn NOW: close it (live dot / Stop button clear,
+        ``last_response_at`` stamped), hold composer sends and injections
+        (``_question_parked``) and fire the "needs your input" ping. The
+        transcript fold (``question_pending``) does the same once the CLI
+        journals the ``tool_use`` line — but Claude writes that line late in
+        some runs (T1, 2.1.263, 2026-09-10: two of three plan approvals
+        journaled while the dialog was open, one only with the answer; the
+        operator's live question journaled NOTHING of the reply until the
+        answer), and then the chat sat live for the whole dialog. The hook
+        call is deterministic and precedes the dialog, so it is the primary
+        trigger; the fold stays as the fallback and ``_native_park_pinged``
+        keeps it from pinging the same dialog twice. The chat rows stay the
+        tailers' job: while the CLI holds its reply the history shows the
+        prompt only, and the whole turn lands in order with the answer (a
+        hook-written card was tried and dropped — it could not be answered
+        from the history and the late-arriving text rendered below it).
+        Loop thread (called from the hook handler)."""
+        if self._closed or not self.chat_id:
+            return
+        logger.info("interactive %s: parked on the native %s dialog",
+                    self.session_id[:8], tool_name)
+        self._question_parked = True
+        if self._turn_open:
+            self._set_turn_open(False)
+        else:
+            # The transcript never opened this turn (late user line): the
+            # close-side effects must still run so the dot clears.
+            self._turn_end_effects()
+        # The flag dedupes the transcript fold, never a hook park: a dialog
+        # chained on the previous one (a follow-up question, a plan approval
+        # after a question) parks before any tail consumed the flag, and
+        # each of them is a fresh wait on the human.
+        self._native_park_pinged = False
+        self._maybe_fire_turn_complete("", persisted=1, question=True)
+        self._native_park_pinged = True
+
     def _chat_owner(self) -> str:
         """The chat ROW's owner sub (synthetic ``agent::<slug>`` for shared-only
         agents) — the identity the chat_status fan-out keys on. Lazy, cached."""
@@ -1202,6 +1279,7 @@ class InteractiveSession:
         self._turn_open = is_open
         if is_open:
             self._question_parked = False  # any open unparks (answer/inject)
+            self._native_park_pinged = False
             self._clear_cold_flush()  # prompt confirmed — retry stands down
         if is_open == was or not self.chat_id or self.chat_id.startswith("meeting-"):
             return
@@ -1817,9 +1895,14 @@ class InteractiveSession:
         hold both until the FINAL turn.
 
         ``question=True``: the "turn end" is really the CLI parked on an
-        unanswered AskUserQuestion — (2) words the ping as needs-input and (3)
-        is skipped (a question is not a task completion; hooks deny the tool
-        for autonomous tasks anyway, this is defense in depth)."""
+        unanswered AskUserQuestion / ExitPlanMode — (2) words the ping as
+        needs-input and (3) is skipped (a question is not a task completion;
+        hooks deny the tool for autonomous tasks anyway, this is defense in
+        depth). A transcript fold for a dialog the hook-driven park
+        (:meth:`park_on_native_dialog`) already pinged is a no-op."""
+        if question and self._native_park_pinged:
+            self._native_park_pinged = False
+            return
         # (1) one-time chat-title upgrade — the fallback fire for first turns
         # the early triggers (batch thresholds / timer) never reached.
         if self._title_armed and self.chat_id:

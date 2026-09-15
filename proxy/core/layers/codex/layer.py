@@ -40,7 +40,7 @@ logger = logging.getLogger("codex-layer")
 
 # The event translator now lives in translator.py; re-exported here so
 # `from core.layers.codex.layer import CodexEventTranslator` keeps working
-# (remote_execution + the codex tests import it from this module).
+# (remote_session_info, remote_session_start + the codex tests import it from this module).
 from core.layers.codex.translator import CodexEventTranslator  # noqa: F401
 
 
@@ -126,7 +126,7 @@ def _inject_fetch_tokens_toml(
 
     Section-aware + append-only — every stdio MCP already has an ``env`` block
     (the OTO_* set is injected at config build), so the bundle MCPs always have
-    one to extend. Mirrors ``remote_execution._rewrite_mcp_toml_for_remote``'s
+    one to extend. Mirrors ``remote_mcp_rewrite._rewrite_mcp_toml_for_remote``'s
     env branch; the token's presence then triggers the interceptor wrap.
     """
     from core.credentials import mcp_broker

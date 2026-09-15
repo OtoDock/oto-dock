@@ -111,7 +111,7 @@ def _build_session_parts(agent: str, row: dict):
     from core.session.visibility import resolve_visibility
     from services import path_roles
     from services.mcp import mcp_registry
-    from storage import agent_store
+    from storage.agents import agent_store
 
     scope = "user" if row.get("username") else "agent"
     identity = resolve_task_identity(agent, scope, row.get("owner_sub") or None)

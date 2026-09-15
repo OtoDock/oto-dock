@@ -12,9 +12,13 @@ interface Props {
   onImplementCodex?: (mode: string) => void
   onSendMessage?: (text: string) => void
   onPlanFetched?: (filename: string, content: string) => void
+  // A live interactive terminal owns the approval: the TUI shows its own
+  // "proceed?" dialog, so the card carries no Implement / Edit / Reject
+  // buttons (a card send would only be held until the parked turn ends).
+  readOnly?: boolean
 }
 
-export default function PlanView({ action, toolInput, superseded, onImplement, onImplementCodex, onSendMessage, onPlanFetched }: Props) {
+export default function PlanView({ action, toolInput, superseded, onImplement, onImplementCodex, onSendMessage, onPlanFetched, readOnly }: Props) {
   const [collapsed, setCollapsed] = useState(false)
 
   // ExitPlanMode tool_input has: planFilePath, plan (content), allowedPrompts
@@ -45,7 +49,7 @@ export default function PlanView({ action, toolInput, superseded, onImplement, o
   // Exit — show plan content + action buttons
   const displayName = planFilename || 'Plan'
   // A superseded card (a later plan turn replaced it) is inert — content only.
-  const showActions = !superseded && (planFilename || isCodexPlan)
+  const showActions = !superseded && !readOnly && (planFilename || isCodexPlan)
 
   return (
     <div className="my-2 rounded-lg border border-brand/20 bg-brand-50 overflow-hidden">
@@ -76,6 +80,15 @@ export default function PlanView({ action, toolInput, superseded, onImplement, o
             <div className="px-4 py-3 border-t border-brand/20 text-sm text-brand/60">
               No plan content available
             </div>
+          )}
+
+          {readOnly && !superseded && (
+            <p
+              data-testid="plan-readonly"
+              className="px-4 py-2 border-t border-brand/20 text-xs text-gray-500 dark:text-gray-400"
+            >
+              Approve or reject in the terminal. The agent is waiting there.
+            </p>
           )}
 
           {/* Action buttons */}

@@ -62,6 +62,11 @@ export interface McpServer {
   // 'skill' = standalone skill package (runtime none) — listed on the admin
   // Skills page, filtered out of the MCP Servers page.
   category: 'core' | 'custom' | 'community' | 'skill'
+  // Who wrote the server code the MCP wraps and where it lives (community
+  // manifests); empty on bundled MCPs. `icon`: the install dir ships icon.png.
+  author?: string
+  author_url?: string
+  icon?: boolean
   runtime: 'python' | 'node' | 'docker'
   transport: 'stdio' | 'sse'
   source: string
@@ -540,6 +545,10 @@ export interface AgentMcp {
   label: string
   description: string
   category: string
+  author?: string
+  author_url?: string
+  /** The install dir ships an icon.png. */
+  icon?: boolean
   assignment_mode: 'auto' | 'explicit'
   credential_type: string
   /** Manifest declares a service account — the binding dropdown only

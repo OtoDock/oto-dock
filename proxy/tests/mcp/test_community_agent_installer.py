@@ -109,7 +109,7 @@ def _install_admin(template_dir: Path, target_slug: str = "demo-agent",
     # ``install_from_catalog`` (which fetches the tarball first); this helper
     # skips the fetch since the test owns the dir.
     from services.community.community_agent_installer import install_from_extracted_template
-    from storage.community_agent_template_store import load_template_from_dir
+    from storage.agents.community_agent_template_store import load_template_from_dir
     template = load_template_from_dir(template_dir)
     return asyncio.run(install_from_extracted_template(
         template=template, target_slug=target_slug,
@@ -124,7 +124,7 @@ def _install_admin(template_dir: Path, target_slug: str = "demo-agent",
 
 class TestTemplateLoading:
     def test_minimal_valid_template(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import load_template_from_dir
+        from storage.agents.community_agent_template_store import load_template_from_dir
         tdir = _write_template(tmp_path)
         template = load_template_from_dir(tdir)
         assert template.slug == "demo-template"
@@ -134,7 +134,7 @@ class TestTemplateLoading:
         assert template.context_files == {}
 
     def test_missing_agent_json_raises(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = tmp_path / "bad"
@@ -146,7 +146,7 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_invalid_slug_in_agent_json(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = tmp_path / "demo"
@@ -161,7 +161,7 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_invalid_cron_in_tasks(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = _write_template(tmp_path, tasks=[{
@@ -173,7 +173,7 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_valid_task_with_cron_schedule(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import load_template_from_dir
+        from storage.agents.community_agent_template_store import load_template_from_dir
         tdir = _write_template(tmp_path, tasks=[{
             "slug": "good-task", "description": "Test",
             "scope": "user", "prompt": "echo",
@@ -185,14 +185,14 @@ class TestTemplateLoading:
         assert template.tasks[0].cron == "0 9 * * *"
 
     def test_setup_md_parsed_when_present(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import load_template_from_dir
+        from storage.agents.community_agent_template_store import load_template_from_dir
         tdir = _write_template(tmp_path, setup_md="## Setup steps\n1. Do X\n")
         template = load_template_from_dir(tdir)
         assert template.setup_md is not None
         assert "Setup steps" in template.setup_md
 
     def test_context_collected(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import load_template_from_dir
+        from storage.agents.community_agent_template_store import load_template_from_dir
         tdir = _write_template(tmp_path, context_files={
             "methodology.md": "## Methodology", "glossary.txt": "terms",
         })
@@ -224,7 +224,7 @@ class TestPreflight:
 
     def test_mcp_in_catalog_passes_preflight(self, tmp_path, temp_db):
         from services.community.community_agent_installer import _preflight_check_mcps
-        from storage.community_agent_template_store import McpRequirement
+        from storage.agents.community_agent_template_store import McpRequirement
 
         with patch(
             "services.community.community_catalog.fetch_registry",
@@ -244,20 +244,20 @@ class TestPreflight:
 class TestSlugCollision:
     def test_propose_free_slug_appends_2(self, temp_db):
         from services.community.community_agent_installer import _propose_free_slug
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("foo", "Foo")
         assert _propose_free_slug("foo") == "foo-2"
 
     def test_propose_free_slug_skips_existing_suffix(self, temp_db):
         from services.community.community_agent_installer import _propose_free_slug
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("foo", "Foo")
         agent_store.create_agent("foo-2", "Foo Two")
         assert _propose_free_slug("foo") == "foo-3"
 
     def test_install_collision_returns_409_with_suggestion(self, tmp_path, temp_db):
         from fastapi import HTTPException
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("demo-agent", "Existing")
         tdir = _write_template(tmp_path)
         with pytest.raises(HTTPException) as exc:
@@ -288,7 +288,7 @@ class _StubAutoManifest:
 class TestAdminCascade:
     def test_admin_install_with_only_auto_installed_mcps(self, tmp_path, temp_db):
         """Auto-mode MCP already installed → just enable, no requests created."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         tdir = _write_template(tmp_path, mcps=[{"name": "auto-mcp"}])
         with patch(
@@ -320,7 +320,7 @@ class TestAdminCascade:
 
 class TestManagerCascade:
     def test_manager_install_with_missing_mcp_creates_request(self, tmp_path, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         tdir = _write_template(tmp_path, mcps=[{"name": "missing-mcp"}])
         with patch(
@@ -354,7 +354,7 @@ class TestManagerCascade:
         assert len(rows) == 1
 
     def test_manager_install_two_missing_mcps_share_one_batch(self, tmp_path, temp_db):
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         tdir = _write_template(tmp_path, mcps=[
             {"name": "first-mcp"}, {"name": "second-mcp"},
@@ -503,7 +503,8 @@ class TestNotificationBatching:
 
 class TestSeededCleanupInvariants:
     def test_delete_agent_removes_seeded_items(self, tmp_path, temp_db):
-        from storage import agent_store, database as db
+        from storage.agents import agent_store
+        from storage import database as db
 
         tdir = _write_template(tmp_path, tasks=[{
             "slug": "smoke-task", "description": "x", "scope": "agent",
@@ -597,7 +598,7 @@ class TestUserJoinHook:
     when a user is attached to a community-template agent after install."""
 
     def test_persists_template_data_at_install_time(self, tmp_path, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_slug = _install_with_user_items(tmp_path)
         data = agent_store.get_community_template_data(agent_slug)
         assert data is not None
@@ -682,7 +683,7 @@ class TestUserJoinHook:
     def test_hook_noop_for_non_community_agent(self, tmp_path, temp_db):
         """Agents not installed from a template have no template_data; hook
         returns empty counts without raising."""
-        from storage import agent_store
+        from storage.agents import agent_store
         from services.community.community_agent_installer import on_user_added_to_agent
 
         agent_store.create_agent("native-agent", "Native Agent")
@@ -719,7 +720,7 @@ class TestUserJoinHook:
         assert counts["tasks"] == 0
 
     def test_install_writes_default_for_new_users_role(self, tmp_path, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_slug = _install_with_user_items(
             tmp_path,
             default_for_new_users={"enabled": True, "role": "viewer"},
@@ -728,7 +729,7 @@ class TestUserJoinHook:
         assert agent["default_for_new_users_role"] == "viewer"
 
     def test_install_default_for_new_users_disabled_keeps_empty(self, tmp_path, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_slug = _install_with_user_items(
             tmp_path,
             default_for_new_users={"enabled": False},
@@ -737,7 +738,7 @@ class TestUserJoinHook:
         assert agent["default_for_new_users_role"] == ""
 
     def test_invalid_default_role_rejected_at_load(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = _write_template(tmp_path, slug="badrole")
@@ -751,7 +752,7 @@ class TestUserJoinHook:
     def test_core_mcps_field_parses_and_validates(self, tmp_path, temp_db):
         """``core_mcps``: absent → "all" (the default install behavior);
         "none" round-trips; anything else is a schema violation."""
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = _write_template(tmp_path, slug="coreopt")
@@ -809,7 +810,7 @@ class TestSkillPackages:
         monkeypatch.setattr(mcp_registry, "get_manifest", _one)
 
     def test_skills_json_validation(self, tmp_path, temp_db):
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             load_template_from_dir, TemplateValidationError,
         )
         tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
@@ -839,7 +840,7 @@ class TestSkillPackages:
         whose package is only in the catalog gets the AGENT plus a queued
         ``kind: "skill"`` request per missing package — not the old
         ``skills_require_admin`` hard-fail."""
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
         tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
         with patch(
             "services.community.community_catalog.fetch_skills_registry",
@@ -865,7 +866,7 @@ class TestSkillPackages:
 
     def test_admin_cascade_installs_assigns_and_seeds(self, tmp_path, temp_db):
         from types import SimpleNamespace
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         tdir = _write_template(
             tmp_path, skills=[{"name": "theme-factory", "skills": ["theme-factory"]}],
         )
@@ -908,7 +909,7 @@ class TestSkillPackages:
 
     def test_skill_install_failure_never_aborts_agent(self, tmp_path, temp_db):
         from fastapi import HTTPException as HX
-        from storage import agent_store
+        from storage.agents import agent_store
         tdir = _write_template(
             tmp_path, slug="resilient", skills=[{"name": "theme-factory"}],
         )
@@ -1028,7 +1029,7 @@ class TestDashboardSeeding:
     def test_validation_mode_and_files(self, tmp_path, temp_db):
         import json as _json
         import pytest as _pytest
-        from storage.community_agent_template_store import (
+        from storage.agents.community_agent_template_store import (
             TemplateValidationError, load_template_from_dir)
         # visibility the template's mode doesn't offer → manifest error.
         tdir = _write_template(

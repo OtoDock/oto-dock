@@ -56,7 +56,7 @@ registered — it's a reference, not a selectable provider.)
 
 ## Heavy / local providers
 
-- Local model imports (ONNX, `silero_vad_lite`, `transformers`) go **inside
+- Local model imports (`onnxruntime`, `transformers`) go **inside
   `__init__`**, never at module top-level — a cloud-only deployment that never
   instantiates a local provider then never pays the import cost.
 - Heavy deps belong in an **optional dependency group** in `pyproject.toml`
@@ -73,8 +73,10 @@ registered — it's a reference, not a selectable provider.)
   `WhisperFeatureExtractor` config at `audio/models/whisper_feature_extractor/`
   (shipped via `pyproject.toml` package-data) and loads it from disk —
   `from_pretrained("openai/whisper-small")` is only a fallback if the vendored
-  asset is missing. Follow the same pattern for any provider whose model/config
-  would otherwise fetch from a hub on first use (vendor it; HF-id as fallback).
+  asset is missing. Silero VAD ships as `audio/models/silero_vad.onnx` the
+  same way. Follow the same pattern for any provider whose model/config
+  would otherwise fetch from a hub on first use (vendor it; HF-id as fallback),
+  and record the file's origin, version and licence in `audio/models/README.md`.
 
 ## Testing (no paid credentials)
 
@@ -83,8 +85,10 @@ registered — it's a reference, not a selectable provider.)
   `stt/tests/test_deepgram.py`, `tts/tests/test_cartesia.py`.
 - Use `ExampleSTT` (or a small fake subclass) as a test double for pipeline-level
   tests — `feed_transcript()` simulates STT output without a network.
-- VAD tests run fully offline (`silero-vad-lite` bundles its model) —
-  `vad/tests/test_silero.py`.
+- VAD tests run fully offline (the model is bundled) —
+  `vad/tests/test_silero.py` and `test_silero_model.py` need `onnxruntime`
+  (the `localmodels` extra) and skip without it; `test_silero_rates.py`
+  fakes the model and runs everywhere.
 - A 5-second public-domain clip at `audio/tests/fixtures/sample.wav` is the
   intended fixture for `transcribe_file` smoke tests against a real key (kept out
   of the default suite). Drop one in when you wire batch transcription.

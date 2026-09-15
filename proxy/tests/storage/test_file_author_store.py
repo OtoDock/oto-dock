@@ -1,10 +1,10 @@
-"""Tests for storage/file_author_store.py — persisted platform last-writer.
+"""Tests for storage/files/file_author_store.py — persisted platform last-writer.
 
 Run individually (the conftest DB pool exhausts if test files run together):
     proxy/venv/bin/python -m pytest tests/storage/test_file_author_store.py
 """
 
-from storage import file_author_store as fa
+from storage.files import file_author_store as fa
 
 A = "agent-x"
 

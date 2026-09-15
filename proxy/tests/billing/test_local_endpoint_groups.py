@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from storage import subscription_store as store_mod
+from storage.billing import subscription_store as store_mod
 
 
 def _row(layer, *, sub_id, provider="openai_compatible", status="active",
@@ -189,20 +189,30 @@ class TestLocalEndpointApi:
             assert ei.value.status_code == 403
 
     def test_delete_removes_every_sibling_unless_busy(self):
+        # Live bindings decide (the stored counter is reconciled first):
+        # every sibling row goes when nothing is live; a live session on
+        # any engine refuses with 409 unless force=true.
         import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
         g = self._group({"direct-llm": "active", "codex-cli": "active"})
+        live = {"codex-cli-id": 0, "direct-llm-id": 0}
         with patch.object(api_mod, "subscription_store") as store, \
-             patch.object(api_mod, "subscription_pool"), \
+             patch.object(api_mod, "subscription_pool") as pool, \
              patch.object(api_mod, "notify_phone_config_changed"):
             store.list_local_endpoint_groups.return_value = [g]
+            pool.reconcile_active_sessions.side_effect = lambda sid: (live[sid], live[sid])
             self._run(api_mod.admin_delete_local_endpoint(g["group"], user=self._admin()))
             deleted = sorted(c.args[0] for c in store.delete_subscription.call_args_list)
             assert deleted == ["codex-cli-id", "direct-llm-id"]
-            g["engines"]["codex-cli"]["active_sessions"] = 2
+            live["codex-cli-id"] = 2
             with pytest.raises(HTTPException) as ei:
                 self._run(api_mod.admin_delete_local_endpoint(g["group"], user=self._admin()))
             assert ei.value.status_code == 409
+            assert "codex-cli (2)" in ei.value.detail
+            store.delete_subscription.reset_mock()
+            self._run(api_mod.admin_delete_local_endpoint(
+                g["group"], force=True, user=self._admin()))
+            assert store.delete_subscription.call_count == 2
 
     def test_bulk_add_targets_every_listed_engine(self):
         import api.admin.execution_layers as api_mod

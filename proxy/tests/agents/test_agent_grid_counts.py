@@ -19,9 +19,9 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from storage import agent_store  # noqa: E402
+from storage.agents import agent_store  # noqa: E402
 from storage import database as task_store  # noqa: E402
-from storage import trigger_store  # noqa: E402
+from storage.automation import trigger_store  # noqa: E402
 
 A = "user-admin"      # seeded by conftest._seed_users
 M = "user-manager"

@@ -26,7 +26,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-from storage import agent_store, remote_store
+from storage.agents import agent_store
+from storage import remote_store
 from storage import database as task_store
 
 _ADMIN = {"username": "ada", "display_name": "Ada", "email": "a@x", "role": "admin"}
@@ -44,7 +45,7 @@ def _mk_user(sub: str, name: str, role: str = "admin") -> str:
 # ---------------------------------------------------------------------------
 
 def test_resolver_answers_local_for_a_direct_llm_agent(temp_db):
-    with patch("storage.agent_store.get_agent", return_value=_DIRECT), \
+    with patch("storage.agents.agent_store.get_agent", return_value=_DIRECT), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
         assert remote_store.resolve_execution_target("pa", None, "manager") == ("local", None)
         assert remote_store.resolve_execution_target("pa", None, "admin") == ("local", None)
@@ -53,7 +54,7 @@ def test_resolver_answers_local_for_a_direct_llm_agent(temp_db):
 def test_resolver_ignores_a_user_override_for_a_direct_llm_agent(temp_db):
     # The user's own paired machine wins for every other layer (viewers
     # included) — not for an engine that cannot run there.
-    with patch("storage.agent_store.get_agent", return_value=_DIRECT), \
+    with patch("storage.agents.agent_store.get_agent", return_value=_DIRECT), \
          patch.object(remote_store, "get_user_remote_target",
                       return_value={"machine_id": "machine-mine"}), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
@@ -62,7 +63,7 @@ def test_resolver_ignores_a_user_override_for_a_direct_llm_agent(temp_db):
 
 def test_resolver_keeps_the_machine_for_a_cli_agent(temp_db):
     # Regression guard: the short-circuit is keyed on the path, nothing else.
-    with patch("storage.agent_store.get_agent", return_value=_CLI), \
+    with patch("storage.agents.agent_store.get_agent", return_value=_CLI), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
         assert remote_store.resolve_execution_target("pa", None, "manager") == ("machine-admin", None)
 

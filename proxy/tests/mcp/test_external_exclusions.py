@@ -137,7 +137,7 @@ class TestPromptSide:
     @pytest.fixture
     def registry(self, monkeypatch, tmp_path):
         from services.mcp import mcp_registry as reg
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         manifests = [
             _manifest("memory-mcp"), _manifest("schedules-mcp"), _manifest("helpdesk", ["external"]),
         ]
@@ -182,7 +182,7 @@ class TestUnavailableTools:
     def test_external_reasons_are_not_listed(self, temp_db):
         import config
         from services.mcp import mcp_registry as reg
-        from storage import agent_store
+        from storage.agents import agent_store
         if not agent_store.agent_exists("ext-prompt"):
             agent_store.create_agent("ext-prompt", "Ext Prompt")
         persona = config.get_agent_dir("ext-prompt") / "config" / "agent.md"

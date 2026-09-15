@@ -26,7 +26,7 @@ import pytest
 
 from core.layers.cli.settle import SettleController
 from core.layers.cli.translator import ClaudeCLIEventTranslator
-from core.remote import remote_execution
+from core.remote import remote_abort
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
 
 
@@ -159,7 +159,7 @@ async def test_soft_abort_requires_live_turn():
 
 @pytest.mark.asyncio
 async def test_watchdog_escalates_when_turn_never_closes(monkeypatch):
-    monkeypatch.setattr(remote_execution, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
+    monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
     layer = _make_layer(soft_supported=True)
     info = _make_info()
     layer._sessions[info.session_id] = info
@@ -191,7 +191,7 @@ async def test_codex_watchdog_escalates_when_turn_never_closes(monkeypatch):
     grace-drop + ack drain), the daemon still isn't flagged dead, and the
     optimistic graceful flag is flipped back so the next turn re-injects the
     cancelled context."""
-    monkeypatch.setattr(remote_execution, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
+    monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
     layer = _make_layer(soft_supported=True)
     info = _make_info(execution_path="codex-cli")
     layer._sessions[info.session_id] = info
@@ -218,7 +218,7 @@ async def test_codex_watchdog_escalates_when_turn_never_closes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_watchdog_stands_down_when_turn_closes(monkeypatch):
-    monkeypatch.setattr(remote_execution, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
+    monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
     layer = _make_layer(soft_supported=True)
     info = _make_info()
     layer._sessions[info.session_id] = info
@@ -234,7 +234,7 @@ async def test_watchdog_stands_down_when_turn_closes(monkeypatch):
 async def test_watchdog_pins_to_the_interrupted_turn(monkeypatch):
     """A successor turn (new command id) must never be killed by a stale
     watchdog even if it is active at the deadline."""
-    monkeypatch.setattr(remote_execution, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
+    monkeypatch.setattr(remote_abort, "_REMOTE_INTERRUPT_WATCHDOG_S", 0.3)
     layer = _make_layer(soft_supported=True)
     info = _make_info()
     layer._sessions[info.session_id] = info
@@ -254,7 +254,7 @@ async def test_watchdog_pins_to_the_interrupted_turn(monkeypatch):
 def _released(monkeypatch) -> list:
     calls: list = []
     monkeypatch.setattr(
-        remote_execution, "resolve_session_permissions",
+        remote_abort, "resolve_session_permissions",
         lambda sid, approved: calls.append((sid, approved)),
     )
     return calls
@@ -282,7 +282,7 @@ async def test_interrupt_for_queued_fires_graceful_only(monkeypatch):
 async def test_interrupt_for_queued_gates_return_false(monkeypatch):
     released_total: list = []
     monkeypatch.setattr(
-        remote_execution, "resolve_session_permissions",
+        remote_abort, "resolve_session_permissions",
         lambda sid, approved: released_total.append(sid),
     )
 

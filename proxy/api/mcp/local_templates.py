@@ -187,7 +187,7 @@ async def _load_snapshot(user: UserContext, raw_path: str):
 
     The caller owns the snapshot dir and must delete it.
     """
-    from storage.community_agent_template_store import (
+    from storage.agents.community_agent_template_store import (
         TemplateValidationError,
         load_template_from_dir,
     )
@@ -223,7 +223,7 @@ async def local_template_building_blocks(
     from services.mcp import mcp_registry
     from services.mcp.mcp_registry import _first_sentence
     from services.community import community_catalog
-    from storage import agent_store
+    from storage.agents import agent_store
 
     mcps: list[dict] = []
     skill_packages: list[dict] = []
@@ -311,7 +311,7 @@ async def validate_local_template(
     """
     u = _require_creator_or_admin(user)
     from services.community import community_agent_installer as installer
-    from storage import agent_store
+    from storage.agents import agent_store
 
     try:
         template, snapshot = await _load_snapshot(u, body.path)

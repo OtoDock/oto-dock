@@ -1732,7 +1732,7 @@ class SessionManager:
     async def sync_mcps(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Install / update / remove MCPs per a batched platform directive.
 
-        Payload shape (built by proxy/core/remote/remote_execution.py):
+        Payload shape (built by proxy/core/remote/remote_start_payload.py):
             {
               command_id: str,
               mcps_to_install: [

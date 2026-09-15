@@ -121,7 +121,7 @@ def expand_session_id(value: str, session_id: str) -> str:
 def derive_username_from_cwd_relative(cwd_relative: str) -> str:
     """Recover the session's username from the proxy-supplied cwd_relative.
 
-    Mirrors the convention in ``proxy/core/remote/remote_execution.py`` where:
+    Mirrors the convention in ``proxy/core/remote/remote_start_payload.py`` where:
       - user-scoped sessions: cwd_relative = "users/{username}"
       - agent-scoped sessions: cwd_relative = "workspace"
 

@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
-from storage import trigger_store
+from storage.automation import trigger_store
 
 from api.agents._common import _get_agent_dir, _get_execution_paths
 from api.agents._router import router
@@ -90,7 +90,7 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
     require_auth(user)
     from core.session.session_manager import get_all_capabilities
     from services.engines import subscription_pool
-    from storage import subscription_store
+    from storage.billing import subscription_store
 
     caps = get_all_capabilities()
     result = {}
@@ -346,7 +346,8 @@ async def _remove_synced_setup_file(
         )
         return False
     import time as _time
-    from storage import file_author_store, file_tombstones_store
+    from storage.files import file_author_store
+    from storage.files import file_tombstones_store
     await asyncio.to_thread(
         file_tombstones_store.record, agent_slug, rel_path, _time.time(),
         origin="complete-setup",
@@ -543,7 +544,7 @@ async def get_delegation_targets(name: str, user: UserContext | None = Depends(g
     compiled_targets = [d["target"] for d in detailed if d["source"] == "department"]
     compiled = []
     if compiled_targets:
-        from storage import db_departments
+        from storage.agents import db_departments
         agent_row = agent_store.get_agent(name) or {}
         dept = None
         if agent_row.get("department_id"):

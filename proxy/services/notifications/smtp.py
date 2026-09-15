@@ -8,7 +8,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from storage import database as db
-from storage.credential_store import _encrypt, _decrypt
+from storage.identity.credential_store import _encrypt, _decrypt
 
 logger = logging.getLogger("claude-proxy")
 

@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-from api.hooks import hooks
+from api.hooks import permission, routing
 from auth.path_policy import SecurityContext
 from tests._paths import PROXY_DIR
 
@@ -39,11 +39,11 @@ def _remote_ctx(role: str = "manager") -> SecurityContext:
 def _stub(monkeypatch):
     """Session lookups stubbed so decide_tool_permission runs DB-free with a
     remote security context in auto mode (no prompt round-trip)."""
-    monkeypatch.setattr(hooks, "record_hook_activity", lambda sid: None)
-    monkeypatch.setattr(hooks, "get_meeting_session_info", lambda sid: None)
-    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "auto")
-    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "task")
-    monkeypatch.setattr(hooks, "get_session_security", lambda sid: _remote_ctx())
+    monkeypatch.setattr(permission, "record_hook_activity", lambda sid: None)
+    monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: None)
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "auto")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "task")
+    monkeypatch.setattr(permission, "get_session_security", lambda sid: _remote_ctx())
     # Target-revocation check hits the DB — the target is valid here.
     from services import path_policy_v2
     monkeypatch.setattr(path_policy_v2, "check_target_still_valid", lambda ctx: "")
@@ -51,7 +51,7 @@ def _stub(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_allow_carries_updated_input(_stub):
-    res = await hooks.decide_tool_permission(
+    res = await permission.decide_tool_permission(
         "s", "Read", {"file_path": "/workspace/notes.md"},
     )
     assert res["decision"] == "allow"
@@ -62,7 +62,7 @@ async def test_allow_carries_updated_input(_stub):
 
 @pytest.mark.asyncio
 async def test_native_path_allow_has_no_updated_input(_stub):
-    res = await hooks.decide_tool_permission(
+    res = await permission.decide_tool_permission(
         "s", "Read", {"file_path": "/home/dave/Desktop/foo.png"},
     )
     assert res["decision"] == "allow"
@@ -76,10 +76,10 @@ async def test_interactive_rewrite_rides_allow(_stub, monkeypatch):
     # "allow"/"ask" — silence would run the tool against the raw
     # sandbox-virtual path (ENOENT). The decision is "allow" with the
     # rewrite attached; promptless matches trusted-dir native behavior.
-    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
-    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
-    monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
-    res = await hooks.decide_tool_permission(
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "default")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "dashboard")
+    monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: True)
+    res = await permission.decide_tool_permission(
         "s", "Write", {"file_path": "/workspace/notes.md", "content": "x"},
     )
     assert res["decision"] == "allow"
@@ -91,9 +91,9 @@ async def test_interactive_rewrite_rides_allow(_stub, monkeypatch):
 @pytest.mark.asyncio
 async def test_deny_never_carries_updated_input(_stub, monkeypatch):
     monkeypatch.setattr(
-        hooks, "get_session_security", lambda sid: _remote_ctx(role="viewer"),
+        permission, "get_session_security", lambda sid: _remote_ctx(role="viewer"),
     )
-    res = await hooks.decide_tool_permission(
+    res = await permission.decide_tool_permission(
         "s", "Write", {"file_path": "/knowledge/x.md", "content": "y"},
     )
     assert res["decision"] == "deny"

@@ -73,9 +73,9 @@ async def test_run_deferred_pulls_applies_and_broadcasts(tmp_path):
          patch("config.AGENTS_DIR", tmp_path), \
          patch("core.remote.remote_file_flow._acquire_global_path_lock",
                new=AsyncMock(return_value=asyncio.Lock())), \
-         patch("storage.sync_state_store.record_one") as rec, \
-         patch("storage.file_author_store.record") as auth, \
-         patch("storage.file_tombstones_store.drop") as drop, \
+         patch("storage.files.sync_state_store.record_one") as rec, \
+         patch("storage.files.file_author_store.record") as auth, \
+         patch("storage.files.file_tombstones_store.drop") as drop, \
          patch("services.notifications.notification_manager.broadcast_file_updated",
                new=AsyncMock()) as bcast:
         await layer._run_deferred_pulls("m1", "agent-1", [action], "alice")
@@ -101,7 +101,7 @@ async def test_run_deferred_pulls_failure_skips_bookkeeping_and_broadcast(tmp_pa
          patch("config.AGENTS_DIR", tmp_path), \
          patch("core.remote.remote_file_flow._acquire_global_path_lock",
                new=AsyncMock(return_value=asyncio.Lock())), \
-         patch("storage.sync_state_store.record_one") as rec, \
+         patch("storage.files.sync_state_store.record_one") as rec, \
          patch("services.notifications.notification_manager.broadcast_file_updated",
                new=AsyncMock()) as bcast:
         await layer._run_deferred_pulls("m1", "agent-1", [action], "alice")

@@ -159,9 +159,13 @@ interface Props {
   textareaRef?: React.RefObject<HTMLTextAreaElement | null>
   /** Voice mode (AgentChat only). Hands-free speak → send → hear. Omitted where
    * voice mode isn't wired → no voice UI or behaviour. */
-  voice?: {
-    duplex?: import('./VoiceControl').DuplexControlProps  // full-duplex mode
-  }
+  voice?: ChatInputVoice
+}
+
+/** The shape of the `voice` prop; the host page builds it
+ * (pages/agent/chat/useChatDuplexVoice.ts). */
+export type ChatInputVoice = {
+  duplex?: import('./VoiceControl').DuplexControlProps  // full-duplex mode
 }
 
 /** Check if camera capture is available (mobile only — desktop browsers ignore capture attr) */

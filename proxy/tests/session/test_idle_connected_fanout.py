@@ -37,7 +37,7 @@ class _FakeLayer:
 def _setup(monkeypatch, *, sessions, identities, connected, agents_by_machine):
     import core.session.session_manager as sm
     import core.remote.satellite_connection as sc
-    import storage.sync_state_store as ss
+    import storage.files.sync_state_store as ss
     layer = _FakeLayer(sessions, identities)
     monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
     fake_cm = SimpleNamespace(get_connected_machines=lambda: list(connected))

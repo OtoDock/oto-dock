@@ -42,7 +42,7 @@ MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 #
 # ``.credentials`` (OAuth token files) is deliberately NOT here: token
 # files are delivered per-session over the session-file broker channel
-# (``remote_execution._collect_session_files`` → satellite
+# (``remote_session_start._collect_session_files`` → satellite
 # ``sessions/session_files.py``) and wiped at session close, so a satellite
 # disk never holds long-lived refresh tokens between sessions. The platform
 # is refresh-authoritative (proxy-side background refresher); the transient

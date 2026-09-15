@@ -13,7 +13,9 @@ import logging
 import time
 import uuid
 import config
-from storage import database as task_store, agent_store, remote_store
+from storage import database as task_store
+from storage.agents import agent_store
+from storage import remote_store
 from core.session.session_state import (
     set_session_mode,
     get_session_mode,
@@ -26,9 +28,11 @@ from core.execution_layer import ExecutionLayer
 from core.session.session_manager import get_execution_layer, resolve_execution_path
 from core.config.config_builder import (
     build_agent_config,
+    release_config_seat,
     is_hard_fail_target,
     extract_offline_machine,
 )
+from services.engines import subscription_pool
 from services.engines.subscription_pool import NoSubscriptionError
 from core.session.history_seed import consume_pending_seed_digest
 from core.config.task_config_builder import (
@@ -179,24 +183,46 @@ class WarmupController:
             from core.session import prewarm_session_registry as _prewarm
             await _prewarm.discard(old_sid)
 
+        agent_cfg = None
+        started = False
+        build = None
+        new_sid = str(uuid.uuid4())
         try:
-            new_sid = str(uuid.uuid4())
+            resolved_exec_path = resolve_execution_path(agent, requested_exec_path)
+            # The frame's model belongs to the engine the page showed; when
+            # that is not the engine this pre-warm resolved, building would
+            # acquire (and refuse) credentials for the wrong provider. A
+            # pre-warm is an optimisation — skip, the real warmup decides.
+            if _model_foreign_to_engine(requested_model, resolved_exec_path):
+                logger.info(
+                    f"WS dashboard pre_warmup: skipped (model {requested_model} "
+                    f"is not a {resolved_exec_path} model) agent={agent}"
+                )
+                return
 
             # Build the config FIRST so the resolved execution target + the
             # interactive decision are known BEFORE we acquire a slot or spawn.
-            agent_cfg = await build_agent_config(
+            # From here on every early exit returns the pool seat the build
+            # acquired (release_config_seat) — a skipped pre-warm used to
+            # leak one seat per chat opened on a remote or interactive agent.
+            # Shielded: the seat is taken inside the build's thread, so a
+            # cancel landing here must not lose the config that holds it —
+            # the rollback waits for the build and returns the seat.
+            build = asyncio.ensure_future(build_agent_config(
                 agent_name=agent, user=self.user, user_sub=self.user_sub,
                 user_role=pw_effective_role, permission_mode=permission_mode,
                 client_type="dashboard", resume=False,
                 model=requested_model,
-                execution_path=resolve_execution_path(agent, requested_exec_path),
+                execution_path=resolved_exec_path,
                 session_id=new_sid,
-            )
+            ))
+            agent_cfg = await asyncio.shield(build)
             # Skip pre-warm for a REMOTE target: it would spawn a real session on
             # the satellite (counting against THAT satellite's budget) for a chat
             # the user may never send. The first real send warms it on demand.
             if (agent_cfg.execution_target or "local") != "local":
                 logger.info(f"WS dashboard pre_warmup: skipped (remote target) agent={agent}")
+                release_config_seat(new_sid, agent_cfg)
                 return
             # Interactive agents are NOT eagerly pre-warmed: the interactive
             # cold-start spawns a FRESH session (`_spawn_tail` skips reusing a
@@ -205,12 +231,14 @@ class WarmupController:
             # the first send warms interactively and waits for the install.
             if _resolve_session_interactive(agent_cfg):
                 logger.info(f"WS dashboard pre_warmup: skipped (interactive) agent={agent}")
+                release_config_seat(new_sid, agent_cfg)
                 return
             # Local target → acquire a unit of the local ceiling G before spawning.
             from core.concurrency import acquire_chat_slot
             adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
                                           user_sub=self.user_sub)
             if not adm:
+                release_config_seat(new_sid, agent_cfg)
                 await self._send_error(adm.user_message)
                 return
             # pw_effective_role (resolved at the top) → the spawned session's
@@ -218,11 +246,16 @@ class WarmupController:
             # delivered out-of-band via the per-user broadcaster (install_registry
             # → push_install_event), so a detached pre-warm still reaches the
             # user's dashboard tabs.
+            # The layer must match the target the build resolved (local here,
+            # the remote case returned above): resolving again without it
+            # could hand back the remote layer for an agent whose machine the
+            # build had already decided to fall back from.
             self.layer = get_execution_layer(
                 agent, execution_path=requested_exec_path, user_sub=self.user_sub,
-                role=pw_effective_role,
+                role=pw_effective_role, execution_target=agent_cfg.execution_target,
             )
             await self.layer.start_session(new_sid, agent_cfg)
+            started = True
 
             # Propagate the user's browser-detected TZ onto the pre-warmed
             # session (client_info fires on WS open, before pre_warmup).
@@ -248,10 +281,25 @@ class WarmupController:
                 f"WS dashboard pre_warmup: created session={new_sid[:8]}, "
                 f"agent={agent}, exec_path={self._pre_warmed_exec_path}, model={agent_cfg.model}"
             )
+        except asyncio.CancelledError:
+            # A newer pre_warmup frame (the dispatcher) or the closing socket
+            # cancelled this spawn. Not an Exception, so the rollback below
+            # never ran for it: the seat, the chat slot and a half-started
+            # session stayed taken until a restart. The rollback is its own
+            # task — a second cancel (the socket closing right after an
+            # agent switch) must not cut it short too.
+            _schedule_pre_warmup_rollback(
+                new_sid, build, agent_cfg, started, getattr(self, "layer", None))
+            raise
         except Exception as e:
-            logger.error(f"WS dashboard pre_warmup failed: {e}", exc_info=True)
-            from core.concurrency import release_chat_slot
-            release_chat_slot(new_sid)
+            if isinstance(e, NoSubscriptionError):
+                # A configuration state (no usable account, a pool cap), not
+                # a crash: the first real send surfaces the reason to the user.
+                logger.info(f"WS dashboard pre_warmup skipped (reason={e.reason}): {e}")
+            else:
+                logger.error(f"WS dashboard pre_warmup failed: {e}", exc_info=True)
+            await _pre_warmup_rollback(
+                new_sid, None, agent_cfg, started, getattr(self, "layer", None))
             self._pre_warmed_sid = None
             self._pre_warmed_agent = None
             self._pre_warmed_exec_path = ""
@@ -724,6 +772,11 @@ class WarmupController:
                             f"chat={wcid}, agent={w_agent}, model={chat_model}"
                         )
                     else:
+                        # The dead session's binding would outlive it: a
+                        # resume hands it over at bind time, a fresh id never
+                        # meets it, and nothing else releases a seat under an
+                        # id no session runs.
+                        subscription_pool.release_subscription(old_session_id)
                         new_sid = str(uuid.uuid4())
                         res = await self._create_or_resume_session(
                             new_sid, w_agent, permission_mode, resume=False,
@@ -1242,8 +1295,10 @@ class WarmupController:
         # Checked BEFORE get_execution_layer so the user gets the tailored
         # message below instead of the resolver's generic offline RuntimeError.
         if is_hard_fail_target(agent_cfg.execution_target):
-            # No slot acquired yet (acquire happens after this check), so there
-            # is nothing to release here.
+            # No slot acquired yet (acquire happens after this check); the
+            # pool seat the build took IS, and every raise below abandons
+            # the spawn.
+            release_config_seat(sid, agent_cfg)
             offline_machine_id = extract_offline_machine(agent_cfg.execution_target)
             machine = remote_store.get_remote_machine(offline_machine_id)
             if not machine:
@@ -1284,6 +1339,7 @@ class WarmupController:
                                       execution_path=agent_cfg.execution_path,
                                       user_sub=self.user_sub)
         if not adm:
+            release_config_seat(sid, agent_cfg)
             raise RuntimeError(adm.user_message)
 
         # Interactive mode: resolved once here — this
@@ -1361,6 +1417,7 @@ class WarmupController:
         except Exception:
             from core.concurrency import release_chat_slot
             release_chat_slot(sid)
+            release_config_seat(sid, agent_cfg)
             raise
         # Propagate browser-detected TZ from the user's last client_info onto
         # this session. Required when client_info arrived before warmup (the
@@ -1442,10 +1499,13 @@ class WarmupController:
                 exec_path=chat_exec_path, chat_id=t_chat_id, pinned_target=chat_pinned,
                 adopt=adopt,
             )
-        # No conversation data → fresh session. Release the old slot first
-        # (prepare_resume removed the session from the registry).
+        # No conversation data → fresh session. Release the old slot and the
+        # old binding first (prepare_resume removed the session from the
+        # registry; a fresh id never meets the binding a resume would have
+        # handed over at bind time).
         from core.concurrency import release_chat_slot
         release_chat_slot(dead_sid)
+        subscription_pool.release_subscription(dead_sid)
         # The dead session's background work died with it — clear any stuck
         # liveness badges before the fresh session takes the chat over.
         clear_session_liveness(dead_sid, reason="resume_failed")
@@ -1472,6 +1532,35 @@ class WarmupController:
         return res
 
 
+_ROLLBACK_TASKS: set[asyncio.Task] = set()
+
+
+async def _pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer) -> None:
+    """Give back what an abandoned pre-warm holds: the chat slot, and either
+    the session (spawned and bound — closing it releases the seat) or the
+    seat its config acquired that nothing bound. ``build`` is the shielded
+    config build a cancel interrupted: awaited first, the seat lives in its
+    result. A cancel inside ``start_session`` can land after the bind and
+    before ``started`` is set, so the binding decides, not the flag."""
+    if agent_cfg is None and build is not None:
+        with contextlib.suppress(Exception):
+            agent_cfg = await build
+    from core.concurrency import release_chat_slot
+    release_chat_slot(sid)
+    if started or subscription_pool.session_bound(sid):
+        if layer is not None:
+            with contextlib.suppress(Exception):
+                await layer.close_session(sid)
+    elif agent_cfg is not None:
+        release_config_seat(sid, agent_cfg)
+
+
+def _schedule_pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer) -> None:
+    task = asyncio.create_task(_pre_warmup_rollback(sid, build, agent_cfg, started, layer))
+    _ROLLBACK_TASKS.add(task)
+    task.add_done_callback(_ROLLBACK_TASKS.discard)
+
+
 async def spawn_detached_prewarm(
     *, agent: str, user: dict, user_sub: str,
     requested_model: str = "", permission_mode: str = "default",
@@ -1488,31 +1577,50 @@ async def spawn_detached_prewarm(
     """
     role = await run_db(_effective_agent_role, user_sub, agent, fallback_user=user)
     new_sid = str(uuid.uuid4())
+    agent_cfg = None
+    layer = None
     try:
+        exec_path = resolve_execution_path(agent, "")
+        if _model_foreign_to_engine(requested_model, exec_path):
+            logger.info(
+                f"detached pre-warm: skipped (model {requested_model} is not a "
+                f"{exec_path} model) agent={agent}"
+            )
+            return None
         agent_cfg = await build_agent_config(
             agent_name=agent, user=user, user_sub=user_sub,
             user_role=role, permission_mode=permission_mode,
             client_type="dashboard", resume=False,
             model=requested_model,
-            execution_path=resolve_execution_path(agent, ""),
+            execution_path=exec_path,
             session_id=new_sid,
         )
         # Same skips as the WS pre-warm: a remote pre-warm spends the
         # satellite's budget for a chat that may never come; an interactive
-        # cold-start never reuses a -p pre-warm.
+        # cold-start never reuses a -p pre-warm. Each skip returns the seat
+        # the build acquired.
         if (agent_cfg.execution_target or "local") != "local":
             logger.info(f"detached pre-warm: skipped (remote target) agent={agent}")
+            release_config_seat(new_sid, agent_cfg)
             return None
         if _resolve_session_interactive(agent_cfg):
             logger.info(f"detached pre-warm: skipped (interactive) agent={agent}")
+            release_config_seat(new_sid, agent_cfg)
             return None
         from core.concurrency import acquire_chat_slot
         adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
                                       user_sub=user_sub)
         if not adm:
             logger.info(f"detached pre-warm: no slot ({adm.user_message})")
+            release_config_seat(new_sid, agent_cfg)
             return None
-        layer = get_execution_layer(agent, user_sub=user_sub, role=role)
+        # The layer must match the target the build resolved (local here):
+        # resolving again without it could hand back the remote layer for an
+        # agent whose machine the build had already fallen back from.
+        layer = get_execution_layer(
+            agent, execution_path=exec_path, user_sub=user_sub, role=role,
+            execution_target=agent_cfg.execution_target,
+        )
         await layer.start_session(new_sid, agent_cfg)
         _tz = get_user_tz(user_sub)
         if _tz:
@@ -1531,4 +1639,26 @@ async def spawn_detached_prewarm(
         logger.error(f"detached pre-warm failed: {e}", exc_info=True)
         from core.concurrency import release_chat_slot
         release_chat_slot(new_sid)
+        if layer is not None and await layer.is_session_alive(new_sid):
+            # Spawned and bound, then the registration after it failed: the
+            # session owns the seat — close it, which releases it.
+            with contextlib.suppress(Exception):
+                await layer.close_session(new_sid)
+        elif agent_cfg is not None:
+            release_config_seat(new_sid, agent_cfg)
         return None
+
+
+def _model_foreign_to_engine(model: str, execution_path: str) -> bool:
+    """True when ``model`` is KNOWN to run on other engines only — a
+    pre-warm frame can pair the page's model with an engine the resolver
+    then overrides (seen on T1: a Claude model on a Codex pre-warm, which
+    filtered the Codex candidates by the wrong provider and refused). An
+    unknown model (custom row, local endpoint) is trusted."""
+    if not model or not execution_path:
+        return False
+    try:
+        layers = config.get_model_layers(model)
+    except Exception:
+        return False
+    return bool(layers) and execution_path not in layers

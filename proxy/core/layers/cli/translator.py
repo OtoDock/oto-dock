@@ -3,7 +3,7 @@
 Pure per-turn parser. Takes raw NDJSON dicts from `claude -p --output-format
 stream-json`, yields `ClaudeStreamChunk` objects. No I/O, no subprocess
 management, no settle decisions — those live in `session.py` (for local) and
-`remote_execution.py` (for remote).
+`core/remote/remote_turn.py` (for remote).
 
 This is the shared piece that guarantees identical event semantics between
 local-sandboxed and remote-unsandboxed Claude CLI sessions.
@@ -222,6 +222,14 @@ class ClaudeCLIEventTranslator:
             return self._handle_stream_event(data)
         if msg_type == "result":
             return self._handle_result(data)
+        if msg_type == "rate_limit_event":
+            # The account's own 5-hour / weekly window state, read by the CLI
+            # from the response headers. Not chat content: the consumers hand
+            # it to services.engines.subscription_windows and drop it.
+            info = data.get("rate_limit_info")
+            if isinstance(info, dict):
+                return [ClaudeStreamChunk(event_type="rate_limit", event_data=info)]
+            return []
 
         return []
 

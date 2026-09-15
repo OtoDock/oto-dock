@@ -20,7 +20,7 @@ def client(temp_db):
 
 
 def _seed_agent(slug: str) -> None:
-    from storage import agent_store
+    from storage.agents import agent_store
     if not agent_store.agent_exists(slug):
         agent_store.create_agent(slug, slug.title())
 

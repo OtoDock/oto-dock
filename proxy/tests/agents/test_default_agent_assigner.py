@@ -44,7 +44,7 @@ def _make_default_agent(slug: str, role: str = "viewer") -> None:
     assigner in isolation. Tests that need a real template install
     live in ``test_community_agent_installer.py::TestUserJoinHook``.
     """
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent(slug, slug.replace("-", " ").title())
     agent_store.set_default_for_new_users_role(slug, role)
 

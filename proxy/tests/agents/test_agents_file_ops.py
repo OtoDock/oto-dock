@@ -41,7 +41,7 @@ def _make_app(tmp_path, monkeypatch, *, role: str = "manager", username: str = "
     async def _stub_user():
         return user
 
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "test-agent")
     monkeypatch.setattr(

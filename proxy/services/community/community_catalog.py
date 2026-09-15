@@ -422,16 +422,21 @@ def augment_entry(
     installed = local_version is not None
     catalog_version = entry.get("version")
     update_available = bool(installed and _catalog_is_newer(catalog_version, local_version))
-    # node/python: catalog version is "" (unbounded), so the version compare never
-    # fires — flag instead when the catalog integration manifest changed. Guarded:
-    # both hashes present (a stale registry.json without ``manifest_hash`` must
-    # not false-flag). runtime "none" = skill packages / context-only entries,
-    # whose only non-version update signal is the manifest hash.
+    # The version compare never fires for node/python (catalog version "",
+    # unbounded) and misses a docker entry whose manifest changed under the
+    # same image tag — flag instead when the catalog integration manifest
+    # changed. Guarded: both hashes present (a stale registry.json without
+    # ``manifest_hash`` must not false-flag), and only for entries the updater
+    # can converge (see ``manifest_hash_signal_applies``). A docker install
+    # AHEAD of the catalog always mismatches (the image tag is in the hash)
+    # and the converge would be a downgrade, so the signal needs the same
+    # version, as ``mcp_updater.detect_available_updates`` requires.
     if (
         installed
         and not update_available
         and installed_manifest_hashes
-        and entry.get("runtime") in ("node", "python", "none")
+        and manifest_hash_signal_applies(entry)
+        and (entry.get("runtime") != "docker" or str(catalog_version) == str(local_version))
     ):
         catalog_hash = entry.get("manifest_hash")
         installed_hash = installed_manifest_hashes.get(name)
@@ -470,20 +475,39 @@ def _collect_installed_versions() -> dict[str, str]:
     return {name: m.version for name, m in manifests.items()}
 
 
+NON_CONVERGEABLE_SOURCE_PREFIXES = ("git+", "remote:")
+
+
+def manifest_hash_signal_applies(entry: dict[str, Any]) -> bool:
+    """Whether a catalog ``manifest_hash`` mismatch is an update the updater can
+    apply: npm/pypi entries converge to the catalog folder, docker entries
+    re-fetch it; skill packages (runtime ``none``) reinstall from theirs.
+    git+ and remote entries have no converge path, so a mismatch there would
+    badge an update nobody can run: they pick up manifest changes with a
+    version bump or a reinstall."""
+    runtime = entry.get("runtime")
+    if runtime == "none":
+        return True
+    if runtime not in ("node", "python", "docker"):
+        return False
+    return not str(entry.get("source") or "").startswith(NON_CONVERGEABLE_SOURCE_PREFIXES)
+
+
 def _collect_installed_manifest_hashes() -> dict[str, str]:
     """Build a ``{mcp_name: normalized_manifest_hash}`` map for installed
-    node/python MCPs, read from each install's raw ``manifest.json``.
+    node/python/docker MCPs, read from each install's raw ``manifest.json``.
 
     The in-memory ``McpManifest`` dataclass is lossy (drops unknown keys, applies
     defaults), so the hash must come from the file — hence raw reads here. Used by
     :func:`augment_entry` to flag catalog integration-manifest changes for the
-    Browse UI. Docker/git+/remote are skipped (their update signal is the version).
+    Browse UI (git+/remote hashes are collected too but never applied, see
+    :func:`manifest_hash_signal_applies`).
     """
     from services.mcp import mcp_registry
 
     out: dict[str, str] = {}
     for name, m in mcp_registry.get_all_manifests().items():
-        if getattr(m.server, "runtime", "") not in ("node", "python", "none"):
+        if getattr(m.server, "runtime", "") not in ("node", "python", "docker", "none"):
             continue
         try:
             data = json.loads((Path(m.mcp_dir) / "manifest.json").read_text())
@@ -508,11 +532,12 @@ async def collect_local_state() -> tuple[
     - ``enabled_for_agents[mcp_name]`` = list of agent slugs that have
       enabled the MCP via the manager UI.
     - ``pending_requests[(mcp_name, agent_slug)]`` = open request id (any
-      state in :data:`storage.mcp_request_store.OPEN_STATES`).
+      state in :data:`storage.mcp.mcp_request_store.OPEN_STATES`).
     - ``installed_manifest_hashes[mcp_name]`` = normalized manifest hash for
       installed node/python MCPs (for integration-change detection in Browse).
     """
-    from storage import mcp_store, mcp_request_store
+    from storage.mcp import mcp_store
+    from storage.mcp import mcp_request_store
 
     installed_versions = await asyncio.to_thread(_collect_installed_versions)
     installed_manifest_hashes = await asyncio.to_thread(_collect_installed_manifest_hashes)

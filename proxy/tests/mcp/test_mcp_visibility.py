@@ -54,7 +54,7 @@ def _make_manifest(name, assignment_mode="auto", category="custom", has_instance
 def _patch_manifests(monkeypatch, manifests: dict):
     """Replace mcp_registry._manifests + enable each in mcp_state."""
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     monkeypatch.setattr(mcp_registry, "_manifests", manifests)
     for name in manifests:
         mcp_store.set_mcp_enabled(name, True)
@@ -78,7 +78,7 @@ def _make_instance(mcp_name: str, instance_name: str, *,
                    agents: list[str] | None = None,
                    assigned_to_all: bool = False) -> int:
     """Create an MCP instance row. Returns the inserted id."""
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     return mcp_store.upsert_mcp_instance(
         mcp_name,
         {
@@ -98,13 +98,13 @@ def _make_instance(mcp_name: str, instance_name: str, *,
 class TestVisibilityHelpers:
     def test_explicit_mcp_no_instances_no_visibility(self, temp_db):
         """An explicit-mode MCP with zero instances authorizes nobody."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is False
         assert mcp_store.get_visible_explicit_mcps("alice") == set()
 
     def test_explicit_mcp_agent_in_list(self, temp_db):
         """Agent in the instance's agents list → visible. Other agents → not."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "primary", agents=["alice"])
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is True
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "bob") is False
@@ -113,7 +113,7 @@ class TestVisibilityHelpers:
 
     def test_explicit_mcp_assigned_to_all(self, temp_db):
         """assigned_to_all=True authorizes every agent (incl. unknown ones)."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "shared", agents=[], assigned_to_all=True)
         for agent in ("alice", "bob", "newcomer"):
             assert mcp_store.is_agent_authorized_for_mcp("image-gen", agent) is True
@@ -121,7 +121,7 @@ class TestVisibilityHelpers:
 
     def test_explicit_mcp_combined(self, temp_db):
         """agents list + assigned_to_all both set → still visible to every agent."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "combined",
                        agents=["alice"], assigned_to_all=True)
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is True
@@ -129,7 +129,7 @@ class TestVisibilityHelpers:
 
     def test_visibility_after_revoke(self, temp_db):
         """Removing agent from agents list flips visibility off (if not assigned_to_all)."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "primary", agents=["alice"])
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is True
         # Update with empty agents list (admin revokes)
@@ -143,7 +143,7 @@ class TestVisibilityHelpers:
 
     def test_visibility_isolated_per_mcp(self, temp_db):
         """Two MCPs, only one authorizes alice."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "primary", agents=["alice"])
         _make_instance("ssh-server", "h1", agents=["bob"])
         assert mcp_store.get_visible_explicit_mcps("alice") == {"image-gen"}
@@ -158,7 +158,7 @@ class TestVisibilityHelpers:
 class TestInstancePrecedence:
     def test_env_delivery_explicit_beats_all(self, temp_db):
         """Two instances: one explicit-for-alice, one assigned_to_all → returns explicit."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         # Create the catch-all FIRST (so it has a lower id)
         all_id = _make_instance("image-gen", "shared",
                                 agents=[], assigned_to_all=True)
@@ -175,7 +175,7 @@ class TestInstancePrecedence:
 
     def test_env_delivery_only_assigned_to_all(self, temp_db):
         """Only an assigned_to_all instance → returns it."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = _make_instance("image-gen", "shared",
                              agents=[], assigned_to_all=True)
         chosen = mcp_store.get_instance_for_agent_env_delivery(
@@ -186,7 +186,7 @@ class TestInstancePrecedence:
 
     def test_env_delivery_two_explicit_lowest_id(self, temp_db):
         """Two explicit matches → returns lowest id deterministically."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         first_id = _make_instance("image-gen", "instance-a", agents=["alice"])
         second_id = _make_instance("image-gen", "instance-b", agents=["alice"])
         assert first_id < second_id
@@ -198,7 +198,7 @@ class TestInstancePrecedence:
 
     def test_env_delivery_two_all_lowest_id(self, temp_db):
         """Two assigned_to_all matches → returns lowest id."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         first_id = _make_instance("image-gen", "shared-a",
                                   agents=[], assigned_to_all=True)
         _make_instance("image-gen", "shared-b",
@@ -210,7 +210,7 @@ class TestInstancePrecedence:
 
     def test_env_delivery_no_match_returns_none(self, temp_db):
         """No instance authorizes the agent → None."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _make_instance("image-gen", "primary", agents=["bob"])
         assert mcp_store.get_instance_for_agent_env_delivery(
             "image-gen", "alice",
@@ -218,7 +218,7 @@ class TestInstancePrecedence:
 
     def test_config_file_delivery_unions(self, temp_db):
         """get_mcp_instances_for_agent unions explicit + assigned_to_all, ordered by id."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         # Insertion order matters for id assignment
         explicit_id = _make_instance("ssh-server", "host-a", agents=["alice"])
         all_id = _make_instance("ssh-server", "host-b",
@@ -232,7 +232,7 @@ class TestInstancePrecedence:
 
     def test_upsert_persists_assigned_to_all(self, temp_db):
         """upsert_mcp_instance round-trips assigned_to_all."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = _make_instance("image-gen", "shared", assigned_to_all=True)
         instances = mcp_store.get_mcp_instances("image-gen")
         match = next(i for i in instances if i["id"] == iid)
@@ -260,7 +260,7 @@ class TestRegistryIntersection:
     def test_visible_and_enabled_returns_manifest(self, temp_db, monkeypatch):
         """auto MCP, manager-enabled, platform-enabled → returned."""
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _patch_manifests(monkeypatch, {
             "schedules-mcp": _make_manifest("schedules-mcp", assignment_mode="auto"),
         })
@@ -271,7 +271,7 @@ class TestRegistryIntersection:
     def test_enabled_but_not_visible(self, temp_db, monkeypatch):
         """Explicit MCP with no authorizing instance → NOT returned even if enabled."""
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _patch_manifests(monkeypatch, {
             "image-gen": _make_manifest(
                 "image-gen", assignment_mode="explicit", has_instances=True,
@@ -298,7 +298,7 @@ class TestRegistryIntersection:
     def test_state_disabled(self, temp_db, monkeypatch):
         """Visible + manager-enabled but mcp_state.enabled=False → NOT returned."""
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _patch_manifests(monkeypatch, {
             "schedules-mcp": _make_manifest("schedules-mcp", assignment_mode="auto"),
         })
@@ -310,7 +310,7 @@ class TestRegistryIntersection:
     def test_revoke_after_enable_filters_out(self, temp_db, monkeypatch):
         """Manager enabled, admin revoked authorization → runtime drops, but agent_mcps row persists."""
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _patch_manifests(monkeypatch, {
             "image-gen": _make_manifest(
                 "image-gen", assignment_mode="explicit", has_instances=True,
@@ -439,10 +439,13 @@ class TestApiEndpoint:
         # Service-account capability is surfaced per row (False when the
         # manifest declares none) so the UI never probes non-capable MCPs.
         assert names_to_meta["schedules-mcp"]["has_service_account"] is False
+        # Provenance and the icon flag ride every row (the MCPs tab renders them).
+        for row in names_to_meta.values():
+            assert {"author", "author_url", "icon"} <= set(row)
 
     def test_get_reflects_enabled_state(self, client, monkeypatch):
         """GET reflects manager's prior toggle state."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _seed_agent("alice-agent")
         _patch_manifests(monkeypatch, {
             "schedules-mcp": _make_manifest("schedules-mcp", assignment_mode="auto"),
@@ -472,7 +475,7 @@ class TestApiEndpoint:
 
     def test_put_succeeds_for_admin_authorized(self, client, monkeypatch):
         """PUT enabling an admin-authorized explicit MCP succeeds."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _seed_agent("alice-agent")
         _patch_manifests(monkeypatch, {
             "image-gen": _make_manifest(
@@ -488,7 +491,7 @@ class TestApiEndpoint:
     def test_put_keeps_skills_for_disabled_mcp(self, client, monkeypatch):
         """Disabling an MCP doesn't delete its agent_skills rows (preserves manager intent)."""
         from services.mcp.mcp_registry import SkillDef
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         _seed_agent("alice-agent")
 
         manifest = _make_manifest("schedules-mcp", assignment_mode="auto")
@@ -532,7 +535,7 @@ class TestOriginalBugIntegration:
         from fastapi.testclient import TestClient
         from auth.providers import UserContext, get_current_user
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         _seed_agent("alice-agent")
         _patch_manifests(monkeypatch, {
@@ -613,7 +616,7 @@ class TestOriginalBugIntegration:
 class TestMigration:
     def test_assigned_to_all_default_false(self, temp_db):
         """New rows default to assigned_to_all=False; column is present after migration."""
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         iid = _make_instance("image-gen", "primary", agents=["alice"])
         instances = mcp_store.get_mcp_instances("image-gen")
         match = next(i for i in instances if i["id"] == iid)

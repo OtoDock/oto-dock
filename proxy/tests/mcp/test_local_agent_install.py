@@ -281,7 +281,7 @@ class TestValidate:
         assert resp.json()["ok"] is False
 
     def test_taken_slug_suggests_an_alternative(self, tmp_path, monkeypatch, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("demo-template", "Demo", admin_only=False)
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         _write_template(_agent_root(agents_dir))
@@ -313,7 +313,7 @@ class TestInstall:
         # The DB row is internal detail — the MCP response must not carry it.
         assert "agent" not in body
 
-        from storage import agent_store
+        from storage.agents import agent_store
         agent = agent_store.get_agent("demo-template")
         # Provenance: a local template must never match a catalog slug.
         assert agent["community_template"] == "local:demo-template"
@@ -359,7 +359,7 @@ class TestInstall:
             json={"path": "/users/alice/workspace/demo-template"},
         )
         assert resp.status_code == 200, resp.text
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assigned = set(mcp_store.get_manager_enabled_mcps("demo-template"))
         assert "core-thing" in assigned
         # ``explicit`` means an admin authorizes it per-agent; ``community``
@@ -389,7 +389,7 @@ class TestInstall:
             json={"path": "/users/alice/workspace/demo-template"},
         )
         assert resp.status_code == 200, resp.text
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assert "core-thing" not in set(
             mcp_store.get_manager_enabled_mcps("demo-template"))
 
@@ -426,7 +426,7 @@ class TestInstall:
             json={"path": "/users/alice/workspace/demo-template"},
         ).json()
         assert body["ignored_fields"] == ["default_for_new_users"]
-        from storage import agent_store
+        from storage.agents import agent_store
         assert not agent_store.get_agent("demo-template").get("default_for_new_users_role")
 
     def test_admin_can_set_default_for_new_users(self, tmp_path, monkeypatch, temp_db):
@@ -442,11 +442,11 @@ class TestInstall:
             json={"path": "/users/alice/workspace/demo-template"},
         ).json()
         assert body["ignored_fields"] == []
-        from storage import agent_store
+        from storage.agents import agent_store
         assert agent_store.get_agent("demo-template")["default_for_new_users_role"] == "viewer"
 
     def test_slug_collision_returns_409_with_suggestion(self, tmp_path, monkeypatch, temp_db):
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("demo-template", "Demo", admin_only=False)
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         _write_template(_agent_root(agents_dir))
@@ -466,7 +466,7 @@ class TestInstall:
                   "target_slug": "renamed-agent"},
         ).json()
         assert body["agent_slug"] == "renamed-agent"
-        from storage import agent_store
+        from storage.agents import agent_store
         # Provenance still records the TEMPLATE's slug, not the install name.
         assert agent_store.get_agent("renamed-agent")["community_template"] == "local:demo-template"
 

@@ -245,10 +245,10 @@ def test_device_capability_for_server(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _hook_env(monkeypatch, *, grants):
-    """Wire up api.hooks.hooks for a default-mode dashboard session whose target
+    """Wire up api.hooks.permission for a default-mode dashboard session whose target
     machine grants ``grants``. Returns the configured SecurityContext."""
     import asyncio  # noqa: F401
-    from api.hooks import hooks
+    from api.hooks import permission, routing
     from auth.path_policy import SecurityContext, PathDecision
     from services import path_policy_v2
 
@@ -263,31 +263,31 @@ def _hook_env(monkeypatch, *, grants):
         target_kind="user_remote", target_machine_id="m1deadbeef",
         target_device_grants=set(grants),
     )
-    monkeypatch.setattr(hooks, "verify_session_match", lambda *a, **k: None)
-    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
-    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
-    monkeypatch.setattr(hooks, "get_meeting_session_info", lambda sid: None)
-    monkeypatch.setattr(hooks, "record_hook_activity", lambda sid: None)
-    monkeypatch.setattr(hooks, "get_session_security", lambda sid: ctx)
-    monkeypatch.setattr(hooks, "check_tool_access",
+    monkeypatch.setattr(permission, "verify_session_match", lambda *a, **k: None)
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "default")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "dashboard")
+    monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: None)
+    monkeypatch.setattr(permission, "record_hook_activity", lambda sid: None)
+    monkeypatch.setattr(permission, "get_session_security", lambda sid: ctx)
+    monkeypatch.setattr(permission, "check_tool_access",
                         lambda *a, **k: (PathDecision(allowed=True), None))
     monkeypatch.setattr(path_policy_v2, "check_target_still_valid", lambda c: None)
-    return hooks, ctx
+    return permission, ctx
 
 
 def test_hook_auto_approves_granted_device_tool(monkeypatch):
     import asyncio
-    hooks, _ = _hook_env(monkeypatch, grants={"computer"})
-    req = hooks.HookPermissionRequest(
+    permission, _ = _hook_env(monkeypatch, grants={"computer"})
+    req = permission.HookPermissionRequest(
         session_id="s1", tool_name="mcp__computer__computer", tool_input={},
     )
-    out = asyncio.run(hooks.hook_permission(req, authorization="Bearer x"))
+    out = asyncio.run(permission.hook_permission(req, authorization="Bearer x"))
     assert out == {"decision": "allow"}
 
 
 def test_hook_prompts_ungranted_device_tool(monkeypatch):
     import asyncio
-    hooks, _ = _hook_env(monkeypatch, grants=set())  # capability NOT granted
+    permission, _ = _hook_env(monkeypatch, grants=set())  # capability NOT granted
 
     # The ungranted device tool must fall through to the dashboard prompt
     # (NOT auto-approve). Stub the prompt machinery so the deny resolves
@@ -297,13 +297,13 @@ def test_hook_prompts_ungranted_device_tool(monkeypatch):
             return None
     async def _wait(_request_id, _session_id="", timeout=0):
         return False
-    monkeypatch.setattr(hooks, "get_permission_queue", lambda sid: _Q())
-    monkeypatch.setattr(hooks, "wait_for_permission", _wait)
+    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
+    monkeypatch.setattr(permission, "wait_for_permission", _wait)
 
-    req = hooks.HookPermissionRequest(
+    req = permission.HookPermissionRequest(
         session_id="s1", tool_name="mcp__computer__computer", tool_input={},
     )
-    out = asyncio.run(hooks.hook_permission(req, authorization="Bearer x"))
+    out = asyncio.run(permission.hook_permission(req, authorization="Bearer x"))
     assert out["decision"] == "deny"  # prompted (then our stub denied) — never auto-approved
 
 
@@ -311,7 +311,7 @@ def test_hook_does_not_auto_approve_nondevice_mcp(monkeypatch):
     import asyncio
     # A non-device MCP (no device_capability) must still prompt even though a
     # device capability is granted — the grant is per-capability, not blanket.
-    hooks, _ = _hook_env(monkeypatch, grants={"computer"})
+    permission, _ = _hook_env(monkeypatch, grants={"computer"})
     hooks_reg = reg._manifests
     hooks_reg["slack"] = _mk("slack", server_name="slack")  # no device_capability
 
@@ -320,13 +320,13 @@ def test_hook_does_not_auto_approve_nondevice_mcp(monkeypatch):
             return None
     async def _wait(_request_id, _session_id="", timeout=0):
         return False
-    monkeypatch.setattr(hooks, "get_permission_queue", lambda sid: _Q())
-    monkeypatch.setattr(hooks, "wait_for_permission", _wait)
+    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
+    monkeypatch.setattr(permission, "wait_for_permission", _wait)
 
-    req = hooks.HookPermissionRequest(
+    req = permission.HookPermissionRequest(
         session_id="s1", tool_name="mcp__slack__post_message", tool_input={},
     )
-    out = asyncio.run(hooks.hook_permission(req, authorization="Bearer x"))
+    out = asyncio.run(permission.hook_permission(req, authorization="Bearer x"))
     assert out["decision"] == "deny"  # non-device MCP still prompts
 
 
@@ -335,7 +335,7 @@ def test_hook_high_risk_device_tool_prompts_even_when_granted(monkeypatch):
     # A granted device capability auto-approves the connector's normal tools,
     # but a tool listed in device_high_risk_tools (e.g. execute_blender_code =
     # RCE inside the app) must STILL prompt.
-    hooks, _ = _hook_env(monkeypatch, grants={"app"})
+    permission, _ = _hook_env(monkeypatch, grants={"app"})
     reg._manifests["blender-bridge"] = _mk(
         "blender-bridge", placement="satellite_only", device_capability="app",
         server_name="blender", device_high_risk_tools=["execute_blender_code"],
@@ -346,18 +346,18 @@ def test_hook_high_risk_device_tool_prompts_even_when_granted(monkeypatch):
             return None
     async def _wait(_request_id, _session_id="", timeout=0):
         return False
-    monkeypatch.setattr(hooks, "get_permission_queue", lambda sid: _Q())
-    monkeypatch.setattr(hooks, "wait_for_permission", _wait)
+    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
+    monkeypatch.setattr(permission, "wait_for_permission", _wait)
 
     # high-risk tool → prompts (our stub denies), NOT auto-approved
-    hr = hooks.HookPermissionRequest(
+    hr = permission.HookPermissionRequest(
         session_id="s1", tool_name="mcp__blender__execute_blender_code",
         tool_input={"code": "import bpy"},
     )
-    assert asyncio.run(hooks.hook_permission(hr, authorization="Bearer x"))["decision"] == "deny"
+    assert asyncio.run(permission.hook_permission(hr, authorization="Bearer x"))["decision"] == "deny"
 
     # a non-high-risk tool on the SAME granted connector still auto-approves
-    ok = hooks.HookPermissionRequest(
+    ok = permission.HookPermissionRequest(
         session_id="s1", tool_name="mcp__blender__get_scene_info", tool_input={},
     )
-    assert asyncio.run(hooks.hook_permission(ok, authorization="Bearer x")) == {"decision": "allow"}
+    assert asyncio.run(permission.hook_permission(ok, authorization="Bearer x")) == {"decision": "allow"}

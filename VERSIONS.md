@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.6.0
+OTODOCK_VERSION=1.6.1
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
@@ -32,17 +32,15 @@ Pinned to exact minor+patch. For CI gold standard, bump these to digest pins (`@
 |-------|-------------|-------------|
 | `otodock-proxy` | yes | yes |
 | `otodock-file-tools` | yes | yes |
-| `otodock-phone` | yes | **no** |
+| `otodock-phone` | yes | yes |
 
 The release tags are manifest lists, so `docker pull` resolves per host and no
-Compose change is needed on either architecture.
-
-`otodock-phone` is amd64-only: `silero-vad-lite` (pinned in the
-compatibility-locked table below) publishes no aarch64 wheel, and its sdist
-hardcodes a `linux-x64` static ONNX Runtime, so an arm64 build links against the
-wrong architecture. Telephony is an optional overlay
-(`docker-compose.phone.yml`), so arm64 hosts run the rest of the platform
-normally; `OTODOCK_PHONE=0 scripts/compose.sh …` skips it in the source flow.
+Compose change is needed on either architecture; the release workflow fails
+when a tag's list lacks either one, and the release tooling verifies the pull
+of both before the release counts. The source flow (`scripts/compose.sh up -d
+--build`) builds the host's own architecture. Every Python dependency of the
+three images installs from a wheel on both (the Silero VAD model is vendored
+and runs on onnxruntime, see the compatibility-locked table below).
 
 ## Runtime binary versions
 
@@ -85,7 +83,7 @@ runtime path. Each pin documents its reason at the pin site.
 |-----|-------|-----------------|
 | `playwright==1.59.0` + `@playwright/mcp@0.0.68` | `mcps/community/camoufox/Dockerfile` | camoufox 0.4.11's Firefox launch driver needs `browserServerImpl` (playwright-core **1.60+ dropped** it), and `@playwright/mcp@0.0.68`'s MCP code lives in a nightly playwright-core (`1.59.0-alpha-…`). The Dockerfile pins `playwright==1.59.0` and **overwrites** camoufox's driver `playwright-core` with the MCP's bundled alpha core so both ends speak the same connect protocol. Newer/mismatched pairs fail to launch the browser. |
 | `cartesia>=3.2,<4.0` (lock 3.2.0) | `audio/pyproject.toml`, `phone/requirements.txt` | Cartesia 3.x exposes the public context/push API with a dict `output_format`; the old private `cartesia._types.OutputFormat` import (≤2.x) is gone and 4.x is a future break. The audio TTS provider is written against 3.x. |
-| `silero-vad-lite==0.2.1` | `audio/pyproject.toml`, `phone/requirements.txt` | Exact-pin — VAD behaviour is runtime semantics (endpointing tuning depends on it), not a stable public API. |
+| `audio/models/silero_vad.onnx` (Silero VAD v5.1.2, vendored) | `audio/models/README.md` | Not a package pin but a locked file: VAD behaviour is runtime semantics (the phone's endpointing tuning depends on these exact weights and the no-context feed in `audio/providers/vad/silero_model.py`). Swapping the model file is a tuning change; prove equivalence against the previous file, or re-tune, before shipping. |
 | Base images: `postgres:16.14-alpine`, `python:3.13.14-slim-bookworm`, `node:24.18.0-slim` | (this file) | Exact for reproducible image builds; bump deliberately, not opportunistically. |
 
 > **Per-MCP SDK version spread is expected, not drift.** Each MCP has its own

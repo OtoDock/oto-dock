@@ -120,7 +120,8 @@ def test_ami_user_snippet_minted_and_stable(client):
     assert "permit = 1.2.3.4/255.255.255.255" in boot["ami_snippet"]
 
     # minted secret landed in the credential store AND is stable on re-render
-    from storage import credential_store, phone_server_store
+    from storage.identity import credential_store
+    from storage.phone import phone_server_store
     stored = credential_store.get_infra_credentials(
         phone_server_store.ami_cred_name(sid))[phone_server_store.AMI_SECRET_KEY]
     assert stored and f"secret = {stored}" in boot["ami_snippet"]

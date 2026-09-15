@@ -7,7 +7,7 @@ Provides a single entry point for session lifecycle management.
 import logging
 from typing import TYPE_CHECKING
 
-from storage import agent_store
+from storage.agents import agent_store
 from core.execution_layer import ExecutionLayer, LayerCapabilities
 from core.layers.cli import CLIExecutionLayer
 from core.layers.direct import DirectLLMExecutionLayer

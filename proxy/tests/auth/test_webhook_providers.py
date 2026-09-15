@@ -1068,7 +1068,7 @@ def test_platform_signing_secret_reads_app_credential_slug(monkeypatch):
     from types import SimpleNamespace
     from services.mcp import mcp_registry
     from services.webhooks import webhook_dispatcher
-    from storage import credential_store
+    from storage.identity import credential_store
 
     manifest = SimpleNamespace(credentials=SimpleNamespace(
         oauth={"app_credential": "slack-oauth-app"},
@@ -1100,7 +1100,7 @@ def test_platform_signing_secret_falls_back_to_mcp_name(monkeypatch):
     from types import SimpleNamespace
     from services.mcp import mcp_registry
     from services.webhooks import webhook_dispatcher
-    from storage import credential_store
+    from storage.identity import credential_store
 
     manifest = SimpleNamespace(credentials=SimpleNamespace(oauth={}))
     monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: manifest)

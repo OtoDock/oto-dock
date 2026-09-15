@@ -121,7 +121,7 @@ def test_provider_renders_authorized_hosts():
          "username": "root", "key_name": "prod_key"},
         {"name": "", "host": "backup.lan", "username": "oto"},
     )
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         text = _ssh_hosts_context("agent")
 
     assert "## SSH Hosts" in text
@@ -151,7 +151,7 @@ def test_provider_mux_gated_by_target_os():
     from services.mcp.dynamic_context import _ssh_hosts_context
 
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         linux = _ssh_hosts_context(
             "agent", is_remote=True, target_admin_paired=True, target_os="linux")
         windows = _ssh_hosts_context(
@@ -168,10 +168,10 @@ def test_provider_mux_gated_by_target_os():
 def test_provider_silent_when_remote_or_unauthorized():
     from services.mcp.dynamic_context import _ssh_hosts_context
 
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=[]):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=[]):
         assert _ssh_hosts_context("agent") is None
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         assert _ssh_hosts_context("agent", is_remote=True) is None
 
 
@@ -190,7 +190,7 @@ def _materialize_env(tmp_path, *, assigned=True, instances=None):
         mcp_dir,
         patch("services.mcp.mcp_registry.get_manifest", return_value=manifest),
         patch("services.mcp.mcp_registry.get_agent_mcps", return_value=agent_mcps),
-        patch("storage.mcp_store.get_mcp_instances_for_agent",
+        patch("storage.mcp.mcp_store.get_mcp_instances_for_agent",
               return_value=instances or []),
     )
 
@@ -348,7 +348,7 @@ def test_provider_block_cross_links_the_tool():
     from services.mcp.dynamic_context import _ssh_hosts_context
 
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         text = _ssh_hosts_context("agent")
     assert "list_ssh_hosts" in text
 
@@ -382,7 +382,7 @@ def _endpoint_patches(instances):
     return (
         patch("services.mcp.mcp_registry.get_manifest", return_value=manifest),
         patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[manifest]),
-        patch("storage.mcp_store.get_mcp_instances_for_agent",
+        patch("storage.mcp.mcp_store.get_mcp_instances_for_agent",
               return_value=instances),
     )
 

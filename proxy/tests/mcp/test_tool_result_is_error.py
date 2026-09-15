@@ -68,7 +68,7 @@ class TestSummaryFeedsDerivation:
 
 class TestHookRequestCarriesFlag:
     def test_default_false_and_explicit_true(self):
-        from api.hooks.hooks import HookToolResultRequest
+        from api.hooks.lifecycle import HookToolResultRequest
 
         default = HookToolResultRequest(session_id="s", tool_name="t", summary="ok")
         assert default.is_error is False

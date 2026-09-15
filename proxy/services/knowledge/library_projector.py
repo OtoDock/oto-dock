@@ -12,7 +12,7 @@ fan-out) work without special cases. This module is the only writer of
 mirror content and the only mirror→source bridge.
 
 Merge base (2026-09-03): every converged (consumer, file) pair is
-remembered in ``library_mirror_state`` (``storage/db_library_mirror_state``)
+remembered in ``library_mirror_state`` (``storage/knowledge/db_library_mirror_state``)
 — the content hash + size/mtime the mirror and the source last agreed on,
 the ``sync_state`` idea applied to libraries. It is what turns a bare
 "the mirror lacks this file" into one of three things:
@@ -87,8 +87,10 @@ import shutil
 import time
 from pathlib import Path
 
-from storage import db_knowledge_libraries, db_library_mirror_state, recover_bin_store
-from storage.db_knowledge_libraries import subtree_covers
+from storage.knowledge import db_knowledge_libraries
+from storage.knowledge import db_library_mirror_state
+from storage.files import recover_bin_store
+from storage.knowledge.db_knowledge_libraries import subtree_covers
 from services.infra.path_confinement import join_under, safe_agent_dir
 
 logger = logging.getLogger("claude-proxy.knowledge-libraries")

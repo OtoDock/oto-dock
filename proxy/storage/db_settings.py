@@ -56,7 +56,7 @@ def seed_platform_timezone_if_unset() -> None:
         # Only a GENUINELY fresh install (no users yet) — never retroactively
         # change an EXISTING install whose tz setting merely defaulted to UTC
         # (e.g. the live box on its next restart). "On installation" = no users.
-        from storage.db_users import count_users
+        from storage.identity.db_users import count_users
         if count_users() > 0:
             return
         import tzlocal

@@ -34,12 +34,12 @@ from auth.providers import UserContext, get_current_user, mask_email, require_ad
 from services.media import audio_service
 from services.media import wake_keywords
 from services.media import ws_audio_token
-from storage import audio_provider_store
-from storage import credential_store
+from storage.prefs import audio_provider_store
+from storage.identity import credential_store
 from storage import database as task_store
-from storage import user_audio_prefs_store
-from storage import user_ui_prefs_store
-from storage.audio_provider_store import (
+from storage.prefs import user_audio_prefs_store
+from storage.prefs import user_ui_prefs_store
+from storage.prefs.audio_provider_store import (
     CREDENTIAL_INNER_KEY as AUDIO_CREDENTIAL_KEY,
     ProviderDefaultDisabledError,
 )

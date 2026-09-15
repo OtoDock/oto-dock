@@ -13,6 +13,9 @@ import { hydrateLastInteractiveFromServer } from '../store/agentPrefsStore'
 export interface UiPrefs {
   // agent slug → 'interactive' | '-p'
   last_execution_mode?: Record<string, string>
+  // Owner notifications at 90% and 100% of a connected account's weekly
+  // window (absent = on).
+  subscription_usage_alerts?: boolean
   [key: string]: unknown
 }
 

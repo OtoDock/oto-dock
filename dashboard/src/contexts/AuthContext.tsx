@@ -3,6 +3,7 @@ import { type User, type AuthConfig, fetchCurrentUser, fetchAuthConfig, startLog
 import { useChatStore } from '../store/chatStore'
 import { useAgentPrefsStore, migrateAgentPrefsToUser } from '../store/agentPrefsStore'
 import { migrateAudioPrefsToUser } from '../store/audioPrefsStore'
+import { setWakeDiag } from '../audio/wakeDiag'
 
 interface AuthContextValue {
   user: User | null
@@ -75,6 +76,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // machine doesn't inherit them. Theme stays (display preference).
     try { useChatStore.persist.clearStorage() } catch { /* ignore */ }
     try { useAgentPrefsStore.persist.clearStorage() } catch { /* ignore */ }
+    // The wake-word diagnostics recorder is a per-tab switch: it ends with
+    // the session, never with the next user's sign-in.
+    try { setWakeDiag(false) } catch { /* ignore */ }
     doLogout()
   }, [])
 

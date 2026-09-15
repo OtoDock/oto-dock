@@ -56,7 +56,7 @@ def _create_dynamic_task(*, task_id="task-1", agent="support-bot",
 
 def _create_notification(*, nid="notif-1", schedule=None, run_at=None,
                          notification_type="recurring", user_tz=None):
-    from storage import notification_store
+    from storage.automation import notification_store
     return notification_store.create_notification(
         notification_id=nid,
         title="Test",
@@ -180,7 +180,7 @@ def test_create_dynamic_task_persists_user_tz(temp_db):
 
 
 def test_create_notification_persists_user_tz(temp_db):
-    from storage import notification_store
+    from storage.automation import notification_store
     _create_notification(nid="notif-tz", schedule="0 9 * * *",
                          user_tz="Asia/Tokyo")
     row = notification_store.get_notification("notif-tz")
@@ -201,7 +201,7 @@ def test_update_dynamic_task_can_change_user_tz(temp_db):
 
 
 def test_update_notification_can_change_user_tz(temp_db):
-    from storage import notification_store
+    from storage.automation import notification_store
     _create_notification(nid="notif-edit-tz", schedule="0 9 * * *",
                          user_tz="America/New_York")
     ok = notification_store.update_notification(

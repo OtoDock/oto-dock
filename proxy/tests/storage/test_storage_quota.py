@@ -10,7 +10,8 @@ identity, limits, allocation, measurement, and preflight gating.
 import config
 import pytest
 from services.infra import storage_quota as sq
-from storage import agent_store, database
+from storage.agents import agent_store
+from storage import database
 from storage.pg import get_conn
 
 

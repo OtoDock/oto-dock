@@ -906,3 +906,89 @@ class TestProviderBreakdown:
         by_provider = {(b["provider"], b["model"]): b["cost"] for b in ag["breakdown"]}
         assert by_provider[("anthropic", "claude-opus-4-1")] == 3.0
         assert by_provider[("image-gen", "gpt-image")] == 0.5
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The user's own dollar cap on their own API keys (limit_type='user_self')
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _own_sub(user_sub, auth_type, layer="claude-code-cli"):
+    from storage.billing import subscription_store
+    return subscription_store.add_subscription(
+        layer, "anthropic", auth_type, owner_sub=user_sub,
+        credential_data={"api_key": "k"} if auth_type == "api_key" else None,
+    )["id"]
+
+
+def _rec_on(user_sub, sub_id, cost):
+    return task_store.insert_usage_record(
+        user_sub, "a", "user", "chat", "c", cost, source_key=sub_id, message_count=1,
+    )
+
+
+class TestOwnApiKeyCap:
+    def test_self_api_key_basis_counts_own_keys_only(self, temp_db):
+        key = _own_sub("user-viewer", "api_key")
+        oauth = _own_sub("user-viewer", "oauth")
+        _rec_on("user-viewer", key, 3.0)
+        _rec_on("user-viewer", oauth, 5.0)
+        _rec_platform("user-viewer", 7.0)
+        agg = task_store.get_usage_aggregated(user_sub="user-viewer", scope="user",
+                                              basis="self_api_key")
+        assert agg["total_cost"] == 3.0
+        assert task_store.get_usage_aggregated(
+            user_sub="user-viewer", scope="user", basis="self")["total_cost"] == 8.0
+
+    def test_user_self_limit_has_no_role_fallback(self, temp_db):
+        task_store.upsert_usage_limit("role_default", "member", "monthly", 1.0, "admin")
+        key = _own_sub("user-viewer", "api_key")
+        _rec_on("user-viewer", key, 9.0)
+        r = usage_service.check_user_limit("user-viewer", "member")
+        # The role limit gates platform-paid spend only: own-key spend is 0 there.
+        assert r["allowed"] and r["periods"]["monthly"]["used"] == 0
+        assert r["periods"]["self"] == {"monthly": None, "weekly": None}
+
+    def test_own_cap_blocks_and_warns_on_own_key_spend(self, temp_db):
+        task_store.upsert_usage_limit("user_self", "user-viewer", "monthly", 10.0, "user-viewer")
+        key = _own_sub("user-viewer", "api_key")
+        _rec_on("user-viewer", key, 8.5)
+        r = usage_service.check_user_limit("user-viewer", "member")
+        assert r["allowed"] and r["warning"]
+        assert r["periods"]["self"]["monthly"]["percent"] == 85.0
+        assert r["periods"]["monthly"] is None
+        _rec_on("user-viewer", key, 2.0)
+        r = usage_service.check_user_limit("user-viewer", "member")
+        assert not r["allowed"]
+        assert r["periods"]["self"]["monthly"]["used"] == 10.5
+
+    def test_own_cap_ignores_own_oauth_and_borrowed_spend(self, temp_db):
+        task_store.upsert_usage_limit("user_self", "user-viewer", "weekly", 1.0, "user-viewer")
+        oauth = _own_sub("user-viewer", "oauth")
+        _rec_on("user-viewer", oauth, 50.0)
+        _rec_platform("user-viewer", 50.0)
+        r = usage_service.check_user_limit("user-viewer", "member")
+        assert r["allowed"] and not r["warning"]
+        assert r["periods"]["self"]["weekly"]["used"] == 0
+
+    def test_summary_reports_self_limits(self, temp_db):
+        key = _own_sub("user-viewer", "api_key")
+        _rec_on("user-viewer", key, 2.5)
+        s = usage_service.get_user_summary("user-viewer", "member")
+        assert s["self_limits"]["monthly"] == {
+            "limit": None, "used": 2.5, "percent": 0,
+            "start": s["monthly"]["start"], "end": s["monthly"]["end"]}
+        task_store.upsert_usage_limit("user_self", "user-viewer", "monthly", 5.0, "user-viewer")
+        s = usage_service.get_user_summary("user-viewer", "member")
+        assert s["self_limits"]["monthly"]["limit"] == 5.0
+        assert s["self_limits"]["monthly"]["percent"] == 50.0
+        assert s["self_limits"]["weekly"]["limit"] is None
+
+    def test_delete_limits_for_target(self, temp_db):
+        task_store.upsert_usage_limit("user_self", "u", "monthly", 5.0, "u")
+        task_store.upsert_usage_limit("user_self", "u", "weekly", 2.0, "u")
+        task_store.upsert_usage_limit("user_self", "v", "weekly", 2.0, "v")
+        assert task_store.delete_usage_limits_for_target("user_self", "u") == 2
+        assert task_store.get_usage_limits_for_target("user_self", "u") == []
+        assert len(task_store.get_usage_limits_for_target("user_self", "v")) == 1
+        assert task_store.delete_usage_limits_for_target("user_self", "u") == 0

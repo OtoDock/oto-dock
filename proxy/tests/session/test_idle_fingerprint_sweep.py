@@ -40,7 +40,7 @@ async def test_sweep_triggers_only_changed_idle_tracked(monkeypatch):
     layer = RemoteExecutionLayer(cm)
 
     monkeypatch.setattr(
-        "storage.sync_state_store.agents_for_machine",
+        "storage.files.sync_state_store.agents_for_machine",
         lambda mid: {"a-changed", "a-unchanged", "a-active"},  # a-untracked absent
     )
     monkeypatch.setattr(
@@ -73,7 +73,7 @@ async def test_sweep_noop_when_no_fingerprints(monkeypatch):
     layer = RemoteExecutionLayer(cm)
     called = {"n": 0}
     monkeypatch.setattr(
-        "storage.sync_state_store.agents_for_machine",
+        "storage.files.sync_state_store.agents_for_machine",
         lambda mid: called.__setitem__("n", called["n"] + 1) or {"x"},
     )
     monkeypatch.setattr(layer, "_idle_fingerprint_sync_one", AsyncMock())

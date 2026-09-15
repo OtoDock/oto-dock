@@ -22,7 +22,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 # onnxruntime (Smart Turn + Silero VAD) needs libgomp at runtime; curl for the
-# healthcheck. silero-vad-lite ships a manylinux cp312 wheel — no build tools.
+# healthcheck. Every Python dep installs from a wheel on amd64 and arm64 — no
+# build tools.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 \
  && rm -rf /var/lib/apt/lists/*
@@ -38,7 +39,8 @@ RUN python -m venv /opt/otodock/phone/venv \
 # The `audio` package WITH the on-box [localmodels] stack (Silero VAD + Smart Turn
 # ONNX/transformers) — an editable local package whose deps are already pinned in
 # requirements.txt above but which is itself installed here (mirrors how the proxy
-# installs the lean core). Includes the VENDORED models/ (no runtime HF download).
+# installs the lean core). Includes the VENDORED models/ (both ONNX models; no
+# runtime download).
 # Its own dir for layer caching.
 COPY audio/ /opt/otodock/audio/
 RUN /opt/otodock/phone/venv/bin/pip install -e "/opt/otodock/audio[localmodels]"

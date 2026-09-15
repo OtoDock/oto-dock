@@ -10,7 +10,7 @@ from services.notifications import notification_manager as nm
 
 
 def _agent(monkeypatch, rows: dict):
-    from storage import agent_store
+    from storage.agents import agent_store
 
     def _get(slug):
         return rows.get(slug)
@@ -59,7 +59,7 @@ def test_push_title_skips_prefix_when_title_already_names_the_agent(monkeypatch)
 
 
 def test_push_title_survives_store_errors(monkeypatch):
-    from storage import agent_store
+    from storage.agents import agent_store
 
     def boom(_slug):
         raise RuntimeError("db down")

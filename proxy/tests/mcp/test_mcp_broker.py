@@ -105,7 +105,7 @@ def test_verify_rejects_missing_claims():
 # ── endpoint: cap-token-only, mcp-derived-from-token ───────────────────────
 
 def _call(authorization):
-    from api.hooks.hooks import hook_mcp_credentials
+    from api.hooks.permission import hook_mcp_credentials
     return asyncio.run(hook_mcp_credentials(authorization=authorization))
 
 

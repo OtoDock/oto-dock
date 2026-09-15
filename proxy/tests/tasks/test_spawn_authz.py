@@ -15,7 +15,8 @@ from fastapi import HTTPException
 
 from auth.providers import UserContext
 from services.delegation.spawn_authz import authorize_spawn
-from storage import agent_store, mcp_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 
 
@@ -284,7 +285,7 @@ class TestValidateSpawnOverrides:
             lambda slug: {"execution_path": path, "execution_paths": extras})
 
     def _models(self, monkeypatch, rows):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
                             lambda layer=None: rows)
 
@@ -312,7 +313,7 @@ class TestValidateSpawnOverrides:
 
     def test_registry_error_fails_open(self, monkeypatch):
         from services.delegation.spawn_authz import validate_spawn_overrides
-        from storage import subscription_store
+        from storage.billing import subscription_store
 
         def _boom(layer=None):
             raise RuntimeError("db down")

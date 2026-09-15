@@ -181,7 +181,7 @@ def local_model_rows_json(provider: str) -> str:
     runs under ``asyncio.to_thread``)."""
     rows: list[list] = []
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models(layer="codex-cli"):
             if (m.get("provider") or "") == (provider or "") and m.get("model_id"):
                 rows.append([m["model_id"], int(m.get("context_window") or 0)])

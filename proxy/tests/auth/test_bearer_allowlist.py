@@ -9,7 +9,7 @@ functions exercised with synthetic inputs.
 import uuid
 import pytest
 
-from storage import bearer_allowlist
+from storage.identity import bearer_allowlist
 from services.mcp import mcp_registry
 
 

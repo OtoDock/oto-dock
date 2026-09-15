@@ -10,7 +10,7 @@ vi.mock('@/lib/uploadWithProgress', () => ({
   uploadWithProgress: (...args: unknown[]) => uploadMock(...args),
 }))
 
-import { enqueueChatUpload, dequeueChatUpload, chatUploadQueueSize } from '@/lib/chatUploadQueue'
+import { enqueueChatUpload, dequeueChatUpload, chatUploadQueueSize, chatUploadActive } from '@/lib/chatUploadQueue'
 import { useChatStore } from '@/store/chatStore'
 import { useTransferStore } from '@/store/transferStore'
 
@@ -45,6 +45,23 @@ describe('chatUploadQueue', () => {
     useChatStore.setState({ byChat: {} })
     useTransferStore.setState({ byId: {} })
     uploadMock.mockReset()
+  })
+
+  it('reports an upload as active while its only entry is on the wire', async () => {
+    // The queue is empty the moment its single file starts uploading; the
+    // reload-on-new-build deferral must still see the running one.
+    let resolveUpload!: (v: unknown) => void
+    uploadMock.mockImplementation(() => new Promise((res) => { resolveUpload = res }))
+    const f = makeFile('one.bin', 10)
+    const a = addPending('chat1', 'fo', f)
+    expect(chatUploadActive()).toBe(false)
+    enqueueChatUpload({ fileId: 'fo', file: f, agent: 'ag', abort: a })
+    await flush()
+    expect(chatUploadQueueSize()).toBe(0)
+    expect(chatUploadActive()).toBe(true)
+    resolveUpload(resp('p/one.bin', 'one.bin', 10, 't1'))
+    await flush()
+    expect(chatUploadActive()).toBe(false)
   })
 
   it('serializes uploads: the second starts only after the first resolves', async () => {

@@ -39,7 +39,7 @@ def _admin_cookie() -> dict[str, str]:
 
 
 def _seed_agent(slug: str, *, default_scope: str = "user") -> None:
-    from storage import agent_store
+    from storage.agents import agent_store
     if not agent_store.agent_exists(slug):
         agent_store.create_agent(
             slug, slug.replace("-", " ").title(),
@@ -352,7 +352,7 @@ def test_agent_scope_session_no_user_memory(client):
 def test_agent_toggle_disables_scope(client):
     _seed_agent("acme")
     _assign_role("user-manager", "acme", "manager")
-    from storage import memory_store
+    from storage.agents import memory_store
     memory_store.set_agent_toggle("acme", "agent_memory_enabled", False)
     h = _headers("s-17", "acme", "user-manager")
     r = _op(
@@ -370,7 +370,7 @@ def test_agent_toggle_disables_scope(client):
 def test_both_toggles_off_memory_disabled(client):
     _seed_agent("acme")
     _assign_role("user-manager", "acme", "manager")
-    from storage import memory_store
+    from storage.agents import memory_store
     memory_store.update_settings(
         user_memory_enabled=False, agent_memory_enabled=False,
     )

@@ -484,7 +484,7 @@ def _derive_mcp_display_info(mcp_names: set[str]) -> dict[str, dict]:
     row, so the 200-row admin listing stays two queries deep. Synchronous;
     call via ``asyncio.to_thread``."""
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     info: dict[str, dict] = {}
     for name in mcp_names:
@@ -516,7 +516,7 @@ def _augment_request_row(row: dict, mcp_info: dict[str, dict]) -> dict:
     - ``instance_count`` — how many instances exist for the MCP (drives the
       dashboard's selector-vs-create-guidance choice without an extra call).
     """
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
 
     out = {
         **row,
@@ -622,7 +622,8 @@ async def create_mcp_request(
 
     # Short-circuit when the MCP is already enabled on the agent — no need to
     # bother the admin.
-    from storage import mcp_store, mcp_request_store
+    from storage.mcp import mcp_store
+    from storage.mcp import mcp_request_store
     current = await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, slug)
     if body.mcp_name in current:
         raise HTTPException(409, f"{body.mcp_name} is already enabled on {slug}")
@@ -675,7 +676,7 @@ async def list_agent_mcp_requests(
     if not user.can_manage_agent(slug):
         raise HTTPException(403, "Manager access required for this agent")
 
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     requested_by = None if user.role == "admin" else user.sub
     rows = await asyncio.to_thread(
         mcp_request_store.list_requests_for_agent, slug, requested_by,
@@ -709,7 +710,7 @@ async def list_admin_mcp_requests(
 ) -> dict:
     """All requests across all agents. Admin only."""
     _require_admin(user)
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     if open_only:
         rows = await asyncio.to_thread(mcp_request_store.list_open_requests)
     else:
@@ -848,7 +849,8 @@ async def preview_community_agent_install(
     _require_creator_or_admin(user)
     from services.community import community_agents_catalog
     from services.mcp import mcp_registry
-    from storage import agent_store, mcp_store
+    from storage.agents import agent_store
+    from storage.mcp import mcp_store
 
     try:
         registry = await community_agents_catalog.fetch_registry()
@@ -963,7 +965,8 @@ async def admin_reseed_template_items(
     Admin only.
     """
     _require_admin(user)
-    from storage import agent_store, database as user_store
+    from storage.agents import agent_store
+    from storage import database as user_store
     from services.community import community_agent_installer
 
     if not await asyncio.to_thread(agent_store.agent_exists, slug):

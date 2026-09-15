@@ -1,3 +1,5 @@
+import { Link } from 'react-router-dom'
+
 interface Props {
   subtype: string
   agentName?: string
@@ -83,6 +85,21 @@ export default function SystemEvent({
       <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
         <div className="font-medium">Subscription required</div>
         {message && <div className="mt-1 opacity-90">{message}</div>}
+      </div>
+    )
+  }
+
+  // The pool's subscription cap refused the spawn (the proxy's wording says
+  // which cap and where it is set). Amber: a limit the user or an admin
+  // chose, not a crash.
+  if (subtype === 'pool_cap') {
+    return (
+      <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
+        <div className="font-medium">Subscription cap reached</div>
+        {message && <div className="mt-1 opacity-90">{message}</div>}
+        <div className="mt-1 text-xs">
+          <Link to="/user-settings?tab=usage" className="underline hover:no-underline">Open the Usage tab</Link>
+        </div>
       </div>
     )
   }

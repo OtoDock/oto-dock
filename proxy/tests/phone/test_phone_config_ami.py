@@ -8,7 +8,8 @@ the phone daemon's outbound Originate gets an empty host → DNS failure.
 from __future__ import annotations
 
 from services.phone.phone_config import assemble_phone_config
-from storage import credential_store, phone_server_store
+from storage.identity import credential_store
+from storage.phone import phone_server_store
 
 
 def test_ami_host_falls_back_to_server_host(temp_db):

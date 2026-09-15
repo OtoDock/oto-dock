@@ -43,7 +43,8 @@ class OtodockSessionError(Exception):
 async def _owner_for_machine(machine_id: str):
     """Resolve + validate the machine owner. Returns ``(machine, owner_sub, owner)``
     or raises :class:`OtodockSessionError` with a user-facing reason."""
-    from storage import remote_store, database as db
+    from storage import remote_store
+    from storage import database as db
     machine = await asyncio.to_thread(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise OtodockSessionError("this machine is not paired with the platform")
@@ -85,7 +86,8 @@ def _model_for_path(agent: str, execution_path: str, requested: str) -> str:
 
 async def _owner_role_for_agent(owner_sub: str, owner: dict, agent: str) -> str:
     """The owner's effective role on ``agent`` (admins → 'admin'); '' = no access."""
-    from storage import database as db, agent_store
+    from storage import database as db
+    from storage.agents import agent_store
     if not await asyncio.to_thread(agent_store.get_agent, agent):
         raise OtodockSessionError(f"agent '{agent}' not found")
     if owner.get("role") == "admin":
@@ -189,7 +191,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     :class:`OtodockSessionError` with a user-facing reason on any authz/validation
     failure (the caller relays it). Other exceptions bubble as internal errors."""
     from storage import database as db
-    from core.config.config_builder import build_agent_config
+    from core.config.config_builder import build_agent_config, release_config_seat
     from core.session.session_manager import get_execution_layer
     from core.concurrency import acquire_chat_slot, release_chat_slot
     from core.session import interactive_session
@@ -361,7 +363,9 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
         raise
 
     # Must run on THIS machine — refuse rather than silently spawn elsewhere.
+    # (Each refusal below also returns the pool seat the build acquired.)
     if (agent_cfg.execution_target or "local") != machine_id:
+        release_config_seat(session_id, agent_cfg)
         await _cleanup_chat()
         raise OtodockSessionError(
             "could not target this machine for the session (check the agent's "
@@ -371,6 +375,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
 
     adm = await acquire_chat_slot(session_id, target=machine_id)
     if not adm:
+        release_config_seat(session_id, agent_cfg)
         await _cleanup_chat()
         raise OtodockSessionError(adm.user_message)
     try:
@@ -381,6 +386,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
         await layer.start_session(session_id, agent_cfg)
     except Exception:
         release_chat_slot(session_id)
+        release_config_seat(session_id, agent_cfg)
         await _cleanup_chat()
         raise
 

@@ -9,7 +9,7 @@ import jwt
 import pyotp
 
 import config
-from storage.credential_store import _encrypt, _decrypt
+from storage.identity.credential_store import _encrypt, _decrypt
 
 
 def generate_totp_secret() -> str:

@@ -1,4 +1,4 @@
-"""Meeting-aware hook routing — ``api.hooks.hooks.resolve_hook_route``.
+"""Meeting-aware hook routing — ``api.hooks.routing.resolve_hook_route``.
 
 Meeting participants run their own CLI sessions but stream through the
 MEETING's pump (session ``meeting-<id>``) into the parent chat, while every
@@ -96,7 +96,7 @@ async def test_hook_chat_id_falls_back_to_session_chat_row(temp_db):
 
 
 def test_tool_result_hook_routes_to_meeting_pump_queue(meeting_participant):
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.lifecycle.verify_session_match"):
         resp = client.post(
             "/v1/hooks/tool-result",
             json={"session_id": meeting_participant, "tool_name": "Bash",
@@ -112,7 +112,7 @@ def test_tool_result_hook_routes_to_meeting_pump_queue(meeting_participant):
 
 
 def test_images_hook_routes_to_meeting_pump_queue(meeting_participant):
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match"):
         resp = client.post(
             "/v1/hooks/images",
             json={"session_id": meeting_participant,
@@ -126,7 +126,7 @@ def test_images_hook_routes_to_meeting_pump_queue(meeting_participant):
 
 
 def test_url_hook_identity_for_normal_session():
-    with patch("api.hooks.hooks.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match"):
         resp = client.post(
             "/v1/hooks/url",
             json={"session_id": "plain-sess-url", "url": "https://x", "title": "t"},
@@ -149,8 +149,8 @@ def test_subagent_stop_resolves_to_parent_chat(meeting_participant, temp_db):
         "session_id": "meeting-m1",
         "active_agents": [{"tool_use_id": "tu-ag1", "active": True}],
     }
-    with patch("api.hooks.hooks.verify_session_match"), \
-         patch("api.hooks.hooks.push_pump_event", return_value=True) as push:
+    with patch("api.hooks.lifecycle.verify_session_match"), \
+         patch("api.hooks.lifecycle.push_pump_event", return_value=True) as push:
         resp = client.post(
             "/v1/hooks/subagent",
             json={"session_id": meeting_participant, "agent_id": "ag1"},

@@ -5,7 +5,7 @@ Background
 ----------
 When users A and B run sessions for the same agent on DIFFERENT satellites, an
 edit on A's machine only reached B's machine at B's next session start
-(``core/remote/remote_execution.py::_initial_workspace_sync``). This module closes that
+(``core/remote/remote_workspace_sync.py::_initial_workspace_sync``). This module closes that
 gap: every authorized platform-side workspace write — the per-turn ``file_changed``
 applier (``core/remote/satellite_connection.py``), dashboard file-API edits + uploads,
 Collabora saves (``api/media/wopi.py``) and file-tools writes (``push_back`` +
@@ -233,7 +233,7 @@ async def idle_connected_targets(
         from core.remote.file_sync import should_sync_to_target
         from core.remote.satellite_connection import get_connection_manager
         from core.session.session_manager import _get_remote_layer
-        from storage import sync_state_store
+        from storage.files import sync_state_store
 
         # Same shared-only users/ exclusion as fanout_targets.
         if rel_path.startswith("users/"):
@@ -402,7 +402,7 @@ async def fan_out_write(
         import hashlib
         import config as _cfg
         from core.remote import file_sync as _file_sync
-        from storage import sync_state_store
+        from storage.files import sync_state_store
         if isinstance(source, (bytes, bytearray)):
             content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
         else:
@@ -460,7 +460,7 @@ async def fan_out_delete(
     if not machines:
         return
     from core.remote.satellite_connection import get_connection_manager
-    from storage import sync_state_store
+    from storage.files import sync_state_store
     cm = get_connection_manager()
     for mid in machines:
         try:
@@ -525,7 +525,7 @@ async def propagate_write(
     bytes directly, not a pull from a satellite):
       * **Collabora save** — ``api/media/wopi.py::wopi_put_file`` (Collabora already
         live-merged concurrent human editors → ``content`` IS the merged result);
-      * **file-tools on a LOCAL session** — ``api/hooks/hooks.py::hook_file_written``
+      * **file-tools on a LOCAL session** — ``api/hooks/lifecycle.py::hook_file_written``
         local branch (the Docker MCP wrote the platform agent dir directly; we
         re-publish those bytes atomically + fan them out to remote satellites).
 
@@ -552,7 +552,8 @@ async def propagate_write(
         # Versioned-sync bookkeeping: the path is live again (retire any tombstone)
         # and ``writer`` (the editing user's slug, if known) becomes its author for
         # cross-user conflict attribution. Best-effort.
-        from storage import file_tombstones_store, file_author_store
+        from storage.files import file_tombstones_store
+        from storage.files import file_author_store
         await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
         if writer:
             await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)

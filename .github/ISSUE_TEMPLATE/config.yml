@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or help with an install
+    url: https://github.com/OtoDock/oto-dock/discussions/categories/q-a
+    about: Ask in Discussions. Bug reports and feature requests stay here as issues.
+  - name: Security vulnerability
+    url: https://github.com/OtoDock/oto-dock/security/advisories/new
+    about: Report it privately. It reaches the maintainer alone; SECURITY.md says what is in scope and the response time.
+  - name: Documentation
+    url: https://docs.otodock.io
+    about: Installation, upgrading, remote machines, MCPs and administration.

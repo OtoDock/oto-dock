@@ -51,7 +51,7 @@ def _create_one_time_task(task_id="task-onetime", agent="support-bot",
 
 def _create_notification(nid="notif-1", schedule="*/10 * * * *",
                           notification_type="recurring", run_at=None):
-    from storage import notification_store
+    from storage.automation import notification_store
     return notification_store.create_notification(
         notification_id=nid,
         title="Test",
@@ -169,7 +169,7 @@ class TestSchedulerPauseResume:
 class TestNotificationPauseResume:
     def test_pause_flips_flag(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-pause")
         ok = asyncio.run(notification_manager.pause_notification("notif-pause"))
@@ -178,7 +178,7 @@ class TestNotificationPauseResume:
 
     def test_resume_flips_flag(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-resume")
         notification_store.set_notification_enabled("notif-resume", False)
@@ -200,7 +200,7 @@ class TestNotificationPauseResume:
     def test_resume_one_time_past_run_at(self, temp_db):
         """Resuming a past one-time notification keeps it enabled but doesn't fire."""
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         _create_notification(
@@ -218,7 +218,7 @@ class TestNotificationPauseResume:
 
     def test_delete_hard_removes_row(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-del")
         assert notification_store.get_notification("notif-del") is not None
@@ -236,7 +236,7 @@ class TestNotificationPauseResume:
 class TestNotificationListAndFire:
     def test_list_default_includes_paused(self, temp_db):
         """list_notifications now defaults to enabled_only=False — paused rows show."""
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-active")
         _create_notification("notif-paused")
@@ -248,7 +248,7 @@ class TestNotificationListAndFire:
         assert "notif-paused" in ids
 
     def test_list_enabled_only_excludes_paused(self, temp_db):
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-a2")
         _create_notification("notif-b2")
@@ -262,7 +262,7 @@ class TestNotificationListAndFire:
     def test_fire_scheduled_short_circuits_on_paused(self, temp_db):
         """Defence-in-depth: paused notifications never fire even if a stale job triggers."""
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-fire")
         notification_store.set_notification_enabled("notif-fire", False)
@@ -300,7 +300,7 @@ class TestOneTimeAutoCleanup:
         notification_deliveries are independent and remain.
         """
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
         from datetime import datetime, timezone
 
         # Seed a target user so resolve_targets has someone to deliver to
@@ -335,7 +335,7 @@ class TestOneTimeAutoCleanup:
     def test_recurring_kept_after_fire(self, temp_db):
         """A recurring notification stays in the DB after firing — only fired_count bumps."""
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
         from datetime import datetime, timezone
 
         # Seed a target user
@@ -552,7 +552,7 @@ class TestEditTask:
 class TestEditNotification:
     def test_edit_title_only_no_reschedule(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-edit-title")
 
@@ -567,7 +567,7 @@ class TestEditNotification:
 
     def test_edit_schedule_changes_db(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         _create_notification("notif-edit-sched")
         ok, err = asyncio.run(
@@ -581,7 +581,7 @@ class TestEditNotification:
 
     def test_switch_to_one_time_clears_schedule_and_sets_type(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
         from datetime import datetime, timedelta, timezone
 
         _create_notification("notif-switch")
@@ -600,7 +600,7 @@ class TestEditNotification:
 
     def test_switch_to_recurring_clears_run_at_and_sets_type(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
         from datetime import datetime, timedelta, timezone
 
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()

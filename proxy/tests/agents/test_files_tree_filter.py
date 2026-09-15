@@ -96,7 +96,7 @@ def _make_app(tmp_path, monkeypatch, *, role: str, username: str = "jim",
     import config
     from api.agents import agents
     from auth.providers import UserContext, get_current_user
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
 
     agents_dir = tmp_path / "agents"

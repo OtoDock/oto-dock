@@ -13,7 +13,7 @@ import re
 
 import config
 from core.config import deployment
-from storage import mcp_store
+from storage.mcp import mcp_store
 from services.mcp.mcp_manifest_types import McpManifest
 
 logger = logging.getLogger(__name__)

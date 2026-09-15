@@ -25,7 +25,8 @@ from services.billing import usage_service
 from services.infra import external_retention
 from services.phone.phone_identity import pop_call_identity
 from storage import database as task_store
-from storage import phone_call_log_store, phone_route_store
+from storage.phone import phone_call_log_store
+from storage.phone import phone_route_store
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()

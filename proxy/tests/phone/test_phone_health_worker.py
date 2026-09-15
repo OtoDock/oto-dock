@@ -47,7 +47,8 @@ def _make_fake(phone_adapters, dids, healthy=True):
 
 
 def _setup_verified_server_with_route(did="+30210"):
-    from storage import phone_route_store, phone_server_store
+    from storage.phone import phone_route_store
+    from storage.phone import phone_server_store
 
     s = phone_server_store.create_server({"name": "pbx", "adapter_type": "asterisk_manual"})
     phone_server_store.update_server(s["id"], {"bootstrap_status": "verified"})
@@ -60,7 +61,7 @@ def _setup_verified_server_with_route(did="+30210"):
 
 def test_health_persisted(temp_db, monkeypatch):
     from services.phone import phone_adapters, phone_health_worker
-    from storage import phone_server_store
+    from storage.phone import phone_server_store
 
     sid = _setup_verified_server_with_route()
     monkeypatch.setattr(phone_adapters, "load_adapter",
@@ -74,7 +75,7 @@ def test_health_persisted(temp_db, monkeypatch):
 
 def test_drift_detected(temp_db, monkeypatch):
     from services.phone import phone_adapters, phone_health_worker
-    from storage import phone_server_store
+    from storage.phone import phone_server_store
 
     sid = _setup_verified_server_with_route("+30210")
     # PBX reports a different DID set → drift.
@@ -88,7 +89,7 @@ def test_drift_detected(temp_db, monkeypatch):
 
 def test_matching_routes_no_drift(temp_db, monkeypatch):
     from services.phone import phone_adapters, phone_health_worker
-    from storage import phone_server_store
+    from storage.phone import phone_server_store
 
     sid = _setup_verified_server_with_route("+30210")
     monkeypatch.setattr(phone_adapters, "load_adapter",
@@ -99,7 +100,7 @@ def test_matching_routes_no_drift(temp_db, monkeypatch):
 
 def test_untracked_adapter_no_drift(temp_db, monkeypatch):
     from services.phone import phone_adapters, phone_health_worker
-    from storage import phone_server_store
+    from storage.phone import phone_server_store
 
     sid = _setup_verified_server_with_route("+30210")
     # list_provisioned_routes returns None → drift untracked, stays verified.

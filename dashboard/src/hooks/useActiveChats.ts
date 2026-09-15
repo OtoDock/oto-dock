@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { fetchActiveChats, type ActiveChat } from '../api/chats'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { fetchActiveChats, type ActiveChat, type Chat } from '../api/chats'
 import { useChatStore, NEW_CHAT_PREFIX, type ChatStreamPhase } from '../store/chatStore'
 
 // One row of the cross-agent "Active now" widget (sidebar + agent home).
@@ -40,6 +40,14 @@ const RESEED_MAX_ATTEMPTS = 4
 // ['active-chats'] cache — per-mount maps would multiply the per-id cap by
 // the mount census. Exported for tests only.
 export const _reseedAttempts = new Map<string, { count: number; lastAt: number }>()
+// The phase an id's attempts were spent in. A phase TRANSITION (a new
+// activity episode, warming → streaming, a re-open after finished) is new
+// evidence that the server's active set changed, so the cap resets: the old
+// lifetime cap burned all four attempts while the backend had not yet seen an
+// interactive turn open (the CLI journals late) and the row then read "New
+// chat" until an unrelated refetch — even after the turn was answered
+// (operator screenshots, 2026-09-10).
+export const _reseedPhases = new Map<string, string>()
 
 /** Live cross-agent active-chats feed.
  *
@@ -61,6 +69,7 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
     enabled,
   })
   const byChat = useChatStore((s) => s.byChat)
+  const queryClient = useQueryClient()
 
   // (id, phase) pairs the store says are live right now. New-chat draft
   // slices (no real chat id yet) are skipped.
@@ -110,6 +119,14 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
   // by the module-scoped attempt map above.
   useEffect(() => {
     if (!enabled) return
+    for (const [id, phase] of activePairs) {
+      if (_reseedPhases.get(id) !== phase) {
+        _reseedPhases.set(id, phase)
+        const rec = _reseedAttempts.get(id)
+        // Fresh cap, same spacing: a transition must not fire a burst.
+        if (rec) _reseedAttempts.set(id, { count: 0, lastAt: rec.lastAt })
+      }
+    }
     const attempt = () => {
       const now = Date.now()
       let due = false
@@ -167,13 +184,22 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
     const now = Date.now()
     const rows: ActiveChatRow[] = []
     const shown = new Set<string>()
+    // Title fallback: a chat the client already lists (any agent's cached
+    // chat list) keeps its title while the seed has no row for it — the seed
+    // lists only chats whose turn the BACKEND sees open, and an interactive
+    // turn the CLI has not journaled yet is invisible there.
+    const cachedTitles = new Map<string, string>()
+    for (const [, list] of queryClient.getQueriesData<Chat[]>({ queryKey: ['chats'] })) {
+      if (!Array.isArray(list)) continue
+      for (const c of list) if (c?.id && c.title) cachedTitles.set(c.id, c.title)
+    }
     const add = (id: string, phase: ActiveChatRow['phase']) => {
       const meta = metaById.get(id)
       const agent = meta?.agent || byChat[id]?.agent || ''
       if (!agent) return // nothing renderable yet; the re-seed will supply it
       shown.add(id)
       rows.push({
-        id, agent, title: meta?.title || 'New chat', phase,
+        id, agent, title: meta?.title || cachedTitles.get(id) || 'New chat', phase,
         // The id prefix is the durable task marker (scheduler chats are
         // `task-run-…`), so classification never waits on the seed — a live
         // task with no seed row yet must not render (or filter) as a chat.
@@ -199,5 +225,5 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
       (a, b) => order[a.phase] - order[b.phase] || a.agent.localeCompare(b.agent),
     )
     return rows
-  }, [activePairs, finished, metaById, byChat, enabled, seed.data])
+  }, [activePairs, finished, metaById, byChat, enabled, seed.data, queryClient])
 }

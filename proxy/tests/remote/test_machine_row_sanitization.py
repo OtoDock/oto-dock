@@ -75,7 +75,7 @@ def test_user_visible_and_user_paired_lists_clean(temp_db):
 
 
 def test_default_machine_for_agent_clean(machine, temp_db):
-    from storage import agent_store
+    from storage.agents import agent_store
 
     agent_store.create_agent("probe-agent", "Probe Agent")
     remote_store.set_agent_remote_target(

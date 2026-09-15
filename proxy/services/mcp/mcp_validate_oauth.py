@@ -43,7 +43,7 @@ _OAUTH_FLOWS = {
 
 # Hosts in `proposed_hosts` must look like valid hostnames (no scheme,
 # no path). Allow letters, digits, hyphen, dot, and ``*`` for wildcard
-# subdomains (matches the allowlist matcher in storage.bearer_allowlist).
+# subdomains (matches the allowlist matcher in storage.identity.bearer_allowlist).
 _HOSTNAME_RE = re.compile(r"^[*A-Za-z0-9](?:[-A-Za-z0-9.*])*$")
 
 

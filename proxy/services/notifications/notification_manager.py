@@ -30,7 +30,7 @@ import zoneinfo
 from dataclasses import dataclass
 from datetime import datetime
 
-from storage import notification_store
+from storage.automation import notification_store
 import config
 
 logger = logging.getLogger("claude-proxy.notifications")
@@ -304,7 +304,7 @@ def agent_label(agent_slug: str | None) -> str:
     if not agent_slug:
         return ""
     try:
-        from storage import agent_store
+        from storage.agents import agent_store
         row = agent_store.get_agent(agent_slug)
     except Exception:
         row = None
@@ -391,8 +391,10 @@ async def fire_notification(
             )
             logger.debug(f"Cleaned up fired one-time notification: {notification_id}")
 
+    # The title is user-facing content (a window alert names the account and
+    # its email): the log keeps the row id, not the text.
     logger.info(
-        f"Notification fired: title={title!r}, severity={severity}, "
+        f"Notification fired: id={notification_id or 'ephemeral'}, severity={severity}, "
         f"scope={scope}, targets={len(deliveries)}"
     )
     return deliveries
@@ -515,7 +517,7 @@ async def fire_ephemeral(
 
     try:
         from services.notifications.push_sender import send_fcm
-        from storage import notification_store as ns
+        from storage.automation import notification_store as ns
         # Deep link for the tap — same route rules as _deliver_to_user's
         # click_url. Ephemeral pushes historically carried NO link, so tapping
         # an end-of-turn notification just foregrounded the app on whatever

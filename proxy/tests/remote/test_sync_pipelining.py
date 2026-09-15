@@ -59,7 +59,8 @@ async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None):
     import config as _cfg
     from core.remote import file_sync
     from core.session import visibility
-    from storage import sync_state_store, file_tombstones_store
+    from storage.files import sync_state_store
+    from storage.files import file_tombstones_store
 
     agent_dir = tmp_path / "test-agent"
     agent_dir.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useSyncExternalStore } from 'react'
 import QRCode from 'qrcode'
+import { isWakeDiagOn, setWakeDiag, subscribeWakeDiag } from '../audio/wakeDiag'
 import { useAuth } from '../contexts/AuthContext'
 import { apiFetch, fetchCurrentUser } from '../api/auth'
 import { deletePasskey, listPasskeys, passkeySupported, registerPasskey, renamePasskey, type PasskeyInfo } from '../api/webauthn'
@@ -7,6 +8,7 @@ import { useTheme } from '../contexts/ThemeContext'
 import { useActivityDisplay, setActivityDisplay, type ActivityDisplayMode } from '../hooks/useActivityDisplay'
 import { useClearMyMemory } from '../api/memory'
 import { useMyAudioPrefs, useUpdateMyAudioPrefs } from '../api/userAudio'
+import { useMyUiPrefs, useUpdateMyUiPrefs } from '../api/userUiPrefs'
 import { useWakeKeywords } from '../api/wakeWord'
 import { useChatAudioCapability } from '../hooks/useChatAudioCapability'
 import StrongConfirmModal from '../components/StrongConfirmModal'
@@ -690,6 +692,55 @@ function WakeWordSection() {
           )}
         </p>
       )}
+      {enabled && <WakeDiagControl />}
+    </div>
+  )
+}
+
+// Troubleshooting switch for the wake word: keeps the last 30 seconds of
+// what the listener hears in memory (audio/wakeDiag.ts) so a missed phrase
+// can be saved to a local file and replayed offline. Lives here because the
+// phone app has no address bar for the `?wakeDiag=1` shortcut — folded
+// under a closed "Troubleshooting" disclosure (operator 2026-09-11): a rare
+// control must not read as something every user should consider. It stays
+// open while a recording is on so Stop is always reachable.
+function WakeDiagControl() {
+  const on = useSyncExternalStore(subscribeWakeDiag, isWakeDiagOn, () => false)
+  const [open, setOpen] = useState(false)
+  const expanded = open || on
+  return (
+    <div className="mt-4">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-xs text-p-text-light hover:text-p-text transition-colors"
+      >
+        <svg
+          viewBox="0 0 16 16"
+          className={`h-3 w-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
+          fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+        >
+          <path d="M6 3l5 5-5 5" />
+        </svg>
+        Troubleshooting
+      </button>
+      {expanded && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setWakeDiag(!on)}
+            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:text-p-text transition-colors"
+          >
+            {on ? 'Stop recording diagnostics' : 'Record diagnostics'}
+          </button>
+          <p className="text-xs text-p-text-light mt-2">
+            {on
+              ? 'Recording: a small badge at the bottom right shows the listener state. Say the wake phrase once, wait a few seconds, then use Save on the badge to store the last 30 seconds and the event log as one local file. Nothing is uploaded.'
+              : 'For troubleshooting a missed wake phrase: keeps the last 30 seconds the listener hears in memory, on this device only, until you save it to a file or stop.'}
+          </p>
+        </div>
+      )}
     </div>
   )
 }
@@ -747,3 +798,36 @@ function MyMemorySection() {
 }
 
 export { MyMemorySection, WakeWordSection }
+
+
+// ---------------------------------------------------------------------------
+// Notifications — the owner's switch for the subscription window alerts
+// ---------------------------------------------------------------------------
+
+export function NotificationsSection() {
+  const { data: prefs } = useMyUiPrefs()
+  const update = useUpdateMyUiPrefs()
+  // Absent means on: the alerts ship enabled and the bag only stores an opt-out.
+  const alertsOn = prefs?.subscription_usage_alerts !== false
+
+  return (
+    <div className="mb-8">
+      <h2 className="text-lg font-medium text-p-text mb-3">Notifications</h2>
+      <label className="flex items-start gap-3 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={alertsOn}
+          onChange={(e) => update.mutate({ subscription_usage_alerts: e.target.checked })}
+          className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
+        />
+        <span>
+          <span className="block text-sm font-medium text-p-text">Subscription usage alerts</span>
+          <span className="block text-sm text-p-text-secondary">
+            A notification when one of your connected Claude or ChatGPT accounts passes 90% of its
+            weekly limit, and another when the limit is reached.
+          </span>
+        </span>
+      </label>
+    </div>
+  )
+}

@@ -11,7 +11,8 @@ from __future__ import annotations
 import pytest
 
 from core.session.visibility import chat_history_owner, is_shared_chat_owner
-from storage import agent_store, database
+from storage.agents import agent_store
+from storage import database
 
 
 def _seed_modes():

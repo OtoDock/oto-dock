@@ -118,7 +118,7 @@ class TestEnumerateTargets:
         class _Ref:
             label = "default"
         from services.oauth import credential_resolver
-        from storage import credential_store
+        from storage.identity import credential_store
         monkeypatch.setattr(credential_resolver, "pick_account", lambda *a, **k: _Ref())
         monkeypatch.setattr(credential_store, "get_user_credentials",
                             lambda u, n, l: {"NEXTCLOUD_URL": "https://cloud.lan"})

@@ -329,3 +329,134 @@ class TestStickyLiveness:
         assert sp._sticky_subscription_id(_SCOPE) == "sub-old"
         mock_store.list_scope_bindings.assert_not_called()
         mock_store.delete_session_binding.assert_not_called()
+
+
+def _window_row(**o):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    row = {"observed_at": now.isoformat(), "source": "poll",
+           "five_hour_pct": 5.0, "five_hour_resets_at": (now + timedelta(hours=2)).isoformat(),
+           "seven_day_pct": 10.0, "seven_day_resets_at": (now + timedelta(days=3)).isoformat(),
+           "data": {"scoped": [], "reached": "", "plan": "max"}}
+    row.update(o)
+    return row
+
+
+class TestWindowExhaustionRebalance:
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_window_exhausted_scope_moves(self, mock_store, _t, mock_fan, _on):
+        """The vendor's own reading (no error text needed) moves the scope."""
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: _window_row(five_hour_pct=95.0) if sid == "sub-a" else _window_row()
+            for sid in ids}
+        _bind()
+        assert sp.rebalance_scopes(reason="windows") == 1
+        assert sp._session_subscriptions["sess-1"] == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_replacement_must_not_be_window_exhausted(self, mock_store, _t, mock_fan, _on):
+        # Every account out of window: hopping A→B is churn, the scope stays.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: _window_row(seven_day_pct=99.0) for sid in ids}
+        _bind()
+        assert sp.rebalance_scopes(reason="windows") == 0
+        assert sp._session_subscriptions["sess-1"] == "sub-a"
+        mock_fan.assert_not_called()
+
+
+def _fable_full():
+    return {"scoped": [{"key": "fable", "label": "Fable", "pct": 100.0,
+                        "resets_at": "2099-01-01T00:00:00+00:00", "active": True}],
+            "reached": "scoped:fable", "plan": "max"}
+
+
+class TestModelAwareRebalance:
+    """A scope is judged and re-homed by the model its sessions run: the
+    chat rows carry it (the binding context does not). Live-observed
+    2026-09-11: Fable sessions were moved onto the account whose Fable
+    window was full, trading one refusal for another."""
+
+    def _chat_model(self, model):
+        return patch("storage.database.get_chat_by_session",
+                     return_value={"model": model, "agent": "dev"})
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_full_model_window_moves_the_scope_running_that_model(self, mock_store, _t, mock_fan, _on):
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        # sub-a: overall windows fine, Fable full. sub-b: everything fine.
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: _window_row(data=_fable_full()) if sid == "sub-a" else _window_row()
+            for sid in ids}
+        _bind()
+        with self._chat_model("claude-fable-5-1"):
+            assert sp.rebalance_scopes(reason="windows") == 1
+        assert sp._session_subscriptions["sess-1"] == "sub-b"
+        # A Sonnet scope on the same account has nothing to flee from.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        _bind()
+        with self._chat_model("claude-sonnet-5"):
+            assert sp.rebalance_scopes(reason="windows") == 0
+        assert sp._session_subscriptions["sess-1"] == "sub-a"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_replacement_must_serve_the_scopes_model(self, mock_store, _t, mock_fan, _on):
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        # sub-a: session window gone. sub-b: session fine, Fable full.
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: _window_row(five_hour_pct=97.0) if sid == "sub-a"
+            else _window_row(data=_fable_full())
+            for sid in ids}
+        _bind()
+        with self._chat_model("claude-fable-5-1"):
+            assert sp.rebalance_scopes(reason="windows") == 0
+        assert sp._session_subscriptions["sess-1"] == "sub-a"
+        mock_fan.assert_not_called()
+        # The same accounts serve a Sonnet scope: sub-b has room for it.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        _bind()
+        with self._chat_model("claude-sonnet-5"):
+            assert sp.rebalance_scopes(reason="windows") == 1
+        assert sp._session_subscriptions["sess-1"] == "sub-b"
+
+    @patch("services.engines.subscription_windows.is_enabled", return_value=True)
+    @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
+    @patch.object(tf, "session_target",
+                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+    @patch("services.engines.subscription_pool.subscription_store")
+    def test_recent_claim_on_another_account_does_not_defer(self, mock_store, _t, mock_fan, _on):
+        # A sticky pin that yielded to exhaustion claimed the scope on sub-b:
+        # the rest of the scope follows now, not a tick later.
+        _reset()
+        _store_two_subs(mock_store, cons_a=1.0, cons_b=0.0)
+        mock_store.latest_window_samples.side_effect = lambda ids: {
+            sid: _window_row(five_hour_pct=97.0) if sid == "sub-a" else _window_row()
+            for sid in ids}
+        _bind()
+        sp._scope_recent[_SCOPE] = ("sub-b", time.time())
+        with self._chat_model("claude-fable-5-1"):
+            assert sp.rebalance_scopes(reason="windows") == 1
+        assert sp._session_subscriptions["sess-1"] == "sub-b"

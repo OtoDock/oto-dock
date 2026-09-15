@@ -187,6 +187,38 @@ class TestInteractiveSession:
         finally:
             await s.close()
 
+    async def test_cold_flush_hook_activity_stops_retry(self, monkeypatch):
+        # Second confirmation source: a hook of this session fired after the
+        # cold Enter (PreToolUse for the turn's first tool) — the turn runs
+        # even though no transcript line arrived (late forward, or a CLI that
+        # journals nothing). No re-emit, no breadcrumb (T1 2026-09-10: the
+        # replay landed in the open AskUserQuestion dialog).
+        monkeypatch.setattr(isess, "_SUBMIT_SETTLE_S", 0.1)
+        monkeypatch.setattr(isess, "_COLD_RETRY_S", 0.5)
+        captured = []
+        from core.session import transcript_tool_events as tte
+        monkeypatch.setattr(
+            tte, "persist_event",
+            lambda store, chat_id, block: captured.append((chat_id, block)),
+        )
+        from core.session.session_state import record_hook_activity
+        s = await _register("sid-hook-confirmed")
+        try:
+            writes: list[bytes] = []
+            orig = s.pty.write
+            s.pty.write = lambda b: (writes.append(bytes(b)), orig(b))[1]
+            s.write_input(b"please use your question tool and ask me one thing\r")
+            s._mark_ready()
+            await asyncio.sleep(0.3)            # Enter fired, watcher armed
+            record_hook_activity("sid-hook-confirmed")  # the turn's first tool
+            await asyncio.sleep(0.7)             # past the watcher window
+            assert sum(1 for w in writes if b"question tool" in w) == 1
+            assert s._cold_flush_attempts == 0
+            assert s._cold_flush_pending == b""
+            assert captured == []                # no breadcrumb either
+        finally:
+            await s.close()
+
     async def test_cold_flush_retries_exhaust_with_warning(self, monkeypatch, caplog):
         # Retries are bounded: after _COLD_RETRY_MAX unconfirmed replays the
         # watcher gives up with a WARNING — never loops, never raises.
@@ -479,6 +511,123 @@ class TestInteractiveSession:
         s = isess.InteractiveSession(session_id="tc-4", chat_id="c", agent_name="agent")
         s.created_at = time.monotonic() - 100
         s._maybe_fire_turn_complete("whatever")  # must not raise
+
+    # -- hook-driven park on a native dialog ----------------------------------
+
+    async def test_park_on_native_dialog_closes_turn_and_pings_once(self, monkeypatch):
+        # The permission hook saw ExitPlanMode / AskUserQuestion on a
+        # human-driven session: the turn parks NOW (ready broadcast, hold,
+        # one "needs your input" ping). The transcript fold that may follow
+        # for the same dialog pings nothing; the answer's reopen resets.
+        from services.notifications import notification_manager as nm
+        statuses, pings = [], []
+        monkeypatch.setattr(nm, "broadcast_chat_status",
+                            lambda owner, cid, status, agent="": statuses.append(status))
+        monkeypatch.setattr(nm, "agent_label", lambda a: a)
+
+        async def _ping(user_sub, **kw):
+            pings.append(kw.get("title", ""))
+        monkeypatch.setattr(nm, "fire_ephemeral", _ping)
+        s = isess.InteractiveSession(session_id="park-1", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
+        s._title_armed = False
+        s._turn_open = True
+        s.park_on_native_dialog("ExitPlanMode")
+        await asyncio.sleep(0.05)
+        assert s.turn_open is False
+        assert s.question_parked is True
+        assert "ready" in statuses
+        assert len(pings) == 1 and "needs your input" in pings[0]
+        # The CLI journals the tool_use line later → the fold runs for the
+        # same dialog: no second ping.
+        s._apply_turn_signal("end_turn", question_pending=True)
+        s._maybe_fire_turn_complete("", persisted=1, question=True)
+        await asyncio.sleep(0.05)
+        assert len(pings) == 1
+        # The answer's continuation reopens: unparked, and a LATER dialog
+        # (a real fold, no hook park) pings again.
+        s._apply_turn_signal("tool_use")
+        assert s.question_parked is False and s._native_park_pinged is False
+        s._apply_turn_signal("end_turn", question_pending=True)
+        s._maybe_fire_turn_complete("", persisted=1, question=True)
+        await asyncio.sleep(0.05)
+        assert len(pings) == 2
+
+    async def test_park_writes_no_chat_row(self, monkeypatch):
+        # The chat rows stay the tailers' job (a hook-written card was tried
+        # and dropped: it could not be answered from the history and the
+        # late-arriving reply text rendered below it). The park only flips
+        # the live state and pings.
+        from services.notifications import notification_manager as nm
+        from core.session import transcript_tool_events as tte
+        rows = []
+        monkeypatch.setattr(nm, "broadcast_chat_status", lambda *a, **k: None)
+        monkeypatch.setattr(nm, "agent_label", lambda a: a)
+
+        async def _ping(user_sub, **kw):
+            return None
+        monkeypatch.setattr(nm, "fire_ephemeral", _ping)
+        monkeypatch.setattr(tte, "persist_event",
+                            lambda store, chat_id, block: rows.append(block))
+        s = isess.InteractiveSession(session_id="park-3", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
+        s._title_armed = False
+        for tool in ("AskUserQuestion", "ExitPlanMode", "request_user_input"):
+            s.park_on_native_dialog(tool)
+        await asyncio.sleep(0.05)
+        assert rows == []
+        assert s.question_parked is True
+
+    async def test_chained_native_dialogs_each_ping(self, monkeypatch):
+        # The CLI journals late and the model chains a plan approval onto a
+        # question: the second hook park lands before any tail consumed the
+        # first park's dedupe flag. Every hook park is a fresh wait on the
+        # human, so each one pings.
+        from services.notifications import notification_manager as nm
+        pings = []
+        monkeypatch.setattr(nm, "broadcast_chat_status", lambda owner, cid, status, agent="": None)
+        monkeypatch.setattr(nm, "agent_label", lambda a: a)
+
+        async def _ping(user_sub, **kw):
+            pings.append(kw.get("title", ""))
+        monkeypatch.setattr(nm, "fire_ephemeral", _ping)
+        s = isess.InteractiveSession(session_id="park-3", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
+        s._title_armed = False
+        s._turn_open = True
+        s.park_on_native_dialog("AskUserQuestion")
+        await asyncio.sleep(0.05)
+        s.park_on_native_dialog("ExitPlanMode")
+        await asyncio.sleep(0.05)
+        assert len(pings) == 2
+        # The tailer's fold for the last dialog still pings nothing.
+        s._maybe_fire_turn_complete("", persisted=1, question=True)
+        await asyncio.sleep(0.05)
+        assert len(pings) == 2
+
+    async def test_park_on_native_dialog_without_open_turn_still_clears(self, monkeypatch):
+        # A late transcript never opened the turn: the close-side effects
+        # (ready broadcast) must still run so the dot clears.
+        from services.notifications import notification_manager as nm
+        statuses = []
+        monkeypatch.setattr(nm, "broadcast_chat_status",
+                            lambda owner, cid, status, agent="": statuses.append(status))
+        monkeypatch.setattr(nm, "agent_label", lambda a: a)
+
+        async def _ping(user_sub, **kw):
+            return None
+        monkeypatch.setattr(nm, "fire_ephemeral", _ping)
+        s = isess.InteractiveSession(session_id="park-2", chat_id="c", agent_name="agent",
+                                     user_sub="u1")
+        s.created_at = time.monotonic() - (isess.MIN_TURN_S + 1)
+        s._title_armed = False
+        s.park_on_native_dialog("AskUserQuestion")
+        await asyncio.sleep(0.05)
+        assert "ready" in statuses
+        assert s.question_parked is True
 
     # -- self-resume detection -------------------------------------------------
     # Output while the turn is CLOSED arms one short-fuse resume-check tail

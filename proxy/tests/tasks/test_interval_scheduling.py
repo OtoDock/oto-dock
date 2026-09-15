@@ -53,7 +53,7 @@ def _create_cron_task(task_id="task-cron", agent="support-bot",
 
 
 def _create_interval_notification(nid="notif-interval", interval_seconds=61200):
-    from storage import notification_store
+    from storage.automation import notification_store
     return notification_store.create_notification(
         notification_id=nid,
         title="Interval Notif",
@@ -275,7 +275,7 @@ class TestNotificationInterval:
 
     def test_update_notification_swaps_to_interval(self, temp_db):
         from services.notifications import notification_manager
-        from storage import notification_store
+        from storage.automation import notification_store
 
         # Start with cron
         notification_store.create_notification(

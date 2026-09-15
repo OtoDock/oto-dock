@@ -3,8 +3,8 @@
 Pure functions that rewrite an agent's MCP config (TOML for Codex, JSON for the
 CLI) so stdio servers, paths, venvs and env land correctly on the satellite host,
 plus the proxy-terminable-HTTP bearer-swap bookkeeping. Split out of
-remote_execution.py; remote_execution re-exports these so its payload builders
-call them by bare name. NOTE: the internally-called helpers
+remote_execution.py; the payload builders (remote_start_payload.py) call them by
+bare name and remote_execution re-exports them. NOTE: the internally-called helpers
 (_resolve_satellite_mcp_path_info / _rewrite_stdio_paths / _rewrite_env_for_remote)
 must be monkeypatched HERE (core.remote.remote_mcp_rewrite), not on remote_execution.
 """

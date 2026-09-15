@@ -45,7 +45,7 @@ from auth.providers import UserContext, get_current_user, mask_email, require_au
 from auth.rate_limiter import hit as rate_limit_hit
 from auth.totp import consume_2fa_session_token, validate_2fa_session_token
 from storage import database as task_store
-from storage import webauthn_store
+from storage.identity import webauthn_store
 
 from api.auth._common import _build_user_response
 from api.auth._router import router

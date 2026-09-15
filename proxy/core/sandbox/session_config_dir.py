@@ -657,10 +657,10 @@ def collect_authorized_ssh_keys(agent_name: str) -> dict[str, Path]:
     poisoned instance row can never become a file-read primitive.
 
     Shared by the local sandbox materializer above and the remote
-    session-file provisioning in ``core/remote/remote_execution``.
+    session-file provisioning in ``core/remote/remote_session_start``.
     """
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     manifest = mcp_registry.get_manifest("ssh-hosts")
     if manifest is None:

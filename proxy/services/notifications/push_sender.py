@@ -13,7 +13,7 @@ import socket
 from urllib.parse import urlparse
 
 import config
-from storage import notification_store
+from storage.automation import notification_store
 
 logger = logging.getLogger("claude-proxy.push")
 

@@ -22,7 +22,7 @@ semantics + knowledge-vs-workspace prose moved to ``# Folders`` and
 from __future__ import annotations
 
 from auth.path_policy import build_permission_context, SecurityContext
-from storage import agent_store
+from storage.agents import agent_store
 
 
 def _ctx(role: str, username: str, agent: str = "pa") -> SecurityContext:

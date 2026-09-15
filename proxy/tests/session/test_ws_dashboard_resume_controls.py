@@ -1086,3 +1086,80 @@ class TestTaskChatModeRestore:
                 assert history["model"] == TEST_MODEL
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
+
+
+# ---------------------------------------------------------------------------
+# Self-heal on a bare `chat` frame: a WS that lost its state (reconnect
+# before resume_chat) re-attaches to the chat's still-running pump.
+# ---------------------------------------------------------------------------
+
+class TestReattachToRunningPump:
+    """The recovered-pump branch of ``_handle_chat`` reads the chat row for
+    the frame it sends; it used to name a variable that only the resume path
+    binds, so every reattach raised before ``warmup_ready`` went out."""
+
+    def test_reattach_sends_warmup_ready_from_the_chat_row(self, monkeypatch):
+        import contextlib
+        from unittest.mock import AsyncMock, patch
+        import ws.dashboard  # noqa: F401  # assembles the controller first
+        from ws import dashboard_chat_send as mod
+
+        class _Stop(Exception):
+            pass
+
+        class _Pump:
+            session_id = "sess-live"
+            is_done = False
+
+        chat_row = {
+            "user_sub": "user-admin", "agent": "alpha",
+            "execution_path": "codex-cli", "execution_target": "local",
+            "model": TEST_MODEL, "permission_mode": "auto",
+        }
+        sent: list[dict] = []
+
+        class _Conn(mod.ChatSendMixin):
+            user_sub = "user-admin"
+            user_role = "admin"
+            user_agents: set[str] = set()
+            user = None
+            notify_connection_id = "conn-1"
+            chat_id = None
+            agent_name = None
+            session_id = None
+            layer = None
+
+            async def _send(self, frame):
+                sent.append(frame)
+                if frame.get("type") == "warmup_ready":
+                    raise _Stop()
+
+            async def _send_error(self, text):
+                sent.append({"type": "error", "message": text})
+
+            async def _deny_task_continue(self, chat_id):
+                return False
+
+        monkeypatch.setattr(mod.task_store, "get_chat", lambda cid: chat_row)
+        monkeypatch.setattr(mod, "_role_and_layer",
+                            lambda *a, **k: ("admin", object()))
+        monkeypatch.setattr(mod, "get_session_mode", lambda sid: "")
+        monkeypatch.setattr(mod.notification_manager, "set_chat_turn_origin",
+                            lambda *a, **k: None)
+        monkeypatch.setitem(mod._active_pumps, "chat-1", _Pump())
+
+        async def run():
+            conn = _Conn()
+            with patch("core.concurrency.acquire_chat_slot",
+                       AsyncMock(return_value=True)), contextlib.suppress(_Stop):
+                await conn._handle_chat({"text": "hi", "chat_id": "chat-1"})
+            return conn
+
+        conn = asyncio.run(run())
+        assert conn.session_id == "sess-live"
+        ready = [f for f in sent if f.get("type") == "warmup_ready"]
+        assert ready == [{
+            "type": "warmup_ready", "session_id": "sess-live",
+            "chat_id": "chat-1", "mode": "auto", "model": TEST_MODEL,
+            "execution_path": "codex-cli",
+        }]

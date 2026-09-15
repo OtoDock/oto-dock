@@ -600,13 +600,13 @@ class CodexAppServerSession:
     async def _decide_permission(self, tool_name: str, tool_input: dict) -> dict:
         """The injected decision authority for the approval bridge — runs the
         platform permission decision in-process (local Codex)."""
-        from api.hooks.hooks import decide_tool_permission
+        from api.hooks.permission import decide_tool_permission
         return await decide_tool_permission(self.session_id, tool_name, tool_input)
 
     async def _ask_question(self, questions: list) -> dict:
         """The injected question authority for request_user_input — surfaces the
         dashboard card and blocks for the human answer in-process (local Codex)."""
-        from api.hooks.hooks import ask_user_question
+        from api.hooks.permission import ask_user_question
         return await ask_user_question(self.session_id, questions)
 
     def _track_item_paths(self, params: dict) -> None:

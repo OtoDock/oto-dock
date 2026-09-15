@@ -13,7 +13,7 @@ from typing import Any
 
 import config
 from core.config import deployment
-from storage import mcp_store
+from storage.mcp import mcp_store
 from auth.session_token import SESSION_JWT_SENTINEL_BEARER
 # The manifest schema (data classes + validation enums), template resolution,
 # the oauth/webhook validators, and manifest parsing now live in sibling
@@ -334,7 +334,7 @@ def get_tool_filter(mcp_name: str) -> tuple[str, str] | None:
     manifest = _manifests.get(mcp_name)
     if manifest is None or manifest.tool_filter is None:
         return None
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     regex = mcp_store.get_tool_filter_regex(mcp_name) or ""
     if not regex:
         return None
@@ -929,7 +929,7 @@ def enumerate_mcp_network_targets(
     if not manifest.network_targets:
         return []
     from services.oauth import credential_resolver
-    from storage import credential_store
+    from storage.identity import credential_store
 
     out: list[tuple[str, int | None]] = []
     seen: set[tuple[str, int | None]] = set()
@@ -1758,7 +1758,7 @@ def maybe_inject_bearer_header(
         return entry
 
     from urllib.parse import urlparse
-    from storage import bearer_allowlist
+    from storage.identity import bearer_allowlist
 
     host = urlparse(url).hostname or ""
     provider_id = oauth.get("provider_id", "")
@@ -2375,7 +2375,7 @@ def build_session_mcp_config(
     # blocked-origins default still applies). Only hit the DB when the browser
     # MCP actually attached to this session.
     if "local" in servers:
-        from storage import agent_store as _agent_store
+        from storage.agents import agent_store as _agent_store
         _apply_browser_allowed_origins(
             servers["local"], _agent_store.get_browser_allowed_origins(agent_name)
         )

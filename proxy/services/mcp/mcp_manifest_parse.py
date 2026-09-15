@@ -980,6 +980,8 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         exclude_from=data.get("exclude_from", []),
         skills=skills,
         server_name=data.get("server_name", name),
+        author=str(data.get("author") or ""),
+        author_url=str(data.get("author_url") or ""),
         assignment_mode=data.get("assignment_mode", "auto"),
         requires_capability=data.get("requires_capability"),
         network_targets=[

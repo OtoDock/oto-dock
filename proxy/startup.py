@@ -154,7 +154,7 @@ async def lifespan(app: FastAPI):
     # Credential-key canary: one loud ERROR when stored secrets can't be
     # decrypted (JWT_SECRET changed / config.env recreated) instead of
     # scattered use-time 500s and silently-empty credential reads.
-    from storage.credential_store import startup_key_canary
+    from storage.identity.credential_store import startup_key_canary
     startup_key_canary()
     # First-install only: default the platform timezone to the server's local
     # wall clock (UTC otherwise). Guarded on the setting being absent → set once,
@@ -193,7 +193,7 @@ async def lifespan(app: FastAPI):
     from core.session.session_state import load_session_security
     load_session_security()
 
-    from storage import agent_store
+    from storage.agents import agent_store
     # Converge pre-1.4 agents on the agent.md persona filename before any
     # session builds a prompt (readers accept both names; this makes disk,
     # git and satellite sync agree on the new one).
@@ -272,7 +272,7 @@ async def lifespan(app: FastAPI):
     # user identity the install couldn't auto-approve MCPs and would leave
     # the agent half-configured.
     # Reset leaked subscription session counters from previous run
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subscription_store.reset_active_sessions()
     # Prune crash-orphaned session→subscription bindings (release never ran).
     # Bounded staleness: rows younger than the TTL deliberately SURVIVE the
@@ -283,6 +283,12 @@ async def lifespan(app: FastAPI):
         pruned = subscription_store.prune_stale_session_bindings()
         if pruned:
             logger.info(f"Pruned {pruned} stale session-subscription binding(s)")
+        # Rows whose subscription is gone (deleted or replaced while a
+        # session was bound) — no TTL saves them: they would bind a
+        # re-adopted session to nothing and attribute usage to a ghost.
+        orphans = subscription_store.prune_orphan_session_bindings()
+        if orphans:
+            logger.info(f"Pruned {orphans} orphan session-subscription binding(s)")
     except Exception:
         logger.exception("session-binding prune failed (non-fatal)")
     # Sync built-in models into execution_layer_models so the DB fallback in
@@ -443,14 +449,14 @@ async def lifespan(app: FastAPI):
             try:
                 # Workspace Recover Bin: reap entries past their 7-day TTL
                 # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
-                from storage import recover_bin_store as _rbstore
+                from storage.files import recover_bin_store as _rbstore
                 await _run_db(_rbstore.delete_expired)
             except Exception:
                 logger.exception("recover-bin reap failed")
             try:
                 # File-sync delete tombstones: reap past their 30-day TTL (an
                 # offline satellite is assumed long-since caught up). Indexed delete.
-                from storage import file_tombstones_store as _tstore
+                from storage.files import file_tombstones_store as _tstore
                 await _run_db(_tstore.delete_expired)
             except Exception:
                 logger.exception("tombstone reap failed")
@@ -492,6 +498,14 @@ async def lifespan(app: FastAPI):
                 await _sub_health.check_subscription_health()
             except Exception:
                 logger.exception("subscription health sweep failed")
+            try:
+                # Provider windows: tell an account's owner when a weekly
+                # window passes 90 % and when it is reached. Self-throttled
+                # to 5 min; dedup rows persist per window instance.
+                from services.infra import subscription_window_alerts as _win_alerts
+                await _win_alerts.check_window_alerts()
+            except Exception:
+                logger.exception("subscription window alert sweep failed")
             try:
                 # Automatic MCP updates: once a week in a low-traffic window,
                 # apply available community-MCP updates (deferring in-use docker

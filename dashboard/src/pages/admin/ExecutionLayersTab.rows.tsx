@@ -16,6 +16,7 @@ import {
 } from '../../api/executionLayers'
 import { Toggle, Badge, PROVIDER_LABELS } from './ExecutionLayersTab.widgets'
 import { AddModelForm } from './ExecutionLayersTab.forms'
+import { SubscriptionWindowBars } from '../../components/engines/SubscriptionWindows'
 
 const AUTH_TYPE_LABELS: Record<string, string> = {
   api_key: 'API Key',
@@ -66,6 +67,7 @@ export function SubscriptionRow({
         {sub.oauth_email && sub.label && (
           <p className="text-xs text-p-text-light truncate">{sub.oauth_email}</p>
         )}
+        {sub.auth_type === 'oauth' && <SubscriptionWindowBars windows={sub.windows} />}
         {/* Scope: who may use this account. An OAuth login can be used personally
             by its owner and/or contributed to the shared agent pool; only the owner
             (or any admin, for owner-less infra) can change this. */}
@@ -108,13 +110,20 @@ export function SubscriptionRow({
         )}
         {manageable && (
           <button
-            onClick={() => {
-              if (sub.active_sessions > 0) {
-                alert(`Cannot delete: ${sub.active_sessions} active sessions`)
-                return
-              }
-              if (confirm('Remove this subscription?')) {
-                deleteMut.mutate({ layer, id: sub.id })
+            onClick={async () => {
+              // The counter shown here can read stale; the server judges
+              // "in use" on its live bindings and answers 409 only for
+              // sessions that are really running — then the admin may
+              // still remove it and let those sessions move.
+              if (!confirm('Remove this subscription?')) return
+              try {
+                await deleteMut.mutateAsync({ layer, id: sub.id })
+              } catch (e) {
+                const err = e as Error & { status?: number }
+                if (err.status !== 409) return
+                if (confirm(`${err.message}\n\nRemove it anyway? Its running sessions move to another subscription, or stop until one is connected.`)) {
+                  deleteMut.mutate({ layer, id: sub.id, force: true })
+                }
               }
             }}
             className="text-xs text-red-500 hover:text-red-600 transition-colors sm:opacity-0 sm:group-hover:opacity-100"
@@ -123,6 +132,9 @@ export function SubscriptionRow({
           </button>
         )}
       </div>
+      {deleteMut.isError && (
+        <p className="w-full text-xs text-red-500">{(deleteMut.error as Error).message}</p>
+      )}
     </div>
   )
 }

@@ -95,12 +95,28 @@ def note_sent_prompt(chat_id: str, text: str) -> None:
     _sent_prompts[chat_id] = (text, now)
 
 
+def _whitespace_folded(text: str) -> str:
+    """The prompt with every whitespace run collapsed to one space — the
+    shape the compare below works on."""
+    return " ".join((text or "").split())
+
+
 def consume_sent_prompt(chat_id: str, text: str) -> bool:
     """True exactly once for the noted (chat, text) pair — the caller skips
-    persisting that user row. Non-matching text leaves the note in place
-    (the journaled first prompt should be byte-identical to what was sent)."""
+    persisting that user row. Non-matching text leaves the note in place.
+
+    The compare ignores whitespace SHAPE: a fresh Codex TUI on a satellite
+    receives its first prompt single-lined on the argv (a multi-line
+    composer pre-fill repaints erratically over a laggy WS —
+    ``satellite/terminal/codex_pty_session.py``), so the rollout journals
+    ``[Current time: …] <text>`` where the note holds
+    ``[Current time: …]\\n\\n<text>``. Byte equality never matched and the
+    echo landed as a second user row (T1 chats 268e141a / 4080cf79 /
+    90c87d18, 2026-09-10). Words still have to match exactly; the note is
+    per chat and TTL-pruned, so the loosened compare cannot swallow a
+    different prompt."""
     rec = _sent_prompts.get(chat_id)
-    if rec and rec[0] == text:
+    if rec and _whitespace_folded(rec[0]) == _whitespace_folded(text):
         _sent_prompts.pop(chat_id, None)
         return True
     return False

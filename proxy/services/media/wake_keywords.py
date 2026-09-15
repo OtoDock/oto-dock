@@ -13,10 +13,11 @@ reaches them via the favorite.
 Line format consumed by the spotter: ``<tokens> [:boost] [#threshold]
 @<agent-slug>`` — the ``@`` tag is echoed back verbatim in a detection
 result, so the routing target rides inside the keyword itself; ``:``/``#``
-are optional per-line sensitivity modifiers (platform lines only). The
-platform word "hey OtoDock" compiles to the user's favorite agent
-(default_agent when it is among the user's ADDED agents, else the first
-added agent alphabetically).
+are per-line sensitivity modifiers, one seeded pair for the platform lines
+and one for the agent-name lines (both admin-tunable, both validated here
+and never emitted raw). The platform word "hey OtoDock" compiles to the
+user's favorite agent (default_agent when it is among the user's ADDED
+agents, else the first added agent alphabetically).
 
 Scope: the keyword pool is the caller's ADDED agents (their user_agents
 rows) — NOT everything an admin can access. Voice-waking an agent nobody
@@ -31,10 +32,11 @@ All functions are synchronous — call via asyncio.to_thread.
 from __future__ import annotations
 
 import logging
+import math
 import unicodedata
 
 from config import BASE_DIR
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 logger = logging.getLogger(__name__)
@@ -124,16 +126,17 @@ def encode_phrase(phrase: str) -> str | None:
 
 def _float_setting(key: str, default: float) -> float:
     """A platform-settings float with a hard code fallback. The fallback also
-    swallows non-positive values: per-line keyword modifiers are fed to an
-    unguarded std::stof in the spotter (a junk value would abort the engine
-    for EVERY user at init), and 0 means "fall back to global" downstream —
-    never emit either."""
+    swallows non-positive and non-finite values: per-line keyword modifiers
+    are fed to an unguarded std::stof in the spotter (a junk value would
+    abort the engine for EVERY user at init; ``inf`` parses and boosts
+    every path or makes the line unreachable), and 0 means "fall back to
+    global" downstream — never emit any of them."""
     raw = task_store.get_platform_setting(key) or ""
     try:
         value = float(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 def _threshold() -> float:
@@ -185,6 +188,13 @@ def build_for_user(user) -> dict:
     lines: list[str] = []
     seen_tokens: set[str] = set()
     agents_out: list[dict] = []
+    # Agent-name lines carry their own rider pair (2026-09-11): the names
+    # are multi-token English phrases and a non-native pronunciation lands
+    # the acoustic path near, not on, the trie — measured on an operator's
+    # own recordings, the boost + lower threshold doubled recall with zero
+    # false fires on control speech. Same validation as the platform pair.
+    agent_boost = _float_setting("audio_wake_word_agent_boost", 2.0)
+    agent_thr = _float_setting("audio_wake_word_agent_threshold", 0.20)
     for slug in added:
         display = by_slug[slug].get("display_name") or slug
         # Normalize the NAME alone first: a name with no English-phonetic
@@ -195,21 +205,19 @@ def build_for_user(user) -> dict:
         wakeable = encoded is not None and encoded not in seen_tokens
         if wakeable and encoded is not None:
             seen_tokens.add(encoded)
-            lines.append(f"{encoded} @{slug}")
+            lines.append(f"{encoded} :{agent_boost:g} #{agent_thr:g} @{slug}")
         agents_out.append(
             {"slug": slug, "display_name": display, "wakeable": wakeable}
         )
 
     platform_target = _resolve_favorite(user, added)
     if platform_target:
-        # Per-line sensitivity on the platform lines only: ':' boosts the
-        # trie path score, '#' lowers the acoustic trigger threshold below
-        # the global one; the '@' tag must stay LAST on the line. Bare agent
-        # lines get 0-entries engine-side, which fall back to the global
-        # keywordsScore/threshold. Emitted AFTER the agent lines on purpose
-        # (agent keywords win dedupe collisions); the shared ▁HE Y prefix
-        # picking up the boost was verified harmless for agent detection in
-        # the Node smoke.
+        # Per-line sensitivity on the platform lines: ':' boosts the trie
+        # path score, '#' lowers the acoustic trigger threshold below the
+        # global one; the '@' tag must stay LAST on the line. Emitted AFTER
+        # the agent lines on purpose (agent keywords win dedupe collisions);
+        # the shared ▁HE Y prefix picking up the boost was verified harmless
+        # for agent detection in the Node smoke.
         boost = _float_setting("audio_wake_word_platform_boost", 2.0)
         thr = _float_setting("audio_wake_word_platform_threshold", 0.20)
         for phrase in PLATFORM_PHRASES:

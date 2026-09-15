@@ -33,7 +33,8 @@ spawn-authz layer. Same behavior manual edges have always had.
 
 import logging
 
-from storage import agent_store, db_departments
+from storage.agents import agent_store
+from storage.agents import db_departments
 
 logger = logging.getLogger(__name__)
 

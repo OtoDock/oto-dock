@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom'
 import type { ReactNode } from 'react'
 
 import { acquireMic, releaseMic, micBusy, subscribeMic } from '@/audio/micCoordinator'
+import { isWakeDiagOn, setWakeDiag } from '@/audio/wakeDiag'
 import { WakeWordSection } from '@/pages/UserSettings.general'
 import { useWakeWord } from '@/hooks/useWakeWord'
 import * as authApi from '@/api/auth'
@@ -123,6 +124,31 @@ describe('WakeWordSection', () => {
       expect(screen.getByText(/Voice conversations are currently unavailable/)).toBeInTheDocument())
     expect(screen.getByText(/duplex engine not connected/)).toBeInTheDocument()
   })
+
+  it('folds the diagnostics recorder under a closed Troubleshooting disclosure, only while the wake word is on', async () => {
+    mockApi()
+    const { unmount } = render(<WakeWordSection />, { wrapper })
+    await waitFor(() => expect(screen.getByText('Wake word')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: 'Troubleshooting' })).toBeNull()
+    unmount()
+    mockApi({ wakeEnabled: true })
+    render(<WakeWordSection />, { wrapper })
+    const disclosure = await screen.findByRole('button', { name: 'Troubleshooting' })
+    // Closed by default: the rare control is out of sight.
+    expect(disclosure).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: 'Record diagnostics' })).toBeNull()
+    fireEvent.click(disclosure)
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.click(screen.getByRole('button', { name: 'Record diagnostics' }))
+    expect(isWakeDiagOn()).toBe(true)
+    expect(screen.getByText(/Nothing is uploaded/)).toBeInTheDocument()
+    // While recording, collapsing the disclosure must not hide Stop.
+    fireEvent.click(disclosure)
+    expect(screen.getByRole('button', { name: 'Stop recording diagnostics' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop recording diagnostics' }))
+    expect(isWakeDiagOn()).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Record diagnostics' })).toBeNull()
+  })
 })
 
 // ─── useWakeWord (app-root listener) ────────────────────────────────────────
@@ -179,6 +205,40 @@ describe('useWakeWord', () => {
     expect(prewarm).toBeTruthy()
     expect(prewarm?.[1]?.method).toBe('POST')
     expect(JSON.parse(String(prewarm?.[1]?.body))).toEqual({ agent: 'alpha' })
+  })
+
+  it('?wakeDiag=1 switches the diagnostics recorder on (the desktop shortcut)', async () => {
+    mockApi()
+    try {
+      render(<Harness navigate={vi.fn()} entry="/agents?wakeDiag=1" />)
+      await waitFor(() => expect(isWakeDiagOn()).toBe(true))
+    } finally {
+      setWakeDiag(false)
+    }
+  })
+
+  it('rebuilds a worker that dies, after a bounded delay', async () => {
+    vi.useFakeTimers()
+    mockApi({ wakeEnabled: true })
+    vi.stubGlobal('Worker', FakeWorker as unknown as typeof Worker)
+    installMicEnv()
+    Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true })
+    try {
+      render(<Harness navigate={vi.fn()} entry="/agents" />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+      expect(FakeWorker.instances).toHaveLength(1)
+      act(() => { FakeWorker.instances[0].onmessage?.({ data: { type: 'error', message: 'wasm aborted: fetch' } }) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_900) })
+      expect(FakeWorker.instances).toHaveLength(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(200) })
+      expect(FakeWorker.instances).toHaveLength(2)
+      const init = FakeWorker.instances[1].posted.find((m) => (m as { type: string }).type === 'init') as
+        { keywords: string } | undefined
+      expect(init?.keywords).toContain('@alpha')
+    } finally {
+      vi.useRealTimers()
+      uninstallMicEnv()
+    }
   })
 
   it('spawns the worker when every gate passes and navigates on detection', async () => {

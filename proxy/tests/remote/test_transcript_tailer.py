@@ -538,6 +538,58 @@ def test_question_then_new_prompt_opens_turn(tmp_path, _capture):
     assert stats["question_pending"] is False
 
 
+def _exit_plan(tuid: str) -> str:
+    return _assistant_sr(
+        [{"type": "tool_use", "id": tuid, "name": "ExitPlanMode",
+          "input": {"plan": "1. add README\n2. done"}}],
+        "tool_use",
+    )
+
+
+def test_unanswered_exit_plan_parks_like_a_question(tmp_path, _capture):
+    """The TUI blocks on its native plan-approval dialog exactly like on the
+    question cards (the hook defers ExitPlanMode for a human-driven
+    interactive session, and the CLI journals the tool_use line while the
+    dialog is open — T1 2.1.263, 2026-09-10): an unanswered ExitPlanMode at
+    batch end closes the turn with question_pending, so the live dot clears
+    and the "needs your input" ping fires instead of a chat stuck 'live'."""
+    path = _write(tmp_path, _user("plan it"), _exit_plan("t_p1"))
+    stats = T.tail_transcript("sp1", "cp1", path)
+    assert stats["last_signal"] == "end_turn"
+    assert stats["question_pending"] is True
+    assert stats["turn_complete"] is False
+    assert ("event", "plan_mode") in _capture.order
+
+
+def test_exit_plan_approved_in_batch_continues_the_turn(tmp_path, _capture):
+    # Approved (tool_result present) and the implementation started in the
+    # same batch: no park — the continuation's tool_use signal stands.
+    path = _write(
+        tmp_path,
+        _user("plan it"),
+        _exit_plan("t_p2"),
+        _tool_result("t_p2", "User has approved your plan."),
+        _assistant_sr([{"type": "tool_use", "id": "t_w", "name": "Write",
+                        "input": {}}], "tool_use"),
+    )
+    stats = T.tail_transcript("sp2", "cp2", path)
+    assert stats["last_signal"] == "tool_use"
+    assert stats["question_pending"] is False
+
+
+def test_exit_plan_then_interrupt_marker_is_plain_close(tmp_path, _capture):
+    # ESC at the plan dialog: the interrupt fold wins — no input ping.
+    path = _write(
+        tmp_path,
+        _user("plan it"),
+        _exit_plan("t_p3"),
+        _user("[Request interrupted by user for tool use]"),
+    )
+    stats = T.tail_transcript("sp3", "cp3", path)
+    assert stats["last_signal"] == "end_turn"
+    assert stats["question_pending"] is False
+
+
 # ---------------------------------------------------------------------------
 # Tool-event persistence — pump-shaped rows (headless parity)
 # ---------------------------------------------------------------------------

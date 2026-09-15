@@ -1,23 +1,35 @@
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, type Plugin, type ResolvedConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
 import path from 'path'
+import { precompressDir } from './build/precompress'
+import { stampBuildId } from './build/buildId'
+
+// The resolved output directory, so a build with `--outDir` writes its kit
+// files and compressed siblings THERE and never touches the real dist.
+function resolvedOutDir(config: ResolvedConfig): string {
+  return path.resolve(config.root, config.build.outDir)
+}
 
 // animejs v4 ships only an ESM module tree (no script-tag build), so the
 // script-tag artifact the UI kit serves is bundled here: IIFE, global `anime`,
 // minified. Rolldown is vite 8's own bundler (pinned to vite's range).
 function bundleAnimeIife(): Plugin {
+  let outDir = path.resolve(__dirname, 'dist')
   return {
     name: 'otodock:bundle-anime-iife',
     apply: 'build',
+    configResolved(config) {
+      outDir = resolvedOutDir(config)
+    },
     async closeBundle() {
       const { rolldown } = await import('rolldown')
       const bundle = await rolldown({ input: 'animejs' })
       await bundle.write({
         format: 'iife',
         name: 'anime',
-        file: path.resolve(__dirname, 'dist/ui-kit/anime.min.js'),
+        file: path.join(outDir, 'ui-kit/anime.min.js'),
         minify: true,
       })
       await bundle.close()
@@ -38,9 +50,13 @@ function bundleAnimeIife(): Plugin {
 // precedent. Version bumps hit both at once.
 function bundleThreeIife(): Plugin {
   const entry = 'otodock-three-kit-entry'
+  let outDir = path.resolve(__dirname, 'dist')
   return {
     name: 'otodock:bundle-three-iife',
     apply: 'build',
+    configResolved(config) {
+      outDir = resolvedOutDir(config)
+    },
     async closeBundle() {
       const { rolldown } = await import('rolldown')
       const bundle = await rolldown({
@@ -76,10 +92,33 @@ function bundleThreeIife(): Plugin {
       await bundle.write({
         format: 'iife',
         name: 'THREE',
-        file: path.resolve(__dirname, 'dist/ui-kit/three.min.js'),
+        file: path.join(outDir, 'ui-kit/three.min.js'),
         minify: true,
       })
       await bundle.close()
+    },
+  }
+}
+
+// Every text asset under assets/ and ui-kit/ gets .br and .gz siblings; the
+// proxy serves the one the client accepts and never compresses at request
+// time. Registered LAST: the static-copy targets land in writeBundle and the
+// two IIFE writers above run earlier in the same sequential closeBundle
+// pass, so the kit files exist by now.
+function precompressAssets(): Plugin {
+  let outDir = path.resolve(__dirname, 'dist')
+  return {
+    name: 'otodock:precompress-assets',
+    apply: 'build',
+    configResolved(config) {
+      outDir = resolvedOutDir(config)
+    },
+    async closeBundle(error?: Error) {
+      if (error) return
+      await Promise.all([
+        precompressDir(path.join(outDir, 'assets')),
+        precompressDir(path.join(outDir, 'ui-kit')),
+      ])
     },
   }
 }
@@ -119,6 +158,11 @@ export default defineConfig({
     }),
     bundleAnimeIife(),
     bundleThreeIife(),
+    // The build id in index.html (a hash of the built page + public/): the
+    // proxy reads it back and a stale page reloads once. Before the
+    // precompress plugin, which must stay last.
+    stampBuildId(),
+    precompressAssets(),
   ],
   resolve: {
     alias: {

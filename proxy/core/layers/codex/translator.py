@@ -112,7 +112,7 @@ _SUPPRESSED_METHODS = frozenset({
     "command/exec/outputDelta", "item/fileChange/outputDelta",
     "turn/diff/updated",
     "serverRequest/resolved", "hook/started", "hook/completed",
-    "model/rerouted", "account/updated", "account/rateLimits/updated",
+    "model/rerouted", "account/updated",
     "app/list/updated", "fs/changed", "item/plan/delta",
     "item/reasoning/summaryPartAdded", "deprecationNotice", "configWarning",
     # 0.152+: the daemon announces a provider auth refresh (token rotation)
@@ -325,11 +325,26 @@ class CodexEventTranslator:
                 "message": err.get("message", "Codex error"),
             })]
 
+        if method == "account/rateLimits/updated":
+            # The account's own window state. Recorded for the pool on a
+            # side channel and never emitted: CommonEvents reach the chat,
+            # and a pool account's usage is not the chatting user's business.
+            self._record_rate_limits(params)
+            return []
+
         if method in _SUPPRESSED_METHODS:
             return []
 
         logger.debug(f"Codex translator: unhandled notification {method}")
         return []
+
+    def _record_rate_limits(self, params) -> None:
+        if not self._session_id or not isinstance(params, dict):
+            return
+        from services.engines import subscription_windows as _sw
+        snapshot = params.get("rateLimits")
+        _sw.record_codex_snapshot_async(
+            self._session_id, snapshot if isinstance(snapshot, dict) else params)
 
     def _on_goal_updated(self, params) -> list[CommonEvent]:
         """``thread/goal/updated`` → GOAL_UPDATE. Wire shape verified live vs

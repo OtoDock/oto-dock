@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from core.config.task_config_builder import resolve_task_identity
 from core.session.visibility import resolve_visibility
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 

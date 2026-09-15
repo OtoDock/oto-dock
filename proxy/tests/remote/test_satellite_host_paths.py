@@ -264,18 +264,18 @@ class TestResolvePathHookSatelliteHost:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match", lambda *a, **kw: None,
         )
         return TestClient(app)
 
     def test_satellite_host_path_rejected_home_only(self, client, monkeypatch):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -291,7 +291,7 @@ class TestResolvePathHookSatelliteHost:
         self, client, monkeypatch, tmp_path,
     ):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=True),
         )
         monkeypatch.setattr(
@@ -330,7 +330,7 @@ class TestResolvePathHookSatelliteHost:
         previously the hook pulled with raw.lstrip('/') (the entire
         ``home/dave/.oto-dock/agents/my-agent/users/…`` string) and missed."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -368,7 +368,7 @@ class TestResolvePathHookSatelliteHost:
         must handle ``{sat_agents_dir}/{slug}/workspace/...`` the same way
         (pull by ``workspace/...``)."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -401,7 +401,7 @@ class TestResolvePathHookSatelliteHost:
         """The sandbox-virtual form pulls by the same slug — the fix is
         behavior-preserving for the path form that already worked."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -437,7 +437,7 @@ class TestResolvePathHookSatelliteHost:
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -474,7 +474,7 @@ class TestResolvePathHookSatelliteHost:
         (write_docx on an existing doc) needs the satellite's current bytes
         materialized first."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=False),
         )
         monkeypatch.setattr(
@@ -505,7 +505,7 @@ class TestResolvePathHookSatelliteHost:
         unsupported for Docker MCPs — the caller gets a clear 403, not a
         baffling 404."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_remote_ctx(allow_full_fs=True),
         )
         monkeypatch.setattr(
@@ -533,12 +533,12 @@ class TestFileWrittenHookDispatch:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, lifecycle
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            lifecycle, "verify_session_match", lambda *a, **kw: None,
         )
         return TestClient(app)
 
@@ -610,7 +610,7 @@ class TestFileWrittenHookDispatch:
         platform-side and the next analyze re-pulled the satellite original
         over it."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.lifecycle.get_session_security",
             lambda sid: _make_remote_ctx(),
         )
         monkeypatch.setattr(
@@ -640,7 +640,7 @@ class TestFileWrittenHookDispatch:
         """Only the session's OWN agent slug folds off — a foreign slug is
         passed through untouched (and fails push_back's canonical gate)."""
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.lifecycle.get_session_security",
             lambda sid: _make_remote_ctx(),
         )
         monkeypatch.setattr(
@@ -678,7 +678,7 @@ class TestFileWrittenHookDispatch:
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.lifecycle.get_session_security",
             lambda sid: _make_remote_ctx(),
         )
         monkeypatch.setattr(
@@ -756,12 +756,12 @@ class TestResolvePathWriteRbac:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match", lambda *a, **kw: None,
         )
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: False,
@@ -770,7 +770,7 @@ class TestResolvePathWriteRbac:
 
     def _post(self, client, monkeypatch, role, *, writing):
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_local_ctx(role),
         )
         return client.post("/v1/hooks/resolve-path", json={
@@ -821,26 +821,26 @@ class TestClassifyGateHostCache:
 
     def test_own_session_cache_path_serves(self, tmp_path, monkeypatch):
         import asyncio
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         cache = rff.host_cache_session_root(sid) / "abcd1234"
         cache.mkdir(parents=True)
         f = cache / "doc.xlsx"
         f.write_bytes(b"x")
         rel = str(f.relative_to(tmp_path))
-        host, _res = asyncio.run(hooks_mod._classify_and_pull(sid, rel))
+        host, _res = asyncio.run(paths._classify_and_pull(sid, rel))
         assert host is not None and host.resolve() == f.resolve()
 
     def test_other_sessions_cache_denied(self, tmp_path, monkeypatch):
         import asyncio
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         other = rff.host_cache_session_root("sess-OTHER") / "abcd1234"
         other.mkdir(parents=True)
         f = other / "doc.xlsx"
         f.write_bytes(b"x")
         rel = str(f.relative_to(tmp_path))
-        host, _res = asyncio.run(hooks_mod._classify_and_pull(sid, rel))
+        host, _res = asyncio.run(paths._classify_and_pull(sid, rel))
         assert host is None
 
     def test_cache_rel_never_mints_write_capability(self):
@@ -936,12 +936,12 @@ class TestHostCachePreviewEditMint:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, preview
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            preview, "verify_session_match", lambda *a, **kw: None,
         )
         return TestClient(app)
 
@@ -951,7 +951,7 @@ class TestHostCachePreviewEditMint:
         from unittest.mock import AsyncMock
 
         import config
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import paths, preview, routing
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
         monkeypatch.setattr(config, "COLLABORA_URL", "https://c.example", raising=False)
@@ -965,17 +965,17 @@ class TestHostCachePreviewEditMint:
         async def _cap(session_id, path):
             return (cache, None)
 
-        monkeypatch.setattr(hooks_mod, "_classify_and_pull", _cap)
+        monkeypatch.setattr(paths, "_classify_and_pull", _cap)
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.preview.get_session_security",
             lambda sid: SimpleNamespace(
                 role=role, username="u", mount_username="", agent="test-agent",
             ),
         )
         monkeypatch.setattr(
-            hooks_mod, "resolve_hook_chat_id", AsyncMock(return_value=None),
+            routing, "resolve_hook_chat_id", AsyncMock(return_value=None),
         )
-        hooks_mod._wopi_url_cache.clear()
+        preview._wopi_url_cache.clear()
         minted = {}
 
         def _fake_mint(rel, sub, name, permissions, agent):
@@ -1032,15 +1032,15 @@ class TestResolvePathDisplayPathCarveOut:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
-        from api.hooks import hooks as hooks_mod
+        from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            hooks_mod, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match", lambda *a, **kw: None,
         )
         monkeypatch.setattr(
-            "api.hooks.hooks.get_session_security",
+            "api.hooks.paths.get_session_security",
             lambda sid: _make_display_ctx(),
         )
         monkeypatch.setattr(

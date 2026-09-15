@@ -460,6 +460,7 @@ export default function SystemSettingsTab() {
   const [retentionEnabled, setRetentionEnabled] = useState(true)
   const [retentionDays, setRetentionDays] = useState('180')
   const [mcpAutoUpdate, setMcpAutoUpdate] = useState(true)
+  const [windowsEnabled, setWindowsEnabled] = useState(true)
   const [quotas, setQuotas] = useState<Record<string, string>>({
     quota_shared_folder_mb: '15360',
     quota_user_folder_mb: '2048',
@@ -480,6 +481,7 @@ export default function SystemSettingsTab() {
       setRetentionEnabled(data.session_retention_enabled !== false)
       setRetentionDays(data.session_retention_days || '180')
       setMcpAutoUpdate(data.mcp_auto_update_enabled !== false)
+      setWindowsEnabled(data.subscription_windows_enabled !== false)
       setQuotas({
         quota_shared_folder_mb: data.quota_shared_folder_mb || '15360',
         quota_user_folder_mb: data.quota_user_folder_mb || '2048',
@@ -676,6 +678,28 @@ export default function SystemSettingsTab() {
               className="h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
             />
             <SavedBadge show={savedField === 'interactive_cli_enabled'} />
+          </div>
+        </div>
+
+        {/* Provider windows (default ON): the pool reads each OAuth account's
+            session and weekly usage from the vendor. */}
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex-1">
+            <label className="block text-sm font-medium text-p-text mb-0.5">Read subscription usage from the provider</label>
+            <p className="text-xs text-p-text-light">
+              OtoDock asks Claude and ChatGPT for each connected account's session and weekly usage,
+              prefers the account that resets first, and shows both windows on the AI Engines cards.
+              Off: the pool balances by recorded cost only.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={windowsEnabled}
+              onChange={(e) => { setWindowsEnabled(e.target.checked); save('subscription_windows_enabled', e.target.checked) }}
+              className="h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
+            />
+            <SavedBadge show={savedField === 'subscription_windows_enabled'} />
           </div>
         </div>
       </div>

@@ -14,7 +14,7 @@ from fastapi import HTTPException
 
 from api.mcp import mcps as mcps_api
 from auth.providers import UserContext
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 
 def _admin() -> UserContext:
@@ -78,3 +78,8 @@ def test_listing_reports_can_disable(core_manifests):
     assert by_name["delegation-mcp"]["can_disable"] is True
     assert by_name["schedules-mcp"]["can_disable"] is False
     assert by_name["memory-mcp"]["can_disable"] is False
+    # Provenance rides every row: empty on bundled manifests, and no icon.png
+    # in the fixture's mcp_dir.
+    assert by_name["memory-mcp"]["author"] == ""
+    assert by_name["memory-mcp"]["author_url"] == ""
+    assert by_name["memory-mcp"]["icon"] is False

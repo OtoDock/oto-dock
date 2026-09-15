@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from storage import credential_store
+from storage.identity import credential_store
 from storage.pg import get_conn
 
 

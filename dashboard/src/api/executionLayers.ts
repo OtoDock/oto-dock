@@ -12,6 +12,26 @@ import { apiFetch } from './auth'
 // Types
 // ---------------------------------------------------------------------------
 
+/** One rate-limit window of an OAuth account as the vendor reports it. */
+export interface SubscriptionWindow {
+  pct: number             // 0..100 (above 100 when the vendor says so)
+  resets_at: string | null
+}
+
+/** The vendor's own reading of an OAuth account's usage windows (Claude and
+ *  ChatGPT both cap a subscription with a rolling session window and a
+ *  rolling weekly one; Claude adds per-model weekly windows). Present on
+ *  OAuth rows while the platform reads it; null until the first sample. */
+export interface SubscriptionWindows {
+  five_hour: SubscriptionWindow | null
+  seven_day: SubscriptionWindow | null
+  scoped: Array<SubscriptionWindow & { key: string; label: string; active: boolean }>
+  reached: string         // '' | 'five_hour' | 'seven_day' | 'scoped:<key>'
+  plan: string
+  observed_at: string
+  source: string
+}
+
 export interface Subscription {
   id: string
   layer: string
@@ -27,6 +47,8 @@ export interface Subscription {
   status: string          // 'active' | 'disabled' | 'expired'
   created_at: string
   updated_at: string
+  // Absent on non-OAuth rows and while the platform setting is off.
+  windows?: SubscriptionWindows | null
 }
 
 export interface LayerModel {
@@ -179,13 +201,14 @@ export function useSetLocalEndpointEngine() {
 export function useDeleteLocalEndpoint() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ group }: { group: string }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}`, {
+    mutationFn: async ({ group, force }: { group: string; force?: boolean }) => {
+      const qs = force ? '?force=true' : ''
+      const res = await apiFetch(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}${qs}`, {
         method: 'DELETE',
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to remove local endpoint')
+        throw Object.assign(new Error(err.detail || 'Failed to remove local endpoint'), { status: res.status })
       }
       return res.json()
     },
@@ -318,13 +341,17 @@ export function useUserUpdateSubscription() {
 export function useDeleteSubscription() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ layer, id }: { layer: string; id: string }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/subscriptions/${id}`, {
+    // `force` deletes past live sessions: the server re-homes them onto the
+    // remaining subscriptions. A stale counter alone never blocks — the
+    // server reconciles it against the live bindings first.
+    mutationFn: async ({ layer, id, force }: { layer: string; id: string; force?: boolean }) => {
+      const qs = force ? '?force=true' : ''
+      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/subscriptions/${id}${qs}`, {
         method: 'DELETE',
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to delete subscription')
+        throw Object.assign(new Error(err.detail || 'Failed to delete subscription'), { status: res.status })
       }
       return res.json()
     },
@@ -597,6 +624,37 @@ export const useUserExecutionLayers = () =>
       return data.layers ?? []
     },
   })
+
+/** A user's own API key on one of the two CLI engines (the server accepts
+ *  api_key only there). The user card sends `contribute_platform: false`
+ *  explicitly so an admin's personal key never defaults into the agent pool. */
+export function useUserAddSubscription() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      layer,
+      ...body
+    }: {
+      layer: string
+      provider: string
+      auth_type: string
+      label?: string
+      api_key?: string
+      contribute_platform?: boolean
+    }) => {
+      const res = await apiFetch(`/v1/users/me/execution-layers/${layer}/subscriptions`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to add the API key')
+      }
+      return res.json()
+    },
+    onSuccess: () => invalidateEngineQueries(qc),
+  })
+}
 
 export function useUserDeleteSubscription() {
   const qc = useQueryClient()

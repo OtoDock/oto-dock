@@ -89,7 +89,8 @@ def test_totp_setup_reconfigure_requires_password():
 # --- User delete revokes API keys + user triggers ----------------------------
 
 def test_delete_user_revokes_api_keys_and_triggers():
-    from storage import api_key_store, trigger_store
+    from storage.identity import api_key_store
+    from storage.automation import trigger_store
 
     admin_sub = _mk_user(email="admin@t.com", role="admin")
     victim_sub = _mk_user(email="victim@t.com")
@@ -111,3 +112,25 @@ def test_delete_user_revokes_api_keys_and_triggers():
     # The orphaned key is gone (was previously un-revocable after delete).
     assert api_key_store.list_user_api_keys(user_sub=victim_sub) == []
     assert trigger_store.cleanup_user_triggers(victim_sub) == 0
+
+
+def test_delete_user_removes_their_usage_caps():
+    from storage.billing import subscription_store
+
+    admin_sub = _mk_user(email="admin2@t.com", role="admin")
+    victim_sub = _mk_user(email="capped@t.com")
+    db.upsert_usage_limit("user_self", victim_sub, "monthly", 5.0, victim_sub)
+    db.upsert_usage_limit("user_override", victim_sub, "weekly", 9.0, admin_sub)
+    subscription_store.upsert_pool_cap(
+        "user", victim_sub, week_pct=50, day_pct=None, week_usd=None, day_usd=None,
+        on_reached="stop", updated_by=victim_sub)
+
+    async def _admin():
+        return UserContext(sub=admin_sub, email="admin2@t.com", name="A", role="admin")
+    app.dependency_overrides[get_current_user] = _admin
+
+    r = client.request("DELETE", f"/v1/admin/users/{victim_sub}")
+    assert r.status_code == 200, r.text
+    assert db.get_usage_limits_for_target("user_self", victim_sub) == []
+    assert db.get_usage_limits_for_target("user_override", victim_sub) == []
+    assert subscription_store.get_pool_cap("user", victim_sub) is None

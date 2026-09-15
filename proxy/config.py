@@ -211,7 +211,7 @@ RECOVER_BIN_MAX_BYTES = int(_cfg("RECOVER_BIN_MAX_MB", "100")) * 1024 * 1024
 # agent itself is over quota. On overflow, capture() evicts that agent's oldest
 # entries first (atop the 7-day TTL). 0 = unlimited.
 RECOVER_BIN_AGENT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
-# Delete tombstones (storage/file_tombstones_store.py) are kept this long so an
+# Delete tombstones (storage/files/file_tombstones_store.py) are kept this long so an
 # offline satellite that missed a delete still applies it on reconnect. After
 # this, a re-created file at the same path is simply re-adopted (the delete is
 # assumed long-since propagated). Generous because satellites can be offline for
@@ -775,7 +775,8 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
     disabled.
     """
     from services.memory import memory_file
-    from storage import agent_store, memory_store
+    from storage.agents import agent_store
+    from storage.agents import memory_store
 
     settings = memory_store.get_settings()
     toggles = memory_store.get_agent_toggles(model)
@@ -929,7 +930,7 @@ def _render_library_bulletins(agent_name: str) -> str | None:
     here via the projector's normal mirror→source adoption, so the source
     copy stays the single read point). Default-on convention: no flag,
     missing file = no subsection."""
-    from storage import db_knowledge_libraries
+    from storage.knowledge import db_knowledge_libraries
     # (source, subdir, name, own, writable)
     entries: list[tuple[str, str, str, bool, bool]] = []
     for a in db_knowledge_libraries.attachments_for_consumer(agent_name):
@@ -1682,7 +1683,7 @@ def get_model_supports_xhigh(model: str) -> bool:
     if entry:
         return bool(entry.get("supports_xhigh", False))
     with contextlib.suppress(Exception):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models():
             if m.get("model_id") == model:
                 return bool(m.get("supports_xhigh", 0))
@@ -1718,7 +1719,7 @@ def get_model_provider(model: str, layer: str = "") -> str:
         return entry.get("provider", "anthropic")
     # 2. Check DB (dynamically discovered/added models have provider set)
     with contextlib.suppress(Exception):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         db_models = subscription_store.list_models(layer=layer or None)
         for m in db_models:
             if m.get("model_id") == model and m.get("provider"):
@@ -1748,7 +1749,7 @@ def get_model_layers(model: str) -> list[str]:
     if entry:
         return list(entry.get("layers", []))
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         return [
             m["layer"] for m in subscription_store.list_models()
             if m.get("model_id") == model and m.get("layer")
@@ -1794,7 +1795,7 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
     """
     # 1. Check DB for custom pricing (dynamically added models)
     with contextlib.suppress(Exception):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("model_id") == model and m.get("pricing_input", 0) > 0:
                 return (
@@ -1817,7 +1818,7 @@ def get_model_context_window(model: str) -> int:
     """
     # Check DB for custom context window
     with contextlib.suppress(Exception):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("model_id") == model and m.get("context_window", 0) > 0:
                 return m["context_window"]
@@ -1837,7 +1838,7 @@ def model_supports_reasoning(model: str) -> bool:
         return entry.get("supports_reasoning", False)
     # Dynamic models: check DB (admin-configured via execution layers page)
     with contextlib.suppress(Exception):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models():
             if m.get("model_id") == model:
                 return bool(m.get("supports_reasoning", 0))
@@ -1888,7 +1889,7 @@ def _pool_providers(layer: str) -> set[str]:
     relay rows count; personal-only accounts do not — they serve one user's
     chats, and the System Default is an agent-level choice)."""
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         return {
             (s.get("provider") or "")
             for s in subscription_store.list_platform_pool(layer)
@@ -1930,7 +1931,8 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
             a layer without adding a custom one. Message includes the agent
             name and execution path so admins know where to look.
     """
-    from storage import agent_store, subscription_store
+    from storage.agents import agent_store
+    from storage.billing import subscription_store
 
     agent = agent_store.get_agent(agent_name)
     path = (layer
@@ -2004,7 +2006,7 @@ def get_agent_model(agent_name: str) -> str:
 
 def get_cli_effort(agent_name: str) -> str:
     """Get the effort level for an agent (CLI sessions)."""
-    from storage import agent_store
+    from storage.agents import agent_store
     agent = agent_store.get_agent(agent_name)
     return (agent["default_effort"] if agent and agent["default_effort"] else DEFAULT_EFFORT_LEVEL)
 

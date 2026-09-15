@@ -70,6 +70,17 @@ from core.session.transcript_tool_events import (
 
 logger = logging.getLogger("claude-proxy.codex_rollout_tailer")
 
+
+def _record_rate_limits(session_id: str, snapshot: dict, timestamp) -> None:
+    """A ``token_count`` line's ``rate_limits``: the account's window state,
+    for the pool (synchronous: the tailer runs in a thread)."""
+    from services.engines import subscription_windows as _sw
+    try:
+        _sw.record_codex_snapshot(
+            session_id, snapshot, timestamp if isinstance(timestamp, str) else None)
+    except Exception:
+        logger.debug("rollout tailer: window record failed", exc_info=True)
+
 # session_id → number of rollout lines already processed. The rollout JSONL is
 # append-only within a session, so a line offset is a sufficient, cheap cursor.
 _offsets: dict[str, int] = {}
@@ -696,7 +707,8 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # event, identical on a re-delivery.
             key = (f"usage:{obj.get('timestamp', '')}"
                    f":{total.get('total_tokens', 0)}")
-            if last and buf.claim(key) and not calibrate_usage:
+            fresh = buf.claim(key)
+            if last and fresh and not calibrate_usage:
                 inp = int(last.get("input_tokens") or 0)
                 cached = int(last.get("cached_input_tokens") or 0)
                 cw = int(last.get("cache_write_input_tokens") or 0)
@@ -706,6 +718,12 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 usage_acc["cache_read"] += cached
                 usage_acc["cache_write"] += cw
                 usage_acc["output_tokens"] += int(last.get("output_tokens") or 0)
+            if fresh and isinstance(payload.get("rate_limits"), dict):
+                # The account's window state rides next to the counts; the
+                # envelope timestamp dates the observation, so a replayed
+                # line never reads as a fresh one.
+                _record_rate_limits(session_id, payload["rate_limits"],
+                                    obj.get("timestamp"))
             continue
 
         if otype == "event_msg" and payload.get("type") in ("error", "stream_error"):

@@ -8,23 +8,23 @@ headless ``-p`` task. DB-free (the special-tool branch returns before Pass-1).
 """
 import pytest
 
-from api.hooks import hooks
+from api.hooks import permission, routing
 
 
 @pytest.fixture
 def _stub(monkeypatch):
     """Stub the session lookups so decide_tool_permission runs DB-free, with the
     session treated as interactive. Returns the list the deny path pushes to."""
-    monkeypatch.setattr(hooks, "record_hook_activity", lambda sid: None)
-    monkeypatch.setattr(hooks, "get_meeting_session_info", lambda sid: None)
-    monkeypatch.setattr(hooks, "_is_interactive_session", lambda sid: True)
+    monkeypatch.setattr(permission, "record_hook_activity", lambda sid: None)
+    monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: None)
+    monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: True)
     pushed = []
 
     class _Q:
         async def put(self, item):
             pushed.append(item)
 
-    monkeypatch.setattr(hooks, "get_permission_queue", lambda sid: _Q())
+    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
     return pushed
 
 
@@ -32,9 +32,9 @@ def _stub(monkeypatch):
 async def test_askuserquestion_interactive_task_denies(monkeypatch, _stub):
     # client_type "task" → no viewer → deny + surface the question (don't let the
     # TUI block on cards nobody answers).
-    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "auto")
-    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "task")
-    res = await hooks.decide_tool_permission("s", "AskUserQuestion", {"questions": []})
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "auto")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "task")
+    res = await permission.decide_tool_permission("s", "AskUserQuestion", {"questions": []})
     assert res["decision"] == "deny"
     assert "Do NOT re-ask" in res["reason"]
     assert _stub and _stub[0]["event_type"] == "question"
@@ -44,8 +44,8 @@ async def test_askuserquestion_interactive_task_denies(monkeypatch, _stub):
 async def test_askuserquestion_interactive_chat_allows(monkeypatch, _stub):
     # A human re-opening the run is client_type "dashboard" → let the tool RUN so
     # the TUI renders the native question cards inline.
-    monkeypatch.setattr(hooks, "get_session_mode", lambda sid: "default")
-    monkeypatch.setattr(hooks, "get_session_client_type", lambda sid: "dashboard")
-    res = await hooks.decide_tool_permission("s", "AskUserQuestion", {"questions": []})
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "default")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "dashboard")
+    res = await permission.decide_tool_permission("s", "AskUserQuestion", {"questions": []})
     assert res["decision"] == "allow"
     assert _stub == []  # nothing surfaced to a dashboard queue — the TUI handles it

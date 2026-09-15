@@ -1,6 +1,6 @@
 """Tests for the Workspace Recover Bin.
 
-Covers ``storage/recover_bin_store.py`` (capture scope/owner resolution, size
+Covers ``storage/files/recover_bin_store.py`` (capture scope/owner resolution, size
 cap, ``list_for`` per-user/manager/admin scoping with NO cross-user leak,
 ``delete_expired`` removing rows AND on-disk bytes) and the ``api/agents/agents.py``
 recover-bin endpoints (restore → original path; collision → "(recovered)"
@@ -14,7 +14,7 @@ Run individually (the conftest DB pool exhausts if test files run together):
 import pytest
 
 import config
-from storage import recover_bin_store as rb
+from storage.files import recover_bin_store as rb
 
 AGENT = "test-agent"
 
@@ -283,7 +283,7 @@ def _manager_with_agent():
 
 
 def _make_agent():
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent(AGENT, "Test Agent")
     agent_store._invalidate_cache()
 
@@ -507,7 +507,8 @@ async def test_restore_manager_can_restore_config(_fanout_calls):
 
 
 def _attach_library(source: str, consumer: str, *, writable: bool):
-    from storage import agent_store, db_knowledge_libraries
+    from storage.agents import agent_store
+    from storage.knowledge import db_knowledge_libraries
     agent_store.create_agent(source, "Lib Source")
     agent_store._invalidate_cache()
     db_knowledge_libraries.promote(source, created_by="u-admin", name="Lib")

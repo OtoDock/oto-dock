@@ -8,20 +8,7 @@ import PlatformSetupGuard from './components/PlatformSetupGuard'
 import AgentGuard from './components/AgentGuard'
 import DefaultAgentRedirect from './components/DefaultAgentRedirect'
 import AuthCallback from './pages/AuthCallback'
-import Overview from './pages/Overview'
-import Schedules from './pages/Schedules'
-import Triggers from './pages/Triggers'
-import History from './pages/History'
 import RunRedirect from './pages/RunRedirect'
-import UsersPage from './pages/admin/UsersPage'
-import UsagePage from './pages/admin/UsagePage'
-import McpServersPage from './pages/admin/McpServersPage'
-import McpRequestsPage from './pages/admin/McpRequestsPage'
-import SkillsPage from './pages/admin/SkillsPage'
-import PlatformPage from './pages/admin/PlatformPage'
-import NotificationsPage from './pages/admin/NotificationsPage'
-import MeetingsPage from './pages/admin/MeetingsPage'
-import RemoteMachinesPage from './pages/admin/RemoteMachinesPage'
 import UserSettings from './pages/UserSettings'
 import AgentOverview from './pages/agent/AgentOverview'
 import AgentChat from './pages/agent/AgentChat'
@@ -44,6 +31,24 @@ import NativePasskey from './pages/NativePasskey'
 // lazy route, so the 3D chunk never taxes the initial load. Stale-chunk
 // recovery already exists (vite:preloadError handler in main.tsx).
 const AgentsPage = lazy(() => import('./pages/AgentsPage'))
+
+// Every route inside the admin Layout is admin-only and loads when first
+// opened; Layout holds the Suspense boundary, so the sidebar stays put while
+// a page's chunk arrives. The chat route stays eager: it is the landing
+// screen, and a fetch in front of it would move the cost, not remove it.
+const Overview = lazy(() => import('./pages/Overview'))
+const Schedules = lazy(() => import('./pages/Schedules'))
+const Triggers = lazy(() => import('./pages/Triggers'))
+const History = lazy(() => import('./pages/History'))
+const UsersPage = lazy(() => import('./pages/admin/UsersPage'))
+const UsagePage = lazy(() => import('./pages/admin/UsagePage'))
+const McpServersPage = lazy(() => import('./pages/admin/McpServersPage'))
+const McpRequestsPage = lazy(() => import('./pages/admin/McpRequestsPage'))
+const SkillsPage = lazy(() => import('./pages/admin/SkillsPage'))
+const PlatformPage = lazy(() => import('./pages/admin/PlatformPage'))
+const NotificationsPage = lazy(() => import('./pages/admin/NotificationsPage'))
+const MeetingsPage = lazy(() => import('./pages/admin/MeetingsPage'))
+const RemoteMachinesPage = lazy(() => import('./pages/admin/RemoteMachinesPage'))
 
 /**
  * Ensures back button works on secondary pages (settings, agents, admin).

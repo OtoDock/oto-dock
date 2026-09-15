@@ -33,7 +33,8 @@ from services.webhooks.event_normalizer import (
     resolve_catalog_keys,
     walk_path,
 )
-from storage import trigger_store, webhook_subscription_store
+from storage.automation import trigger_store
+from storage.automation import webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.webhook-dispatcher")
 
@@ -223,7 +224,7 @@ async def dispatch_relay_webhook(
 
     from auth.webhook_providers.generic import GenericWebhookProvider
     from services.billing import relay_client
-    from storage import credential_store
+    from storage.identity import credential_store
 
     forward_secret = (
         credential_store.get_infra_credentials(
@@ -525,7 +526,7 @@ def _resolve_signing_secret(*, webhooks_block: dict, row: dict) -> str:
     if not key:
         return ""
     from services.mcp import mcp_registry
-    from storage import credential_store
+    from storage.identity import credential_store
     manifest = mcp_registry.get_manifest(row["mcp_name"])
     oauth_block = (manifest.credentials.oauth or {}) if manifest else {}
     for slug in (oauth_block.get("app_credential", ""), row["mcp_name"]):

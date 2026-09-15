@@ -14,11 +14,11 @@ import logging
 import secrets
 import time
 
-from storage import audio_provider_store
-from storage import credential_store
+from storage.prefs import audio_provider_store
+from storage.identity import credential_store
 from storage import database as task_store
-from storage import phone_route_store
-from storage import phone_server_store
+from storage.phone import phone_route_store
+from storage.phone import phone_server_store
 
 logger = logging.getLogger("phone_config")
 
@@ -69,7 +69,7 @@ def assemble_duplex_session_config(user_sub: str) -> dict:
     the turn-classifier language map + Groq credentials) ride the GLOBAL
     config push — one source per knob, never duplicated here.
     """
-    from storage import user_audio_prefs_store
+    from storage.prefs import user_audio_prefs_store
 
     stt = audio_provider_store.get_default_provider("stt", "chat") or {}
     tts = audio_provider_store.get_default_provider("tts", "chat") or {}
@@ -138,7 +138,7 @@ def direct_llm_groq_credentials() -> tuple[str, str]:
     call. The per-turn classifier traffic runs phone-daemon → relay, not via the
     proxy.
     """
-    from storage import subscription_store
+    from storage.billing import subscription_store
 
     # Pool view (contribute_platform + active + owner-is-admin); reading the store
     # directly here bypasses acquire_subscription, so list_platform_pool is what
@@ -167,7 +167,7 @@ def groq_classifier_configured() -> bool:
     "active" indicator (a GET shouldn't trigger a relay round-trip); whether a
     hosted call actually succeeds still depends on credits at call time.
     """
-    from storage import subscription_store
+    from storage.billing import subscription_store
     for sub in subscription_store.list_platform_pool(layer="direct-llm", provider="groq"):
         if sub.get("auth_type") == "relay":
             return True

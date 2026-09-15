@@ -14,7 +14,8 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.scheduler import scheduler
-from storage import agent_store, mcp_store
+from storage.agents import agent_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 
 
@@ -302,7 +303,7 @@ class TestSpawnOverrides:
     worker chat row, and IGNORED on continue (the worker keeps its config)."""
 
     def test_overrides_ride_the_task_and_chat_pins(self, client, monkeypatch):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
                             lambda p: [{"model_id": "claude-opus-5", "enabled": True}])
         r = _spawn(client, surface="chat", model="claude-opus-5",
@@ -332,7 +333,7 @@ class TestSpawnOverrides:
         assert client.fired == []
 
     def test_model_foreign_to_layer_400(self, client, monkeypatch):
-        from storage import subscription_store
+        from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
                             lambda p: [{"model_id": "other-model", "enabled": True}])
         r = _spawn(client, model="gpt-5.4")

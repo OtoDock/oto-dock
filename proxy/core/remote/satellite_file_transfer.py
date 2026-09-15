@@ -537,7 +537,7 @@ class SatelliteFileTransferMixin:
         _lib_src = core_file_sync.library_mirror_source(rel_path)
         _writable_libs: frozenset[tuple[str, str]] | None = None
         if _lib_src is not None:
-            from storage import db_knowledge_libraries
+            from storage.knowledge import db_knowledge_libraries
             _writable_libs = await asyncio.to_thread(
                 db_knowledge_libraries.writable_pairs_for, agent_slug)
         if sec is None or not core_file_sync.can_write_back(
@@ -639,10 +639,10 @@ class SatelliteFileTransferMixin:
         conflict_notify: tuple[str, str] | None = None  # (loser_slug, filename)
         try:
             async with lock:
-                from storage import (
-                    sync_state_store, file_tombstones_store,
-                    file_author_store, recover_bin_store,
-                )
+                from storage.files import sync_state_store
+                from storage.files import file_tombstones_store
+                from storage.files import file_author_store
+                from storage.files import recover_bin_store
 
                 # Pre-capture the to-be-removed/overwritten bytes. Size-gated, so a
                 # large file is never read on the apply path (None → not captured).

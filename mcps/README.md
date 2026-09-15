@@ -14,5 +14,10 @@ drop in a manifest, assign the MCP to an agent, done.
   the community repo, not here.
 - `_shared/` — building blocks shared across MCPs (see its README).
 
+An MCP folder may carry an `icon.png` (256×256) that the dashboard shows
+next to the MCP. The bundled ones share one family, a blue tile with a
+[Lucide](https://lucide.dev) glyph (ISC licence); a community entry's icon
+is the upstream project's own mark.
+
 Developer docs — manifest format, sandboxing, credential brokering — live at
 [docs.otodock.io](https://docs.otodock.io).

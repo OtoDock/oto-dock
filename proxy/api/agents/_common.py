@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 import config
-from storage import agent_store
+from storage.agents import agent_store
 
 
 def _get_agent_dir(name: str) -> Path:

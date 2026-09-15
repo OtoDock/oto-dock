@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from api.hooks.hooks import _sandbox_to_host, _session_scope_root
+from api.hooks.paths import _sandbox_to_host, _session_scope_root
 from auth.path_policy import SecurityContext
 
 

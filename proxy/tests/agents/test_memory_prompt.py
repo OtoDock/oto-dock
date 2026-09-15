@@ -15,7 +15,8 @@ from pathlib import Path
 
 import config as app_config
 from services.memory import memory_file
-from storage import agent_store, memory_store
+from storage.agents import agent_store
+from storage.agents import memory_store
 
 
 def _seed_agent(slug: str, *, default_scope: str = "user") -> Path:

@@ -1,7 +1,7 @@
 """Who the caller IS on a phone route — the warmup-time identity resolver.
 
 A phone route carries ``identity_mode`` (``caller`` / ``shared`` / ``user``)
-and ``remember_callers`` (``storage/phone_route_store.py``). This module
+and ``remember_callers`` (``storage/phone/phone_route_store.py``). This module
 turns one call's facts (the route, the agent the daemon asked for, the
 caller-id the trunk reported, the daemon's PIN-gate result) into a
 :class:`RouteIdentity` the config builder consumes. It is the ONLY place that
@@ -26,7 +26,8 @@ from dataclasses import dataclass
 
 from core.session import external_identity
 from core.session.visibility import available_scopes_for
-from storage import agent_store, phone_route_store
+from storage.agents import agent_store
+from storage.phone import phone_route_store
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy")

@@ -69,7 +69,7 @@ async def run_health_tick() -> None:
     Public (no sleep) so it can be driven directly from a test or an admin
     "refresh all" action.
     """
-    from storage import phone_server_store
+    from storage.phone import phone_server_store
 
     servers = await asyncio.to_thread(phone_server_store.get_all_servers)
     if not servers:
@@ -89,7 +89,8 @@ async def run_health_tick() -> None:
 async def _reconcile_server(server: dict) -> None:
     """Health-probe one server and, if verified + enumerable, drift-check it."""
     from services.phone import phone_adapters
-    from storage import phone_route_store, phone_server_store
+    from storage.phone import phone_route_store
+    from storage.phone import phone_server_store
 
     adapter = await asyncio.to_thread(phone_adapters.load_adapter, server)
 

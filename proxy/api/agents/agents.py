@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_auth, require_write
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 from api.agents._common import _get_execution_paths
@@ -398,7 +398,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                 "(or both empty to clear the assignment).",
             )
         if _dept:
-            from storage import db_departments
+            from storage.agents import db_departments
             dept_row = await asyncio.to_thread(
                 db_departments.get_department, _dept
             )
@@ -565,7 +565,7 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
     # Knowledge-library consumers must be read BEFORE the DB cascade wipes
     # the attachment rows — their mirror dirs live in OTHER agents' trees,
     # which the rmtree below never reaches.
-    from storage import db_knowledge_libraries
+    from storage.knowledge import db_knowledge_libraries
     _lib_consumers = [
         a["consumer_agent"] for a in await asyncio.to_thread(
             db_knowledge_libraries.consumers_of, name)
@@ -594,7 +594,7 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
         except Exception as e:
             logger.warning("Failed to remove agent directory %s: %s", name, e)
     try:
-        from storage import recover_bin_store
+        from storage.files import recover_bin_store
         await asyncio.to_thread(recover_bin_store.remove_agent_files, name)
     except Exception as e:
         logger.warning("Failed to remove recover-bin files for %s: %s", name, e)

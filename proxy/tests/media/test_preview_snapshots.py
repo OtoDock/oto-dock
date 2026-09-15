@@ -1,7 +1,7 @@
 """Version-pinned preview snapshots: the store
 (services/media/preview_snapshots.py), the WOPI snapshot namespace + the
 view-only ``/v1/documents/snapshot-wopi-url`` mint (api/media/wopi.py), and
-instance-scoped dismissal (storage/db_chats.py).
+instance-scoped dismissal (storage/chat/db_chats.py).
 
 The frozen "previous version" block's whole trust story lives here: snapshots
 are proxy-owned copies outside every agent tree, served only through

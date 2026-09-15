@@ -24,7 +24,8 @@ if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
 import config as app_config
-from storage import agent_store, file_tombstones_store
+from storage.agents import agent_store
+from storage.files import file_tombstones_store
 from storage.pg import get_conn
 
 AGENT = "setup-v2-agent"

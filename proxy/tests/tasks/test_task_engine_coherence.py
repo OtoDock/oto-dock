@@ -28,7 +28,7 @@ from core.events.stream_pump import ChatStreamPump
 
 
 def _seed_models():
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subscription_store.sync_builtin_models("claude-code-cli", [
         {"value": "claude-sonnet-5", "label": "Sonnet 5", "provider": "anthropic"},
     ])
@@ -38,7 +38,7 @@ def _seed_models():
 
 
 def _make_agent(slug: str = "coherence-agent") -> str:
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent(
         slug, "Coherence",
         execution_path="claude-code-cli",

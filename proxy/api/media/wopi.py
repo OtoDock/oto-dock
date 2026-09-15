@@ -519,7 +519,7 @@ async def generate_wopi_url(
         _rel = full_path.relative_to(agent_root).as_posix()
         _wl = None
         if library_mirror_source(_rel) is not None:
-            from storage import db_knowledge_libraries
+            from storage.knowledge import db_knowledge_libraries
             _wl = db_knowledge_libraries.writable_pairs_for(req.agent)
         can_edit = req.edit and can_write_back(
             _rel, user.get_agent_role(req.agent), _uname,
@@ -658,7 +658,7 @@ async def generate_preview_wopi_url(
         _tree_rel = rel_path.partition("/")[2]
         _wl = None
         if library_mirror_source(_tree_rel) is not None:
-            from storage import db_knowledge_libraries
+            from storage.knowledge import db_knowledge_libraries
             _wl = db_knowledge_libraries.writable_pairs_for(agent)
         if can_write_back(_tree_rel, role, username, writable_libraries=_wl):
             permissions = "edit"

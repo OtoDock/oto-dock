@@ -16,9 +16,9 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.media import wake_keywords
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
-from storage import user_audio_prefs_store
+from storage.prefs import user_audio_prefs_store
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +56,14 @@ class TestNormalizeEncode:
         assert set(wake_keywords.PLATFORM_PHRASES) == set(expected)
         for phrase, chain in expected.items():
             assert wake_keywords.encode_phrase(phrase) == chain
+
+    def test_line_modifiers_are_finite_and_positive(self, temp_db):
+        # std::stof in the spotter accepts "inf" (HUGE_VALF, no throw): an
+        # infinite boost or threshold would reach every user's spotter.
+        for raw, want in [("2.5", 2.5), ("inf", 2.0), ("1e400", 2.0), ("nan", 2.0),
+                          ("0", 2.0), ("-1", 2.0), ("junk", 2.0), ("", 2.0)]:
+            task_store.set_platform_setting("audio_wake_word_agent_boost", raw)
+            assert wake_keywords._float_setting("audio_wake_word_agent_boost", 2.0) == want, raw
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +140,10 @@ class TestWakeKeywordsEndpoint:
         assert lines[0].endswith(" @alpha") and lines[1].endswith(" @beta")
         # every line is "<bpe tokens> [modifiers] @slug"
         assert all(line.startswith("▁HE Y ") for line in lines)
-        # agent lines carry NO per-line modifiers — globals apply to them
-        assert all(":" not in line and "#" not in line for line in lines[:2])
+        # agent lines carry their own rider pair (2026-09-11: measured on an
+        # operator's accented recordings — recall doubled, no false fires)
+        assert all(" :2 " in line and " #0.2 " in line for line in lines[:2])
+        assert lines[0].endswith(" :2 #0.2 @alpha")
         # every platform variant targets the favorite, tag last on the line
         platform_lines = lines[2:]
         assert len(platform_lines) == 4
@@ -223,9 +233,11 @@ class TestWakeKeywordsEndpoint:
             "audio_wake_word_platform_threshold", "0.15")
         client = _make_client(_member(["alpha"], default="alpha"))
         lines = client.get("/v1/users/me/wake-keywords").json()["keywords"].splitlines()
-        platform_lines = [ln for ln in lines if ":" in ln]
-        assert platform_lines
+        platform_lines = [ln for ln in lines if "▁DO CK" in ln or "D O CK" in ln]
+        assert len(platform_lines) == 4
         assert all(" :3.5 " in ln and " #0.15 " in ln for ln in platform_lines)
+        # the agent line keeps ITS pair — the two knobs are independent
+        assert lines[0].endswith(" :2 #0.2 @alpha")
 
     def test_platform_line_tuning_junk_falls_back(self, three_agents):
         # A junk or non-positive admin value must NEVER reach the emitted
@@ -235,9 +247,25 @@ class TestWakeKeywordsEndpoint:
         task_store.set_platform_setting("audio_wake_word_platform_threshold", "0")
         client = _make_client(_member(["alpha"], default="alpha"))
         lines = client.get("/v1/users/me/wake-keywords").json()["keywords"].splitlines()
-        platform_lines = [ln for ln in lines if ":" in ln]
-        assert platform_lines
+        platform_lines = [ln for ln in lines if "▁DO CK" in ln or "D O CK" in ln]
+        assert len(platform_lines) == 4
         assert all(" :2 " in ln and " #0.2 " in ln for ln in platform_lines)
+
+    def test_agent_line_tuning_settings_and_junk_fallback(self, three_agents):
+        # The agent-name pair (2026-09-11) rides every agent line and
+        # follows the same validation as the platform pair.
+        task_store.set_platform_setting("audio_wake_word_agent_boost", "2.5")
+        task_store.set_platform_setting("audio_wake_word_agent_threshold", "0.1")
+        client = _make_client(_member(["alpha", "beta"], default="alpha"))
+        lines = client.get("/v1/users/me/wake-keywords").json()["keywords"].splitlines()
+        assert lines[0].endswith(" :2.5 #0.1 @alpha")
+        assert lines[1].endswith(" :2.5 #0.1 @beta")
+        # platform lines untouched by the agent knobs
+        assert all(" :2 " in ln and " #0.2 " in ln for ln in lines[2:])
+        task_store.set_platform_setting("audio_wake_word_agent_boost", "-1")
+        task_store.set_platform_setting("audio_wake_word_agent_threshold", "nope")
+        lines = client.get("/v1/users/me/wake-keywords").json()["keywords"].splitlines()
+        assert lines[0].endswith(" :2 #0.2 @alpha")
 
     def test_no_agents_disabled(self, temp_db):
         client = _make_client(_member([]))

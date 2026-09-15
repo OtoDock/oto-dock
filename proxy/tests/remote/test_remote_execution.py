@@ -14,7 +14,7 @@ def test_load_hook_scripts_loads_all_hooks():
     Pin that all three hook scripts load from the real proxy/hooks dir with
     non-empty content.
     """
-    from core.remote import remote_execution as re
+    from core.remote import remote_start_payload as re
 
     re._HOOK_SCRIPTS_CACHE = None  # bypass the module-level cache
     try:
@@ -43,7 +43,7 @@ class TestRestoreAdoptedCredentials:
         from core.remote.remote_execution import RemoteExecutionLayer
         from core.session import session_state
         from services.engines import subscription_pool, token_fanout
-        from storage import subscription_store
+        from storage.billing import subscription_store
 
         calls = {}
 
@@ -73,7 +73,7 @@ class TestRestoreAdoptedCredentials:
         from core.remote.remote_execution import RemoteExecutionLayer
         from core.session import session_state
         from services.engines import subscription_pool, token_fanout
-        from storage import subscription_store
+        from storage.billing import subscription_store
 
         calls = {}
         monkeypatch.setattr(subscription_pool, "restore_session_binding",
@@ -92,7 +92,7 @@ class TestRestoreAdoptedCredentials:
     def test_api_key_subscription_skips_registration(self, monkeypatch):
         from core.remote.remote_execution import RemoteExecutionLayer
         from services.engines import subscription_pool, token_fanout
-        from storage import subscription_store
+        from storage.billing import subscription_store
 
         calls = {}
         monkeypatch.setattr(subscription_pool, "restore_session_binding",

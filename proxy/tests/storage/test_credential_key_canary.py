@@ -1,4 +1,4 @@
-"""Boot-time credential-key canary (storage.credential_store.startup_key_canary).
+"""Boot-time credential-key canary (storage.identity.credential_store.startup_key_canary).
 
 The Fernet key derives from JWT_SECRET; a recreated config.env orphans every
 encrypted row. The canary samples each store at boot and logs one loud ERROR
@@ -13,8 +13,8 @@ import logging
 
 import pytest
 
-from storage import credential_store
-from storage.credential_store import startup_key_canary
+from storage.identity import credential_store
+from storage.identity.credential_store import startup_key_canary
 from storage.database import get_conn
 
 

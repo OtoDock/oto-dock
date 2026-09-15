@@ -33,7 +33,7 @@ _MAX_TRACKED_SESSIONS = 4096
 
 def _threshold() -> int:
     try:
-        from storage import memory_store
+        from storage.agents import memory_store
         return int(memory_store.get_settings().get("nudge_turns") or 0)
     except Exception:
         return 0

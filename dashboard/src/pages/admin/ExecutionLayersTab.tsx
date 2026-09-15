@@ -21,6 +21,7 @@ import { AddApiKeyForm, ConnectOAuth, DiscoverModelsPanel } from './ExecutionLay
 import { LocalModelsSection } from './ExecutionLayersTab.local'
 import { SubscriptionRow, ModelsByProvider } from './ExecutionLayersTab.rows'
 import { SetupBanner } from './ExecutionLayersTab.sections'
+import { BalanceHint } from '../../components/engines/SubscriptionWindows'
 
 // ---------------------------------------------------------------------------
 // Layer Card
@@ -210,6 +211,7 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
                 />
               ))}
             </div>
+            <BalanceHint oauthCount={rowSubs.filter((s) => s.auth_type === 'oauth' && s.status === 'active').length} />
 
             {showOAuth && (
               <ConnectOAuth layer={layer.name} ownerType="platform" provider={layer.name === 'codex-cli' ? 'openai' : 'claude'} onDone={() => setShowOAuth(false)} />

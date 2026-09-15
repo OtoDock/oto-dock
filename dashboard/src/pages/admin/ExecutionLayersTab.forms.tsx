@@ -19,73 +19,20 @@ import {
 } from '../../api/executionLayers'
 import { Badge, PROVIDER_LABELS } from './ExecutionLayersTab.widgets'
 import { CopyButton } from '../../components/CopyButton'
+import { ApiKeyForm } from '../../components/engines/AddApiKeyForm'
 
 // ---------------------------------------------------------------------------
-// Add API Key Form
+// Add API Key Form — the admin binding of the shared form (a provider choice
+// on the multi-provider engines).
 // ---------------------------------------------------------------------------
 
-const API_KEY_PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic' },
-  { id: 'openai', label: 'OpenAI' },
-  { id: 'groq', label: 'Groq' },
-]
-
-export function AddApiKeyForm({ layer, provider: defaultProvider, onDone }: { layer: string; provider: string; onDone: () => void }) {
-  const [label, setLabel] = useState('')
-  const [apiKey, setApiKey] = useState('')
-  const [provider, setProvider] = useState(defaultProvider)
+export function AddApiKeyForm({ layer, provider, onDone }: { layer: string; provider: string; onDone: () => void }) {
   const addMut = useAddSubscription()
-  const showProviderSelect = layer === 'direct-llm' || layer === 'codex-cli'
-
-  const handleSubmit = () => {
-    if (!apiKey.trim()) return
-    addMut.mutate(
-      { layer, provider, auth_type: 'api_key', label: label.trim(), api_key: apiKey.trim() },
-      { onSuccess: () => { setLabel(''); setApiKey(''); onDone() } },
-    )
-  }
-
   return (
-    <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
-      {showProviderSelect && (
-        <select
-          value={provider}
-          onChange={(e) => setProvider(e.target.value)}
-          className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
-        >
-          {API_KEY_PROVIDERS.map((p) => (
-            <option key={p.id} value={p.id}>{p.label}</option>
-          ))}
-        </select>
-      )}
-      <input
-        type="text"
-        placeholder="Label (optional)"
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
-      />
-      <input
-        type="password"
-        placeholder="API key"
-        value={apiKey}
-        onChange={(e) => setApiKey(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 font-mono"
-      />
-      <div className="flex gap-2">
-        <button
-          onClick={handleSubmit}
-          disabled={!apiKey.trim() || addMut.isPending}
-          className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
-        >
-          {addMut.isPending ? 'Adding...' : 'Add'}
-        </button>
-        <button onClick={onDone} className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
-          Cancel
-        </button>
-      </div>
-      {addMut.isError && <p className="text-xs text-red-500">{(addMut.error as Error).message}</p>}
-    </div>
+    <ApiKeyForm
+      layer={layer} provider={provider} onDone={onDone} mutation={addMut} ownerType="platform"
+      showProviderSelect={layer === 'direct-llm' || layer === 'codex-cli'}
+    />
   )
 }
 

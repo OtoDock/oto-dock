@@ -130,6 +130,10 @@ class PtyViewerController:
                     frame["meeting_agent"] = item["meeting_agent"]
                 await self._send(frame)
             elif et in ("plan_review", "question"):
+                # Neither reaches a human-driven interactive session any
+                # more: the hook lets AskUserQuestion run natively and
+                # defers ExitPlanMode to the CLI's own plan dialog
+                # (2026-09-10). Kept for the queue's other producers.
                 await self._send({
                     "type": "pty_permission", "kind": et,
                     "chat_id": vcid, "session_id": vsid,

@@ -24,7 +24,9 @@ from services.infra import external_retention as er
 from services.infra import retention
 from services.infra.retention import LiveSnapshot
 from storage import database as task_store
-from storage import file_author_store, file_tombstones_store, phone_call_log_store
+from storage.files import file_author_store
+from storage.files import file_tombstones_store
+from storage.phone import phone_call_log_store
 
 AGENT = "support"
 

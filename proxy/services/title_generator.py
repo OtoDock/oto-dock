@@ -49,7 +49,7 @@ TITLE_TOOL_THRESHOLD = 5
 def deterministic_title(text: str) -> str:
     """Stable chat title from a first user message — first ~6 words / 48 chars,
     whitespace-collapsed, ellipsis if truncated. The same rule the chat layer
-    applies at send time (``ws/dashboard_chat.py::_deterministic_title``);
+    applies at send time (``ws/dashboard_chat_support.py::_deterministic_title``);
     exposed here so the storage layer can stamp scheduler-driven task chats
     without importing the WS controller."""
     stripped = _TIME_PRELUDE_RE.sub("", text or "", count=1)
@@ -111,7 +111,7 @@ def _platform_direct_subs(provider: str) -> list[dict]:
     # Pool view (contribute_platform + active + owner-is-admin). This helper reads
     # the store directly — it bypasses acquire_subscription — so list_platform_pool
     # is what keeps a demoted admin's / a user's personal sub out of title generation.
-    from storage import subscription_store
+    from storage.billing import subscription_store
     return subscription_store.list_platform_pool(layer="direct-llm", provider=provider)
 
 
@@ -119,7 +119,7 @@ def _provider_configured(provider: str) -> bool:
     """True if ``provider`` has a usable Direct-LLM platform subscription — a BYO
     key, a hosted relay sub, or (keyless local) any active sub. Does NOT mint a
     token, so it is safe for the admin GET / status path."""
-    from storage import subscription_store
+    from storage.billing import subscription_store
     keyless = provider in _KEYLESS
     for sub in _platform_direct_subs(provider):
         if sub.get("auth_type") == "relay":
@@ -134,7 +134,7 @@ def _provider_configured(provider: str) -> bool:
 def _local_model_for(provider: str) -> str:
     """First enabled Direct-LLM model for a keyless local provider (ollama/openai_compatible)."""
     try:
-        from storage import subscription_store
+        from storage.billing import subscription_store
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("provider") == provider and m.get("enabled", True):
                 return m.get("model_id") or ""
@@ -176,7 +176,7 @@ def _provider_credentials(provider: str) -> tuple[str, str] | None:
     """``(api_key, base_url)`` for a provider — BYO-key-wins → relay-mint → keyless
     local. ``base_url`` '' means the adapter's vendor default. None when
     unresolved. MAY mint a relay token (do not call from a GET)."""
-    from storage import subscription_store
+    from storage.billing import subscription_store
     subs = _platform_direct_subs(provider)
     if not subs:
         return None

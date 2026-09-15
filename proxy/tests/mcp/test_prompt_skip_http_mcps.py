@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import config as app_config
 from services.mcp import mcp_registry
-from storage import agent_store
+from storage.agents import agent_store
 
 
 def _manifest(tmp_path, name, transport, skills):

@@ -14,7 +14,8 @@ from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext, get_current_user
-from storage import agent_store, db_knowledge_libraries
+from storage.agents import agent_store
+from storage.knowledge import db_knowledge_libraries
 
 SRC = "kaa-src"
 CON = "kaa-con"

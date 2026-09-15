@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useAdminMcps, useCheckMcpUpdates, McpServer } from '../../api/mcps'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
+import McpCategoryFilter, { matchesMcpCategory, type McpCategoryFilterValue } from '../../components/McpCategoryFilter'
 import { McpRow } from './McpServersPage.row'
 import { InstallModal } from './McpServersPage.installModal'
 
@@ -16,6 +17,7 @@ export default function McpServersPage() {
   const [showInstall, setShowInstall] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState<McpCategoryFilterValue>('all')
   const { data: updateData, refetch: checkUpdates, isFetching: checkingUpdates } = useCheckMcpUpdates()
   const updates = updateData?.updates || {}
 
@@ -26,15 +28,18 @@ export default function McpServersPage() {
   if (isLoading) return <div className="text-sm text-p-text-light">Loading MCP servers...</div>
   if (!mcps || mcps.length === 0) return <div className="text-sm text-p-text-light">No MCP servers found.</div>
 
-  // Group by category (after applying the search filter)
+  // Group by category (after applying the category and search filters)
   const q = query.trim().toLowerCase()
-  const visibleMcps = q
-    ? mcps.filter(m =>
-        (m.label || '').toLowerCase().includes(q) ||
-        (m.description || '').toLowerCase().includes(q) ||
-        m.name.toLowerCase().includes(q),
-      )
-    : mcps
+  const categoryCounts: Record<string, number> = {}
+  for (const m of mcps) categoryCounts[m.category] = (categoryCounts[m.category] ?? 0) + 1
+  const visibleMcps = mcps.filter(m =>
+    matchesMcpCategory(m.category, categoryFilter) && (
+      !q ||
+      (m.label || '').toLowerCase().includes(q) ||
+      (m.description || '').toLowerCase().includes(q) ||
+      m.name.toLowerCase().includes(q)
+    ),
+  )
   const grouped: Record<string, McpServer[]> = {}
   for (const mcp of visibleMcps) {
     const cat = mcp.category
@@ -93,31 +98,36 @@ export default function McpServersPage() {
         </button>
       </div>
 
-      {/* Search */}
-      <div className="relative mb-4 max-w-md">
-        <svg className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-p-text-light pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" />
-        </svg>
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search MCP servers…"
-          className="w-full pl-8 pr-8 py-2 text-sm rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
-        />
-        {query && (
-          <button
-            onClick={() => setQuery('')}
-            aria-label="Clear search"
-            className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded-sm text-p-text-light hover:text-p-text hover:bg-p-surface-hover"
-          >
-            ×
-          </button>
-        )}
+      {/* Search + category filter */}
+      <div className="mb-4 max-w-md flex items-center gap-2">
+        <div className="relative flex-1 min-w-0">
+          <svg className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-p-text-light pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" />
+          </svg>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search MCP servers…"
+            className="w-full pl-8 pr-8 py-2 text-sm rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+          />
+          {query && (
+            <button
+              onClick={() => setQuery('')}
+              aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded-sm text-p-text-light hover:text-p-text hover:bg-p-surface-hover"
+            >
+              ×
+            </button>
+          )}
+        </div>
+        <McpCategoryFilter value={categoryFilter} onChange={setCategoryFilter} counts={categoryCounts} />
       </div>
 
       {categories.length === 0 && (
-        <p className="text-sm text-p-text-light py-4">No MCP servers match "{query}".</p>
+        <p className="text-sm text-p-text-light py-4">
+          {q ? `No MCP servers match "${query}".` : 'No MCP servers in this category.'}
+        </p>
       )}
 
       {categories.map(cat => (

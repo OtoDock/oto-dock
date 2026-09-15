@@ -22,7 +22,7 @@ from auth.password import hash_password
 from auth.providers import UserContext, get_current_user
 from auth.rate_limiter import clear_rate_limit
 from storage import database as db
-from storage import webauthn_store
+from storage.identity import webauthn_store
 
 client = TestClient(app)
 

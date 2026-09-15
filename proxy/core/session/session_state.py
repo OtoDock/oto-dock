@@ -427,7 +427,7 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
     translator so a later ``collabAgentToolCall`` snapshot can't re-open a phantom
     badge. The single source of truth shared by BOTH Codex bg supervisors — the
     local session's ``notif_queue`` supervisor (``core/layers/codex/session.py``)
-    and the remote layer's WS-forwarded supervisor (``core/remote/remote_execution.py``)
+    and the remote layer's WS-forwarded supervisor (``core/remote/remote_bg_subagent.py``)
     — so completion behaves identically on local and satellite agents.
 
     Idempotent: ``reg.mark_done`` returns True only on the resolving transition,

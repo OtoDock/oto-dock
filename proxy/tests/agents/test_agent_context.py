@@ -18,7 +18,7 @@ import pytest
 
 from services.mcp import dynamic_context, mcp_registry
 from services.mcp.mcp_registry import AgentContextBlock, McpManifest, ServerConfig, CredentialConfig
-from storage import credential_store
+from storage.identity import credential_store
 from storage.pg import get_conn
 
 
@@ -85,7 +85,7 @@ def agent_name(request):
     for `${agent.display_name}` / description / color, and that
     function is cached so we have to invalidate after teardown.
     """
-    from storage import agent_store
+    from storage.agents import agent_store
     slug = f"test-ac-agent-{uuid.uuid4().hex[:8]}"
     with get_conn() as conn:
         conn.execute(
@@ -594,7 +594,8 @@ def _roster_env(monkeypatch, *, models, default_model="m-default",
     import json as _json
 
     import config as app_config
-    from storage import agent_store, subscription_store
+    from storage.agents import agent_store
+    from storage.billing import subscription_store
 
     agent_row = {
         "display_name": "Worker", "description": "does work",

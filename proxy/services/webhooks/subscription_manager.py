@@ -1,7 +1,7 @@
 """Vendor-webhook subscription orchestration.
 
 Owns the create / delete / renew flow that talks to the vendor's webhook
-API. Pure storage lives in ``storage/webhook_subscription_store.py``;
+API. Pure storage lives in ``storage/automation/webhook_subscription_store.py``;
 this module wires storage to:
 
 * OAuth token resolution (``oauth_account_store._read_oauth_token``)
@@ -41,7 +41,9 @@ from services.webhooks.webhook_template import (  # noqa: F401  (re-exported for
     _substitute_value,
     _walk_dot_path,
 )
-from storage import credential_store, database as task_store, webhook_subscription_store
+from storage.identity import credential_store
+from storage import database as task_store
+from storage.automation import webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.subscription-manager")
 

@@ -13,7 +13,7 @@ collide with other tests' data and don't need teardown.
 import uuid
 import pytest
 
-from storage import credential_store
+from storage.identity import credential_store
 from storage.pg import get_conn
 from services.oauth import credential_resolver
 

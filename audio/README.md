@@ -38,10 +38,10 @@ audio/
     credential_resolver.py   CredentialResolver Protocol (caller-supplied)
     stt/  { base, deepgram, canary(stub), example_provider }
     tts/  { base, cartesia, elevenlabs(stub), chatterbox(stub) }
-    vad/  { base, silero }
+    vad/  { base, silero (state machine), silero_model (the ONNX session) }
     turn/ { base, smart_turn, groq, dispatcher }
   streaming/          lang.py (language registry/detect), text_chunks.py (sentence chunking), tts_stream.py (streaming-TTS orchestration)
-  models/             smart-turn-v3.2-cpu.onnx + vendored whisper feature-extractor config
+  models/             smart-turn-v3.2-cpu.onnx, silero_vad.onnx + vendored whisper feature-extractor config (README.md: origin + licences)
 ```
 
 ## Local development

@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 import config
 from storage import database as task_store
-from storage import agent_store
+from storage.agents import agent_store
 from storage import remote_store
 from services.mcp import mcp_registry
 from services.mcp import dynamic_context
@@ -420,7 +420,7 @@ async def build_task_agent_config(
     # Attached knowledge libraries — same bake-at-build contract as
     # config_builder (fail-safe empty: policy denies mirror writes).
     try:
-        from storage import db_knowledge_libraries as _db_kl
+        from storage.knowledge import db_knowledge_libraries as _db_kl
         _kl_rows = await asyncio.to_thread(
             _db_kl.attachments_for_consumer, agent_name)
         _knowledge_libraries = tuple(
@@ -650,7 +650,7 @@ async def build_delivery_security_context(
     delivering identity (the delegating chat's owner, or the shared agent
     identity for agent-scope callbacks).
     """
-    from storage.db_users import get_username_by_sub
+    from storage.identity.db_users import get_username_by_sub
     username = (get_username_by_sub(user_sub) or "") if user_sub else ""
     target_kind, target_label = await asyncio.to_thread(
         remote_store.get_target_metadata, target, user_sub, agent_name,
@@ -670,7 +670,7 @@ async def build_delivery_security_context(
         scope_override="user" if user_sub else "agent",
     )
     try:
-        from storage import db_knowledge_libraries as _db_kl
+        from storage.knowledge import db_knowledge_libraries as _db_kl
         _kl_rows = await asyncio.to_thread(
             _db_kl.attachments_for_consumer, agent_name)
         _knowledge_libraries = tuple(

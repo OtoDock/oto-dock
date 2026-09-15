@@ -134,7 +134,7 @@ def _build_codex_config_toml(
     if mcp_toml.strip():
         # The remote ``startup_timeout_sec`` floor (and per-MCP overrides for
         # heavy servers like google-workspace) is applied PROXY-side in
-        # ``remote_execution._rewrite_mcp_toml_for_remote`` — which covers this
+        # ``remote_mcp_rewrite._rewrite_mcp_toml_for_remote`` — which covers this
         # interactive TUI path AND the app-server path — so the MCP TOML already
         # arrives with remote-safe timeouts. Append it (minus any LEADING
         # [features] block an older proxy prepends for headless dashboard

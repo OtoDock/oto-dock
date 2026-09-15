@@ -15,7 +15,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from services.mcp import mcp_registry
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 
 def _manifest_with_skills(tmp_path, name, skills):

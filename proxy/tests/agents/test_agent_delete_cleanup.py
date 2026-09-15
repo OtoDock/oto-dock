@@ -18,7 +18,9 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from storage import agent_store, remote_store, recover_bin_store  # noqa: E402
+from storage.agents import agent_store # noqa: E402
+from storage import remote_store # noqa: E402
+from storage.files import recover_bin_store # noqa: E402
 from storage import database as task_store  # noqa: E402
 from storage.pg import get_conn  # noqa: E402
 
@@ -182,7 +184,8 @@ class TestDeleteAgentCleanup:
     def test_phone_route_is_detached_not_deleted(self, temp_db):
         """Telephony routes survive agent deletion — the agent is just detached
         and the route parked, so the admin keeps the DID/PBX provisioning."""
-        from storage import phone_server_store, phone_route_store
+        from storage.phone import phone_server_store
+        from storage.phone import phone_route_store
 
         slug = "phone-agent"
         agent_store.create_agent(slug, "Phone Agent", created_by=USER)

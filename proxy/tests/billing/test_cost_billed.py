@@ -73,7 +73,7 @@ class TestSessionCostBilled:
         """Bind → hidden; release deletes the binding → shown again (which is
         why the flag must ride the persisted turn row, not a chat-level read)."""
         from services.engines import subscription_pool as sp
-        from storage import subscription_store as store
+        from storage.billing import subscription_store as store
         _reset(sp)
         sub = store.add_subscription(
             layer="direct-llm", provider="ollama", auth_type="local_endpoint",

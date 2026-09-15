@@ -272,7 +272,7 @@ def persist_oauth_account(
     This single entry point keeps the on-disk token, the DB account row,
     and the credentials row consistent.
     """
-    from storage import credential_store
+    from storage.identity import credential_store
     from storage import database as task_store
     from services.mcp import mcp_registry
 

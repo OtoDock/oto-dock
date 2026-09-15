@@ -30,7 +30,7 @@ def client(temp_db):
 
 @pytest.fixture
 def agent(temp_db):
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent(SLUG, "Cfg Demo", created_by=ADMIN)
     return SLUG
 

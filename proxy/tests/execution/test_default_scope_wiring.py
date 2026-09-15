@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.sandbox import oto_env
-from storage import agent_store
+from storage.agents import agent_store
 
 # Custom MCP servers live at <repo-root>/mcps/custom/. Derive the path from this
 # file's location so the tests are portable across checkouts / CI — never a

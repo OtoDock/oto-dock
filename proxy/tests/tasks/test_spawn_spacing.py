@@ -8,11 +8,12 @@ import pytest
 
 import config
 from services.scheduler import scheduler
+from services.scheduler import firing
 
 
 @pytest.fixture(autouse=True)
 def _reset_slot(monkeypatch):
-    monkeypatch.setattr(scheduler, "_next_spawn_slot", 0.0)
+    monkeypatch.setattr(firing, "_next_spawn_slot", 0.0)
     yield
 
 
@@ -37,7 +38,7 @@ def test_lone_fire_waits_zero(monkeypatch):
         first = await scheduler._reserve_spawn_slot()
         # Simulate the herd having passed long ago: the reserved horizon is
         # behind now, so a later lone fire must start immediately.
-        scheduler._next_spawn_slot = (
+        firing._next_spawn_slot = (
             asyncio.get_running_loop().time() - 60.0
         )
         second = await scheduler._reserve_spawn_slot()
@@ -66,7 +67,7 @@ def test_gate_sleeps_the_reserved_wait(monkeypatch):
     async def fake_sleep(seconds):
         slept.append(seconds)
 
-    monkeypatch.setattr(scheduler.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(firing.asyncio, "sleep", fake_sleep)
 
     async def run():
         await scheduler._spawn_spacing_gate("dyn-a")

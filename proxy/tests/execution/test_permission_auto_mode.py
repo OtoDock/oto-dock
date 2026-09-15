@@ -18,7 +18,7 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from api.hooks.hooks import hook_permission, HookPermissionRequest  # noqa: E402
+from api.hooks.permission import hook_permission, HookPermissionRequest  # noqa: E402
 from core.session import session_state # noqa: E402
 
 
@@ -31,7 +31,7 @@ def dashboard_session(monkeypatch):
     on the old fail-open skip."""
     from auth.path_policy import SecurityContext
     sid = "sess-auto-test"
-    monkeypatch.setattr("api.hooks.hooks.verify_session_match", lambda *a, **k: None)
+    monkeypatch.setattr("api.hooks.permission.verify_session_match", lambda *a, **k: None)
     session_state._sessions[sid] = {"client_type": "dashboard"}
     session_state._session_security[sid] = SecurityContext(
         role="admin", username="", agent="demo", is_admin_agent=True,
@@ -189,7 +189,7 @@ async def test_auto_dashboard_critical_prompts(dashboard_session, monkeypatch):
     """A critical tool in an auto-mode DASHBOARD session (human watching a
     continued task) blocks on the dashboard prompt instead of auto-running."""
     from services.mcp import mcp_permissions
-    from api.hooks import hooks as hooks_mod
+    from api.hooks import permission
     session_state.set_session_mode(dashboard_session, "auto")
     monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "critical")
     prompted = {}
@@ -198,7 +198,7 @@ async def test_auto_dashboard_critical_prompts(dashboard_session, monkeypatch):
         prompted["yes"] = True
         return False
 
-    monkeypatch.setattr(hooks_mod, "wait_for_permission", _fake_wait)
+    monkeypatch.setattr(permission, "wait_for_permission", _fake_wait)
     decision = await _decide(dashboard_session)
     assert prompted.get("yes")
     assert decision["decision"] == "deny"
@@ -224,14 +224,14 @@ async def test_headless_default_open_tier_allows_without_prompt(dashboard_sessio
     Codex approval bridge takes (it relays this decision as an elicitation
     accept)."""
     from services.mcp import mcp_permissions
-    from api.hooks import hooks as hooks_mod
+    from api.hooks import permission
     session_state.set_session_mode(dashboard_session, "default")
     monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "open")
 
     async def _no_prompt_expected(request_id, session_id, timeout):
         raise AssertionError("open tier must not prompt")
 
-    monkeypatch.setattr(hooks_mod, "wait_for_permission", _no_prompt_expected)
+    monkeypatch.setattr(permission, "wait_for_permission", _no_prompt_expected)
     assert (await _decide(dashboard_session))["decision"] == "allow"
 
 
@@ -239,26 +239,26 @@ async def test_headless_default_open_tier_allows_without_prompt(dashboard_sessio
 async def test_headless_default_standard_tier_still_prompts(dashboard_session, monkeypatch):
     """standard relaxes acceptEdits only — default mode keeps the prompt."""
     from services.mcp import mcp_permissions
-    from api.hooks import hooks as hooks_mod
+    from api.hooks import permission
     session_state.set_session_mode(dashboard_session, "default")
     monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "standard")
 
     async def _approve(request_id, session_id, timeout):
         return True
 
-    monkeypatch.setattr(hooks_mod, "wait_for_permission", _approve)
+    monkeypatch.setattr(permission, "wait_for_permission", _approve)
     assert (await _decide(dashboard_session))["decision"] == "allow"
 
 
 @pytest.mark.asyncio
 async def test_accept_edits_standard_tier_allows_without_prompt(dashboard_session, monkeypatch):
     from services.mcp import mcp_permissions
-    from api.hooks import hooks as hooks_mod
+    from api.hooks import permission
     session_state.set_session_mode(dashboard_session, "acceptEdits")
     monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda s, t: "standard")
 
     async def _no_prompt_expected(request_id, session_id, timeout):
         raise AssertionError("standard tier must not prompt in acceptEdits")
 
-    monkeypatch.setattr(hooks_mod, "wait_for_permission", _no_prompt_expected)
+    monkeypatch.setattr(permission, "wait_for_permission", _no_prompt_expected)
     assert (await _decide(dashboard_session))["decision"] == "allow"

@@ -21,7 +21,7 @@ def test_restore_enriches_slug_strings_to_objects():
     with patch("storage.database.get_active_meeting_for_chat",
                return_value=meeting_row), \
          patch("storage.database.get_last_todo_snapshot", return_value=[]), \
-         patch("storage.agent_store.get_agent",
+         patch("storage.agents.agent_store.get_agent",
                side_effect=agents.get):
         restore = _build_chat_restore("chat-1")
 

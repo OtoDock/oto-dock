@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in OtoDock does not behave the way the docs say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two things first: a security problem goes through
+        [private vulnerability reporting](https://github.com/OtoDock/oto-dock/security/advisories/new),
+        never an issue, and a question about an install belongs in
+        [Discussions](https://github.com/OtoDock/oto-dock/discussions/categories/q-a).
+  - type: input
+    id: version
+    attributes:
+      label: OtoDock version
+      description: >-
+        `/health` on the proxy returns it as `version`; it is the `OTODOCK_VERSION`
+        pinned in your `docker-compose.yml` (in `VERSIONS.md` on a source checkout).
+      placeholder: "1.6.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install
+      options:
+        - Docker Compose with the released images
+        - Source build (scripts/compose.sh or bare metal)
+        - Other (say what under "What happened")
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: The agent engine behind the session, when it matters.
+      options:
+        - Claude Code
+        - Codex
+        - Both, or not engine-specific
+        - Not sure
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        What you did, what you expected, what happened instead. Steps that
+        reproduce it from a fresh chat help most.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        `docker compose logs otodock-proxy` around the moment, and the browser
+        console. Remove tokens, keys and anything personal before pasting.
+      render: text
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Drag images into this field, when a picture says it faster.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        Host OS and CPU architecture, browser, a remote machine or satellite
+        involved, a reverse proxy in front of the dashboard.

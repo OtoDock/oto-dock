@@ -5,7 +5,8 @@ import config
 import pytest
 from services.infra import quota_monitor as qm
 from services.infra import storage_quota as sq
-from storage import agent_store, database
+from storage.agents import agent_store
+from storage import database
 
 
 def _scope(scope_key="acme:shared", scope_type="shared", agent="acme",

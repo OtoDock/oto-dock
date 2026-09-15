@@ -35,6 +35,9 @@ interface Props {
   onLoadOlder?: () => void
   hasMoreOlder?: boolean
   loadingOlder?: boolean
+  /** A live interactive terminal owns this chat's dialogs — question and
+   * plan cards render read-only (see BlockRenderer). */
+  dialogsInTerminal?: boolean
 }
 
 // --- Scroll tuning (items: autoscroll hysteresis + arrow settle) ---
@@ -146,6 +149,7 @@ export default function ChatMessages({
   onImplementPlanCodex,
   onQuestionAnswer,
   onQuestionAnswerStructured,
+  dialogsInTerminal,
   onSendMessage,
   onPlanFetched,
   onDismissPreview,
@@ -525,6 +529,7 @@ export default function ChatMessages({
                           onImplementPlanCodex={onImplementPlanCodex}
                           onQuestionAnswer={onQuestionAnswer}
                           onQuestionAnswerStructured={onQuestionAnswerStructured}
+                          dialogsInTerminal={dialogsInTerminal}
                           onSendMessage={onSendMessage}
                           onDismissPreview={onDismissPreview}
                           onPlanFetched={onPlanFetched}
@@ -633,6 +638,7 @@ export default function ChatMessages({
                       onImplementPlanCodex={onImplementPlanCodex}
                       onQuestionAnswer={onQuestionAnswer}
                       onQuestionAnswerStructured={onQuestionAnswerStructured}
+                      dialogsInTerminal={dialogsInTerminal}
                       onSendMessage={onSendMessage}
                       onPlanFetched={onPlanFetched}
                       onDismissPreview={onDismissPreview}

@@ -16,6 +16,7 @@ import contextlib
 import copy
 import json
 import logging
+import os
 
 import websockets
 
@@ -25,13 +26,15 @@ logger = logging.getLogger("duplex")
 
 
 def duplex_supported() -> bool:
-    """Duplex needs the local models (Silero VAD) — the ``localmodels``
-    extra. A lean install simply doesn't advertise the capability."""
+    """Duplex needs the local models (Silero VAD on ONNX Runtime) — the
+    ``localmodels`` extra plus the bundled model file. A lean install simply
+    doesn't advertise the capability."""
     try:
-        import silero_vad_lite  # noqa: F401
-        return True
+        import onnxruntime  # noqa: F401
     except ImportError:
         return False
+    from audio.providers.vad.silero_model import default_model_path
+    return os.path.isfile(default_model_path())
 
 
 def capabilities_frame() -> dict:

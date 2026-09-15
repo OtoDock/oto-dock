@@ -12,7 +12,8 @@ import uuid
 
 import pytest
 
-from storage import trigger_store, phone_route_store
+from storage.automation import trigger_store
+from storage.phone import phone_route_store
 from storage.pg import get_conn
 
 

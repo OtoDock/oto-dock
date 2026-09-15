@@ -27,7 +27,7 @@ import config
 from auth.providers import UserContext, get_current_user, require_auth
 from services.mcp import mcp_registry
 from services.webhooks import subscription_manager
-from storage import webhook_subscription_store
+from storage.automation import webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.api.subscriptions")
 router = APIRouter()
@@ -113,7 +113,7 @@ def _enforce_create_permission(
         # cannot have agent-scope subscriptions; Shared-only / agent-default
         # agents can. Closes the orphan-subscription gap.
         from core.session.visibility import available_scopes_for
-        from storage import agent_store as _as
+        from storage.agents import agent_store as _as
         _row = _as.get_agent(agent) or {}
         _avail = available_scopes_for(
             bool(_row.get("collaborative", True)), _row.get("default_scope") or "user",

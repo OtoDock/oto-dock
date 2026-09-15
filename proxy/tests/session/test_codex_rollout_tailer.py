@@ -909,6 +909,39 @@ def test_send_persisted_prompt_is_skipped_once_codex(tmp_path, _capture):
     assert ("user", prompt) in _capture
 
 
+def test_single_lined_argv_echo_is_consumed(tmp_path, _capture):
+    # A fresh remote Codex TUI gets its cold prompt SINGLE-LINED on the argv
+    # (satellite codex_pty_session: the multi-line composer pre-fill repaints
+    # erratically), so the rollout journals the stamp and the text joined by
+    # ONE space while the note holds the "\n\n" shape. Whitespace shape must
+    # not defeat the consume (T1 chats 268e141a / 4080cf79 / 90c87d18 each
+    # held the prompt twice).
+    from core.session import transcript_tool_events as TE
+    noted = "[Current time: Thursday, September 10, 2026 07:24 (7:24 AM) UTC]\n\nReply with PONG."
+    journaled = "[Current time: Thursday, September 10, 2026 07:24 (7:24 AM) UTC] Reply with PONG."
+    TE.note_sent_prompt("c-note-sl", noted)
+    path = _write(
+        tmp_path,
+        _meta("t-note-sl"),
+        _msg("user", journaled),
+        _msg("assistant", "PONG"),
+        _evt("task_complete", last_agent_message="PONG"),
+    )
+    stats = C.tail_rollout("s-note-sl", "c-note-sl", path)
+    assert _capture == [("assistant", "PONG")]
+    assert stats["persisted"] == 1
+    assert stats["last_signal"] == "end_turn"
+
+
+def test_different_words_still_persist_despite_note(tmp_path, _capture):
+    # The loosened compare is whitespace-only: another prompt is never eaten.
+    from core.session import transcript_tool_events as TE
+    TE.note_sent_prompt("c-note-dw", "[Current time: X]\n\nReply with PONG.")
+    path = _write(tmp_path, _meta("t-note-dw"), _msg("user", "[Current time: X] Reply with PING."))
+    assert C.tail_rollout("s-note-dw", "c-note-dw", path)["persisted"] == 1
+    assert ("user", "[Current time: X] Reply with PING.") in _capture
+
+
 # ─────────────────────────── compaction (compacted) ─────────────────────────
 
 
@@ -978,3 +1011,25 @@ def test_assistant_prose_never_triggers_hook_codex(tmp_path, _capture, monkeypat
     )
     C.tail_rollout("s-prose-cx", "c-prose-cx", path)
     assert calls == []
+
+
+def test_token_count_rate_limits_recorded_with_the_line_timestamp(tmp_path, _capture):
+    """The account's window state rides next to the token counts; the line's
+    own timestamp dates the observation and a re-tail never records twice."""
+    from unittest.mock import patch
+    snapshot = {"limit_name": "codex", "plan_type": "plus",
+                "primary": {"used_percent": 3, "window_minutes": 300, "resets_at": 1789114918},
+                "secondary": {"used_percent": 50, "window_minutes": 10080, "resets_at": 1789447223}}
+    token_count = _line({"timestamp": "2026-09-11T05:00:00.123Z", "type": "event_msg",
+                         "payload": {"type": "token_count",
+                                     "info": {"last_token_usage": {"input_tokens": 10, "output_tokens": 2},
+                                              "total_token_usage": {"total_tokens": 12}},
+                                     "rate_limits": snapshot}})
+    path = _write(tmp_path, _meta("019ec-tid"), _msg("user", "hi"), token_count)
+    with patch("services.engines.subscription_windows.record_codex_snapshot") as rec:
+        C.tail_rollout("s1", "c1", path)
+        rec.assert_called_once_with("s1", snapshot, "2026-09-11T05:00:00.123Z")
+        rec.reset_mock()
+        C._offsets.clear()          # force a full re-read: the claim dedups it
+        C.tail_rollout("s1", "c1", path)
+        rec.assert_not_called()

@@ -34,7 +34,8 @@ from auth.providers import (
     require_creator,
 )
 from services.departments import edge_compiler
-from storage import agent_store, db_departments
+from storage.agents import agent_store
+from storage.agents import db_departments
 
 logger = logging.getLogger("claude-proxy.departments")
 

@@ -7,7 +7,7 @@ import uuid
 import pytest
 
 from services.phone import phone_identity as pi
-from storage import phone_route_store
+from storage.phone import phone_route_store
 from storage.pg import get_conn
 
 SID = "11111111-2222-4333-8444-555555555555"

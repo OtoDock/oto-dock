@@ -70,7 +70,8 @@ class RemoteWorkspaceSyncMixin:
         pull side, so a user machine only ever syncs back its role-allowed folders.
         """
         import asyncio as _asyncio
-        from storage import remote_store as _rs, database as _db
+        from storage import remote_store as _rs
+        from storage import database as _db
 
         machine = await _asyncio.to_thread(_rs.get_remote_machine, machine_id)
         if not machine:
@@ -132,7 +133,7 @@ class RemoteWorkspaceSyncMixin:
         serializes each agent against a concurrent session warmup. Best-effort.
         """
         import asyncio as _asyncio
-        from storage import sync_state_store
+        from storage.files import sync_state_store
 
         agents = await _asyncio.to_thread(sync_state_store.agents_for_machine, machine_id)
         if not agents:
@@ -174,7 +175,7 @@ class RemoteWorkspaceSyncMixin:
         sweep in ``app.py``."""
         import asyncio as _asyncio
         from services.remote import workspace_fanout
-        from storage import sync_state_store
+        from storage.files import sync_state_store
 
         cm = self._cm
         for machine_id in list(cm.get_connected_machines()):
@@ -243,9 +244,9 @@ class RemoteWorkspaceSyncMixin:
         from core.remote import remote_file_flow
         from services.notifications import notification_manager
         from services.path_policy_v2 import PathRef
-        from storage import (
-            file_author_store, file_tombstones_store, sync_state_store,
-        )
+        from storage.files import file_author_store
+        from storage.files import file_tombstones_store
+        from storage.files import sync_state_store
 
         agent_dir = _cfg.AGENTS_DIR / agent_slug
         pulled = 0
@@ -344,10 +345,10 @@ class RemoteWorkspaceSyncMixin:
         from core.remote import file_sync, remote_file_flow
         from services.path_policy_v2 import PathRef
         from services.notifications import notification_manager
-        from storage import (
-            sync_state_store, file_tombstones_store, file_author_store,
-            recover_bin_store,
-        )
+        from storage.files import sync_state_store
+        from storage.files import file_tombstones_store
+        from storage.files import file_author_store
+        from storage.files import recover_bin_store
 
         agent_dir = _cfg.AGENTS_DIR / agent_slug
         if not agent_dir.exists():
@@ -439,7 +440,7 @@ class RemoteWorkspaceSyncMixin:
             # subtree rule. Prefixes are PER LIBRARY subtree — the trailing
             # slash keeps the prefix match segment-safe (an RO library
             # ``marketing`` never covers ``marketing-extra``).
-            from storage import db_knowledge_libraries
+            from storage.knowledge import db_knowledge_libraries
             _attachments = await _asyncio.to_thread(
                 db_knowledge_libraries.attachments_for_consumer, agent_slug,
             )

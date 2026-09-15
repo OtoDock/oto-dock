@@ -18,7 +18,7 @@ import logging
 
 import config
 from storage import database as task_store
-from storage import agent_store
+from storage.agents import agent_store
 from services.mcp import mcp_registry
 from services.mcp import dynamic_context
 from services.engines import subscription_pool
@@ -257,6 +257,10 @@ async def build_meeting_agent_config(
             model=resolved_model, agent_info=agent_info,
         )
         extra_env.update(sub_env)
+    except subscription_pool.NoSubscriptionError:
+        # The pool refused the spawn (its subscription cap, or a user-scope
+        # block): the orchestrator fails the meeting with the reason.
+        raise
     except Exception as e:
         logger.warning(f"Subscription pool error for meeting agent {agent_name}: {e}")
 

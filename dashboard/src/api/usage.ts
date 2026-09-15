@@ -27,11 +27,53 @@ export interface AgentBreakdown {
   messages: number
 }
 
+// The subscription pool cap (one per user pool, one for the platform pool):
+// caps and readings per engine. Percent = share of the accounts' weekly
+// windows, dollars = spend attributed to the accounts; null = not set /
+// no reading.
+export type PoolCapField = 'week_pct' | 'day_pct' | 'week_usd' | 'day_usd'
+export type PoolCapFields = Record<PoolCapField, number | null>
+
+export interface PoolCapStatus {
+  scope: 'user' | 'platform'
+  layer: string
+  configured: boolean
+  caps: PoolCapFields
+  readings: PoolCapFields
+  on_reached: 'stop' | 'continue'
+  accounts: number
+  hits: PoolCapField[]
+  warning: boolean
+  allowed: boolean
+}
+
+export interface PoolCapResponse {
+  caps: PoolCapFields
+  on_reached: 'stop' | 'continue'
+  engines: Record<string, PoolCapStatus>
+}
+
+export interface PoolCapUpdate extends Partial<PoolCapFields> {
+  on_reached?: 'stop' | 'continue'
+}
+
 export interface UserUsageSummary {
   monthly: PeriodUsage | null
   weekly: PeriodUsage | null
+  // The user's own API-key budget (their user_self cap, or limit null).
+  self_limits: { monthly: PeriodUsage; weekly: PeriodUsage }
+  pool: Record<string, PoolCapStatus>
   daily_chart: DailyUsage[]
   agent_breakdown: AgentBreakdown[]
+}
+
+// The `limit_warning` / `limit_reached` payloads: the platform budget's
+// periods, the own API-key budget under `self`, the pool cap under `pool`.
+export interface LimitPayload {
+  monthly?: PeriodUsage | null
+  weekly?: PeriodUsage | null
+  self?: { monthly?: PeriodUsage | null; weekly?: PeriodUsage | null }
+  pool?: PoolCapStatus
 }
 
 export interface UsageCheck {
@@ -40,6 +82,7 @@ export interface UsageCheck {
   periods: {
     monthly: PeriodUsage | null
     weekly: PeriodUsage | null
+    self: { monthly: PeriodUsage | null; weekly: PeriodUsage | null }
   }
 }
 
@@ -92,6 +135,7 @@ export interface AdminUsageOverview {
   model_totals: ModelTotal[]
   users: AdminUserUsage[]
   agents: AdminAgentUsage[]
+  pool: Record<string, PoolCapStatus>
 }
 
 export interface UsageLimit {
@@ -120,9 +164,99 @@ export function useMyUsage(days = 30) {
   })
 }
 
+export function useMyLimits() {
+  return useQuery({
+    queryKey: ['my-usage-limits'],
+    queryFn: async (): Promise<{ limits: UsageLimit[] }> => {
+      const res = await apiFetch('/v1/usage/me/limits')
+      if (!res.ok) throw new Error('Failed to fetch limits')
+      return res.json()
+    },
+  })
+}
+
+// The user's own API-key budget: `cost_limit_usd: null` clears the period.
+export function useSetMyLimit() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (data: { period: string; cost_limit_usd: number | null }) => {
+      const res = await apiFetch('/v1/usage/me/limits', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to set limit')
+      }
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['my-usage-limits'] })
+      qc.invalidateQueries({ queryKey: ['my-usage'] })
+    },
+  })
+}
+
+async function fetchPoolCap(path: string): Promise<PoolCapResponse> {
+  const res = await apiFetch(path)
+  if (!res.ok) throw new Error('Failed to fetch the pool cap')
+  return res.json()
+}
+
+async function putPoolCap(path: string, data: PoolCapUpdate): Promise<PoolCapResponse> {
+  const res = await apiFetch(path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to save the cap')
+  }
+  return res.json()
+}
+
+export function useMyPoolCap() {
+  return useQuery({
+    queryKey: ['my-pool-cap'],
+    queryFn: () => fetchPoolCap('/v1/usage/me/pool-cap'),
+    staleTime: 30_000,
+  })
+}
+
+export function useSetMyPoolCap() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: PoolCapUpdate) => putPoolCap('/v1/usage/me/pool-cap', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['my-pool-cap'] })
+      qc.invalidateQueries({ queryKey: ['my-usage'] })
+    },
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Admin hooks
 // ---------------------------------------------------------------------------
+
+export function useAdminPoolCap() {
+  return useQuery({
+    queryKey: ['admin-pool-cap'],
+    queryFn: () => fetchPoolCap('/v1/admin/usage/pool-cap'),
+    staleTime: 30_000,
+  })
+}
+
+export function useSetAdminPoolCap() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: PoolCapUpdate) => putPoolCap('/v1/admin/usage/pool-cap', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['admin-pool-cap'] })
+      qc.invalidateQueries({ queryKey: ['admin-usage-overview'] })
+    },
+  })
+}
 
 export function useAdminUsageOverview(days = 30) {
   return useQuery({

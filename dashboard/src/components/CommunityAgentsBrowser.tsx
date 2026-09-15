@@ -14,6 +14,7 @@ import {
   CommunityAgentRegistryEntry,
   useCommunityAgents,
 } from '../api/communityAgents'
+import { safeHref } from '../lib/safeUrl'
 import AgentInstallModal from './AgentInstallModal'
 
 interface Props {
@@ -209,7 +210,14 @@ function AgentCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold text-p-text truncate">{agent.display_name}</div>
-          <div className="text-[11px] text-p-text-light">v{agent.version} · {agent.author}</div>
+          <div className="text-[11px] text-p-text-light">
+            v{agent.version} ·{' '}
+            {safeHref(agent.author_url) ? (
+              <a href={safeHref(agent.author_url)} target="_blank" rel="noreferrer" className="hover:underline" title="Template author">
+                {agent.author}
+              </a>
+            ) : agent.author}
+          </div>
           {agent.deprecated && (
             <div className="text-[11px] text-red-500 mt-1">⚠ Deprecated</div>
           )}

@@ -47,12 +47,12 @@ async def _run(role, username, path, action="write"):
          patch.object(cm, "_capture_pre_overwrite",
                       new=AsyncMock(return_value=(None, None))), \
          patch.object(cm, "_mtime_of", return_value=0.0), \
-         patch("storage.sync_state_store.get_one", return_value=None), \
-         patch("storage.sync_state_store.record_one"), \
-         patch("storage.sync_state_store.clear_one"), \
-         patch("storage.file_author_store.record"), \
-         patch("storage.file_author_store.clear"), \
-         patch("storage.file_tombstones_store.record"), \
+         patch("storage.files.sync_state_store.get_one", return_value=None), \
+         patch("storage.files.sync_state_store.record_one"), \
+         patch("storage.files.sync_state_store.clear_one"), \
+         patch("storage.files.file_author_store.record"), \
+         patch("storage.files.file_author_store.clear"), \
+         patch("storage.files.file_tombstones_store.record"), \
          patch("services.remote.workspace_fanout.fanout_targets", return_value=[]), \
          patch("services.remote.workspace_fanout.fan_out_delete", new=AsyncMock()), \
          patch("services.notifications.notification_manager.broadcast_file_updated", new=bcast):

@@ -12,7 +12,7 @@ Each test inserts under a unique ``mcp_name`` so rows don't collide.
 import uuid
 import pytest
 
-from storage import credential_store
+from storage.identity import credential_store
 from storage.pg import get_conn
 from services.oauth import credential_resolver
 
@@ -219,7 +219,7 @@ class TestCleanupServiceAgentBindingsForOwner:
 
 class TestTokenMapServiceBinding:
     def test_agent_scope_resolves_bound_user_account(self, mcp_name, user_sub):
-        from storage import agent_store
+        from storage.agents import agent_store
         from services.mcp import dynamic_context
 
         slug = f"svc-agent-{uuid.uuid4().hex[:6]}"
@@ -257,7 +257,7 @@ class TestTokenMapServiceBinding:
             agent_store._invalidate_cache()
 
     def test_agent_scope_no_binding_yields_no_account(self, mcp_name):
-        from storage import agent_store
+        from storage.agents import agent_store
         from services.mcp import dynamic_context
 
         slug = f"svc-agent-{uuid.uuid4().hex[:6]}"

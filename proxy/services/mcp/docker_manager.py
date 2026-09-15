@@ -219,7 +219,7 @@ def _inject_mcp_env(manifest) -> bool:
     update via the API). Idempotent.
     """
     from services.mcp import mcp_registry
-    from storage import credential_store
+    from storage.identity import credential_store
 
     env_path = manifest.mcp_dir / ".env"
 
@@ -736,7 +736,7 @@ def startup_docker_mcps() -> None:
     would silently fail until manual recreate.
     """
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
 
     # Every topology with a local daemon: name (but never touch) MCP
     # containers left behind by a previous install identity.

@@ -301,7 +301,7 @@ def get_license_key() -> str:
     store first; falls back to — and migrates from — the legacy plain
     ``platform_settings.license_key``."""
     try:
-        from storage import credential_store
+        from storage.identity import credential_store
         enc = (credential_store.get_infra_credentials(_LICENSE_CRED_SLUG) or {}).get(
             _LICENSE_CRED_KEY, "")
         if enc:
@@ -311,7 +311,7 @@ def get_license_key() -> str:
     legacy = (db.get_platform_setting("license_key") or "").strip()
     if legacy:
         try:  # one-time migration: move the plain key into the encrypted store
-            from storage import credential_store
+            from storage.identity import credential_store
             credential_store.set_infra_credentials(
                 _LICENSE_CRED_SLUG, {_LICENSE_CRED_KEY: legacy})
             db.set_platform_setting("license_key", "")
@@ -325,7 +325,7 @@ def set_license_key(key: str) -> None:
     copy in platform_settings. An empty key clears it."""
     key = (key or "").strip()
     try:
-        from storage import credential_store
+        from storage.identity import credential_store
         if key:
             credential_store.set_infra_credentials(
                 _LICENSE_CRED_SLUG, {_LICENSE_CRED_KEY: key})
@@ -493,7 +493,7 @@ def check_seat_limit() -> tuple[bool, int, int]:
 
 def _count_user_agents() -> int:
     """Count agents toward the licensed agent cap — every mode counts the same."""
-    from storage import agent_store
+    from storage.agents import agent_store
     return len(agent_store.get_all_agents())
 
 

@@ -308,7 +308,7 @@ async def do_oauth_exchange(*, code: str, state_token: str) -> ExchangeResult:
 
     # Provider + app credentials
     from auth.oauth_providers import get_provider
-    from storage import credential_store
+    from storage.identity import credential_store
     from services.billing import relay_client
     from services.mcp import mcp_registry
 

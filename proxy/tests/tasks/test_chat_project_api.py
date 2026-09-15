@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
 
 

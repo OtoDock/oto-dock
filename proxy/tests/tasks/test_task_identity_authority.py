@@ -268,7 +268,7 @@ def test_member_with_agent_editor_can_create_agent_scope(monkeypatch):
     """A platform 'member' who is a per-agent editor passes the task scope gate
     for agent-scope — the platform-level require_write(u) that used to reject
     every non-creator/non-admin is gone."""
-    from storage import agent_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "get_agent",
                         lambda a: {"collaborative": True, "default_scope": "user"})
     tasks._enforce_task_scope(_member("u-ed", "acme", "editor"), "agent", "acme")  # no raise
@@ -277,7 +277,7 @@ def test_member_with_agent_editor_can_create_agent_scope(monkeypatch):
 def test_member_viewer_still_blocked_from_agent_scope(monkeypatch):
     """Viewers remain read-only — dropping require_write must not open agent
     scope to them; _enforce_task_scope still requires editor+."""
-    from storage import agent_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "get_agent",
                         lambda a: {"collaborative": True, "default_scope": "user"})
     with pytest.raises(HTTPException) as exc:
@@ -289,7 +289,7 @@ def test_member_can_create_own_user_scope(monkeypatch):
     """Any authenticated user with agent access may create their OWN user-scope
     task — the platform require_write gate that used to block plain members is
     gone (a user-scope task runs as, and is visible only to, its creator)."""
-    from storage import agent_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "get_agent",
                         lambda a: {"collaborative": True, "default_scope": "user"})
     tasks._enforce_task_scope(_member("u-vw", "acme", "viewer"), "user", "acme")  # no raise

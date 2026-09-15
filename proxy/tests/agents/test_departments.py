@@ -44,7 +44,7 @@ MEMBER_H = lambda: _cookie(MEMBER, "viewer@test.com", "member")  # noqa: E731
 
 
 def _mk_agent(slug: str) -> str:
-    from storage import agent_store
+    from storage.agents import agent_store
     agent_store.create_agent(slug, slug.title(), created_by=ADMIN)
     return slug
 
@@ -70,7 +70,7 @@ def _assign_dept(slug: str, dept: dict, level_name: str) -> None:
     """Assign directly at the store + recompile (bypasses the HTTP gate —
     gate behavior has its own tests below)."""
     from services.departments import edge_compiler
-    from storage import agent_store
+    from storage.agents import agent_store
     level = next(lv for lv in dept["levels"] if lv["name"] == level_name)
     agent_store.update_agent(
         slug, department_id=dept["id"], department_level_id=level["id"],
@@ -79,7 +79,7 @@ def _assign_dept(slug: str, dept: dict, level_name: str) -> None:
 
 
 def _edges() -> set[tuple[str, str, str]]:
-    from storage import agent_store
+    from storage.agents import agent_store
     return {
         (e["from"], e["to"], e["source"])
         for e in agent_store.get_all_delegation_edges()
@@ -176,7 +176,7 @@ class TestDepartmentCrud:
         # kept id preserved the keeper's assignment; removed level dropped
         # the orphan out of the department entirely
         assert body["unassigned_agents"] == ["lvl-orphan"]
-        from storage import agent_store
+        from storage.agents import agent_store
         keeper = agent_store.get_agent("lvl-keeper")
         assert keeper["department_level_id"] == head["id"]
         orphan = agent_store.get_agent("lvl-orphan")
@@ -254,7 +254,7 @@ class TestAssignmentFieldGate:
             headers=CREATOR_H(),
         )
         assert r.status_code == 200, r.text
-        from storage import agent_store
+        from storage.agents import agent_store
         assert agent_store.get_agent("gate-b")["department_id"] == dept["id"]
         r = client.patch(
             "/v1/agents/gate-b",
@@ -349,7 +349,7 @@ class TestEdgeCompiler:
 
     def test_leaving_retracts_only_compiled(self, client):
         from services.departments import edge_compiler
-        from storage import agent_store
+        from storage.agents import agent_store
         dept = _mk_dept(client)
         _mk_agent("lv-a")
         _mk_agent("lv-b")
@@ -381,7 +381,7 @@ class TestEdgeCompiler:
         assert r.status_code == 200
         assert sorted(r.json()["unassigned_agents"]) == ["dd-a", "dd-b"]
         assert not {t for t in _edges() if t[2] == "department"}
-        from storage import agent_store
+        from storage.agents import agent_store
         assert agent_store.get_agent("dd-a")["department_id"] == ""
 
 
@@ -410,7 +410,7 @@ class TestManualCompiledCoexistence:
         assert ("mx-b", "mx-a", "department") in e
 
     def test_unchecking_dept_wanted_edge_reasserts_compiled(self, client):
-        from storage import agent_store
+        from storage.agents import agent_store
         dept = _mk_dept(client)
         _mk_agent("re-a")
         _mk_agent("re-b")
@@ -434,7 +434,7 @@ class TestManualCompiledCoexistence:
             _mk_agent(s)
         _assign_dept("gs-a", dept, "Head")
         _assign_dept("gs-b", dept, "Head")
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.set_delegation_targets("gs-a", ["gs-solo"])
         r = client.get(
             "/v1/agents/gs-a/delegation-targets", headers=ADMIN_H()
@@ -479,7 +479,7 @@ class TestDelegationEdgesEndpoint:
             _mk_agent(s)
         _assign_dept("ee-a", dept, "Head")
         _assign_dept("ee-b", dept, "Head")
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.set_delegation_targets("ee-hidden", ["ee-a"])
         _assign_user(MEMBER, {"ee-a": "viewer"})
         r = client.get("/v1/agents/delegation-edges", headers=MEMBER_H())
@@ -491,7 +491,7 @@ class TestDelegationEdgesEndpoint:
         assert all(e[0] != "ee-hidden" for e in edges)
 
     def test_admin_sees_everything(self, client):
-        from storage import agent_store
+        from storage.agents import agent_store
         _mk_agent("ea-a")
         _mk_agent("ea-b")
         agent_store.set_delegation_targets("ea-a", ["ea-b"])
@@ -538,7 +538,7 @@ class TestAdminAddUserAgent:
             json={"role": "viewer"}, headers=ADMIN_H(),
         ).status_code == 404
         # admin-only agent to a non-admin user
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("add-secret", "Secret", created_by=ADMIN,
                                  admin_only=True)
         assert client.post(
@@ -556,7 +556,7 @@ class TestPromptDepartmentLine:
         _assign_dept("pr-head", dept, "Head")
         _assign_dept("pr-peer", dept, "Head")
         _assign_dept("pr-jun", dept, "Senior")
-        from storage import agent_store
+        from storage.agents import agent_store
         targets = agent_store.get_delegation_targets("pr-head")
         text = _delegation_mcp_context("pr-head", delegation_targets=targets)
         assert "**Engineering** department" in text
@@ -573,7 +573,7 @@ class TestPromptDepartmentLine:
         from services.mcp.dynamic_context import _delegation_mcp_context
         _mk_agent("pr-solo")
         _mk_agent("pr-solo2")
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.set_delegation_targets("pr-solo", ["pr-solo2"])
         text = _delegation_mcp_context(
             "pr-solo", delegation_targets=["pr-solo2"]

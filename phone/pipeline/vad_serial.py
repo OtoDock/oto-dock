@@ -5,9 +5,9 @@ Two problems, one mechanism (P2.2 / audit F11):
 - Inference off the event loop: Silero runs synchronously per 20 ms inbound
   frame; its p99 spikes on a busy VM block the paced TTS sender mid-frame —
   the live calls logged 6–17 pacing stalls (>50 ms holes) per long playback,
-  audible as crackle. silero-vad-lite is ONNX Runtime under the hood, which
-  releases the GIL during Run, so a thread genuinely unblocks the loop.
-- Mode-swap race: ``set_bargein_mode``/``reset`` replace the ONNX model and
+  audible as crackle. The VAD is ONNX Runtime, which releases the GIL
+  during Run, so a thread genuinely unblocks the loop.
+- Mode-swap race: ``set_bargein_mode``/``reset`` zero the model state and
   clear deques while a threaded ``process`` could be mid-inference. ALL
   mutating calls ride the SAME single worker, so they serialize in submit
   order — a mode change lands before the next frame's inference, exactly

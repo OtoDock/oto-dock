@@ -21,9 +21,9 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from storage import trigger_store
+from storage.automation import trigger_store
 from storage import database as task_store
-from storage import notification_store
+from storage.automation import notification_store
 
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
@@ -231,7 +231,7 @@ def _validate_subscription_linkage(
     if not subscription_id:
         return
     # Lazy import — storage layer is loaded after services in some startup paths.
-    from storage import webhook_subscription_store
+    from storage.automation import webhook_subscription_store
     sub = webhook_subscription_store.get_subscription(subscription_id)
     if not sub:
         raise TriggerValidationError(
@@ -289,7 +289,7 @@ def _validate_event_filter(
     if not wanted:
         return
 
-    from storage import webhook_subscription_store
+    from storage.automation import webhook_subscription_store
     sub = webhook_subscription_store.get_subscription(subscription_id)
     if not sub:
         return  # missing subscription is handled by _validate_subscription_linkage

@@ -227,21 +227,31 @@ class TestWorkerTick:
         from services.engines import subscription_pool as pool
 
         calls = []
-        with patch.object(pool, "rebind_delisted_sessions",
+
+        async def _poll(**kw):
+            calls.append("poll")
+            return 0
+
+        with patch("services.engines.subscription_windows.poll_due", _poll), \
+             patch.object(pool, "rebind_delisted_sessions",
                           side_effect=lambda **kw: calls.append("rebind") or 0), \
              patch.object(pool, "bound_oauth_subscription_ids",
                           side_effect=lambda: calls.append("list") or {"x"}), \
              patch.object(pool, "ensure_fresh_and_fan_out",
                           side_effect=lambda *a, **k: calls.append("fresh") or True):
             asyncio.run(tf._tick())
-        assert calls == ["rebind", "list", "fresh"]
+        # The provider-window poll leads so the rebind and rebalance passes
+        # converge on a fresh reading in the same tick.
+        assert calls == ["poll", "rebind", "list", "fresh"]
 
     def test_tick_survives_rebind_failure(self):
         import asyncio
-        from unittest.mock import patch
+        from unittest.mock import AsyncMock, patch
         from services.engines import subscription_pool as pool
 
-        with patch.object(pool, "rebind_delisted_sessions",
+        with patch("services.engines.subscription_windows.poll_due",
+                   AsyncMock(side_effect=RuntimeError("poll boom"))), \
+             patch.object(pool, "rebind_delisted_sessions",
                           side_effect=RuntimeError("boom")), \
              patch.object(pool, "bound_oauth_subscription_ids", return_value=set()):
             asyncio.run(tf._tick())  # must not raise
@@ -252,16 +262,19 @@ class TestWorkerTick:
         from services.engines import subscription_pool as pool
 
         freshened = []
-        with patch.object(pool, "rebind_delisted_sessions", return_value=0), \
+        from unittest.mock import AsyncMock
+        with patch("services.engines.subscription_windows.poll_due",
+                   AsyncMock(return_value=0)), \
+             patch.object(pool, "rebind_delisted_sessions", return_value=0), \
              patch.object(pool, "rebalance_scopes", return_value=None), \
              patch.object(pool, "bound_oauth_subscription_ids",
                           return_value=set(bound)), \
              patch.object(pool, "within_boot_grace", return_value=boot_grace), \
              patch.object(pool, "ensure_fresh_and_fan_out",
                           side_effect=lambda sid, *a, **k: freshened.append(sid) or True), \
-             patch("storage.subscription_store.list_persisted_binding_sub_ids",
+             patch("storage.billing.subscription_store.list_persisted_binding_sub_ids",
                    return_value=set(persisted)), \
-             patch("storage.subscription_store.list_subscriptions",
+             patch("storage.billing.subscription_store.list_subscriptions",
                    return_value=rows):
             asyncio.run(tf._tick())
         return freshened

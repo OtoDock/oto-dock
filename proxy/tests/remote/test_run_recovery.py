@@ -70,7 +70,7 @@ class TestDeferOrphanedRuns:
     def test_empty_exec_path_codex_default_agent_not_parked(self, temp_db):
         # The resolution consults the AGENT default — a codex-default agent's
         # empty-path chat stays out of Mode C (codex is out of recovery scope).
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_store.create_agent("codex-ag", "Codex Agent",
                                  created_by="user-1",
                                  execution_path="codex-cli")

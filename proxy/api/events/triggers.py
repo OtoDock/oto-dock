@@ -37,9 +37,9 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from storage import trigger_store
+from storage.automation import trigger_store
 from storage import database as task_store
-from storage import notification_store
+from storage.automation import notification_store
 from services.scheduler import trigger_manager
 from services.infra import api_key_manager
 from auth.providers import UserContext, get_current_user, require_auth
@@ -193,7 +193,7 @@ def _enforce_create_permission(
     # Visibility-modes: reject a scope the agent's mode doesn't offer
     # (Personal-only → no "agent"; Shared-only → no "user").
     from core.session.visibility import available_scopes_for
-    from storage import agent_store as _as
+    from storage.agents import agent_store as _as
     _row = _as.get_agent(agent) or {}
     _avail = available_scopes_for(
         bool(_row.get("collaborative", True)), _row.get("default_scope") or "user",

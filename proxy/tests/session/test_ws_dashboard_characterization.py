@@ -82,7 +82,7 @@ class TestConnectionLifecycle:
                 assert ws.accepted
 
                 ws.client_send({"type": "ping"})
-                await ws.expect({"type": "pong"})
+                await ws.expect({"type": "pong", "build_id": ANY})
 
                 ws.client_send({"type": "close"})
             # clean close: the handler returns without closing the socket

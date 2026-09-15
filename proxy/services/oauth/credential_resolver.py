@@ -25,8 +25,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from storage import credential_store
-from storage import mcp_store
+from storage.identity import credential_store
+from storage.mcp import mcp_store
 from storage import database as task_store
 import contextlib
 

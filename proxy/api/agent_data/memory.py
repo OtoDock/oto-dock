@@ -53,9 +53,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from auth.providers import UserContext, get_current_user, require_auth
-from storage import agent_store
+from storage.agents import agent_store
 from storage import database as task_store
-from storage import memory_store
+from storage.agents import memory_store
 from services.infra.path_confinement import safe_agent_dir
 from services.memory import memory_file
 from services.memory.memory_file import MemoryOpError, OpResult
@@ -188,7 +188,8 @@ async def _publish_changes(
     try:
         from services.remote import workspace_fanout
         from services.notifications.notification_manager import broadcast_file_updated
-        from storage import file_author_store, file_tombstones_store
+        from storage.files import file_author_store
+        from storage.files import file_tombstones_store
 
         for rel in result.changed:
             tree_rel = _tree_rel(agent_dir, root, rel)

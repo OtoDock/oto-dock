@@ -168,7 +168,7 @@ async def test_lookup_runs_off_the_loop_with_the_real_store(temp_db, loop_db_gua
     must take it through run_db, never on the loop thread. A REAL local-model
     binding must come back False — a swallowed guard violation would fall
     back to True and pass a weaker assertion."""
-    from storage import subscription_store as store
+    from storage.billing import subscription_store as store
     temp_db.create_chat("cb7", "user-admin", "a1")
     sub = store.add_subscription(
         layer="direct-llm", provider="ollama", auth_type="local_endpoint",

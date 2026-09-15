@@ -36,7 +36,7 @@ import asyncio
 import logging
 import time
 
-from storage import subscription_store
+from storage.billing import subscription_store
 
 logger = logging.getLogger(__name__)
 

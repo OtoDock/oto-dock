@@ -186,7 +186,8 @@ async def test_pool_exhaustion_keeps_loop_and_reserve_free(monkeypatch):
     """Every DB-executor worker parks on a 'stalled commit' that HOLDS a real
     pool connection. The loop must keep ticking and a loop-side get_conn()
     must still succeed — the executor is sized below the pool on purpose."""
-    from storage import pg, remote_store
+    from storage import pg
+    from storage import remote_store
 
     release = threading.Event()
     started = threading.Semaphore(0)

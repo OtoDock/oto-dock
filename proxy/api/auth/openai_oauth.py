@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 from auth.providers import get_current_user, require_auth, UserContext
 from services.engines import subscription_pool
-from storage import subscription_store
+from storage.billing import subscription_store
 import config as app_config
 import contextlib
 
@@ -367,6 +367,9 @@ async def oauth_finish(
     # A freshly (re)connected account may be the replacement that sessions
     # stuck on a delisted/removed subscription are waiting for.
     subscription_pool.schedule_rebind("openai oauth connect")
+    # The account's window bars show right after the connect.
+    from services.engines import subscription_windows
+    subscription_windows.schedule_poll(str(sub.get("id") or ""))
     return {"subscription": sub}
 
 

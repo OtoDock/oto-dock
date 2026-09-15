@@ -26,7 +26,8 @@ from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user, require_auth
 from services.remote.remote_status import get_live_machine_status
-from storage import remote_store, agent_store
+from storage import remote_store
+from storage.agents import agent_store
 
 
 def _merge_live_status(machine: dict) -> dict:

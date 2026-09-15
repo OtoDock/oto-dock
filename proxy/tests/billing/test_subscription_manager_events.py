@@ -18,7 +18,8 @@ if _proxy_root not in sys.path:
 import config  # noqa: E402
 from services.billing import relay_client  # noqa: E402
 from services.webhooks import subscription_manager  # noqa: E402
-from storage import credential_store, webhook_subscription_store  # noqa: E402
+from storage.identity import credential_store # noqa: E402
+from storage.automation import webhook_subscription_store # noqa: E402
 
 _WB = {
     "available": True,

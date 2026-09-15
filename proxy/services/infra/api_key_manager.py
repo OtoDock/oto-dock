@@ -9,7 +9,7 @@ CRUD endpoints. Master ``PROXY_API_KEY`` is REJECTED here — it never
 authenticates webhook fires (security boundary between internal ops and
 external webhooks).
 
-This module reads the storage layer (``storage.api_key_store``) and adds:
+This module reads the storage layer (``storage.identity.api_key_store``) and adds:
 
   - cryptographically random key generation
   - bcrypt password hashing
@@ -25,8 +25,8 @@ import secrets
 import bcrypt
 
 import config
-from storage import api_key_store
-from storage import notification_store
+from storage.identity import api_key_store
+from storage.automation import notification_store
 
 logger = logging.getLogger("claude-proxy.api-keys")
 

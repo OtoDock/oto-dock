@@ -7,14 +7,21 @@ name: release-images
 #
 # The version tag is read from VERSIONS.md (OTODOCK_VERSION) — the single
 # source of truth — so bumping it there is what drives a new release tag.
-# Triggers: manual dispatch, or pushing a release tag (v*).
+# Triggers: pushing a release tag (v*), pushing an rc branch, or a manual
+# dispatch on main. The ref decides the image tags (merge job):
+#   tag v<X>            → <X> and latest; the tag must equal OTODOCK_VERSION
+#   branch rc/<X>-rcN   → <X>-rcN only (a rehearsal of this pipeline before
+#                         the tag, driven by the maintainers' release tooling;
+#                         no compose file points at an rc tag)
+#   dispatch on main    → <X> and latest, as a tag push would
 #
-# ARCHITECTURES: proxy + file-tools publish linux/amd64 AND linux/arm64 as a
+# ARCHITECTURES: every image publishes linux/amd64 AND linux/arm64 as a
 # manifest list, so `docker pull ghcr.io/otodock/<image>:<version>` resolves per
 # host with no compose change. Each platform builds on a NATIVE runner and is
-# pushed by digest; the `merge` job assembles the manifest list and applies the
-# tags. otodock-phone stays amd64-only — silero-vad-lite publishes no aarch64
-# wheel and its sdist hardcodes an x86_64 ONNX Runtime (see VERSIONS.md).
+# pushed by digest; the `merge` job assembles the manifest list, applies the
+# tags and fails the run when the list lacks either architecture (a merge
+# only runs once both legs pushed, so the check is the record, not the gate;
+# the release tooling checks the pull again before it calls the release done).
 #
 # FIRST-RUN, ONE-TIME (per package): after the first successful push, open
 # Packages → <package> → Package settings and (a) set visibility to Public and
@@ -25,6 +32,7 @@ on:
   workflow_dispatch: {}
   push:
     tags: ['v*']
+    branches: ['rc/**']
 
 permissions:
   contents: read
@@ -35,7 +43,7 @@ jobs:
     # Images publish only from the official repo (never mirrors or forks).
     if: github.repository == 'OtoDock/oto-dock'
     # Native runner per platform — arm64 under QEMU would emulate `npm ci` and
-    # the LibreOffice/model layers, which is too slow for a 5-leg matrix.
+    # the LibreOffice/model layers, which is too slow for a 6-leg matrix.
     # ubuntu-24.04-arm is a GitHub-hosted arm64 runner (free for public repos).
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
@@ -43,11 +51,6 @@ jobs:
       matrix:
         image: [otodock-proxy, otodock-file-tools, otodock-phone]
         platform: [linux/amd64, linux/arm64]
-        exclude:
-          # silero-vad-lite has no aarch64 wheel; its sdist downloads a
-          # linux-x64 static ONNX Runtime and fails to link on arm64.
-          - image: otodock-phone
-            platform: linux/arm64
         include:
           # Merged into the combinations above (matching `image` key), so each
           # image keeps its build context without duplicating the platform axis.
@@ -130,8 +133,8 @@ jobs:
 
   merge:
     # Assemble one manifest list per image from the per-platform digests and
-    # apply the release tags. A single-platform image (phone) gets a one-entry
-    # list, which pulls identically to the old single-arch tag.
+    # apply the release tags. A failed build leg skips this job (no
+    # `if: always()`), so a half-built release never gets a tag.
     if: github.repository == 'OtoDock/oto-dock'
     needs: [build]
     runs-on: ubuntu-latest
@@ -149,14 +152,40 @@ jobs:
           pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
 
-      - name: Resolve the version from VERSIONS.md
+      - name: Resolve the image tags for this ref
         id: meta
+        # The ref decides the tags (see the header). Both the tag and the rc
+        # branch must name the version VERSIONS.md carries, so a forgotten
+        # bump fails here, before any tag moves.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           version=$(bash scripts/versions.sh OTODOCK_VERSION)
           if [ -z "$version" ]; then
             echo "::error::OTODOCK_VERSION missing from VERSIONS.md"; exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$REF_TYPE/$REF_NAME" in
+            tag/v*)
+              if [ "${REF_NAME#v}" != "$version" ]; then
+                echo "::error::tag $REF_NAME does not match OTODOCK_VERSION=$version"; exit 1
+              fi
+              tags="$version latest" ;;
+            branch/rc/*)
+              rc="${REF_NAME#rc/}"
+              case "$rc" in
+                "$version"-rc[0-9]*) ;;
+                *) echo "::error::branch $REF_NAME does not match OTODOCK_VERSION=$version (expected rc/$version-rcN)"; exit 1 ;;
+              esac
+              tags="$rc" ;;
+            *)
+              tags="$version latest" ;;
+          esac
+          {
+            echo "tags=$tags"
+            echo "primary=${tags%% *}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::${{ matrix.image }} → $tags"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -170,15 +199,25 @@ jobs:
 
       - name: Create the manifest list and tag it
         working-directory: ${{ runner.temp }}/digests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           image=ghcr.io/otodock/${{ matrix.image }}
-          version='${{ steps.meta.outputs.version }}'
-          docker buildx imagetools create \
-            -t "${image}:${version}" \
-            -t "${image}:latest" \
-            $(printf "${image}@sha256:%s " *)
+          # The digests directory holds one empty file per platform, named by
+          # the digest the build leg pushed.
+          refs=()
+          for d in *; do refs+=("${image}@sha256:${d}"); done
+          tag_args=()
+          for t in $TAGS; do tag_args+=(-t "${image}:${t}"); done
+          docker buildx imagetools create "${tag_args[@]}" "${refs[@]}"
 
-      - name: Inspect
+      - name: Verify both architectures
+        # The list also carries buildx's provenance attestations (os "unknown"),
+        # which do not count as an architecture.
         run: |
-          docker buildx imagetools inspect \
-            "ghcr.io/otodock/${{ matrix.image }}:${{ steps.meta.outputs.version }}"
+          image="ghcr.io/otodock/${{ matrix.image }}:${{ steps.meta.outputs.primary }}"
+          docker buildx imagetools inspect "$image"
+          docker buildx imagetools inspect --raw "$image" \
+            | jq -e '[.manifests[]?.platform | select(.os != "unknown") | "\(.os)/\(.architecture)"]
+                     | index("linux/amd64") != null and index("linux/arm64") != null' >/dev/null \
+            || { echo "::error::$image lacks linux/amd64 or linux/arm64"; exit 1; }

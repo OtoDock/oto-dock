@@ -61,7 +61,7 @@ def _make_manifest(name, category="custom", skills=None, tmp_path=None):
 
 def _patch_manifests(monkeypatch, manifests: dict):
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     monkeypatch.setattr(mcp_registry, "_manifests", manifests)
     for name in manifests:
         mcp_store.set_mcp_enabled(name, True)
@@ -138,7 +138,7 @@ def test_prompt_catalog_excludes_skill_packages(wired, monkeypatch, tmp_path):
 
 def test_discovery_count_excludes_skill_packages(wired):
     from api.agents.discovery import _get_mcp_info
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     mcp_store.add_agent_mcp("alice-agent", "tts-mcp")
     mcp_store.add_agent_mcp("alice-agent", "pdf-skills")
     count, names = _get_mcp_info("alice-agent")
@@ -154,7 +154,7 @@ def test_put_rejects_skill_packages_in_payload(wired):
 
 
 def test_put_preserves_assigned_skill_packages(wired):
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     mcp_store.add_agent_mcp("alice-agent", "pdf-skills")
     r = wired.put("/v1/agents/alice-agent/mcps", json={"mcps": ["tts-mcp"]})
     assert r.status_code == 200
@@ -166,7 +166,7 @@ def test_put_preserves_assigned_skill_packages(wired):
 # ── Skills tab endpoint ────────────────────────────────────────────────
 
 def test_skills_list_includes_unassigned_standalone(wired):
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     mcp_store.add_agent_mcp("alice-agent", "tts-mcp")
     rows = wired.get("/v1/agents/alice-agent/skills").json()["skills"]
     by_id = {r["id"]: r for r in rows}
@@ -181,7 +181,7 @@ def test_skills_list_includes_unassigned_standalone(wired):
 
 
 def test_patch_enable_standalone_auto_assigns(wired):
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     r = wired.patch("/v1/agents/alice-agent/skills/pdf-processing",
                     json={"enabled": True, "exclude_from": []})
     assert r.status_code == 200
@@ -192,7 +192,7 @@ def test_patch_enable_standalone_auto_assigns(wired):
 
 
 def test_patch_disable_keeps_package_assigned(wired):
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     wired.patch("/v1/agents/alice-agent/skills/pdf-processing",
                 json={"enabled": True, "exclude_from": []})
     wired.patch("/v1/agents/alice-agent/skills/pdf-processing",
@@ -236,7 +236,7 @@ def test_scan_first_wins_on_name_collision(temp_db, tmp_path, monkeypatch):
 
 
 def test_create_request_kind_roundtrip(temp_db):
-    from storage import mcp_request_store as rs
+    from storage.mcp import mcp_request_store as rs
     row_mcp = rs.create_request("camoufox", "a1", "user-1")
     assert row_mcp["kind"] == "mcp"
     row_skill = rs.create_request("pdf-skills", "a1", "user-1", kind="skill")
@@ -250,7 +250,7 @@ def test_delete_skill_package_removes_folder_and_rows(wired, monkeypatch):
     folder gone, agent_mcps assignment gone, agent_skills rows gone (skill
     ids are BARE — the old '{mcp}/%' LIKE cleanup matched nothing)."""
     from services.mcp import mcp_registry
-    from storage import mcp_store
+    from storage.mcp import mcp_store
     from storage.pg import get_conn
 
     r = wired.patch(

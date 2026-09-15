@@ -1,0 +1,46 @@
+name: Feature request
+description: Propose a change or an addition to the platform.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A new MCP server, agent template or skill for the catalogs belongs in
+        [community-mcps](https://github.com/OtoDock/community-mcps),
+        [community-agents](https://github.com/OtoDock/community-agents) or
+        [community-skills](https://github.com/OtoDock/community-skills).
+        For anything large, an issue before the code saves everyone time
+        (see `CONTRIBUTING.md`).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what stands in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: What you would like to happen. Alternatives you considered are welcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Proxy and backend
+        - Dashboard
+        - Remote machines (satellite)
+        - Phone
+        - First-party MCPs and skills
+        - Install and upgrade
+        - Docs
+        - Not sure
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to work on this myself.

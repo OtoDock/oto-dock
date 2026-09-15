@@ -20,7 +20,7 @@ from pydantic import BaseModel
 import config
 from services.scheduler import scheduler
 from storage import database as task_store
-from storage import agent_store
+from storage.agents import agent_store
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth

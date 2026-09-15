@@ -122,7 +122,7 @@ def _stub_assembly(monkeypatch, manifests, *, env_by_mcp, tmp_path,
     # Keep the assembly DB-free: server_name "local" (browser-mcp) would
     # otherwise hit get_browser_allowed_origins, opening an app DB connection
     # that deadlocks the autouse temp_db DDL.
-    from storage import agent_store
+    from storage.agents import agent_store
     monkeypatch.setattr(
         agent_store, "get_browser_allowed_origins", lambda *a, **k: [],
     )

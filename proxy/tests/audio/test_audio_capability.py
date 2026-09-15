@@ -8,8 +8,8 @@ from __future__ import annotations
 
 
 from services.media import audio_service
-from storage import audio_provider_store
-from storage import credential_store
+from storage.prefs import audio_provider_store
+from storage.identity import credential_store
 from storage import database as task_store
 
 

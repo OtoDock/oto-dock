@@ -96,7 +96,7 @@ def test_files_token_rejects_expired_and_forged():
 # ── endpoint ───────────────────────────────────────────────────────────────
 
 def _call(authorization):
-    from api.hooks.hooks import hook_session_files
+    from api.hooks.permission import hook_session_files
     return asyncio.run(hook_session_files(authorization=authorization))
 
 
@@ -341,7 +341,7 @@ def test_provider_renders_on_admin_paired_remote():
     rows = [{"id": 1, "field_values": {"name": "x", "host": "10.0.0.5",
                                        "username": "u", "key_name": "k"},
              "agents": ["agent"], "assigned_to_all": False}]
-    with patch("storage.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         assert _ssh_hosts_context(
             "agent", is_remote=True, target_admin_paired=True,
         ) is not None

@@ -109,7 +109,7 @@ def test_local_or_unknown_target_is_dedicated(machine, monkeypatch):
 
 
 def test_undecryptable_token_degrades_to_no_token(machine, monkeypatch):
-    from storage import credential_store
+    from storage.identity import credential_store
     remote_store.set_device_grants(machine["id"], ["browser"])
     remote_store.set_browser_mode(machine["id"], "own")
     remote_store.set_browser_extension_token(machine["id"], "D" * 43)

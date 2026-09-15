@@ -47,7 +47,7 @@ def app_with_router(tmp_path, monkeypatch):
         return user
 
     # Stub agent_store + task_store calls inside the endpoint
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "test-agent")
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice" if sub == "user-test-sub" else None)
@@ -209,7 +209,7 @@ def app_with_internal_agent(tmp_path, monkeypatch):
     async def _stub_user():
         return user
 
-    from storage import agent_store
+    from storage.agents import agent_store
     from storage import database as task_store
     from core.session import visibility as _vis
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "internal-bot")

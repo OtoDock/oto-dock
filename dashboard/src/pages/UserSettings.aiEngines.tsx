@@ -2,8 +2,11 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { fetchCurrentUser } from '../api/auth'
 import { setNativeAuthInProgress } from '../lib/nativeBridge'
+import { SubscriptionWindowBars, BalanceHint } from '../components/engines/SubscriptionWindows'
+import { ApiKeyForm } from '../components/engines/AddApiKeyForm'
 import {
   useUserExecutionLayers,
+  useUserAddSubscription,
   useUserDeleteSubscription,
   useUserUpdateSubscription,
   useStartClaudeOAuth,
@@ -30,6 +33,7 @@ const STATUS_CHIP: Record<string, string> = {
 function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const [expanded, setExpanded] = useState(false)
   const [showConnect, setShowConnect] = useState(false)
+  const [showApiKey, setShowApiKey] = useState(false)
   const [oauthStep, setOauthStep] = useState<'idle' | 'code'>('idle')
   const [oauthState, setOauthState] = useState('')
   const [code, setCode] = useState('')
@@ -53,6 +57,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const finishOpenAI = useFinishOpenAIOAuth()
   const deleteSub = useUserDeleteSubscription()
   const updateSub = useUserUpdateSubscription()
+  const addKey = useUserAddSubscription()
   const { user, setUser } = useAuth()
   const isAdmin = user?.role === 'admin'
   const [userCode, setUserCode] = useState('')
@@ -74,8 +79,10 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   // "Your subscription" claims key on ACTIVE rows only — an expired row still
   // lists (so it can be reconnected) but must not report a working setup.
   const hasOwnSub = userSubs.some(s => s.status === 'active')
+  const hasOwnOAuth = userSubs.some(s => s.status === 'active' && s.auth_type !== 'api_key')
   const hasExpiredSub = userSubs.some(s => s.status === 'expired')
   const supportsOAuth = layer.name === 'claude-code-cli' || layer.name === 'codex-cli'
+  const keyProvider = isOpenAI ? 'openai' : 'anthropic'
 
   // Keep the auth user's `has_own_engine` fresh so the global "connect an AI
   // engine" banner clears the instant the user connects one here. It derives
@@ -180,10 +187,16 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   }, [handleStartOAuth])
 
   const handleDelete = (sub: Subscription) => {
-    if (confirm('Remove your subscription?')) {
+    if (confirm(sub.auth_type === 'api_key' ? 'Remove your API key?' : 'Remove your subscription?')) {
       deleteSub.mutate({ layer: layer.name, id: sub.id })
     }
   }
+
+  // The pill's name: the row's label, else what the row is on this engine.
+  const subLabel = (sub: Subscription) =>
+    sub.label || (sub.auth_type === 'api_key'
+      ? `${isOpenAI ? 'OpenAI' : 'Anthropic'} API key`
+      : `${isOpenAI ? 'ChatGPT' : 'Claude'} Subscription`)
 
   return (
     <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
@@ -201,8 +214,10 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             </span>
           </div>
           <div className="text-sm text-p-text-secondary">
-            {hasOwnSub
+            {hasOwnOAuth
               ? 'Using your subscription'
+              : hasOwnSub
+                ? 'Using your API key'
               : hasExpiredSub
                 ? 'Your subscription needs reconnecting'
                 : layer.platform_available
@@ -243,7 +258,12 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                     on mobile — without it the badge and Remove button get
                     pushed past the right edge. */}
                 <div className="min-w-0 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                  <span className="text-sm font-medium text-p-text">{sub.label || 'Claude Subscription'}</span>
+                  <span className="text-sm font-medium text-p-text">{subLabel(sub)}</span>
+                  {sub.auth_type === 'api_key' && (
+                    <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+                      API key
+                    </span>
+                  )}
                   {sub.oauth_email && <span className="text-xs text-p-text-light truncate max-w-full">{sub.oauth_email}</span>}
                   <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded-sm ${STATUS_CHIP[sub.status] || STATUS_CHIP.disabled}`}>
                     {sub.status}
@@ -266,6 +286,9 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   </button>
                 </div>
               </div>
+              {sub.status === 'active' && sub.auth_type !== 'api_key' && (
+                <SubscriptionWindowBars windows={sub.windows} />
+              )}
               {sub.status === 'expired' && (
                 <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                   This account's login expired — reconnect the same account to revive it.
@@ -307,6 +330,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
               </div>
             </div>
           ))}
+          <BalanceHint oauthCount={userSubs.filter((s) => s.status === 'active' && s.auth_type !== 'api_key').length} />
 
           {/* Platform status */}
           {!hasOwnSub && hasExpiredSub && (
@@ -332,14 +356,28 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             </p>
           )}
 
-          {/* Connect button */}
-          {supportsOAuth && !showConnect && (
-            <button
-              onClick={() => setShowConnect(true)}
-              className="px-4 py-2 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
-            >
-              {userSubs.length > 0 ? 'Add Another Account' : `Connect Your ${isOpenAI ? 'ChatGPT' : 'Claude'} Account`}
-            </button>
+          {/* Connect button, and the pay-as-you-go alternative */}
+          {supportsOAuth && !showConnect && !showApiKey && (
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                onClick={() => setShowConnect(true)}
+                className="px-4 py-2 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
+              >
+                {userSubs.length > 0 ? 'Add Another Account' : `Connect Your ${isOpenAI ? 'ChatGPT' : 'Claude'} Account`}
+              </button>
+              <button
+                onClick={() => setShowApiKey(true)}
+                className="text-xs text-brand hover:underline"
+              >
+                Use an API key instead
+              </button>
+            </div>
+          )}
+          {showApiKey && (
+            <ApiKeyForm
+              layer={layer.name} provider={keyProvider} ownerType="user" showProviderSelect={false}
+              mutation={addKey} onDone={() => setShowApiKey(false)}
+            />
           )}
 
           {/* OAuth flow */}

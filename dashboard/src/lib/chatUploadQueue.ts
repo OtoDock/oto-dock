@@ -86,6 +86,11 @@ export function chatUploadQueueSize(): number {
   return queue.length
 }
 
+/** An upload is running or waiting: work a page reload would destroy. */
+export function chatUploadActive(): boolean {
+  return running || queue.length > 0
+}
+
 async function pump(): Promise<void> {
   if (running) return
   running = true

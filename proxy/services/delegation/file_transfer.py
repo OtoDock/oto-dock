@@ -13,7 +13,7 @@ existing inbox file is never overwritten.
 send_files is the PASSIVE half of the delegation pair: it never spawns a
 turn on the target (autonomy stays with explicit ``delegate``); the
 target hears about the drop from the file-inbox context block at its
-next session start (``storage/db_file_transfers``).
+next session start (``storage/files/db_file_transfers``).
 
 Remote sources (2026-09-05): satellite → platform workspace sync runs at
 turn boundaries, so for a session executing on a remote machine the
@@ -38,7 +38,10 @@ from fastapi import HTTPException
 import config
 from auth.providers import UserContext
 from core.session.visibility import available_scopes_for
-from storage import agent_store, db_file_transfers, mcp_store, remote_store
+from storage.agents import agent_store
+from storage.files import db_file_transfers
+from storage.mcp import mcp_store
+from storage import remote_store
 from storage import database as task_store
 from storage.pg import run_db
 

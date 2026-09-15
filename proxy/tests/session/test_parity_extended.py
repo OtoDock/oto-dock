@@ -591,3 +591,29 @@ def test_direct_llm_local_target_returns_local():
         }
         layer = get_execution_layer("test-agent")
         assert layer is _direct_layer
+
+
+def test_codex_translator_rate_limits_recorded_not_emitted():
+    """``account/rateLimits/updated`` feeds the pool's window samples on a side
+    channel and never becomes a CommonEvent (a pool account's usage is not
+    the chatting user's business)."""
+    from unittest.mock import patch
+    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    snapshot = {"limitName": "codex", "planType": "plus",
+                "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1789114918},
+                "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1789447223}}
+    with patch("services.engines.subscription_windows.record_codex_snapshot_async") as rec:
+        t = CodexEventTranslator(session_id="sess-1")
+        assert t.translate(CodexEvent(type="account/rateLimits/updated",
+                                      data={"rateLimits": snapshot})) == []
+        rec.assert_called_once_with("sess-1", snapshot)
+        # Params that ARE the snapshot (no wrapper) work too.
+        rec.reset_mock()
+        assert t.translate(CodexEvent(type="account/rateLimits/updated", data=snapshot)) == []
+        rec.assert_called_once_with("sess-1", snapshot)
+        # No session id (back-compat construction): nothing to attribute to.
+        rec.reset_mock()
+        assert CodexEventTranslator().translate(
+            CodexEvent(type="account/rateLimits/updated", data={"rateLimits": snapshot})) == []
+        rec.assert_not_called()

@@ -118,7 +118,7 @@ class TestDeleteMachine:
         cursor_mock = MagicMock()
         cursor_mock.rowcount = 1
         mock_db.execute.return_value = cursor_mock
-        with patch("storage.agent_store._invalidate_cache"):
+        with patch("storage.agents.agent_store._invalidate_cache"):
             result = delete_remote_machine("machine-1")
         assert result is True
         # Verify agent reset and user target cleanup were called
@@ -132,14 +132,14 @@ class TestResolveExecutionTarget:
     """
     def test_no_user_returns_agent_default(self, mock_db):
         from storage.remote_store import resolve_execution_target
-        with patch("storage.agent_store.get_agent") as mock_agent, \
+        with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable", return_value=True):
             mock_agent.return_value = {"execution_target": "machine-agent"}
             result = resolve_execution_target("test-agent", user_sub=None)
             assert result == ("machine-agent", None)
     def test_no_user_no_agent_returns_local(self, mock_db):
         from storage.remote_store import resolve_execution_target
-        with patch("storage.agent_store.get_agent") as mock_agent:
+        with patch("storage.agents.agent_store.get_agent") as mock_agent:
             mock_agent.return_value = {"execution_target": "local"}
             result = resolve_execution_target("test-agent", user_sub=None)
             assert result == ("local", None)
@@ -154,7 +154,7 @@ class TestResolveExecutionTarget:
             "name": "my-laptop",
             "capabilities": "{}",
         }
-        with patch("storage.agent_store.get_agent") as mock_agent, \
+        with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable", return_value=True):
             mock_agent.return_value = {"execution_target": "machine-agent"}
             result = resolve_execution_target("test-agent", user_sub="user-1")
@@ -171,7 +171,7 @@ class TestResolveExecutionTarget:
             "capabilities": "{}",
         }
         # User machine unreachable → fall through to agent default (reachable).
-        with patch("storage.agent_store.get_agent") as mock_agent, \
+        with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable",
                    side_effect=lambda mid: mid == "machine-agent"):
             mock_agent.return_value = {"execution_target": "machine-agent"}
@@ -181,7 +181,7 @@ class TestResolveExecutionTarget:
         from storage.remote_store import resolve_execution_target
         # Only one query — per-agent — returns None.
         mock_db.execute.return_value.fetchone.return_value = None
-        with patch("storage.agent_store.get_agent") as mock_agent, \
+        with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable", return_value=True):
             mock_agent.return_value = {"execution_target": "machine-agent"}
             result = resolve_execution_target("test-agent", user_sub="user-1")
@@ -197,7 +197,7 @@ class TestResolveExecutionTarget:
             "name": "dev-server",
             "capabilities": "{}",
         }
-        with patch("storage.agent_store.get_agent") as mock_agent, \
+        with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable", return_value=True):
             mock_agent.return_value = {"execution_target": "local"}
             result = resolve_execution_target("test-agent", user_sub="user-1")

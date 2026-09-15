@@ -8,12 +8,31 @@
 // leaves this worker — detection is fully on-device.
 //
 // Protocol:
-//   in:  {type:'init', base, keywords, threshold, score}
+//   in:  {type:'init', base, keywords, threshold, score, diag?}
 //        {type:'frames', samples: Float32Array}   (transferred)
+//        {type:'reset'}        capture resumed after a pause
+//        {type:'diag', on}     toggle diagnostic breadcrumbs at runtime
 //        {type:'stop'}
-//   out: {type:'ready'} | {type:'detect', keyword} | {type:'error', message}
+//   out: {type:'ready'}
+//        {type:'detect', keyword, at_s, engine:{start_time, timestamps}}
+//        {type:'diag', event, data}   only while diag is on
+//        {type:'error', message}
 //
 // `keyword` is the @tag from the keywords line — the target agent slug.
+// `at_s` is this worker's own sample clock (seconds of audio fed to the
+// current stream): a diagnostics recording aligns to it, whereas the
+// engine's timestamps restart at each of its internal resets and its
+// start_time is always 0.
+//
+// Stream discipline (measured 2026-09-11 against the real engine with the
+// replay harness): the encoder needs NO warm-up — a cold stream recalls
+// every test phrase — so after a detection and on capture resume the
+// stream is simply REPLACED by a fresh one. That drops the decoder's
+// partial context and any undecoded pre-pause residue, and it honours the
+// upstream "reset right after a detection" rule in superset form. The
+// engine's own silence-timer reset is patched at build time to keep the
+// encoder states (scripts/build-wasm-kws.sh); nothing here depends on that
+// patch except recall.
 
 /* eslint-disable no-undef */
 'use strict'
@@ -24,50 +43,36 @@ var stream = null
 var pending = []
 var pendingSamples = 0
 var overflowLogged = false
+var diag = false
+var fed = 0 // samples fed to the CURRENT stream
+var decodes = 0
+var heartbeat = 0
 
 // Pre-ready buffer cap by DURATION (frame size varies with the page's
 // AudioContext rate — a 16 kHz context would make a frame-count cap 3x
 // longer): ~15 s covers a real cold engine boot on a slow phone.
 var PENDING_MAX_SAMPLES = 15 * 16000
-
-// Encoder warm-up material: the zipformer runs chunk-16-left-64 — 64 left
-// frames x 40 ms = ~2.56 s of trained left context. After every stream
-// reset the encoder starts from init states (~cold recall until the cache
-// refills), so we pre-roll ~2.6 s of near-silence. Low-amplitude noise, not
-// digital zeros: real microphone silence always has a noise floor, exact
-// zeros hit the fbank's epsilon clamp (out-of-distribution features).
-var WARMUP = null
-function warmupBuf() {
-  if (!WARMUP) {
-    WARMUP = new Float32Array(Math.round(16000 * 2.6))
-    for (var i = 0; i < WARMUP.length; i++) WARMUP[i] = (Math.random() * 2 - 1) * 1e-4
-  }
-  return WARMUP
-}
-
-// Rebuild encoder left context after a reset. The drain deliberately never
-// posts detections: reset does NOT flush already-accepted feature frames,
-// so residue audio from before the reset (e.g. duplex speech) is decoded
-// first — if it latched a keyword, swallow it here instead of firing a
-// phantom wake, and hard-reset (accepting a cold encoder on this ~never
-// branch).
-function warmStream() {
-  if (!kws || !stream) return
-  try {
-    stream.acceptWaveform(16000, warmupBuf())
-    while (kws.isReady(stream)) kws.decode(stream)
-    var r = kws.getResult(stream)
-    if (r.keyword && r.keyword.length > 0) {
-      kws.reset(stream)
-      console.log('[wake] warmup swallowed stale keyword')
-    }
-  } catch (e) {
-    fail(e)
-  }
-}
+var HEARTBEAT_MS = 5000
 
 function fail(message) {
   postMessage({ type: 'error', message: String(message) })
+}
+
+function diagPost(event, data) {
+  if (diag) postMessage({ type: 'diag', event: event, data: data || {} })
+}
+
+// Replace the stream. `stream` is nulled BEFORE freeing so a throw in
+// createStream leaves the worker with no stream (frames buffer, the page
+// gets the error and rebuilds the worker) instead of a dangling freed
+// handle that the next feed would hand back to the wasm.
+function freshStream(why) {
+  var old = stream
+  stream = null
+  try { if (old) old.free() } catch (e) { /* a dead handle must not block the recreate */ }
+  stream = kws.createStream()
+  fed = 0
+  diagPost('stream recreated', { why: why })
 }
 
 // Engine assets are same-origin only: the page names the versioned
@@ -80,11 +85,13 @@ function assetBase(raw) {
 }
 
 function init(msg) {
-  const base = assetBase(msg.base) // e.g. '/kws-assets/1.13.5-gigaspeech-3.3M/'
+  const base = assetBase(msg.base) // e.g. '/kws-assets/1.13.5-gigaspeech-3.3M-r2/'
   if (!base) {
     fail('invalid asset base')
     return
   }
+  diag = msg.diag === true
+  const t0 = Date.now()
   Module = {
     locateFile: (f) => base + f,
     print: () => {},
@@ -109,7 +116,13 @@ function init(msg) {
             modelingUnit: '',
             bpeVocab: '',
           },
-          maxActivePaths: 4,
+          // Beam of 8, not upstream's 4 (2026-09-11, measured on an
+          // operator's real recordings replayed offline): with the same
+          // per-line riders, a non-native "hey personal assistant" went
+          // from 14 % to 30 % recall and "hey otodock" from 13/21 to 21/21
+          // alignments, zero false fires on control speech, decode time
+          // unchanged (the encoder dominates). 16 buys nothing more.
+          maxActivePaths: 8,
           numTrailingBlanks: 1,
           // Positive-clamp, not ||/??: a zero threshold would fire on
           // everything (the server never sends one, but this fallback is
@@ -119,20 +132,27 @@ function init(msg) {
           keywords: msg.keywords,
         })
         stream = kws.createStream()
-        // Warm BEFORE draining the pre-ready buffer: a fresh stream has
-        // zero left context, and the buffer may hold the very utterance
-        // the user is waiting on.
-        warmStream()
+        fed = 0
         const queued = pending
         pending = []
         pendingSamples = 0
+        heartbeat = setInterval(function () {
+          diagPost('heartbeat', { decodes: decodes, fed_s: Math.round(fed / 160) / 100 })
+        }, HEARTBEAT_MS)
         postMessage({ type: 'ready' })
+        diagPost('engine ready', { boot_ms: Date.now() - t0, buffered_s: Math.round(queued.reduce((n, s) => n + s.length, 0) / 160) / 100 })
+        // The buffer may hold the very utterance the user is waiting on:
+        // catch-up decode runs ~20x realtime.
         queued.forEach(feed)
       } catch (e) {
         fail(e)
       }
     },
   }
+  // Also reachable as a global-scope property (what the glue reads; the
+  // top-level `var` above is that same binding in a real worker) so a
+  // test that evaluates this script in a function scope can reach it.
+  self.Module = Module
   try {
     importScripts(base + 'sherpa-onnx-kws.js', base + 'sherpa-onnx-wasm-kws-main.js')
   } catch (e) {
@@ -143,8 +163,8 @@ function init(msg) {
 function feed(samples) {
   if (!kws || !stream) {
     // Engine still booting: buffer ~15 s of audio so a wake phrase spoken
-    // DURING the boot is decoded the moment the spotter is up (catch-up
-    // decode runs ~20x realtime) — "say it twice" on first use was this.
+    // DURING the boot is decoded the moment the spotter is up — "say it
+    // twice" on first use was this.
     pending.push(samples)
     pendingSamples += samples.length
     while (pendingSamples > PENDING_MAX_SAMPLES && pending.length > 1) {
@@ -158,23 +178,30 @@ function feed(samples) {
   }
   try {
     stream.acceptWaveform(16000, samples)
+    fed += samples.length
     var detected = null
     while (kws.isReady(stream)) {
       kws.decode(stream)
+      decodes++
       var r = kws.getResult(stream)
       if (r.keyword && r.keyword.length > 0) {
-        // Upstream rule: reset immediately after a detection (prevents
-        // duplicate triggers from the surviving beam). Warm-up runs AFTER
-        // the loop — never inside it (the warm-up audio itself re-arms
-        // isReady and would spin the loop through getResult).
-        detected = r.keyword
-        kws.reset(stream)
+        detected = r
         break
       }
     }
     if (detected) {
-      postMessage({ type: 'detect', keyword: detected })
-      warmStream()
+      var at = Math.round(fed / 16) / 1000
+      postMessage({
+        type: 'detect',
+        keyword: detected.keyword,
+        at_s: at,
+        engine: { start_time: detected.start_time, timestamps: detected.timestamps },
+      })
+      diagPost('detected', { keyword: detected.keyword, at_s: at, timestamps: detected.timestamps })
+      // Upstream rule: reset immediately after a detection (prevents
+      // duplicate triggers from the surviving beam). The rest of this
+      // frame after the keyword (< 90 ms) is dropped with the old stream.
+      freshStream('detection')
     }
   } catch (e) {
     fail(e)
@@ -188,19 +215,21 @@ self.onmessage = (ev) => {
   else if (msg.type === 'frames') feed(msg.samples)
   else if (msg.type === 'reset') {
     // Capture resumed after a pause (the engine outlives mic pauses):
-    // drop buffered pre-pause audio and the decoder's partial context,
-    // then rebuild encoder left context so the first fresh utterance
-    // isn't decoded cold.
+    // drop buffered pre-pause audio and start a fresh stream so the
+    // decoder's pre-pause partial context cannot stitch onto new speech.
     pending = []
     pendingSamples = 0
     try {
-      if (kws && stream) {
-        kws.reset(stream)
-        warmStream()
-      }
-    } catch { /* ignore */ }
+      if (kws && stream) freshStream('capture resume')
+    } catch (e) {
+      fail(e)
+    }
+  }
+  else if (msg.type === 'diag') {
+    diag = msg.on === true
   }
   else if (msg.type === 'stop') {
+    clearInterval(heartbeat)
     try { if (stream) stream.free() } catch { /* ignore */ }
     try { if (kws) kws.free() } catch { /* ignore */ }
     stream = null

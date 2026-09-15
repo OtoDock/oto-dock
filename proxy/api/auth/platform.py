@@ -38,6 +38,9 @@ class PlatformSettingsRequest(BaseModel):
     session_retention_days: str | None = None
     # Automatic MCP updates (services/mcp/mcp_autoupdate.py)
     mcp_auto_update_enabled: bool | None = None
+    # Read each OAuth account's 5-hour / weekly usage from the vendor
+    # (services/engines/subscription_windows.py). Default ON (unset = on).
+    subscription_windows_enabled: bool | None = None
     # Storage quotas (services/infra/storage_quota.py) — MB / file-count; 0 = unlimited
     quota_shared_folder_mb: str | None = None
     quota_user_folder_mb: str | None = None
@@ -169,6 +172,10 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # only — junk/orphan cleanup always runs.
         "session_retention_enabled": settings.get("session_retention_enabled", "") != "0",
         "session_retention_days": settings.get("session_retention_days", "") or "180",
+        # Provider windows (services/engines/subscription_windows.py). Default
+        # ON (unset = "1" semantics): the pool reads each OAuth account's
+        # session and weekly usage from Claude and ChatGPT.
+        "subscription_windows_enabled": settings.get("subscription_windows_enabled", "") != "0",
         # Automatic MCP updates (services/mcp/mcp_autoupdate.py). Default ON
         # (unset = "1" semantics); a weekly job applies available community-MCP
         # updates in a low-traffic window, deferring docker MCPs that are in use.
@@ -290,6 +297,14 @@ async def set_platform_settings(
             execution_mode.KILL_SWITCH_KEY,
             "1" if req.interactive_cli_enabled else "0",
         )
+    if req.subscription_windows_enabled is not None:
+        from services.engines import subscription_windows
+        await asyncio.to_thread(
+            task_store.set_platform_setting,
+            subscription_windows.SETTING_KEY,
+            "1" if req.subscription_windows_enabled else "0",
+        )
+        subscription_windows.invalidate_setting_cache()
     if req.remote_fallback_user_override is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting,

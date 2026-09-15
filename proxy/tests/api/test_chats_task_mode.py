@@ -174,7 +174,7 @@ def test_search_task_mode_matches_and_gates(temp_db, _as):
 
 def test_chat_status_targets_task_owner_reaches_agent_users(temp_db, monkeypatch):
     from services.notifications import notification_manager as nm
-    from storage import notification_store
+    from storage.automation import notification_store
     monkeypatch.setattr(notification_store, "get_agent_user_subs",
                         lambda agent: ["user-alice", "user-bob"])
     assert nm.chat_status_targets(f"task::{AGENT}", AGENT) == [
@@ -219,7 +219,7 @@ async def test_delivery_push_task_chat_deep_link(temp_db, monkeypatch):
 async def test_ephemeral_push_task_chat_deep_link(temp_db, monkeypatch):
     import services.notifications.notification_manager as nm
     import services.notifications.push_sender as ps
-    from storage import notification_store as ns
+    from storage.automation import notification_store as ns
     captured = {}
 
     async def fake_send_fcm(token, payload):

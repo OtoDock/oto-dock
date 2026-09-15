@@ -365,7 +365,7 @@ def _pass_mcp_autoupdate_log(stats: dict, dry_run: bool) -> None:
     """Trim the automatic MCP-update run log (keep ~90 days / newest 500 rows)."""
     if dry_run:
         return
-    from storage import mcp_autoupdate_store
+    from storage.mcp import mcp_autoupdate_store
     stats["mcp_autoupdate_rows_deleted"] += mcp_autoupdate_store.prune()
 
 
@@ -379,7 +379,7 @@ def _pass_orphan_quota_projects(stats: dict, dry_run: bool) -> None:
     if not storage_quota.hard_enabled():
         return
     try:
-        from storage import agent_store
+        from storage.agents import agent_store
         live = set(agent_store.get_agent_slugs())
         for row in storage_quota.list_projects():
             if row.get("agent_slug") not in live:

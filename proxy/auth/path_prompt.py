@@ -143,7 +143,7 @@ def _build_execution_scope_section(
     # Look up agents.default_scope. Best-effort: a missing or unknown agent
     # row falls back to the safer "user" default.
     try:
-        from storage import agent_store
+        from storage.agents import agent_store
         agent_row = agent_store.get_agent(ctx.agent) or {}
         default_scope = agent_row.get("default_scope") or "user"
         collaborative = bool(agent_row.get("collaborative", True))
@@ -499,7 +499,7 @@ def _local_env_section(*, has_file_tools: bool = False) -> str:
 def _get_default_scope(agent: str) -> str:
     """Look up ``agents.default_scope`` with a safe fallback to ``"user"``."""
     try:
-        from storage import agent_store
+        from storage.agents import agent_store
         row = agent_store.get_agent(agent) or {}
         ds = row.get("default_scope") or "user"
         return ds if ds in ("user", "agent") else "user"

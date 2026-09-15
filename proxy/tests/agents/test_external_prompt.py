@@ -58,7 +58,7 @@ class TestSystemPrompt:
     @pytest.fixture
     def agent(self, temp_db, tmp_path):
         import config
-        from storage import agent_store
+        from storage.agents import agent_store
         if not agent_store.agent_exists("ext-prompt"):
             agent_store.create_agent("ext-prompt", "Ext Prompt")
         agent_dir = config.get_agent_dir("ext-prompt")

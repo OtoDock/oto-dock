@@ -102,7 +102,7 @@ class TestUnauthorizedRegistryListing:
 
     def test_explicit_without_instance_is_listed(self, temp_db):
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("prometheus", True)
         with self._patched_manifests({"prometheus": _stub_manifest("prometheus", "explicit")}):
             names = [m.name for m in mcp_registry.get_unauthorized_explicit_mcps_for_agent("a1")]
@@ -110,21 +110,21 @@ class TestUnauthorizedRegistryListing:
 
     def test_auto_mode_never_listed(self, temp_db):
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("bluesky-mcp", True)
         with self._patched_manifests({"bluesky-mcp": _stub_manifest("bluesky-mcp", "auto")}):
             assert mcp_registry.get_unauthorized_explicit_mcps_for_agent("a1") == []
 
     def test_platform_disabled_is_hidden(self, temp_db):
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("prometheus", False)
         with self._patched_manifests({"prometheus": _stub_manifest("prometheus", "explicit")}):
             assert mcp_registry.get_unauthorized_explicit_mcps_for_agent("a1") == []
 
     def test_covered_agent_not_listed_but_others_are(self, temp_db):
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("prometheus", True)
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default", "field_values": {},
@@ -137,7 +137,7 @@ class TestUnauthorizedRegistryListing:
 
     def test_assigned_to_all_covers_everyone(self, temp_db):
         from services.mcp import mcp_registry
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.set_mcp_enabled("prometheus", True)
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default", "field_values": {},
@@ -291,7 +291,8 @@ class TestApproveWithInstanceId:
         on that one, not the lowest-id automatic choice."""
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_request_store, mcp_store
+        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_store
 
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "first", "field_values": {},
@@ -320,7 +321,8 @@ class TestApproveWithInstanceId:
         ``installing``, which only exits via installed/install_failed)."""
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_request_store, mcp_store
+        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_store
 
         alien = mcp_store.upsert_mcp_instance("other-mcp", {
             "instance_name": "alien", "field_values": {},
@@ -339,7 +341,7 @@ class TestApproveWithInstanceId:
     def test_auto_mode_instance_id_400s(self, temp_db):
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         row = mcp_request_store.create_request("bluesky-mcp", "test-agent", REQUESTER_SUB)
         with patch(
@@ -356,7 +358,7 @@ class TestApproveWithInstanceId:
     def test_uninstalled_instance_id_400s(self, temp_db):
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_request_store
+        from storage.mcp import mcp_request_store
 
         row = mcp_request_store.create_request("ghost-mcp", "test-agent", REQUESTER_SUB)
         with patch(
@@ -375,7 +377,8 @@ class TestApproveWithInstanceId:
         the instance-save auto-retry hook depends on."""
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_request_store, mcp_store
+        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_store
 
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "first", "field_values": {},
@@ -400,7 +403,7 @@ class TestApproveWithInstanceId:
         → the helper silently takes the automatic path instead of failing."""
         _seed_agent()
         from services.community import community_installer
-        from storage import mcp_store
+        from storage.mcp import mcp_store
 
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "survivor", "field_values": {},
@@ -442,7 +445,7 @@ class TestDerivedDisplayFields:
         assert out["instance_count"] == 0
 
     def test_covering_instance_clears_the_flag(self, temp_db):
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "default", "field_values": {},
             "agents": ["test-agent"], "assigned_to_all": False,
@@ -512,7 +515,7 @@ class TestAdminAgentInstallZeroInstances:
         from services.community.community_agent_installer import (
             install_from_extracted_template,
         )
-        from storage.community_agent_template_store import load_template_from_dir
+        from storage.agents.community_agent_template_store import load_template_from_dir
 
         tdir = self._write_template(tmp_path, "prometheus")
         template = load_template_from_dir(tdir)
@@ -543,5 +546,5 @@ class TestAdminAgentInstallZeroInstances:
         assert "Create an instance" in (req["install_log"] or "")
         assert result["ready_mcps"] == []
         # The enable was rolled back — no non-functional row for the UI.
-        from storage import mcp_store
+        from storage.mcp import mcp_store
         assert "prometheus" not in mcp_store.get_manager_enabled_mcps("demo-agent")

@@ -12,7 +12,7 @@ window this applies every available **community-MCP** update:
     still busy after the overall timeout they are skipped this cycle (logged
     ``skipped_in_use``, retried next week — never a failure).
 
-Every per-MCP result is logged (``storage/mcp_autoupdate_store``) for the admin
+Every per-MCP result is logged (``storage/mcp/mcp_autoupdate_store``) for the admin
 run-history card; admins get ONE notification only if something failed. On T3
 (cloud) docker MCPs are managed centrally and excluded by
 ``mcp_updater.community_targets`` — the job is a clean no-op for them.
@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 import config
 from services.mcp import mcp_updater
 from storage import database as task_store
-from storage import mcp_autoupdate_store as log_store
+from storage.mcp import mcp_autoupdate_store as log_store
 
 logger = logging.getLogger("claude-proxy.mcp-autoupdate")
 

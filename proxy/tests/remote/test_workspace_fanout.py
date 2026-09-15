@@ -331,7 +331,9 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
     # the recover-bin (reason conflict) + notify the loser; advance base + author.
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage import file_author_store, sync_state_store, recover_bin_store
+    from storage.files import file_author_store
+    from storage.files import sync_state_store
+    from storage.files import recover_bin_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -374,7 +376,8 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
 async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage import file_author_store, recover_bin_store
+    from storage.files import file_author_store
+    from storage.files import recover_bin_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -408,7 +411,9 @@ async def test_apply_no_conflict_when_base_matches(temp_db, tmp_path, monkeypatc
     sequential edit (the machine SAW this version) → no conflict, even cross-user."""
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage import file_author_store, sync_state_store, recover_bin_store
+    from storage.files import file_author_store
+    from storage.files import sync_state_store
+    from storage.files import recover_bin_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -442,9 +447,10 @@ async def test_apply_delete_writes_tombstone_and_captures(temp_db, tmp_path, mon
     # pre-delete bytes, and clear this machine's base + the author.
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage import (
-        file_author_store, sync_state_store, file_tombstones_store, recover_bin_store,
-    )
+    from storage.files import file_author_store
+    from storage.files import sync_state_store
+    from storage.files import file_tombstones_store
+    from storage.files import recover_bin_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/doomed.md"

@@ -6,6 +6,7 @@ managing Docker containers, and agent assignments.
 
 import asyncio
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 import config
 from auth.providers import UserContext, get_current_user
 from services.mcp import mcp_registry
-from storage import mcp_store
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("claude-proxy.mcp-api")
 router = APIRouter()
@@ -34,6 +35,15 @@ def _require_manage(user: UserContext | None, agent: str | None = None) -> UserC
     elif user.role not in ("admin", "creator"):
         raise HTTPException(403, "Admin or creator only")
     return user
+
+
+def _icon_flags(manifests) -> dict[str, bool]:
+    """``{name: has icon.png}`` for the rows (a stat per MCP: call off the loop)."""
+    out: dict[str, bool] = {}
+    for m in manifests:
+        mcp_dir = getattr(m, "mcp_dir", None)
+        out[m.name] = bool(mcp_dir) and (Path(mcp_dir) / "icon.png").is_file()
+    return out
 
 
 # Core MCPs an admin MAY platform-disable: the parallelism features. Their
@@ -70,6 +80,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         return out
 
     mcp_agents = await asyncio.to_thread(_enabled_agents_by_mcp)
+    icon_flags = await asyncio.to_thread(_icon_flags, manifests.values())
 
     # Docker status (async). Containerized installs: an image-less docker MCP
     # (core file-tools) runs as an OPERATOR-MANAGED compose sibling there — the
@@ -107,6 +118,9 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             "description": m.description,
             "version": m.version,
             "category": m.category,
+            "author": getattr(m, "author", ""),
+            "author_url": getattr(m, "author_url", ""),
+            "icon": icon_flags.get(name, False),
             "runtime": m.server.runtime,
             "transport": m.server.transport,
             "source": m.server.source,
@@ -171,7 +185,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         if cred and cred_type == "infra":
             entry["credential_fields"] = cred.get("fields", [])
             entry["server_config_fields"] = cred.get("server_config_fields", [])
-            from storage import credential_store
+            from storage.identity import credential_store
             stored = await asyncio.to_thread(credential_store.get_infra_credentials, name)
             entry["credential_configured"] = bool(stored)
             entry["credential_configured_keys"] = list(stored.keys()) if stored else []
@@ -184,7 +198,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             # App credential info for OAuth MCPs (e.g. google-oauth-app)
             app_cred_name = cred.get("app_credential", "")
             if app_cred_name and cred.get("app_credential_fields"):
-                from storage import credential_store
+                from storage.identity import credential_store
                 stored = await asyncio.to_thread(
                     credential_store.get_infra_credentials, app_cred_name
                 )
@@ -573,6 +587,16 @@ async def get_agent_mcps(
         await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, name)
     )
 
+    unauthorized = []
+    if include_unauthorized:
+        unauthorized = [
+            m for m in await asyncio.to_thread(
+                mcp_registry.get_unauthorized_explicit_mcps_for_agent, name,
+            )
+            if m.category != "skill"
+        ]
+    icon_flags = await asyncio.to_thread(_icon_flags, [*visible, *unauthorized])
+
     def _row(m, *, authorized: bool) -> dict:
         cred = mcp_registry.get_credential_schema(m.name)
         return {
@@ -580,6 +604,9 @@ async def get_agent_mcps(
             "label": m.label,
             "description": m.description,
             "category": m.category,
+            "author": getattr(m, "author", ""),
+            "author_url": getattr(m, "author_url", ""),
+            "icon": icon_flags.get(m.name, False),
             "assignment_mode": m.assignment_mode,
             "credential_type": cred.get("type", "none") if cred else "none",
             # Lets the UI render the service-account binding dropdown only
@@ -592,15 +619,7 @@ async def get_agent_mcps(
         }
 
     mcps = [_row(m, authorized=True) for m in visible]
-
-    if include_unauthorized:
-        unauthorized = await asyncio.to_thread(
-            mcp_registry.get_unauthorized_explicit_mcps_for_agent, name,
-        )
-        mcps.extend(
-            _row(m, authorized=False)
-            for m in unauthorized if m.category != "skill"
-        )
+    mcps.extend(_row(m, authorized=False) for m in unauthorized)
 
     # Sort: core category first, then alphabetical by label.
     mcps.sort(key=lambda x: (x["category"] != "core", x["label"]))
@@ -977,7 +996,7 @@ async def _retry_install_failed_for_instance(
     Failures are logged and swallowed so the parent instance-save still
     returns 200 — auto-retry is a UX nicety, not a hard contract.
     """
-    from storage import mcp_request_store
+    from storage.mcp import mcp_request_store
     from services.community import community_installer
 
     failed = await asyncio.to_thread(
@@ -1232,7 +1251,7 @@ async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
     )
 
     # Remove credentials (infra, service accounts, all user credentials)
-    from storage import credential_store
+    from storage.identity import credential_store
     await asyncio.to_thread(credential_store.delete_all_mcp_credentials, name)
 
     # Self-host (T1/T2): tear the Docker container + its named volumes down
@@ -1302,7 +1321,8 @@ async def get_mcp_auto_update_log(user: UserContext = Depends(get_current_user))
     nothing to update, so the status line can show "last run … — up to date".
     """
     _require_admin(user)
-    from storage import database as _db, mcp_autoupdate_store
+    from storage import database as _db
+    from storage.mcp import mcp_autoupdate_store
     from services.mcp import mcp_autoupdate
     runs = await asyncio.to_thread(mcp_autoupdate_store.recent_runs, 50)
     last_run_at = await asyncio.to_thread(
