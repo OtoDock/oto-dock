@@ -156,6 +156,12 @@ jobs:
             satellite/requirements.txt
             proxy/requirements-test.txt
 
+      - name: Codex CLI at the VERSIONS.md pin
+        # Two session tests start a Codex session for real to check the
+        # files it writes, so the daemon must be on PATH, at the version the
+        # platform ships.
+        run: sudo npm install -g "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
+
       - name: Install satellite dependencies
         run: |
           python -m pip install -U pip
