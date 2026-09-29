@@ -472,11 +472,13 @@ def test_the_daily_sweep_tells_the_managers_once_per_version(tmp_path, temp_db):
     with patch("services.community.community_agents_catalog.fetch_registry",
                new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
             patch("services.notifications.notification_manager.fire_notification", new=fired):
-        upd._last_notify_sweep = 0.0
+        # Minus infinity, not 0: the marker is a time.monotonic() stamp, which counts
+        # from boot, and on a host up less than a day (a fresh CI runner) 0 is recent.
+        upd._last_notify_sweep = float("-inf")
         assert asyncio.run(upd.maybe_notify_updates()) == 1
         assert fired.call_args.kwargs["target"] == ADMIN_SUB and "2.0.0" in fired.call_args.kwargs["title"]
         assert agent_store.get_community_template_data(AGENT)["update_notified"] == "2.0.0"
-        upd._last_notify_sweep = 0.0
+        upd._last_notify_sweep = float("-inf")
         assert asyncio.run(upd.maybe_notify_updates()) == 0
 
 
@@ -766,7 +768,7 @@ def test_the_daily_sweep_never_undoes_a_record_saved_meanwhile(tmp_path, temp_db
                new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
             patch("services.notifications.notification_manager.fire_notification",
                   new=AsyncMock(side_effect=an_update_lands)):
-        upd._last_notify_sweep = 0.0
+        upd._last_notify_sweep = float("-inf")
         asyncio.run(upd.maybe_notify_updates())
     data = agent_store.get_community_template_data(AGENT)
     assert data["version"] == "2.0.0" and data["saved_by"] == "the update"

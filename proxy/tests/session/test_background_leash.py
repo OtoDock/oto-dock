@@ -108,6 +108,18 @@ def _mk_session(idle_s: float) -> PersistentSession:
     return s
 
 
+@pytest.fixture(autouse=True)
+def _no_hook_is_never(monkeypatch):
+    # A session with no hook activity reads 0 (a real stamp is a positive
+    # time.monotonic()). These tests backdate sessions from time.monotonic(),
+    # which counts from boot: on a host up for minutes (a fresh CI runner) the
+    # stamps go below 0, and the idle age max(last_activity, hook) would take
+    # the 0 for newer activity. Here "no hook" is minus infinity.
+    from core.session import session_state
+    monkeypatch.setattr(session_state, "get_hook_activity",
+                        lambda sid: session_state._session_hook_activity.get(sid, float("-inf")))
+
+
 @pytest.fixture
 def pool():
     saved = dict(_persistent_sessions)
