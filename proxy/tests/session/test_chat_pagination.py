@@ -6,6 +6,7 @@ the synthesized panel_only block, robust to '' event_data), the id-based cutoff
 helper, and the GET /v1/chats/{id}?before_id= older-page endpoint.
 """
 
+from core.events import tool_roles
 import json
 
 from fastapi.testclient import TestClient
@@ -70,14 +71,14 @@ def test_last_todo_snapshot_native(temp_db):
     db.create_chat("c-todo", "user-admin", "agent-x")
     _todo_event("c-todo", [{"content": "a", "status": "completed"}])
     _todo_event("c-todo", [{"content": "a", "status": "completed"}, {"content": "b", "status": "pending"}])
-    snap = db.get_last_todo_snapshot("c-todo")
+    snap = db.get_last_todo_snapshot("c-todo", tool_roles.TODO_SNAPSHOT)
     assert [t["content"] for t in snap] == ["a", "b"]           # the LATEST snapshot
 
 
 def test_last_todo_snapshot_finds_panel_only(temp_db):
     db.create_chat("c-task", "user-admin", "agent-x")
     _todo_event("c-task", [{"content": "x", "status": "in_progress"}], panel_only=True)
-    snap = db.get_last_todo_snapshot("c-task")
+    snap = db.get_last_todo_snapshot("c-task", tool_roles.TODO_SNAPSHOT)
     assert [t["content"] for t in snap] == ["x"]
 
 
@@ -88,13 +89,13 @@ def test_last_todo_snapshot_ignores_empty_event_data(temp_db):
     db.add_chat_message("c-mix", "event", "", event_type="system", event_data="")
     _todo_event("c-mix", [{"content": "real", "status": "pending"}])
     db.add_chat_message("c-mix", "assistant", "ok")            # newer non-todo row
-    assert [t["content"] for t in db.get_last_todo_snapshot("c-mix")] == ["real"]
+    assert [t["content"] for t in db.get_last_todo_snapshot("c-mix", tool_roles.TODO_SNAPSHOT)] == ["real"]
 
 
 def test_last_todo_snapshot_none(temp_db):
     db.create_chat("c-empty", "user-admin", "agent-x")
     db.add_chat_message("c-empty", "user", "hi")
-    assert db.get_last_todo_snapshot("c-empty") == []
+    assert db.get_last_todo_snapshot("c-empty", tool_roles.TODO_SNAPSHOT) == []
 
 
 # --- REST older-page endpoint --------------------------------------------------

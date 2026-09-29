@@ -10,6 +10,7 @@ import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { fetchChatPage } from '../../../api/chats'
 import { useChatStore } from '../../../store/chatStore'
+import type { QueuedMessage } from '../../../store/types'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
 
 type Stream = ReturnType<typeof useChatStream>
@@ -25,7 +26,7 @@ export function useInteractiveHandlers({
   ws: Stream['ws']
   seedDbHistory: Stream['seedDbHistory']
   draftKey: string
-  queuedMessages: string[]
+  queuedMessages: QueuedMessage[]
   setEditText: Stream['setEditText']
 }) {
   // Interactive CLI toggle. No live session:
@@ -94,13 +95,26 @@ export function useInteractiveHandlers({
     [ws, draftKey],
   )
 
-  // Pull ALL queued messages back to input for editing (they're combined on the backend)
+  // Pull ALL queued messages back to input for editing (they're combined on
+  // the backend). Their attachments come back too, from the local items —
+  // the queue_cleared frame carries only the combined text.
   const handleEditQueued = useCallback(
     () => {
       if (queuedMessages.length === 0) return
-      const combined = queuedMessages.join('\n\n')
+      const combined = queuedMessages.map(q => q.text).join('\n\n')
       ws.cancelAllQueued()
-      if (draftKey) useChatStore.getState().clearQueuedMessages(draftKey)
+      if (draftKey) {
+        const st = useChatStore.getState()
+        st.clearQueuedMessages(draftKey)
+        const images = queuedMessages.flatMap(q => q.images ?? []).filter(i => i.path)
+        const files = queuedMessages.flatMap(q => q.files ?? [])
+        if (images.length) {
+          st.addPendingImages(draftKey, images.map(i => ({ id: `img-${i.path}`, path: i.path, name: i.name })))
+        }
+        if (files.length) {
+          st.addPendingFiles(draftKey, files.map(f => ({ id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path })))
+        }
+      }
       setEditText(combined)
     },
     [queuedMessages, ws, draftKey],

@@ -31,6 +31,9 @@ import time
 from datetime import datetime, timezone
 
 from storage import database as task_store
+from storage.automation import run_status
+from core import placement
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy.recovery")
 
@@ -54,11 +57,14 @@ def _is_remote_cli_chat(chat: dict) -> bool:
     may be EMPTY (= agent default — delegate worker chats never stamp it), so
     resolve it the way the spawn path does before comparing; the literal
     comparison silently excluded every delegate lane from Mode C."""
-    from core.session.session_manager import resolve_execution_path
+    from core.session.session_manager import (
+        get_layer_capabilities, resolve_execution_path,
+    )
     path = resolve_execution_path(
         chat.get("agent") or "", chat.get("execution_path") or "",
     )
-    return path == "claude-code-cli"
+    caps = get_layer_capabilities(path)
+    return bool(caps and caps.runtime.supports_reattach_after_restart)
 
 
 def defer_orphaned_runs() -> tuple[int, int]:
@@ -72,10 +78,10 @@ def defer_orphaned_runs() -> tuple[int, int]:
         chat_id = run.get("chat_id") or ""
         session_id = run.get("session_id") or ""
         chat = task_store.get_chat(chat_id) if chat_id else None
-        target = (chat or {}).get("execution_target") or "local"
+        target = (chat or {}).get("execution_target") or placement.LOCAL
         eligible = (
             bool(session_id) and bool(chat)
-            and target not in ("", "local")
+            and bool(placement.machine_of(target))
             and _is_remote_cli_chat(chat)
         )
         if eligible:
@@ -111,8 +117,8 @@ def is_recovery_eligible(chat_id: str) -> bool:
     chat = task_store.get_chat(chat_id) if chat_id else None
     if not chat:
         return False
-    target = chat.get("execution_target") or "local"
-    return target not in ("", "local") and _is_remote_cli_chat(chat)
+    target = chat.get("execution_target") or placement.LOCAL
+    return bool(placement.machine_of(target)) and _is_remote_cli_chat(chat)
 
 
 async def sweep_expired() -> None:
@@ -138,9 +144,9 @@ async def sweep_expired() -> None:
 
 def _fail_run(run_id: str, reason: str) -> None:
     run = task_store.get_run(run_id)
-    if run and run.get("status") in ("running", "pending"):
+    if run and run_status.is_live(run.get("status")):
         task_store.update_run(
-            run_id, status="failed", error_message=reason,
+            run_id, status=run_status.FAILED, error_message=reason,
             completed_at=_now(),
         )
 
@@ -236,6 +242,9 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict]) -> None:
             try:
                 await idle_layer.adopt_idle_session(
                     machine_id=machine_id, session_id=sid, agent_name=agent,
+                    # The satellite names the engine each live session runs
+                    # (every satellite that reports sessions_alive does).
+                    execution_path=info.get("execution_path") or "",
                     use_native_permissions=bool(
                         info.get("use_native_permissions")),
                 )
@@ -299,6 +308,7 @@ async def _recover_session(
             async for event in layer.adopt_session(
                 machine_id=machine_id, session_id=session_id,
                 agent_name=agent, command_id=command_id,
+                execution_path=info.get("execution_path") or "",
                 use_native_permissions=use_native,
             ):
                 await event_queue.put(event)
@@ -317,7 +327,7 @@ async def _recover_session(
         producer=producer,
         event_queue=event_queue,
         perm_queue=get_permission_queue(session_id),
-        source_type="task" if run_id else "chat",
+        source_type=(session_kind.TASK if run_id else session_kind.DASHBOARD).source_type,
     )
     _active_pumps[chat_id] = pump
     pump.start()
@@ -339,13 +349,13 @@ async def _finalize_run(run_id: str, chat_id: str) -> None:
     fire the delegate callback if any. Called after the recovery pump ends."""
     from services.scheduler import scheduler
     run = await asyncio.to_thread(task_store.get_run, run_id)
-    if not run or run.get("status") not in ("running", "pending"):
+    if not run or not run_status.is_live(run.get("status")):
         return  # already terminal (a concurrent path finished it)
     output = await asyncio.to_thread(scheduler._collect_task_output, chat_id)
     chat_row = await asyncio.to_thread(task_store.get_chat, chat_id) or {}
     cost = chat_row.get("total_cost") or 0
     await asyncio.to_thread(
-        task_store.update_run, run_id, status="completed",
+        task_store.update_run, run_id, status=run_status.COMPLETED,
         output_text=output[:10000] if output else "",
         completed_at=_now(),
         cost_usd=cost if cost > 0 else None,

@@ -456,6 +456,37 @@ def get_visible_explicit_mcps(agent_name: str) -> set[str]:
     return result
 
 
+def get_visible_explicit_mcps_by_agent(agent_names: list[str]) -> dict[str, set[str]]:
+    """``get_visible_explicit_mcps`` for many agents from ONE ``mcp_instances``
+    scan: ``{agent: {mcp_name, ...}}`` for every requested agent (an empty
+    set for one no instance names). The agents listing builds every agent's
+    MCP badge per request, so the per-agent scan would run once per agent.
+    An instance's ``agents`` column is parsed once; ``assigned_to_all``
+    reaches every requested agent; a column that is not JSON authorizes
+    nobody, as the per-agent read decides."""
+    names = list(dict.fromkeys(a for a in agent_names if a))
+    result: dict[str, set[str]] = {a: set() for a in names}
+    if not names:
+        return result
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT mcp_name, agents, assigned_to_all FROM mcp_instances"
+        ).fetchall()
+    for r in rows:
+        if r["assigned_to_all"]:
+            for a in names:
+                result[a].add(r["mcp_name"])
+            continue
+        try:
+            agents = json.loads(r["agents"]) if r["agents"] else []
+        except (json.JSONDecodeError, TypeError):
+            agents = []
+        for a in names:
+            if a in agents:
+                result[a].add(r["mcp_name"])
+    return result
+
+
 def upsert_mcp_instance(mcp_name: str, data: dict) -> int:
     """Create or update an MCP instance. Returns the instance ID.
 

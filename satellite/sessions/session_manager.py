@@ -1,7 +1,9 @@
 """Session manager for satellite daemon.
 
-Dispatches platform commands to CLI or Codex sessions based on execution_path.
-Manages session registry and lifecycle.
+Dispatches platform commands to the ENGINE a session runs — the ``ENGINES``
+table (``satellite/engines.py``) maps each ``execution_path`` to its session
+classes and facts; an id the table lacks fails closed on every path. Manages
+the session registry and lifecycle.
 """
 
 import asyncio
@@ -9,6 +11,7 @@ import base64
 import json
 import logging
 import os
+import re
 import platform
 import shutil
 import sys
@@ -22,6 +25,7 @@ from ..transport import file_sync
 from .cli_session import CLISession, _write_cli_hooks
 from .codex_session import CodexSession, _write_codex_hooks
 from ..config import atomic_replace, force_rmtree, kill_process_tree
+from ..engines import BY_CREDENTIAL_KIND, ENGINES, engine_for
 from ..host.host_probe import (
     _detect_display,
     _detect_os_user_and_home,
@@ -40,6 +44,8 @@ from .mcp_install_support import (
     _warm_one_mcp,
 )
 import contextlib
+from .. import config
+from .._vendored import layout
 
 
 if TYPE_CHECKING:
@@ -113,7 +119,7 @@ def _is_claude_runtime_path(raw: str) -> bool:
     own tree.
     """
     root = _claude_runtime_root()
-    is_ci = platform.system().lower() in ("windows", "darwin")
+    is_ci = config.HOST.case_insensitive
 
     def _under(child: str, parent: str) -> bool:
         c, p = child.replace("\\", "/"), parent.replace("\\", "/")
@@ -138,16 +144,38 @@ def _is_claude_runtime_path(raw: str) -> bool:
     return True
 
 
-def _check_satellite_host_policy(raw: str) -> None:
+def _under(path: str, root: str, *, fold: bool) -> bool:
+    """Whether ``path`` is ``root`` or below it, on whole segments, both in
+    forward-slash form; ``fold`` compares case-insensitively (Windows, the
+    default macOS filesystem)."""
+    p, r = path.rstrip("/"), root.rstrip("/")
+    if fold:
+        p, r = p.lower(), r.lower()
+    return bool(r) and (p == r or p.startswith(r + "/"))
+
+
+def _check_satellite_host_policy(
+    raw: str, *, own_agent: str = "", agents_dir: "Path | None" = None,
+    mcps_dir: "Path | None" = None,
+) -> None:
     """Local policy re-check before a satellite-host
     write or read. Defense in depth: the proxy already policy-gated the
     call via ``path_policy_v2``, but a compromised proxy could lie. We
     independently verify against the satellite's own cached
     ``allow_full_fs`` flag (received at WS auth or via ``policy_update``).
 
-    When ``allow_full_fs`` is True: admit anything that passes structural
-    validation (proxy is trusted on path scope when the toggle was
-    explicitly enabled).
+    First, on every pairing (``allow_full_fs`` included): the machine's own
+    OtoDock state (``config.otodock_dir()``: the machine secret, the
+    configuration, the browser profiles, the installed MCPs), the MCP folder
+    and the agents root are refused, with realpath on both sides, except the
+    session's own ``agents/<own_agent>`` subtree when ``own_agent`` is a safe
+    slug (the agent-tree frames never take this branch; a host-path frame
+    that names no slug gets no exception). REMOTE-AGENTS.md promises this
+    re-check independent of the proxy's decision.
+
+    Then, when ``allow_full_fs`` is True: admit anything that passes
+    structural validation (proxy is trusted on path scope when the toggle
+    was explicitly enabled).
 
     When ``allow_full_fs`` is False: require the path to be under the OS
     user's home directory, OR inside this machine's own Claude-CLI
@@ -158,7 +186,24 @@ def _check_satellite_host_policy(raw: str) -> None:
 
     Raises ``ValueError`` on policy violation.
     """
+    from ..host.auth_paths import is_safe_slug
     from ..host.satellite_policy import is_full_fs_allowed
+    fold = config.HOST.case_insensitive
+    real = os.path.realpath(raw).replace("\\", "/")
+    state_roots = [str(config.otodock_dir().resolve()).replace("\\", "/")]
+    if mcps_dir is not None:
+        state_roots.append(str(Path(mcps_dir).resolve()).replace("\\", "/"))
+    agents_root = str(Path(agents_dir).resolve()).replace("\\", "/") if agents_dir is not None else ""
+    own_root = f"{agents_root}/{own_agent}" if agents_root and is_safe_slug(own_agent) else ""
+    if own_root and _under(real, own_root, fold=fold):
+        pass  # the session's own synced tree, judged by the home band below
+    elif any(_under(real, root, fold=fold) for root in state_roots) or (
+            agents_root and _under(real, agents_root, fold=fold)):
+        raise ValueError(
+            f"satellite-host path {raw!r} is inside this machine's own OtoDock "
+            "state (its configuration, installed MCPs or another agent's tree) "
+            "and is never reachable from a session"
+        )
     if is_full_fs_allowed():
         return
     if _is_claude_runtime_path(raw):
@@ -177,9 +222,7 @@ def _check_satellite_host_policy(raw: str) -> None:
     normalized = os.path.realpath(raw).replace("\\", "/")
     # Case-fold for Windows / macOS-HFS+ (matches the proxy's
     # `_normalize_for_compare`).
-    is_case_insensitive = (
-        platform.system().lower() in ("windows", "darwin")
-    )
+    is_case_insensitive = config.HOST.case_insensitive
     if is_case_insensitive:
         c = normalized.lower().rstrip("/")
         p = home_dir.lower().rstrip("/")
@@ -194,6 +237,45 @@ def _check_satellite_host_policy(raw: str) -> None:
         "ask an admin to enable full-FS access for this machine if "
         "broader scope is needed"
     )
+
+
+# A manifest page holds at most this many entries and about this much text.
+_MANIFEST_PAGE_MIN, _MANIFEST_PAGE_MAX = 256, 8192
+_MANIFEST_PAGE_BYTES = 2 * 1024 * 1024
+
+
+_SOURCE_BUILD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _source_build_of(spec: dict) -> list[str]:
+    """The ``source_build`` list of a sync spec: the package names the
+    manifest allows to build from source, each a plain distribution name
+    (the installer's own rule); anything else is dropped, a missing or
+    malformed field is the empty list (an older proxy)."""
+    raw = spec.get("source_build")
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, str) and _SOURCE_BUILD_RE.fullmatch(e)]
+
+
+def _manifest_pages(entries: list[dict], page_size: int) -> list[list[dict]]:
+    """Split a manifest into pages of at most ``page_size`` entries (clamped
+    to the satellite's bounds) and about ``_MANIFEST_PAGE_BYTES`` of
+    serialized text; an empty manifest is one empty page."""
+    import json as _json
+    size = max(_MANIFEST_PAGE_MIN, min(_MANIFEST_PAGE_MAX, int(page_size)))
+    pages: list[list[dict]] = []
+    page: list[dict] = []
+    page_bytes = 0
+    for e in entries:
+        cost = len(_json.dumps(e, separators=(",", ":"))) + 1
+        if page and (len(page) >= size or page_bytes + cost > _MANIFEST_PAGE_BYTES):
+            pages.append(page)
+            page, page_bytes = [], 0
+        page.append(e)
+        page_bytes += cost
+    pages.append(page)
+    return pages
 
 
 async def _apply_satellite_host_push(
@@ -290,6 +372,12 @@ class SessionManager:
         # capabilities so the platform can rewrite PROXY_URL to
         # http://127.0.0.1:<port> for satellite subprocesses.
         self.local_tunnel_port: int = 0
+        # App steps (proxy APPS.md "Steps", 0.5.122): the scripts running
+        # right now, by delivery id — killed when the link drops. The
+        # private scratch tree is wiped at start.
+        self._steps: dict[str, asyncio.subprocess.Process] = {}
+        from .step_runner import wipe_steps_root
+        wipe_steps_root()
         # Proxy-restart re-attach (Mode C): per-CLI-session retention of the
         # CURRENT turn's forwarded events, replayable to a restarted proxy.
         # turn_state carries {command_id, active, seq, start_seq}; the buffer
@@ -324,13 +412,23 @@ class SessionManager:
         os_user, home_dir = _detect_os_user_and_home()
         user_dirs = _detect_user_dirs(home_dir)
         caps = {
-            "os": platform.system().lower(),
+            "os": config.HOST.name,
             "arch": platform.machine(),
             # Absolute path to the satellite's agents root. The proxy uses
             # this to set sandbox-equivalent path env vars (IMAGE_SAVE_DIR,
             # credential_dir vars) on remote sessions and to strip the
             # prefix when MCPs send absolute paths back via /v1/hooks/*.
             "agents_dir": str(self.config.agents_dir.resolve()),
+            # The machine's own OtoDock root and its MCP folder, forward-slash
+            # form: the proxy's placement refuses them to every remote
+            # session (a satellite that reports none is derived from the home).
+            "otodock_dir": str(config.otodock_dir().resolve()).replace("\\", "/"),
+            "mcps_dir": str(self.config.mcps_dir.resolve()).replace("\\", "/"),
+            # The home and the OtoDock root as the OS names them (a link or
+            # a Windows short name left unresolved): a session may spell the
+            # state through them, and the proxy refuses both spellings.
+            "home_dir_unresolved": str(Path.home()).replace("\\", "/"),
+            "otodock_dir_unresolved": str(config.otodock_dir()).replace("\\", "/"),
             # Local tunnel server port (HTTP-over-WS). The platform reads
             # this and uses it as PROXY_URL when injecting env for new
             # subprocesses on this machine. 0 = tunnel not started (e.g.
@@ -365,11 +463,17 @@ class SessionManager:
         # Sync variant only: this runs on the event loop during auth.
         from ..host.cli_versions import resolve_spawn_bin
         installed_clis = []
-        if shutil.which(resolve_spawn_bin("claude", self.config.claude_bin)):
-            installed_clis.append("claude-code")
-        if shutil.which(resolve_spawn_bin("codex", self.config.codex_bin)):
-            installed_clis.append("codex")
+        for engine in ENGINES.values():
+            if shutil.which(resolve_spawn_bin(engine.binary, self.config.bin_hint(engine.binary))):
+                installed_clis.append(engine.installed_name)
         caps["installed_clis"] = installed_clis
+        # The engines this build's CODE can dispatch (the table's wire ids) —
+        # the proxy sends a start for an engine only to a satellite that has
+        # said it runs it; a satellite that reports no ``engines`` is read as
+        # the two every earlier build ran. Binary presence is a separate fact
+        # (``installed_clis`` above): the pin reconcile may install a pinned
+        # binary after this probe, so a spawn is never gated on it.
+        caps["engines"] = sorted(ENGINES)
         caps["installed_mcps"] = _scan_installed_mcps(self.config.mcps_dir)
         # Interactive PTY: the proxy lets Claude run its
         # native TUI on this satellite (streamed over the WS) only when this is
@@ -378,6 +482,11 @@ class SessionManager:
         # actually importable so a Windows box that missed the dep falls back to
         # headless -p instead of opening a PTY that can't spawn.
         caps["interactive_pty"] = _interactive_pty_supported()
+        # App steps (proxy APPS.md "Steps"): this satellite handles
+        # ``step_run`` and streams ``step_output``; the proxy gates on the
+        # flag AND the version, and never sends the frame to a satellite
+        # without it (the router would drop it silently).
+        caps["steps"] = True
         # Per-satellite budget: raw resources + this host's own
         # physical-safety session ceiling. The proxy displays these and may apply
         # a lower admin override (remote_machines.max_sessions) on top.
@@ -436,7 +545,7 @@ class SessionManager:
     # -----------------------------------------------------------------
 
     async def start_session(self, msg: dict, ws: "SatelliteWSClient") -> None:
-        """Start a CLI or Codex session."""
+        """Start a headless session of the engine ``execution_path`` names."""
         session_id = msg["session_id"]
         execution_path = msg["execution_path"]
         config_payload = msg["config"]
@@ -444,6 +553,7 @@ class SessionManager:
         agent_slug = msg["agent_slug"]
 
         try:
+            engine = engine_for(execution_path)   # fail-closed: an unknown id is an ack error
             # Same slug gate as file_push/file_pull — the slug becomes a
             # path component of the whole config-tree write below.
             from ..host import auth_paths
@@ -471,14 +581,8 @@ class SessionManager:
                 except Exception:
                     logger.exception(f"Failed to close stale session {session_id}")
 
-            if execution_path == "claude-code-cli":
-                session = CLISession(session_id, agent_dir, config_payload, self.config)
-                await session.start()
-            elif execution_path == "codex-cli":
-                session = CodexSession(session_id, agent_dir, config_payload, self.config)
-                await session.start()
-            else:
-                raise ValueError(f"Unsupported execution_path: {execution_path}")
+            session = engine.headless_cls()(session_id, agent_dir, config_payload, self.config)
+            await session.start()
 
             self.sessions[session_id] = session
 
@@ -495,14 +599,18 @@ class SessionManager:
                 "execution_path": execution_path,
             })
 
-            # Codex app-server captures the thread_id at start (the thread/start
-            # response), not per-turn — report it now so the proxy persists it
-            # to chats.codex_thread_id for resume after a proxy restart.
-            if execution_path == "codex-cli" and getattr(session, "thread_id", None):
+            # An engine whose session captures its RESUME HANDLE at start (the
+            # Codex app-server's thread id, from the thread/start response —
+            # not per turn) reports it now so the proxy persists it for a
+            # resume after a proxy restart. The frame type is the vocabulary
+            # of the engine that first needed one — FROZEN wire; the proxy
+            # reads it as the generic resume handle.
+            handle = getattr(session, "thread_id", None)
+            if handle:
                 await ws.enqueue_send({
                     "type": "codex_thread_id",
                     "session_id": session_id,
-                    "thread_id": session.thread_id,
+                    "thread_id": handle,
                 })
 
         except Exception as e:
@@ -529,13 +637,15 @@ class SessionManager:
             })
             return
 
-        # CLI sessions hold a persistent subprocess; if it died (crash, or a
-        # prior abort) fail the send as an ACK error so the proxy's cli_dead
-        # path fires and the dashboard auto-resumes a fresh session. Without
-        # this, the dead-proc RuntimeError raised inside session.send_message
-        # is caught below and emitted as a session_event error — which the
-        # proxy does NOT map to cli_dead, leaving the session hung.
-        if session.execution_path == "claude-code-cli" and not session.is_alive:
+        engine = ENGINES[session.execution_path]
+        # An engine whose session cannot revive its own dead process (the
+        # persistent Claude CLI: a crash or a prior abort) fails the send as
+        # an ACK error so the proxy's cli_dead path fires and the dashboard
+        # auto-resumes a fresh session — a session_event error is NOT mapped
+        # to cli_dead and would leave the session hung. An engine whose
+        # session re-warms in place (the Codex daemon: thread/resume on the
+        # next turn) is never gated here.
+        if not engine.revives_dead_process and not session.is_alive:
             await ws.enqueue_send({
                 "type": "ack",
                 "command_id": command_id,
@@ -546,58 +656,48 @@ class SessionManager:
 
         await ws.enqueue_send({"type": "ack", "command_id": command_id, "status": "ok"})
 
+        # Mode C retention (engines whose in-flight turn a restarted proxy can
+        # re-adopt): a fresh per-turn buffer, and every event tagged with the
+        # command it streamed under — so a replaced process's dying flush
+        # racing into the NEXT turn's queue can't terminate that turn (the
+        # proxy drops mismatched result/error events) — plus a per-session
+        # seq so a replay overlap dedupes. An engine without turn replay
+        # ships its events untagged: its persistent forwarder crosses turns
+        # by design (background sub-agent supervision on the proxy).
+        state = buffer = None
+        if engine.turn_replay:
+            state = self.turn_state.setdefault(session_id, {"seq": 0})
+            state.update({"command_id": command_id, "active": True,
+                          "start_seq": state["seq"] + 1,
+                          "execution_path": session.execution_path})
+            buffer = deque(maxlen=2000)
+            self.turn_buffers[session_id] = buffer
+
+        async def _forward(event: dict) -> None:
+            if engine.turn_replay:
+                event["_command_id"] = command_id
+                state["seq"] += 1
+                event["_seq"] = state["seq"]
+                buffer.append(event)
+                await self._wait_forward_unpaused(session_id)
+            await ws.enqueue_send({
+                "type": "session_event",
+                "session_id": session_id,
+                "execution_path": session.execution_path,
+                "event": event,
+            })
+
         try:
-            if session.execution_path == "codex-cli":
-                # Codex: a persistent forwarder (started at session start) streams
-                # EVERY app-server notification to the proxy as a session_event —
-                # including a BACKGROUND sub-agent's events AFTER the main turn
-                # ends, so the proxy (which holds the translator) can supervise
-                # bg sub-agents centrally. run_turn just drives turn/start + waits
-                # for the MAIN thread's completion (the satellite stays dumb).
-                session.set_event_forwarder(lambda ev: ws.enqueue_send({
-                    "type": "session_event",
-                    "session_id": session_id,
-                    "execution_path": "codex-cli",
-                    "event": ev,
-                }))
-                await session.run_turn(
-                    msg["message"],
-                    inject_time=msg.get("inject_time", False),
-                )
-            else:
-                # Fresh per-turn retention buffer (Mode C re-attach): a proxy
-                # restart mid-turn replays these to close or resume the turn.
-                state = self.turn_state.setdefault(
-                    session_id, {"seq": 0},
-                )
-                state.update({"command_id": command_id, "active": True,
-                              "start_seq": state["seq"] + 1})
-                buffer = deque(maxlen=2000)
-                self.turn_buffers[session_id] = buffer
-                async for event in session.send_message(
-                    msg["message"],
-                    inject_time=msg.get("inject_time", False),
-                ):
-                    # Tag each CLI turn event with the command it streamed
-                    # under, so a replaced process's dying flush racing into
-                    # the NEXT turn's queue can't terminate that turn (the
-                    # proxy drops mismatched result/error events), plus a
-                    # per-session seq so a replay overlap dedupes. Codex
-                    # events stay untagged — its persistent forwarder crosses
-                    # turns by design (bg sub-agent supervision).
-                    event["_command_id"] = command_id
-                    state["seq"] += 1
-                    event["_seq"] = state["seq"]
-                    buffer.append(event)
-                    await self._wait_forward_unpaused(session_id)
-                    await ws.enqueue_send({
-                        "type": "session_event",
-                        "session_id": session_id,
-                        "execution_path": session.execution_path,
-                        "event": event,
-                    })
-                # (CLI sessions forward raw NDJSON; Codex thread_id is reported
-                # once at start_session from the thread/start response.)
+            # One entry point for every engine's session: drive the turn and
+            # hand each raw event to ``_forward`` (the CLI session pumps its
+            # stdout until stop_turn / EOF; the Codex session installs it as
+            # its persistent forwarder and waits for the main thread's
+            # completion — the satellite stays a dumb pipe either way).
+            await session.run_turn(
+                msg["message"],
+                inject_time=msg.get("inject_time", False),
+                forward=_forward,
+            )
 
         except Exception as e:
             logger.exception(f"Error streaming session {session_id}")
@@ -657,12 +757,13 @@ class SessionManager:
         except Exception:
             logger.exception(f"Error detecting file changes for {session_id}")
 
-        # CLI: if the proxy flagged a still-pending backgrounded command on its
-        # stop_turn, keep draining + forwarding stdout post-turn so the command's
-        # completion frame (claude emits it idle, after the turn) reaches the
-        # proxy's bg-command monitor. No-op unless drain_bg was requested; the
-        # next send_message cancels it. (Codex uses its own persistent forwarder.)
-        if session.execution_path == "claude-code-cli" and hasattr(session, "start_bg_drain"):
+        # A session with a post-turn stdout drainer (the Claude CLI): if the
+        # proxy flagged a still-pending backgrounded command on its stop_turn,
+        # keep draining + forwarding stdout post-turn so the command's
+        # completion frame (emitted idle, after the turn) reaches the proxy's
+        # bg-command monitor. No-op unless drain_bg was requested; the next
+        # send_message cancels it. (A persistent-forwarder engine has none.)
+        if hasattr(session, "start_bg_drain"):
             async def _fwd_bg(ev):
                 # Tagged with THIS (finished) turn's command id: the proxy's
                 # stale filter only drops mismatched result/error events, so
@@ -786,7 +887,7 @@ class SessionManager:
         if not session:
             return
         if not hasattr(session, "send_control_request"):
-            return  # Codex has no mid-session control channel
+            return  # a session class without a control channel ignores the frame
         subtype = msg.get("subtype", "")
         kwargs = msg.get("kwargs", {})
         await session.send_control_request(subtype, **kwargs)
@@ -808,25 +909,29 @@ class SessionManager:
         error_msg = ""
         try:
             # The target is constrained to exactly what the platform writes at
-            # session start: a .claude/.codex scope dir inside the agent tree.
+            # session start: an engine's scope config dir inside the agent
+            # tree — the kind names the engine's row, the row names the dir
+            # suffix and the file.
+            from ..host import auth_paths
+            engine = BY_CREDENTIAL_KIND.get(kind)
             parts = dir_relative.replace("\\", "/").split("/")
             if (
                 not agent_slug or "/" in agent_slug or "\\" in agent_slug
                 or agent_slug in (".", "..")
                 or not isinstance(content, dict)
-                or kind not in ("claude", "codex")
+                or engine is None
                 # RELATIVE only: an absolute dir_relative would win the join
                 # (`agents_dir / slug / "/x"` IS "/x") and relocate the
                 # credential write anywhere — reject leading separators and
                 # drive-qualified forms alongside traversal.
                 or Path(dir_relative).is_absolute()
                 or parts[0] == "" or ":" in parts[0]
-                or ".." in parts
-                or parts[-1] != (".claude" if kind == "claude" else ".codex")
+                or not auth_paths.is_authorized_relative_path("/".join(parts))
+                or parts[-1] != engine.config_dir
             ):
                 raise ValueError(f"invalid credentials_update target: "
                                  f"{agent_slug!r}/{dir_relative!r} kind={kind!r}")
-            filename = ".credentials.json" if kind == "claude" else "auth.json"
+            filename = engine.credential_filename
             target_dir = self.config.agents_dir / agent_slug / dir_relative
             target_dir.mkdir(parents=True, exist_ok=True)
             path = target_dir / filename
@@ -856,11 +961,15 @@ class SessionManager:
         command_id = msg["command_id"]
         agent_slug = msg["agent_slug"]
         config_payload = msg["config"]
-        execution_path = msg.get("execution_path", "claude-code-cli")
+        # Every proxy that drives a PTY names the engine (the key shipped with
+        # the frame's first release); an unknown id — or none — is an ack
+        # error, never a default engine.
+        execution_path = msg.get("execution_path", "")
         rows = int(msg.get("rows", 24))
         cols = int(msg.get("cols", 80))
 
         try:
+            engine = engine_for(execution_path)   # fail-closed, like start_session
             # Same slug gate as start_session — the slug is a path component.
             from ..host import auth_paths
             if not auth_paths.is_safe_slug(agent_slug):
@@ -868,14 +977,11 @@ class SessionManager:
             agent_dir = self.config.agents_dir / agent_slug
             agent_dir.mkdir(parents=True, exist_ok=True)
             self._check_capacity(session_id)  # physical-safety cap → ack error below
-            # Codex runs the Ratatui TUI (rollout JSONL); Claude runs
-            # the Ink TUI (<id>.jsonl). Both share BasePtySession (spawn + transcript
-            # forwarding); only the config tree / argv / rollout-locate differ.
-            if execution_path == "codex-cli":
-                from ..terminal.codex_pty_session import CodexPtySession as _PtySessionCls
-            else:
-                from ..terminal.pty_session import PtySession as _PtySessionCls
-            session = _PtySessionCls(
+            # The engine's TUI session (Codex: the Ratatui TUI + its rollout
+            # JSONL; Claude: the Ink TUI + <id>.jsonl). Both share
+            # BasePtySession (spawn + transcript forwarding); only the config
+            # tree / argv / rollout-locate differ.
+            session = engine.pty_cls()(
                 session_id, agent_dir, config_payload, self.config, ws,
                 rows=rows, cols=cols,
             )
@@ -979,7 +1085,7 @@ class SessionManager:
         anyway, and a nudge mid-startup is pointless). Both the relay attach + the
         scrollback replay run SYNCHRONOUSLY (no awaits between), so a live-tee frame
         can't interleave and duplicate the replayed scrollback."""
-        from ..terminal.terminal_queries import strip_clipboard_writes, strip_queries
+        from .._vendored.terminal_queries import strip_clipboard_writes, strip_queries
 
         conn.bind_session(session)
         session.attach_local_relay(conn.feed_output, conn.feed_exit)
@@ -1101,16 +1207,9 @@ class SessionManager:
                 # Mirror the proxy-side path derivation: per-user agent
                 # dirs win over the shared workspace .claude/ for sessions
                 # that ran under a logged-in user.
-                if username:
-                    claude_dir = (
-                        self.config.agents_dir / agent_slug
-                        / "users" / username / ".claude"
-                    )
-                else:
-                    claude_dir = (
-                        self.config.agents_dir / agent_slug
-                        / "workspace" / ".claude"
-                    )
+                claude_dir = layout.state_dir(
+                    self.config.agents_dir / agent_slug, username, ".claude",
+                )
                 projects_dir = claude_dir / "projects"
                 if projects_dir.is_dir():
                     # Project-hash dir name varies by CWD; search all.
@@ -1174,11 +1273,13 @@ class SessionManager:
             ack["reason"] = reason
         await ws.enqueue_send(ack)
 
-    async def codex_steer(self, msg: dict, ws: "SatelliteWSClient") -> None:
-        """Mid-turn steering RPC (proxy ``RemoteExecutionLayer.steer`` →
-        ``CodexSession.steer``). ``steered`` is STRICT — True only on daemon
-        accept: the proxy's caller queues the message otherwise, so a false
-        positive would lose user input."""
+    async def steer_turn(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """Mid-turn steering RPC (proxy ``RemoteExecutionLayer.steer`` → the
+        session's ``steer``: ``CodexSession`` since 0.5.98 under the
+        ``codex_steer`` frame, ``CLISession`` since 0.5.128 under
+        ``steer_turn``; both frames land here). ``steered`` is STRICT — True
+        only when the engine took the text: the proxy's caller queues the
+        message otherwise, so a false positive would lose user input."""
         command_id = msg.get("command_id", "")
         session_id = msg.get("session_id", "")
         text = msg.get("text", "") or ""
@@ -1189,7 +1290,7 @@ class SessionManager:
             try:
                 steered = bool(await steer(text))
             except Exception:
-                logger.exception("codex_steer failed for %s", session_id[:8])
+                logger.exception("steer_turn failed for %s", session_id[:8])
                 steered = False
         await ws.enqueue_send({
             "type": "ack", "command_id": command_id, "status": "ok",
@@ -1238,13 +1339,15 @@ class SessionManager:
             await asyncio.sleep(0.05)
 
     def headless_sessions_alive(self) -> list[dict]:
-        """Live headless CLI sessions + their turn state, reported post-auth
-        (mirrors pty_alive) so a RESTARTED proxy can re-adopt in-flight turns
-        instead of failing them blind. Codex sessions are not reported —
-        thread-id resume already covers their next-turn continuity."""
+        """Live headless sessions of the engines whose turns a restarted proxy
+        re-adopts (``turn_replay``), with their turn state — reported post-auth
+        (mirrors pty_alive) so the proxy re-adopts in-flight turns instead of
+        failing them blind. An engine without turn replay is not reported —
+        its resume handle already covers next-turn continuity."""
         out = []
         for sid, session in self.sessions.items():
-            if session.execution_path != "claude-code-cli":
+            engine = ENGINES.get(session.execution_path)
+            if engine is None or not engine.turn_replay:
                 continue
             if not session.is_alive:
                 continue
@@ -1275,6 +1378,13 @@ class SessionManager:
         session_id = msg.get("session_id", "")
         state = self.turn_state.get(session_id) or {}
         buffer = self.turn_buffers.get(session_id)
+        # The engine the session runs: the live session's, else what the turn
+        # state recorded at turn start (a replay may outlive the session object).
+        session = self.sessions.get(session_id)
+        execution_path = (
+            session.execution_path if session is not None
+            else state.get("execution_path", "")
+        )
         self.forward_paused.add(session_id)
         try:
             events = list(buffer) if buffer is not None else []
@@ -1285,7 +1395,7 @@ class SessionManager:
             await ws.enqueue_send({
                 "type": "session_event",
                 "session_id": session_id,
-                "execution_path": "claude-code-cli",
+                "execution_path": execution_path,
                 "event": {"type": "_resume_replay_begin",
                           "truncated": truncated,
                           "count": len(events)},
@@ -1298,7 +1408,7 @@ class SessionManager:
                 await ws.enqueue_send({
                     "type": "session_event",
                     "session_id": session_id,
-                    "execution_path": "claude-code-cli",
+                    "execution_path": execution_path,
                     "event": ev,
                 })
                 if i % 100 == 99:
@@ -1366,21 +1476,47 @@ class SessionManager:
         return out
 
     async def request_manifest(self, msg: dict, ws: "SatelliteWSClient") -> None:
-        """Compute and send file manifest for an agent directory."""
+        """Compute and send file manifest for an agent directory.
+
+        A proxy that asks with ``page_size`` (0.5.130+ on both sides) gets
+        the entries in pages, each frame at most that many entries and at
+        most ``_MANIFEST_PAGE_BYTES`` of text, ``more`` true on all but the
+        last, in order on one lane, so a large tree never needs a frame past
+        the socket's cap; a proxy that does not ask gets one frame (an older
+        proxy resolves its wait on the first frame it sees)."""
         agent_slug = msg.get("agent_slug", "")
         command_id = msg.get("command_id", "")
         agent_dir = self.config.agents_dir / agent_slug
 
-        # Off-thread: a big tree's manifest (walk + hash, even cache-warm)
-        # would otherwise stall the event loop — heartbeats and PTY frames
-        # share it.
-        manifest = await asyncio.to_thread(file_sync.compute_manifest, agent_dir)
-        await ws.enqueue_send({
-            "type": "file_manifest",
-            "agent_slug": agent_slug,
-            "command_id": command_id,
-            "files": manifest,
-        })
+        page_size = msg.get("page_size")
+        paged = isinstance(page_size, int) and not isinstance(page_size, bool) and page_size > 0
+
+        def _walk() -> list:
+            # A big tree's manifest (walk + hash, even cache-warm) and its
+            # pages (one serialization per entry to size them) would stall
+            # the event loop that heartbeats and PTY frames share.
+            manifest = file_sync.compute_manifest(agent_dir)
+            return _manifest_pages(manifest, page_size) if paged else manifest
+
+        walked = await asyncio.to_thread(_walk)
+        if not paged:
+            await ws.enqueue_send({
+                "type": "file_manifest",
+                "agent_slug": agent_slug,
+                "command_id": command_id,
+                "files": walked,
+            })
+            return
+        pages = walked
+        for i, page in enumerate(pages):
+            await ws.enqueue_send({
+                "type": "file_manifest",
+                "agent_slug": agent_slug,
+                "command_id": command_id,
+                "files": page,
+                "page": i,
+                "more": i < len(pages) - 1,
+            })
 
     async def file_push(self, msg: dict, ws: "SatelliteWSClient | None" = None) -> None:
         """Apply a file pushed from the platform.
@@ -1425,7 +1561,10 @@ class SessionManager:
                 # Re-check the satellite's local
                 # allow_full_fs policy before accepting the write.
                 # Deletes also go through this check.
-                _check_satellite_host_policy(rel_path)
+                _check_satellite_host_policy(
+                    rel_path, own_agent=agent_slug,
+                    agents_dir=self.config.agents_dir, mcps_dir=self.config.mcps_dir,
+                )
             else:
                 raise ValueError(f"unknown path_kind: {path_kind!r}")
         except ValueError as e:
@@ -1577,11 +1716,21 @@ class SessionManager:
         request_id = msg.get("request_id", "")
         rel_path = msg.get("path", "")
 
+        opener = None
         try:
             if path_kind == "agent_tree":
                 target = auth_paths.assert_agent_path_safe(
                     rel_path, agent_slug, self.config.agents_dir,
                 )
+                # The bytes sent are read from a descriptor opened beneath
+                # the agents root with no link followed (host.safe_fs), so
+                # the file checked is the file sent.
+                _agent_rel = auth_paths.agent_rel(rel_path, agent_slug)
+                _agents_dir = self.config.agents_dir
+
+                def opener(_rel=_agent_rel, _root=_agents_dir):
+                    from ..host import safe_fs
+                    return safe_fs.open_regular_for_read(_root, _rel, max_size=file_sync.max_file_size())
             elif path_kind == "satellite_host":
                 _validate_satellite_host_path(rel_path)
                 # Same local-policy re-check on the
@@ -1589,7 +1738,10 @@ class SessionManager:
                 # ~/.ssh/id_rsa from a home-only machine where the user
                 # paired with allow_full_fs=False then disabled the
                 # toggle from the dashboard.
-                _check_satellite_host_policy(rel_path)
+                _check_satellite_host_policy(
+                    rel_path, own_agent=agent_slug,
+                    agents_dir=self.config.agents_dir, mcps_dir=self.config.mcps_dir,
+                )
                 target = Path(rel_path)
             else:
                 raise ValueError(f"unknown path_kind: {path_kind!r}")
@@ -1606,15 +1758,6 @@ class SessionManager:
             })
             return
 
-        if not target.exists():
-            await ws.enqueue_send({
-                "type": "file_content",
-                "request_id": request_id,
-                "path": rel_path,
-                "error": "File not found",
-            })
-            return
-
         # Stream the file back in CHUNK_SIZE blocks so a large file never
         # becomes a single oversized WS frame — the proxy's 16MB ws_max_size
         # would reject it (close 1009), and the reconnect → initial-sync →
@@ -1623,8 +1766,53 @@ class SessionManager:
         # one block at a time so the satellite never holds the whole file.
         import hashlib
 
+        fh = None
         try:
-            size = target.stat().st_size
+            if opener is not None:
+                from ..host import safe_fs as _sfs
+                try:
+                    fd, st = await asyncio.to_thread(opener)
+                except FileNotFoundError:
+                    raise
+                except _sfs.FileTooLarge:
+                    await ws.enqueue_send({
+                        "type": "file_content",
+                        "request_id": request_id,
+                        "path": rel_path,
+                        "error": f"file exceeds {file_sync.max_file_size() // (1024 * 1024)}MB limit",
+                    })
+                    return
+                except _sfs.SafeFsError as e:
+                    await ws.enqueue_send({
+                        "type": "file_content",
+                        "request_id": request_id,
+                        "path": rel_path,
+                        "error": f"path not authorized: {type(e).__name__}",
+                    })
+                    return
+                fh = os.fdopen(fd, "rb")
+                size = st.st_size
+            else:
+                if not target.exists():
+                    raise FileNotFoundError(rel_path)
+                size = target.stat().st_size
+                if size > file_sync.max_file_size():
+                    await ws.enqueue_send({
+                        "type": "file_content",
+                        "request_id": request_id,
+                        "path": rel_path,
+                        "error": f"file exceeds {file_sync.max_file_size() // (1024 * 1024)}MB limit",
+                    })
+                    return
+                fh = open(target, "rb")
+        except FileNotFoundError:
+            await ws.enqueue_send({
+                "type": "file_content",
+                "request_id": request_id,
+                "path": rel_path,
+                "error": "File not found",
+            })
+            return
         except OSError as e:
             await ws.enqueue_send({
                 "type": "file_content",
@@ -1633,20 +1821,12 @@ class SessionManager:
                 "error": f"stat failed: {e}",
             })
             return
-        if size > file_sync.max_file_size():
-            await ws.enqueue_send({
-                "type": "file_content",
-                "request_id": request_id,
-                "path": rel_path,
-                "error": f"file exceeds {file_sync.max_file_size() // (1024 * 1024)}MB limit",
-            })
-            return
 
         chunk_size = file_sync.CHUNK_SIZE
         total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
         hasher = hashlib.sha256()
         try:
-            with open(target, "rb") as fh:
+            with fh:
                 for chunk_index in range(total_chunks):
                     block = fh.read(chunk_size)
                     hasher.update(block)
@@ -1693,7 +1873,10 @@ class SessionManager:
                 )
             elif path_kind == "satellite_host":
                 _validate_satellite_host_path(rel_path)
-                _check_satellite_host_policy(rel_path)
+                _check_satellite_host_policy(
+                    rel_path, own_agent=agent_slug,
+                    agents_dir=self.config.agents_dir, mcps_dir=self.config.mcps_dir,
+                )
                 target = Path(rel_path)
             else:
                 raise ValueError(f"unknown path_kind: {path_kind!r}")
@@ -1716,11 +1899,31 @@ class SessionManager:
             "mtime_ns": 0,
         }
         try:
-            st = target.stat()
-            if target.is_file():
-                reply["exists"] = True
-                reply["size"] = st.st_size
-                reply["mtime_ns"] = st.st_mtime_ns
+            if path_kind == "agent_tree":
+                # The name's own status beneath the agents root, never
+                # followed: a link answers the error ack, a missing name or
+                # a directory "exists: False".
+                from ..host import auth_paths as _ap
+                from ..host import safe_fs as _sfs
+                try:
+                    st = _sfs.lstat_beneath(
+                        self.config.agents_dir, _ap.agent_rel(rel_path, agent_slug))
+                except _sfs.SafeFsError as e:
+                    reply["status"] = "error"
+                    reply["error"] = f"path not authorized: {type(e).__name__}"
+                    await ws.enqueue_send(reply)
+                    return
+                import stat as _stat
+                if _stat.S_ISREG(st.st_mode):
+                    reply["exists"] = True
+                    reply["size"] = st.st_size
+                    reply["mtime_ns"] = st.st_mtime_ns
+            else:
+                st = target.stat()
+                if target.is_file():
+                    reply["exists"] = True
+                    reply["size"] = st.st_size
+                    reply["mtime_ns"] = st.st_mtime_ns
         except OSError:
             pass  # exists stays False — the proxy re-pulls and surfaces it
         await ws.enqueue_send(reply)
@@ -1850,10 +2053,11 @@ class SessionManager:
                 # Extract the tarball into .new/
                 tarbytes = _b64.b64decode(tarball_b64)
                 with tarfile.open(fileobj=io.BytesIO(tarbytes), mode="r:gz") as tar:
-                    # Safe extract: reject absolute paths + path traversal.
+                    # Safe extract: reject absolute paths + path traversal
+                    # (the satellite's containment, symlinks followed).
+                    from ..host import auth_paths
                     for member in tar.getmembers():
-                        mpath = (new_root / member.name).resolve()
-                        if not str(mpath).startswith(str(new_root.resolve())):
+                        if not auth_paths.is_path_under_root(new_root / member.name, new_root):
                             raise ValueError(f"tarball escaped: {member.name}")
                     # filter="data" additionally blocks what the pre-check
                     # can't see: symlink members that retarget later writes
@@ -1882,11 +2086,16 @@ class SessionManager:
                 # doesn't exist on Windows (only python.exe / py.exe do).
                 # sys.executable is the satellite venv's python, available
                 # on every platform we run on.
+                # The packages the manifest allows to build from source
+                # (everything else installs from wheels only): the proxy's
+                # spec carries the list; an older proxy sends none.
+                source_build = _source_build_of(spec)
                 r = await mcp_installer.install_mcp(
                     new_root, spec.get("runtime", ""), source,
                     progress_cb=_progress,
                     uv_bin=_uv_bin_if_present(),
                     python_bin=sys.executable,
+                    source_build=source_build,
                 )
                 # Retry past a TRANSIENT Windows file lock: a real-time AV
                 # scanner holding a freshly-written file open blocks uv/pip's
@@ -1918,6 +2127,7 @@ class SessionManager:
                         progress_cb=_progress,
                         uv_bin=_uv_bin_if_present(),
                         python_bin=sys.executable,
+                        source_build=source_build,
                     )
                 if not r.ok:
                     raise RuntimeError(r.log[-500:] if r.log else "install failed")
@@ -2094,6 +2304,23 @@ class SessionManager:
             "results": results,
             "installed_mcps": installed,
         })
+
+    async def step_run(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """An app step (proxy APPS.md "Steps", 0.5.122): the script and the
+        payload land in the private steps directory, the hash is checked,
+        the interpreter the script names runs in the synced folder the
+        proxy chose, the output streams as ``step_output`` frames and the
+        ack carries the verdict. ``step_runner`` does the work."""
+        from . import step_runner
+        await step_runner.run_step(msg, ws, self.config.agents_dir, self.local_tunnel_port,
+                                   self._steps)
+
+    def kill_steps(self, reason: str) -> int:
+        """Every running step killed (the link dropped): the proxy marks the
+        delivery dead on its side, and a script must not keep running for a
+        platform that can no longer hear it."""
+        from . import step_runner
+        return step_runner.kill_running(self._steps, reason)
 
     async def sync_mcps_verify(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Compute version hashes for all installed MCPs and return them.

@@ -17,8 +17,10 @@ BYO-key-wins → hosted-relay mint, reusing ``subscription_pool.relay_llm_creden
 (the same path the Direct-LLM layer and the phone turn-classifier use). Cost is
 metered into ``usage_records`` (``source_type='title-generation'``) and surfaces
 in usage analytics. Disabled / no-provider → the deterministic title stays.
-Task-run chats get the same upgrade (they list in the sidebar's task mode);
-only ``meeting-`` chats are skipped.
+Task-run chats get the same upgrade (they list in the sidebar's task mode).
+The service skips no id shape: a meeting's pump disarms itself by its driver
+kind (``ChatStreamPump._title_armed``, ``session_kind.MEETING``), and an
+interactive session never carries a meeting id.
 """
 
 import asyncio
@@ -30,10 +32,13 @@ from storage import database as task_store
 
 logger = logging.getLogger("title_generator")
 
-# The dashboard injects a "[Current time: …]" prelude ahead of interactive
-# sends — strip it or it becomes the title (twin of ws/dashboard_chat.py's
-# send-time recognizer; both must keep matching the injected shape).
-_TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)")
+# The dashboard injects a "[Current time: …]" prelude (and the viewer focus
+# line) ahead of interactive sends — strip them or they become the title
+# (twin of ws/dashboard_chat.py's send-time recognizer; both must keep
+# matching the injected shapes).
+_TIME_PRELUDE_RE = re.compile(
+    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+)
 
 # Early-fire thresholds — the canonical values shared by BOTH trigger surfaces
 # (the headless pump's TEXT/TOOL_USE handlers and the interactive funnel's
@@ -52,7 +57,12 @@ def deterministic_title(text: str) -> str:
     applies at send time (``ws/dashboard_chat_support.py::_deterministic_title``);
     exposed here so the storage layer can stamp scheduler-driven task chats
     without importing the WS controller."""
-    stripped = _TIME_PRELUDE_RE.sub("", text or "", count=1)
+    stripped = text or ""
+    while True:  # stacked preludes (the time stamp plus the focus line)
+        once = _TIME_PRELUDE_RE.sub("", stripped, count=1)
+        if once == stripped:
+            break
+        stripped = once
     cleaned = " ".join(stripped.split())
     if not cleaned:
         return "New Chat"
@@ -70,25 +80,38 @@ _PROVIDER_TITLE_MODEL = {
     # gpt-oss-120b is a reasoning model, which is fine here: on Groq its
     # thinking rides a separate ``message.reasoning`` field (never content, so
     # titles stay clean) and _MAX_TOKENS leaves room for the thinking tokens —
-    # same treatment as OpenAI's gpt-5.6-luna. generate_title() also requests
+    # same treatment as OpenAI's gpt-6-luna. generate_title() also requests
     # effort "low" so reasoning-capable title models think minimally.
+    # A change here needs the hosted relay's row first (relay_vendors.py in
+    # otodock-commercial): the relay rejects a model it does not price.
     "groq": "openai/gpt-oss-120b",
-    "openai": "gpt-5.6-luna",
+    "openai": "gpt-6-luna",
     "anthropic": "claude-haiku-4-5",
 }
 # Auto-resolution order when the admin hasn't pinned a model.
 _LADDER = ["groq", "openai", "anthropic", "ollama"]
-_PROVIDER_LABEL = {
-    "groq": "Groq", "openai": "OpenAI", "anthropic": "Anthropic",
-    "ollama": "Ollama (local)", "openai_compatible": "OpenAI-compatible endpoint",
-}
-_KEYLESS = ("ollama", "openai_compatible")
+
+
+def _direct_provider(provider: str) -> dict | None:
+    """The API engine's ``providers[]`` entry for ``provider`` — its label,
+    whether it takes a key, its relay path — or None when it declares none
+    (a local provider on hosted OtoDock)."""
+    from core.execution_layer import provider_entry
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities("direct-llm")
+    return provider_entry(caps, provider) if caps is not None else None
+
+
+def _keyless(provider: str) -> bool:
+    """A self-hosted endpoint: any active row serves it, no key needed."""
+    entry = _direct_provider(provider)
+    return bool(entry) and not entry.get("requires_key", True)
 
 _TITLE_SYS = (
     "Generate a concise chat title (max 6 words) capturing the topic. "
     "Start with one relevant emoji. Output only the title — no quotes, no preamble."
 )
-# Generous cap: a title is ~10 tokens, but gpt-5.6-luna and gpt-oss-120b are
+# Generous cap: a title is ~10 tokens, but gpt-6-luna and gpt-oss-120b are
 # REASONING models whose thinking tokens are billed as output and must fit under
 # this cap too — a tiny cap (e.g. 24) lets reasoning exhaust the budget and
 # yields an EMPTY title. Non-reasoning models (claude-haiku) emit ~10 tokens
@@ -120,7 +143,7 @@ def _provider_configured(provider: str) -> bool:
     key, a hosted relay sub, or (keyless local) any active sub. Does NOT mint a
     token, so it is safe for the admin GET / status path."""
     from storage.billing import subscription_store
-    keyless = provider in _KEYLESS
+    keyless = _keyless(provider)
     for sub in _platform_direct_subs(provider):
         if sub.get("auth_type") == "relay":
             return True
@@ -146,7 +169,7 @@ def _local_model_for(provider: str) -> str:
 def _title_model_for(provider: str) -> str:
     if provider in _PROVIDER_TITLE_MODEL:
         return _PROVIDER_TITLE_MODEL[provider]
-    if provider in _KEYLESS:
+    if _keyless(provider):
         return _local_model_for(provider)
     return ""
 
@@ -157,7 +180,10 @@ def _select_provider() -> tuple[str, str] | None:
     call from the admin GET. None when disabled or nothing is configured."""
     if task_store.get_platform_setting(_SETTING_ENABLED) == "0":
         return None
-    selected = (task_store.get_platform_setting(_SETTING_MODEL) or "").strip()
+    # A persisted pin the boot remap never sees: a retired id follows its
+    # successor at read time (an admin's gpt-5.6-luna titles on GPT-6 Luna).
+    selected = config.successor_model(
+        (task_store.get_platform_setting(_SETTING_MODEL) or "").strip())
     if selected:
         provider = config.get_model_provider(selected)
         if _provider_configured(provider):
@@ -190,14 +216,14 @@ def _provider_credentials(provider: str) -> tuple[str, str] | None:
     # the same path the Direct-LLM layer + phone classifier use.
     if any(s.get("auth_type") == "relay" for s in subs):
         from services.engines import subscription_pool
-        creds = subscription_pool.relay_llm_credentials(provider, "")
+        creds = subscription_pool.relay_llm_credentials("direct-llm", provider, "")
         if creds:
             return creds  # (minted_token, "{RELAY}/v1/relay/<provider>/...")
-    # Keyless local (ollama / openai_compatible): default key + the sub's endpoint.
-    if provider in _KEYLESS:
+    # A keyless local endpoint: the adapter's placeholder key + the sub's endpoint.
+    if _keyless(provider):
+        from core.layers.providers.registry import get_adapter
         data = subscription_store.get_credential_data(subs[0]["id"])
-        default_key = "ollama" if provider == "ollama" else "not-needed"
-        return default_key, (data.get("endpoint_url", "") or "")
+        return (get_adapter(provider).default_api_key() or ""), (data.get("endpoint_url", "") or "")
     return None
 
 
@@ -227,9 +253,10 @@ def title_generation_status() -> dict:
         if _provider_configured(provider):
             model = _title_model_for(provider)
             if model:
+                entry = _direct_provider(provider)
                 options.append({
                     "provider": provider, "model": model,
-                    "label": _PROVIDER_LABEL.get(provider, provider.title()),
+                    "label": entry["label"] if entry else provider.title(),
                 })
     sel = _select_provider()
     return {
@@ -282,7 +309,7 @@ async def generate_title(
         tools=[],
         max_tokens=_MAX_TOKENS,
         endpoint_url=(base_url or None),
-        # "low" = minimal thinking on reasoning-capable title models (gpt-5.6-luna,
+        # "low" = minimal thinking on reasoning-capable title models (gpt-6-luna,
         # gpt-oss-120b); the adapters drop it for non-reasoning models/providers.
         effort="low",
     ):
@@ -319,7 +346,7 @@ async def request_chat_title(chat_id: str, *, assistant_excerpt: str = "") -> No
     safe to call from both pump fire points, the interactive funnel, and any later
     turn — the atomic claim ensures exactly one generation. Never raises."""
     try:
-        if not chat_id or chat_id.startswith("meeting-"):
+        if not chat_id:
             return
         resolved = await asyncio.to_thread(resolve_title_provider)
         if not resolved:

@@ -6,11 +6,22 @@ Single entry-point from the public ``api/events/webhooks.py`` route. Owns:
 * Signature verification (per-vendor)
 * Event-id dedup via an in-memory ring (10-minute TTL, single-replica)
 * Payload normalization → ``NormalizedEvent``
-* Fan-out: match the event against triggers WHERE subscription_id=row.id,
-  call ``trigger_manager.fire_trigger`` concurrently per match
+* Fan-out: match the event against triggers WHERE subscription_id=row.id
+  (one query per request), call ``trigger_manager.fire_trigger``
+  concurrently per match
 * ``record_event_received`` housekeeping on the subscription row
 
 Returns a JSON dict the API layer wraps in a Response.
+
+The loop rules of this module: every store call runs through ``run_db``
+(the row, the secret and the manifest check as ONE executor job behind a
+small gate, so a burst of unauthenticated requests is answered 503 instead
+of filling the lane); a refused signature writes nothing per request (an
+in-memory count, one ``last_error`` note per subscription per minute); the
+body is parsed before verification only when it is small enough to be a
+handshake, otherwise after the signature passes (the parse itself holds the
+GIL wherever it runs, so only the route's body cap bounds it); the relay's
+forward secret is a per-process cache.
 
 Cross-replica dedup (Redis-backed) is on the deferred list — single proxy
 for v1.
@@ -19,6 +30,7 @@ for v1.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -35,8 +47,31 @@ from services.webhooks.event_normalizer import (
 )
 from storage.automation import trigger_store
 from storage.automation import webhook_subscription_store
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.webhook-dispatcher")
+
+# The pre-auth executor job (the row, the manifest check, the secret): this
+# many in flight, this many waiting, the rest answered 503 at once.
+_PREAUTH_CONCURRENCY = 4
+_PREAUTH_MAX_WAITING = 64
+_PREAUTH_RETRY_AFTER_S = 5
+# A body up to this size may be a vendor handshake and is parsed before the
+# signature check; anything larger is verified first.
+_HANDSHAKE_MAX_BYTES = 16 * 1024
+# A refused signature is counted in memory; the row's last_error is written
+# at most this often per subscription, with the count since the last note.
+_SIGNATURE_NOTE_INTERVAL_S = 60.0
+_SIGNATURE_FAILURES_MAX = 1024
+# The relay's forward secret: served from memory this long; a refused forward
+# signature re-reads it once the cached value is older than the retry window
+# (a rotated secret takes effect within seconds, a flood costs one read).
+_RELAY_SECRET_TTL_S = 60.0
+_RELAY_SECRET_RETRY_S = 5.0
+
+_JSON_CT = {"content-type": "application/json"}
+_BUSY = (503, {"error": "busy"},
+         {**_JSON_CT, "retry-after": str(_PREAUTH_RETRY_AFTER_S)})
 
 # The relay's forward-signature contract — verified with the SAME generic
 # HMAC verifier the vendor schemes use, just with this constant pseudo-block
@@ -62,6 +97,69 @@ _DEDUP_LOCK = asyncio.Lock()
 _DEDUP_TTL_SECONDS = 600  # 10 minutes
 
 
+class _LoopBound:
+    """The asyncio primitives of this module, bound to the running loop and
+    rebuilt when it changes (several loops share the process in the test
+    suite; a semaphore or lock with waiters is bound to the loop that
+    created them)."""
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.preauth: asyncio.Semaphore | None = None
+        self.waiting = 0
+        self.capture_lock: asyncio.Lock | None = None
+        self.relay_lock: asyncio.Lock | None = None
+
+    def current(self) -> "_LoopBound":
+        loop = asyncio.get_running_loop()
+        if self.loop is not loop:
+            self.loop = loop
+            self.preauth = asyncio.Semaphore(_PREAUTH_CONCURRENCY)
+            self.waiting = 0
+            self.capture_lock = asyncio.Lock()
+            self.relay_lock = asyncio.Lock()
+        return self
+
+
+_bound = _LoopBound()
+
+
+class _Busy(Exception):
+    """The pre-auth gate is saturated."""
+
+
+@contextlib.asynccontextmanager
+async def _preauth_slot():
+    """One of ``_PREAUTH_CONCURRENCY`` slots for the pre-auth executor job;
+    raises ``_Busy`` instead of queueing once ``_PREAUTH_MAX_WAITING``
+    requests already wait."""
+    b = _bound.current()
+    if b.waiting >= _PREAUTH_MAX_WAITING:
+        raise _Busy()
+    b.waiting += 1
+    try:
+        await b.preauth.acquire()
+    finally:
+        b.waiting -= 1
+    try:
+        yield
+    finally:
+        b.preauth.release()
+
+
+# subscription id -> (refusals since the last note, monotonic time of it)
+_signature_failures: dict[str, tuple[int, float]] = {}
+# (forward secret, monotonic time it was read)
+_relay_secret: tuple[str, float] | None = None
+
+
+def reset_caches() -> None:
+    """Forget the signature counters and the relay secret (tests)."""
+    global _relay_secret
+    _signature_failures.clear()
+    _relay_secret = None
+
+
 # ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
@@ -84,22 +182,27 @@ async def dispatch_webhook(
       * Returns 410 for status='disabled'; 404 for unknown subscription_id.
 
     Always returns 200 once signature passes (vendors retry on non-200; we
-    don't want trigger-fire errors to cause infinite retries).
+    don't want trigger-fire errors to cause infinite retries). Answers 503
+    with ``Retry-After`` when the pre-auth gate is saturated.
     """
-    # 1. Load subscription row.
-    row = webhook_subscription_store.get_subscription(subscription_id)
+    # 1. Load subscription row, manifest and signing secret: one executor job.
+    try:
+        async with _preauth_slot():
+            row, manifest, signing_secret = await run_db(
+                _load_receive_context, subscription_id)
+    except _Busy:
+        return _BUSY
     if not row:
         return (404, {"error": "subscription not found"}, {"content-type": "application/json"})
     if row.get("provider_id") != provider_id:
         return (404, {"error": "provider mismatch"}, {"content-type": "application/json"})
-    if row.get("status") == "disabled":
+    if row.get("status") == webhook_subscription_store.DISABLED:
         return (410, {"error": "subscription disabled"}, {"content-type": "application/json"})
-    if row.get("status") not in ("active", "renew_failed", "creating"):
+    if row.get("status") not in webhook_subscription_store.RECEIVING:
         return (410, {"error": f"subscription status={row.get('status')!r}"},
                 {"content-type": "application/json"})
 
     # 2. Resolve manifest + provider implementation.
-    manifest = mcp_registry.get_manifest(row["mcp_name"])
     if manifest is None:
         return (500, {"error": "manifest not found"}, {"content-type": "application/json"})
     webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
@@ -116,38 +219,40 @@ async def dispatch_webhook(
     # Lowercase headers for case-insensitive lookups downstream.
     headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
 
-    # 3. URL-verification handshake — runs BEFORE signature verification.
-    parsed_body = _safe_parse_json(raw_body)
-    signing_secret = _resolve_signing_secret(
-        webhooks_block=webhooks_block,
-        row=row,
-    )
-    uv_block = webhooks_block.get("url_verification") or {"kind": "none"}
-    if uv_block.get("kind") == "verification_token_capture":
-        # Notion-class: the vendor's one-time UNSIGNED token POST carries the
-        # permanent signing secret in-band — dispatcher-owned (it writes the
-        # row), so it never reaches the provider's handshake handler.
-        capture = _handle_token_capture(
-            subscription_id=subscription_id, uv_block=uv_block,
-            parsed_body=parsed_body, signing_secret=signing_secret,
-        )
-        if capture is not None:
-            return capture
-    else:
-        try:
-            handshake = await provider.handle_url_verification(
-                request_body=parsed_body if isinstance(parsed_body, dict) else {},
-                query_params=query_params or {},
-                manifest_uv_block=uv_block,
-                signing_secret=signing_secret,
+    # 3. URL-verification handshake: runs BEFORE signature verification,
+    # but only for a body small enough to be one (a GET carries its token in
+    # the query string and has no body worth parsing). A larger body is
+    # verified first and parsed afterwards.
+    parsed_body: Any = None
+    if http_method == "GET" or len(raw_body) <= _HANDSHAKE_MAX_BYTES:
+        parsed_body = {} if http_method == "GET" else _safe_parse_json(raw_body)
+        uv_block = webhooks_block.get("url_verification") or {"kind": "none"}
+        if uv_block.get("kind") == "verification_token_capture":
+            # Notion-class: the vendor's one-time UNSIGNED token POST carries
+            # the permanent signing secret in-band, so it is dispatcher-owned (it
+            # writes the row), so it never reaches the provider's handshake
+            # handler.
+            capture = await _handle_token_capture(
+                subscription_id=subscription_id, uv_block=uv_block,
+                parsed_body=parsed_body, signing_secret=signing_secret,
             )
-        except Exception as e:
-            logger.exception("url verification handler raised for provider=%s sub=%s: %s",
-                             provider_id, subscription_id, e)
-            handshake = None
-        if handshake is not None:
-            status, body, resp_headers = handshake
-            return (status, body, resp_headers)
+            if capture is not None:
+                return capture
+        else:
+            try:
+                handshake = await provider.handle_url_verification(
+                    request_body=parsed_body if isinstance(parsed_body, dict) else {},
+                    query_params=query_params or {},
+                    manifest_uv_block=uv_block,
+                    signing_secret=signing_secret,
+                )
+            except Exception as e:
+                logger.exception("url verification handler raised for provider=%s sub=%s: %s",
+                                 provider_id, subscription_id, e)
+                handshake = None
+            if handshake is not None:
+                status, body, resp_headers = handshake
+                return (status, body, resp_headers)
 
     # 4. Signature verification (skip for MS Graph GET validation handshake
     # which arrives before any signed payload — already handled above).
@@ -156,20 +261,16 @@ async def dispatch_webhook(
         return (200, {"status": "ok"}, {"content-type": "application/json"})
 
     sig_block = webhooks_block.get("signature") or {}
-    verify = provider.verify_signature(
-        raw_body=raw_body,
-        headers=headers_lc,
-        signing_secret=signing_secret,
-        manifest_sig_block=sig_block,
+    verify = await _verified(
+        provider, raw_body=raw_body, headers=headers_lc,
+        signing_secret=signing_secret, manifest_sig_block=sig_block,
     )
     if not verify.ok:
-        if row["status"] not in ("creating",):
-            webhook_subscription_store.update_subscription_status(
-                subscription_id, row["status"],  # no-op transition; just to write last_error
-                last_error=f"signature: {verify.reason}",
-            )
+        await _note_signature_failure(row, verify.reason)
         return (401, {"error": "signature verification failed", "reason": verify.reason},
                 {"content-type": "application/json"})
+    if parsed_body is None:
+        parsed_body = _safe_parse_json(raw_body)
 
     # 5-8. Normalize → canonicalize → gate → dedup → match → fire → aggregate.
     # Shared with the relay-forwarded ingest (which verifies the relay's
@@ -223,19 +324,22 @@ async def dispatch_relay_webhook(
         return (400, {"error": "provider header mismatch"}, json_ct)
 
     from auth.webhook_providers.generic import GenericWebhookProvider
-    from services.billing import relay_client
-    from storage.identity import credential_store
 
-    forward_secret = (
-        credential_store.get_infra_credentials(
-            relay_client.EVENTS_FORWARD_SECRET_SLUG) or {}
-    ).get(relay_client.EVENTS_FORWARD_SECRET_KEY, "")
-    verify = GenericWebhookProvider(provider_id="relay").verify_signature(
-        raw_body=raw_body,
-        headers=headers_lc,
-        signing_secret=forward_secret,
+    relay = GenericWebhookProvider(provider_id="relay")
+    forward_secret = await _forward_secret(max_age_s=_RELAY_SECRET_TTL_S)
+    verify = await _verified(
+        relay, raw_body=raw_body, headers=headers_lc, signing_secret=forward_secret,
         manifest_sig_block=_RELAY_SIG_BLOCK,
     )
+    if not verify.ok:
+        # The relay may have rotated the secret: one re-read per retry
+        # window, then the same check again.
+        fresh = await _forward_secret(max_age_s=_RELAY_SECRET_RETRY_S)
+        if fresh != forward_secret:
+            verify = await _verified(
+                relay, raw_body=raw_body, headers=headers_lc, signing_secret=fresh,
+                manifest_sig_block=_RELAY_SIG_BLOCK,
+            )
     if not verify.ok:
         return (401, {"error": "forward signature verification failed",
                       "reason": verify.reason}, json_ct)
@@ -248,11 +352,12 @@ async def dispatch_relay_webhook(
         return (200, {"status": "ignored", "reason": "no_workspace_id"}, json_ct)
 
     rows = [
-        r for r in webhook_subscription_store.list_subscriptions(
+        r for r in await run_db(
+            webhook_subscription_store.list_subscriptions,
             provider_id=provider_id, vendor_target=workspace_id,
             delivery_mode="relay",
         )
-        if r.get("status") in ("active", "renew_failed")
+        if r.get("status") in webhook_subscription_store.DELIVERING
     ]
     if not rows:
         return (200, {"status": "no_subscriptions", "fired": 0}, json_ct)
@@ -322,7 +427,7 @@ async def _process_subscription_events(
         # Empty batch (vendor sent value=[] or normalize raised) — record
         # the receipt but don't fan out.
         try:
-            webhook_subscription_store.record_event_received(subscription_id)
+            await run_db(webhook_subscription_store.record_event_received, subscription_id)
         except Exception as ex:
             logger.warning(
                 "record_event_received failed for sub=%s: %s",
@@ -349,6 +454,10 @@ async def _process_subscription_events(
     ignored_count = 0
     body_dict = parsed_body if isinstance(parsed_body, dict) else {}
     event_catalog = webhooks_block.get("event_catalog") or []
+    # The subscription's enabled triggers, read once per request, on the
+    # first event that passes the gate and the dedup (a batch of nothing but
+    # repeats costs no query).
+    trigger_rows: list[dict] | None = None
     for event in events:
         # Canonicalize the event type to its catalog key (slack: raw
         # "message" + channel_type=channel → "message.channels") so BOTH the
@@ -387,7 +496,12 @@ async def _process_subscription_events(
                 })
                 continue
 
-        matching_triggers = _find_matching_triggers(subscription_id, event)
+        if trigger_rows is None:
+            trigger_rows = await run_db(
+                trigger_store.list_triggers,
+                enabled_only=True, subscription_id=subscription_id,
+            )
+        matching_triggers = _matching_triggers(trigger_rows, event)
         if not matching_triggers:
             no_trigger_count += 1
             per_event_results.append({
@@ -424,7 +538,7 @@ async def _process_subscription_events(
 
     # 7. Record receive housekeeping (best-effort, once per inbound request).
     try:
-        webhook_subscription_store.record_event_received(subscription_id)
+        await run_db(webhook_subscription_store.record_event_received, subscription_id)
     except Exception as e:
         logger.warning(
             "record_event_received failed for sub=%s: %s", subscription_id, e,
@@ -459,6 +573,19 @@ async def _process_subscription_events(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# An HMAC over a body this large is worth a thread hop; below it the hop
+# costs more loop time than the digest (the receive caps bound the body).
+_VERIFY_OFF_LOOP_BYTES = 256 * 1024
+
+
+async def _verified(provider, *, raw_body: bytes, **kw):
+    """The provider's signature check, in a worker thread once the body is
+    large enough for the digest to show on the loop."""
+    if len(raw_body) > _VERIFY_OFF_LOOP_BYTES:
+        return await asyncio.to_thread(provider.verify_signature, raw_body=raw_body, **kw)
+    return provider.verify_signature(raw_body=raw_body, **kw)
+
+
 def _safe_parse_json(raw: bytes) -> Any:
     """Parse JSON body. Returns empty dict on parse failure (vendors
     occasionally send empty body for handshakes)."""
@@ -470,7 +597,75 @@ def _safe_parse_json(raw: bytes) -> Any:
         return {}
 
 
-def _handle_token_capture(
+def _load_receive_context(subscription_id: str) -> tuple[dict | None, Any, str]:
+    """The pre-auth store work of one request, run as ONE executor job: the
+    row, its manifest, and (only for a row that can receive under a manifest
+    that still declares a receiver) the signing secret. The decisions stay
+    with the caller, in the same order as before."""
+    row = webhook_subscription_store.get_subscription(subscription_id)
+    if not row:
+        return None, None, ""
+    manifest = mcp_registry.get_manifest(row["mcp_name"])
+    webhooks_block = (manifest.credentials.webhooks or {}) if manifest and manifest.credentials else {}
+    secret = ""
+    if (row.get("status") in webhook_subscription_store.RECEIVING
+            and webhooks_block.get("available", False)):
+        secret = _resolve_signing_secret(webhooks_block=webhooks_block, row=row)
+    return row, manifest, secret
+
+
+async def _note_signature_failure(row: dict, reason: str) -> None:
+    """Count a refused signature; write the row's ``last_error`` at most once
+    per ``_SIGNATURE_NOTE_INTERVAL_S`` per subscription, with the refusals
+    since the previous note. A row still ``creating`` takes no note (its
+    first deliveries may arrive before the vendor confirms)."""
+    if row.get("status") == webhook_subscription_store.CREATING:
+        return
+    sid = row["id"]
+    now = time.monotonic()
+    count, last = _signature_failures.get(sid, (0, None))
+    count += 1
+    if last is not None and now - last < _SIGNATURE_NOTE_INTERVAL_S:
+        _signature_failures[sid] = (count, last)
+        return
+    if sid not in _signature_failures and len(_signature_failures) >= _SIGNATURE_FAILURES_MAX:
+        oldest = min(_signature_failures, key=lambda k: _signature_failures[k][1])
+        del _signature_failures[oldest]
+    _signature_failures[sid] = (0, now)
+    try:
+        await run_db(webhook_subscription_store.note_last_error,
+                     sid, f"signature: {reason} ({count} refused)")
+    except Exception:
+        logger.warning("signature note failed for sub=%s", sid, exc_info=True)
+
+
+def _read_forward_secret() -> str:
+    from services.billing import relay_client
+    from storage.identity import credential_store
+    return (
+        credential_store.get_infra_credentials(
+            relay_client.EVENTS_FORWARD_SECRET_SLUG) or {}
+    ).get(relay_client.EVENTS_FORWARD_SECRET_KEY, "")
+
+
+async def _forward_secret(*, max_age_s: float) -> str:
+    """The relay's forward secret, from memory while younger than
+    ``max_age_s`` (an empty value too: an install with no relay pays no
+    read), else read once through the executor under a lock."""
+    global _relay_secret
+    hit = _relay_secret
+    if hit is not None and time.monotonic() - hit[1] < max_age_s:
+        return hit[0]
+    async with _bound.current().relay_lock:
+        hit = _relay_secret
+        if hit is not None and time.monotonic() - hit[1] < max_age_s:
+            return hit[0]
+        value = await run_db(_read_forward_secret)
+        _relay_secret = (value, time.monotonic())
+        return value
+
+
+async def _handle_token_capture(
     *, subscription_id: str, uv_block: dict, parsed_body: Any,
     signing_secret: str,
 ) -> tuple[int, dict, dict[str, str]] | None:
@@ -494,12 +689,19 @@ def _handle_token_capture(
     if not isinstance(token, str) or not token:
         return None
     if not signing_secret:
-        webhook_subscription_store.update_signing_secret(subscription_id, token)
-        logger.info(
-            "webhook verification token captured for subscription %s — reveal "
-            "it on the subscription card to verify at the vendor",
-            subscription_id,
-        )
+        # The check and the write are two executor hops now, so two setup
+        # POSTs at once are serialized and the second sees the first's secret.
+        async with _bound.current().capture_lock:
+            current = await run_db(
+                webhook_subscription_store.get_signing_secret, subscription_id)
+            if not current:
+                await run_db(
+                    webhook_subscription_store.update_signing_secret, subscription_id, token)
+                logger.info(
+                    "webhook verification token captured for subscription %s: reveal "
+                    "it on the subscription card to verify at the vendor",
+                    subscription_id,
+                )
     response_field = uv_block.get("response_field") or "ok"
     content_type = uv_block.get("response_content_type") or "application/json"
     return (200, {response_field: True}, {"content-type": content_type})
@@ -553,16 +755,11 @@ async def _is_duplicate(subscription_id: str, event_id: str) -> bool:
         return False
 
 
-def _find_matching_triggers(
-    subscription_id: str, event: NormalizedEvent,
-) -> list[dict]:
-    """Read all enabled triggers for this subscription; return those whose
-    event_filter matches the event."""
-    rows = trigger_store.list_triggers(enabled_only=True)
+def _matching_triggers(rows: list[dict], event: NormalizedEvent) -> list[dict]:
+    """The subscription's enabled triggers (already read for this request)
+    whose event_filter matches the event."""
     matches: list[dict] = []
     for row in rows:
-        if row.get("subscription_id") != subscription_id:
-            continue
         event_filter = row.get("event_filter")
         # Tolerate JSONB returning as str or already-dict.
         if isinstance(event_filter, str):

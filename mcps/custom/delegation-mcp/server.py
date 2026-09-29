@@ -160,7 +160,11 @@ async def list_tools() -> list[Tool]:
                             "Continue a previous delegation (multi-turn): pass the task_id "
                             "of a previous surface=task delegation, or the chat_id of a "
                             "previous worker (chat or task-run). The worker keeps its chat "
-                            "and full context from prior rounds, on its own agent."
+                            "and full context from prior rounds, on its own agent. A worker "
+                            "still WORKING on your run reads the follow-up inside that turn "
+                            "(steered at its next tool boundary, nothing interrupted) and "
+                            "its report covers it; otherwise the follow-up runs as its next "
+                            "turn."
                         ),
                     },
                     "output_dir": {
@@ -189,7 +193,11 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "OPTIONAL model override for this worker — only when the "
                             "task specifically needs a different model (must be "
-                            "available on the worker's execution layer). Omit to "
+                            "available on the worker's execution layer: read the ids "
+                            "off the target's `layers:` line in Available Agents and "
+                            "pick by the capability tier tagged there, [t1] frontier "
+                            "for judgement-heavy work down to [t4] fast for routine "
+                            "work; the Model tiers list explains each). Omit to "
                             "inherit the agent's default. Ignored with continue_id."
                         ),
                     },
@@ -210,6 +218,18 @@ async def list_tools() -> list[Tool]:
                             "mid-turn on local PTYs), 'non-interactive' headless. "
                             "Omit to inherit the agent's default. Ignored with "
                             "continue_id."
+                        ),
+                    },
+                    "checks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "OPTIONAL checks to run on the worker's result (the "
+                            "target agent's offered checks or your own, by name; "
+                            "list_checks names them). A failing check hands the "
+                            "worker its findings for another round before the "
+                            "result reaches you; the agent's mandatory checks run "
+                            "regardless."
                         ),
                     },
                 },
@@ -444,8 +464,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "model": arguments.get("model"),
                 "layer": arguments.get("layer"),
                 "mode": arguments.get("mode"),
+                "checks": arguments.get("checks") or None,
             })
 
+            if result.get("steered"):
+                # The lane was working on this caller's run: the follow-up
+                # went INTO that turn, no second run exists.
+                lines = [
+                    f"Steered '{arguments['name']}' into the running lane "
+                    f"(run: {result['run_id']}, id: {result['task_id']}).",
+                    f"Agent: {result.get('agent') or target_agent}",
+                    f"Worker chat: {result.get('chat_id')}",
+                    "The worker reads it at its next tool boundary — nothing was "
+                    "interrupted — and the lane's report, delivered to this session "
+                    "when that run completes, covers it. Continue your current work.",
+                ]
+                return [TextContent(type="text", text="\n".join(lines))]
             lines = [
                 f"Delegated '{arguments['name']}' (surface={surface}, id: {result['task_id']}, run: {result['run_id']}).",
                 f"Agent: {result.get('agent') or target_agent}",

@@ -208,7 +208,9 @@ function Test-PythonVersion {
     return $null
 }
 
-# Try python / python3 on PATH first.
+# Try python / python3 on PATH first. The 3.10 floor (here and in the two
+# fallbacks below) is PYTHON_MIN_VERSION in VERSIONS.md, pinned by
+# satellite/tests/test_python_floor.py together with install.sh's gate.
 foreach ($candidate in @('python', 'python3')) {
     $resolved = Get-Command $candidate -ErrorAction SilentlyContinue
     if (-not $resolved) { continue }
@@ -429,7 +431,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $principalId `
 # Restart-on-FAILURE (3x, 1 min apart) is what lets the boot-guard's
 # crash-attempt counter advance. A clean exit-0 (update / rollback) is
 # NOT auto-restarted -- the daemon relaunches
-# itself via `schtasks /Run` (config.py::_relaunch_self). IgnoreNew keeps a
+# itself via `schtasks /Run` (config.py::relaunch_self). IgnoreNew keeps a
 # second instance from starting if one is already running. ExecutionTimeLimit
 # 0 = run forever. Battery flags keep it alive on laptops.
 $settings = New-ScheduledTaskSettingsSet `

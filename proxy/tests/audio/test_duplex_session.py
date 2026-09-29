@@ -123,29 +123,105 @@ def test_duplex_token_round_trip(temp_db):
 
 # --- access checks ---------------------------------------------------------
 
-def _mk_chat(chat_id, user_sub, agent="agent-a"):
-    task_store.create_chat(chat_id, user_sub, agent, "auto")
+def _mk_chat(chat_id, user_sub, agent="agent-a", source_type="chat"):
+    task_store.create_chat(chat_id, user_sub, agent, "auto", source_type=source_type)
+
+
+def _ctx(sub, role="member", agent_roles=None):
+    agent_roles = agent_roles or {}
+    return UserContext(sub=sub, email="", name="", role=role,
+                       agents=list(agent_roles), agent_roles=agent_roles)
 
 
 def test_access_owner_and_admin_allowed(temp_db):
     _mk_chat("c-own", "user-admin")
     assert duplex_service.chat_access_denied_reason(
-        "c-own", user_sub="user-admin", user_role="admin", user_agents=[]) is None
+        "c-own", _ctx("user-admin", role="admin")) is None
     assert duplex_service.chat_access_denied_reason(
-        "c-own", user_sub="someone-else", user_role="admin", user_agents=[]) is None
+        "c-own", _ctx("someone-else", role="admin")) is None
 
 
 def test_access_foreign_chat_denied(temp_db):
     _mk_chat("c-foreign", "user-admin")
     denial = duplex_service.chat_access_denied_reason(
-        "c-foreign", user_sub="user-b", user_role="member", user_agents=["agent-a"])
+        "c-foreign", _ctx("user-b", agent_roles={"agent-a": "editor"}))
     assert denial == "Access denied"
 
 
-def test_access_missing_chat(temp_db):
-    denial = duplex_service.chat_access_denied_reason(
-        "c-nope", user_sub="user-admin", user_role="admin", user_agents=[])
-    assert denial == "Chat not found"
+def test_access_missing_chat_and_unknown_user(temp_db):
+    assert duplex_service.chat_access_denied_reason(
+        "c-nope", _ctx("user-admin", role="admin")) == "Chat not found"
+    _mk_chat("c-own2", "user-admin")
+    assert duplex_service.chat_access_denied_reason("c-own2", None) == "Access denied"
+
+
+def test_access_follows_the_chat_owner_not_the_agent_mode(temp_db):
+    """The by-id rule resume_chat binds by: on a Shared-only agent an
+    assigned editor drives the ``agent::`` pool, never a colleague's chat
+    from before the switch, and a phone call only as a manager."""
+    from core.session import session_kind
+    from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
+    from storage.agents import agent_store
+    agent_store.create_agent("agent-so", "Shared only", collaborative=False,
+                             default_scope="agent")
+    _mk_chat("c-pre", "user-admin", agent="agent-so")
+    _mk_chat("c-pool", shared_chat_owner("agent-so"), agent="agent-so")
+    _mk_chat("c-call", PHONE_CHAT_OWNER, agent="agent-so",
+             source_type=session_kind.PHONE.source_type)
+    editor = _ctx("user-b", agent_roles={"agent-so": "editor"})
+    manager = _ctx("user-m", agent_roles={"agent-so": "manager"})
+    assert duplex_service.chat_access_denied_reason("c-pre", editor) == "Access denied"
+    assert duplex_service.chat_access_denied_reason("c-pool", editor) is None
+    assert duplex_service.chat_access_denied_reason("c-call", editor) == "Access denied"
+    assert duplex_service.chat_access_denied_reason("c-call", manager) is None
+
+
+def test_access_pooled_chat_takes_the_editor_tier(temp_db):
+    """A Shared-only pool chat runs as the agent: below editor the mint and
+    the attach refuse with the tier's own sentence, an editor passes (the case
+    above), and a personal chat's owner is untouched."""
+    from core.session.visibility import shared_chat_owner
+    from storage.agents import agent_store
+    agent_store.create_agent("agent-so2", "Shared only", collaborative=False,
+                             default_scope="agent")
+    _mk_chat("c-pool2", shared_chat_owner("agent-so2"), agent="agent-so2")
+    contributor = _ctx("user-c", agent_roles={"agent-so2": "contributor"})
+    viewer = _ctx("user-v", agent_roles={"agent-so2": "viewer"})
+    editor = _ctx("user-e", agent_roles={"agent-so2": "editor"})
+    denial = duplex_service.chat_access_denied_reason("c-pool2", contributor)
+    assert denial and "editor role" in denial
+    assert duplex_service.chat_access_denied_reason("c-pool2", viewer)
+    assert duplex_service.chat_access_denied_reason("c-pool2", editor) is None
+    _mk_chat("c-own3", "user-c", agent="agent-a")
+    assert duplex_service.chat_access_denied_reason("c-own3", contributor) is None
+
+
+@pytest.mark.asyncio
+async def test_attach_resolve_refuses_a_contributor_on_a_pooled_chat(temp_db):
+    """The first utterance re-checks the tier from the live role: a
+    contributor's pooled chat gets the sentence, an editor's proceeds to the
+    session lookup."""
+    from types import SimpleNamespace
+    from core.session.visibility import shared_chat_owner
+    from storage.agents import agent_store
+    from ws import duplex_attach
+    agent_store.create_agent("agent-so3", "Shared only", collaborative=False,
+                             default_scope="agent")
+    task_store.upsert_user("user-c3", "c3@test.com", "C3", "member")
+    task_store.add_user_agent("user-c3", "agent-so3", "contributor", "test")
+    task_store.upsert_user("user-e3", "e3@test.com", "E3", "member")
+    task_store.add_user_agent("user-e3", "agent-so3", "editor", "test")
+    _mk_chat("c-pool3", shared_chat_owner("agent-so3"), agent="agent-so3")
+    try:
+        got = await duplex_attach._resolve(
+            SimpleNamespace(duplex_id="dx-c3", sub="user-c3", chat_id="c-pool3"))
+        assert isinstance(got, str) and "editor role" in got
+        got = await duplex_attach._resolve(
+            SimpleNamespace(duplex_id="dx-e3", sub="user-e3", chat_id="c-pool3"))
+        assert got == "no_session"
+    finally:
+        duplex_attach._states.pop("dx-c3", None)
+        duplex_attach._states.pop("dx-e3", None)
 
 
 # --- mint endpoint ---------------------------------------------------------
@@ -200,8 +276,9 @@ def test_prewarm_endpoint_access_and_spawn(client, temp_db, monkeypatch):
     async def _fake_spawn(**kw):
         calls.append(kw)
         return "sid-123"
-    import ws.dashboard_warmup as dw
-    monkeypatch.setattr(dw, "spawn_detached_prewarm", _fake_spawn)
+    import ws.dashboard  # noqa: F401  (the pre-warm module needs it loaded first)
+    import ws.dashboard_prewarm as dp
+    monkeypatch.setattr(dp, "spawn_detached_prewarm", _fake_spawn)
 
     resp = client.post("/v1/duplex/prewarm", json={"agent": "alpha"})
     assert resp.status_code == 200
@@ -235,8 +312,9 @@ def test_prewarm_endpoint_refuses_unadded_agent(temp_db, monkeypatch):
     async def _fake_spawn(**kw):
         called.append(kw)
         return None
-    import ws.dashboard_warmup as dw
-    monkeypatch.setattr(dw, "spawn_detached_prewarm", _fake_spawn)
+    import ws.dashboard  # noqa: F401  (the pre-warm module needs it loaded first)
+    import ws.dashboard_prewarm as dp
+    monkeypatch.setattr(dp, "spawn_detached_prewarm", _fake_spawn)
     assert c.post("/v1/duplex/prewarm",
                   json={"agent": "mine"}).status_code == 200
     assert called

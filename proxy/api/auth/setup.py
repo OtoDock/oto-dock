@@ -2,17 +2,38 @@
 
 import asyncio
 import logging
+import threading
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from storage import database as task_store
-from auth.password import hash_password, check_password_strength
+from auth.password import HashBusy, check_password_strength_async, hash_password_async
 from auth.providers import create_session_jwt, apply_session_cookie
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
+
+_SETUP_DONE = "Setup already completed"
+# The owner is created only while no user exists. The strength check and the
+# hash run for hundreds of milliseconds after the first count, so the count
+# is read again right before the insert, in one job under this lock: two
+# setups at once make one owner, and a person who signed in meanwhile (a
+# first SSO login) ends the setup.
+_create_lock = threading.Lock()
+
+
+def _create_owner(email: str, display_name: str, pw_hash: str) -> str | None:
+    """The owner's sub, or None when a user exists already. Synchronous:
+    call it on a worker thread."""
+    with _create_lock:
+        if task_store.count_users() > 0:
+            return None
+        return task_store.create_local_user(
+            email, display_name, display_name, "admin", pw_hash,
+            is_owner=True, must_change_password=False,
+        )
 
 
 class SetupRequest(BaseModel):
@@ -29,10 +50,10 @@ async def setup_first_user(req: SetupRequest):
     This is the setup wizard endpoint — called once on fresh install.
     After the first user is created, this endpoint returns 403.
     """
-    # Guard: only when no users exist
+    # Guard: only when no users exist (read again before the insert).
     user_count = await asyncio.to_thread(task_store.count_users)
     if user_count > 0:
-        raise HTTPException(status_code=403, detail="Setup already completed")
+        raise HTTPException(status_code=403, detail=_SETUP_DONE)
 
     email = req.email.strip().lower()
     if not email or "@" not in email:
@@ -43,20 +64,22 @@ async def setup_first_user(req: SetupRequest):
         raise HTTPException(status_code=400, detail="Display name required")
 
     # Password strength check
-    ok, msg, _ = check_password_strength(req.password)
+    ok, msg, _ = await check_password_strength_async(req.password)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
-    pw_hash = hash_password(req.password)
+    try:
+        pw_hash = await hash_password_async(req.password)
+    except HashBusy:
+        raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
+                            headers={"Retry-After": "5"})
 
     try:
-        sub = await asyncio.to_thread(
-            task_store.create_local_user,
-            email, display_name, display_name, "admin", pw_hash,
-            is_owner=True, must_change_password=False,
-        )
+        sub = await asyncio.to_thread(_create_owner, email, display_name, pw_hash)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    if sub is None:
+        raise HTTPException(status_code=403, detail=_SETUP_DONE)
 
     user = await asyncio.to_thread(task_store.get_user, sub)
     if not user:
@@ -71,6 +94,12 @@ async def setup_first_user(req: SetupRequest):
     #
     # Network failure (offline / GitHub unreachable) is non-fatal: the admin
     # can install it manually via Browse Community Agents later.
+    #
+    # ``consent_all``: the platform's own default template is installed
+    # with the consent a dialog would carry — the admin is creating the
+    # platform and the template is the platform's choice, as bundling it
+    # was (COMMUNITY-AGENTS-REGISTRY.md "Consent"); the owner-only rule
+    # still applies to every copy.
     try:
         from services.community import community_agent_installer
         result = await community_agent_installer.install_from_catalog(
@@ -78,6 +107,7 @@ async def setup_first_user(req: SetupRequest):
             target_slug="personal-assistant",
             installer_user_sub=sub,
             installer_role="admin",
+            consent_all=True,
         )
         logger.info(
             "Setup wizard: Personal Assistant installed for new owner: %s",

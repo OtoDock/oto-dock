@@ -16,9 +16,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.execution_layer import AgentConfig, UNATTENDED_CLIENT_TYPES
+from core.execution_layer import AgentConfig
 from core.layers.codex.helpers import codex_hooks_floor
 from core.remote.remote_execution import RemoteExecutionLayer
+from core.session import session_kind
+
+# The kinds with nobody on the line — the floor applies to exactly these.
+_UNATTENDED = [k.name for k in session_kind.KINDS if not k.attended]
 
 
 def _machine():
@@ -56,11 +60,11 @@ def layer():
 
 async def _build(layer, config, execution_path="codex-cli"):
     with patch("storage.remote_store.get_remote_machine", return_value=_machine()):
-        return await layer._build_start_payload("sess-1", config, execution_path)
+        return (await layer._build_start_payload("sess-1", config, execution_path)).payload
 
 
 def test_the_rule_is_the_unattended_set_minus_the_tui():
-    for client_type in UNATTENDED_CLIENT_TYPES:
+    for client_type in _UNATTENDED:
         assert codex_hooks_floor(client_type) is True
         assert codex_hooks_floor(client_type, interactive=True) is False
     assert codex_hooks_floor("dashboard") is False
@@ -69,7 +73,7 @@ def test_the_rule_is_the_unattended_set_minus_the_tui():
 
 class TestCodexHooksFloorPayload:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("client_type", list(UNATTENDED_CLIENT_TYPES))
+    @pytest.mark.parametrize("client_type", _UNATTENDED)
     async def test_unattended_sessions_carry_the_floor(self, layer, client_type, caplog):
         with caplog.at_level(logging.WARNING, logger="remote-layer"):
             payload = await _build(layer, _config(client_type=client_type))

@@ -18,6 +18,7 @@ from core.config import phone_config_builder as pcb
 from core.execution_layer import AgentConfig
 from core.session import external_identity
 from services.phone.phone_identity import RouteIdentity
+from core import placement
 
 SID = "11111111-2222-4333-8444-555555555555"
 
@@ -58,16 +59,11 @@ def stubs(monkeypatch):
                         lambda *a, **k: ("sub-1", {"_PROVIDER": "anthropic"}))
     monkeypatch.setattr(remote_store, "resolve_execution_target",
                         lambda agent, sub, role: (seen.setdefault("target", "local"), None))
-    monkeypatch.setattr(remote_store, "get_target_metadata",
+    monkeypatch.setattr(remote_store, "placement_of",
                         lambda value, sub, agent: (
-                            "admin_remote" if value != "local" else "local", ""))
-    monkeypatch.setattr(remote_store, "get_target_has_display", lambda k, v: None)
-    monkeypatch.setattr(remote_store, "get_target_device_grants", lambda k, v: set())
-    monkeypatch.setattr(remote_store, "get_target_browser_settings", lambda k, v: None)
-    monkeypatch.setattr(remote_store, "get_target_path_policy", lambda k, v: {
-        "agents_dir": "", "machine_id": "", "home_dir": "", "allow_full_fs": False,
-        "os_user": "", "user_dirs": {},
-    })
+                            placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE)
+                            if not placement.is_local(value) else placement.LOCAL_PLACEMENT))
+    monkeypatch.setattr(remote_store, "get_target_browser_settings", lambda p: None)
     return seen
 
 
@@ -137,7 +133,7 @@ async def test_remote_target_keeps_the_agent_scope(agent, stubs):
     ctx = cfg.security_context
     assert ctx.principal == "external" and ctx.external_home == ""
     assert ctx.external_claim == "phone:+302101234567"   # memory still keyed on it
-    assert ctx.target_kind == "admin_remote"
+    assert ctx.placement.admin_paired
 
 
 @pytest.mark.asyncio

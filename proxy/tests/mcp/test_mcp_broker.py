@@ -150,3 +150,100 @@ def test_cleanup_session_permission_state_purges_broker():
     mcp_broker.provision("s1", {"github": SecretBundle(env={"GH_TOKEN": "gh"})})
     session_state.cleanup_session_permission_state("s1")
     assert mcp_broker.get("s1", "github") is None
+
+
+# ── OAuth token files ride the bundle ────────────────
+
+def _token_world(monkeypatch):
+    """Two stdio OAuth MCPs with a credentials_dir, one bound file each in
+    the collector's virtual-path shape, plus neighbours that contribute
+    nothing (no credentials_dir, no bound file)."""
+    from types import SimpleNamespace
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver as cr
+
+    manifests = [
+        SimpleNamespace(name="google-workspace", server_name=""),
+        SimpleNamespace(name="google-analytics-mcp", server_name="analytics"),
+        SimpleNamespace(name="unbound-mcp", server_name=""),
+        SimpleNamespace(name="file-tools", server_name=""),
+    ]
+    dirs = {
+        "google-workspace": [("WORKSPACE_MCP_CREDENTIALS_DIR", "google-tokens")],
+        "google-analytics-mcp": [("GA_TOKENS_DIR", "google-analytics-tokens")],
+        "unbound-mcp": [("X_DIR", "x-tokens")],
+    }
+    seen = {}
+
+    def _collect(agent, *, user_sub=None, session_scope="user"):
+        seen.update(agent=agent, user_sub=user_sub, session_scope=session_scope)
+        base = "/users/alice/.credentials" if session_scope == "user" else "/knowledge/.credentials"
+        return {
+            f"{base}/google-tokens/a@b.com.json": b'{"access_token": "x"}',
+            f"{base}/google-analytics-tokens/a@b.com.json": b'{"access_token": "y"}',
+        }
+
+    monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda a, **k: manifests)
+    monkeypatch.setattr(mcp_registry, "get_credentials_dirs", lambda n: dirs.get(n, []))
+    monkeypatch.setattr(cr, "collect_oauth_token_files", _collect)
+    return seen
+
+
+def test_token_file_env_is_keyed_by_config_key_and_is_a_json_string(monkeypatch):
+    import json
+    from core.credentials import credential_files as cf
+    _token_world(monkeypatch)
+    out = cf.token_file_env("agent", user_sub="sub-1", session_scope="user")
+    assert set(out) == {"google-workspace", "analytics"}
+    val = out["google-workspace"][cf.CREDENTIAL_FILES_ENV]
+    assert isinstance(val, str)
+    assert json.loads(val) == {"WORKSPACE_MCP_CREDENTIALS_DIR": {
+        "subpath": "google-tokens", "files": {"a@b.com.json": '{"access_token": "x"}'}}}
+    assert json.loads(out["analytics"][cf.CREDENTIAL_FILES_ENV]) == {"GA_TOKENS_DIR": {
+        "subpath": "google-analytics-tokens", "files": {"a@b.com.json": '{"access_token": "y"}'}}}
+    # The agent scope reads the service account's files the same way.
+    assert set(cf.token_file_env("agent", session_scope="agent")) == {"google-workspace", "analytics"}
+
+
+def test_merge_token_files_extends_and_creates_bundles(monkeypatch):
+    from core.credentials import credential_files as cf
+    bundles = {"analytics": SecretBundle(env={"GOOGLE_PROJECT_ID": "p"}, http_bearer=None)}
+    cf.merge_token_files(bundles, {"analytics": {"OTO_CREDENTIAL_FILES": "{}"},
+                                   "google-workspace": {"OTO_CREDENTIAL_FILES": "{}"}})
+    assert bundles["analytics"].env == {"GOOGLE_PROJECT_ID": "p", "OTO_CREDENTIAL_FILES": "{}"}
+    assert bundles["google-workspace"].env == {"OTO_CREDENTIAL_FILES": "{}"}
+
+
+def test_attach_token_files_reads_the_session_off_the_config(monkeypatch):
+    from types import SimpleNamespace
+    from core.credentials import credential_files as cf
+    from core.execution_layer import AgentConfig
+    seen = _token_world(monkeypatch)
+    cfg = AgentConfig(agent_name="agent", user_sub="sub-1",
+                      security_context=SimpleNamespace(session_scope="agent"))
+    cf.attach_token_files(cfg)
+    assert seen == {"agent": "agent", "user_sub": "sub-1", "session_scope": "agent"}
+    assert set(cfg.mcp_secret_bundles) == {"google-workspace", "analytics"}
+    # A collector failure delivers nothing and the session still builds.
+    from services.oauth import credential_resolver as cr
+
+    def _boom(*a, **k):
+        raise RuntimeError("store down")
+    monkeypatch.setattr(cr, "collect_oauth_token_files", _boom)
+    cfg2 = AgentConfig(agent_name="agent", security_context=SimpleNamespace(session_scope="user"))
+    cf.attach_token_files(cfg2)
+    assert cfg2.mcp_secret_bundles == {}
+
+
+def test_token_files_round_trip_through_the_interceptor(monkeypatch):
+    import json
+    from core import stdio_path_interceptor as icpt
+    from core.credentials import credential_files as cf
+    _token_world(monkeypatch)
+    env = cf.token_file_env("agent", user_sub="sub-1")["google-workspace"]
+    monkeypatch.setattr(icpt, "_fetch_mcp_credentials", lambda tok: {"env": env})
+    child = {"OTO_MCP_FETCH_TOKEN": "cap", "PATH": "/usr/bin"}
+    icpt._apply_broker_credentials(child)
+    assert "OTO_MCP_FETCH_TOKEN" not in child
+    spec = json.loads(child[cf.CREDENTIAL_FILES_ENV])
+    assert spec["WORKSPACE_MCP_CREDENTIALS_DIR"]["files"] == {"a@b.com.json": '{"access_token": "x"}'}

@@ -1,6 +1,7 @@
 // uploadWithProgress chunked path: threshold switch, slicing by the SERVER's
 // returned chunk size, sequential PUTs with aggregate progress, per-chunk
-// retry on transient failures, no retry on 4xx, abort → DELETE cleanup.
+// retry on transient failures, no retry on 4xx, any terminal failure or an
+// abort → DELETE cleanup.
 // jsdom has an XHR class but no network — the stub below is the seam.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -146,12 +147,26 @@ describe('uploadWithProgress — chunked path', () => {
     expect(chunk0Attempts).toHaveLength(2)
   }, 15000)
 
-  it('does not retry a 4xx chunk failure', async () => {
+  it('does not retry a 4xx chunk failure, and releases the staging', async () => {
     FakeXHR.autoRespond = (x) => x.respond(413, { detail: 'File too large (max 1024 MB)' })
     await expect(
       uploadWithProgress(bigFile(), 'ag', '', () => {}),
     ).rejects.toThrow('File too large (max 1024 MB)')
     expect(FakeXHR.instances).toHaveLength(1)
+    const del = fetchCalls.find(c => c.init?.method === 'DELETE')
+    expect(del?.url).toBe('/v1/upload/chunked/up_test123')
+  })
+
+  it('a refused complete releases the staging', async () => {
+    FakeXHR.autoRespond = (x) => x.respond(200, { ok: true })
+    fetchResponder = (url) => url.endsWith('/complete')
+      ? { status: 507, body: { detail: 'Not enough free disk space' } }
+      : okResponder(url)
+    await expect(
+      uploadWithProgress(bigFile(), 'ag', '', () => {}),
+    ).rejects.toThrow('Not enough free disk space')
+    const del = fetchCalls.find(c => c.init?.method === 'DELETE')
+    expect(del?.url).toBe('/v1/upload/chunked/up_test123')
   })
 
   it('abort mid-chunk rejects AbortError and fires the DELETE cleanup', async () => {

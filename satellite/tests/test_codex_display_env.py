@@ -7,8 +7,6 @@ browser unavailable" — found live 2026-07-19; claude sessions were fine
 because CLI children inherit the full env).
 """
 
-import pytest
-
 from satellite.sessions.codex_session import _inject_display_env_toml
 
 TOML = (
@@ -49,6 +47,6 @@ def test_skips_blocks_that_declare_their_own(monkeypatch):
 
 
 def test_result_stays_valid_toml(monkeypatch):
-    tomllib = pytest.importorskip("tomllib")
+    from satellite.tests._toml import toml_loads
     monkeypatch.setenv("DISPLAY", ":99")
-    tomllib.loads(_inject_display_env_toml(TOML))
+    toml_loads(_inject_display_env_toml(TOML))

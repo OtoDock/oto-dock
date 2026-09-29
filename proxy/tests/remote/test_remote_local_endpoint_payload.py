@@ -63,7 +63,7 @@ def layer():
 
 async def _build(layer, config, execution_path="codex-cli"):
     with patch("storage.remote_store.get_remote_machine", return_value=_machine()):
-        return await layer._build_start_payload("sess-1", config, execution_path)
+        return (await layer._build_start_payload("sess-1", config, execution_path)).payload
 
 
 class TestLocalEndpointPayload:
@@ -262,7 +262,7 @@ class TestProviderSwitchBlockerOnRemote:
             dashboard_chat.config, "get_model_provider",
             lambda model, layer="": wanted_provider,
         )
-        return dashboard_chat._codex_provider_switch_blocker("sess-remote", "gpt-5.6-terra")
+        return dashboard_chat._provider_switch_blocker("sess-remote", "gpt-5.6-terra", layer="codex-cli")
 
     def test_cross_provider_switch_is_refused(self, monkeypatch):
         msg = self._blocker(monkeypatch, "openai_compatible", "openai")

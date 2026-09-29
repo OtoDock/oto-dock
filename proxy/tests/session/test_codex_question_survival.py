@@ -164,7 +164,7 @@ class TestQuestionResponseFallback:
             "answers": _answers("Option B"),
         })
         assert conn.chat_calls == []
-        assert conn.message_queue == ["Option B"]
+        assert [q.text for q in conn.message_queue] == ["Option B"]
         assert conn.sent == [{"type": "queued", "index": 0, "text": "Option B"}]
 
     async def test_no_waiter_and_no_answer_text_is_a_noop(self):

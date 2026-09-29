@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import type { AgentSummary } from '../api/agents'
 import { useRemoteMachines } from '../api/remoteMachines'
+import { isLocalTarget } from '../lib/placement'
 import { MODE_LABEL, modeOfAgent } from '../lib/visibility'
 import RemoteBadge from './RemoteBadge'
 
@@ -24,7 +25,7 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
   // badge (fine — viewers shouldn't see a stale dot).
   const { data: machines } = useRemoteMachines()
   const agentMachine =
-    agent.execution_target && agent.execution_target !== 'local'
+    !isLocalTarget(agent.execution_target)
       ? machines?.find(m => m.id === agent.execution_target) ?? null
       : null
 
@@ -79,7 +80,7 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
             </h3>
             {agentMachine && (
               <RemoteBadge
-                state={(agentMachine.status as any) ?? null}
+                state={agentMachine.status ?? null}
                 machineName={agentMachine.name}
                 lastSeenIso={agentMachine.last_seen}
                 heartbeatAgeS={agentMachine.last_heartbeat_age_s ?? null}

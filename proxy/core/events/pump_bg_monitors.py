@@ -8,12 +8,14 @@ entry points so existing imports keep working.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import time
 from contextlib import contextmanager
 
 from storage import database as task_store
+from storage.pg import run_db
 from core.session.session_state import (
     _dashboard_notify_queues,
     push_pump_event,
@@ -21,9 +23,22 @@ from core.session.session_state import (
     mark_bg_agents_completed,
     get_subagent_registry,
 )
+from core.events import chat_writer
 from core.events.bg_command_state import get_bg_command_registry
+from ws import wire_events as wire
+from core.events.common_events import TEXT
 
 logger = logging.getLogger("claude-proxy")
+
+
+def _persist_row(chat_id: str, role: str, content: str, *, label: str,
+                 event_type: str = "", event_data: str = "") -> asyncio.Future:
+    """Queue one chat row on the chat's writer lane (off the loop, in order
+    with the chat's other rows)."""
+    return chat_writer.submit(chat_id, functools.partial(
+        task_store.add_chat_message, chat_id, role, content,
+        event_type=event_type, event_data=event_data,
+    ), label=label)
 
 
 def format_job_list(labels: list[str], limit: int = 3) -> str:
@@ -188,7 +203,7 @@ async def _bg_agent_monitor_impl(
     # turn; the *_complete cohort frame below keeps reconnect state honest).
     if await _wake_grace_covers(layer, session_id):
         mark_bg_agents_completed(chat_id)
-        push_pump_event(chat_id, {"type": "bg_agents_complete", "count": count})
+        push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
         logger.info(
             f"BG agent monitor: self-wake turn covered the cohort — nudge "
             f"stands down (session={session_id[:8]})"
@@ -207,9 +222,9 @@ async def _bg_agent_monitor_impl(
     # Path 1: WS connected — notification queue (full handling with UI event + LLM prompt)
     notify_queue = _dashboard_notify_queues.get(session_id)
     if notify_queue:
-        push_pump_event(chat_id, {"type": "bg_agents_complete", "count": count})
+        push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
         await notify_queue.put({
-            "type": "bg_nudge",
+            "type": wire.NOTIFY_BG_NUDGE,
             "session_id": session_id,
             "chat_id": chat_id,
             "count": count,
@@ -219,11 +234,11 @@ async def _bg_agent_monitor_impl(
         return
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery
-    task_store.add_chat_message(chat_id, "event", "",
-        event_type="bg_nudge",
-        event_data=json.dumps({"count": count, "labels": labels}))
+    _persist_row(chat_id, "event", "", event_type=wire.PERSISTED_BG_NUDGE,
+                 event_data=json.dumps({"count": count, "labels": labels}),
+                 label="bg_nudge")
     if queue_pump_prompt(chat_id, nudge, system=True):
-        push_pump_event(chat_id, {"type": "bg_agents_complete", "count": count})
+        push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
         logger.info(f"BG agent monitor: nudge queued on pump for chat={chat_id[:8]}")
         return
 
@@ -233,11 +248,11 @@ async def _bg_agent_monitor_impl(
         parts: list[str] = []
         async with layer.session_lock(session_id):
             async for event in layer.send_message(session_id, nudge):
-                if event.type == "text":
+                if event.type == TEXT:
                     parts.append(event.data.get("content", ""))
         response = "".join(parts)
         if response:
-            task_store.add_chat_message(chat_id, "assistant", response)
+            await _persist_row(chat_id, "assistant", response, label="bg_direct_reply")
     except Exception as e:
         logger.error(f"BG agent monitor direct delivery failed: {e}", exc_info=True)
 
@@ -329,9 +344,30 @@ async def _bg_command_monitor_impl(
             await asyncio.sleep(0.3)  # nothing ready — back off before re-draining
 
     if bgreg.has_pending:
+        # Past the fast phase a still-running job is polled slowly, up to
+        # the background-work ceiling: its completion frame lands on this
+        # stdout and nobody else reads it between turns, and the idle
+        # reaper spares the session only while the registry shows it.
+        from core.session import background_leash
+        SLOW_POLL = 15.0
+        ceiling = background_leash.background_work_ceiling()
+        logger.info(
+            f"BG command monitor: {bgreg.pending_count} command(s) still "
+            f"running after {MAX_WAIT:.0f}s — polling every {SLOW_POLL:.0f}s "
+            f"up to the {ceiling:.0f}s ceiling (session={session_id[:8]})"
+        )
+        while bgreg.has_pending and (time.monotonic() - start) < ceiling:
+            if not await layer.is_session_alive(session_id):
+                logger.info(f"BG command monitor: session {session_id[:8]} gone, exiting")
+                return
+            progressed = await layer.drain_bg_commands(session_id, budget=POLL_INTERVAL)
+            if bgreg.has_pending and not progressed:
+                await asyncio.sleep(SLOW_POLL)
+
+    if bgreg.has_pending:
         logger.warning(
             f"BG command monitor: {bgreg.pending_count} command(s) still pending "
-            f"after {MAX_WAIT:.0f}s ceiling — giving up (no nudge)"
+            f"at the background-work ceiling — giving up (no nudge)"
         )
         return
 
@@ -342,7 +378,7 @@ async def _bg_command_monitor_impl(
     # and its backgrounded commands — alive, so this monitor now survives an
     # abort): a nudge would auto-run a turn the user just refused. The CLI's
     # own bg tracking hands the results to the model on the next REAL turn.
-    if chat_id and (task_store.get_chat(chat_id) or {}).get("last_turn_aborted"):
+    if chat_id and ((await run_db(task_store.get_chat, chat_id)) or {}).get("last_turn_aborted"):
         logger.info(
             f"BG command monitor: last turn aborted by the user — skipping "
             f"nudge for chat={chat_id[:8]}"
@@ -359,9 +395,23 @@ async def _bg_command_monitor_impl(
         )
         return
 
+    # Every completion landed inside a later turn (the turn-start reset keeps
+    # a still-running command pending, so this monitor outlives that turn),
+    # where the model already read it: only an unseen completion earns a
+    # review turn (the task producer's rule).
+    if not bgreg.unsurfaced_count:
+        logger.info(
+            f"BG command monitor: every completion was surfaced in a later "
+            f"turn — no nudge (session={session_id[:8]})"
+        )
+        return
+
     # Which commands finished — labels captured at spawn (claude: shell id +
     # command; codex: command text). See compose_command_nudge.
     labels = [bgreg.label_for(t) for t in sorted(bgreg.completed)]
+    # A later turn's command joined this monitor: the cohort is what the
+    # registry resolved, not the count the first turn started with.
+    count = max(count, len(labels))
     nudge = compose_command_nudge(count, labels)
 
     # Path 1: WS connected — deliver as a server turn via the notify queue. The
@@ -370,7 +420,7 @@ async def _bg_command_monitor_impl(
     notify_queue = _dashboard_notify_queues.get(session_id)
     if notify_queue:
         await notify_queue.put({
-            "type": "bg_command_nudge",
+            "type": wire.NOTIFY_BG_COMMAND_NUDGE,
             "session_id": session_id,
             "chat_id": chat_id,
             "count": count,
@@ -380,9 +430,9 @@ async def _bg_command_monitor_impl(
         return
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery.
-    task_store.add_chat_message(chat_id, "event", "",
-        event_type="bg_command_nudge",
-        event_data=json.dumps({"count": count, "labels": labels}))
+    _persist_row(chat_id, "event", "", event_type=wire.PERSISTED_BG_COMMAND_NUDGE,
+                 event_data=json.dumps({"count": count, "labels": labels}),
+                 label="bg_command_nudge")
     if queue_pump_prompt(chat_id, nudge, system=True):
         logger.info(f"BG command monitor: nudge queued on pump for chat={chat_id[:8]}")
         return
@@ -393,10 +443,10 @@ async def _bg_command_monitor_impl(
         parts: list[str] = []
         async with layer.session_lock(session_id):
             async for event in layer.send_message(session_id, nudge):
-                if event.type == "text":
+                if event.type == TEXT:
                     parts.append(event.data.get("content", ""))
         response = "".join(parts)
         if response:
-            task_store.add_chat_message(chat_id, "assistant", response)
+            await _persist_row(chat_id, "assistant", response, label="bg_direct_reply")
     except Exception as e:
         logger.error(f"BG command monitor direct delivery failed: {e}", exc_info=True)

@@ -79,6 +79,13 @@ def user_sub2(request):
     return _make_user(request)
 
 
+def _manages(sub: str, agent: str) -> None:
+    """The lender's standing: a binding is live while its owner manages the
+    agent (the bind route requires it; the store re-checks on every read)."""
+    from storage import database as task_store
+    task_store.add_user_agent(sub, agent, "manager", "test")
+
+
 # ---------------------------------------------------------------------------
 # pick_account — service scope (binding-only; NO platform fallback)
 # ---------------------------------------------------------------------------
@@ -105,6 +112,7 @@ class TestServiceAgentBinding:
         credential_store.set_user_credentials(
             user_sub, mcp_name, {"k": "v"}, account_label="personal",
         )
+        _manages(user_sub, "customer-support")
         ok = credential_store.set_service_agent_binding(
             mcp_name, "customer-support", account_label="personal",
             owner_sub=user_sub,
@@ -131,13 +139,38 @@ class TestServiceAgentBinding:
         )
         assert ok is False
 
+    def test_binding_is_live_only_while_its_owner_manages_the_agent(self, mcp_name, user_sub):
+        """The binding lends the MANAGER's account (CREDENTIALS.md): once the
+        lender is demoted or unassigned, the agent no longer acts with it; a
+        platform admin manages every agent with no row."""
+        from storage import database as task_store
+        credential_store.set_user_credentials(
+            user_sub, mcp_name, {"k": "v"}, account_label="personal",
+        )
+        _manages(user_sub, "customer-support")
+        assert credential_store.set_service_agent_binding(
+            mcp_name, "customer-support", account_label="personal", owner_sub=user_sub,
+        )
+        assert credential_resolver.pick_account(mcp_name, "customer-support").owner_sub == user_sub
+        task_store.set_user_agent_role(user_sub, "customer-support", "editor")
+        assert credential_resolver.pick_account(mcp_name, "customer-support") is None
+        assert credential_store.get_service_agent_binding(mcp_name, "customer-support") is None
+        task_store.set_user_agents(user_sub, [], "test")
+        assert credential_resolver.pick_account(mcp_name, "customer-support") is None
+        with get_conn() as conn:
+            conn.execute("UPDATE users SET role='admin' WHERE sub=%s", (user_sub,))
+            conn.commit()
+        assert credential_resolver.pick_account(mcp_name, "customer-support").label == "personal"
+
     def test_remove_binding(self, mcp_name, user_sub):
         credential_store.set_user_credentials(
             user_sub, mcp_name, {"k": "v"}, account_label="personal",
         )
+        _manages(user_sub, "voice-agent")
         credential_store.set_service_agent_binding(
             mcp_name, "voice-agent", account_label="personal", owner_sub=user_sub,
         )
+        assert credential_resolver.pick_account(mcp_name, "voice-agent") is not None
         credential_store.remove_service_agent_binding(mcp_name, "voice-agent")
         assert credential_resolver.pick_account(mcp_name, "voice-agent") is None
 
@@ -170,6 +203,8 @@ class TestSetServiceAgentBindingUniquePerAgent:
         credential_store.set_user_credentials(
             user_sub2, mcp_name, {"k": "v"}, account_label="acct-b",
         )
+        _manages(user_sub, "agent")
+        _manages(user_sub2, "agent")
         credential_store.set_service_agent_binding(
             mcp_name, "agent", account_label="acct-a", owner_sub=user_sub,
         )
@@ -193,6 +228,8 @@ class TestCleanupServiceAgentBindingsForOwner:
         credential_store.set_user_credentials(
             user_sub2, mcp_name, {"k": "v"}, account_label="b",
         )
+        _manages(user_sub, "agent-1")
+        _manages(user_sub2, "agent-2")
         credential_store.set_service_agent_binding(
             mcp_name, "agent-1", account_label="a", owner_sub=user_sub,
         )
@@ -241,6 +278,7 @@ class TestTokenMapServiceBinding:
             credential_store.set_account_display_email(
                 user_sub, mcp_name, "support", "support@org.com",
             )
+            _manages(user_sub, slug)
             credential_store.set_service_agent_binding(
                 mcp_name, slug, account_label="support", owner_sub=user_sub,
             )

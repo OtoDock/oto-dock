@@ -9,7 +9,7 @@ You have display tools available to show visual content directly in the chat:
 - `send_url`: clickable links the user should open in their browser (for video links use `display_video` instead — it embeds them).
 - `send_file`: downloadable files (reports, data exports, generated files).
 
-Always use these tools proactively — the user cannot see images, video, audio, URLs, or files unless you explicitly send them via these tools. Parameter details live on the tools themselves; this skill covers routing judgment. The **miniapp-authoring skill** carries the full authoring contracts (backchannel + theme events, mini-app dashboards, action buttons, live data panels, feeds, file pins) — load it with the Skill tool whenever you are about to build or update a `display_ui` artifact, mini-app, or dashboard.
+Always use these tools proactively — the user cannot see images, video, audio, URLs, or files unless you explicitly send them via these tools. Parameter details live on the tools themselves; this skill covers routing judgment. The **app-authoring skill** carries the full authoring contracts (backchannel + theme events, app dashboards, action buttons, live data panels, feeds, file pins) — load it with the Skill tool whenever you are about to build or update a `display_ui` artifact, app, or dashboard.
 
 ### Media routing rules
 
@@ -19,7 +19,7 @@ Always use these tools proactively — the user cannot see images, video, audio,
 
 ### When to reach for `display_ui`
 
-It's occasion-driven, not a default: dense or comparative data that reads better as a real chart or styled table than markdown; a stat summary worth presenting as a dashboard card; a visual explanation (timeline, flow, before/after); a moment worth celebrating with a tasteful animation; or a small self-contained interactive (calculator, unit converter, what-if slider, sortable table, tabbed view). Plain prose or a markdown table is still right for simple answers. Three levels of ambition, all supported: **display** (one-way), **self-contained interactivity** (inputs, client-side calculation), and the **chat backchannel** (`window.otodock.send(payload)` delivers a user gesture back to you as a new framed input) — contracts and snippets in the miniapp-authoring skill.
+It's occasion-driven, not a default: dense or comparative data that reads better as a real chart or styled table than markdown; a stat summary worth presenting as a dashboard card; a visual explanation (timeline, flow, before/after); a moment worth celebrating with a tasteful animation; or a small self-contained interactive (calculator, unit converter, what-if slider, sortable table, tabbed view). Plain prose or a markdown table is still right for simple answers. Three levels of ambition, all supported: **display** (one-way), **self-contained interactivity** (inputs, client-side calculation), and the **chat backchannel** (`window.otodock.send(payload)` delivers a user gesture back to you as a new framed input) — contracts and snippets in the app-authoring skill.
 
 ### Iterating — edit the file, don't resend the html
 
@@ -27,5 +27,5 @@ The ack returns the artifact's file path. To update an artifact you already disp
 
 ### Standing surfaces — offer, don't wait to be asked
 
-- When your domain has an obvious at-a-glance view (home panel, finance overview, ops status board), OFFER to pin a **mini-app dashboard** (`pin_app`) — it outlives every chat; check `list_apps` first so you don't duplicate one. Authoring rules + action buttons: miniapp-authoring skill.
-- To show a **living document** (plan file, spec, notes) on a chat/project Dock, use `pin_file` — it live-renders the file as you edit it. **Never build a mini-app just to display a file.**
+- When your domain has an obvious at-a-glance view (home panel, finance overview, ops status board), OFFER to pin an **app dashboard** (`pin_app`) — it outlives every chat; check `list_apps` first so you don't duplicate one. Authoring rules + action buttons: app-authoring skill.
+- To show a **living document** (plan file, spec, notes) on a chat/project Dock, use `pin_file` — it live-renders the file as you edit it. **Never build an app just to display a file.**

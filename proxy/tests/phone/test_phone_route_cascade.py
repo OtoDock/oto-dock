@@ -8,9 +8,13 @@ exercised without any live PBX.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from storage.phone import phone_route_store
 
 from auth.providers import UserContext, get_current_user
 
@@ -83,6 +87,96 @@ def _verified_server(client, name="pbx"):
     s = client.post("/v1/admin/phone-servers", json={"name": name}).json()
     assert client.post(f"/v1/admin/phone-servers/{s['id']}/bootstrap/verify").status_code == 200
     return s
+
+
+def _admin_user() -> str:
+    """A platform admin qualifies as a route's tied user on any agent."""
+    from storage.pg import get_conn
+    sub = f"admin-{uuid.uuid4().hex[:8]}"
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (sub, email, name, role, username, created_at, last_login) "
+            "VALUES (%s, %s, 'Root', 'admin', %s, NOW()::text, NOW()::text)",
+            (sub, f"{sub}@test.com", f"u{uuid.uuid4().hex[:8]}"),
+        )
+        conn.commit()
+    return sub
+
+
+def _routes(client):
+    return client.get("/v1/admin/phone/routes").json()["routes"]
+
+
+def test_create_user_route_without_pin_needs_the_flag(cascade):
+    client, state = cascade
+    s = _verified_server(client)
+    body = {"direction": "inbound", "did": "+30230", "phone_server_id": s["id"],
+            "identity_mode": "user", "identity_user_sub": _admin_user()}
+    r = client.post("/v1/admin/phone/routes", json=body)
+    assert r.status_code == 400 and "acknowledge_no_pin" in r.json()["detail"]
+    assert "Root" in r.json()["detail"]
+    assert state.calls == [] and _routes(client) == []
+    r = client.post("/v1/admin/phone/routes", json={**body, "acknowledge_no_pin": True})
+    assert r.status_code == 200, r.text
+    assert any("no PIN" in w for w in r.json()["warnings"])
+    assert "acknowledge_no_pin" not in r.json()
+
+
+def test_create_with_a_pin_stores_it_before_provisioning(cascade):
+    client, state = cascade
+    s = _verified_server(client)
+    body = {"direction": "inbound", "did": "+30231", "phone_server_id": s["id"],
+            "identity_mode": "user", "identity_user_sub": _admin_user(), "pin": "907162"}
+    r = client.post("/v1/admin/phone/routes", json=body)
+    assert r.status_code == 200, r.text
+    assert "pin" not in r.json() and "907162" not in r.text
+    assert not any("no PIN" in w for w in r.json()["warnings"])
+    assert phone_route_store.get_route_pin(r.json()["id"]) == "907162"
+    assert ("provision", r.json()["id"]) in state.calls
+    assert _routes(client)[0]["pin_configured"] is True
+
+
+def test_create_with_a_pin_rolls_back_when_the_pin_cannot_be_stored(cascade, monkeypatch):
+    client, state = cascade
+    s = _verified_server(client)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("store down")
+    monkeypatch.setattr(phone_route_store, "set_route_pin", _boom)
+    r = client.post("/v1/admin/phone/routes", json={
+        "direction": "inbound", "did": "+30232", "phone_server_id": s["id"], "pin": "1234"})
+    assert r.status_code == 500 and "PIN" in r.json()["detail"]
+    assert state.calls == [] and _routes(client) == []
+
+
+def test_provision_failure_with_a_pin_drops_the_credential(cascade, monkeypatch):
+    client, state = cascade
+    s = _verified_server(client)
+    state.fail_provision = True
+    stored: list[str] = []
+    real_set = phone_route_store.set_route_pin
+
+    def _record(route_id, pin):
+        stored.append(route_id)
+        real_set(route_id, pin)
+    monkeypatch.setattr(phone_route_store, "set_route_pin", _record)
+    r = client.post("/v1/admin/phone/routes", json={
+        "direction": "inbound", "did": "+30233", "phone_server_id": s["id"], "pin": "1234"})
+    assert r.status_code == 502
+    assert _routes(client) == []
+    assert stored and phone_route_store.get_route_pin(stored[0]) == ""
+
+
+def test_create_refuses_a_pin_on_outbound_and_an_unknown_direction(cascade):
+    client, state = cascade
+    s = _verified_server(client)
+    r = client.post("/v1/admin/phone/routes", json={
+        "direction": "outbound", "phone_server_id": s["id"], "pin": "1234"})
+    assert r.status_code == 400 and "inbound" in r.json()["detail"]
+    r = client.post("/v1/admin/phone/routes", json={
+        "direction": "sideways", "did": "+30234", "phone_server_id": s["id"]})
+    assert r.status_code == 400 and "direction" in r.json()["detail"]
+    assert state.calls == [] and _routes(client) == []
 
 
 def test_create_inbound_provisions_and_persists(cascade):

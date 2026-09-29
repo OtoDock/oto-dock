@@ -15,7 +15,6 @@ cleared, and the ``engine_switched`` ack emitted.
 
 import asyncio
 import uuid
-from types import SimpleNamespace
 
 from tests.fixtures.ws_dashboard_harness import (
     TEST_MODEL,
@@ -90,6 +89,20 @@ def _switch(ws, path: str = "codex-cli", model: str = TEST_MODEL):
                     "execution_path": path, "model": model})
 
 
+def _off_loop_only(monkeypatch, module, name: str):
+    """The store read must reach ``name`` from a worker thread, never on the
+    loop (a read on the loop raises)."""
+    real = getattr(module, name)
+
+    def _guarded(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return real(*a, **kw)
+        raise AssertionError(f"{name} read on the loop")
+    monkeypatch.setattr(module, name, _guarded)
+
+
 # ---------------------------------------------------------------------------
 # Gate ladder — every refusal in handler order.
 # ---------------------------------------------------------------------------
@@ -133,16 +146,17 @@ class TestSwitchEngineGates:
         _grant("codex-cli")
         cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}")
         self._make_task_run(cid, status="completed", agent=slug)
+        from storage import database as task_store
 
         async def scenario():
             async with dashboard_connection(session_cookie()) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
                 await _drain_until(ws, "chat_history")
+                _off_loop_only(monkeypatch, task_store, "get_run")
                 _switch(ws)
                 frame = await _drain_until(ws, "engine_switched")
                 assert frame["execution_path"] == "codex-cli"
-            from storage import database as task_store
             chat = task_store.get_chat(cid)
             assert chat["execution_path"] == "codex-cli"
             assert chat["pending_history_seed"].startswith("engine_switch:")
@@ -244,19 +258,24 @@ class TestSwitchEngineGates:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
                 await _drain_until(ws, "chat_history")
+                _off_loop_only(monkeypatch, task_store, "list_continuations_for_chat")
                 _switch(ws)
                 frame = await _drain_until(ws, "switch_engine_denied")
                 assert "follow-up" in frame["message"]
         run_ws_scenario(scenario)
 
     def test_non_owner_refused(self, temp_db, monkeypatch):
+        # A Shared-only agent's assigned viewer opens the shared pool's chat
+        # (the ``agent::`` owner every dashboard chat on such an agent gets)
+        # but is nobody's owner there.
+        from core.session.visibility import shared_chat_owner
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent(default_scope="agent", collaborative=False)
         _enable_codex(slug)
         task_store.set_user_agents("user-viewer", [slug], "user-admin",
                                    agent_roles={slug: "viewer"})
-        cid = _make_chat(slug, user_sub="user-admin")
+        cid = _make_chat(slug, user_sub=shared_chat_owner(slug))
 
         async def scenario():
             cookie = session_cookie(sub="user-viewer", email="viewer@test.com",
@@ -346,19 +365,19 @@ class TestSwitchEngineGates:
         run_ws_scenario(scenario)
 
     def test_alive_headless_session_refused(self, temp_db, monkeypatch):
-        # chat_process_alive checks REGISTRY membership (the stored path may
-        # be stale) — a live entry in the cli pool refuses the switch.
-        stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
+        # chat_process_alive asks the LAYER that HOLDS the session (the chat's
+        # stored execution_path may be stale, so membership decides, not the
+        # row) — a live headless session refuses the switch.
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
         slug = make_test_agent()
         _enable_codex(slug)
         _grant("codex-cli")
         sid = str(uuid.uuid4())
         cid = _make_chat(slug, session_id=sid)
+        layer.alive.add(sid)
 
         async def scenario():
-            from core.layers.cli import session as cli_session
-            monkeypatch.setitem(cli_session._persistent_sessions, sid,
-                                SimpleNamespace(is_alive=True))
             async with dashboard_connection(session_cookie()) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
@@ -534,6 +553,15 @@ class TestProbeLiveness:
         sid = str(uuid.uuid4())
         cid = _make_chat(slug, session_id=sid)
 
+        # The probe reads the run row off the loop: the synchronous
+        # read must never run from the handler.
+        import ws.dashboard as wsd
+
+        def _on_loop(cid):
+            raise AssertionError("task_run_active read on the loop")
+        monkeypatch.setattr(wsd, "task_run_active", _on_loop)
+        from storage import database as task_store
+
         async def scenario():
             from core.session import interactive_session as isess_mod
             try:
@@ -541,6 +569,7 @@ class TestProbeLiveness:
                     await drain_startup(ws)
                     ws.client_send({"type": "resume_chat", "chat_id": cid})
                     await _drain_until(ws, "queue_snapshot")
+                    _off_loop_only(monkeypatch, task_store, "get_chat")
                     ws.client_send({"type": "probe_liveness"})
                     frame = await _drain_until(ws, "liveness")
                     assert frame == {"type": "liveness", "chat_id": cid,
@@ -640,7 +669,7 @@ class TestEngineSwitchSeedReason:
         task_store.update_chat(cid,
                                pending_history_seed="engine_switch:codex-cli")
         digest, notice = history_seed.consume_pending_seed_digest(cid)
-        assert "previous engine: Codex" in notice
+        assert "previous engine: OpenAI Codex" in notice  # the engine's display_name
         assert digest  # conversation restored
         # Claimed exactly once; card persisted with the machine-readable kind.
         assert task_store.get_chat(cid)["pending_history_seed"] == ""

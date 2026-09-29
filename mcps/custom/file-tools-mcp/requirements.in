@@ -13,6 +13,10 @@ matplotlib>=3.8
 rembg[cpu]>=2.0
 starlette>=1.3.1
 uvicorn
+# The headless browser of the app checks (render.py): the package bundles
+# Playwright's driver; the browser itself is installed by the Dockerfile
+# (chromium-headless-shell under PLAYWRIGHT_BROWSERS_PATH).
+playwright>=1.62,<2
 # Equation pipeline: LaTeX → MathML → OMML (docx) / SVG (pdf) / PNG (pptx, xlsx)
 lxml>=5.0
 latex2mathml>=3.78

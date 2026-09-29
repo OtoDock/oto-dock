@@ -198,7 +198,8 @@ class TestStore:
         route = _make_route(agent, identity_mode="user", identity_user_sub=sub, role="manager")
         pushed = {r["id"]: r for r in assemble_phone_config()["routes"]}
         row = pushed[route["id"]]
-        for key in ("identity_mode", "identity_user_sub", "role", "remember_callers"):
+        for key in ("identity_mode", "identity_user_sub", "role", "remember_callers",
+                    "acknowledge_no_pin"):
             assert key not in row
         assert sub not in str(row)
 
@@ -263,11 +264,164 @@ class TestValidators:
         nameless = _make_user(username="", agents=(agent,))
         r = self._put(client, route["id"], {"identity_mode": "user", "identity_user_sub": nameless})
         assert r.status_code == 400 and "username" in r.json()["detail"]
-        # Assigned user: OK; a platform admin needs no assignment.
+        # Assigned user: OK; a platform admin needs no assignment. (An inbound
+        # user line without a PIN needs the acknowledgement, below.)
         member = _make_user(agents=(agent,))
-        assert self._put(client, route["id"], {"identity_mode": "user", "identity_user_sub": member}).status_code == 200
+        assert self._put(client, route["id"], {
+            "identity_mode": "user", "identity_user_sub": member,
+            "acknowledge_no_pin": True,
+        }).status_code == 200
         admin = _make_user(role="admin", username="root")
-        assert self._put(client, route["id"], {"identity_user_sub": admin}).status_code == 200
+        assert self._put(client, route["id"], {
+            "identity_user_sub": admin, "acknowledge_no_pin": True,
+        }).status_code == 200
+
+    def test_user_mode_inbound_without_pin_needs_the_acknowledgement(self, client):
+        """A user-mode inbound route saves without a PIN only
+        when the request says so; the refusal names the user and the flag,
+        and the row stays as it was."""
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent)
+        body = {"identity_mode": "user", "identity_user_sub": member}
+        r = self._put(client, route["id"], body)
+        assert r.status_code == 400, r.text
+        detail = r.json()["detail"]
+        assert "acknowledge_no_pin" in detail and member in detail
+        assert "tools and credentials" in detail
+        assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
+        r = self._put(client, route["id"], {**body, "acknowledge_no_pin": True})
+        assert r.status_code == 200, r.text
+        assert any("no PIN" in w for w in r.json()["warnings"])
+        assert "acknowledge_no_pin" not in r.json()
+        # An outbound user route needs no flag (there is no PIN to set).
+        outbound = _make_route(agent, "outbound")
+        assert self._put(client, outbound["id"], body).status_code == 200
+
+    def test_a_pin_in_the_save_satisfies_the_rule(self, client):
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent)
+        body = {"identity_mode": "user", "identity_user_sub": member}
+        # A malformed or empty PIN is refused before anything changes.
+        for bad in ("12", "", "12345678", "abcd"):
+            r = self._put(client, route["id"], {**body, "pin": bad})
+            assert r.status_code == 400 and "4 to 6 digits" in r.json()["detail"], bad
+        assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
+        assert phone_route_store.get_route_pin(route["id"]) == ""
+        r = self._put(client, route["id"], {**body, "pin": "907162"})
+        assert r.status_code == 200, r.text
+        assert "pin" not in r.json() and "907162" not in r.text
+        assert not any("no PIN" in w for w in r.json()["warnings"])
+        assert phone_route_store.get_route_pin(route["id"]) == "907162"
+        listed = {x["id"]: x for x in client.get("/v1/admin/phone/routes").json()["routes"]}
+        assert listed[route["id"]]["pin_configured"] is True
+        # `pin: null` means no change.
+        r = self._put(client, route["id"], {**body, "pin": None})
+        assert r.status_code == 200
+        assert phone_route_store.get_route_pin(route["id"]) == "907162"
+
+    def test_a_pin_needs_an_inbound_post_save_direction(self, client):
+        agent = _make_agent()
+        route = _make_route(agent)
+        r = self._put(client, route["id"], {"direction": "outbound", "pin": "1234"})
+        assert r.status_code == 400 and "inbound" in r.json()["detail"]
+        assert phone_route_store.get_route(route["id"])["direction"] == "inbound"
+        # With a stored PIN the direction check still answers before the 409.
+        phone_route_store.set_route_pin(route["id"], "1234")
+        r = self._put(client, route["id"], {"direction": "outbound", "pin": "1234"})
+        assert r.status_code == 400 and "inbound" in r.json()["detail"]
+        outbound = _make_route(agent, "outbound")
+        assert self._put(client, outbound["id"], {"pin": "1234"}).status_code == 400
+
+    def test_direction_is_an_enum(self, client):
+        agent = _make_agent()
+        route = _make_route(agent)
+        r = self._put(client, route["id"], {"direction": "sideways"})
+        assert r.status_code == 400 and "direction" in r.json()["detail"]
+        assert phone_route_store.get_route(route["id"])["direction"] == "inbound"
+
+    def test_edits_without_identity_keys_never_need_the_flag(self, client):
+        """A route saved before the rule keeps working: the table's enable
+        toggle and a rename never carry identity keys; re-submitting its
+        identity (the form sends every field) is judged."""
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent, identity_mode="user", identity_user_sub=member)
+        assert self._put(client, route["id"], {"enabled": False}).status_code == 200
+        assert self._put(client, route["id"], {"name": "renamed"}).status_code == 200
+        r = self._put(client, route["id"], {"identity_mode": "user", "identity_user_sub": member})
+        assert r.status_code == 400
+
+    def test_explicit_nulls_never_skip_the_rules(self, client):
+        """A null in the body is "no change" (the store drops it): the rules
+        judge the row that will be written, so a null direction or identity
+        mode cannot stand in for a value that would fail them."""
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent)
+        r = self._put(client, route["id"], {
+            "direction": None, "identity_mode": "user", "identity_user_sub": member,
+        })
+        assert r.status_code == 400 and "acknowledge_no_pin" in r.json()["detail"]
+        assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
+        user_route = _make_route(agent, identity_mode="user", identity_user_sub=member)
+        stranger = _make_user()
+        r = self._put(client, user_route["id"], {
+            "identity_mode": None, "identity_user_sub": stranger,
+        })
+        assert r.status_code == 400 and "no access" in r.json()["detail"]
+        assert phone_route_store.get_route(user_route["id"])["identity_user_sub"] == member
+
+    def test_pin_removal_on_a_user_route_needs_the_flag(self, client):
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent, identity_mode="user", identity_user_sub=member)
+        phone_route_store.set_route_pin(route["id"], "4711")
+        r = client.delete(f"/v1/admin/phone/routes/{route['id']}/pin")
+        assert r.status_code == 400 and "acknowledge_no_pin" in r.json()["detail"]
+        assert phone_route_store.get_route_pin(route["id"]) == "4711"
+        r = client.delete(f"/v1/admin/phone/routes/{route['id']}/pin",
+                          params={"acknowledge_no_pin": "true"})
+        assert r.status_code == 200 and any("no PIN" in w for w in r.json()["warnings"])
+        assert phone_route_store.get_route_pin(route["id"]) == ""
+        # Nothing stored any more: a repeat needs no flag.
+        assert client.delete(f"/v1/admin/phone/routes/{route['id']}/pin").status_code == 200
+        # A caller-mode route never needs it.
+        caller = _make_route(agent)
+        phone_route_store.set_route_pin(caller["id"], "4711")
+        assert client.delete(f"/v1/admin/phone/routes/{caller['id']}/pin").status_code == 200
+        assert phone_route_store.get_route_pin(caller["id"]) == ""
+
+    def test_the_pin_lands_before_the_row_and_is_restored_on_a_later_failure(
+            self, client, monkeypatch):
+        agent = _make_agent()
+        member = _make_user(agents=(agent,))
+        route = _make_route(agent)
+        body = {"identity_mode": "user", "identity_user_sub": member, "pin": "4711"}
+
+        real_set, real_update = phone_route_store.set_route_pin, phone_route_store.update_route
+
+        def _boom(*a, **kw):
+            raise RuntimeError("store down")
+        # The credential store fails: 500, nothing changed.
+        monkeypatch.setattr(phone_route_store, "set_route_pin", _boom)
+        r = self._put(client, route["id"], body)
+        assert r.status_code == 500 and "4711" not in r.text
+        assert phone_route_store.get_route(route["id"])["identity_mode"] == "caller"
+        assert phone_route_store.get_route_pin(route["id"]) == ""
+        monkeypatch.setattr(phone_route_store, "set_route_pin", real_set)
+        # The row write fails after the PIN landed: the PIN state is restored.
+        monkeypatch.setattr(phone_route_store, "update_route", _boom)
+        with pytest.raises(RuntimeError):
+            self._put(client, route["id"], body)
+        assert phone_route_store.get_route_pin(route["id"]) == ""
+        monkeypatch.setattr(phone_route_store, "update_route", real_update)
+        phone_route_store.set_route_pin(route["id"], "2468")
+        monkeypatch.setattr(phone_route_store, "update_route", _boom)
+        with pytest.raises(RuntimeError):
+            self._put(client, route["id"], body)
+        assert phone_route_store.get_route_pin(route["id"]) == "2468"
 
     def test_user_mode_warnings(self, client):
         agent = _make_agent()
@@ -279,7 +433,8 @@ class TestValidators:
         client.put(f"/v1/admin/phone/routes/{inbound['id']}/pin", json={"value": "4711"})
         listed = {r["id"]: r for r in client.get("/v1/admin/phone/routes").json()["routes"]}
         assert listed[inbound["id"]]["warnings"] == []
-        r = client.delete(f"/v1/admin/phone/routes/{inbound['id']}/pin")
+        r = client.delete(f"/v1/admin/phone/routes/{inbound['id']}/pin",
+                          params={"acknowledge_no_pin": "true"})
         assert any("no PIN" in w for w in r.json()["warnings"])
         # Outbound user-tied route: whoever answers acts as the user.
         outbound = _make_route(agent, "outbound", identity_mode="user", identity_user_sub=member)
@@ -308,7 +463,9 @@ class TestValidators:
         listed = {r["id"]: r for r in client.get("/v1/admin/phone/routes").json()["routes"]}
         assert listed[route["id"]]["warnings"] == []
         admin = _make_user(role="admin", username="root")
-        r = self._put(client, route["id"], {"identity_mode": "user", "identity_user_sub": admin})
+        r = self._put(client, route["id"], {
+            "identity_mode": "user", "identity_user_sub": admin, "acknowledge_no_pin": True,
+        })
         assert r.status_code == 200
         assert not any("Codex" in w for w in r.json()["warnings"])
 

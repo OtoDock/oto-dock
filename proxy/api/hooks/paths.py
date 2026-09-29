@@ -14,16 +14,20 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+import re
+
 import config
 from auth.path_policy import (
     SecurityContext,
     enforce_agent_tree_rbac,
     check_host_path_access,
 )
-from api.sessions.sessions import verify_session_match
+from api.sessions.sessions import verify_session_match_async
 from core.session.session_state import (
     get_session_security,
 )
+from auth import roles
+from core import layout
 
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathResolution
@@ -72,7 +76,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
             metadata sidecar so write-back targets the original
             absolute path on the satellite.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     ctx = get_session_security(req.session_id)
     if not ctx:
@@ -110,11 +114,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
             acc = check_host_path_access(candidate, ctx, writing=False)
             if not acc.allowed:
                 raise HTTPException(status_code=403, detail=acc.reason or "access denied")
-            host_path = str(candidate)
-            return {
-                "host_path": host_path,
-                "agents_relative": _to_agents_relative(host_path),
-            }
+            return _answer(str(candidate), ctx)
 
     from core.remote import remote_file_flow
     is_remote = remote_file_flow.is_remote_session(req.session_id)
@@ -174,14 +174,12 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
                 status_code=404,
                 detail=f"file not reachable on satellite: {resolution.access_path}",
             )
-        host_path = str(cached)
         # The cache lives under AGENTS_DIR/.remote-host-cache/ so the
         # Docker MCP's /agents mount resolves it. Returning the
         # agents-relative form lets file-tools' existing
         # `MOUNT_AGENTS_DIR + agents_rel` logic work unchanged — no
         # MCP-side code change needed for satellite-host paths.
-        agents_rel = _to_agents_relative(host_path)
-        return {"host_path": host_path, "agents_relative": agents_rel}
+        return _answer(str(cached), ctx)
 
     # ANY policy denial → 403 with the resolver's reason. This must precede both
     # the remote pull-through and the local _sandbox_to_host translate below: a
@@ -215,9 +213,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
             rel = raw.lstrip("/")
         cached = await remote_file_flow.pull_through(req.session_id, rel)
         if cached is not None and cached.is_file():
-            host_path = str(cached)
-            agents_rel = _to_agents_relative(host_path)
-            return {"host_path": host_path, "agents_relative": agents_rel}
+            return _answer(str(cached), ctx)
         # WRITE target that doesn't exist on the satellite yet (new output
         # file): resolve to the platform creation path — the Docker MCP
         # writes there and /v1/hooks/file-written pushes it back. Without
@@ -238,9 +234,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
                     create_host.relative_to(agent_dir.resolve())
                 except ValueError:
                     raise HTTPException(status_code=403, detail="access denied")
-                host_path = str(create_host)
-                agents_rel = _to_agents_relative(host_path)
-                return {"host_path": host_path, "agents_relative": agents_rel}
+                return _answer(str(create_host), ctx)
 
     # Translate sandbox-internal paths to host paths (local sessions). Re-gate
     # the TRANSLATED host path: _sandbox_to_host is purely lexical, and an
@@ -255,8 +249,25 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
         acc = check_host_path_access(Path(host_path), ctx, writing=req.writing)
         if not acc.allowed:
             raise HTTPException(status_code=403, detail=acc.reason or "access denied")
-    agents_rel = _to_agents_relative(host_path)
-    return {"host_path": host_path, "agents_relative": agents_rel}
+    return _answer(host_path, ctx)
+
+
+def _answer(host_path: str, ctx) -> dict:
+    """The hook's answer: the host path, its agents-relative form and the
+    agent whose folder it sits in (the session's own, or the host-cache
+    pseudo-agent for a satellite-host pull), which the consumer confines
+    its writes to. Judged on the host path the hook itself joined, never
+    on the caller's string."""
+    from core.remote import remote_file_flow
+    agent = (
+        ".remote-host-cache" if remote_file_flow.is_host_cache_path(host_path)
+        else ctx.agent
+    )
+    return {
+        "host_path": host_path,
+        "agents_relative": _to_agents_relative(host_path),
+        "agent": agent,
+    }
 
 
 # (removed: _looks_sandbox_virtual — the resolve-path policy-reject branch now
@@ -270,10 +281,11 @@ def _session_scope_root(ctx: SecurityContext, agent_dir: Path) -> Path:
     from core.session.external_identity import external_home_of
     ext_home = external_home_of(ctx)
     if ext_home:
-        return Path(ext_home) / "workspace"
-    if ctx.mount_username:
-        return agent_dir / "users" / ctx.mount_username / "workspace"
-    return agent_dir / "workspace"
+        return Path(ext_home) / layout.WORKSPACE
+    return layout.workspace_dir(agent_dir, ctx.mount_username)
+
+
+_SLASH_RUN_RE = re.compile(r"/{2,}")
 
 
 def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -> str:
@@ -283,8 +295,14 @@ def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -
     identity ("" for agent-scope mounts, including Shared-only human chats,
     whose ``ctx.username`` stays set for attribution). Keying on the raw
     username misdirected Shared-only sessions' paths into per-user dirs
-    that their mode doesn't even mount (found live 2026-07-10)."""
-    p = sandbox_path
+    that their mode doesn't even mount (found live 2026-07-10).
+
+    A run of slashes is collapsed first: the ``Path`` joins below slice the
+    root off (``p[11:]``), and ``pathlib`` restarts a join at an absolute
+    component — ``/workspace//etc/passwd`` mapped to ``/etc/passwd`` while
+    the policy verdict before it had judged the collapsed form (core-seams
+    phase 10, audit A1)."""
+    p = _SLASH_RUN_RE.sub("/", sandbox_path)
 
     # External caller with a private tree (SecurityContext.external_home):
     # /caller, /.claude, /.codex and /context ARE that tree, and a viewer's
@@ -303,28 +321,28 @@ def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -
         if p.startswith("/.codex/") or p == "/.codex":
             return str(home / ".codex" / p[8:])
         if p.startswith("/context/") or p == "/context":
-            return str(home / "context" / p[9:])
-        if ctx.role == "viewer" and (p.startswith("/workspace/") or p == "/workspace"):
-            return str(home / "workspace" / p[11:])
+            return str(home / layout.CONTEXT / p[9:])
+        if ctx.role == roles.VIEWER and layout.under(p, layout.V_WORKSPACE):
+            return str(home / layout.WORKSPACE / p[11:])
 
     # /.claude/ → session's .claude/ dir
     if p.startswith("/.claude/") or p == "/.claude":
         if ctx.mount_username:
-            return str(agent_dir / "users" / ctx.mount_username / ".claude" / p[9:])
-        return str(agent_dir / "workspace" / ".claude" / p[9:])
+            return str(layout.user_dir(agent_dir, ctx.mount_username) / ".claude" / p[9:])
+        return str(agent_dir / layout.WORKSPACE / ".claude" / p[9:])
 
-    # Viewer redirect: for viewers, Docker MCPs that say `/workspace/foo`
-    # mean THEIR personal workspace (matches their `OTO_WORKSPACE_DIR =
-    # /users/{u}/workspace` for stdio MCPs). The viewer's bwrap mount ALSO
-    # exposes the shared `/workspace` RO (expanded viewer reads),
-    # so stdio Read sees shared content, but Docker MCPs see per-user —
-    # this is the intentional asymmetry: writes via Docker MCPs land in
-    # the user's own dir, not the shared workspace.
-    if ctx.role == "viewer" and ctx.mount_username:
-        if p.startswith("/workspace/") or p == "/workspace":
-            return str(agent_dir / "users" / ctx.mount_username / "workspace" / p[11:])
+    # Viewer redirect: below the workspace tier, Docker MCPs that say
+    # `/workspace/foo` mean THEIR personal workspace (matches their
+    # `OTO_WORKSPACE_DIR = /users/{u}/workspace` for stdio MCPs). The
+    # viewer's bwrap mount ALSO exposes the shared `/workspace` RO (expanded
+    # viewer reads), so stdio Read sees shared content, but Docker MCPs see
+    # per-user — this is the intentional asymmetry: writes via Docker MCPs
+    # land in the user's own dir, not the shared workspace.
+    if not roles.can_write_workspace(ctx.role) and ctx.mount_username:
+        if layout.under(p, layout.V_WORKSPACE):
+            return str(layout.workspace_dir(agent_dir, ctx.mount_username) / p[11:])
         if p.startswith("/context/") or p == "/context":
-            return str(agent_dir / "users" / ctx.mount_username / "context" / p[9:])
+            return str(layout.context_dir(agent_dir, ctx.mount_username) / p[9:])
 
     # Editor / Manager / Admin: /workspace/ → shared workspace.
     # /config/ is owner-only — editor's bwrap doesn't mount it
@@ -332,19 +350,20 @@ def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -
     # /config for an editor session, the host path resolves but the file
     # is owner-curated; documented residual (Docker MCPs bypass bwrap +
     # path_policy hook — same gap as `satellite has no bwrap`).
-    if p.startswith("/config/") or p == "/config":
-        return str(agent_dir / "config" / p[8:])
-    if p.startswith("/workspace/") or p == "/workspace":
-        return str(agent_dir / "workspace" / p[11:])
+    if layout.under(p, layout.V_CONFIG):
+        return str(agent_dir / layout.CONFIG / p[8:])
+    if layout.under(p, layout.V_WORKSPACE):
+        return str(agent_dir / layout.WORKSPACE / p[11:])
 
-    # /users/{username}/ → users/{username}/
-    if p.startswith("/users/"):
+    # /users/{username}/ → users/{username}/ (a bare ``/users`` takes the
+    # fallback below, as it always did)
+    if p.startswith(layout.V_USERS + "/"):
         return str(agent_dir / p[1:])  # strip leading /
 
     # /context/ for viewer (already handled above, but safety)
     if p.startswith("/context/") or p == "/context":
         if ctx.mount_username:
-            return str(agent_dir / "users" / ctx.mount_username / "context" / p[9:])
+            return str(layout.context_dir(agent_dir, ctx.mount_username) / p[9:])
 
     # NOTE: the legacy "/includes/<sub-agent>/" cross-agent translation was
     # removed. No component produced it, and it let a session map ANY agent's
@@ -410,7 +429,7 @@ async def resolve_tool_arg_paths(
     fields — the interceptor synthesizes a JSON-RPC tool-error to the
     LLM when any item is rejected.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     ctx = get_session_security(req.session_id)
     if not ctx:

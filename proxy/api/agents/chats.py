@@ -4,6 +4,7 @@ CRUD endpoints for chats and messages, authenticated via JWT session cookie.
 """
 
 import asyncio
+import functools
 import logging
 import re
 import unicodedata
@@ -13,7 +14,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from storage import database as task_store
+from storage.pg import run_db
+from core import placement
+from core.events import chat_writer
 from auth.providers import UserContext, get_current_user, require_auth, require_agent_access
+from core.session import session_kind
+from core.session.visibility import is_phone_chat_owner, is_task_chat_owner
+from auth import roles
+from core.session import visibility as _vis
+from ws import chat_phase
+from core import layout
 
 logger = logging.getLogger("claude-proxy.chat-api")
 router = APIRouter()
@@ -72,8 +82,8 @@ def _run_for_chat(chat: dict) -> dict | None:
     stamp window (run row exists, ``chat_id`` not yet pointing at it)."""
     chat_id = chat.get("id", "")
     run = task_store.get_run_for_chat(chat_id)
-    if run is None and chat_id.startswith("task-"):
-        run = task_store.get_run(chat_id.removeprefix("task-"))
+    if run is None and session_kind.is_task_chat_id(chat_id):
+        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
     return run
 
 
@@ -82,15 +92,12 @@ def _task_mutation_allowed(role: str, acting: str, scope: str,
     """The task mutation matrix (mirrors ``api/tasks``' ``_check_task_permission``):
     user-scope → creator only; agent-scope → admin/manager any, editor only
     their own, viewer never."""
-    if role == "admin":
+    if roles.is_admin(role):
         return True
-    if (scope or "agent") == "user":
-        return bool(acting) and created_by == acting
-    if role == "manager":
-        return True
-    if role == "editor":
-        return bool(acting) and created_by == acting
-    return False
+    own = bool(acting) and created_by == acting
+    if (scope or _vis.SCOPE_AGENT) == _vis.SCOPE_USER:
+        return own
+    return roles.may_mutate_shared(role, own=own)
 
 
 def can_access_chat(u: UserContext, chat: dict) -> bool:
@@ -112,7 +119,7 @@ def can_access_chat(u: UserContext, chat: dict) -> bool:
         return True
     if is_shared_chat_owner(owner):
         return u.can_access_agent(chat.get("agent", ""))
-    if owner.startswith("task::") or chat.get("id", "").startswith("task-"):
+    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
         run = _run_for_chat(chat)
         if run is not None:
             if (run.get("scope") or "agent") == "user":
@@ -143,7 +150,7 @@ def can_mutate_chat(u: UserContext, chat: dict, run: dict | None = None,
         run = _run_for_chat(chat)
     if run is not None:
         return _task_mutation_allowed(
-            u.get_agent_role(chat.get("agent", "")), u.acting_sub or "",
+            u.acting_role(chat.get("agent", "")), u.acting_sub or "",
             run.get("scope") or "agent", run.get("created_by") or "",
         )
     owner = chat.get("user_sub", "")
@@ -161,14 +168,12 @@ def _task_scope_sub(u: UserContext) -> str | None:
     return None if u.is_service else (u.acting_sub or "")
 
 
-@router.get("/v1/chats")
-async def list_chats(
-    agent: str | None = Query(None),
-    kind: str = Query("chats", pattern="^(chats|tasks)$"),
-    limit: int = Query(50, ge=1, le=200),
-    user: UserContext | None = Depends(get_current_user),
-):
-    u = require_auth(user)
+def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
+                     limit: int) -> list[dict]:
+    """The listing as ONE executor job: the access checks, the store reads
+    and the flag stamping together, so the 30 s poll of every open
+    dashboard costs the loop a hand-off and a JSON render, nothing more.
+    A refusal raised here is answered exactly as before."""
     # kind=tasks → the sidebar's task mode: the agent's task-run chats joined
     # with their latest run, gated by the run rules (see _task_scope_sub).
     if kind == "tasks":
@@ -177,14 +182,27 @@ async def list_chats(
         require_agent_access(u, agent)
         chats = task_store.list_task_chats(agent, _task_scope_sub(u), limit=limit)
         _stamp_mutation_flags(u, chats)
-        return {"chats": chats}
+        return chats
     # Shared-only agents have ONE shared chat list (synthetic owner); every
     # other mode lists the user's own. A global (no-agent) list stays per-user.
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub) if agent else u.sub
+    if owner != u.sub:
+        require_agent_access(u, agent)  # the shared pool is its members' only
     chats = task_store.list_chats(owner, agent=agent, limit=limit)
     _stamp_mutation_flags(u, chats)
-    return {"chats": chats}
+    return chats
+
+
+@router.get("/v1/chats")
+async def list_chats(
+    agent: str | None = Query(None),
+    kind: str = Query("chats", pattern="^(chats|tasks)$"),
+    limit: int = Query(50, ge=1, le=200),
+    user: UserContext | None = Depends(get_current_user),
+):
+    u = require_auth(user)
+    return {"chats": await run_db(_list_chats_sync, u, agent, kind, limit)}
 
 
 def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
@@ -213,11 +231,51 @@ def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
         r["can_delete"] = can_mutate_chat(u, r, run, run_resolved=True)
         if r.get("task_name") and r.get("task_id"):
             r["can_rename"] = _task_mutation_allowed(
-                u.get_agent_role(r.get("agent", "")), u.acting_sub or "",
+                u.acting_role(r.get("agent", "")), u.acting_sub or "",
                 r.get("task_scope") or "agent", r.get("task_created_by") or "",
             )
         else:
             r["can_rename"] = r["can_delete"]
+        # Sharing a chat as a snapshot (SHARING.md): the owner of a per-user
+        # chat, editor and above on a shared-only agent's chat, never a task
+        # run — the same rule the share routes apply.
+        r["can_share"] = run is None and can_share_chat(u, r)
+
+
+def can_share_chat(u: UserContext, chat: dict) -> bool:
+    """May this user share the chat as a snapshot? Cookie principals only
+    decide at the route (``require_human``); this is the role half."""
+    from core.session.visibility import is_shared_chat_owner
+    owner = chat.get("user_sub", "") or ""
+    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
+        return False
+    if is_phone_chat_owner(owner):
+        return False
+    if u.is_admin:
+        return True
+    if is_shared_chat_owner(owner):
+        return u.can_edit_agent(chat.get("agent", ""))
+    return owner == u.sub
+
+
+def sub_can_share_chat(sub: str, chat: dict) -> bool:
+    """``can_share_chat`` for a stored sub (a link's creator, re-checked at
+    every click): their CURRENT platform and per-agent role."""
+    from core.session.visibility import is_shared_chat_owner
+    if not sub:
+        return False
+    user = task_store.get_user(sub)
+    if not user:
+        return False
+    owner = chat.get("user_sub", "") or ""
+    if is_task_chat_owner(owner) or is_phone_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
+        return False
+    role = roles.effective_role(user.get("role"), task_store.get_user_agent_roles(sub), chat.get("agent", ""))
+    if roles.is_admin(role):
+        return True
+    if is_shared_chat_owner(owner):
+        return roles.can_edit(role)
+    return owner == sub
 
 
 def _widget_shows_agent(u: UserContext, agent: str) -> bool:
@@ -243,13 +301,18 @@ def _widget_chat_visible(u: UserContext, chat: dict) -> bool:
     return is_shared_chat_owner(owner) and _widget_shows_agent(u, chat.get("agent", ""))
 
 
-def _shape_active_row(u: UserContext, chat: dict, status: str) -> dict | None:
+def _shape_active_row(u: UserContext, chat: dict, status: str, *,
+                      runs: dict[str, dict], dyn_names: dict[str, str]) -> dict | None:
     """One Active-now widget row, or None when the viewer must not see it.
+    ``runs`` (run id → row) and ``dyn_names`` (task id → name) are the
+    batched reads of ``_active_rows``; a run absent from the map hides the
+    row exactly as an absent row did.
 
     Shared by the streaming set and the warming backfill so BOTH re-derive
     per-viewer visibility from the CHAT ROW with the same gates:
 
-    - Task rows (``task-run-…`` ids) click through to the per-agent Task
+    - Task rows (``session_kind.of_chat(chat) is TASK`` — the column, or the
+      ``task-`` id for a row minted before the write) click through to the per-agent Task
       History, which scopes runs like /v1/tasks/runs (audit=false):
       agent-scoped runs for anyone with agent access, user-scoped runs only
       for their creator — deliberately NO admin bypass (the admin audit page
@@ -264,16 +327,15 @@ def _shape_active_row(u: UserContext, chat: dict, status: str) -> dict | None:
     from core.session.visibility import is_shared_chat_owner
     cid = chat.get("id", "")
     title = chat.get("title") or ""
-    if cid.startswith("task-run-"):
-        run = task_store.get_run(cid.removeprefix("task-"))
+    kind = session_kind.of_chat(chat)
+    if kind is session_kind.TASK:
+        run = runs.get(session_kind.run_id_of_chat(cid))
         if not run or not _widget_shows_agent(u, run.get("agent", "")):
             return None
         if (run.get("scope") or "agent") == "user" and \
                 run.get("created_by") != u.acting_sub:
             return None
-        dyn = task_store.get_dynamic_task(run.get("task_id") or "")
-        if dyn and dyn.get("name"):
-            title = dyn["name"]
+        title = dyn_names.get(run.get("task_id") or "") or title
     elif not _widget_chat_visible(u, chat):
         return None
     return {
@@ -281,12 +343,10 @@ def _shape_active_row(u: UserContext, chat: dict, status: str) -> dict | None:
         "agent": chat.get("agent", ""),
         "title": title,
         "status": status,
-        # Task-run chats are created with the DEFAULT source_type
-        # ('chat') — their durable marker is the id prefix. The widget
-        # renders task rows purple and routes them to the run view,
-        # so report them as what they are.
-        "source_type": ("task" if cid.startswith("task-run-")
-                        else chat.get("source_type") or ""),
+        # The row's kind — the column, or the id prefix for a task row
+        # minted before the column was written (session_kind.of_chat). The
+        # widget renders task rows purple and routes them to the run view.
+        "source_type": kind.source_type,
         "owner_is_shared": is_shared_chat_owner(chat.get("user_sub", "")),
         "last_response_at": chat.get("last_response_at"),
     }
@@ -304,8 +364,10 @@ async def list_active_chats(
     receives; this endpoint only supplies the metadata (title/agent) those
     broadcasts don't carry. Composition mirrors the WS connect snapshot
     (``ws/dashboard.py`` chat_status_snapshot): the union of pump turns and
-    interactive PTY turns — both in-memory sets, so this is cheap (one
-    ``get_chat`` per active id, no table scans). Per-row visibility is
+    interactive PTY turns: both in-memory sets, snapshotted here and
+    resolved by ``_active_rows`` as ONE executor job of three batched reads
+    (a burst of tabs re-seeding on one ``chat_status`` frame costs the loop
+    nothing measurable). Per-row visibility is
     ASSIGNMENT-scoped (``_widget_chat_visible``): own chats + shared chats of
     agents on the viewer's list — deliberately narrower than
     ``can_access_chat``'s admin bypass, matching the ``chat_status`` WS
@@ -316,48 +378,59 @@ async def list_active_chats(
     u = require_auth(user)
     from core.session.session_state import streaming_chat_ids as pump_streaming
     from core.session import interactive_session, warmup_registry
-    from core.session.visibility import is_shared_chat_owner
-
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for cid in list(pump_streaming()) + list(interactive_session.streaming_chat_ids()):
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-        chat = task_store.get_chat(cid)
-        if not chat:
-            continue
-        row = _shape_active_row(u, chat, "streaming")
-        if row:
-            rows.append(row)
+    from datetime import datetime, timedelta, timezone
 
     # Warming backfill: chats registered as warming have NO open turn yet, so
-    # the streaming sets above miss them — but the title is already persisted
+    # the streaming sets miss them, but the title is already persisted
     # (_persist_first_prompt runs before the warmup frame goes out), which is
     # exactly the metadata the client's placeholder row needs. The registry
     # entry's user_sub is the WARMER, not the audience — visibility comes from
     # the chat row via the same gates as the streaming set. A registry entry
-    # with no DB row is skipped. `seen` keeps the streaming row when a turn
-    # opened between the two snapshots (unregister precedes kick/submit, but
-    # stay defensive).
-    for cid in warmup_registry.inflight_chat_ids():
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-        chat = task_store.get_chat(cid)
-        if not chat:
-            continue
-        row = _shape_active_row(u, chat, "warming")
-        if row:
-            rows.append(row)
+    # with no DB row is skipped. The streaming row wins when a turn opened
+    # between the two snapshots (unregister precedes kick/submit, but stay
+    # defensive). The 48h window of the finished backfill is fixed here too.
+    streaming = list(pump_streaming()) + list(interactive_session.streaming_chat_ids())
+    warming = list(warmup_registry.inflight_chat_ids())
+    since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    return {"chats": await run_db(_active_rows, u, streaming, warming, since)}
+
+
+def _active_rows(u: UserContext, streaming_ids: list[str], warming_ids: list[str],
+                 since: str) -> list[dict]:
+    """The Active-now rows for the id snapshots the handler took, as ONE
+    executor job: the chat rows, the run rows behind the task chats and
+    their task names in three batched reads, then the per-viewer gates of
+    ``_shape_active_row`` unchanged, then the finished-unread backfill."""
+    from core.session.visibility import is_shared_chat_owner
+
+    chats = task_store.get_chats_by_ids(streaming_ids + warming_ids)
+    runs = task_store.get_runs_by_ids([
+        session_kind.run_id_of_chat(cid) for cid, chat in chats.items()
+        if session_kind.of_chat(chat) is session_kind.TASK
+    ])
+    dyn_names = task_store.get_dynamic_task_names(
+        [run.get("task_id") or "" for run in runs.values()])
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for ids, status in ((streaming_ids, chat_phase.STREAMING),
+                        (warming_ids, chat_phase.WARMING)):
+        for cid in ids:
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            chat = chats.get(cid)
+            if not chat:
+                continue
+            row = _shape_active_row(u, chat, status, runs=runs, dyn_names=dyn_names)
+            if row:
+                rows.append(row)
 
     # Finished-unread backfill: recent responses nobody opened yet stay in the
     # widget across page reloads (status 'finished' — the client renders the
     # steady done tint + dot and retires the row on open). Same per-row access
     # rule as the streaming set; 48h window, so an abandoned chat eventually
     # ages out of the widget while staying unread in its own history list.
-    from datetime import datetime, timedelta, timezone
-    since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     for chat in task_store.list_unread_finished_chats(since):
         cid = chat.get("id", "")
         if not cid or cid in seen:
@@ -369,13 +442,13 @@ async def list_active_chats(
             "id": cid,
             "agent": chat.get("agent", ""),
             "title": chat.get("title") or "",
-            "status": "finished",
-            "source_type": chat.get("source_type") or "",
+            "status": chat_phase.FINISHED,
+            "source_type": session_kind.of_chat(chat).source_type,
             "owner_is_shared": is_shared_chat_owner(chat.get("user_sub", "")),
             "last_response_at": chat.get("last_response_at"),
             "unread": True,
         })
-    return {"chats": rows}
+    return rows
 
 
 @router.get("/v1/chats/search")
@@ -389,19 +462,28 @@ async def search_chats(
     """FTS over chat titles + content. Search follows the sidebar mode:
     kind=chats scopes to the viewer's history owner and excludes task-run
     chats; kind=tasks searches the agent's task-run chats under the run
-    permission rules (same gating as the kind=tasks listing)."""
+    permission rules (same gating as the kind=tasks listing). One executor
+    job, like the listing."""
     u = require_auth(user)
     if not agent:
         raise HTTPException(status_code=400, detail="agent parameter required")
+    return {"chats": await run_db(_search_chats_sync, u, agent, kind, q, limit)}
+
+
+def _search_chats_sync(u: UserContext, agent: str, kind: str, q: str,
+                       limit: int) -> list[dict]:
     if kind == "tasks":
         require_agent_access(u, agent)
         results = task_store.search_task_chats(agent, q, _task_scope_sub(u), limit=limit)
         _stamp_mutation_flags(u, results)
-        return {"chats": results}
+        return results
     from core.session.visibility import chat_history_owner
-    results = task_store.search_chats(chat_history_owner(agent, u.sub), agent, q, limit=limit)
+    owner = chat_history_owner(agent, u.sub)
+    if owner != u.sub:
+        require_agent_access(u, agent)
+    results = task_store.search_chats(owner, agent, q, limit=limit)
     _stamp_mutation_flags(u, results)
-    return {"chats": results}
+    return results
 
 
 @router.get("/v1/chats/{chat_id}")
@@ -482,7 +564,7 @@ async def get_chat_pins(
     chat_id: str,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """The chat's Dock pins: its own chat-scoped mini-app (if any) and — when
+    """The chat's Dock pins: its own chat-scoped app (if any) and — when
     the chat belongs to a delegation project — the project-scoped one. Anchor
     authz = access to the chat (same rule as opening it); each pin row is then
     filtered by the app's OWN serve rule (``app_access``: personal rows →
@@ -548,7 +630,7 @@ _COLLABORA_DOC_EXTENSIONS = frozenset({
 # Agent-tree top-level segments a chip path may name directly. Deliberately
 # NOT path_policy_v2._SANDBOX_VIRTUAL_SEGMENTS — ``screenshots`` is not a
 # preview surface for chips.
-_RESOLVE_TREE_SEGMENTS = ("workspace", "users", "knowledge", "config")
+_RESOLVE_TREE_SEGMENTS = layout.HEADS
 
 
 def _normalize_chip_path(raw: str) -> str:
@@ -557,6 +639,7 @@ def _normalize_chip_path(raw: str) -> str:
     empty / ``..`` / empty segments. The order is load-bearing: a ``/``-split
     segment check on the raw string misses backslash-carried ``..``
     (``workspace\\..\\config\\x``). Returns ``""`` for a rejected path."""
+    from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
     from services.path_policy_v2 import normalize_path
     if not raw or not isinstance(raw, str) or "\x00" in raw:
         return ""
@@ -564,12 +647,16 @@ def _normalize_chip_path(raw: str) -> str:
     if not normalized:
         return ""
     segs = normalized.split("/")
-    # A leading '/' yields one empty head segment (legitimate absolute form);
-    # any OTHER empty segment (``//host`` UNC heads included) or ``..`` rejects.
-    body = segs[1:] if normalized.startswith("/") else segs
-    if any(s in ("", "..") for s in body):
+    # A leading '/' yields one empty head segment (legitimate absolute form)
+    # and ``.`` segments are dropped; any OTHER empty segment (``//host`` UNC
+    # heads included) or ``..`` rejects (``normalize_rel_path``).
+    is_abs = normalized.startswith("/")
+    body = [s for s in (segs[1:] if is_abs else segs) if s != "."]
+    try:
+        rel = normalize_rel_path("/".join(body))
+    except PathOutsideRoot:
         return ""
-    return normalized
+    return ("/" + rel) if is_abs else rel
 
 
 def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
@@ -584,7 +671,7 @@ def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
     from storage import remote_store
 
     target = (chat.get("execution_target") or "").strip()
-    if not target or target == "local":
+    if placement.is_local(target):
         # create_chat's INSERT does not stamp execution_target on every path —
         # fall back to the agent-default resolution before skipping the rule.
         try:
@@ -593,10 +680,10 @@ def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
             return ""
     # The offline sentinel still names the intended machine; the fold is pure
     # prefix translation against the platform-synced tree — reachability-free.
-    target = (target or "").removeprefix("__offline__:")
-    if not target or target == "local":
+    machine_id = placement.machine_of(target)
+    if not machine_id:
         return ""
-    machine = remote_store.get_remote_machine(target)
+    machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         return ""
     caps_raw = machine.get("capabilities") or "{}"
@@ -661,9 +748,9 @@ def _chip_path_candidates(
         _add(_satellite_fold_candidate(agent, chat, normalized))
     if not is_abs and not normalized.startswith("~"):
         # Relative (no leading slash/drive/tilde).
-        _add("workspace/" + normalized)
+        _add(f"{layout.WORKSPACE}/" + normalized)
         if username:  # get_username_by_sub may return None → skip
-            _add(f"users/{username}/workspace/{normalized}")
+            _add(f"{layout.scope_workspace(username)}/{normalized}")
         if normalized.split("/", 1)[0] in _RESOLVE_TREE_SEGMENTS:
             _add(normalized)
     return candidates
@@ -732,7 +819,7 @@ async def resolve_chat_path(
         # would reject, AND the extension must be a Collabora document type.
         previewable = (
             resolved.suffix.lower() in _COLLABORA_DOC_EXTENSIONS
-            and rel.split("/", 1)[0] in ("workspace", "users")
+            and layout.head_of(rel) in (layout.WORKSPACE, layout.USERS)
         )
         return {
             "found": True,
@@ -752,13 +839,35 @@ async def create_chat(
 ):
     u = require_auth(user)
     require_agent_access(u, req.agent)
-    chat_id = str(uuid.uuid4())
+    chat = await run_db(_create_chat_sync, u, req.agent, req.permission_mode)
+    from api.apps import catalog
+    catalog.announce_new_chat(chat)
+    return {"chat": chat}
+
+
+def _create_chat_sync(u: UserContext, agent: str, permission_mode: str) -> dict:
     # Shared-only agents collapse into ONE shared chat list (synthetic owner).
     from core.session.visibility import chat_history_owner
-    chat = task_store.create_chat(
-        chat_id, chat_history_owner(req.agent, u.sub), req.agent, req.permission_mode,
-    )
-    return {"chat": chat}
+    owner = chat_history_owner(agent, u.sub)
+    if _vis.is_shared_chat_owner(owner) and not roles.can_edit(u.acting_role(agent)):
+        # The shared chat runs as the agent (editor tier and up): a caller
+        # below it never leaves a pick of its own on the shared row.
+        permission_mode = "default"
+    return task_store.create_chat(str(uuid.uuid4()), owner, agent, permission_mode)
+
+
+def _mutable_chat(u: UserContext, chat_id: str, action: str) -> dict:
+    """The row a rename or delete may touch, or the refusal: 404 for a chat
+    that does not exist, 403 when the viewer may not mutate it. One
+    executor job, since the checks read the run row of a task chat."""
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    if not can_access_chat(u, chat) or not can_mutate_chat(u, chat):
+        raise HTTPException(
+            status_code=403,
+            detail=f"You don't have permission to {action} this chat")
+    return chat
 
 
 @router.patch("/v1/chats/{chat_id}")
@@ -768,13 +877,7 @@ async def update_chat(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat) or not can_mutate_chat(u, chat):
-        raise HTTPException(
-            status_code=403,
-            detail="You don't have permission to rename this chat")
+    chat = await run_db(_mutable_chat, u, chat_id, "rename")
     updates: dict = {}
     if req.title is not None:
         title = _sanitize_title(req.title)
@@ -785,7 +888,13 @@ async def update_chat(
         # LLM title upgrade (services/title_generator.py) never overwrites it.
         updates["title_generated"] = True
     if updates:
-        task_store.update_chat(chat_id, **updates)
+        # The row write and its search-row rebuild ride the chat's writer
+        # lane, behind any row job of the chat still queued (a turn ending
+        # right now); the response waits for it, so the sidebar's refetch
+        # and its search read the new title.
+        await chat_writer.submit(
+            chat_id, functools.partial(task_store.update_chat, chat_id, **updates),
+            label="rename")
         if "title" in updates:
             # Fan out to every viewer's sidebar + Active-now widget NOW — a
             # rename must not wait for the next navigation refetch. Pass the
@@ -804,8 +913,37 @@ async def update_chat(
     return {"status": "ok", "title": updates.get("title")}
 
 
+# The engine switch (ws/dashboard_dispatch.py) refuses the same window with
+# its own sentence; a session still starting is registered nowhere a close
+# can reach, so the delete waits for it to exist.
+_STILL_STARTING = "This chat is still starting. Wait a moment, then delete it."
+
+
+async def _close_chat_terminal(chat_id: str) -> None:
+    """Close a deleted chat's live interactive terminal, so the person's
+    session count and the subscription seat are freed with the chat instead
+    of at the idle reap. The queued server prompts are dropped, never handed
+    back: the chat is going. Bounded re-read: a respawn race can leave two
+    live sessions on one chat for a moment. Best-effort, like the pooled
+    close below."""
+    from core.session import interactive_session
+    for _ in range(4):
+        live = interactive_session.find_live_for_chat(chat_id)
+        if live is None:
+            return
+        try:
+            await interactive_session.close_session(
+                live.session_id, reason="chat_deleted", drop_queued=True)
+        except Exception:
+            # The next round re-reads: a close that raised may have left
+            # this session registered, or a respawn's twin behind it.
+            logger.warning("Chat delete: closing terminal %s failed",
+                           live.session_id[:8], exc_info=True)
+
+
 async def _close_chat_session(chat: dict) -> None:
-    """Close a deleted chat's live session on whichever layer holds it.
+    """Close a deleted chat's live pooled session on whichever layer holds it
+    (the engine switch calls this too, with a bare session_id/agent dict).
 
     Without this, deleting a chat leaves its warm CLI/daemon running headless
     (holding a subscription seat + satellite/local slot) until the idle
@@ -814,28 +952,12 @@ async def _close_chat_session(chat: dict) -> None:
     stored execution_path may be stale relative to where the session actually
     lives. Best-effort — an absent/dead session is fine."""
     session_id = chat.get("session_id") or ""
-    agent = chat.get("agent") or ""
-    if not session_id or not agent:
+    if not session_id:
         return
     try:
-        from core.session.session_manager import (
-            get_execution_layer, _remote_layer,
-        )
-        from core.layers.cli.session import _persistent_sessions
-        from core.layers.codex.session import _codex_sessions
-        from core.layers.direct.session import _direct_sessions
-        if _remote_layer and session_id in _remote_layer._sessions:
-            layer = _remote_layer
-        elif session_id in _persistent_sessions:
-            layer = get_execution_layer(agent, execution_path="claude-code-cli",
-                                        execution_target="local")
-        elif session_id in _codex_sessions:
-            layer = get_execution_layer(agent, execution_path="codex-cli",
-                                        execution_target="local")
-        elif session_id in _direct_sessions:
-            layer = get_execution_layer(agent, execution_path="direct-llm",
-                                        execution_target="local")
-        else:
+        from core.session.session_manager import find_layer_for_session
+        layer = find_layer_for_session(session_id)
+        if layer is None:
             return
         await layer.close_session(session_id)
     except Exception:
@@ -849,29 +971,38 @@ async def delete_chat(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat) or not can_mutate_chat(u, chat):
-        raise HTTPException(
-            status_code=403,
-            detail="You don't have permission to delete this chat")
+    chat = await run_db(_mutable_chat, u, chat_id, "delete")
     # A live/queued run would keep writing rows (and holding a session)
     # against a deleted chat — deliberately an EXISTS over ALL the chat's
     # runs, never "the latest run's status" (a pending run has no started_at
     # and sorts last on a multi-run worker chat).
-    if await asyncio.to_thread(task_store.has_live_run, chat_id):
+    if await run_db(task_store.has_live_run, chat_id):
         raise HTTPException(
             status_code=409,
             detail="A task run is still active on this chat — cancel it "
                    "first, then delete the history entry.")
+    from core.session import session_delivery, warmup_registry
+    if warmup_registry.get(chat_id) is not None \
+            or session_delivery.oneshot_inflight(chat_id) is not None:
+        raise HTTPException(status_code=409, detail=_STILL_STARTING)
     # A deleted chat must never be woken — cancel its pending continuations
     # (row + APScheduler job) before the row goes.
     from services.scheduler import scheduler
-    for cont in task_store.list_continuations_for_chat(chat_id):
+    for cont in await run_db(task_store.list_continuations_for_chat, chat_id):
         await scheduler.remove_dynamic_task(cont["id"])
+    await _close_chat_terminal(chat_id)
     await _close_chat_session(chat)
-    task_store.delete_chat(chat_id)
+    # The chat's share rows cascade with it; their snapshot copies do not
+    # (SHARING.md): take them first, remove them after. The row delete
+    # rides the chat's writer lane so it lands behind any row job of the
+    # chat still queued (a turn ending right now) instead of racing it.
+    from services.sharing import chat_snapshot
+    from storage.sharing import share_store
+    doomed = await run_db(share_store.list_target_shares, "chat", chat_id)
+    await chat_writer.submit(
+        chat_id, functools.partial(task_store.delete_chat, chat_id), label="delete")
+    for share in doomed:
+        await asyncio.to_thread(chat_snapshot.remove, share)
     from services.media import preview_snapshots
     await asyncio.to_thread(preview_snapshots.delete_chat_dir, chat_id)
     return {"status": "ok"}
@@ -891,14 +1022,8 @@ async def dismiss_preview(
     instance (a "previous version" block closing itself); with neither, every
     instance for the file is dismissed (the live block's close)."""
     u = require_auth(user)
-    chat = task_store.get_chat(chat_id)
-    if not chat:
-        raise HTTPException(status_code=404, detail="Chat not found")
-    if not can_access_chat(u, chat):
-        raise HTTPException(status_code=403, detail="Access denied")
-    count, freed = task_store.dismiss_document_previews(
-        chat_id, file_id, snapshot_id=snapshot_id, db_message_id=message_id,
-    )
+    count, freed = await run_db(
+        _dismiss_preview_sync, u, chat_id, file_id, snapshot_id, message_id)
     if freed:
         from services.media import preview_snapshots
 
@@ -907,3 +1032,15 @@ async def dismiss_preview(
                 preview_snapshots.delete_snapshot(chat_id, sid)
         await asyncio.to_thread(_drop)
     return {"status": "ok", "dismissed": count}
+
+
+def _dismiss_preview_sync(u: UserContext, chat_id: str, file_id: str,
+                          snapshot_id: str | None, message_id: int | None):
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    if not can_access_chat(u, chat):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return task_store.dismiss_document_previews(
+        chat_id, file_id, snapshot_id=snapshot_id, db_message_id=message_id,
+    )

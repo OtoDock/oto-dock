@@ -246,6 +246,8 @@ class TestTokenMap:
     ):
         # A manager binds their own connected account as the agent's service
         # identity; agent-scope sessions then read that account.
+        from storage import database as task_store
+        task_store.add_user_agent(user_sub, agent_name, "manager", "test")
         credential_store.set_user_credentials(
             user_sub, mcp_name,
             {"GOOGLE_EMAIL": "service@example.com", "GOOGLE_SERVICES": "gmail"},
@@ -323,6 +325,8 @@ class TestBlockResolution:
     async def test_block_renders_for_service_scope_when_account_bound(
         self, reset_manifests, agent_name, mcp_name, user_sub,
     ):
+        from storage import database as task_store
+        task_store.add_user_agent(user_sub, agent_name, "manager", "test")
         credential_store.set_user_credentials(
             user_sub, mcp_name, {"GOOGLE_EMAIL": "support@org.com"},
             account_label="default",
@@ -608,7 +612,7 @@ def _roster_env(monkeypatch, *, models, default_model="m-default",
     monkeypatch.setattr(subscription_store, "list_models",
                         lambda layer=None: [dict(m) for m in models])
     monkeypatch.setattr(app_config, "resolve_agent_model",
-                        lambda slug: default_model)
+                        lambda slug, layer=None: default_model)
 
 
 def test_build_delegation_roster_enabled_only_default_first(monkeypatch):
@@ -622,6 +626,37 @@ def test_build_delegation_roster_enabled_only_default_first(monkeypatch):
     assert layer["path"] == "claude-code-cli" and layer["is_default"]
     assert layer["models"] == ["m-default", "m-a"]
     assert layer["more"] == 0 and not layer["local_only"]
+    # Untiered rows carry no tier; the catalog lists every enabled model.
+    assert layer["tiers"] == {"m-a": None, "m-default": None}
+    assert [m["model_id"] for m in layer["catalog"]] == ["m-a", "m-default"]
+
+
+def test_build_delegation_roster_orders_by_tier_then_hoists_default(monkeypatch):
+    """The line an agent reads is the capability ranking: tier 1 first,
+    untiered last — except the default, which the cap must never hide."""
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-local", "enabled": True, "is_builtin": False},
+        {"model_id": "m-fast", "enabled": True, "tier": 4, "good_at": "cheap"},
+        {"model_id": "m-top", "enabled": True, "tier": 1, "good_at": "judgement"},
+        {"model_id": "m-default", "enabled": True, "tier": 3},
+    ])
+    (layer,) = dynamic_context.build_delegation_roster(["worker"])["worker"]
+    assert layer["models"] == ["m-default", "m-top", "m-fast", "m-local"]
+    assert layer["tiers"]["m-top"] == 1 and layer["tiers"]["m-local"] is None
+    assert layer["catalog"][0]["tier_label"] == "frontier"
+
+
+def test_build_delegation_roster_default_per_layer(monkeypatch):
+    """A non-default layer resolves its own default (the task runner's
+    rule) instead of showing no [default] at all."""
+    import config as app_config
+    _roster_env(monkeypatch, models=[{"model_id": "m-x", "enabled": True}],
+                paths=("claude-code-cli", "codex-cli"))
+    monkeypatch.setattr(app_config, "resolve_agent_model",
+                        lambda slug, layer=None: f"{layer}-pick")
+    cli, codex = dynamic_context.build_delegation_roster(["worker"])["worker"]
+    assert cli["default_model"] == "claude-code-cli-pick"
+    assert codex["default_model"] == "codex-cli-pick"
 
 
 def test_build_delegation_roster_caps_and_tags(monkeypatch):
@@ -648,8 +683,9 @@ def test_delegation_context_renders_roster(monkeypatch, temp_db):
     text = dynamic_context._delegation_mcp_context(
         "self-agent", ["worker"], delegation_roster=roster)
     assert ("layers: claude-code-cli (default | models: "
-            "m-default [default], m-b)") in text
+            "m-default [default, t?], m-b [t?])") in text
     assert "Ignored with `continue_id`" in text
+    assert "**Model tiers**" in text and "t? untiered" in text
     # Without the pre-resolved roster the provider stays name-only (no I/O).
     text2 = dynamic_context._delegation_mcp_context("self-agent", ["worker"])
     assert "layers:" not in text2
@@ -682,8 +718,41 @@ def test_schedules_context_renders_own_layers(monkeypatch, temp_db):
         "self-agent", delegation_roster=roster,
         assigned_mcps=["schedules-mcp"])
     assert ("Your layers: claude-code-cli (default | models: "
-            "m-default [default], m-b)") in text
+            "m-default [default, t?], m-b [t?])") in text
     assert "edit_task" in text
+    assert "**Model tiers**" in text
+
+
+def test_model_tiers_block_groups_by_tier_with_good_at(monkeypatch, temp_db):
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-default", "enabled": True, "tier": 2, "good_at": "coding"},
+        {"model_id": "m-top", "enabled": True, "tier": 1, "good_at": "judgement"},
+        {"model_id": "m-local", "enabled": True},
+    ])
+    roster = dynamic_context.build_delegation_roster(["worker"])
+    text = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], delegation_roster=roster)
+    assert "- t1 frontier: `m-top` (judgement)" in text
+    assert "- t2 strong: `m-default` (coding)" in text
+    assert "- t? untiered (a local or custom model nobody rated): `m-local`" in text
+    assert text.index("t1 frontier") < text.index("t2 strong") < text.index("t? untiered")
+
+
+def test_model_tiers_block_folds_models_that_share_a_line(monkeypatch, temp_db):
+    # Two vendors' models of one tier carry the same good_at: the ids come
+    # first, the line once — and a model with its own line stays apart.
+    _roster_env(monkeypatch, models=[
+        {"model_id": "m-anthropic", "enabled": True, "tier": 1, "good_at": "complex coding"},
+        {"model_id": "m-openai", "enabled": True, "tier": 1, "good_at": "complex coding"},
+        {"model_id": "m-fast-a", "enabled": True, "tier": 4, "good_at": "routine work; no tool calling"},
+        {"model_id": "m-fast-b", "enabled": True, "tier": 4, "good_at": "routine work"},
+    ])
+    roster = dynamic_context.build_delegation_roster(["worker"])
+    text = dynamic_context._delegation_mcp_context(
+        "self-agent", ["worker"], delegation_roster=roster)
+    assert "- t1 frontier: `m-anthropic`, `m-openai` (complex coding)" in text
+    assert ("- t4 fast: `m-fast-a` (routine work; no tool calling), "
+            "`m-fast-b` (routine work)") in text
 
 
 def test_schedules_context_defers_to_delegation_block(monkeypatch, temp_db):

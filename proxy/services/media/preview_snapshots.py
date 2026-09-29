@@ -9,8 +9,11 @@ tree and every sync surface).
 
 Layout: ``PREVIEW_SNAPSHOT_DIR/<chat_id>/<snapshot_id>`` — the id is an opaque
 uuid4 hex, the file carries no extension (Collabora gets the display name from
-the WOPI token instead). Writes are atomic (copy to a ``.tmp`` sibling, then
-``os.replace``) so a concurrent WOPI read can never see a torn file.
+the WOPI token instead). The copy goes through ``safe_fs``: the source is
+opened beneath the agents root with no symlink followed (a file the agent
+swapped for a link before the push is not pinned) and the write is atomic
+(a temp sibling renamed into place) so a concurrent WOPI read can never see
+a torn file.
 
 Lifecycle is reference-driven: a snapshot lives as long as a non-dismissed
 persisted ``document_preview`` event references it (``gc_chat``). The periodic
@@ -31,6 +34,7 @@ from pathlib import Path
 
 import config
 import contextlib
+from services.infra import safe_fs
 
 logger = logging.getLogger("claude-proxy.media")
 
@@ -70,24 +74,23 @@ def create_snapshot(chat_id: str, source: Path) -> str | None:
     if not _valid_id(chat_id):
         return None
     snapshot_id = uuid.uuid4().hex
-    dest_dir = config.PREVIEW_SNAPSHOT_DIR / chat_id
-    dest = dest_dir / snapshot_id
-    tmp = dest_dir / f"{snapshot_id}.tmp"
     try:
-        if source.stat().st_size > _MAX_SNAPSHOT_BYTES:
-            logger.info(
-                "preview snapshot skipped for chat %s: %s exceeds %d MB",
-                chat_id, source.name, _MAX_SNAPSHOT_BYTES // (1024 * 1024),
-            )
-            return None
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, tmp)
-        os.replace(tmp, dest)
+        rel = safe_fs.rel_under(source, config.AGENTS_DIR)
+        os.makedirs(config.PREVIEW_SNAPSHOT_DIR, exist_ok=True)
+        # The size is checked at the open, before the chat's directory exists.
+        safe_fs.copy_file_beneath(
+            config.AGENTS_DIR, rel, config.PREVIEW_SNAPSHOT_DIR,
+            f"{chat_id}/{snapshot_id}", max_size=_MAX_SNAPSHOT_BYTES, mkdirs=True,
+        )
         return snapshot_id
+    except safe_fs.FileTooLarge:
+        logger.info(
+            "preview snapshot skipped for chat %s: %s exceeds %d MB",
+            chat_id, source.name, _MAX_SNAPSHOT_BYTES // (1024 * 1024),
+        )
+        return None
     except OSError as e:
         logger.warning("preview snapshot copy failed for chat %s: %s", chat_id, e)
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
         return None
 
 

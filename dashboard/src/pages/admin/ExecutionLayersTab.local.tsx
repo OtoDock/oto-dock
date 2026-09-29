@@ -1,24 +1,38 @@
 /**
  * Shared "Local models" section — self-hosted OpenAI-compatible endpoints
  * (Ollama, llama.cpp, LM Studio, vLLM, LiteLLM) listed ONCE and enabled per
- * engine. Rendered inside both the Direct LLM API and the Codex CLI cards:
- * the rows are the same everywhere, only Discover acts for the card's engine.
+ * engine. Rendered inside the card of every engine whose descriptor accepts
+ * `local_endpoint` rows: the rows are the same everywhere, only Discover
+ * acts for the card's engine.
  */
 
 import { useState } from 'react'
 import {
   useAddLocalEndpoint,
+  useAdminExecutionLayers,
   useAdminLocalEndpoints,
   useDeleteLocalEndpoint,
   useSetLocalEndpointEngine,
   type LocalEndpointGroup,
 } from '../../api/executionLayers'
+import { acceptsLocalEndpoints, engineLabel, sortEngineRows } from '../../lib/engines'
+import { ENGINE_SUBSCRIPTION_STATUS } from '../../lib/status/engineSubscription'
 import { Badge, PROVIDER_LABELS } from './ExecutionLayersTab.widgets'
 
-export const LOCAL_ENGINES = [
-  { id: 'direct-llm', label: 'Direct LLM API' },
-  { id: 'codex-cli', label: 'Codex CLI' },
-] as const
+interface LocalEngine {
+  id: string
+  label: string
+}
+
+/** The engines a self-hosted endpoint may serve — those whose descriptor
+ *  lists `local_endpoint` among its auth types — in engine order. Read from
+ *  the admin catalog (the same query the tab renders from). */
+function useLocalEngines(): LocalEngine[] {
+  const { data: layers } = useAdminExecutionLayers()
+  return sortEngineRows(layers ?? [])
+    .filter((l) => acceptsLocalEndpoints(l.capabilities))
+    .map((l) => ({ id: l.name, label: engineLabel(l.capabilities) }))
+}
 
 const LOCAL_PROVIDERS = [
   { id: 'ollama', label: 'Ollama', url: 'http://localhost:11434/v1' },
@@ -33,8 +47,8 @@ export interface LocalDiscoverTarget {
 
 const INPUT = 'w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30'
 
-function enabledEngines(g: LocalEndpointGroup): string[] {
-  return LOCAL_ENGINES.map((e) => e.id).filter((id) => g.engines[id]?.status === 'active')
+function enabledEngines(g: LocalEndpointGroup, engines: LocalEngine[]): string[] {
+  return engines.map((e) => e.id).filter((id) => g.engines[id]?.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE)
 }
 
 export function LocalModelsSection({ layer, onDiscover }: {
@@ -42,6 +56,7 @@ export function LocalModelsSection({ layer, onDiscover }: {
   onDiscover: (target: LocalDiscoverTarget) => void
 }) {
   const { data: groups } = useAdminLocalEndpoints()
+  const engines = useLocalEngines()
   const [showAdd, setShowAdd] = useState(false)
   const list = groups ?? []
 
@@ -64,17 +79,18 @@ export function LocalModelsSection({ layer, onDiscover }: {
       )}
       <div className="space-y-0.5">
         {list.map((g) => (
-          <LocalEndpointRow key={g.group} group={g} layer={layer} onDiscover={onDiscover} />
+          <LocalEndpointRow key={g.group} group={g} layer={layer} engines={engines} onDiscover={onDiscover} />
         ))}
       </div>
-      {showAdd && <AddLocalEndpointForm currentLayer={layer} onDone={() => setShowAdd(false)} />}
+      {showAdd && <AddLocalEndpointForm currentLayer={layer} engines={engines} onDone={() => setShowAdd(false)} />}
     </div>
   )
 }
 
-function LocalEndpointRow({ group: g, layer, onDiscover }: {
+function LocalEndpointRow({ group: g, layer, engines, onDiscover }: {
   group: LocalEndpointGroup
   layer: string
+  engines: LocalEngine[]
   onDiscover: (target: LocalDiscoverTarget) => void
 }) {
   const setEngine = useSetLocalEndpointEngine()
@@ -82,7 +98,7 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
   const rows = Object.values(g.engines)
   const manageable = rows.every((e) => e.is_mine)
   const here = g.engines[layer]
-  const canDiscover = here?.status === 'active'
+  const canDiscover = here?.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE
 
   return (
     <div className="flex flex-wrap items-center gap-2 sm:gap-3 py-2 px-3 rounded-lg hover:bg-p-bg-hover/50 group">
@@ -94,7 +110,7 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
         </div>
         {g.label && <p className="text-xs text-p-text-light truncate font-mono">{g.endpoint_url}</p>}
         <div className="flex items-center gap-3 mt-1">
-          {LOCAL_ENGINES.map((e) => (
+          {engines.map((e) => (
             <label
               key={e.id}
               className="flex items-center gap-1 text-xs text-p-text-light cursor-pointer"
@@ -103,7 +119,7 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
               <input
                 type="checkbox"
                 aria-label={e.label}
-                checked={g.engines[e.id]?.status === 'active'}
+                checked={g.engines[e.id]?.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE}
                 disabled={!manageable || setEngine.isPending}
                 onChange={(ev) => setEngine.mutate({ group: g.group, layer: e.id, enabled: ev.target.checked })}
               />
@@ -116,7 +132,7 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <button
-          onClick={() => canDiscover && here && onDiscover({ id: here.id, provider: g.provider, layers: enabledEngines(g) })}
+          onClick={() => canDiscover && here && onDiscover({ id: here.id, provider: g.provider, layers: enabledEngines(g, engines) })}
           disabled={!canDiscover}
           className="text-xs text-brand hover:text-brand-hover transition-colors disabled:opacity-40 sm:opacity-0 sm:group-hover:opacity-100"
           title={canDiscover ? 'Discover the models this server offers' : 'Enable the endpoint for this engine first'}
@@ -150,14 +166,18 @@ function LocalEndpointRow({ group: g, layer, onDiscover }: {
   )
 }
 
-export function AddLocalEndpointForm({ currentLayer, onDone }: { currentLayer: string; onDone: () => void }) {
+export function AddLocalEndpointForm({ currentLayer, engines, onDone }: {
+  currentLayer: string
+  engines: LocalEngine[]
+  onDone: () => void
+}) {
   const [provider, setProvider] = useState<string>(LOCAL_PROVIDERS[1].id)
   const [label, setLabel] = useState('')
   const [url, setUrl] = useState<string>(LOCAL_PROVIDERS[1].url)
   const [apiKey, setApiKey] = useState('')
-  // Both engines on by default (operator decision): the admin unticks what
-  // it should not serve.
-  const [layers, setLayers] = useState<string[]>(LOCAL_ENGINES.map((e) => e.id))
+  // Every engine that accepts a local endpoint is on by default (operator
+  // decision): the admin unticks what it should not serve.
+  const [layers, setLayers] = useState<string[]>(() => engines.map((e) => e.id))
   const addMut = useAddLocalEndpoint()
 
   const pickProvider = (id: string) => {
@@ -197,7 +217,7 @@ export function AddLocalEndpointForm({ currentLayer, onDone }: { currentLayer: s
       />
       <div className="flex items-center gap-3 text-xs text-p-text-light">
         <span>Use with:</span>
-        {LOCAL_ENGINES.map((e) => (
+        {engines.map((e) => (
           <label key={e.id} className="flex items-center gap-1 cursor-pointer">
             <input
               type="checkbox"

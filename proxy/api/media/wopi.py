@@ -7,6 +7,7 @@ Security: Every WOPI call is authenticated via a short-lived JWT access_token
 that is scoped to a specific file, user, agent, and permission level.
 """
 
+import asyncio
 import base64
 import contextlib
 import logging
@@ -17,12 +18,15 @@ from pathlib import Path
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 import config
+from api.media.media import HOST_CACHE_SEGMENT, FdFileResponse
 from auth.providers import get_current_user, require_auth, UserContext
-from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
+from services.infra import safe_fs
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under, safe_agent_dir
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter(tags=["wopi"])
@@ -145,6 +149,41 @@ def _validate_access(file_id: str, access_token: str) -> tuple[Path, dict]:
     return _resolve_wopi_path(file_id, claims), claims
 
 
+def _open_wopi_regular(file_id: str, claims: dict) -> tuple[int, os.stat_result, str]:
+    """``(fd, stat, name)`` of the regular file a token names, for the read
+    routes. The signed ``file_path`` is the binding: it is the path the mint
+    resolved and authorized, and it is opened beneath its root through
+    ``safe_fs`` with no symlink followed, so a file swapped for a link after
+    the mint is "not found" whatever it points at (no role is re-checked:
+    the three mint rules differ and the path is already theirs). Blocking:
+    run it in a thread. The caller closes the descriptor."""
+    try:
+        rel_path = decode_file_id(file_id)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    if claims.get("file_path") != rel_path:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    if rel_path.startswith(_SNAPSHOT_NS + "/"):
+        from services.media import preview_snapshots
+        parts = rel_path.split("/")
+        if len(parts) != 3 or not all(preview_snapshots._valid_id(x) for x in parts[1:]):
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        root, rel = config.PREVIEW_SNAPSHOT_DIR, f"{parts[1]}/{parts[2]}"
+    else:
+        first, _, rest = rel_path.partition("/")
+        if not rest or (first != HOST_CACHE_SEGMENT and not config.is_safe_agent_name(first)):
+            raise HTTPException(status_code=404, detail="File not found")
+        root, rel = config.AGENTS_DIR, rel_path
+    try:
+        fd, st = safe_fs.open_regular_for_read(root, rel)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except OSError as exc:
+        logger.warning("WOPI read refused for %s: %s", rel_path, type(exc).__name__)
+        raise HTTPException(status_code=404, detail="File not found")
+    return fd, st, rel.rsplit("/", 1)[-1]
+
+
 # ---------------------------------------------------------------------------
 # WOPI Lock Management (in-memory, for conflict prevention)
 # ---------------------------------------------------------------------------
@@ -201,18 +240,19 @@ async def wopi_check_file_info(
     access_token: str = Query(...),
 ):
     """WOPI CheckFileInfo — returns file metadata for Collabora."""
-    file_path, claims = _validate_access(file_id, access_token)
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
+    claims = validate_wopi_token(access_token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    fd, st, name = await asyncio.to_thread(_open_wopi_regular, file_id, claims)
+    os.close(fd)  # metadata only: the stat came from the checked descriptor
 
     can_write = claims.get("permissions") == "edit"
 
     return {
         # Snapshot tokens carry display_name (opaque on-disk id, no
         # extension) — Collabora picks its renderer from this extension.
-        "BaseFileName": claims.get("display_name") or file_path.name,
-        "Size": file_path.stat().st_size,
+        "BaseFileName": claims.get("display_name") or name,
+        "Size": st.st_size,
         "OwnerId": claims.get("user_sub", ""),
         "UserId": claims.get("user_sub", ""),
         "UserFriendlyName": claims.get("user_name", "User"),
@@ -221,7 +261,7 @@ async def wopi_check_file_info(
         "SupportsLocks": True,
         "SupportsUpdate": can_write,
         "LastModifiedTime": time.strftime(
-            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(file_path.stat().st_mtime)
+            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(st.st_mtime)
         ),
         # Co-edit presence: show co-editors' names/cursors and their
         # join/leave messages so two users editing the same doc see each other.
@@ -241,19 +281,23 @@ async def wopi_get_file(
     access_token: str = Query(...),
 ):
     """WOPI GetFile — returns raw file bytes."""
-    file_path, claims = _validate_access(file_id, access_token)
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # Streamed (sendfile) — Collabora re-fetches on every retry, and holding
-    # a large document (a 536MB preview, once) fully in proxy memory per
-    # fetch is what a range-capable FileResponse exists to avoid.
-    return FileResponse(
-        file_path,
-        media_type="application/octet-stream",
-        headers={"X-WOPI-ItemVersion": str(int(file_path.stat().st_mtime))},
-    )
+    claims = validate_wopi_token(access_token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    fd, st, _name = await asyncio.to_thread(_open_wopi_regular, file_id, claims)
+    # Streamed from the checked descriptor: Collabora re-fetches on every
+    # retry, and holding a large document (a 536MB preview, once) fully in
+    # proxy memory per fetch is what a range-capable FileResponse exists to
+    # avoid.
+    try:
+        return FdFileResponse(
+            fd, st,
+            media_type="application/octet-stream",
+            headers={"X-WOPI-ItemVersion": str(int(st.st_mtime))},
+        )
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 @router.post("/wopi/files/{file_id}/contents")
@@ -262,15 +306,38 @@ async def wopi_put_file(
     file_id: str,
     access_token: str = Query(...),
 ):
-    """WOPI PutFile — saves file from Collabora (user editing)."""
-    file_path, claims = _validate_access(file_id, access_token)
+    """WOPI PutFile: saves file from Collabora (user editing).
+
+    The signed ``file_path`` is the binding (the mint resolved and authorized
+    it): it must name an agent tree file (``<agent>/<canonical rel>``) or a
+    host-cache mirror (``.remote-host-cache/<session>/<digest>/<name>``), and
+    every write below opens that rel beneath ``AGENTS_DIR`` through
+    ``safe_fs`` in a worker thread, no component followed; a token whose path
+    fits neither shape is refused, never written."""
+    claims = validate_wopi_token(access_token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    try:
+        rel = decode_file_id(file_id)
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    if claims.get("file_path") != rel:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
 
     if claims.get("permissions") != "edit":
         raise HTTPException(status_code=403, detail="Write permission required")
     # Snapshots are immutable history; tokens for them are minted view-only,
     # but refuse writes on the namespace itself as defence in depth.
-    if (claims.get("file_path") or "").startswith(_SNAPSHOT_NS + "/"):
+    if rel.startswith(_SNAPSHOT_NS + "/"):
         raise HTTPException(status_code=403, detail="Snapshots are read-only")
+    agent_slug, _, tree_rel = rel.partition("/")
+    try:
+        if not tree_rel or normalize_rel_path(tree_rel) != tree_rel:
+            raise PathOutsideRoot(rel)
+        if agent_slug != HOST_CACHE_SEGMENT and not config.is_safe_agent_name(agent_slug):
+            raise PathOutsideRoot(rel)
+    except PathOutsideRoot:
+        raise HTTPException(status_code=403, detail="Token/file mismatch")
 
     # Check lock (if locked by someone else, reject)
     lock_header = request.headers.get("X-WOPI-Lock", "")
@@ -282,19 +349,9 @@ async def wopi_put_file(
         )
 
     body = await request.body()
+    name = rel.rsplit("/", 1)[-1]
 
-    # Persist + propagate. ``propagate_write`` does the authoritative
-    # atomic write to the platform agent tree AND fans the saved bytes out to
-    # every OTHER satellite running this agent — all under the global
-    # per-(agent, rel_path) lock, so a concurrent satellite / file-tools write
-    # can't interleave (disk and satellites converge on the same bytes).
-    # Collabora already live-merged concurrent human editors, so ``body`` IS the
-    # merged result → no conflict capture (see propagate_write). agent_slug +
-    # agent-tree rel come from the token's AGENTS_DIR-relative file_path
-    # ("<agent>/workspace/..." or "<agent>/users/{u}/...").
-    rel = claims.get("file_path", "")
-    agent_slug, _, tree_rel = rel.partition("/")
-    if rel.startswith(".remote-host-cache/"):
+    if agent_slug == HOST_CACHE_SEGMENT:
         # Host-cache doc: the platform copy is a MIRROR of a file on the
         # session's own machine (Desktop/Downloads pulled through the lazy
         # cache). Persist the cache copy atomically, then push the bytes back
@@ -304,26 +361,21 @@ async def wopi_put_file(
         # a save error) instead of letting cache and reality silently
         # diverge. Never routed through propagate_write: host files have no
         # agent-tree fan-out.
-        session_id = rel.split("/")[1] if rel.count("/") >= 2 else ""
+        session_id = tree_rel.split("/")[0]
         try:
-            prev = file_path.read_bytes()
-        except OSError:
-            prev = None
-        tmp = Path(str(file_path) + ".partial")
-        tmp.write_bytes(body)
-        tmp.replace(file_path)
+            prev = await asyncio.to_thread(_host_cache_write, rel, body)
+        except OSError as exc:
+            logger.warning("WOPI PutFile (host-cache) refused for %s: %s", rel, type(exc).__name__)
+            raise HTTPException(status_code=403, detail="Token/file mismatch")
         from core.remote import remote_file_flow
-        ok = await remote_file_flow.push_back_host_path(session_id, str(file_path))
+        ok = await remote_file_flow.push_back_host_path(session_id, str(config.AGENTS_DIR / rel))
         if not ok:
             # The cache MIRRORS the machine — a failed push must not leave
             # diverged bytes that later reads would serve as truth. Restore
             # the pre-save content (best-effort) and fail the save.
             if prev is not None:
-                try:
-                    tmp.write_bytes(prev)
-                    tmp.replace(file_path)
-                except OSError:
-                    pass
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(_host_cache_write, rel, prev)
             raise HTTPException(
                 status_code=500,
                 detail="Could not write the file back to the remote machine "
@@ -331,36 +383,56 @@ async def wopi_put_file(
             )
         logger.info(
             "WOPI PutFile (host-cache → machine): %s (%d bytes) by %s",
-            file_path.name, len(body), claims.get("user_name"),
+            name, len(body), claims.get("user_name"),
         )
         return Response(status_code=200)
-    if agent_slug and tree_rel:
-        from services.remote import workspace_fanout
-        from storage import database as _db
-        _sub = claims.get("user_sub", "")
-        _writer = _db.get_username_by_sub(_sub) if _sub else None
-        await workspace_fanout.propagate_write(
-            agent_slug, tree_rel, body, exclude_machine_id=None, writer=_writer,
-        )
-        # Tell OTHER users' dashboards the file changed so an open
-        # preview / workspace tree refreshes. source="collabora": a peer with the
-        # SAME doc open in Collabora is already live-merged (won't force-reload);
-        # a non-Collabora view still refreshes. Exclude the saving user
-        # (claims user_sub — "agent" for inline tokens → excludes nothing real).
-        from services.notifications import notification_manager
-        await notification_manager.broadcast_file_updated(
-            agent_slug, tree_rel, source="collabora",
-            exclude_user_sub=claims.get("user_sub", "") or "",
-        )
-    else:
-        # Malformed / edge token path — fall back to a plain write (no fan-out).
-        file_path.write_bytes(body)
+
+    # Persist + propagate. ``propagate_write`` does the authoritative
+    # atomic write to the platform agent tree AND fans the saved bytes out to
+    # every OTHER satellite running this agent, all under the global
+    # per-(agent, rel_path) lock, so a concurrent satellite / file-tools write
+    # can't interleave (disk and satellites converge on the same bytes).
+    # Collabora already live-merged concurrent human editors, so ``body`` IS the
+    # merged result → no conflict capture (see propagate_write). agent_slug +
+    # agent-tree rel come from the token's AGENTS_DIR-relative file_path
+    # ("<agent>/workspace/..." or "<agent>/users/{u}/...").
+    from services.remote import workspace_fanout
+    from storage import database as _db
+    from storage.pg import run_db
+    _sub = claims.get("user_sub", "")
+    _writer = await run_db(_db.get_username_by_sub, _sub) if _sub else None
+    await workspace_fanout.propagate_write(
+        agent_slug, tree_rel, body, exclude_machine_id=None, writer=_writer,
+    )
+    # Tell OTHER users' dashboards the file changed so an open
+    # preview / workspace tree refreshes. source="collabora": a peer with the
+    # SAME doc open in Collabora is already live-merged (won't force-reload);
+    # a non-Collabora view still refreshes. Exclude the saving user
+    # (claims user_sub: "agent" for inline tokens → excludes nothing real).
+    from services.notifications import notification_manager
+    await notification_manager.broadcast_file_updated(
+        agent_slug, tree_rel, source="collabora",
+        exclude_user_sub=claims.get("user_sub", "") or "",
+    )
     logger.info(
         "WOPI PutFile: %s (%d bytes) by %s",
-        file_path.name, len(body), claims.get("user_name"),
+        name, len(body), claims.get("user_name"),
     )
 
     return Response(status_code=200)
+
+
+def _host_cache_write(rel: str, body: bytes) -> bytes | None:
+    """Replace the host-cache mirror at ``rel`` beneath ``AGENTS_DIR`` (no
+    component followed) and return the bytes it held, None for a new file.
+    A link at the name or a mirror over the sync cap refuses the save (an
+    ``OSError`` of the helpers). Blocking: a worker-thread call."""
+    try:
+        prev = safe_fs.read_bytes_beneath(config.AGENTS_DIR, rel, max_size=config.SYNC_MAX_FILE_BYTES)
+    except FileNotFoundError:
+        prev = None
+    safe_fs.atomic_write_beneath(config.AGENTS_DIR, rel, body)
+    return prev
 
 
 @router.post("/wopi/files/{file_id}")
@@ -480,7 +552,7 @@ async def generate_wopi_url(
     agent_rel = full_path.relative_to(agent_root).as_posix()
 
     # Security: must be within agent workspace or users directory
-    if agent_rel.split("/", 1)[0] not in ("workspace", "users"):
+    if layout.head_of(agent_rel) not in (layout.WORKSPACE, layout.USERS):
         raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory")
 
     if not full_path.is_file():
@@ -494,7 +566,7 @@ async def generate_wopi_url(
         from api.agents.agents import _check_file_role
         from storage import database as _db
         _check_file_role(
-            agent_rel, user.get_agent_role(req.agent), writing=False,
+            agent_rel, user.acting_role(req.agent), writing=False,
             username=_db.get_username_by_sub(user.sub) or "",
         )
 
@@ -522,7 +594,7 @@ async def generate_wopi_url(
             from storage.knowledge import db_knowledge_libraries
             _wl = db_knowledge_libraries.writable_pairs_for(req.agent)
         can_edit = req.edit and can_write_back(
-            _rel, user.get_agent_role(req.agent), _uname,
+            _rel, user.acting_role(req.agent), _uname,
             writable_libraries=_wl,
         )
     permissions = "edit" if can_edit else "view"
@@ -636,9 +708,15 @@ async def generate_preview_wopi_url(
         raise HTTPException(status_code=404, detail="Preview not found")
 
     agent = chat.get("agent") or ""
+    # A meeting participant's preview sits in the participant's tree: the
+    # claim names the tree the path is in (the role is still the requester's
+    # on that agent), so the token says what it covers.
+    _first = rel_path.partition("/")[0]
+    if _first != agent and _first != HOST_CACHE_SEGMENT and config.is_safe_agent_name(_first):
+        agent = _first
     from core.remote.file_sync import can_write_back, library_mirror_source
     from storage import database as _db
-    role = u.get_agent_role(agent)
+    role = u.acting_role(agent)
     username = _db.get_username_by_sub(u.sub) or ""
     permissions = "view"
     _session_id = chat.get("session_id") or ""
@@ -652,7 +730,7 @@ async def generate_preview_wopi_url(
     if _is_host_cache:
         # PutFile pushes the bytes back to the real file on the machine, where
         # the satellite's own host write policy is the authoritative gate.
-        if role in ("editor", "manager", "admin"):
+        if roles.can_write_workspace(role):
             permissions = "edit"
     else:
         _tree_rel = rel_path.partition("/")[2]

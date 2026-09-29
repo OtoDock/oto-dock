@@ -199,6 +199,43 @@ install_linux_tier_1() {
     ok "Tier 1 installed"
 }
 
+install_bun() {
+    # Bun — the runtime of app servers (apps with a server/ folder). The
+    # proxy bind-mounts the binary into each app's sandbox, so it must be a
+    # real file under /usr/local/bin (HOME is never mounted). PINNED exactly
+    # (keep BUN_VERSION in sync with VERSIONS.md; the Docker build runs this
+    # before VERSIONS.md is copied in, so the default is carried here). The
+    # release zip is fetched straight from GitHub: no curl-pipe-bash, no rc
+    # edits, the same bytes on every host.
+    local bun_ver="${BUN_VERSION:-1.4.2}"
+    if command -v bun &>/dev/null && [ "$(bun --version 2>/dev/null)" = "$bun_ver" ]; then
+        ok "bun ${bun_ver} already installed"
+        return 0
+    fi
+    local arch
+    case "$(dpkg --print-architecture 2>/dev/null || uname -m)" in
+        amd64|x86_64)  arch="x64" ;;
+        arm64|aarch64) arch="aarch64" ;;
+        *) warn "no Bun build for this architecture — app servers will not start"; return 0 ;;
+    esac
+    # The default x64 build needs AVX2; older CPUs take the -baseline build.
+    if [ "$arch" = "x64" ] && ! grep -q avx2 /proc/cpuinfo 2>/dev/null; then
+        arch="x64-baseline"
+    fi
+    local url="https://github.com/oven-sh/bun/releases/download/bun-v${bun_ver}/bun-linux-${arch}.zip"
+    local tmp
+    tmp="$(mktemp -d)"
+    info "Installing bun ${bun_ver} (${arch}) to /usr/local/bin..."
+    if curl -fsSL "$url" -o "$tmp/bun.zip" \
+        && python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$tmp/bun.zip" "$tmp"; then
+        $SUDO install -m 0755 "$tmp/bun-linux-${arch}/bun" /usr/local/bin/bun
+        ok "bun $(bun --version 2>/dev/null || echo "$bun_ver") installed"
+    else
+        warn "bun download failed (${url}) — app servers will not start until it is installed"
+    fi
+    rm -rf "$tmp"
+}
+
 install_linux_tier_2() {
     info "Tier 2 — document inspection utilities (apt)..."
     # poppler-utils for PDF bash inspection, sqlite3 for embedded DB
@@ -355,8 +392,8 @@ install_sympy() {
 # via the matching env vars (compose.sh passes the VERSIONS.md values in);
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.263}"
-CODEX_VERSION="${CODEX_VERSION:-0.153.4}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.281}"
+CODEX_VERSION="${CODEX_VERSION:-0.156.1}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").
@@ -468,6 +505,7 @@ main() {
     if [ "$OS_TYPE" = "linux" ]; then
         if [ "$SKIP_TIER_1" != "true" ]; then
             install_linux_tier_1
+            install_bun
         fi
         if [ "$SKIP_TIER_2" != "true" ]; then
             install_linux_tier_2

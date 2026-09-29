@@ -18,19 +18,53 @@ import sys
 import urllib.request
 import urllib.error
 
-# Tools that already have dedicated rich rendering — skip to avoid noise.
-_SKIP_TOOLS = {
-    "AskUserQuestion",      # renders formatted question cards
-    "Task",                 # renders agent spawn info
-    "EnterPlanMode",        # meta-action
-    "ExitPlanMode",         # meta-action
-    "TaskCreate",           # task management shown via tool_info
-    "TaskUpdate",           # task management shown via tool_info
-    "TaskList",             # task management shown via tool_info
-    "TaskGet",              # task management shown via tool_info
-    "TaskStop",             # task management shown via tool_info
-    "TaskOutput",           # task management shown via tool_info
+# The platform's tool vocabulary by ROLE — a byte twin of
+# ``core/events/tool_roles.py:TOOL_ROLES`` (this script runs inside the CLI's
+# sandbox and cannot import the proxy; the release gate's twin rule keeps the
+# two identical: same key order, same string values). Everything below keys
+# on a tool's role, never on its name.
+TOOL_ROLES = {
+    "Bash": "shell",
+    "Monitor": "shell",
+    "PowerShell": "shell",
+    "Read": "read",
+    "Glob": "glob",
+    "Grep": "search",
+    "Write": "write",
+    "Edit": "write",
+    "MultiEdit": "write",
+    "NotebookEdit": "write",
+    "apply_patch": "write",
+    "Delete": "delete",
+    "WebFetch": "web_fetch",
+    "WebSearch": "web_search",
+    "web_search": "web_search",
+    "Agent": "subagent",
+    "Task": "subagent",
+    "TodoWrite": "todo",
+    "TodoRead": "todo",
+    "TaskGet": "task_read",
+    "TaskList": "task_read",
+    "TaskOutput": "task_read",
+    "TaskCreate": "task_write",
+    "TaskUpdate": "task_write",
+    "TaskStop": "task_write",
+    "ToolSearch": "discovery",
+    "tool_search": "discovery",
+    "Skill": "skill",
+    "Workflow": "workflow",
+    "EnterPlanMode": "plan_enter",
+    "ExitPlanMode": "plan_exit",
+    "AskUserQuestion": "question",
+    "request_user_input": "question",
+    "CodexEscalation": "escalation",
 }
+
+# Roles whose calls already have dedicated rich rendering (the question
+# cards, the plan-mode rows, the task list's tool_info cards) — skip to
+# avoid noise. A subagent's report is forwarded: the pump attaches it to the
+# spawn block.
+_SKIP_ROLES = {"question", "plan_enter", "plan_exit", "task_read", "task_write"}
 
 # MCP tools to skip (display-mcp tools — the image/link itself just appeared)
 _SKIP_MCP_TOOLS = {
@@ -78,36 +112,38 @@ def _extract_result_text(tool_result: dict) -> str:
 
 
 def _extract_summary(tool_name: str, tool_input: dict, result_text: str) -> str:
-    """Extract a one-line summary from the tool result text."""
+    """Extract a one-line summary from the tool result text, by role (the
+    proxy's ``transcript_tool_events.result_summary`` is the same policy)."""
+    role = TOOL_ROLES.get(tool_name, "")
 
-    # Bash: show line count
-    if tool_name == "Bash":
+    # A shell: show line count
+    if role == "shell":
         lines = result_text.count("\n") + 1 if result_text.strip() else 0
         return f"{lines} lines" if lines else "ok"
 
-    # Grep: match count
-    if tool_name == "Grep":
+    # A content search: match count
+    if role == "search":
         if not result_text.strip():
             return "no matches"
         lines = [l for l in result_text.strip().splitlines() if l.strip()]
         return f"{len(lines)} results"
 
-    # Glob: file count
-    if tool_name == "Glob":
+    # A glob: file count
+    if role == "glob":
         if not result_text.strip():
             return "no files"
         lines = [l for l in result_text.strip().splitlines() if l.strip()]
         return f"{len(lines)} files"
 
-    # Read: line count
-    if tool_name == "Read":
+    # A read: line count
+    if role == "read":
         if not result_text.strip():
             return "empty file"
         lines = result_text.count("\n") + 1
         return f"{lines} lines"
 
-    # Write/Edit: ok
-    if tool_name in ("Write", "Edit"):
+    # A write: ok
+    if role == "write":
         if "error" in result_text.lower()[:100]:
             first_line = result_text.strip().splitlines()[0] if result_text.strip() else ""
             return f"error: {first_line[:80]}"
@@ -129,6 +165,36 @@ def _extract_summary(tool_name: str, tool_input: dict, result_text: str) -> str:
     if "error" in first_line.lower()[:100]:
         return f"error: {first_line[:80]}"
     return "ok"
+
+
+_PATH_KEYS = ("file_path", "path", "notebook_path")
+
+
+def _tool_paths(tool_input) -> list:
+    """The path arguments of a native tool call (Read / Write / Edit / Glob /
+    NotebookEdit name their target under one of three keys)."""
+    if not isinstance(tool_input, dict):
+        return []
+    out = []
+    for key in _PATH_KEYS:
+        v = tool_input.get(key)
+        if isinstance(v, str) and v and v not in out:
+            out.append(v)
+    return out
+
+
+_COMMAND_MAX = 2048
+
+
+def _tool_command(tool_name: str, tool_input) -> str:
+    """A shell tool's command text, capped — the platform's record reads a
+    commit, a push or a build from it. Empty for every other tool."""
+    if TOOL_ROLES.get(tool_name, "") != "shell" or not isinstance(tool_input, dict):
+        return ""
+    cmd = tool_input.get("command")
+    if not isinstance(cmd, str):
+        return ""
+    return cmd[:_COMMAND_MAX]
 
 
 def _is_error_result(tool_result, summary: str) -> bool:
@@ -208,7 +274,7 @@ def main():
     tool_result = inp.get("tool_response") or inp.get("tool_result") or {}
 
     # Skip tools with dedicated rendering
-    if tool_name in _SKIP_TOOLS or tool_name in _SKIP_MCP_TOOLS:
+    if TOOL_ROLES.get(tool_name, "") in _SKIP_ROLES or tool_name in _SKIP_MCP_TOOLS:
         return
 
     result_text = _extract_result_text(tool_result)
@@ -234,6 +300,11 @@ def main():
         "summary": summary,
         "result_content": result_content,
         "is_error": _is_error_result(tool_result, summary),
+        # The paths the call named — the turn's record on the proxy
+        # (session_events.post_tool); never the whole input (a Write's
+        # content would ride along).
+        "tool_paths": _tool_paths(tool_input),
+        "tool_command": _tool_command(tool_name, tool_input),
     }).encode()
 
     req = urllib.request.Request(

@@ -80,7 +80,7 @@ def _mk_chat(sid: str | None = None, owner: str = "alice-sub",
 
 def _hook(op: str, payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.pins.verify_session_match"), \
+    with patch("api.hooks.pins.verify_session_match_async"), \
          patch("services.notifications.notification_manager."
                "broadcast_file_updated", new=AsyncMock()):
         return client.post(f"/v1/hooks/files/{op}", json=payload,
@@ -216,7 +216,7 @@ def test_unpin_resolves_deleted_files(agent_tree):
 def test_pin_broadcasts_file_updated_with_pin_marker(agent_tree):
     _mk_chat(sid=SID_SHARED)
     (agent_tree / "workspace" / "w.md").write_text("x", "utf-8")
-    with patch("api.hooks.pins.verify_session_match"), \
+    with patch("api.hooks.pins.verify_session_match_async"), \
          patch("services.notifications.notification_manager."
                "broadcast_file_updated", new=AsyncMock()) as bc:
         r = client.post("/v1/hooks/files/pin",

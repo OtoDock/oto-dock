@@ -33,6 +33,12 @@ pydantic-settings>=2.14.2
 python-multipart>=0.0.31
 requests>=2.33.0
 urllib3>=2.7.0
+# The checks' user-written patterns (condition.commands, globs, a schema's
+# pattern / patternProperties) run through RE2: linear time, so a member's
+# pattern can never stall the event loop (services/checks/). Exact: its
+# cp313 wheels (manylinux_2_28 x86_64 AND aarch64, no compiler) were checked
+# for this version — re-check both before moving it.
+google-re2==1.1.20251105
 # Wake-word keyword encoding (services/media/wake_keywords.py): BPE-encodes
 # agent display names with the KWS model's own bpe.model. Pure tokenizer
 # wheel — deliberately NOT the [localmodels] ONNX stack.

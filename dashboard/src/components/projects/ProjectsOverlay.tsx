@@ -8,6 +8,7 @@ import { useChatStore } from '../../store/chatStore'
 import type { ChatPins, PinnedApp } from '../../api/apps'
 import PinnedFileRow from './PinnedFileRow'
 import { parseBoard, type BoardLane } from './projectBoard'
+import { LANE_STATUS, laneStatusOf, type LaneStatus } from '../../lib/status/chat'
 
 // The Dock — the chat's unified panel surface, opened from the composer's
 // dock toggle. Panels compose by what the anchor chat carries:
@@ -77,15 +78,15 @@ function findBoardPath(nodes: TreeNode[], suffix: string): string | null {
 // awaiting_user is ORANGE, not amber: the dock's identity accents (header
 // badge, orchestrator card) are amber now, and the needs-attention chip must
 // stay readable as its own signal beside them.
-const STATUS_STYLE: Record<string, string> = {
+const STATUS_STYLE: Record<LaneStatus, string> = {
   generating: 'bg-brand/10 text-brand border-brand/30',
   awaiting_user: 'bg-orange-100 text-orange-700 border-orange-300 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-700/50',
   idle: 'bg-p-surface text-p-text-secondary border-p-border-light',
 }
 
 function StatusChip({ status }: { status: string }) {
-  const style = STATUS_STYLE[status] ?? STATUS_STYLE.idle
-  const label = status === 'awaiting_user' ? 'awaiting user' : status
+  const style = STATUS_STYLE[status as LaneStatus] ?? STATUS_STYLE.idle
+  const label = status === LANE_STATUS.AWAITING_USER ? 'awaiting user' : status
   // No dot inside the generating chip: in the unified live language the CARD
   // pulses while generating and a dot means only "finished, not opened yet".
   return (
@@ -99,7 +100,7 @@ function StatusChip({ status }: { status: string }) {
 // generating = pulsing brand-surface tint, no dot; finished-unread = the tint
 // held steady + a dot beside the title; otherwise the plain card surface.
 function laneCardStateClass(status: string, unread: boolean): string {
-  if (status === 'generating') {
+  if (status === LANE_STATUS.GENERATING) {
     return 'oto-row-live motion-reduce:animate-none bg-brand-surface ring-1 ring-inset ring-brand/35'
   }
   if (unread) return 'bg-brand-surface ring-1 ring-inset ring-brand/30'
@@ -186,16 +187,11 @@ export default function ProjectsOverlay({
   })
 
   // Live turn state per lane: chatStore's WS truth beats the 10s poll in
-  // BOTH directions — a streaming slice pulses instantly, a ready/failed
-  // slice retires a stale "generating" instead of pulsing 10s too long.
-  // `awaiting_user` only the poll knows, so anything else passes through.
+  // BOTH directions (lib/status/chat.ts laneStatusOf — a streaming slice
+  // pulses instantly, a ready/failed slice retires a stale "generating").
   const byChat = useChatStore((s) => s.byChat)
-  const liveStatus = (id: string, polled: string): string => {
-    const st = byChat[id]?.status
-    if (st === 'streaming') return 'generating'
-    if ((st === 'ready' || st === 'failed') && polled === 'generating') return 'idle'
-    return polled
-  }
+  const liveStatus = (id: string, polled: string): string =>
+    laneStatusOf(byChat[id]?.status, polled)
   // Finished-unread per lane chat — the same store flag the sidebar dot
   // rides (chat_status flips it on a background finish, chat_read clears).
   const laneUnread = (id: string): boolean => !!byChat[id]?.unread
@@ -219,12 +215,7 @@ export default function ProjectsOverlay({
   // The `project_lanes` feed rows a docked dashboard may subscribe to — the
   // viewer's own /project slice with the WS-live status merged in.
   const laneFeedRows = useMemo(
-    () => (graph ? chats.map((c) => ({ ...c, status: (() => {
-      const st = byChat[c.id]?.status
-      if (st === 'streaming') return 'generating'
-      if ((st === 'ready' || st === 'failed') && c.status === 'generating') return 'idle'
-      return c.status
-    })() })) : undefined),
+    () => (graph ? chats.map((c) => ({ ...c, status: laneStatusOf(byChat[c.id]?.status, c.status) })) : undefined),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [graph, byChat],
   )
@@ -237,7 +228,7 @@ export default function ProjectsOverlay({
   // collapses into the disclosure.
   const isLive = (c: LaneRow) => {
     const s = liveStatus(c.id, c.status)
-    return s === 'generating' || s === 'awaiting_user'
+    return s === LANE_STATUS.GENERATING || s === LANE_STATUS.AWAITING_USER
   }
   const outsideRound = chats.filter((c) => !roundChats.includes(c))
   const laneChats = [
@@ -288,14 +279,14 @@ export default function ProjectsOverlay({
             <div className="px-2 pb-8">
               {chatApp && (
                 <div className="rounded-xl border border-p-border-light overflow-hidden bg-white dark:bg-p-surface mb-4">
-                  <AppPanel app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" autoHeight />
+                  <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" autoHeight />
                 </div>
               )}
               {filePinsSection}
             </div>
           </div>
         ) : chatApp ? (
-          <AppPanel app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" />
+          <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" />
         ) : (
           <div className="flex-1 flex items-center justify-center text-sm text-p-text-light">
             Nothing docked to this chat.
@@ -319,7 +310,7 @@ export default function ProjectsOverlay({
         }`}
       >
         <span className="min-w-0 flex items-center gap-1.5">
-          {unread && status !== 'generating' && <UnreadDot />}
+          {unread && status !== LANE_STATUS.GENERATING && <UnreadDot />}
           <span className="min-w-0">
             <span className="block text-xs font-medium text-p-text truncate">{c.title || c.id.slice(0, 8)}</span>
             <span className="block text-[10px] text-p-text-light">{c.delegate_role === 'orchestrator' ? 'orchestrator' : 'lane'} · {c.agent}</span>
@@ -367,7 +358,7 @@ export default function ProjectsOverlay({
           }`}
         >
           <span className="min-w-0 flex items-center gap-1.5">
-            {laneUnread(orchestrator.id) && liveStatus(orchestrator.id, orchestrator.status) !== 'generating' && <UnreadDot />}
+            {laneUnread(orchestrator.id) && liveStatus(orchestrator.id, orchestrator.status) !== LANE_STATUS.GENERATING && <UnreadDot />}
             <span className="min-w-0">
               <span className="block text-xs font-semibold text-p-text truncate">
                 {orchestrator.title || 'Orchestrator'}
@@ -477,7 +468,7 @@ export default function ProjectsOverlay({
           content-height, the page scroll owns it. */}
       {chatApp && (
         <div className="mt-4 rounded-xl border border-p-border-light overflow-hidden bg-white dark:bg-p-surface">
-          <AppPanel app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-chat-app" autoHeight />
+          <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-chat-app" autoHeight />
         </div>
       )}
     </div>
@@ -505,7 +496,7 @@ export default function ProjectsOverlay({
           (operator ask; full width 2026-08-13). */}
       <div className="px-2 pb-8">
         <div className="border-t border-p-border-light/60 mb-3" />
-        <AppPanel app={projectApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-project-app" autoHeight />
+        <AppPanel key={projectApp.id} app={projectApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-project-app" autoHeight />
       </div>
     </div>
   )

@@ -17,10 +17,12 @@ import time
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import McpError
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 
 import config
+from core import placement
 import contextlib
 
 logger = logging.getLogger("mcp-manager")
@@ -45,6 +47,14 @@ _REMOTE_STREAMABLE = {"streamable-http", "http"}
 _mcp_loop: asyncio.AbstractEventLoop | None = None
 _mcp_thread: threading.Thread | None = None
 _mcp_thread_lock = threading.Lock()
+
+
+def session_gone(exc: BaseException) -> bool:
+    """The HTTP transport's own error for a server that no longer knows the
+    session — "Session terminated" on a 404, after the server evicted an
+    idle session — as against a tool's failure a live server answered."""
+    text = str(exc).lower()
+    return "session terminated" in text or "session not found" in text
 
 
 def _start_mcp_thread() -> asyncio.AbstractEventLoop:
@@ -266,6 +276,10 @@ class MCPServerConnection:
             # Apply sandbox env restrictions (PATH, HOME)
             env.update(self.sandbox_builder.get_env_overrides())
 
+        # Below the proxy's CPU priority, like every session process.
+        from core.sandbox import pty_relay
+        command, *args = pty_relay.niced([command, *args])
+
         params = StdioServerParameters(
             command=command,
             args=args,
@@ -281,6 +295,24 @@ class MCPServerConnection:
         session_cm = ClientSession(*streams)
         self.session = await session_cm.__aenter__()
         self._cm_stack.append(session_cm)
+
+    def _swap_brokered_bearer(self, auth_value: str) -> str | None:
+        """``Bearer <the broker placeholder>`` → ``Bearer <the real token>`` from
+        this session's bundle for this server; ``None`` for any other header
+        (a vendor bearer, a session JWT, nothing) or on a store miss."""
+        from core.credentials import mcp_broker
+        if auth_value != f"Bearer {mcp_broker.BROKER_BEARER_PLACEHOLDER}":
+            return None
+        bundle = mcp_broker.get(self.session_id, self.name)
+        bearer = getattr(bundle, "http_bearer", None) if bundle else None
+        if not bearer:
+            logger.warning(
+                "MCP server '%s': brokered bearer missing for session %s — the "
+                "sidecar will refuse the call (no bundle provisioned?)",
+                self.name, self.session_id or "(none)",
+            )
+            return None
+        return f"Bearer {bearer}"
 
     async def _start_remote(self) -> None:
         """Connect to a remote MCP server (SSE or streamable HTTP)."""
@@ -307,6 +339,19 @@ class MCPServerConnection:
         )
         if _swapped is not None:
             headers["Authorization"] = _swapped
+        # A proxy-terminable HTTP MCP (github/m365) ships the brokered-bearer
+        # placeholder in its entry and the real token in the session's broker
+        # bundle (mcp_registry: the HTTP bearer-swap). The CLI's per-session
+        # config copy and the satellite tunnel swap it at their boundary; this
+        # layer is its own boundary — it forwards straight to the sidecar — so
+        # it swaps here too. Without this a headless app action (an app's
+        # scheduled handler pressing its GitHub buttons) reached GitHub with
+        # the literal placeholder: "401 Bad credentials" on every call while
+        # the same account worked in every chat (found live, 2026-09-14). A
+        # store miss keeps the placeholder → the sidecar 401s, fail-closed.
+        _swapped = self._swap_brokered_bearer(headers.get("Authorization", ""))
+        if _swapped is not None:
+            headers["Authorization"] = _swapped
         headers = headers or None
 
         server_type = self.config.get("type", "sse")
@@ -327,7 +372,8 @@ class MCPServerConnection:
         self._cm_stack.append(session_cm)
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Call a tool on this server. Returns the result as a string."""
+        """Call a tool on this server. Returns the result as a string. A
+        server that forgot the session is marked dead (``session_gone``)."""
         if not self.session:
             self.dead = True
             return f"Error: MCP server '{self.name}' is not connected"
@@ -348,6 +394,22 @@ class MCPServerConnection:
         except asyncio.TimeoutError:
             # A slow tool is NOT a dead server — timeouts never mark dead.
             return f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s"
+        except McpError as e:
+            # A JSON-RPC error answered by a LIVE server: some servers (the
+            # github sidecar) report a tool's own failure this way instead of
+            # as result.isError — a 404 for a repo with no releases marked
+            # the whole server dead every ten minutes on the internal
+            # install and cost a rebuild per wake. The server answered; only
+            # the call failed. One McpError is the transport's own, not a
+            # tool's: "Session terminated" is the HTTP client's word for a
+            # server that no longer knows the session (the sidecar evicts an
+            # idle one), after which every call fails until a rebuild.
+            if session_gone(e):
+                self.dead = True
+                logger.warning(
+                    f"MCP server '{self.name}' marked dead: the server forgot the session ({e})"
+                )
+            return f"Error calling tool '{tool_name}': {e}"
         except Exception as e:
             # Tool-level failures come back as result.isError above; an
             # EXCEPTION here is transport/protocol trouble (closed stream,
@@ -388,9 +450,13 @@ class AgentMCPManager:
                  prebuilt_config: tuple | None = None,
                  enable_http_transport: bool = False,
                  tool_timeout: int = TOOL_CALL_TIMEOUT,
-                 external: bool = False):
+                 external: bool = False,
+                 included_mcps: set[str] | None = None):
         self.agent_name = agent_name
         self.phone_mode = phone_mode
+        # When set, ONLY these mcpServers keys start (the app-action executor
+        # warms the MCPs an app's manifest names, not the agent's full set).
+        self.included_mcps = included_mcps
         # An EXTERNAL session (a phone caller who is not a platform user)
         # never attaches the platform-management MCPs — the rebuild below
         # applies the same exclusion rule the phone builder used, so the
@@ -436,7 +502,7 @@ class AgentMCPManager:
             mcp_config_path, _, _, secret_bundles, _ = mcp_registry.build_session_mcp_config(
                 self.agent_name, None,
                 phone_mode=self.phone_mode,
-                is_remote=False,
+                placement=placement.LOCAL_PLACEMENT,
                 external=self.external,
             )
         # Credential broker: provision THIS session's per-MCP secret
@@ -445,7 +511,15 @@ class AgentMCPManager:
         # directly. Provisioned from THIS build (agent scope) so the bundle keys
         # match the mcpServers keys read below. Idempotent — a no-op when there
         # are no secret bundles.
-        from core.credentials import mcp_broker
+        from core.credentials import credential_files, mcp_broker
+        secret_bundles = dict(secret_bundles or {})
+        if self.prebuilt_config is None:
+            # A builder that hands in its bundles (an app button) has
+            # delivered the files for ITS identity; re-delivering the agent
+            # scope here would replace a personal owner's file.
+            credential_files.deliver_token_files(
+                secret_bundles, self.agent_name, user_sub="", session_scope="agent",
+            )
         mcp_broker.provision(self.session_id, secret_bundles)
         if not mcp_config_path or not mcp_config_path.exists():
             logger.info(f"No MCP config for agent '{self.agent_name}'")
@@ -468,6 +542,8 @@ class AgentMCPManager:
         for name, srv_config in servers_config.items():
             if name in self.excluded_mcps:
                 logger.info(f"Skipping credential-excluded MCP: {name}")
+                continue
+            if self.included_mcps is not None and name not in self.included_mcps:
                 continue
             if srv_config.get("type") == "http" and not self.enable_http_transport:
                 logger.info(

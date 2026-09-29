@@ -16,6 +16,7 @@ import pytest
 from api.hooks import permission, routing
 from auth.path_policy import SecurityContext
 from tests._paths import PROXY_DIR
+from core import placement
 
 _GATE_SCRIPT = PROXY_DIR / "hooks" / "permission_gate.py"
 
@@ -26,13 +27,8 @@ def _remote_ctx(role: str = "manager") -> SecurityContext:
         username="dave",
         agent="my-agent",
         is_admin_agent=False,
-        target_kind="user_remote",
-        target_label="dev-box",
-        target_agents_dir="/home/dave/.oto-dock/agents",
-        target_machine_id="machine-abc",
-        target_home_dir="/home/dave",
-        target_allow_full_fs=False,
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="dev-box", agents_dir="/home/dave/.oto-dock/agents", machine_id="machine-abc", home_dir="/home/dave", allow_full_fs=False),
+        )
 
 
 @pytest.fixture

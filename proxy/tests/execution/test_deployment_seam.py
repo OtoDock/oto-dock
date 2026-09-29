@@ -202,9 +202,10 @@ def test_resolve_upstream_url_t1(t1, registry):
     from core.remote import satellite_http_tunnel as tun
     url = tun._resolve_upstream_url("/mcp/file-tools/mcp/?session_id=abc")
     assert url.startswith("http://localhost:8932/")
-    # the proxy's own hooks always stay on loopback (both topologies)
+    # the proxy's own hooks always stay on loopback (both topologies): the
+    # internal listener, or the main port when there is none
     assert tun._resolve_upstream_url("/v1/hooks/resolve-path").startswith(
-        f"http://localhost:{config.PORT}"
+        f"http://127.0.0.1:{config.INTERNAL_LISTENER_PORT or config.PORT}"
     )
 
 
@@ -214,7 +215,7 @@ def test_resolve_upstream_url_t2(t2, registry):
     assert url.startswith("http://file-tools:8932/")
     # hooks endpoint still loopback in T2 (proxy calling itself)
     assert tun._resolve_upstream_url("/v1/hooks/resolve-path").startswith(
-        f"http://localhost:{config.PORT}"
+        f"http://127.0.0.1:{config.INTERNAL_LISTENER_PORT or config.PORT}"
     )
 
 

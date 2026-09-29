@@ -43,6 +43,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from core import layout
 
 logger = logging.getLogger("claude-proxy.mcp-output-relocation")
 
@@ -90,10 +91,10 @@ def _session_workspace(
     """
     import config
     if external_home:
-        return Path(external_home) / "workspace"
+        return Path(external_home) / layout.WORKSPACE
     if username:
-        return config.AGENTS_DIR / agent_name / "users" / username / "workspace"
-    return config.AGENTS_DIR / agent_name / "workspace"
+        return layout.user_dir(config.AGENTS_DIR / agent_name, username) / layout.WORKSPACE
+    return config.AGENTS_DIR / agent_name / layout.WORKSPACE
 
 
 def _parse_output_names(result_text: str | None) -> list[str]:

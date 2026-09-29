@@ -34,11 +34,19 @@ from collections import deque
 from typing import Awaitable, Callable, Optional
 
 import config
+from core import placement
+from core import host_os
+from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core.sandbox import pty_relay
 from core.sandbox.pty_relay import PtyProcess
 from core.terminal_queries import strip_queries as _strip_terminal_queries
 from core.terminal_queries import strip_clipboard_writes as _strip_clipboard_writes
 from core.terminal_queries import strip_replies as _strip_terminal_replies
+from core.terminal_queries import MOUSE_RE as _MOUSE_RE
+from core.session import session_kind
+from core.session.transcript_tailer import leaves_turn_open
+from ws import chat_phase
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.interactive")
 
@@ -61,7 +69,6 @@ logger = logging.getLogger("claude-proxy.interactive")
 # pending cold first-prompt submit. A stray mouse-MOVE over the terminal during
 # warmup otherwise cancelled the cold-submit retry before the Enter landed
 # (observed live: `\x1b[<35;70;68M`).
-_MOUSE_RE = re.compile(rb"\x1b\[<[0-9;]*[Mm]|\x1b\[M.{3}", re.DOTALL)
 
 # Minimum recovered-text length for an undelivered-input breadcrumb. A cold
 # flush that dies unconfirmed is persisted into the chat so the user can copy
@@ -96,8 +103,9 @@ _REAPER_PERIOD_S = 60
 # reclaimed after `session_idle_timeout`. Waiting on a HUMAN is not idleness, so
 # a parked turn gets ONE extra window; past it the platform reclaims the slot,
 # and the answer path revives the session (single-flight). Under memory pressure
-# the capacity evictor (core/concurrency._admit_with_eviction) reclaims it after
-# ~5 min regardless — it sorts on last_activity and never consults these spares.
+# the capacity evictor (core/concurrency._admit_with_eviction) spares an open
+# turn or a parked question up to the background-work ceiling and reclaims the
+# rest by last_activity.
 _QUESTION_PARK_TIMEOUT_MULT = 2
 
 # Readiness gate: buffer input until the TUI has rendered + gone quiet, so the
@@ -256,6 +264,9 @@ class InteractiveSession:
     # The hook-driven park already pinged the open dialog (see
     # park_on_native_dialog) — the transcript fold must not ping it again.
     _native_park_pinged = False
+    # No turn-end waiters on a partial instance (the turn-complete funnel
+    # reads it); __init__ gives every real session its own list.
+    _turn_end_waiters: "list[TurnCompleteCb] | tuple[()]" = ()
 
     def __init__(
         self,
@@ -266,11 +277,11 @@ class InteractiveSession:
         user_sub: str = "",
         role: str = "",
         username: str = "",
-        target: str = "local",
+        target: str = placement.LOCAL,
         remote_os: str = "",
         rows: int = pty_relay.DEFAULT_ROWS,
         cols: int = pty_relay.DEFAULT_COLS,
-        transcript_kind: str = "claude",
+        execution_path: str = DEFAULT_EXECUTION_PATH,
         prompt_in_argv: bool = False,
         tui_theme: str = "dark",
         chat_row: dict | None = None,
@@ -288,10 +299,17 @@ class InteractiveSession:
         self.remote_os = remote_os
         self.rows = rows
         self.cols = cols
-        # Which CLI's transcript persists this session's turns: "claude" reads the
-        # Claude transcript JSONL (transcript_tailer); "codex" reads the Codex
-        # rollout JSONL (codex_rollout_tailer). Set by the spawning layer.
-        self.transcript_kind = transcript_kind
+        # The ENGINE whose TUI this PTY runs — its descriptor answers the
+        # per-engine questions here (which transcript tailer persists the
+        # turns, whether the TUI needs the ConPTY Enter backstop) and its short
+        # name is what session_events reports. Fail-closed: an unknown id is
+        # refused at construction, like every builder.
+        from core.session.session_manager import capabilities_for_path
+        self.execution_path = execution_path
+        self._engine_caps = capabilities_for_path(execution_path)
+        # "claude" / "codex" — the engine's short name; the transcript persisted
+        # for this session is that engine's (see _tailer).
+        self.transcript_kind = self._engine_caps.identity.short_name
         # The TUI theme baked into this session at seed time. Dashboard viewers
         # render their xterm with THIS theme, not the dashboard mode — a
         # dark-seeded TUI (otodock-opened and re-warmed sessions default dark)
@@ -328,6 +346,10 @@ class InteractiveSession:
         # maps it to its banner ("opened on another device" / "opened in a local
         # terminal").
         self._viewer_evict: Optional[Callable[[str], "Optional[Awaitable[None]]"]] = None
+        # The controller's own listener (the one an eviction drops) and the
+        # close notices of the read-only mirrors, which outlive a controller.
+        self._viewer_listener: Optional[OutputListener] = None
+        self._listener_close: dict[OutputListener, CloseCb] = {}
         # True once ANY real viewer attached during this session's lifetime
         # (dashboard PTY view / otodock attach). A premature PTY death on an
         # interactive WORKER with had_viewer set reads as a deliberate user
@@ -348,6 +370,10 @@ class InteractiveSession:
         # SubagentRegistry empty + min-turn-time elapsed.
         self.on_turn_complete: Optional[TurnCompleteCb] = None
         self._turn_complete_fired = False
+        # One-shot turn-end waiters (a borrowed-terminal delegate round waits
+        # for the first turn end after ITS prompt was injected): fired and
+        # cleared at the same point as the task callback.
+        self._turn_end_waiters: list[TurnCompleteCb] = []
         # LLM chat-title generation (services/title_generator.py): armed for
         # chats not yet LLM-titled (mirrors the pump's _title_armed — resumed
         # already-titled chats arm False and skip everything, timer included).
@@ -355,8 +381,9 @@ class InteractiveSession:
         # thresholds (_maybe_fire_title_early), the one-shot early timer, or
         # the turn-complete funnel — then disarmed; exactly-once across
         # sessions/fire points is the DB claim's job. Task chats title like
-        # every chat; only meeting- is excluded (here and in the service).
-        armed = bool(chat_id) and not chat_id.startswith("meeting-")
+        # every chat; a meeting never runs an interactive session (its pump
+        # is disarmed by its driver kind).
+        armed = bool(chat_id)
         if armed:
             if chat_row is None:
                 # Construction without a pre-loaded row (tests, legacy
@@ -471,9 +498,9 @@ class InteractiveSession:
         self._inject_backstop_handle: Optional[asyncio.TimerHandle] = None
         self._draining_prompts = False
         # otodock-attached: the ONE in-flight satellite injection —
-        # {"inject_id", "sent_at"}. The queue head stays queued until the
-        # satellite ACKs (handle_inject_result pops it), so a lost result
-        # frame re-sends the same id and the satellite's dedupe re-ACKs.
+        # {"inject_id", "sent_at", "item"}. The item stays queued until the
+        # satellite ACKs (handle_inject_result removes exactly it), so a lost
+        # result frame re-sends the same id and the satellite's dedupe re-ACKs.
         self._satellite_inject: Optional[dict] = None
         # Turn-open state, derived SOLELY from the tailers' last_signal (both
         # CLIs write the user message to the transcript at submit time, so no
@@ -571,6 +598,13 @@ class InteractiveSession:
         return bool(self._output_listeners)
 
     @property
+    def is_remote(self) -> bool:
+        """Where this PTY runs: a satellite the proxy drives over the WS, or
+        the sandbox on this host (``core.placement``; ``target`` is the
+        stored value)."""
+        return not placement.is_local(self.target)
+
+    @property
     def idle_seconds(self) -> float:
         return time.monotonic() - self.last_activity
 
@@ -594,8 +628,9 @@ class InteractiveSession:
 
         * no owner recorded (phone/legacy sessions) — nothing to compare against
         * no sender (server-injected prompts: scheduler wakes, cold submits)
-        * ``task-`` / ``meeting-`` chats — governed by their OWN authorization
-          models (``_task_continue_allowed`` is role-based on purpose, so
+        * a task chat (``session_kind.is_task_chat_id``) — governed by its OWN
+          authorization model (``_task_continue_allowed`` is role-based on
+          purpose, so
           delegate lanes stay steerable by whoever holds the role); an ownership
           gate on top would break live lane steering.
 
@@ -605,7 +640,7 @@ class InteractiveSession:
         """
         if not self.user_sub or not sender_sub:
             return True
-        if self.chat_id.startswith(("task-", "meeting-")):
+        if session_kind.is_task_chat_id(self.chat_id):
             return True
         return sender_sub == self.user_sub
 
@@ -613,24 +648,33 @@ class InteractiveSession:
     def add_output_listener(
         self, cb: OutputListener,
         on_evict: "Optional[Callable[[str], Optional[Awaitable[None]]]]" = None,
+        on_close: "Optional[CloseCb]" = None,
     ) -> bytes:
         """Attach a viewer. Returns the scrollback to replay so the viewer sees
         the current screen (reconnect / late-attach).
 
-        Single-viewer: when ``on_evict`` is given, this is a dashboard
-        viewer — it EVICTS the previous viewer first (drops its listener + fires
-        its evict callback with reason "superseded") so two devices/tabs never
-        mirror the same PTY at different sizes (which garbles both). Pass no
-        ``on_evict`` for internal/test listeners, which don't evict."""
-        prev_evict = self._viewer_evict
-        if on_evict is not None and prev_evict is not None and prev_evict is not on_evict:
-            self._output_listeners.clear()  # the old viewer's listener goes too
+        Single controller: when ``on_evict`` is given, this is the driving
+        dashboard viewer. It EVICTS the previous controller first (drops that
+        one listener and fires its evict callback with reason "superseded")
+        so two devices or tabs never drive the same PTY at different sizes,
+        which garbles both. A read-only mirror passes no ``on_evict`` and
+        survives a controller change; ``on_close`` lets it learn the session
+        ended (the controller's notice is the single-slot ``self.on_close``).
+        Internal and test listeners pass neither."""
+        prev_evict, prev_cb = self._viewer_evict, self._viewer_listener
+        supersede = on_evict is not None and prev_evict is not None and prev_cb is not cb
+        if supersede:
+            self._output_listeners.discard(prev_cb)
+            self._listener_close.pop(prev_cb, None)
         self._output_listeners.add(cb)
+        if on_close is not None:
+            self._listener_close[cb] = on_close
         if on_evict is not None:
             self._viewer_evict = on_evict
+            self._viewer_listener = cb
             self.had_viewer = True
         self._note_activity()
-        if on_evict is not None and prev_evict is not None and prev_evict is not on_evict:
+        if supersede:
             try:
                 res = prev_evict("superseded")
                 if asyncio.iscoroutine(res):
@@ -648,14 +692,16 @@ class InteractiveSession:
         # Clipboard writes (OSC 52 set) are replay-stripped for BOTH targets:
         # they pass live (the TUI's copy feature) but a replayed one would
         # overwrite the viewer's clipboard on page open.
-        if self.target == "local":
+        if not self.is_remote:
             sb = _strip_terminal_queries(sb)
         return _strip_clipboard_writes(sb)
 
     def remove_output_listener(self, cb: OutputListener) -> None:
         self._output_listeners.discard(cb)
-        if not self._output_listeners:
+        self._listener_close.pop(cb, None)
+        if cb is self._viewer_listener:
             self._viewer_evict = None
+            self._viewer_listener = None
 
     def evict_viewer(self, reason: str = "superseded") -> None:
         """dual-control: detach the current dashboard viewer (if any) WITHOUT
@@ -666,9 +712,11 @@ class InteractiveSession:
         fanning out to the now-detached socket. Fully SYNCHRONOUS (it only
         SCHEDULES the evict's WS send as a task), so it is safe to call under the
         registry lock without racing ``close()``'s ``on_close`` read."""
-        ev = self._viewer_evict
-        self._output_listeners.clear()
+        ev, cb = self._viewer_evict, self._viewer_listener
+        self._output_listeners.discard(cb)
+        self._listener_close.pop(cb, None)
         self._viewer_evict = None
+        self._viewer_listener = None
         self.on_perm_event = None
         self.on_close = None
         self.on_status = None
@@ -734,7 +782,7 @@ class InteractiveSession:
             # flows). NOT re-armed per chunk — one probe per fuse window, and
             # only while the turn stays closed. Local only: remote turn state
             # rides the forwarded transcript lines.
-            if (not self._turn_open and self.target == "local"
+            if (not self._turn_open and not self.is_remote
                     and self._resume_tail_handle is None):
                 self._resume_tail_handle = self._loop.call_later(
                     _RESUME_TAIL_S, self._run_resume_tail)
@@ -744,7 +792,7 @@ class InteractiveSession:
         # core.terminal_queries). Remote sessions arrive pre-stripped
         # (remote_pty._feed_output); local PTY bytes are stripped here. The
         # readiness/settle/tail logic above intentionally saw the RAW bytes.
-        mirror_data = _strip_terminal_queries(data) if self.target == "local" else data
+        mirror_data = _strip_terminal_queries(data) if not self.is_remote else data
         if not mirror_data:
             return
         for cb in list(self._output_listeners):
@@ -1015,14 +1063,17 @@ class InteractiveSession:
         # was swallowed and the flush must be replayed.
         if self._cold_flush_pending:
             self._arm_cold_flush_watch()
-        # WINDOWS-remote Claude ONLY: the ConPTY render race can swallow this single
-        # post-settle Enter (it lands first-try local + Linux-remote). Fire ONE more
-        # Enter _SUBMIT_WIN_BACKSTOP_S later — by then the TUI is idle. 2 Enters
+        # WINDOWS-remote, and only a TUI that declares it (Claude's Ink): the
+        # ConPTY render race can swallow this single post-settle Enter (it lands
+        # first-try local + Linux-remote). Fire ONE more Enter
+        # _SUBMIT_WIN_BACKSTOP_S later — by then the TUI is idle. 2 Enters
         # total: an extra Enter on an already-submitted/empty composer is a no-op;
         # the narrow accepted risk is a native menu shown within the gap (it'd select
         # an option). Codex / Linux-remote / local: no backstop (single Enter works).
-        if (self._submit_refires == 0 and self.transcript_kind == "claude"
-                and self.remote_os == "windows"):
+        _row = host_os.of(self.remote_os)
+        if (self._submit_refires == 0
+                and self._engine_caps.runtime.interactive_submit_backstop
+                and _row is not None and _row.conpty):
             self._submit_refires = 1
             self._submit_recheck_handle = self._loop.call_later(
                 _SUBMIT_WIN_BACKSTOP_S, self._fire_submit,
@@ -1140,8 +1191,8 @@ class InteractiveSession:
         from storage import database as task_store
         from core.session.transcript_tool_events import persist_event
         block = {
-            "type": "system",
-            "subtype": "undelivered_input",
+            "type": wire.SYSTEM,
+            "subtype": wire.SUBTYPE_UNDELIVERED_INPUT,
             "message": text,
         }
         async def _write() -> None:
@@ -1170,28 +1221,64 @@ class InteractiveSession:
             self._pending_seed_digest = digest
 
     # -- server-prompt injection (delegate results …) --------------------------
-    def queue_prompt(self, text: str, source: str, **context) -> bool:
+    def queue_prompt(self, text: str, source: str, **context) -> dict | None:
         """Queue a server-originated prompt for injection at CLI quiescence.
 
         ``steer=True`` in the context marks the item steer-eligible: with an
         OPEN turn on a local PTY it injects mid-turn instead of waiting for
         quiescence (see ``_prompt_gates_blocked``); otherwise the flag is
-        inert. Returns False when the session can't take it (dead/closing) so
-        the delivery ladder falls through to its headless rungs. ``context`` is
-        the re-delivery payload (chat_id/agent/user_sub/role/hops + the ladder's
-        rung callables) that close() hands back if the PTY dies first.
-        Deliberately does NOT count as activity — a starved queue must not
-        immortalize an unviewed session against the idle reaper (reap → close
-        → handback is the designed escape for a composer that never clears)."""
+        inert. ``on_injected`` in the context is called once the prompt is in
+        the terminal (the local paste, or the satellite's ACK). Returns the
+        queued item — the handle ``cancel_prompt`` takes — or None when the
+        session can't take it (dead/closing) so the delivery ladder falls
+        through to its headless rungs. ``context`` is the re-delivery payload
+        (chat_id/agent/user_sub/role/hops + the ladder's rung callables) that
+        close() hands back if the PTY dies first. Deliberately does NOT count
+        as activity — a starved queue must not immortalize an unviewed session
+        against the idle reaper (reap → close → handback is the designed
+        escape for a composer that never clears)."""
         if not self.alive or self._closing or self._closed:
-            return False
-        self._prompt_queue.append({"text": text, "source": source, **context})
+            return None
+        item = {"text": text, "source": source, **context}
+        self._prompt_queue.append(item)
         logger.info(
             "interactive %s: queued server prompt [%s] (depth=%d)",
             self.session_id[:8], source, len(self._prompt_queue),
         )
         self._loop.create_task(self._try_drain_prompt_queue())
-        return True
+        return item
+
+    def cancel_prompt(self, item: dict) -> bool:
+        """Drop a queued prompt that has not been injected yet (a cancelled
+        borrowed-terminal round); False when it already left the queue, or
+        when it is the satellite's in-flight injection, which may land anyway
+        (dropped all the same: a decline or a lost result never re-sends it)."""
+        try:
+            self._prompt_queue.remove(item)
+        except ValueError:
+            return False
+        inflight = self._satellite_inject
+        return inflight is None or inflight.get("item") is not item
+
+    def add_turn_end_waiter(self, cb: TurnCompleteCb) -> None:
+        """Fire ``cb`` once at the next turn end that passes the completion
+        gates (min turn time, no background subagent, not a question)."""
+        self._turn_end_waiters.append(cb)
+
+    def remove_turn_end_waiter(self, cb: TurnCompleteCb) -> None:
+        if cb in self._turn_end_waiters:
+            self._turn_end_waiters.remove(cb)
+
+    @staticmethod
+    def _note_injected(item: dict) -> None:
+        """The prompt is in the terminal: tell whoever queued it."""
+        hook = item.get("on_injected")
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            logger.exception("interactive: on_injected hook failed [%s]", item.get("source", "?"))
 
     def _apply_turn_signal(self, last_signal: str | None,
                            question_pending: bool = False) -> None:
@@ -1203,7 +1290,7 @@ class InteractiveSession:
             self._question_parked = True
         elif last_signal is not None:
             self._question_parked = False
-        if last_signal in ("user", "tool_use"):
+        if leaves_turn_open(last_signal):
             self._set_turn_open(True)
         elif last_signal == "end_turn":
             if self._turn_open:
@@ -1281,13 +1368,13 @@ class InteractiveSession:
             self._question_parked = False  # any open unparks (answer/inject)
             self._native_park_pinged = False
             self._clear_cold_flush()  # prompt confirmed — retry stands down
-        if is_open == was or not self.chat_id or self.chat_id.startswith("meeting-"):
+        if is_open == was or not self.chat_id:
             return
         if is_open:
             try:
                 from services.notifications import notification_manager
                 notification_manager.broadcast_chat_status(
-                    self._chat_owner(), self.chat_id, "streaming",
+                    self._chat_owner(), self.chat_id, chat_phase.STREAMING,
                     agent=self.agent_name,
                 )
             except Exception:
@@ -1301,7 +1388,7 @@ class InteractiveSession:
                 self._title_timer = self._loop.call_later(
                     _TITLE_EARLY_TIMER_S, self._fire_title_timer)
             # Mid-turn tail cycle (local): rows land as the turn produces them.
-            if self.target == "local" and self._midturn_tail_handle is None:
+            if not self.is_remote and self._midturn_tail_handle is None:
                 self._midturn_tail_handle = self._loop.call_later(
                     _MIDTURN_TAIL_S, self._run_midturn_tail)
         else:
@@ -1316,7 +1403,20 @@ class InteractiveSession:
         transition AND on an end_turn signal with no prior open (whole turn in
         one tailer batch) — both are real turn ends. Idempotent."""
         self._kick_prompt_queue_post_turn()
-        if not self.chat_id or self.chat_id.startswith("meeting-"):
+        # The platform's turn_end, as an OBSERVATION: on a terminal the CLI
+        # drives the turn and the Stop hook is the one point that can hold it
+        # open, so the verdict is computed there (HOOKS.md); this call only
+        # records the end for the session's bookkeeping.
+        try:
+            from core.session import session_events
+            self._loop.create_task(session_events.turn_end(
+                self.session_id, source="transcript",
+                engine=self.transcript_kind, driven_by="cli",
+            ))
+        except Exception:
+            logger.debug("interactive %s: turn_end observation failed",
+                         self.session_id[:8], exc_info=True)
+        if not self.chat_id:
             return
         try:
             from datetime import datetime, timezone
@@ -1357,7 +1457,7 @@ class InteractiveSession:
                     _stamp_done,
                 )
             notification_manager.broadcast_chat_status(
-                _owner, _chat_id, "ready", agent=self.agent_name,
+                _owner, _chat_id, chat_phase.READY, agent=self.agent_name,
             )
             if _mark_read:
                 with contextlib.suppress(Exception):
@@ -1508,7 +1608,7 @@ class InteractiveSession:
             # lull, e.g. a native permission dialog waiting for input, must not
             # read as idle). Remote sessions are fresh via the satellite's 0.8s
             # forwarded-lines poll, and have no local file to read.
-            if self.target == "local" and self.chat_id:
+            if not self.is_remote and self.chat_id:
                 tailer = self._tailer()
                 try:
                     result = await asyncio.to_thread(
@@ -1519,11 +1619,16 @@ class InteractiveSession:
                         "interactive %s: pre-inject tail failed", self.session_id[:8]
                     )
                     return
-                self._apply_turn_signal(result.get("last_signal"),
-                                question_pending=bool(result.get("question_pending")))
+                # The whole fold: the cursor moved past this batch, so a turn
+                # end in it is reported here or never.
+                self._fold_tail_result(result)
+                if not self._prompt_queue:
+                    return
                 # Re-check everything after the await — state may have moved
                 # (the tail can flip _turn_open; output during the await resets
-                # the quiet clock).
+                # the quiet clock; a cancel can change the head, and with it
+                # the steer eligibility).
+                steering = bool(self._prompt_queue[0].get("steer"))
                 blocked = self._prompt_gates_blocked(steering=steering)
                 if blocked:
                     self._log_held(f"{blocked} post-tail")
@@ -1548,6 +1653,7 @@ class InteractiveSession:
                 "steered into open turn" if steered_live else "injected",
                 item.get("source", "?"), len(self._prompt_queue),
             )
+            self._note_injected(item)
         finally:
             self._draining_prompts = False
             self._arm_inject_backstop()
@@ -1560,7 +1666,7 @@ class InteractiveSession:
         The head item stays queued until the satellite ACKs; a local-terminal
         detach or an old satellite leaves it queued for the proxy path /
         close-handback."""
-        if not self._prompt_queue or self.target == "local":
+        if not self._prompt_queue or not self.is_remote:
             return
         blocked = self._prompt_gates_blocked(for_satellite=True)
         if blocked:
@@ -1578,17 +1684,21 @@ class InteractiveSession:
             )
             return
         now = time.monotonic()
-        if self._satellite_inject is not None:
-            if now - self._satellite_inject["sent_at"] < _SATELLITE_INJECT_TIMEOUT_S:
+        inflight = self._satellite_inject
+        if inflight is not None:
+            if now - inflight["sent_at"] < _SATELLITE_INJECT_TIMEOUT_S:
                 return  # awaiting the result frame
-            # Result lost (WS blip) — re-send the SAME id; the satellite's
-            # recent-id dedupe re-ACKs without re-injecting.
-            self._satellite_inject["sent_at"] = now
-            inject_id = self._satellite_inject["inject_id"]
-        else:
-            inject_id = uuid.uuid4().hex[:12]
-            self._satellite_inject = {"inject_id": inject_id, "sent_at": now}
-        item = self._prompt_queue[0]
+            if any(q is inflight["item"] for q in self._prompt_queue):
+                # Result lost (WS blip) — re-send the SAME id; the
+                # satellite's recent-id dedupe re-ACKs without re-injecting.
+                inflight["sent_at"] = now
+            else:
+                inflight = None  # cancelled in flight — never re-sent
+        if inflight is None:
+            inflight = {"inject_id": uuid.uuid4().hex[:12], "sent_at": now,
+                        "item": self._prompt_queue[0]}
+            self._satellite_inject = inflight
+        inject_id, item = inflight["inject_id"], inflight["item"]
         await mgr.send_fire_and_forget(self.target, {
             "type": "pty_inject",
             "session_id": self.session_id,
@@ -1603,21 +1713,31 @@ class InteractiveSession:
 
     def handle_inject_result(self, inject_id: str, ok: bool, reason: str = "") -> None:
         """satellite ``pty_inject_result``: resolve the in-flight injection.
-        ACK pops the queue head (the prompt is in the user's terminal) and
-        opens the turn; NACK leaves it queued for the backstop / the proxy path
-        (after a detach) / the close-handback (session gone)."""
+        ACK removes exactly the item that was sent (the prompt is in the
+        user's terminal) and opens the turn; an item cancelled in flight is
+        already gone and nothing else leaves the queue. NACK leaves it queued
+        for the backstop / the proxy path (after a detach) / the
+        close-handback (session gone)."""
         inflight = self._satellite_inject
         if not inflight or inflight.get("inject_id") != inject_id:
             return  # stale or unknown — a newer attempt owns the slot
         self._satellite_inject = None
         if ok:
-            item = self._prompt_queue.popleft() if self._prompt_queue else None
+            item = inflight["item"]
+            queued = False
+            for i, q in enumerate(self._prompt_queue):
+                if q is item:
+                    del self._prompt_queue[i]
+                    queued = True
+                    break
             self._set_turn_open(True)  # the injected prompt opened a turn
             logger.info(
-                "interactive %s: satellite injected server prompt [%s] (%d left)",
-                self.session_id[:8],
-                (item or {}).get("source", "?"), len(self._prompt_queue),
+                "interactive %s: satellite injected server prompt [%s]%s (%d left)",
+                self.session_id[:8], item.get("source", "?"),
+                "" if queued else " cancelled in flight", len(self._prompt_queue),
             )
+            if queued:
+                self._note_injected(item)
         else:
             logger.info(
                 "interactive %s: satellite injection declined (%s)",
@@ -1630,14 +1750,12 @@ class InteractiveSession:
         self._arm_inject_backstop()
 
     def _tailer(self):
-        """The transcript-persistence module for this session's CLI flavor. Both
-        expose the same ``resolve_and_tail(session_id, chat_id)`` + ``forget``
-        surface, so the call sites are flavor-agnostic."""
-        if self.transcript_kind == "codex":
-            from core.session import codex_rollout_tailer
-            return codex_rollout_tailer
-        from core.session import transcript_tailer
-        return transcript_tailer
+        """The transcript-persistence module for this session's engine
+        (``ExecutionLayer.transcript_tailer``). Both engines' modules expose
+        the same ``resolve_and_tail(session_id, chat_id)`` + ``forget``
+        surface, so the call sites are engine-agnostic."""
+        from core.session.session_manager import get_layer_by_path
+        return get_layer_by_path(self.execution_path).transcript_tailer()
 
     def _run_post_output_tail(self) -> None:
         """Output settled (turn / long pause likely ended) → tail the transcript
@@ -1690,7 +1808,14 @@ class InteractiveSession:
                 "interactive %s: post-output tail failed", self.session_id[:8]
             )
             return
-        self._apply_turn_signal(result.get("last_signal"),
+        self._fold_tail_result(result)
+
+    def _fold_tail_result(self, result: dict) -> None:
+        """One tail batch into the session: the turn-signal fold, the
+        per-batch effects, then a turn end's completion (gated in
+        :meth:`_maybe_fire_turn_complete`)."""
+        last_signal = result.get("last_signal")
+        self._apply_turn_signal(last_signal,
                                 question_pending=bool(result.get("question_pending")))
         self._post_batch_effects(result)
         if result.get("turn_complete") or result.get("question_pending"):
@@ -1698,6 +1823,7 @@ class InteractiveSession:
                 result.get("last_message", "") or "", result.get("persisted", 0),
                 question=bool(result.get("question_pending")),
                 compacted=bool(result.get("compacted")),
+                reopened=leaves_turn_open(last_signal),
             )
 
     def _post_batch_effects(self, result: dict) -> None:
@@ -1741,8 +1867,7 @@ class InteractiveSession:
         except Exception:
             pass
         try:
-            if result.get("persisted", 0) > 0 and self.chat_id \
-                    and not self.chat_id.startswith("meeting-"):
+            if result.get("persisted", 0) > 0 and self.chat_id:
                 from services.notifications import notification_manager
                 notification_manager.broadcast_chat_rows(
                     self._chat_owner(), self.chat_id, agent=self.agent_name,
@@ -1761,7 +1886,7 @@ class InteractiveSession:
                 self._turn_end_effects()
                 self._fire_turn_notification(compacted=True)
             elif (result.get("compact_trigger") == "manual"
-                    and result.get("last_signal") not in ("user", "tool_use")):
+                    and not leaves_turn_open(result.get("last_signal"))):
                 self._set_turn_open(False)  # runs the turn-end effects
                 self._fire_turn_notification(compacted=True)
 
@@ -1853,26 +1978,20 @@ class InteractiveSession:
                 "interactive %s: forwarded transcript persist failed", self.session_id[:8]
             )
             return
-        self._apply_turn_signal(result.get("last_signal"),
-                                question_pending=bool(result.get("question_pending")))
-        self._post_batch_effects(result)
-        if result.get("turn_complete") or result.get("question_pending"):
-            self._maybe_fire_turn_complete(
-                result.get("last_message", "") or "", result.get("persisted", 0),
-                question=bool(result.get("question_pending")),
-                compacted=bool(result.get("compacted")),
-            )
+        self._fold_tail_result(result)
 
     def _maybe_fire_turn_complete(self, last_message: str, persisted: int = 0,
                                   question: bool = False,
-                                  compacted: bool = False) -> None:
+                                  compacted: bool = False,
+                                  reopened: bool = False) -> None:
         """A tailer saw a turn-end signal. Three independent reactions, in order:
 
         1. **LLM chat-title generation** — the FALLBACK fire for first turns
            the early triggers (tail-batch thresholds / the one-shot timer)
            never reached; disarms ``_title_armed``. Task chats title like any
-           chat — the service skips only ``meeting-`` and atomically claims,
-           so exactly once across every fire point.
+           chat — the service skips no id shape (a meeting pump is disarmed
+           by its driver kind) and atomically claims, so exactly once across
+           every fire point.
         2. **End-of-turn USER notification + audio** — fired once PER TURN (chats
            only — an autonomous task run's completion alert is its
            ``notification_mode`` contract), local AND remote, giving interactive
@@ -1947,9 +2066,22 @@ class InteractiveSession:
         if self._prompt_queue and not self._closing and not question:
             self._loop.create_task(self._try_drain_prompt_queue())
 
-        # (3) one-time interactive-TASK completion callback.
+        # (3) one-time interactive-TASK completion callback, and the one-shot
+        # turn-end waiters (a borrowed-terminal round's) — the same gates.
         if question:
             return
+        # ``reopened``: the batch ends with the next turn already open. A
+        # prompt steered in as this turn closed runs as that next turn, so a
+        # waiter armed at its injection waits for that turn's end.
+        if self._turn_end_waiters and not reopened:
+            waiters, self._turn_end_waiters = self._turn_end_waiters, []
+            for waiter in waiters:
+                try:
+                    waiter(last_message)
+                except Exception:
+                    logger.exception(
+                        "interactive %s: turn-end waiter failed", self.session_id[:8],
+                    )
         if self._turn_complete_fired or self.on_turn_complete is None:
             return
         self._turn_complete_fired = True
@@ -1982,17 +2114,17 @@ class InteractiveSession:
         open, and a stale viewer origin never swallows it. ``user_sub`` +
         ``agent_name`` are on the session (no DB lookup; both calls are
         non-blocking — the first enqueues to in-memory conn queues, the second is
-        scheduled as a task). Skipped for meeting chats (per-speaker turn ends
-        aren't completions) and for autonomous task runs (the scheduler set
-        ``on_turn_complete``) — a task's completion alert is its
+        scheduled as a task). Skipped for autonomous task runs (the scheduler
+        set ``on_turn_complete``) — a task's completion alert is its
         ``notification_mode`` contract; a re-warmed task chat has no callback and
-        keeps the per-turn signal. Best-effort."""
-        if not self.user_sub or not self.chat_id or self.chat_id.startswith("meeting-"):
+        keeps the per-turn signal. A meeting never runs an interactive session.
+        Best-effort."""
+        if not self.user_sub or not self.chat_id:
             return
         try:
             from services.notifications import notification_manager
             notification_manager.broadcast_chat_status(
-                self._chat_owner(), self.chat_id, "ready", agent=self.agent_name,
+                self._chat_owner(), self.chat_id, chat_phase.READY, agent=self.agent_name,
             )
             if self.on_turn_complete is not None:
                 return
@@ -2079,7 +2211,7 @@ class InteractiveSession:
         """``chat_rows`` nudge after an artifact row persists — same contract as
         ``_post_batch_effects``, so an OPEN rich-history view refetches live
         instead of waiting for the next tail batch. Best-effort."""
-        if not self.chat_id or self.chat_id.startswith("meeting-"):
+        if not self.chat_id:
             return
         try:
             from services.notifications import notification_manager
@@ -2136,6 +2268,7 @@ class InteractiveSession:
 
         from core import concurrency
         tailer = self._tailer()
+        deleted = reason == "chat_deleted"
         # Persist the conversation to chat_messages from the transcript/rollout JSONL
         # BEFORE clearing state. The native TUI does not reliably fire the Stop hook,
         # so this discover-and-tail on close is the robust persistence path — without
@@ -2148,9 +2281,11 @@ class InteractiveSession:
             )
             # Backstop: a turn that ended exactly as the session closes (idle
             # reap / toggle-off) still fires the task completion (fire-once).
-            if _r.get("turn_complete"):
+            # A chat being deleted has no audience for it.
+            if _r.get("turn_complete") and not deleted:
                 self._maybe_fire_turn_complete(
-                    _r.get("last_message", "") or "", _r.get("persisted", 0)
+                    _r.get("last_message", "") or "", _r.get("persisted", 0),
+                    reopened=leaves_turn_open(_r.get("last_signal")),
                 )
         except Exception:
             logger.exception(
@@ -2183,11 +2318,18 @@ class InteractiveSession:
 
         # A session dying mid-turn can never emit its end_turn signal — clear
         # the sidebar dot (and stamp the partial response) via the transition
-        # broadcast. No-op when the turn already closed.
-        self._set_turn_open(False)
+        # broadcast. No-op when the turn already closed. A chat being deleted
+        # gets no ready frame and no unread stamp: its row goes next, and the
+        # frame would leave a finished row for an id no list carries.
+        if deleted:
+            self._turn_open = False
+        else:
+            self._set_turn_open(False)
 
         self._closed = True
         self._output_listeners.clear()
+        closers = list(self._listener_close.values())
+        self._listener_close.clear()
         logger.info("interactive %s: closed (%s)", self.session_id[:8], reason)
 
         # Hand undelivered server prompts back to the delivery ladder — the PTY
@@ -2200,9 +2342,9 @@ class InteractiveSession:
             self._prompt_queue.clear()
             self._loop.create_task(_redeliver_pending(self, pending))
 
-        if self.on_close is not None:
+        for notify in ([self.on_close] if self.on_close is not None else []) + closers:
             try:
-                res = self.on_close(self, reason)
+                res = notify(self, reason)
                 if asyncio.iscoroutine(res):
                     await res
             except Exception:
@@ -2352,17 +2494,16 @@ def live_session_ids(local_only: bool = False) -> set[str]:
     excludes remote (satellite) sessions: those belong to a satellite budget, not
     the local ceiling G, so they must not appear in the local reconciler's live set."""
     return {sid for sid, s in _sessions.items()
-            if s.alive and (not local_only or s.target == "local")}
+            if s.alive and (not local_only or not s.is_remote)}
 
 
 def streaming_chat_ids() -> set[str]:
     """Chat ids of live interactive sessions currently INSIDE a turn — the
     interactive half of the dashboard connect-time ``chat_status_snapshot``
-    (the pump half is ``session_state.streaming_chat_ids``). Meeting chats are
-    excluded like every other interactive live-dot signal."""
+    (the pump half is ``session_state.streaming_chat_ids``). A meeting never
+    runs an interactive session, so nothing is excluded here."""
     return {s.chat_id for s in _sessions.values()
-            if s.chat_id and not s.chat_id.startswith("meeting-")
-            and s.alive and s._turn_open}
+            if s.chat_id and s.alive and s._turn_open}
 
 
 def live_agent_names() -> set[str]:
@@ -2401,8 +2542,13 @@ async def _register_session(
         # the satellite enforces its own budget). Local interactive counts as a
         # local session. A session spawned for a task is already tracked as
         # "task" by the scheduler's task_slot — the acquire here is then an
-        # idempotent no-op (no double-count).
-        adm = await concurrency.acquire_chat_slot(session.session_id, target=session.target)
+        # idempotent no-op (no double-count). The owner is recorded for the
+        # per-person count; the cap never refuses here (the person asked for
+        # this chat and the funnel already judged it).
+        adm = await concurrency.acquire_chat_slot(
+            session.session_id, target=session.target,
+            user_sub=session.user_sub or None, per_user_cap=False,
+        )
         if not adm:
             raise CapacityError(
                 f"no chat slot for interactive session {session.session_id[:8]} ({adm.reason})"
@@ -2477,9 +2623,9 @@ async def register(
     user_sub: str = "",
     role: str = "",
     username: str = "",
-    target: str = "local",
+    target: str = placement.LOCAL,
     scrollback_limit: int = pty_relay.DEFAULT_SCROLLBACK_BYTES,
-    transcript_kind: str = "claude",
+    execution_path: str = DEFAULT_EXECUTION_PATH,
     prompt_in_argv: bool = False,
     tui_theme: str = "dark",
 ) -> InteractiveSession:
@@ -2488,8 +2634,9 @@ async def register(
     Enforces the lease (kills any existing process for the same ``session_id``)
     and acquires a chat slot. ``argv``/``env`` are pre-assembled by the caller
     (the interactive CLI argv mirrors the ``-p`` spawn minus ``-p``/stream-json,
-    plus ``TERM``). The PROXY-side identity (``set_session_security`` etc.) is set
-    by the caller BEFORE this call so hooks resolve the moment the CLI starts.
+    plus ``TERM``); ``execution_path`` names the engine whose TUI it is. The
+    PROXY-side identity (``set_session_security`` etc.) is set by the caller
+    BEFORE this call so hooks resolve the moment the CLI starts.
 
     Raises :class:`CapacityError` if no chat slot is free.
     """
@@ -2497,7 +2644,7 @@ async def register(
         session_id=session_id, chat_id=chat_id, agent_name=agent_name,
         user_sub=user_sub, role=role, username=username, target=target,
         rows=rows, cols=cols,
-        transcript_kind=transcript_kind, prompt_in_argv=prompt_in_argv,
+        execution_path=execution_path, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
         chat_row=await _load_chat_row(chat_id),
     )
@@ -2510,7 +2657,11 @@ async def register(
             scrollback_limit=scrollback_limit,
         )
 
-    sess = await _register_session(session, pty_factory=_make_local_pty)
+    # One spawn slot around the local PTY start, taken OUTSIDE
+    # _register_session: its registry lock would otherwise queue every
+    # registration, remote ones included, behind a spawn waiting for a slot.
+    async with pty_relay.spawn_slot():
+        sess = await _register_session(session, pty_factory=_make_local_pty)
     logger.info(
         "interactive %s registered (chat=%s agent=%s pid=%s)",
         session_id[:8], chat_id, agent_name, sess.pty.pid,
@@ -2532,7 +2683,6 @@ async def register_remote(
     role: str = "",
     username: str = "",
     scrollback_limit: int = pty_relay.DEFAULT_SCROLLBACK_BYTES,
-    transcript_kind: str = "claude",
     prompt_in_argv: bool = False,
     tui_theme: str = "dark",
 ) -> InteractiveSession:
@@ -2558,7 +2708,7 @@ async def register_remote(
         user_sub=user_sub, role=role, username=username, target=machine_id,
         remote_os=remote_os,
         rows=rows, cols=cols,
-        transcript_kind=transcript_kind, prompt_in_argv=prompt_in_argv,
+        execution_path=execution_path, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
         chat_row=await _load_chat_row(chat_id),
     )
@@ -2580,11 +2730,18 @@ async def register_remote(
     return sess
 
 
-async def close_session(session_id: str, *, reason: str = "closed") -> bool:
-    """Close a registered interactive session by id. Returns True if it existed."""
+async def close_session(session_id: str, *, reason: str = "closed",
+                        drop_queued: bool = False) -> bool:
+    """Close a registered interactive session by id. Returns True if it existed.
+
+    ``drop_queued`` discards the session's queued server prompts instead of
+    handing them back to the delivery ladder (a closer acting on a person who
+    lost access must not re-deliver what was queued under their role)."""
     session = _sessions.get(session_id)
     if session is None:
         return False
+    if drop_queued:
+        session._prompt_queue.clear()
     await session.close(reason=reason)
     return True
 
@@ -2633,8 +2790,8 @@ def _reap_spare_reason(session: "InteractiveSession", timeout_s: float) -> str:
 async def reap_idle(timeout_s: float | None = None) -> int:
     """Close sessions with no viewer and no activity for ``timeout_s``.
 
-    ``timeout_s`` defaults to the platform-wide admin idle timeout
-    (``config.get_idle_timeout()``) — ONE knob shared with the headless reapers.
+    ``timeout_s`` defaults to the platform-wide admin idle timeout (the
+    cached off-loop read): ONE knob shared with the headless reapers.
     A viewer attached, or any byte in/out, keeps a session alive, so a
     long unviewed agent turn is never killed mid-flight; an on-screen or
     reconnect-grace terminal is also spared below (don't kill visible state —
@@ -2642,7 +2799,8 @@ async def reap_idle(timeout_s: float | None = None) -> int:
     activity also spares (``_reap_spare_reason``). Returns the count reaped.
     """
     if timeout_s is None:
-        timeout_s = config.get_idle_timeout()
+        from core.session import session_state as _state
+        timeout_s = await _state.cached_idle_timeout()
     reaped = 0
     for session in list(_sessions.values()):
         if session.has_viewer or session.otodock_attached or not session.alive:
@@ -2650,7 +2808,7 @@ async def reap_idle(timeout_s: float | None = None) -> int:
         # A remote session whose satellite is mid-reconnect is held in
         # PTY-grace — still `alive` but transiently unviewable. Don't reap it; the
         # grace timer (or its reconcile on reconnect) decides its fate.
-        if session.target != "local":
+        if session.is_remote:
             from core.remote.satellite_connection import get_connection_manager
             if get_connection_manager().is_pty_in_grace(session.target):
                 continue
@@ -2694,6 +2852,7 @@ async def tail_live_sessions() -> None:
                 session._maybe_fire_turn_complete(
                     _r.get("last_message", "") or "", _r.get("persisted", 0),
                     question=bool(_r.get("question_pending")),
+                    reopened=leaves_turn_open(_r.get("last_signal")),
                 )
         except Exception:
             logger.exception(

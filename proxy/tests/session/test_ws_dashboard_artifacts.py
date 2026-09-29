@@ -1,5 +1,5 @@
 """display_ui backchannel over the dashboard WS (``artifact_interaction``)
-plus the pinned mini-app ``app_action`` twin (send_prompt actions).
+plus the pinned app ``app_action`` twin (send_prompt actions).
 
 Golden-master style like the characterization suite: the idle path runs a
 REAL framed turn through the real pump (distinct event row, never a "user"
@@ -299,7 +299,7 @@ class TestValidation:
         run_ws_scenario(scenario)
 
 
-# ───────────────── pinned mini-app send_prompt (``app_action``) ──────────────
+# ───────────────── pinned app send_prompt (``app_action``) ──────────────
 
 
 def _mk_app(agent: str, *, personal: bool = False, approved: bool = True,
@@ -374,7 +374,7 @@ class TestAppActionIdleDelivery:
                 # page data).
                 assert len(layer.messages) == 1
                 framed = layer.messages[0][1]
-                assert '[action from mini-app "Brief" — Ask]' in framed
+                assert '[action from app "Brief" — Ask]' in framed
                 assert "Analyze March for me" in framed
                 assert "template was approved by the user" in framed
 
@@ -508,7 +508,7 @@ class TestAppActionMidTurn:
                 assert len(layer.messages) == 2
                 framed = layer.messages[1][1]
                 assert '[interaction from artifact "Widget"]' in framed
-                assert '[action from mini-app "Brief" — Ask]' in framed
+                assert '[action from app "Brief" — Ask]' in framed
                 assert "not the user typing" in framed
                 assert "template was approved by the user" in framed
 

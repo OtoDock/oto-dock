@@ -1,3 +1,5 @@
+import { PAYLOAD, payloadText, toolPayload } from '../../lib/tools/roles'
+
 interface Props {
   requestId: string
   toolName: string
@@ -22,14 +24,12 @@ export default function PermissionDialog({
   const inputStr =
     typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput, null, 2)
 
-  // Show command for Bash tool, file path for Read/Write/Edit/Delete
-  const isBash = toolName === 'Bash'
-  const isFileOp = ['Read', 'Write', 'Edit', 'Delete'].includes(toolName)
-  const displayInput = isBash
-    ? toolInput?.command || inputStr
-    : isFileOp
-      ? toolInput?.file_path || inputStr
-      : inputStr
+  // The call's payload is what the person judges: a shell's command, a file
+  // tool's path (lib/tools/roles); everything else shows the whole input.
+  const payload = toolPayload(toolName)
+  const displayInput = (payload === PAYLOAD.COMMAND || payload === PAYLOAD.FILE_PATH)
+    ? payloadText(toolName, toolInput) || inputStr
+    : inputStr
 
   if (resolved) {
     // Approved: hide entirely (tool activity block already shows the result)

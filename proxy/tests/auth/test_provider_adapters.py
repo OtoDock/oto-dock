@@ -636,7 +636,7 @@ _TEXT_STREAM = [
 ]
 
 
-def _responses_run(monkeypatch, events, *, model="gpt-5.6-luna", effort="high",
+def _responses_run(monkeypatch, events, *, model="gpt-6-luna", effort="high",
                    tools=None, reasoning=True, endpoint_url=None, messages=None,
                    adapter=None, client_box=None):
     monkeypatch.setattr(_oa_mod.app_config, "model_supports_reasoning", lambda m: reasoning)
@@ -661,7 +661,7 @@ def test_openai_default_endpoint_uses_the_responses_api_with_effort_and_tools(mo
     assert kw["tools"] == [
         {"type": "function", "name": "t", "description": "d",
          "parameters": {"type": "object", "properties": {}}, "strict": False},
-        {"type": "web_search"},          # gpt-5.6-luna is a server-tools model
+        {"type": "web_search"},          # gpt-6-luna is a server-tools model
     ]
     assert kw["reasoning"] == {"effort": "high", "summary": "auto"}
     assert kw["include"] == ["reasoning.encrypted_content"]
@@ -721,7 +721,7 @@ def test_responses_summary_rejected_retries_without_it_and_remembers(monkeypatch
     assert _kinds(events) == [("text_delta", "Hel"), ("text_delta", "lo")]
     # Remembered: the next request never sends a summary.
     box2: list = []
-    _run_openai_capture(monkeypatch, [], None, model="gpt-5.6-luna", effort="high",
+    _run_openai_capture(monkeypatch, [], None, model="gpt-6-luna", effort="high",
                         tools=_TOOL, endpoint_url=None, responses_events=_TEXT_STREAM,
                         client_box=box2)
     assert box2[0].captured_calls[0][1]["reasoning"] == {"effort": "high"}
@@ -904,7 +904,7 @@ def _ws_item(id_="ws_1", status="completed", query="weather athens"):
 
 def test_responses_web_search_tool_rides_only_with_client_tools_on_server_tool_models(monkeypatch):
     monkeypatch.setattr(_oa_mod.app_config, "model_supports_server_tools",
-                        lambda m: m == "gpt-5.6-luna")
+                        lambda m: m == "gpt-6-luna")
     _, kw = _responses_run(monkeypatch, _TEXT_STREAM)
     assert kw["tools"][0]["type"] == "function"
     assert kw["tools"][-1] == {"type": "web_search"}
@@ -917,7 +917,7 @@ def test_responses_web_search_tool_rides_only_with_client_tools_on_server_tool_m
     # The chat-completions path never carries it.
     monkeypatch.setattr(_oa_mod.app_config, "DIRECT_LLM_OPENAI_API", "chat", raising=False)
     monkeypatch.setattr(_oa_mod.app_config, "model_supports_reasoning", lambda m: True)
-    _, kw = _run_openai_capture(monkeypatch, list(_STOP), OpenAIAdapter(), model="gpt-5.6-luna",
+    _, kw = _run_openai_capture(monkeypatch, list(_STOP), OpenAIAdapter(), model="gpt-6-luna",
                                 tools=_TOOL, endpoint_url=None)
     assert [t["type"] for t in kw["tools"]] == ["function"]
 

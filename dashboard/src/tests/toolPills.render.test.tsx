@@ -6,6 +6,30 @@ import SubagentInfo from '@/components/chat/SubagentInfo'
 import BgCommandInfo from '@/components/chat/BgCommandInfo'
 import DelegateTaskInfo from '@/components/chat/DelegateTaskInfo'
 
+describe('ToolActivity — the expanded input', () => {
+  function expand(name: string, toolInput: Record<string, unknown>) {
+    const { container } = render(<ToolActivity name={name} status="done" toolInput={toolInput} />)
+    fireEvent.click(container.firstElementChild!.firstElementChild!)
+    return container.textContent || ''
+  }
+
+  it('shows what a notebook edit, a multi-edit and a workflow carry, not just their path or name', () => {
+    expect(expand('NotebookEdit', { notebook_path: '/w/a.ipynb', cell_id: 'c1', new_source: 'print(42)' }))
+      .toContain('print(42)')
+    expect(expand('MultiEdit', { file_path: '/w/b.py', edits: [{ old_string: 'OLDX', new_string: 'NEWX' }] }))
+      .toContain('NEWX')
+    expect(expand('Workflow', { script: "name: 'sweep'\nsteps: []", args: { target: 'ARGX' } }))
+      .toContain('ARGX')
+  })
+
+  it('keeps the one-line body when the path or the name is all there is', () => {
+    const text = expand('Delete', { file_path: '/w/gone.txt' })
+    expect(text).toContain('/w/gone.txt')
+    expect(text).not.toContain('{')
+    expect(expand('Skill', { name: 'pdf' })).not.toContain('{')
+  })
+})
+
 describe('ToolActivity — Bash pill', () => {
   it('collapsed shows the description; expanding reveals the command', () => {
     render(

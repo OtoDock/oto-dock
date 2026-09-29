@@ -16,6 +16,7 @@ import { useMemo } from 'react'
 import { create } from 'zustand'
 
 import type { ScopeKey } from '../components/workspace/sections'
+import { HEAD, isPersonal, headOf } from '../lib/layout/tree'
 
 export type MachinePushState = 'queued' | 'active' | 'done' | 'failed'
 
@@ -56,16 +57,17 @@ export function sectionForRelPath(
   relPath: string, username?: string,
 ): ScopeKey | null {
   const p = relPath.replace(/^\/+/, '')
-  if (p.startsWith('users/')) {
+  if (isPersonal(p)) {
     const parts = p.split('/')
     if (parts.length < 3 || !username || parts[1] !== username) return null
-    if (parts[2] === 'workspace') return 'my-workspace'
-    if (parts[2] === 'context') return 'my-context'
+    if (parts[2] === HEAD.WORKSPACE) return 'my-workspace'
+    if (parts[2] === HEAD.CONTEXT) return 'my-context'
     return null
   }
-  if (p.startsWith('workspace/') || p === 'workspace') return 'agent-workspace'
-  if (p.startsWith('knowledge/') || p === 'knowledge') return 'agent-knowledge'
-  if (p.startsWith('config/') || p === 'config') return 'agent-config'
+  const head = headOf(p)
+  if (head === HEAD.WORKSPACE) return 'agent-workspace'
+  if (head === HEAD.KNOWLEDGE) return 'agent-knowledge'
+  if (head === HEAD.CONFIG) return 'agent-config'
   return null
 }
 

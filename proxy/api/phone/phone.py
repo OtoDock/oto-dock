@@ -11,6 +11,7 @@ WebSocket (``notify_phone_config_changed``).
 """
 
 import asyncio
+import contextlib
 import logging
 import re
 import uuid
@@ -30,6 +31,8 @@ from storage.phone import phone_route_store
 from storage.phone import phone_server_store
 from storage.automation import trigger_store
 from services.phone.phone_config import ensure_ami_user, ensure_register_secret, notify_phone_config_changed
+from auth import roles
+from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -84,6 +87,12 @@ class PhoneRouteCreate(BaseModel):
     identity_user_sub: str | None = None
     role: str = "viewer"
     remember_callers: bool = True
+    # Request-only, never on the row or in a response: an inbound PIN set
+    # with the route (the phone-server secret shape, stored encrypted like
+    # the sub-resource does), and the acknowledgement a user-mode inbound
+    # route needs to save without one (``_require_no_pin_acknowledged``).
+    pin: str | None = None
+    acknowledge_no_pin: bool = False
 
 
 class PhoneRouteUpdate(BaseModel):
@@ -113,6 +122,14 @@ class PhoneRouteUpdate(BaseModel):
     identity_user_sub: str | None = None
     role: str | None = None  # accepted, ignored (always viewer) — see PhoneRouteCreate
     remember_callers: bool | None = None
+    # Request-only (see PhoneRouteCreate); ``pin: null`` means no change.
+    pin: str | None = None
+    acknowledge_no_pin: bool = False
+
+
+# The two request-only route fields: excluded from every store write and
+# from the row the adapters provision.
+_REQUEST_ONLY = {"pin", "acknowledge_no_pin"}
 
 
 class PhoneServerCreate(BaseModel):
@@ -240,9 +257,60 @@ def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
 # A stored legacy value resolves as ``caller`` and is upgraded on the next save.
 _IDENTITY_MODES = ("caller", "user")
 _LEGACY_IDENTITY_MODE = "shared"
+# The adapters provision anything that is not ``outbound`` as inbound, so the
+# spelling is an enum on every save (the no-PIN rule keys on it).
+_DIRECTIONS = ("inbound", "outbound")
+# The body keys whose presence on a PUT re-runs the identity rules on the
+# post-edit row (the route form sends every field; the table's enable toggle
+# sends ``enabled`` alone).
+_IDENTITY_KEYS = ("identity_mode", "identity_user_sub", "agent", "direction")
 # The only role an external caller runs with; the route column is written
 # as this on every save (services/phone/phone_identity.py ignores it anyway).
-_ROUTE_ROLE = "viewer"
+_ROUTE_ROLE = EXTERNAL_ROUTE_ROLE
+_PIN_RE = re.compile(r"^\d{4,6}$")
+
+
+def _validate_direction(value: str) -> None:
+    if value not in _DIRECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown direction {value!r}: expected one of {list(_DIRECTIONS)}",
+        )
+
+
+def _validate_pin_value(value: str) -> None:
+    """4-6 digits; the error never echoes the value."""
+    if not _PIN_RE.fullmatch(value or ""):
+        raise HTTPException(status_code=400, detail="The PIN must be 4 to 6 digits")
+
+
+def _tied_user_label(sub: str, user: dict | None = None) -> str:
+    """How the route's tied user is named in advisories and refusals."""
+    if user is None:
+        user = task_store.get_user(sub) if sub else None
+    if not user:
+        return "the tied user"
+    return user.get("display_name") or user.get("name") or sub
+
+
+def _require_no_pin_acknowledged(route: dict, *, has_pin: bool, acknowledged: bool) -> None:
+    """A user-mode inbound route without a PIN saves only when the request
+    carries ``acknowledge_no_pin``: whoever dials it acts as the tied user.
+    Judged on the post-save row; ``has_pin`` counts a stored PIN and one set
+    by the same request."""
+    if (route.get("identity_mode") or "caller") != "user":
+        return
+    if route.get("direction", "inbound") != "inbound" or has_pin or acknowledged:
+        return
+    who = _tied_user_label(route.get("identity_user_sub") or "")
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"This route has no PIN: anyone who calls it acts as {who}, with all "
+            "their tools and credentials. Set a PIN, or send "
+            "acknowledge_no_pin=true to save it without one."
+        ),
+    )
 
 
 def _tied_user_problem(sub: str, agent: str) -> str:
@@ -259,7 +327,7 @@ def _tied_user_problem(sub: str, agent: str) -> str:
         return "The tied user has no username (has never logged in)"
     if user.get("locked_until"):
         return "The tied user account is locked"
-    if user.get("role") != "admin" and agent not in task_store.get_user_agent_roles(sub):
+    if not roles.is_admin(user.get("role")) and agent not in task_store.get_user_agent_roles(sub):
         return "The tied user has no access to this agent"
     return ""
 
@@ -269,9 +337,8 @@ def _validate_route_identity(merged: dict) -> None:
 
     - ``identity_mode`` is an enum.
     - ``user`` needs an existing, unlocked platform user with a username who
-      is admin or assigned to the agent. Whether the line is PIN-protected is
-      an advisory (``_route_warnings``), not a block — an admin's deliberate
-      choice.
+      is admin or assigned to the agent. Whether an inbound line is
+      PIN-protected is judged next by ``_require_no_pin_acknowledged``.
     """
     mode = merged.get("identity_mode") or "caller"
     if mode not in _IDENTITY_MODES:
@@ -293,7 +360,8 @@ def _validate_route_identity(merged: dict) -> None:
 
 
 def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[str]:
-    """Server-computed advisories shown next to the route (never a block).
+    """Server-computed advisories shown next to the route (the standing
+    marker; the save-time refusal is ``_require_no_pin_acknowledged``).
 
     - A user-tied inbound line without a PIN, or a user-tied outbound route:
       whoever is on the line acts as that user.
@@ -317,7 +385,7 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
             )
             return warnings
         user = task_store.get_user(sub) or {}
-        who = user.get("display_name") or user.get("name") or sub
+        who = _tied_user_label(sub, user)
         if route.get("direction") == "outbound":
             warnings.append(
                 f"Outbound calls on this route run as {who}: whoever answers "
@@ -331,7 +399,7 @@ def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[
                     f"This line has no PIN: anyone who dials it runs as {who}. "
                     "Set a PIN on the route."
                 )
-        if user.get("role") == "admin" and agent_store.is_admin_only(agent):
+        if roles.is_admin(user.get("role")) and agent_store.is_admin_only(agent):
             warnings.append(
                 f"{who} is a platform admin on an admin-only agent; calls run "
                 "with manager rights on it (the cap for phone lines)."
@@ -392,28 +460,51 @@ async def create_phone_route(
     """Create a phone route and provision it on its phone server.
 
     Gates on a bootstrap-verified server, allocates an AudioSocket UUID for
-    inbound, inserts the row, then asks the adapter to provision it. A provision
-    failure rolls the row back and surfaces the adapter's status (502/400/504).
+    inbound, inserts the row (and stores a ``pin`` sent with it, before any
+    adapter call), then asks the adapter to provision it. A provision failure
+    rolls the row and the PIN back and surfaces the adapter's status
+    (502/400/504).
     """
     u = require_admin(user)
-    data = req.model_dump()
+    data = req.model_dump(exclude=_REQUEST_ONLY)
     data["role"] = _ROUTE_ROLE
+    _validate_direction(data.get("direction", "inbound"))
+    if req.pin is not None:
+        _validate_pin_value(req.pin)
+        if data["direction"] != "inbound":
+            raise HTTPException(
+                status_code=400, detail="PIN protection is for inbound routes only")
     _validate_background_sound(data.get("background_sound", "off"))
     if data.get("trigger_slug"):
         await asyncio.to_thread(
             _validate_trigger_slug, data["trigger_slug"], data["agent"],
         )
     await asyncio.to_thread(_validate_route_identity, data)
+    await asyncio.to_thread(
+        _require_no_pin_acknowledged, data,
+        has_pin=req.pin is not None, acknowledged=req.acknowledge_no_pin,
+    )
 
     server = await _resolve_verified_server(data.get("phone_server_id"))
     data["phone_server_id"] = server["id"]
-    await _assert_did_available(server["id"], data.get("did") or "", data.get("direction", "inbound"))
+    await _assert_did_available(server["id"], data.get("did") or "", data["direction"])
     # Inbound routes need a stable AudioSocket UUID — it's baked into the PBX
     # DID→UUID mapping. Allocate one when the caller didn't supply it.
-    if data.get("direction", "inbound") == "inbound" and not data.get("audiosocket_uuid"):
+    if data["direction"] == "inbound" and not data.get("audiosocket_uuid"):
         data["audiosocket_uuid"] = str(uuid.uuid4())
 
     route = await asyncio.to_thread(phone_route_store.create_route, data)
+    if req.pin is not None:
+        # The PBX is never pointed at a row the admin meant to be PIN-gated
+        # and is not: the PIN lands first, or the route is not created.
+        try:
+            await asyncio.to_thread(phone_route_store.set_route_pin, route["id"], req.pin)
+        except Exception as e:
+            logger.error("Storing the PIN for new route %s failed: %s",
+                         route["id"], type(e).__name__)
+            await asyncio.to_thread(phone_route_store.delete_route, route["id"])
+            raise HTTPException(
+                status_code=500, detail="Route not created: the PIN could not be stored")
 
     adapter = await _load_adapter(server)
     try:
@@ -421,6 +512,9 @@ async def create_phone_route(
     except phone_adapters.PhoneAdapterError as e:
         # Roll the row back so a failed provision leaves no orphan.
         await asyncio.to_thread(phone_route_store.delete_route, route["id"])
+        if req.pin is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(phone_route_store.delete_route_pin, route["id"])
         logger.warning(
             "Provision failed for route %s on server %s: %s",
             route["id"], server["id"], e,
@@ -435,10 +529,13 @@ async def create_phone_route(
     )
     route = updated or route
     logger.info(f"Admin {mask_email(u.email)} created phone route: {route['id']} ({route['name']})")
+    if req.pin is not None:
+        logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route['id']}")
     await notify_phone_config_changed()
     # ``provisioning_instructions`` is non-persisted human follow-up (e.g. the
     # manual adapter's AstDB command); the dashboard shows it after create.
-    warnings = await asyncio.to_thread(_route_warnings, route, pin_configured=False)
+    warnings = await asyncio.to_thread(
+        _route_warnings, route, pin_configured=req.pin is not None)
     return {**route, "provisioning_instructions": handle.instructions, "warnings": warnings}
 
 
@@ -454,21 +551,37 @@ async def update_phone_route(
     are a plain DB update. When that identity changes the route is re-provisioned:
     provision on the (possibly new) server FIRST — so a failure leaves the DB and
     the old provisioning untouched — then best-effort tear down the old one.
+    A ``pin`` sent with the edit is stored after every check and before any
+    write, and its previous state is restored if a later step fails.
     """
     u = require_admin(user)
-    data = req.model_dump(exclude_unset=True)
+    data = req.model_dump(exclude_unset=True, exclude=_REQUEST_ONLY)
+    # An explicit null is "no change" for every field the store drops (it
+    # keeps only the two clearable ones), so the rules below judge the row
+    # that will be written, never a null standing in for the current value.
+    data = {k: v for k, v in data.items()
+            if v is not None or k in ("trigger_slug", "identity_user_sub")}
     if "role" in data:
         # Ignored (always viewer); a legacy editor/manager row converges on
         # its next save, like the legacy ``shared`` identity mode.
         data["role"] = _ROUTE_ROLE
+    if data.get("direction") is not None:
+        _validate_direction(data["direction"])
     if data.get("background_sound") is not None:
         _validate_background_sound(data["background_sound"])
     existing = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Route not found")
+    post_direction = data.get("direction") or existing["direction"]
+    if req.pin is not None:
+        _validate_pin_value(req.pin)
+        if post_direction != "inbound":
+            raise HTTPException(
+                status_code=400, detail="PIN protection is for inbound routes only")
+    stored_pin = await asyncio.to_thread(phone_route_store.get_route_pin, route_id)
     if (data.get("direction") == "outbound"
             and existing["direction"] == "inbound"
-            and await asyncio.to_thread(phone_route_store.get_route_pin, route_id)):
+            and stored_pin):
         # A silent flip would strand the encrypted credential AND disarm the
         # PIN without anyone noticing — make the admin remove it first.
         raise HTTPException(
@@ -489,58 +602,84 @@ async def update_phone_route(
             and "identity_mode" not in data):
         # A row saved before the option was removed: upgrade it on this save.
         data["identity_mode"] = "caller"
-    if any(k in data for k in ("identity_mode", "identity_user_sub",
-                               "agent", "direction")):
+    if any(k in data for k in _IDENTITY_KEYS):
         # Re-validate the identity rules on the post-edit row — the same PUT
         # may rebind the agent or flip the direction.
-        await asyncio.to_thread(_validate_route_identity, {**existing, **data})
+        post_edit = {**existing, **data}
+        await asyncio.to_thread(_validate_route_identity, post_edit)
+        await asyncio.to_thread(
+            _require_no_pin_acknowledged, post_edit,
+            has_pin=bool(stored_pin) or req.pin is not None,
+            acknowledged=req.acknowledge_no_pin,
+        )
+
+    if req.pin is not None:
+        # Before any write: a store failure changes nothing, and a user-mode
+        # row never goes live without the PIN that satisfied the rule.
+        try:
+            await asyncio.to_thread(phone_route_store.set_route_pin, route_id, req.pin)
+        except Exception as e:
+            logger.error("Storing the PIN for route %s failed: %s", route_id, type(e).__name__)
+            raise HTTPException(
+                status_code=500, detail="The PIN could not be stored; the route is unchanged")
 
     identity_changed = any(
         f in data and data[f] != existing.get(f)
         for f in ("phone_server_id", "did", "direction")
     )
 
-    if identity_changed:
-        merged = {**existing, **data}
-        server = await _resolve_verified_server(merged.get("phone_server_id"))
-        merged["phone_server_id"] = server["id"]
-        data["phone_server_id"] = server["id"]
-        await _assert_did_available(
-            server["id"], merged.get("did") or "",
-            merged.get("direction", "inbound"), exclude_route_id=route_id,
-        )
-        if merged.get("direction", "inbound") == "inbound" and not merged.get("audiosocket_uuid"):
-            merged["audiosocket_uuid"] = str(uuid.uuid4())
-        # Provision on the target server FIRST — DB stays untouched on failure.
-        new_adapter = await _load_adapter(server)
-        try:
-            handle = await new_adapter.provision_route(merged)
-        except phone_adapters.PhoneAdapterError as e:
-            logger.warning("Re-provision failed for route %s: %s", route_id, e)
-            raise _adapter_http_error(e)
-        # Best-effort tear-down of the old provisioning (never blocks the edit).
-        old_server = await asyncio.to_thread(
-            phone_server_store.get_server, existing.get("phone_server_id"),
-        )
-        if old_server:
+    try:
+        if identity_changed:
+            merged = {**existing, **data}
+            server = await _resolve_verified_server(merged.get("phone_server_id"))
+            merged["phone_server_id"] = server["id"]
+            data["phone_server_id"] = server["id"]
+            await _assert_did_available(
+                server["id"], merged.get("did") or "",
+                merged.get("direction", "inbound"), exclude_route_id=route_id,
+            )
+            if merged.get("direction", "inbound") == "inbound" and not merged.get("audiosocket_uuid"):
+                merged["audiosocket_uuid"] = str(uuid.uuid4())
+            # Provision on the target server FIRST: the DB stays untouched on failure.
+            new_adapter = await _load_adapter(server)
             try:
-                old_adapter = await _load_adapter(old_server)
-                await old_adapter.deprovision_route(existing)
+                handle = await new_adapter.provision_route(merged)
             except phone_adapters.PhoneAdapterError as e:
-                logger.warning("Old deprovision failed for route %s (continuing): %s", route_id, e)
-        await asyncio.to_thread(phone_route_store.update_route, route_id, data)
-        route = await asyncio.to_thread(
-            phone_route_store.set_adapter_data,
-            route_id,
-            adapter_data=handle.adapter_data,
-            audiosocket_uuid=handle.audiosocket_uuid or merged.get("audiosocket_uuid"),
-        )
-    else:
-        route = await asyncio.to_thread(phone_route_store.update_route, route_id, data)
+                logger.warning("Re-provision failed for route %s: %s", route_id, e)
+                raise _adapter_http_error(e)
+            # Best-effort tear-down of the old provisioning (never blocks the edit).
+            old_server = await asyncio.to_thread(
+                phone_server_store.get_server, existing.get("phone_server_id"),
+            )
+            if old_server:
+                try:
+                    old_adapter = await _load_adapter(old_server)
+                    await old_adapter.deprovision_route(existing)
+                except phone_adapters.PhoneAdapterError as e:
+                    logger.warning("Old deprovision failed for route %s (continuing): %s", route_id, e)
+            await asyncio.to_thread(phone_route_store.update_route, route_id, data)
+            route = await asyncio.to_thread(
+                phone_route_store.set_adapter_data,
+                route_id,
+                adapter_data=handle.adapter_data,
+                audiosocket_uuid=handle.audiosocket_uuid or merged.get("audiosocket_uuid"),
+            )
+        else:
+            route = await asyncio.to_thread(phone_route_store.update_route, route_id, data)
+    except Exception:
+        if req.pin is not None:
+            with contextlib.suppress(Exception):
+                if stored_pin:
+                    await asyncio.to_thread(phone_route_store.set_route_pin, route_id, stored_pin)
+                else:
+                    await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
+        raise
 
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
     logger.info(f"Admin {mask_email(u.email)} updated phone route: {route_id}")
+    if req.pin is not None:
+        logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
     await notify_phone_config_changed()
     warnings = await asyncio.to_thread(_route_warnings, route)
     return {**route, "warnings": warnings}
@@ -596,10 +735,9 @@ async def delete_phone_route(
 # ---------------------------------------------------------------------------
 # Route PIN (inbound access code) — write-only secret sub-resource, the
 # phone-server ami-secret/twilio-auth-token shape. Encrypted at rest
-# (infra_credentials sidecar), surfaced only as ``pin_configured``.
+# (infra_credentials sidecar), surfaced only as ``pin_configured``. A route
+# save may carry the PIN too (``pin`` on POST/PUT).
 # ---------------------------------------------------------------------------
-
-_PIN_RE = re.compile(r"^\d{4,6}$")
 
 
 @router.put("/v1/admin/phone/routes/{route_id}/pin")
@@ -617,9 +755,7 @@ async def set_phone_route_pin(
     if route["direction"] != "inbound":
         raise HTTPException(
             status_code=400, detail="PIN protection is for inbound routes only")
-    if not _PIN_RE.fullmatch(req.value or ""):
-        raise HTTPException(
-            status_code=400, detail="The PIN must be 4 to 6 digits")
+    _validate_pin_value(req.value)
     await asyncio.to_thread(phone_route_store.set_route_pin, route_id, req.value)
     logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
     await notify_phone_config_changed()
@@ -629,12 +765,20 @@ async def set_phone_route_pin(
 @router.delete("/v1/admin/phone/routes/{route_id}/pin")
 async def delete_phone_route_pin(
     route_id: str,
+    acknowledge_no_pin: bool = False,
     user: UserContext | None = Depends(get_current_user),
 ):
+    """Remove the PIN. On a user-mode inbound route that has one, the same
+    acknowledgement a PIN-less save needs (``?acknowledge_no_pin=true``)."""
     u = require_admin(user)
     route = await asyncio.to_thread(phone_route_store.get_route, route_id)
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
+    if await asyncio.to_thread(phone_route_store.get_route_pin, route_id):
+        await asyncio.to_thread(
+            _require_no_pin_acknowledged, route,
+            has_pin=False, acknowledged=acknowledge_no_pin,
+        )
     await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
     logger.info(f"Admin {mask_email(u.email)} removed the PIN on phone route {route_id}")
     await notify_phone_config_changed()

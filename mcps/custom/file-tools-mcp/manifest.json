@@ -2,7 +2,7 @@
   "name": "file-tools",
   "label": "File Tools",
   "description": "Document reading, creation, editing, conversion, image manipulation, and live Collabora preview",
-  "version": "1.2.1",
+  "version": "1.3.1",
   "category": "core",
 
   "server": {

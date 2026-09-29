@@ -17,8 +17,11 @@ cookies). Then the requester is checked against the token's provenance:
 3. rows with neither stamp (minted before the columns existed) → any
    authenticated user. Restore-friendly coarse fallback; no backfill.
 
-``owner_sub`` is stamped where a real user sub exists but not yet enforced —
-explicit share tokens (the sharing era) will refine this rule with it.
+``owner_sub`` is stamped where a real user sub exists (workspace mints) and
+is not part of this rule. Sharing does not widen it either: a chat share
+copies each artifact and media file into its snapshot and serves the copy
+from its own routes (``/v1/shares/{id}/…``, ``/s/{token}/…``), which never
+read a ``media_tokens`` row (SHARING.md "Chat shares are snapshots").
 """
 
 from auth.providers import UserContext

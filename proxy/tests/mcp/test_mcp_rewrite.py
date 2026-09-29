@@ -476,21 +476,8 @@ class TestRewriteStdioPaths:
         assert cmd == "~/OtoDock/mcps/custom/foo/venv/Scripts/python.exe"
 
 
-class TestTranslateVenvForWindows:
-    def test_idempotent_on_scripts_layout(self):
-        from core.remote.remote_execution import _translate_venv_for_windows
-
-        s = "C:/foo/venv/Scripts/python.exe"
-        assert _translate_venv_for_windows(s) == s
-
-    def test_does_not_double_suffix(self):
-        from core.remote.remote_execution import _translate_venv_for_windows
-
-        # An input that already has .exe should not become .exe.exe.
-        s = "/home/foo/venv/bin/workspace-mcp.exe"
-        assert _translate_venv_for_windows(s) == (
-            "/home/foo/venv/Scripts/workspace-mcp.exe"
-        )
+# The venv translation is the host OS table's (``core/host_os.translate_venv``,
+# tested in tests/core/test_host_os.py — core-seams phase 10).
 
 
 class TestRewriteEnv:

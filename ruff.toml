@@ -15,6 +15,7 @@ extend-exclude = [
 [lint]
 select = [
     "F401",    # unused import
+    "F821",    # undefined name (a missing import only a live path would hit)
     "F403",    # star import
     "F405",    # possibly-undefined name via star import
     "F811",    # redefinition / duplicate import
@@ -26,6 +27,11 @@ select = [
 ]
 
 [lint.per-file-ignores]
+# ExceptionGroup and BaseExceptionGroup are 3.11 builtins; the proxy runs 3.13
+# while the target stays at the satellite's floor.
+"proxy/app.py" = ["F821"]
+"proxy/middleware.py" = ["F821"]
+"proxy/tests/api/test_http_middleware.py" = ["F821"]
 # pytest fixture re-import: the module-level import IS the fixture
 # registration; test parameters legitimately shadow it.
 "proxy/tests/mcp/test_builder_blocks.py" = ["F811"]

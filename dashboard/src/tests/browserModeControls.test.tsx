@@ -44,6 +44,12 @@ describe('BrowserModeSelect', () => {
     confirm.mockReturnValue(true)
     fireEvent.change(screen.getByLabelText('Browser mode'), { target: { value: 'own' } })
     expect(modeMutate).toHaveBeenCalledWith({ machineId: 'm1', mode: 'own' })
+    // The disclosure: unattended use with the saved token.
+    expect(confirm.mock.calls[0][0]).toContain(
+      'your logins, cookies and open tabs are reachable to them. With the extension token saved, '
+      + 'scheduled tasks, triggers, calls and meetings on this machine use this browser with nobody '
+      + 'watching, and browser actions are not asked about; only the tools the browser MCP marks '
+      + 'high-risk still need a person.\n\n')
     confirm.mockRestore()
   })
 
@@ -64,6 +70,9 @@ describe('BrowserTokenField', () => {
     expect(link.getAttribute('href')).toMatch(/chromewebstore\.google\.com/)
     expect(link.getAttribute('target')).toBe('_blank')
     expect(screen.getByText(/paste it here/)).toBeInTheDocument()
+    expect(screen.getByText(
+      'Saving it lets scheduled tasks, triggers, calls and meetings use this browser unattended.',
+    )).toBeInTheDocument()
     expect(screen.queryByText(/No token/)).toBeNull()
     expect(screen.queryByText('Token saved')).toBeNull()
     const save = screen.getByRole('button', { name: 'Save token' })

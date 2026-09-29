@@ -23,9 +23,11 @@ machine that no longer exists and would mislead the fresh session.
 """
 
 import json
+from core.events import tool_roles
 import logging
 
 from storage import database as task_store
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -45,12 +47,14 @@ _PREAMBLE = (
 )
 _FOOTER = "[End of restored conversation digest. The latest message follows.]"
 
-# Display labels for the ``engine_switch:<old_layer>`` reason detail.
-_ENGINE_LABELS = {
-    "claude-code-cli": "Claude Code",
-    "codex-cli": "Codex",
-    "direct-llm": "Direct LLM",
-}
+
+
+def _engine_label(execution_path: str) -> str:
+    """The engine's display name for the ``engine_switch:<old_layer>`` reason
+    detail — from the registry, so a fourth engine names itself."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(execution_path)
+    return caps.display_name if caps else (execution_path or "the previous engine")
 
 
 def engine_switch_notice(old_path: str) -> str:
@@ -58,7 +62,7 @@ def engine_switch_notice(old_path: str) -> str:
     the seed-consume branch below and the ``switch_engine`` handler's
     direct-llm-target path (which persists the card at switch time — direct
     sessions never consume seeds, so the branch below would never run)."""
-    old_label = _ENGINE_LABELS.get(old_path, old_path or "the previous engine")
+    old_label = _engine_label(old_path)
     return (
         f"Continued on a different AI engine — chat history was restored "
         f"from the database (previous engine: {old_label}). The old "
@@ -81,13 +85,13 @@ def _render_row(row: dict) -> str | None:
         return f"User: {_truncate(content, SEED_PER_MESSAGE_CHARS)}"
     if role == "assistant" and content:
         return f"Assistant: {_truncate(content, SEED_PER_MESSAGE_CHARS)}"
-    if role == "event" and (row.get("event_type") or "") == "tool":
+    if role == "event" and (row.get("event_type") or "") == wire.PERSISTED_TOOL:
         try:
             block = json.loads(row.get("event_data") or "{}")
         except (ValueError, TypeError):
             return None
         name = block.get("name") or ""
-        if not name or name == "TodoWrite":
+        if not name or tool_roles.role_of(name) == tool_roles.CHECKLIST:
             return None
         detail = (block.get("summary") or "").strip()
         if not detail:
@@ -213,10 +217,10 @@ def consume_pending_seed_digest(
     try:
         task_store.add_chat_message(
             chat_id, "event", "",
-            event_type="system",
+            event_type=wire.SYSTEM,
             event_data=json.dumps({
-                "type": "system",
-                "subtype": "session_reseeded",
+                "type": wire.SYSTEM,
+                "subtype": wire.SUBTYPE_SESSION_RESEEDED,
                 "message": notice,
                 "machine_name": machine_name,
                 "reason": kind,

@@ -44,10 +44,10 @@ def test_editor_user_scoped_all_fields():
         session_id="s",
     )
     assert env["OTO_ROLE"] == "editor"
-    # Editor in _PRIVILEGED for shared_workspace → /workspace resolves.
+    # Editor in WORKSPACE_TIER for shared_workspace → /workspace resolves.
     assert env["OTO_WORKSPACE_DIR"] == "/users/alice/workspace"
     assert env["OTO_USER_ROOT"] == "/users/alice"
-    # Editor NOT in _OWNER_TIER → /config empty.
+    # Editor NOT in OWNER_TIER → /config empty.
     assert env["OTO_CONFIG_DIR"] == ""
     assert env["OTO_KNOWLEDGE_DIR"] == "/knowledge"
     assert env["OTO_SHARED_WORKSPACE"] == "/workspace"
@@ -170,6 +170,9 @@ def test_all_keys_always_present():
     expected_keys = {
         "OTO_AGENT_NAME", "OTO_USERNAME", "OTO_SCOPE", "OTO_ROLE",
         "OTO_PLATFORM_ROLE",
+        # The tier questions answered for MCP processes.
+        "OTO_CAN_MANAGE_AGENT", "OTO_CAN_EDIT_AGENT", "OTO_CAN_WRITE_WORKSPACE",
+        "OTO_CAN_CREATE_AGENTS",
         "OTO_SESSION_ID",
         "OTO_USER_SUB",
         "OTO_WORKSPACE_DIR", "OTO_USER_ROOT",
@@ -210,10 +213,31 @@ def test_platform_role_is_independent_of_agent_role():
     )
     assert env["OTO_PLATFORM_ROLE"] == "creator"
     assert env["OTO_ROLE"] == "manager"
+    assert env["OTO_CAN_CREATE_AGENTS"] == "true"
 
     # Agent-scope service sessions have no human identity → empty.
     env = build_oto_env(agent_name="bot", username="", user_role="manager", session_id="s")
     assert env["OTO_PLATFORM_ROLE"] == ""
+    assert env["OTO_CAN_CREATE_AGENTS"] == "false"
+
+
+def test_the_tier_questions_are_answered_for_mcp_processes():
+    """An MCP process carries no role vocabulary: it reads the answers the
+    authority gives (auth/roles), so a new role word never reaches it."""
+    def flags(role, platform_role=""):
+        env = build_oto_env(agent_name="b", username="alice", user_role=role,
+                            platform_role=platform_role, session_id="s")
+        return (env["OTO_CAN_MANAGE_AGENT"], env["OTO_CAN_EDIT_AGENT"],
+                env["OTO_CAN_WRITE_WORKSPACE"], env["OTO_CAN_CREATE_AGENTS"])
+    assert flags("manager", "member") == ("true", "true", "true", "false")
+    assert flags("admin", "admin") == ("true", "true", "true", "true")
+    assert flags("editor", "creator") == ("false", "true", "true", "true")
+    assert flags("contributor") == ("false", "false", "true", "false")
+    assert flags("viewer") == ("false", "false", "false", "false")
+    assert flags("") == ("false", "false", "false", "false")
+    # An agent-scope fire carries the agent's intrinsic manager role.
+    env = build_oto_env(agent_name="b", username="", user_role="manager", session_id="s")
+    assert env["OTO_CAN_MANAGE_AGENT"] == "true" and env["OTO_CAN_WRITE_WORKSPACE"] == "true"
 
 
 def test_memory_env_resolution():
@@ -265,7 +289,7 @@ def test_resolve_memory_and_scope_respects_agent_default(temp_db):
     from core.sandbox.oto_env import resolve_memory_and_scope
     from storage.agents import agent_store
     agent_store.create_agent("ops", "Ops", default_scope="agent")
-    mu, ma, ds = resolve_memory_and_scope("ops", username="alice")
+    mu, ma, ds = resolve_memory_and_scope("ops", username="alice", user_role="manager")
     assert ds == "agent"
 
 

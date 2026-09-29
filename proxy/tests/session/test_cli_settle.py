@@ -241,3 +241,81 @@ def test_translator_suppresses_handshake_sentinel_fallback():
         "result": "actual answer",
     })
     assert any(c.text == "actual answer" for c in chunks)
+
+
+# ── a task turn's end: the settle exits say DONE ────────────────────────────
+
+
+class _Stdin:
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _Proc:
+    def __init__(self):
+        import asyncio
+        self.stdin = _Stdin()
+        self.stdout = asyncio.StreamReader()
+        self.stderr = None
+        self.returncode = None
+        self.pid = 4242
+
+
+def _frames(*objs: dict) -> bytes:
+    import json
+    return b"".join((json.dumps(o) + "\n").encode() for o in objs)
+
+
+_TURN = (
+    {"type": "system", "subtype": "init", "session_id": "cli-1", "mcp_servers": []},
+    {"type": "assistant", "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "done"}]}},
+    {"type": "result", "subtype": "success", "result": "done", "is_error": False,
+     "duration_ms": 1, "num_turns": 1, "total_cost_usd": 0.0, "session_id": "cli-1"},
+)
+
+
+async def _task_turn(*, eof: bool) -> int:
+    import asyncio
+    import uuid
+    from core.layers.cli.session import PersistentSession
+    s = PersistentSession(session_id=f"sess-{uuid.uuid4().hex[:12]}", agent_prompt=None,
+                          mcp_config_path=None, model="claude-sonnet-5", agent_name="agent")
+    s._started = True
+    s.proc = _Proc()
+
+    async def _feed():
+        # After the send: a turn drains whatever sat in the pipe before it.
+        await asyncio.sleep(0.05)
+        s.proc.stdout.feed_data(_frames(*_TURN))
+        if eof:
+            await asyncio.sleep(0.05)
+            s.proc.stdout.feed_eof()
+
+    done = 0
+
+    async def _run():
+        nonlocal done
+        async for chunk in s.send_message("run the task", settle_after_result=30.0):
+            done += bool(chunk.is_done)
+
+    feeder = asyncio.create_task(_feed())
+    await asyncio.wait_for(_run(), timeout=30)
+    await feeder
+    return done
+
+
+def test_a_task_turn_ends_with_done_on_settle_silence_and_on_eof():
+    """A task turn (settle_after_result) leaves settle on silence or on the
+    CLI's exit after its result: without a DONE the turn-end loop judged
+    nothing, so a check never ran on a local Claude task (the remote twin
+    always said DONE there)."""
+    import asyncio
+    assert asyncio.run(_task_turn(eof=False)) == 1
+    assert asyncio.run(_task_turn(eof=True)) == 1

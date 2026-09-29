@@ -17,10 +17,11 @@ from storage.files import recover_bin_store
 def test_write_cleans_partial_on_replace_oserror(tmp_path, monkeypatch):
     payload = base64.b64encode(b"hello").decode()
 
-    def boom(src, dst):
+    def boom(src, dst, **kw):
         raise OSError("EDQUOT")
 
-    monkeypatch.setattr(file_sync.os, "replace", boom)
+    # The applier commits the temp with a parent-relative rename beneath the root.
+    monkeypatch.setattr(file_sync.os, "rename", boom)
     with pytest.raises(OSError):
         file_sync.apply_incoming_file(tmp_path, "notes.txt", "write", payload)
     assert not (tmp_path / "notes.txt").exists()

@@ -330,31 +330,39 @@ async def close_direct_session(session_id: str) -> bool:
     return True
 
 
+async def _reap_idle_direct_pass() -> None:
+    """One reaper tick: close direct sessions idle past the timeout, then the
+    orphaned MCP managers."""
+    from core.session.session_state import cached_idle_timeout
+    idle_timeout = await cached_idle_timeout()  # once per tick, before the lock
+    now = time.monotonic()
+    to_reap = []
+
+    async with _direct_sessions_lock:
+        for sid, session in list(_direct_sessions.items()):
+            if now - session.last_activity > idle_timeout:
+                to_reap.append(sid)
+                del _direct_sessions[sid]
+
+    for sid in to_reap:
+        logger.info(f"Reaping idle direct session: {sid}")
+        await mcp_pool.close_session(sid)
+        # Release concurrency slot + subscription (bypasses layer.close_session)
+        from core.concurrency import release_chat_slot
+        release_chat_slot(sid)
+        from services.engines.subscription_pool import release_subscription
+        release_subscription(sid)
+
+    # Also reap orphaned MCP managers
+    await mcp_pool.reap_idle(timeout=idle_timeout)
+
+
 async def reap_idle_direct_sessions() -> None:
     """Background task: reap idle direct sessions periodically."""
     while True:
         await asyncio.sleep(60)
         try:
-            now = time.monotonic()
-            to_reap = []
-
-            async with _direct_sessions_lock:
-                for sid, session in list(_direct_sessions.items()):
-                    if now - session.last_activity > config.get_idle_timeout():
-                        to_reap.append(sid)
-                        del _direct_sessions[sid]
-
-            for sid in to_reap:
-                logger.info(f"Reaping idle direct session: {sid}")
-                await mcp_pool.close_session(sid)
-                # Release concurrency slot + subscription (bypasses layer.close_session)
-                from core.concurrency import release_chat_slot
-                release_chat_slot(sid)
-                from services.engines.subscription_pool import release_subscription
-                release_subscription(sid)
-
-            # Also reap orphaned MCP managers
-            await mcp_pool.reap_idle()
+            await _reap_idle_direct_pass()
         except Exception as e:
             logger.error(f"Direct session reaper error: {e}")
 
@@ -429,8 +437,8 @@ async def run_direct_stream(
     # defaults in the adapter; for cloud providers an empty key must surface a
     # CLEAN error instead of an SDK auth stacktrace.
     effective_api_key = session.api_key or ""
-    _adapter_has_default = bool(adapter._get_default_api_key()) \
-        if hasattr(adapter, "_get_default_api_key") else False
+    _adapter_has_default = bool(adapter.default_api_key()) \
+        if hasattr(adapter, "default_api_key") else False
     if not effective_api_key and not _adapter_has_default:
         yield {"type": "error", "data": {"message": (
             f"No LLM credentials available for provider '{session.provider}'. "
@@ -625,7 +633,6 @@ async def run_direct_stream(
                 # CLI hook's two-pass gate inline: path policy, then the
                 # builtin tier × mode table (Delete prompts even in acceptEdits,
                 # like `rm`). They execute in-process, never via the MCP manager.
-                from services.mcp import mcp_permissions
                 perm_mode = get_session_mode(session.session_id) or "auto"
 
                 approved_calls: list[dict] = []   # MCP tools
@@ -655,13 +662,23 @@ async def run_direct_stream(
                     if is_builtin:
                         outcome, deny_reason = direct_builtins.gate(session, tc, perm_mode)
                     else:
-                        parts = (tc["name"] or "").split("__", 2)
-                        tier = mcp_permissions.resolve_tool_tier(
-                            parts[1] if len(parts) >= 2 else "",
-                            parts[2] if len(parts) >= 3 else "",
+                        # MCP tools go through the ONE permission authority
+                        # (session_events.pre_tool → decide_tool_permission):
+                        # the same tier × mode table as before, plus what
+                        # every other placement gets — target revocation,
+                        # the device-grant auto-allow, the session
+                        # allow-memory, high-risk pinning, the meeting
+                        # parent-mode and routing backstop, and the
+                        # dashboard block-and-wait on the meeting's queue
+                        # for a participant. The authority never answers
+                        # "ask"/"defer" for a non-terminal session, so
+                        # anything but allow is a deny with its reason.
+                        from core.session import session_events
+                        decision = await session_events.pre_tool(
+                            session.session_id, _name, tc.get("input") or {},
                         )
-                        outcome = mcp_permissions.tier_decision(tier, perm_mode)
-                        deny_reason = (
+                        outcome = "allow" if decision.get("decision") == "allow" else "deny"
+                        deny_reason = decision.get("reason") or (
                             f"{tc['name']} requires interactive user approval "
                             "and this session runs unattended."
                         )
@@ -719,6 +736,23 @@ async def run_direct_stream(
                         "tool_use_id": tc["id"],
                         "content": reason,
                     })
+
+                # The turn's record (session_events.post_tool) — the direct
+                # placement's ONE source, denied calls included (flagged).
+                from core.session import session_events as _events
+                _by_id = {tc["id"]: tc for tc in tool_calls}
+                _denied_ids = {tc["id"] for tc, _ in denied_calls}
+                for result in results:
+                    _tc = _by_id.get(result["tool_use_id"]) or {}
+                    _content = result.get("content") or ""
+                    _events.post_tool(
+                        session.session_id, _tc.get("name") or "",
+                        tool_use_id=result["tool_use_id"],
+                        tool_input=_tc.get("input") or {},
+                        is_error=(result["tool_use_id"] in _denied_ids
+                                  or str(_content)[:6].lower().startswith("error")),
+                        source="direct",
+                    )
 
                 # Emit tool_end events
                 for result in results:

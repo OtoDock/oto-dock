@@ -163,11 +163,16 @@ async def test_send_message_dispatches_only_after_push_lands(monkeypatch):
     )
     layer._sessions["sess-1"] = info
 
-    async def empty_stream(info):
+    async def empty_stream(info, cm):
         return
         yield  # pragma: no cover — makes this an async generator
 
-    monkeypatch.setattr(layer, "_stream_cli_turn", empty_stream)
+    # The turn streams through the session's ENGINE adapter (a singleton per
+    # layer) — script that instance's stream for this test.
+    from core.session.session_manager import get_layer_by_path
+    monkeypatch.setattr(
+        get_layer_by_path("claude-code-cli").remote_adapter(), "stream_turn", empty_stream,
+    )
 
     async def push():
         await push_gate.wait()

@@ -28,6 +28,7 @@ Pure stdlib + pyyaml — no config / registry imports, mirroring
 """
 
 import logging
+import re
 
 import yaml
 
@@ -41,22 +42,32 @@ FRONTMATTER_ALLOWED_KEYS = ("name", "description", "license", "compatibility",
 
 _FENCE = "---"
 
+# The split rule is the CLI loader's, verbatim (the pinned CLI in VERSIONS.md: one
+# leading U+FEFF dropped, then ``/^---\s*\n([\s\S]*?)---\s*\n?/``): the fence
+# opens on the first line and closes at the FIRST ``---`` after it, wherever
+# it sits. The scrub is only a boundary while the platform and the CLI agree
+# on what is frontmatter, so any divergence here is a security bug, not a
+# style choice; re-verify the rule on every CLI pin bump.
+_BOM = "﻿"
+# The CLI's ``\s`` is ECMAScript's (WhiteSpace plus LineTerminator: TAB, VT,
+# FF, SP, NBSP, ZWNBSP, every Zs space, LF, CR, LS, PS), written out here:
+# Python's ``\s`` also counts U+001C to U+001F and U+0085 and misses U+FEFF.
+_JS_WS = "[\t\n\v\f\r    -     　﻿]"
+_FRONTMATTER_RE = re.compile(rf"^---{_JS_WS}*\n([\s\S]*?)---{_JS_WS}*\n?")
+
 
 def split_frontmatter(text: str) -> tuple[str | None, str]:
     """Split ``text`` into (frontmatter_yaml, body).
 
-    Returns ``(None, text)`` when there is no leading frontmatter fence.
-    The fence must open on the very first line (spec behavior); the closing
-    fence is the next ``---`` line. An unterminated fence is treated as
-    no-frontmatter rather than swallowing the whole file.
+    Returns ``(None, text)`` when there is no leading frontmatter fence,
+    including an opening fence that is never closed (no ``---`` follows).
+    A text that carries a mark but no fence is returned as it is.
     """
-    lines = text.splitlines(keepends=True)
-    if not lines or lines[0].strip() != _FENCE:
+    stripped = text[1:] if text.startswith(_BOM) else text
+    m = _FRONTMATTER_RE.match(stripped)
+    if m is None:
         return None, text
-    for i in range(1, len(lines)):
-        if lines[i].strip() == _FENCE:
-            return "".join(lines[1:i]), "".join(lines[i + 1:])
-    return None, text
+    return m.group(1), stripped[m.end():]
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -106,28 +117,32 @@ def scrub_frontmatter(text: str, origin: str = "") -> str:
     salvage above (re-emitted as VALID YAML via safe_dump, so the CLIs
     accept the skill); only a fully unrecoverable block is dropped (fail
     closed — better a skill the CLI ignores than un-vetted keys reaching
-    it). ``origin`` names the file in logs.
+    it). What a drop leaves is judged again, so a block behind the dropped
+    one, which the CLI would read as the frontmatter, is scrubbed too.
+    ``origin`` names the file in logs.
     """
-    fm, body = split_frontmatter(text)
-    if fm is None:
-        return text
-    try:
-        data = yaml.safe_load(fm)
-    except yaml.YAMLError:
-        data = None
-    if not isinstance(data, dict):
+    while True:
+        fm, body = split_frontmatter(text)
+        if fm is None:
+            return text
+        try:
+            data = yaml.safe_load(fm)
+        except yaml.YAMLError:
+            data = None
+        if isinstance(data, dict):
+            break
         data = _salvage_descriptive_keys(fm)
         if data:
             logger.warning(
                 "SKILL.md frontmatter is invalid YAML (%s) — salvaged "
                 "name/description only", origin or "unknown source",
             )
-        else:
-            logger.warning(
-                "SKILL.md frontmatter unparseable — dropped at scrub (%s)",
-                origin or "unknown source",
-            )
-            return body.lstrip("\n")
+            break
+        logger.warning(
+            "SKILL.md frontmatter unparseable, dropped at scrub (%s)",
+            origin or "unknown source",
+        )
+        text = body.lstrip("\n")
     kept = {k: data[k] for k in FRONTMATTER_ALLOWED_KEYS if k in data}
     dropped = sorted(set(data) - set(kept))
     if dropped:

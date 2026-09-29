@@ -410,6 +410,9 @@ async def test_interactive_state_resolves_once(temp_db, monkeypatch):
     class _FakeIsess:
         prompts: list = []
 
+        def may_drive(self, sender_sub):
+            return True
+
         def queue_prompt(self, text, source, **ctx):
             self.prompts.append(text)
             return True
@@ -548,3 +551,70 @@ async def test_abort_turn_routes_to_foreign_pump_only_while_live():
         assert st.interrupted_last_turn is False
     finally:
         _active_pumps.pop("chat-f", None)
+
+
+@pytest.mark.asyncio
+async def test_an_utterance_during_a_typed_turn_queues_onto_its_pump(monkeypatch):
+    """Speaking while a typed turn streams queues the utterance onto that
+    pump (its producer's drain runs it as its own turn) — the call carries on."""
+    from core.events.common_events import TurnInput
+    from core.events.stream_pump import _active_pumps
+
+    class FakePump:
+        def __init__(self):
+            self.queued: list = []
+
+        def queue_message(self, item):
+            self.queued.append(item)
+            return len(self.queued) - 1
+
+    bridge = _bridge(chat_id="chat-q")
+    bridge.engine_ws = FakeWebSocket()
+    st = duplex_attach._AttachState(chat_id="chat-q", session_id="s1", layer=object())
+    st.context_injected = True
+    duplex_attach._states[bridge.duplex_id] = st
+    live = FakePump()
+    _active_pumps["chat-q"] = live
+    monkeypatch.setattr(duplex_attach, "_start_forward", lambda *a, **k: None)
+    try:
+        await duplex_attach.run_utterance(bridge, {"turn": 3, "text": "and the other one"})
+        assert len(live.queued) == 1 and isinstance(live.queued[0], TurnInput)
+        assert "and the other one" in live.queued[0].text
+        assert st.abort_target is live
+    finally:
+        _active_pumps.pop("chat-q", None)
+
+
+@pytest.mark.asyncio
+async def test_a_voice_never_speaks_into_a_colleagues_terminal(temp_db, monkeypatch):
+    """A live terminal runs as whoever warmed it: an utterance from someone
+    who may not drive it is refused, nothing is queued."""
+    from storage import database as task_store
+    task_store.create_chat("chat-c", "agent::agent-a", "agent-a", "auto")
+    task_store.update_chat("chat-c", session_id="sid-c")
+    # An editor of the agent: the pool chat's tier passes, so the terminal's
+    # own identity rule is what refuses.
+    task_store.upsert_user("user-a", "a@test.com", "A", "member")
+    task_store.add_user_agent("user-a", "agent-a", "editor", "test")
+
+    class _ColleaguesTerminal:
+        prompts: list = []
+
+        def may_drive(self, sender_sub):
+            return sender_sub == "user-owner"
+
+        def queue_prompt(self, text, source, **ctx):
+            self.prompts.append(text)
+            return True
+
+    isess = _ColleaguesTerminal()
+    monkeypatch.setattr(
+        "core.session.interactive_session.find_live_for_chat",
+        lambda chat_id, **kw: isess)
+    bridge = _bridge(chat_id="chat-c", sub="user-a")
+    bridge.engine_ws = FakeWebSocket()
+    await duplex_attach.run_utterance(bridge, {"turn": 1, "text": "delete it all"})
+    assert isess.prompts == []
+    assert any(f.get("data", {}).get("message") == "access_denied"
+               for f in bridge.engine_ws.sent if isinstance(f, dict))
+    duplex_attach._interactive_feeds.clear()

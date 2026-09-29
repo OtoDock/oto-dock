@@ -15,9 +15,10 @@ registry engine.
 import json
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from services.infra import path_confinement
 from services.mcp.mcp_manifest_types import (
     AgentContextBlock,
     AgentContextBuilder,
@@ -58,6 +59,52 @@ from services.mcp.mcp_manifest_types import (
 )
 from services.mcp.mcp_validate_oauth import _validate_oauth_services
 from services.mcp.mcp_validate_webhooks import _validate_webhooks_block
+
+# A ``skills[].file`` value names a file INSIDE its MCP folder and nothing
+# else. The lexical rule below runs at parse, at the install gate and in front
+# of both readers; the filesystem rule (``resolve_skill_file``) judges a
+# symlink by its target. Windows forms are refused on every host because the
+# same manifest is synced to satellites of every platform.
+SKILL_FILE_MAX_LEN = 512
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+# A PyPI distribution name (``server.source_build`` entries).
+SOURCE_BUILD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def skill_file_error(value: Any) -> str | None:
+    """Why ``value`` is not an acceptable ``skills[].file``, or ``None``."""
+    if not isinstance(value, str) or not value:
+        return "must be a non-empty string"
+    if len(value) > SKILL_FILE_MAX_LEN:
+        return f"is longer than {SKILL_FILE_MAX_LEN} characters"
+    if any(ord(c) < 0x20 for c in value):
+        return "carries a control character"
+    if "\\" in value:
+        return "carries a backslash"
+    if (value.startswith("/") or _DRIVE_RE.match(value)
+            or PurePosixPath(value).is_absolute()
+            or PureWindowsPath(value).is_absolute()):
+        return "is absolute"
+    try:
+        if path_confinement.normalize_rel_path(value) != value:
+            return "is not a plain relative path"
+    except path_confinement.PathOutsideRoot:
+        return "is not a plain relative path"
+    return None
+
+
+def resolve_skill_file(mcp_dir: Path, rel: str) -> Path | None:
+    """The regular file ``rel`` names inside ``mcp_dir`` (symlinks followed
+    and judged by where they point), or ``None`` when the value fails the
+    lexical rule, escapes the folder or is not a regular file."""
+    if skill_file_error(rel) is not None:
+        return None
+    try:
+        resolved = path_confinement.resolve_under(Path(mcp_dir) / rel, mcp_dir)
+    except (path_confinement.PathOutsideRoot, OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
 
 logger = logging.getLogger(__name__)
 
@@ -736,13 +783,33 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
                 data.get("name", manifest_path.parent.name), version_constraint,
             )
             version_constraint = ""
+    source_build = []
+    for entry in srv_data.get("source_build") or []:
+        if isinstance(entry, str) and SOURCE_BUILD_RE.fullmatch(entry):
+            source_build.append(entry)
+        else:
+            logger.warning(
+                "%s: server.source_build entry %r is not a package name; dropped",
+                data.get("name", manifest_path.parent.name), entry,
+            )
+    # ``server.docker_compose`` names a file inside the MCP folder, under the
+    # same lexical rule as ``skills[].file``: compose runs it under this MCP's
+    # project and the T2 rewrite rewrites it in place.
+    docker_compose = srv_data.get("docker_compose", "")
+    compose_error = skill_file_error(docker_compose) if docker_compose != "" else None
+    if compose_error is not None:
+        logger.warning(
+            "%s: server.docker_compose %r %s, dropped",
+            data.get("name", manifest_path.parent.name), docker_compose, compose_error,
+        )
+        docker_compose = ""
     server = ServerConfig(
         runtime=srv_data.get("runtime", "python"),
         transport=srv_data.get("transport", "stdio"),
         command=srv_data.get("command", ""),
         args=srv_data.get("args", []),
         source=srv_data.get("source", ""),
-        docker_compose=srv_data.get("docker_compose", ""),
+        docker_compose=docker_compose,
         port=srv_data.get("port", 0),
         health_endpoint=srv_data.get("health_endpoint", ""),
         url_template=srv_data.get("url_template", ""),
@@ -750,6 +817,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         service_name=srv_data.get("service_name", ""),
         image=srv_data.get("image", ""),
         version_constraint=version_constraint,
+        source_build=source_build,
     )
 
     # Credential config. Credential directories (OAuth tokens etc.) are
@@ -792,13 +860,36 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     # installers additionally hard-reject packages with invalid skill entries
     # at install time, where a human sees the error.
     skills = []
-    for sk in data.get("skills", []):
+    raw_skills = data.get("skills", [])
+    if raw_skills is None:
+        raw_skills = []
+    if not isinstance(raw_skills, list):
+        logger.warning(
+            "%s: skills is not a list; skills dropped",
+            data.get("name", mcp_dir.name),
+        )
+        raw_skills = []
+    for sk in raw_skills:
+        if (not isinstance(sk, dict) or not isinstance(sk.get("id"), str)
+                or not isinstance(sk.get("file"), str)):
+            logger.warning(
+                "%s: skill entry %r needs a string id and file; skill dropped",
+                data.get("name", mcp_dir.name), sk,
+            )
+            continue
         skill_id = sk["id"]
         if not SKILL_ID_RE.fullmatch(skill_id) or len(skill_id) > SKILL_ID_MAX_LEN:
             logger.warning(
                 "%s: skill id %r is not a valid skill name (lowercase alnum "
                 "+ single hyphens, max %d chars) — skill dropped",
                 data.get("name", mcp_dir.name), skill_id, SKILL_ID_MAX_LEN,
+            )
+            continue
+        file_error = skill_file_error(sk["file"])
+        if file_error is not None:
+            logger.warning(
+                "%s: skill %r file %r %s; skill dropped",
+                data.get("name", mcp_dir.name), skill_id, sk["file"], file_error,
             )
             continue
         loading = sk.get("loading", SKILL_LOADING_DEFAULT)

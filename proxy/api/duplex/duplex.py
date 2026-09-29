@@ -49,8 +49,7 @@ async def mint_duplex_session(
     if not cap.get("available"):
         raise HTTPException(status_code=503, detail=cap.get("reason") or "unavailable")
     denial = await asyncio.to_thread(
-        duplex_service.chat_access_denied_reason, req.chat_id,
-        user_sub=user.sub, user_role=user.role, user_agents=user.agents,
+        duplex_service.chat_access_denied_reason, req.chat_id, user,
     )
     if denial:
         status = 404 if "not found" in denial.lower() else 403
@@ -85,11 +84,11 @@ async def duplex_prewarm(
     agent = (req.agent or "").strip()
     if not agent:
         raise HTTPException(status_code=422, detail="agent is required")
-    if user.role != "admin" and agent not in (user.agents or []):
+    if not user.is_admin and agent not in (user.agents or []):
         raise HTTPException(status_code=403, detail="Access denied")
 
     from storage import database as _db
-    from ws.dashboard_warmup import spawn_detached_prewarm
+    from ws.dashboard_prewarm import spawn_detached_prewarm
 
     user_row = await asyncio.to_thread(_db.get_user, user.sub)
     if not user_row:

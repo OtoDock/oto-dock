@@ -4,7 +4,8 @@ An interactive CHAT (a human is present) lets ``AskUserQuestion`` RUN so the TUI
 renders native question cards. An interactive TASK (``client_type == "task"``, no
 viewer) must NOT — otherwise the cards block on an answer nobody gives and the
 unattended run hangs. The task falls through to the same deny-and-inform path as a
-headless ``-p`` task. DB-free (the special-tool branch returns before Pass-1).
+headless ``-p`` task. DB-free (the question branch returns before Pass-1; the
+security context and the session's engine are stubbed).
 """
 import pytest
 
@@ -18,6 +19,8 @@ def _stub(monkeypatch):
     monkeypatch.setattr(permission, "record_hook_activity", lambda sid: None)
     monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: None)
     monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: True)
+    monkeypatch.setattr(permission, "get_session_security", lambda sid: object())
+    monkeypatch.setattr("core.session.session_manager.engine_layer_for_session", lambda sid: None)
     pushed = []
 
     class _Q:

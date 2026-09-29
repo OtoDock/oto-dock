@@ -12,6 +12,7 @@ import asyncio
 import sys
 
 import pytest
+from unittest.mock import AsyncMock
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)
@@ -31,7 +32,7 @@ def dashboard_session(monkeypatch):
     on the old fail-open skip."""
     from auth.path_policy import SecurityContext
     sid = "sess-auto-test"
-    monkeypatch.setattr("api.hooks.permission.verify_session_match", lambda *a, **k: None)
+    monkeypatch.setattr("api.hooks.permission.verify_session_match_async", AsyncMock(return_value=None))
     session_state._sessions[sid] = {"client_type": "dashboard"}
     session_state._session_security[sid] = SecurityContext(
         role="admin", username="", agent="demo", is_admin_agent=True,

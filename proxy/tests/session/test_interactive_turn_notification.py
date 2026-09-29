@@ -183,11 +183,15 @@ async def test_min_turn_time_guard():
     assert _calls["ephemeral"] == [], _calls["ephemeral"]
 
 
-async def test_meeting_chat_suppressed():
+async def test_no_chat_id_shape_suppresses_the_ping():
+    """An interactive session's chat id is always a real chat — the dashboard's
+    or the scheduler's; a meeting spawns headless participants — so nothing is
+    suppressed by an id shape (core-seams phase 4 dropped the dead ``meeting-``
+    guard). The task rule below is the one shape-based exemption."""
     s = _new_session(chat_id="meeting-7")
     s._maybe_fire_turn_complete("done", persisted=1)
     await _drain()
-    assert _calls["ephemeral"] == [], _calls["ephemeral"]
+    assert _calls["ephemeral"] == [("user-1", "researcher finished", "meeting-7")], _calls["ephemeral"]
 
 
 async def test_task_run_suppresses_ping_but_fires_callback():
@@ -257,11 +261,14 @@ async def test_turn_open_transitions_broadcast_status():
     assert ("user-1", "chat-1", "ready", "researcher") in _calls["status"]
 
 
-async def test_meeting_turn_transitions_silent():
+async def test_turn_transitions_broadcast_for_every_chat_id_shape():
+    """The turn-open / close broadcasts key on the chat id being set, never on
+    its shape (the dead ``meeting-`` guard is gone — a meeting never runs an
+    interactive session)."""
     s = _new_session(chat_id="meeting-7")
     s._apply_turn_signal("user")
     s._apply_turn_signal("end_turn")
-    assert _calls["status"] == [], _calls["status"]
+    assert [c[2] for c in _calls["status"]] == ["streaming", "ready"], _calls["status"]
 
 
 async def test_whole_turn_in_one_batch_still_ends():

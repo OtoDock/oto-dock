@@ -393,6 +393,55 @@ async def test_no_bg_work_no_nudge(clean_registries):
 
 
 @pytest.mark.asyncio
+async def test_the_producer_never_sends_the_streams_done(clean_registries):
+    """The stream's ``done`` is the runner's, sent after the row is stamped:
+    the producer forwards the turn's frames and nothing else — on a clean
+    run, on a failure and on a cancel."""
+    from core.events.common_events import TEXT, ERROR
+
+    sent: list[dict] = []
+
+    async def _record(run_id, event):
+        sent.append(event)
+
+    sid = "tp-no-done"
+    clean_registries.append(sid)
+    layer = _FakeLayer(turns=[[CommonEvent(type=TEXT, data={"content": "hi"})]])
+    queue: asyncio.Queue = asyncio.Queue()
+    await task_produce(layer, sid, "do the task", queue, "run12345", broadcast_fn=_record,
+                       bg_poll=0.02, bg_cmd_ceiling=0.3, bg_sub_ceiling=0.3)
+    assert [e["type"] for e in sent] == ["text"]
+
+    class _Failing(_FakeLayer):
+        async def send_message(self, session_id, prompt, **kw):
+            raise RuntimeError("engine down")
+            yield  # unreachable: keeps this an async generator
+
+    sent.clear()
+    queue = asyncio.Queue()
+    await task_produce(_Failing(turns=[]), sid, "do the task", queue, "run12345",
+                       broadcast_fn=_record, bg_poll=0.02, bg_cmd_ceiling=0.3, bg_sub_ceiling=0.3)
+    assert sent == []
+    assert any(e.type == ERROR for e in list(queue._queue))
+
+    class _Held(_FakeLayer):
+        async def send_message(self, session_id, prompt, **kw):
+            yield CommonEvent(type=TEXT, data={"content": "hi"})
+            await asyncio.sleep(3600)
+
+    sent.clear()
+    queue = asyncio.Queue()
+    producer = asyncio.get_running_loop().create_task(
+        task_produce(_Held(turns=[]), sid, "do the task", queue, "run12345",
+                     broadcast_fn=_record, bg_poll=0.02, bg_cmd_ceiling=0.3, bg_sub_ceiling=0.3))
+    await asyncio.sleep(0.05)
+    producer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await producer
+    assert [e["type"] for e in sent] == ["text"]
+
+
+@pytest.mark.asyncio
 async def test_nudge_names_finished_commands(clean_registries):
     """Labels captured at spawn ride the review nudge, so the model can tell
     WHICH command finished (2026-08-27 dogfooding find)."""

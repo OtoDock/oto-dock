@@ -153,7 +153,10 @@ def _patch_provider(monkeypatch, title="🚀 Cool Title"):
     return captured
 
 
-def test_request_skips_meeting_only(temp_db, monkeypatch):
+def test_request_never_skips_by_id_shape(temp_db, monkeypatch):
+    """The service titles whatever chat it is asked about — task chats title
+    like any sidebar chat; a meeting's pump never asks (it is disarmed by its
+    driver kind, below). Only an empty id short-circuits before resolve."""
     from services import title_generator as tg
     calls = {"resolve": 0}
 
@@ -162,11 +165,33 @@ def test_request_skips_meeting_only(temp_db, monkeypatch):
         return None
     monkeypatch.setattr(tg, "resolve_title_provider", _count)
 
-    asyncio.run(tg.request_chat_title("meeting-99"))
-    assert calls["resolve"] == 0  # short-circuits before resolve
-    # Task chats are NOT skipped anymore (they title like any sidebar chat).
+    asyncio.run(tg.request_chat_title(""))
+    assert calls["resolve"] == 0
     asyncio.run(tg.request_chat_title("task-99"))
     assert calls["resolve"] == 1
+
+
+def test_a_meeting_pump_is_disarmed_a_task_pump_armed(temp_db):
+    """The pump arms the title upgrade by its DRIVER kind: a meeting pump
+    carries the parent chat's id and must never title it from the meeting's
+    speech; the scheduler's and the dashboard's pumps title as before."""
+    from core.events.stream_pump import ChatStreamPump
+    from core.session import session_kind
+
+    async def _armed() -> dict[str, bool]:
+        producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+        try:
+            return {
+                st: ChatStreamPump(chat_id="c-arm", session_id="s-arm", producer=producer,
+                                   event_queue=asyncio.Queue(), perm_queue=None,
+                                   source_type=st)._title_armed
+                for st in (session_kind.MEETING.source_type, session_kind.TASK.source_type,
+                           session_kind.DASHBOARD.source_type, session_kind.PHONE.source_type)
+            }
+        finally:
+            producer.cancel()
+    armed = asyncio.run(_armed())
+    assert armed == {"meeting": False, "task": True, "chat": True, "phone": True}
 
 
 def test_request_generates_updates_broadcasts_and_meters(temp_db, monkeypatch):

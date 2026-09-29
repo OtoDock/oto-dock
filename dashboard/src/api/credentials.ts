@@ -41,6 +41,16 @@ export interface OverridableConfigField {
   default_value: string
 }
 
+// An agent whose service identity is this account (a manager bound it on the
+// agent's MCPs tab). The account card offers "Subscribe as <agent>" from it;
+// the server computed the two gates, the client never guesses a role.
+export interface ServiceBindingSummary {
+  agent_name: string
+  display_name: string
+  can_manage: boolean
+  agent_scope_available: boolean
+}
+
 // Multi-account: one entry per labeled account a user has connected for a
 // given per-user MCP.
 export interface AccountSummary {
@@ -52,6 +62,7 @@ export interface AccountSummary {
   connected_services: string[]
   agent_overrides: string[]
   missing_scopes: string[]
+  service_bindings?: ServiceBindingSummary[]
 }
 
 export interface Integration {

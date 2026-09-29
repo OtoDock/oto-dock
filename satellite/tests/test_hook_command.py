@@ -16,6 +16,7 @@ import shlex
 import sys
 from pathlib import Path
 
+from satellite import config as sat_config
 from satellite.config import codex_hook_command, hook_command
 
 
@@ -43,7 +44,7 @@ def test_codex_hook_command_posix_matches_claude_form(tmp_path):
 
 
 def test_codex_hook_command_windows_emits_quote_free_wrapper(tmp_path, monkeypatch):
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.WINDOWS])
     hook = tmp_path / "Δημήτρης dir" / "permission_gate.py"
     hook.parent.mkdir()
     cmd = codex_hook_command(hook)

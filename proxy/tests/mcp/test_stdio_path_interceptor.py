@@ -14,7 +14,7 @@ fast unit-test loop.
 
 import json
 import sys
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -29,6 +29,7 @@ from auth.path_policy import SecurityContext  # noqa: E402
 from satellite.sessions.mcp_interceptor import (  # noqa: E402
     wrap_interceptor_in_mcp_config,
 )
+from core import placement
 from satellite._vendored.stdio_path_interceptor import (  # noqa: E402
     _looks_like_path,
     _process_inbound_line,
@@ -470,7 +471,7 @@ class TestResolveToolArgPathsEndpoint:
         # Stub session-match auth so requests don't get rejected on
         # bearer-token shape.
         monkeypatch.setattr(
-            paths, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match_async", AsyncMock(return_value=None),
         )
         return TestClient(app)
 
@@ -478,12 +479,8 @@ class TestResolveToolArgPathsEndpoint:
         return SecurityContext(
             role="manager", username="alice", agent="my-agent",
             is_admin_agent=False,
-            target_kind="user_remote",
-            target_machine_id="m1",
-            target_agents_dir="/home/dave/.oto-dock/agents",
-            target_home_dir=home_dir,
-            target_allow_full_fs=allow_full_fs,
-        )
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1", agents_dir="/home/dave/.oto-dock/agents", home_dir=home_dir, allow_full_fs=allow_full_fs),
+            )
 
     def test_session_not_found(self, client, monkeypatch):
         monkeypatch.setattr(
@@ -558,3 +555,38 @@ class TestResolveToolArgPathsEndpoint:
         }, headers={"Authorization": "Bearer test"})
         assert r.status_code == 200
         assert r.json()["items"][0]["allowed"] is True
+
+
+
+def test_resolve_tool_arg_paths_refuses_the_machines_own_state(monkeypatch):
+    """The interceptor's path translation: a remote
+    session's declared path argument under the machine's OtoDock folder
+    resolves to a refusal, its own tree still translates."""
+    from unittest.mock import AsyncMock
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.hooks import hooks as hooks_mod, paths
+
+    app = FastAPI()
+    app.include_router(hooks_mod.router)
+    monkeypatch.setattr(paths, "verify_session_match_async", AsyncMock(return_value=None))
+    ctx = SecurityContext(
+        role="manager", username="alice", agent="my-agent", is_admin_agent=False,
+        placement=placement.PlacementCapabilities(
+            kind=placement.KIND_ADMIN_REMOTE, machine_id="m1", home_dir="/home/dave",
+            agents_dir="/home/dave/.oto-dock/agents", os="linux", allow_full_fs=True),
+    )
+    monkeypatch.setattr("api.hooks.paths.get_session_security", lambda sid: ctx)
+    r = TestClient(app).post("/v1/hooks/resolve-tool-arg-paths", json={
+        "session_id": "s", "tool": "X",
+        "items": [{"value": "/home/dave/.oto-dock/satellite.conf"},
+                  {"value": "/home/dave/.oto-dock/agents/my-agent/workspace/a.md"},
+                  {"value": "/home/dave/.oto-dock/agents/other/workspace/a.md"}],
+    }, headers={"Authorization": "Bearer test"})
+    assert r.status_code == 200
+    own, other = r.json()["items"][1], r.json()["items"][2]
+    first = r.json()["items"][0]
+    assert first["allowed"] is False and "OtoDock folder" in first["error"]
+    assert own["allowed"] is True
+    assert other["allowed"] is False and "OtoDock folder" in other["error"]

@@ -8,6 +8,7 @@ import {
 } from '../../api/oauth'
 import { usePlatformSettings, useSavePlatformSettings } from './PlatformPage.hooks'
 import { SavedBadge } from './PlatformPage.shared'
+import type { ForwardingWarning } from './PlatformPage.types'
 
 // ---------------------------------------------------------------------------
 // Security tab
@@ -127,10 +128,40 @@ function BearerAllowlistSection() {
 }
 
 
+// The proxy stamps a warning with epoch seconds; an ISO string is accepted too.
+function lastSeen(v: number | string): string {
+  const d = typeof v === 'number' ? new Date(v * 1000) : new Date(v)
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString()
+}
+
+// The proxy marks a warning whose address is the container's gateway.
+type Warning = ForwardingWarning
+
+// Headers from an address that is not a trusted proxy. The container's
+// gateway may be trusted only while the port is published on 127.0.0.1:
+// direct connections to a published port arrive from it too, so trusting it
+// otherwise lets any such client forge its address. TRUSTED_PROXY is a list,
+// so an address is added to it, never set over it. On the OtoDock cloud the
+// operator owns the configuration, so the admin gets no instruction.
+function untrustedForwarderAdvice(w: Warning, cloud: boolean): string {
+  const head = `Forwarding headers arrive from ${w.peer}`
+  if (cloud) return `${head}, which is not a trusted proxy.`
+  const list = '(a comma-separated list: that address, never a subnet)'
+  if (w.gateway) {
+    return `${head}, the container's gateway, which is not a trusted proxy. `
+      + 'Trust it only with PROXY_BIND_IP=127.0.0.1 (the port published on this '
+      + "host's loopback only): direct connections to a published port arrive from "
+      + `the gateway too. Then add ${w.peer} to TRUSTED_PROXY in .env ${list}.`
+  }
+  return `${head}, which is not a trusted proxy: if it is your reverse proxy, add `
+    + `${w.peer} to TRUSTED_PROXY in config.env, or .env on a Docker install ${list}.`
+}
+
 export default function SecurityTab() {
   const { data, isLoading } = usePlatformSettings()
   const saveMutation = useSavePlatformSettings()
   const [savedField, setSavedField] = useState('')
+  const [saveError, setSaveError] = useState('')
 
   // SMTP
   const [smtpHost, setSmtpHost] = useState('')
@@ -168,9 +199,13 @@ export default function SecurityTab() {
   }, [data])
 
   const save = (field: string, value: string | boolean) => {
+    setSaveError('')
     saveMutation.mutate(
       { [field]: value },
-      { onSuccess: () => { setSavedField(field); setTimeout(() => setSavedField(''), 2000) } }
+      {
+        onSuccess: () => { setSavedField(field); setTimeout(() => setSavedField(''), 2000) },
+        onError: (e: unknown) => setSaveError(e instanceof Error ? e.message : 'Failed to save'),
+      }
     )
   }
 
@@ -201,8 +236,27 @@ export default function SecurityTab() {
 
   if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
 
+  const warnings: Warning[] = data?.forwarding_warnings || []
+
   return (
     <div className="space-y-6">
+      {warnings.length > 0 && (
+        <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+          <div className="font-semibold">Client addresses are not being resolved</div>
+          <ul className="mt-1 list-disc pl-5 space-y-0.5">
+            {warnings.map((w) => (
+              <li key={`${w.case}:${w.peer}`}>
+                {w.case === 'edge_without_xff'
+                  ? `The trusted proxy ${w.peer} does not append X-Forwarded-For.`
+                  : untrustedForwarderAdvice(w, !!data?.cloud)}
+                {' '}({w.count} request{w.count === 1 ? '' : 's'}, last {lastSeen(w.last_seen)})
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1 text-xs">Until the address is trusted, everyone behind it shares one sign-in bucket and local-network-only accounts cannot sign in through it.</p>
+        </div>
+      )}
+      {saveError && <div role="alert" className="text-sm text-p-accent-red">{saveError}</div>}
       {/* On the OtoDock cloud these are operator-managed (values come from
           config.env via OTODOCK_FORCED_SETTINGS; writes are rejected
           server-side) — hide them from the customer-admin. */}
@@ -344,6 +398,51 @@ export default function SecurityTab() {
       </div>
 
       </>}
+
+      {/* Sharing (SHARING.md): the platform-wide switches for links. */}
+      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold text-p-text">Sharing</h3>
+          <p className="text-xs text-p-text-light mt-1">
+            Members share apps with colleagues by default. These switches govern links to people
+            outside the platform; every external link is listed under Admin → Shares.
+          </p>
+        </div>
+        {([
+          ['sharing_external_enabled', 'External links', 'Members may make links that open an app for someone without an account (password-protected by default).'],
+          ['sharing_public_links_enabled', 'Links without a password', 'A link may be made public — anyone holding the URL opens it. Off keeps every link behind a password.'],
+          ['user_directory_visible_to_members', 'User directory when sharing', 'Members pick colleagues from a list. Off means they type an exact username or email, and the platform never confirms whether it matched.'],
+        ] as const).map(([key, label, help]) => (
+          <div key={key} className="flex items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-p-text">{label}</span>
+                <SavedBadge show={savedField === key} />
+              </div>
+              <p className="text-xs text-p-text-light mt-0.5">{help}</p>
+            </div>
+            <button type="button" role="switch" aria-checked={!!data?.[key]} aria-label={label}
+              onClick={() => save(key, !data?.[key])}
+              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${data?.[key] ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}>
+              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition ${data?.[key] ? 'translate-x-4' : 'translate-x-0'}`} />
+            </button>
+          </div>
+        ))}
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-p-text">Longest link expiry</span>
+              <SavedBadge show={savedField === 'sharing_max_expiry_days'} />
+            </div>
+            <p className="text-xs text-p-text-light mt-0.5">In days; empty lets a member choose “never”.</p>
+          </div>
+          <input type="text" inputMode="numeric" defaultValue={data?.sharing_max_expiry_days || ''}
+            key={data?.sharing_max_expiry_days || 'unset'}
+            aria-label="Longest link expiry in days" placeholder="no cap"
+            onBlur={(e) => { if (e.target.value !== (data?.sharing_max_expiry_days || '')) save('sharing_max_expiry_days', e.target.value.trim()) }}
+            className="w-24 px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+        </div>
+      </div>
 
       {/* Login Security (Cloudflare Turnstile). Sits OUTSIDE the cloud-managed guard:
           on the OtoDock cloud the keys are operator-managed (OTODOCK_TURNSTILE_* env)

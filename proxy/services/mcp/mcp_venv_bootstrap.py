@@ -7,6 +7,8 @@ to the platform:
 
 - **Python deps** — if a Python MCP's ``venv/`` is missing OR ``requirements.txt``
   is newer than the venv, rebuild via the shared ``mcp_installer.install_mcp``.
+  Platform-shipped (``custom``) folders only: a community MCP installs from its
+  ``server.source`` and its folder's ``requirements.txt`` is never built.
 - **Python interpreter** — if a venv was built on an interpreter OLDER than the
   proxy's own (e.g. a 3.10 venv after the platform bumped to 3.13), delete it and
   rebuild pinned to the proxy interpreter. Upstream ``requires-python`` ceilings
@@ -39,6 +41,7 @@ from pathlib import Path
 
 import config
 from services.mcp import mcp_installer
+from services.mcp import mcp_manifest_types as _mt
 
 logger = logging.getLogger("claude-proxy.venv-bootstrap")
 
@@ -271,6 +274,8 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
     - ``"exception"`` — install_mcp raised
     - ``"fresh"`` — venv exists, current deps + interpreter; skipped
     - ``"skipped-no-reqs"`` — Python MCP with no requirements.txt
+    - ``"skipped-community-python"`` - a catalog Python MCP (installed from its
+      ``server.source``, never from a folder ``requirements.txt``)
     - ``"skipped-docker"`` — Docker MCP; handled by ``docker_manager``
     - ``"skipped-bundled-node"`` — Node MCP without ``node_modules`` to rebuild
     - ``"skipped-node-rebuild-fail"`` — npm rebuild failed (advisory)
@@ -310,11 +315,17 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
             name = manifest.get("name") or mcp_dir.name
             runtime = manifest.get("server", {}).get("runtime", "")
 
-            if runtime == "docker":
+            if runtime == _mt.RUNTIME_DOCKER:
                 results[name] = "skipped-docker"
                 continue
 
-            if runtime == "python":
+            if runtime == _mt.RUNTIME_PYTHON:
+                # A requirements build runs any index, VCS or sdist line the
+                # file names, outside the wheels-only rule: platform-shipped
+                # folders only (a community MCP installs from server.source).
+                if category != "custom":
+                    results[name] = "skipped-community-python"
+                    continue
                 req_file = mcp_dir / "requirements.txt"
                 venv_dir = mcp_dir / "venv"
                 if not req_file.is_file():
@@ -330,7 +341,7 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                     # install_mcp reuses an existing one. Pre-create it on the
                     # proxy interpreter so the rebuild matches the platform; on
                     # failure install_mcp recreates it on uv's default.
-                    shutil.rmtree(venv_dir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
                     if uv:
                         await _uv_venv_pinned(uv, venv_dir, target, mcp_dir)
                 logger.info(
@@ -364,8 +375,12 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
                     results[name] = "exception"
                 continue
 
-            if runtime == "node":
-                if (mcp_dir / "node_modules").is_dir():
+            if runtime == _mt.RUNTIME_NODE:
+                # A rebuild runs the packages' own lifecycle scripts, which the
+                # install refuses for catalog content: platform-shipped
+                # folders only (a community MCP with a native addon already
+                # depends on prebuilt binaries under --ignore-scripts).
+                if category == "custom" and (mcp_dir / "node_modules").is_dir():
                     outcome = await _reconcile_node_addons(mcp_dir, name)
                     if outcome:
                         results[name] = outcome

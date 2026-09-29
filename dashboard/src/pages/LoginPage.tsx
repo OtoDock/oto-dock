@@ -1,9 +1,11 @@
 import { useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { type AuthConfig, localLogin, verify2FA, startOidcLogin, forgotPassword } from '../api/auth'
-import { passkeyLogin, passkeySecondFactor, passkeySupported } from '../api/webauthn'
+import { passkeyLogin, passkeySecondFactor, passkeySupported, startNativeHandoff } from '../api/webauthn'
 import { TurnstileWidget, type TurnstileHandle } from '../components/TurnstileWidget'
+import { useBuildWatch } from '../hooks/useBuildWatch'
+import { callNative, hasNativeBridge, openNativeBrowser } from '../lib/nativeBridge'
 
 interface LoginPageProps {
   authConfig: AuthConfig
@@ -52,6 +54,16 @@ function Shell({ children }: { children: React.ReactNode }) {
 export default function LoginPage({ authConfig }: LoginPageProps) {
   const { setUser } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+  // A signed-out page has no dashboard socket: it learns about a new build
+  // on its own, so a login page left open across an upgrade reloads onto
+  // the bundle that matches the server.
+  useBuildWatch(true)
+  // The login page renders IN PLACE of the page the visitor asked for
+  // (RequireAuth), so a signed-in visitor lands where they were going — a
+  // full-screen app link, a settings tab — never a `next` parameter.
+  const returnToPage = () =>
+    navigate(location.pathname + location.search + location.hash, { replace: true })
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -78,11 +90,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
   // system browser at /native-passkey (same SSO rails: openAuthBrowser →
   // deep-link handoff).
   const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
-  // NB: bridge methods must be INVOKED ON the injected object —
-  // Android.openAuthBrowser(url). A detached reference throws "Java bridge
-  // method invoked on an object that is not injected" (silently, in the
-  // webview) — that bug shipped once; don't reintroduce it.
-  const androidBridge = (window as any).Android
+  const nativeBridge = isNative && hasNativeBridge()
   // Passkeys are bound to the configured public host (the RP): on any OTHER
   // origin — localhost, a LAN IP — the browser refuses the ceremony with its
   // own scary security error. Hide the in-page buttons there and say where
@@ -92,7 +100,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
   const rpMismatch = !!rpHost && window.location.hostname !== rpHost
   const passwordlessPasskey = authConfig.passkeys_enabled
     && authConfig.passkey_login_mode !== 'second_factor'
-    && (isNative ? !!androidBridge?.openAuthBrowser : passkeySupported() && !rpMismatch)
+    && (isNative ? nativeBridge : passkeySupported() && !rpMismatch)
   // 2FA-step passkey: needs in-page WebAuthn (not available in the app webview).
   const stepPasskey = secondFactors.includes('passkey') && !isNative && passkeySupported()
     && !rpMismatch
@@ -116,7 +124,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
         setSecondFactors(result.second_factors?.length ? result.second_factors : ['totp'])
       } else if (result.user) {
         setUser(result.user)
-        navigate('/', { replace: true })
+        returnToPage()
       }
     } catch (err: any) {
       // Turnstile tokens are single-use — get a fresh one for the retry.
@@ -135,7 +143,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
     try {
       const user = await verify2FA(totpToken, totpCode)
       setUser(user)
-      navigate('/', { replace: true })
+      returnToPage()
     } catch (err: any) {
       setError(err.message || '2FA verification failed')
     } finally {
@@ -149,7 +157,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
     try {
       const user = await passkeySecondFactor(totpToken)
       setUser(user)
-      navigate('/', { replace: true })
+      returnToPage()
     } catch (err: any) {
       if (err?.name !== 'NotAllowedError') setError(err.message || 'Passkey verification failed')
     } finally {
@@ -177,7 +185,20 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
 
   async function handlePasskeyLogin() {
     if (isNative) {
-      androidBridge.openAuthBrowser(`${window.location.origin}/native-passkey`)
+      // Bind the sign-in to this webview: the nonce stays in its cookie
+      // (persisted before the system browser takes the foreground) and rides
+      // to the system browser in the page URL.
+      setError('')
+      let handoff = ''
+      try {
+        handoff = await startNativeHandoff()
+      } catch (err: any) {
+        setError(err.message || 'Passkey sign-in failed')
+        return
+      }
+      callNative('flushCookies')
+      void openNativeBrowser(
+        `${window.location.origin}/native-passkey?h=${encodeURIComponent(handoff)}`, 'auth')
       return
     }
     setError('')
@@ -185,7 +206,7 @@ export default function LoginPage({ authConfig }: LoginPageProps) {
     try {
       const user = await passkeyLogin()
       setUser(user)
-      navigate('/', { replace: true })
+      returnToPage()
     } catch (err: any) {
       // Cancelling the browser dialog is not an error worth showing.
       if (err?.name !== 'NotAllowedError') setError(err.message || 'Passkey sign-in failed')

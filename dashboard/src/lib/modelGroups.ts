@@ -15,15 +15,32 @@
  *    (banner + confirm; never an immediate model_change).
  */
 
+export interface ModelGroupOption {
+  value: string
+  label: string
+  /** Capability tier (1 = frontier … 4 = fast); absent = untiered. The
+   * dropdown renders it as the four-dot mark (`TierMark`), the word and the
+   * "good at" line as the row's tooltip. */
+  tier?: number | null
+  tierLabel?: string
+  goodAt?: string
+}
+
 export interface ModelGroup {
   layer: string
   layerLabel: string
-  models: { value: string; label: string }[]
+  models: ModelGroupOption[]
 }
 
 export interface LayerCatalogEntry {
   display_name: string
-  models?: { value: string; label: string }[]
+  models?: { value: string; label: string; tier?: number | null; tier_label?: string; good_at?: string }[]
+}
+
+/** Rank within an engine group: tier first (untiered last), catalog order
+ * inside a tier — the list a person scans is the capability ranking. */
+export function tierRank(tier: number | null | undefined): number {
+  return tier ? tier : 99
 }
 
 export interface ComputeModelGroupsArgs {
@@ -72,9 +89,16 @@ export function computeModelGroups(
   for (const path of pathsToShow) {
     const cap = layers[path]
     if (cap) {
-      const models = (cap.models || [])
+      const models: ModelGroupOption[] = (cap.models || [])
         .filter((m) => m.value !== '')
-        .map((m) => ({ value: `${path}::${m.value}`, label: m.label }))
+        .map((m, i) => ({ m, i }))
+        .sort((a, b) => tierRank(a.m.tier) - tierRank(b.m.tier) || a.i - b.i)
+        .map(({ m }) => ({
+          value: `${path}::${m.value}`,
+          label: m.label,
+          ...(m.tier ? { tier: m.tier, tierLabel: m.tier_label } : {}),
+          ...(m.good_at ? { goodAt: m.good_at } : {}),
+        }))
       if (path === chatActiveLayer && activeModel
           && !models.some((m) => m.value === `${path}::${activeModel}`)) {
         // Retired/unlisted current model: keep its check row renderable.

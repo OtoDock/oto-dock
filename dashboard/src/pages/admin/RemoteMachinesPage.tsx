@@ -7,10 +7,13 @@ import {
   DEVICE_CAPABILITY_INFO,
   type RemoteMachine, type PairResult,
 } from '../../api/remoteMachines'
-import { useAgents } from '../../api/agents'
+import { PAIRING_SCOPE } from '../../lib/placement'
+import { MACHINE_STATE, type MachineState } from '../../lib/status/machine'
+import { useAgents, useExecutionLayers } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
+import { engineLabels, installedCliBinaries, runsRemote } from '../../lib/engines'
 import { cliChipInfo } from '../../lib/cliChip'
 import RemoteBadge from '../../components/RemoteBadge'
 import PairInstallCommand from '../../components/PairInstallCommand'
@@ -127,10 +130,13 @@ function MachineCapacityControls({
   )
 }
 
-const STATUS_COLORS: Record<string, string> = {
+// One class per live state (the mirror's words; the stored column's
+// `offline` never arrives). `paused` reads amber like `stale`: offline by
+// intent, not a fault.
+const STATUS_COLORS: Record<MachineState, string> = {
   online: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
   stale: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  offline: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
+  paused: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
   disconnected: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
   never_connected: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
 }
@@ -198,7 +204,7 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
             disabled={triggerUpdate.isPending}
             className="px-2 py-1 text-xs font-medium rounded-sm border border-p-border-light text-p-text hover:bg-p-surface disabled:opacity-50"
             title={
-              machine.status === 'online'
+              machine.status === MACHINE_STATE.ONLINE
                 ? 'Push the latest satellite tarball now'
                 : 'Mark machine for forced update on next reconnect'
             }
@@ -232,8 +238,8 @@ function MachineFsPolicyControls({ machine }: { machine: RemoteMachine }) {
         <div className="flex flex-col gap-0.5 max-w-md">
           <p className="text-xs text-p-text">
             {allowFullFs
-              ? 'Full filesystem access — agents can read/write any path the OS user can reach.'
-              : 'Home-only — agents are limited to the agent tree and the OS user’s home directory.'}
+              ? "Full filesystem access. Agents can read and write any path the OS user can reach, except the machine's own OtoDock folder."
+              : "Home folder only. Agents are limited to the agent tree and the OS user's home folder, a guardrail, not a sandbox."}
           </p>
         </div>
         <label className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer">
@@ -350,6 +356,11 @@ export default function RemoteMachinesPage() {
   // User-paired section is collapsed by default (per-laptop overview is
   // observability-only — admin doesn't need it open every time).
   const [showUserPaired, setShowUserPaired] = useState(false)
+  // Admin removal of a USER-paired machine: a modal (the row is cramped and
+  // this is someone else's machine) names the owner and what happens on
+  // their side before anything is sent.
+  const [removeUserMachine, setRemoveUserMachine] = useState<RemoteMachine | null>(null)
+  const [removeError, setRemoveError] = useState('')
 
   if (!featureAvailable) {
     return (
@@ -392,20 +403,25 @@ export default function RemoteMachinesPage() {
     await unassignAgent.mutateAsync({ machineId, agentSlug })
   }
 
-  // Agents eligible for remote assignment: must run on a satellite (not
-  // direct-llm) and must have a shared (agent) workspace to run in — a remote
-  // machine runs the agent scope, so Personal-only agents (no shared space)
-  // are excluded.
+  // Agents eligible for remote assignment: their engine must run on a
+  // satellite (the descriptor's `runtime.supports_remote_execution` — an
+  // in-process engine has nothing to relocate) and they must have a shared
+  // (agent) workspace to run in — a remote machine runs the agent scope, so
+  // Personal-only agents (no shared space) are excluded. A machine that
+  // advertises the engines it can run narrows the list further (below).
+  const { data: layers } = useExecutionLayers()
+  const engineNames = engineLabels(layers)
+  const cliBinaries = installedCliBinaries(layers)
   const eligibleAgents = (agents ?? []).filter(
-    a => a.execution_path !== 'direct-llm' && hasAgentScope(modeOfAgent(a))
+    a => runsRemote(layers?.[a.execution_path]) && hasAgentScope(modeOfAgent(a))
   )
 
   if (isLoading) return <div className="p-6 text-p-text-light">Loading...</div>
 
   // Split admin-paired (this section is fully managed here) from
   // user-paired (read-only observability section below).
-  const adminMachines = (machines ?? []).filter(m => m.pairing_scope !== 'user')
-  const userMachines = (machines ?? []).filter(m => m.pairing_scope === 'user')
+  const adminMachines = (machines ?? []).filter(m => m.pairing_scope !== PAIRING_SCOPE.USER)
+  const userMachines = (machines ?? []).filter(m => m.pairing_scope === PAIRING_SCOPE.USER)
 
   return (
     <div className="space-y-6">
@@ -442,7 +458,7 @@ export default function RemoteMachinesPage() {
           >
             <div className="flex items-center gap-3 min-w-0">
               <RemoteBadge
-                state={(m.status as any) ?? null}
+                state={m.status ?? null}
                 machineName={m.name}
                 lastSeenIso={m.last_seen}
                 heartbeatAgeS={m.last_heartbeat_age_s ?? null}
@@ -453,7 +469,7 @@ export default function RemoteMachinesPage() {
               </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-              <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] || STATUS_COLORS.offline}`}>
+              <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected}`}>
                 {m.status}
               </span>
               {m.assigned_agents.length > 0 && (
@@ -480,7 +496,7 @@ export default function RemoteMachinesPage() {
                     </span>
                   )}
                   {(m.capabilities.installed_clis ?? []).map(cli => {
-                    const info = cliChipInfo(cli, m.capabilities.cli_status, m.cli_pins)
+                    const info = cliChipInfo(cli, m.capabilities.cli_status, m.cli_pins, cliBinaries)
                     return (
                       <span
                         key={cli}
@@ -493,6 +509,18 @@ export default function RemoteMachinesPage() {
                       </span>
                     )
                   })}
+                  {/* The engines this satellite runs (its `engines` capability,
+                      0.5.124+), named through the catalog. An older satellite
+                      advertises none and shows no chips. */}
+                  {(m.capabilities.engines ?? []).map(engine => (
+                    <span
+                      key={`engine:${engine}`}
+                      title={`Runs ${engineNames[engine] ?? engine} sessions`}
+                      className="px-2 py-0.5 rounded-sm text-xs bg-p-surface text-p-text"
+                    >
+                      {engineNames[engine] ?? engine}
+                    </span>
+                  ))}
                 </div>
                 {m.capabilities.os_user && (
                   <p className="text-xs text-p-text-light mt-1">
@@ -529,6 +557,10 @@ export default function RemoteMachinesPage() {
                     <option value="">+ Add agent</option>
                     {eligibleAgents
                       .filter(a => !m.assigned_agents.includes(a.name))
+                      // A satellite that says which engines it runs (0.5.124+)
+                      // gets only agents on one of them; an older one is offered
+                      // every eligible agent, as before.
+                      .filter(a => !m.capabilities.engines || m.capabilities.engines.includes(a.execution_path))
                       .map(a => (
                         <option key={a.name} value={a.name}>{a.display_name}</option>
                       ))}
@@ -580,10 +612,12 @@ export default function RemoteMachinesPage() {
         </div>
       ))}
 
-      {/* User-Paired Remote Machines — read-only overview. Collapsed by
-          default. Shows ALL user-paired machines regardless of current
-          status so admins can audit who paired what. No assign/edit/remove
-          actions here: ownership stays with the registering user. */}
+      {/* User-Paired Remote Machines — an overview, collapsed by default,
+          of ALL user-paired machines regardless of status so admins can
+          audit who paired what. The one action is Remove (the same
+          self-uninstall cascade as the owner's own Remove, with a confirm
+          that names the owner); assignment, filesystem scope and device
+          grants stay with the registering user. */}
       <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
         <button
           type="button"
@@ -596,7 +630,7 @@ export default function RemoteMachinesPage() {
               <span className="text-p-text-light font-normal">({userMachines.length})</span>
             </h3>
             <p className="text-xs text-p-text-light mt-0.5">
-              Machines paired by individual users via User Settings → Remote Machines. Read-only.
+              Machines paired by individual users via User Settings → Remote Machines. An admin can remove one; everything else stays with its owner.
             </p>
           </div>
           <svg
@@ -617,7 +651,7 @@ export default function RemoteMachinesPage() {
                 {userMachines.map(m => (
                   <div key={m.id} className="flex items-center gap-3 p-3">
                     <RemoteBadge
-                      state={(m.status as any) ?? null}
+                      state={m.status ?? null}
                       machineName={m.name}
                       lastSeenIso={m.last_seen}
                       heartbeatAgeS={m.last_heartbeat_age_s ?? null}
@@ -632,7 +666,7 @@ export default function RemoteMachinesPage() {
                         {m.capabilities?.os || 'unknown'}
                       </p>
                     </div>
-                    <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] || STATUS_COLORS.offline}`}>
+                    <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected}`}>
                       {m.status}
                     </span>
                     <span className="hidden sm:inline text-xs text-p-text-light w-44 text-right truncate">
@@ -640,6 +674,20 @@ export default function RemoteMachinesPage() {
                         ? `Last seen ${new Date(m.last_seen).toLocaleString()}`
                         : 'Never connected'}
                     </span>
+                    {/* Icon-only on phones, "Remove" from sm: — the row
+                        must never push the page wider than the screen. */}
+                    <button
+                      type="button"
+                      onClick={() => { setRemoveError(''); setRemoveUserMachine(m) }}
+                      title="Remove this machine"
+                      aria-label={`Remove ${m.name}`}
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg border border-red-200 dark:border-red-900/50 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                      <span className="hidden sm:inline">Remove</span>
+                    </button>
                   </div>
                 ))}
               </div>
@@ -647,6 +695,59 @@ export default function RemoteMachinesPage() {
           </div>
         )}
       </div>
+
+      {/* Remove a user-paired machine — confirm first. Stacked buttons on
+          phones, a row from sm:. */}
+      {removeUserMachine && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setRemoveUserMachine(null)}>
+          <div
+            role="dialog"
+            aria-labelledby="remove-user-machine-title"
+            className="bg-white dark:bg-p-surface rounded-xl p-6 w-full max-w-lg mx-4 shadow-xl space-y-4"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 id="remove-user-machine-title" className="text-lg font-semibold text-p-text">
+              Remove {removeUserMachine.name}?
+            </h3>
+            <p className="text-sm text-p-text-secondary">
+              This machine was paired by{' '}
+              <span className="font-medium text-p-text">
+                {removeUserMachine.owner_display_name || '(deleted user)'}
+                {removeUserMachine.owner_email ? ` <${removeUserMachine.owner_email}>` : ''}
+              </span>.
+              The satellite will uninstall itself from their machine (an offline
+              one the next time it connects). Their agents pinned to it run
+              where those agents run by default from their next turn — chats
+              keep their history, a resumed one starts with fresh context. The
+              owner is notified.
+            </p>
+            {removeError && <p className="text-sm text-red-600">{removeError}</p>}
+            <div className="flex flex-col-reverse sm:flex-row gap-2 sm:justify-end">
+              <button
+                onClick={() => setRemoveUserMachine(null)}
+                className="px-3 py-2 sm:py-1.5 text-sm font-medium rounded-lg border border-p-border-light text-p-text hover:bg-p-surface"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const id = removeUserMachine.id
+                  try {
+                    await handleDelete(id)
+                    setRemoveUserMachine(null)
+                  } catch (e: any) {
+                    setRemoveError(e?.message || 'Failed to remove the machine')
+                  }
+                }}
+                disabled={deleteMachine.isPending}
+                className="px-3 py-2 sm:py-1.5 text-sm font-medium rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleteMachine.isPending ? 'Removing…' : 'Remove machine'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Pair Modal */}
       {showPairModal && (
@@ -693,10 +794,11 @@ export default function RemoteMachinesPage() {
                   <span>
                     <span className="font-medium">Allow full filesystem access</span>
                     <span className="block text-xs text-p-text-light">
-                      When enabled, agents on this machine can read/write any path the
-                      OS user can reach (system files, services, etc.). When disabled,
-                      agents are scoped to the OS user’s home directory. Note: agents run
-                      natively as the OS user — this is a scope guardrail, not a kernel
+                      When enabled, agents on this machine can read and write any path the
+                      OS user can reach (system files, services), except the machine's own
+                      OtoDock folder, which no session may touch. When disabled, agents stay
+                      inside the OS user's home folder. Agents run natively as the OS user
+                      either way: the home folder setting is a guardrail, not a kernel
                       sandbox, so only pair machines you trust with the agent.
                     </span>
                   </span>

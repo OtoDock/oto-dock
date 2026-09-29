@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import sys
 from pathlib import Path
 
 logger = logging.getLogger("satellite.auth-paths")
@@ -54,9 +53,10 @@ def is_path_under_root(path: Path, root: Path) -> bool:
     try:
         resolved_path = path.resolve()
         resolved_root = root.resolve()
-        if sys.platform == "win32":
-            resolved_path = Path(os.path.normcase(str(resolved_path)))
-            resolved_root = Path(os.path.normcase(str(resolved_root)))
+        # ``normcase`` folds case where the OS does (Windows) and is the
+        # identity on POSIX — one call for every host.
+        resolved_path = Path(os.path.normcase(str(resolved_path)))
+        resolved_root = Path(os.path.normcase(str(resolved_root)))
         resolved_path.relative_to(resolved_root)
         return True
     except (ValueError, OSError):
@@ -78,6 +78,22 @@ def is_authorized_relative_path(rel_path: str) -> bool:
     if any(part == ".." for part in p.parts):
         return False
     return True
+
+
+def agent_rel(rel_path: str, agent_slug: str) -> str:
+    """The checked ``"<slug>/<rel>"`` a handler opens beneath ``agents_dir``
+    through ``host.safe_fs`` (the first component is the slug itself, so a
+    linked agent folder is refused at the open). The same rules as
+    ``assert_agent_path_safe`` on the text: a safe slug, a relative path with
+    no ``..``, no NUL, no empty or ``.`` segment. Raises ``ValueError``."""
+    if not is_safe_slug(agent_slug):
+        raise ValueError(f"unsafe agent_slug: {agent_slug!r}")
+    if not is_authorized_relative_path(rel_path):
+        raise ValueError(f"unsafe rel_path: {rel_path!r}")
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts:
+        raise ValueError(f"unsafe rel_path: {rel_path!r}")
+    return agent_slug + "/" + "/".join(parts)
 
 
 def assert_agent_path_safe(

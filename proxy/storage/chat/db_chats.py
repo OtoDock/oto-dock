@@ -9,12 +9,20 @@ import contextlib
 import json
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
+from core.session import session_kind
 from storage.pg import get_conn
 
 logger = logging.getLogger("db_chats")
+
+# The persisted role words the store reads back: a person's turn, and the
+# two roles whose text the search row indexes.
+_ROLE_USER = "user"
+_SEARCHED_ROLES = ("user", "assistant")
 
 
 # --- Chat Search (tsvector) ---
@@ -59,6 +67,16 @@ def _sanitize_fts_query(query: str) -> str:
     return " & ".join(f"{t}:*" for t in clean_tokens)
 
 
+# The task kind's ``source_type`` spellings — what chat mode excludes and
+# task mode selects (core-seams phase 4: the scheduler writes ``task`` on
+# the rows it mints). The ``LIKE 'task-%%'`` halves beside them keep the
+# rows minted BEFORE the write (``source_type='chat'`` with a ``task-`` id)
+# in the right list; a backfill that stamps those rows retires the halves.
+_TASK_SOURCE_TYPES = session_kind.source_types(session_kind.TASK)
+_NOT_TASK_ROW = "NOT (c.source_type = ANY(%s)) AND c.id NOT LIKE 'task-%%'"
+_TASK_ROW = "(c.source_type = ANY(%s) OR c.id LIKE 'task-%%')"
+
+
 def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list[dict]:
     """Search chats by title or content using tsvector. Returns matching chat rows.
 
@@ -71,14 +89,14 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list
     with get_conn() as conn:
         try:
             rows = conn.execute(
-                """SELECT c.* FROM chat_search s
+                f"""SELECT c.* FROM chat_search s
                    JOIN chats c ON c.id = s.chat_id
                    WHERE s.user_sub = %s AND s.agent = %s
-                   AND c.id NOT LIKE 'task-%%'
+                   AND {_NOT_TASK_ROW}
                    AND s.search_vector @@ to_tsquery('english', %s)
                    ORDER BY ts_rank(s.search_vector, to_tsquery('english', %s)) DESC
                    LIMIT %s""",
-                (user_sub, agent, tsquery, tsquery, limit),
+                (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, tsquery, limit),
             ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
@@ -90,6 +108,41 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list
 # for the human task name — NULL when the task row is gone (one-time tasks
 # hard-delete after firing), so the client can fall back to the chat title
 # instead of labeling rows with a raw task_id.
+# A failed search-row rebuild (the 1 MB tsvector cap, a lock timeout) leaves
+# the chat's search row stale; the WARNING is rate-limited, with a count.
+_REBUILD_WARN_EVERY_S = 60.0
+_rebuild_warned_at = 0.0
+_rebuild_warn_suppressed = 0
+_rebuild_warn_lock = threading.Lock()
+
+
+def _warn_rebuild_failed(chat_id: str, exc: BaseException) -> None:
+    global _rebuild_warned_at, _rebuild_warn_suppressed
+    with _rebuild_warn_lock:
+        now = time.monotonic()
+        if now - _rebuild_warned_at < _REBUILD_WARN_EVERY_S:
+            _rebuild_warn_suppressed += 1
+            return
+        more, _rebuild_warn_suppressed = _rebuild_warn_suppressed, 0
+        _rebuild_warned_at = now
+    logger.warning(
+        "chat_search rebuild failed for %s: %s%s", chat_id, exc,
+        f" ({more} more since the last warning)" if more else "",
+    )
+
+
+def rebuild_chat_search(chat_id: str) -> None:
+    """Rebuild one chat's search row in its own transaction (a caller that
+    wrote rows with ``sync_search=False`` calls this once per batch)."""
+    with get_conn() as conn:
+        try:
+            _rebuild_chat_search_row(conn, chat_id)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            _warn_rebuild_failed(chat_id, e)
+
+
 _TASK_RUN_JOIN = """
       JOIN LATERAL (
            SELECT id, task_id, status, task_type, scope, created_by
@@ -122,8 +175,8 @@ def list_task_chats(agent: str, scope_user_sub: str | None = None,
     each joined with its latest run. ``scope_user_sub=None`` skips the
     user-scope filter (service callers only). Tasks carry no unread state —
     every row reports ``unread=false``."""
-    conditions = ["c.agent=%s", "c.id LIKE 'task-%%'"]
-    params: list[Any] = [agent]
+    conditions = ["c.agent=%s", _TASK_ROW]
+    params: list[Any] = [agent, _TASK_SOURCE_TYPES]
     if scope_user_sub is not None:
         conditions.append(_TASK_SCOPE_COND)
         params.append(scope_user_sub)
@@ -147,9 +200,9 @@ def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
     tsquery = _sanitize_fts_query(query)
     if not tsquery:
         return []
-    conditions = ["s.agent = %s", "c.id LIKE 'task-%%'",
+    conditions = ["s.agent = %s", _TASK_ROW,
                   "s.search_vector @@ to_tsquery('english', %s)"]
-    params: list[Any] = [agent, tsquery]
+    params: list[Any] = [agent, _TASK_SOURCE_TYPES, tsquery]
     if scope_user_sub is not None:
         conditions.append(_TASK_SCOPE_COND)
         params.append(scope_user_sub)
@@ -173,13 +226,13 @@ def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
 # --- Chat CRUD ---
 
 
-def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = "default", model: str = "", execution_path: str = "", source_type: str = "chat", execution_mode: str = "", origin: str = "dashboard", work_cwd: str = "", parent_chat_id: str = "", project_id: str = "", delegate_role: str = "", title: str = "") -> dict:
+def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = "default", model: str = "", execution_path: str = "", source_type: str = "chat", execution_mode: str = "", origin: str = "dashboard", work_cwd: str = "", parent_chat_id: str = "", project_id: str = "", delegate_role: str = "", title: str = "", checks: str = "") -> dict:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO chats (id, user_sub, agent, title, session_id, permission_mode, model, execution_path, source_type, execution_mode, origin, work_cwd, parent_chat_id, project_id, delegate_role, created_at, updated_at)
-               VALUES (%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (chat_id, user_sub, agent, title, permission_mode, model, execution_path, source_type, execution_mode, origin, work_cwd, parent_chat_id, project_id, delegate_role, now, now),
+            """INSERT INTO chats (id, user_sub, agent, title, session_id, permission_mode, model, execution_path, source_type, execution_mode, origin, work_cwd, parent_chat_id, project_id, delegate_role, checks, created_at, updated_at)
+               VALUES (%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (chat_id, user_sub, agent, title, permission_mode, model, execution_path, source_type, execution_mode, origin, work_cwd, parent_chat_id, project_id, delegate_role, checks or "", now, now),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM chats WHERE id=%s", (chat_id,)).fetchone()
@@ -192,6 +245,21 @@ def get_chat(chat_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
+    """``chat_id → row`` for the ids that exist, one query. The Active-now
+    seed reads every live id this way instead of one ``get_chat`` per id
+    (``api/agents/chats.py`` ``_active_rows``). An empty list answers ``{}``
+    with no query."""
+    ids = list(dict.fromkeys(c for c in chat_ids if c))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chats WHERE id = ANY(%s)", (ids,),
+        ).fetchall()
+        return {r["id"]: dict(r) for r in rows}
+
+
 def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list[dict]:
     """List a chat-history owner's chats, newest first. Each row carries a
     computed ``unread`` bool: the last assistant response landed after the
@@ -200,8 +268,8 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list
     any user opens them)."""
     # Task-run chats never list in chat mode — their single home is the
     # sidebar's task mode (list_task_chats), delegate workers included.
-    conditions = ["c.user_sub=%s", "c.id NOT LIKE 'task-%%'"]
-    params: list[Any] = [user_sub, user_sub]
+    conditions = ["c.user_sub=%s", _NOT_TASK_ROW]
+    params: list[Any] = [user_sub, user_sub, _TASK_SOURCE_TYPES]
     if agent:
         conditions.append("c.agent=%s")
         params.append(agent)
@@ -235,15 +303,15 @@ def list_unread_finished_chats(since: str, limit: int = 30) -> list[dict]:
     rows via the client store instead. Caller applies per-row access."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT c.*, TRUE AS unread
+            f"""SELECT c.*, TRUE AS unread
                  FROM chats c
             LEFT JOIN chat_reads r ON r.chat_id = c.id AND r.user_sub = c.user_sub
                 WHERE c.last_response_at IS NOT NULL
                   AND c.last_response_at > %s
-                  AND c.id NOT LIKE 'task-%%'
+                  AND {_NOT_TASK_ROW}
                   AND (r.last_read_at IS NULL OR c.last_response_at > r.last_read_at)
              ORDER BY c.last_response_at DESC LIMIT %s""",
-            (since, limit),
+            (since, _TASK_SOURCE_TYPES, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -293,21 +361,22 @@ def list_chats_by_project(project_id: str, limit: int = 100) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_agent_conversations(agent: str, *, source_type: str = "", exclude_sources: tuple = (), offset: int = 0, limit: int = 50) -> list[dict]:
+def get_agent_conversations(agent: str, *, source_type: str = "", source_types=(), offset: int = 0, limit: int = 50) -> list[dict]:
     """Get all chats for an agent, ordered by most recent. Used by Conversations tab.
 
-    ``exclude_sources`` drops rows by ``source_type`` (e.g. ``("chat",)`` keeps
-    only phone/external conversations — dashboard chats live on the separate
-    chat-history page).
+    ``source_types`` is the resolved list of the kinds the tab lists (the
+    externally driven ones — ``session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES``;
+    dashboard and task chats live in the sidebar); ``source_type`` narrows to
+    one of them.
     """
     sql = "SELECT * FROM chats WHERE agent=%s"
     params: list[Any] = [agent]
     if source_type:
         sql += " AND source_type=%s"
         params.append(source_type)
-    for ex in exclude_sources:
-        sql += " AND source_type <> %s"
-        params.append(ex)
+    if source_types:
+        sql += " AND source_type = ANY(%s)"
+        params.append(list(source_types))
     sql += " ORDER BY updated_at DESC LIMIT %s OFFSET %s"
     params.extend([limit, offset])
     with get_conn() as conn:
@@ -315,22 +384,22 @@ def get_agent_conversations(agent: str, *, source_type: str = "", exclude_source
         return [dict(r) for r in rows]
 
 
-def count_agent_conversations(agent: str, *, source_type: str = "", exclude_sources: tuple = ()) -> int:
+def count_agent_conversations(agent: str, *, source_type: str = "", source_types=()) -> int:
     """Count all chats for an agent. Used by Conversations tab pagination."""
     sql = "SELECT COUNT(*) AS cnt FROM chats WHERE agent=%s"
     params: list[Any] = [agent]
     if source_type:
         sql += " AND source_type=%s"
         params.append(source_type)
-    for ex in exclude_sources:
-        sql += " AND source_type <> %s"
-        params.append(ex)
+    if source_types:
+        sql += " AND source_type = ANY(%s)"
+        params.append(list(source_types))
     with get_conn() as conn:
         return conn.execute(sql, params).fetchone()["cnt"]
 
 
 def update_chat(chat_id: str, **fields: Any) -> bool:
-    allowed = {"title", "session_id", "permission_mode", "model", "execution_path", "execution_target", "total_cost", "context_used", "context_max", "cache_read", "cache_write", "output_tokens", "last_turn_aborted", "last_abort_graceful", "codex_thread_id", "thread_goal", "pending_history_seed", "execution_mode", "title_generated", "tui_theme", "last_response_at", "parent_chat_id", "project_id", "delegate_role"}
+    allowed = {"title", "session_id", "permission_mode", "model", "execution_path", "execution_target", "total_cost", "context_used", "context_max", "cache_read", "cache_write", "output_tokens", "last_turn_aborted", "last_abort_graceful", "codex_thread_id", "thread_goal", "pending_history_seed", "execution_mode", "title_generated", "tui_theme", "last_response_at", "parent_chat_id", "project_id", "delegate_role", "checks", "engine_cost_total", "engine_cost_session_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
@@ -570,21 +639,27 @@ def update_chat_title_cas(chat_id: str, new_title: str,
         return True
 
 
-def get_retention_candidate_chats(cutoff_iso: str) -> list[dict]:
+def get_retention_candidate_chats(cutoff_iso: str, *,
+                                  fileless_paths: list[str]) -> list[dict]:
     """Chats whose LOCAL on-disk session may be aged out by the retention
     sweep (services/infra/retention.py). Remote-pinned chats are the satellite's
-    business; direct-llm has no session files; ''-target rows (post-#11
-    machine deletion) already have NULL session ids.
+    business; ''-target rows (post-#11 machine deletion) already have NULL
+    session ids. ``fileless_paths`` is the resolved list of engines that keep
+    NO session files (the caller reads it off the registry:
+    ``behaviour.rebuilds_history_from_db`` — a SQL literal cannot read a
+    descriptor); their chats are skipped, every other ``execution_path`` —
+    the empty default included — is a candidate, and an empty list skips
+    nothing.
     """
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT id, user_sub, agent, session_id, codex_thread_id
                  FROM chats
                 WHERE execution_target = 'local'
-                  AND execution_path != 'direct-llm'
+                  AND execution_path <> ALL(%s)
                   AND (session_id IS NOT NULL OR codex_thread_id IS NOT NULL)
                   AND updated_at < %s""",
-            (cutoff_iso,),
+            (list(fileless_paths), cutoff_iso),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -649,27 +724,40 @@ def get_all_session_refs() -> set[str]:
     return refs
 
 
-def flag_chats_for_retention(chat_ids: list[str]) -> int:
-    """Transition aged-out chats to the reseed flow.
+# Chats per retention UPDATE: the first sweep of a large install flags
+# thousands at once, and one statement for all of them could outlast the
+# pool's statement timeout.
+_RETENTION_FLAG_BATCH = 500
+
+
+def flag_chats_for_retention(chat_ids: list[str], cutoff_iso: str) -> list[str]:
+    """Transition aged-out chats to the reseed flow, in committed batches;
+    returns the ids actually flagged. ``cutoff_iso`` is the candidate
+    query's cutoff: a chat resumed since that query (its ``updated_at``
+    moved past the cutoff) is left alone, and the sweep keeps its files.
 
     Mirrors remote_store.delete_remote_machine's chat transition. Deliberately
     NOT update_chat: that helper bumps updated_at, which would float every
     aged chat to the top of the chat list the moment the sweep runs.
     """
     if not chat_ids:
-        return 0
+        return []
+    flagged: list[str] = []
     with get_conn() as conn:
-        cur = conn.execute(
-            """UPDATE chats
-                  SET session_id = NULL, codex_thread_id = NULL,
-                      pending_history_seed = 'retention',
-                      last_turn_aborted = FALSE, last_abort_graceful = FALSE,
-                      context_used = 0
-                WHERE id = ANY(%s)""",
-            (chat_ids,),
-        )
-        conn.commit()
-        return cur.rowcount
+        for i in range(0, len(chat_ids), _RETENTION_FLAG_BATCH):
+            rows = conn.execute(
+                """UPDATE chats
+                      SET session_id = NULL, codex_thread_id = NULL,
+                          pending_history_seed = 'retention',
+                          last_turn_aborted = FALSE, last_abort_graceful = FALSE,
+                          context_used = 0
+                    WHERE id = ANY(%s) AND updated_at < %s
+                RETURNING id""",
+                (chat_ids[i:i + _RETENTION_FLAG_BATCH], cutoff_iso),
+            ).fetchall()
+            conn.commit()
+            flagged.extend(r["id"] for r in rows)
+    return flagged
 
 
 def get_chat_by_session(session_id: str) -> dict | None:
@@ -722,11 +810,14 @@ def delete_chat(chat_id: str) -> bool:
 
 def add_chat_message(chat_id: str, role: str, content: str = "",
                      event_type: str = "", event_data: str = "",
-                     author_sub: str = "") -> int:
+                     author_sub: str = "", *, sync_search: bool = True) -> int:
     """Persist one chat message. ``author_sub`` is the REAL sender's user_sub —
     set for Shared-only chats (where the chat row owner is a synthetic
     ``agent::{slug}``) so each message keeps its true attribution. Empty for
-    single-owner chats (owner == sender) and assistant/event rows."""
+    single-owner chats (owner == sender) and assistant/event rows.
+
+    ``sync_search=False`` skips the search-row rebuild (O(chat) work): a
+    caller writing many rows rebuilds once with ``rebuild_chat_search``."""
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
@@ -743,28 +834,84 @@ def add_chat_message(chat_id: str, role: str, content: str = "",
         # deterministic title from the first prompt here — the chat layer's
         # send-time titling never runs for scheduler-driven chats. First
         # message only (non-empty titles are never overwritten).
-        if role == "user" and content and chat_id.startswith("task-"):
-            try:
-                title_row = conn.execute(
-                    "SELECT title FROM chats WHERE id=%s", (chat_id,),
-                ).fetchone()
-                if title_row is not None and not (title_row["title"] or "").strip():
-                    from services.title_generator import deterministic_title
-                    conn.execute(
-                        "UPDATE chats SET title=%s WHERE id=%s",
-                        (deterministic_title(content), chat_id),
-                    )
-                    conn.commit()
-            except Exception:
-                pass  # title stamp failure should not break message insert
+        if role == _ROLE_USER and content and session_kind.is_task_chat_id(chat_id):
+            _stamp_task_title(conn, chat_id, content)
+            conn.commit()
         # Sync search index for user/assistant text messages
-        if role in ("user", "assistant") and content:
+        if sync_search and role in _SEARCHED_ROLES and content:
             try:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
-            except Exception:
-                pass  # search sync failure should not break message insert
+            except Exception as e:
+                conn.rollback()
+                _warn_rebuild_failed(chat_id, e)  # the row itself is committed
         return row_id
+
+
+def _stamp_task_title(conn, chat_id: str, first_prompt: str) -> None:
+    """The deterministic title of a scheduler-driven task chat, from its first
+    prompt (never overwrites a title). Runs inside a savepoint: its failure
+    never costs the rows it rides with."""
+    try:
+        with conn.transaction():
+            title_row = conn.execute(
+                "SELECT title FROM chats WHERE id=%s", (chat_id,),
+            ).fetchone()
+            if title_row is not None and not (title_row["title"] or "").strip():
+                from services.title_generator import deterministic_title
+                conn.execute(
+                    "UPDATE chats SET title=%s WHERE id=%s",
+                    (deterministic_title(first_prompt), chat_id),
+                )
+    except Exception:
+        logger.debug("task title stamp failed for %s", chat_id, exc_info=True)
+
+
+def add_chat_messages_batch(chat_id: str,
+                            rows: list[tuple[str, str, str, str]]) -> int:
+    """Persist a turn's rows, ``(role, content, event_type, event_data)``
+    each, in order: one transaction for the inserts and ``updated_at``, then
+    ONE search-row rebuild for the lot (not one per text row). When the
+    insert transaction fails (one row the database refuses), it is rolled
+    back and the rows go in one by one, so a bad row costs only itself.
+    Returns the last inserted id (0 when nothing landed)."""
+    if not rows:
+        return 0
+    now = datetime.now(timezone.utc).isoformat()
+    needs_search = any(role in _SEARCHED_ROLES and content
+                       for role, content, _t, _d in rows)
+    first_prompt = next((content for role, content, _t, _d in rows
+                         if role == _ROLE_USER and content), "")
+    last_id = 0
+    try:
+        with get_conn() as conn:
+            for role, content, event_type, event_data in rows:
+                last_id = conn.execute(
+                    """INSERT INTO chat_messages (chat_id, role, content, event_type, event_data, author_sub, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (chat_id, role, content or "", event_type or "",
+                     event_data or "", "", now),
+                ).fetchone()["id"]
+            conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
+            if first_prompt and session_kind.is_task_chat_id(chat_id):
+                _stamp_task_title(conn, chat_id, first_prompt)
+            conn.commit()
+    except Exception as e:
+        logger.warning("chat %s: a %d-row batch failed (%s); writing row by row",
+                       chat_id, len(rows), e)
+        last_id = 0
+        for role, content, event_type, event_data in rows:
+            try:
+                last_id = add_chat_message(chat_id, role, content or "",
+                                           event_type=event_type or "",
+                                           event_data=event_data or "",
+                                           sync_search=False)
+            except Exception as row_err:
+                logger.warning("chat %s: a %s row was refused: %s",
+                               chat_id, role, row_err)
+    if needs_search:
+        rebuild_chat_search(chat_id)
+    return last_id
 
 
 def get_chat_messages(chat_id: str, limit: int = 500, *, before_id: int | None = None) -> list[dict]:
@@ -853,23 +1000,26 @@ def list_tool_names(chat_id: str) -> list[str]:
     return names
 
 
-def get_last_todo_snapshot(chat_id: str) -> list[dict]:
-    """The most recent TodoWrite checklist snapshot in a chat, for the idle-reload
-    panel restore — searched over FULL history so it is independent of the loaded
-    message window. Covers native TodoWrite tool rows AND the synthesized snapshots
-    from the Codex ``update_plan`` / CLI ``TaskCreate``/``TaskUpdate`` paths (all
-    persisted as a tool block named TodoWrite).
+def get_last_todo_snapshot(chat_id: str, tool_name: str) -> list[dict]:
+    """The most recent checklist snapshot in a chat, for the idle-reload panel
+    restore — searched over FULL history so it is independent of the loaded
+    message window. ``tool_name`` is the persisted block name every engine's
+    snapshot carries (``core/events/tool_roles.TODO_SNAPSHOT`` — the caller
+    resolves it; a SQL literal reads no descriptor): native checklist rows AND
+    the synthesized snapshots of Codex's ``update_plan`` and the CLI's
+    ``TaskCreate`` / ``TaskUpdate`` family are all stored under it.
 
     ``event_data`` is TEXT and ``''`` on most rows, so a blind ``::jsonb`` cast can
     throw (Postgres doesn't guarantee predicate short-circuit) — prefilter with a
-    LIKE that can't trip a cast, then parse in Python.
+    LIKE that can't trip a cast (the default ``json.dumps`` separators are
+    load-bearing: ``"name": "<tool>"``), then parse in Python.
     """
     with get_conn() as conn:
         row = conn.execute(
             "SELECT event_data FROM chat_messages "
             "WHERE chat_id=%s AND event_type='tool' AND event_data LIKE %s "
             "ORDER BY id DESC LIMIT 1",
-            (chat_id, '%"name": "TodoWrite"%'),
+            (chat_id, f'%"name": {json.dumps(tool_name)}%'),
         ).fetchone()
     if not row or not row["event_data"]:
         return []

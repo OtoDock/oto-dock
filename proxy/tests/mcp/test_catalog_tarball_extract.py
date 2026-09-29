@@ -72,3 +72,30 @@ def test_malformed_manifest_is_skipped(tmp_path: Path):
     })
     out = _extract_mcp_subfolder(tb, "google-workspace", tmp_path)
     assert out is not None and out.name == "workspace-mcp"
+
+
+def test_a_template_tarball_takes_regular_files_only():
+    # The agents catalog's extraction: a link member (a symlink or a
+    # hardlink, its target in the archive or not) is skipped, never a
+    # KeyError; the template's files come out.
+    import shutil
+    from services.community.community_agents_catalog import _extract_template_subfolder
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        def add(name, data=b"", **kw):
+            ti = tarfile.TarInfo(name)
+            for k, v in kw.items():
+                setattr(ti, k, v)
+            ti.size = len(data) if ti.type == tarfile.REGTYPE else 0
+            tf.addfile(ti, io.BytesIO(data) if ti.type == tarfile.REGTYPE else None)
+        add("root-abc/tpl/agent.json", b"{}")
+        add("root-abc/tpl/context/a.md", b"inner")
+        add("root-abc/tpl/context/out.md", type=tarfile.SYMTYPE, linkname="/etc/hostname")
+        add("root-abc/tpl/context/in.md", type=tarfile.SYMTYPE, linkname="a.md")
+        add("root-abc/tpl/context/hard.md", type=tarfile.LNKTYPE, linkname="etc/passwd")
+    d = _extract_template_subfolder(buf.getvalue(), "tpl")
+    try:
+        assert sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file()) == ["agent.json", "context/a.md"]
+        assert not any(p.is_symlink() for p in d.rglob("*"))
+    finally:
+        shutil.rmtree(d.parent, ignore_errors=True)

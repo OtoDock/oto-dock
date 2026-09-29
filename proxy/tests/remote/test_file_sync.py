@@ -815,6 +815,48 @@ class TestFileChangedInnerRouting:
         assert not (tmp_path / "workspace/mystery").exists()
 
 
+class TestWriteBackGuardLogLevel:
+    """The write-back guard's denial log: an engine-machinery path is denied
+    for every role by design, so it is said quietly — at debug with a live
+    context, at info when the session's context is already gone (the
+    engine's last write landing after the close, e.g. Claude's
+    `.claude/.last-cleanup` a few ms after a mode-switch close; T1
+    2026-09-22). A NORMAL path with no context keeps the WARNING: that is the
+    anomaly the log exists to surface. Nothing is written in either case."""
+
+    def _host(self):
+        from core.remote.satellite_file_transfer import SatelliteFileTransferMixin
+
+        class H(SatelliteFileTransferMixin):
+            def __init__(self):
+                pass
+
+        return H()
+
+    def _apply(self, rel_path: str):
+        import asyncio as _a
+        msg = {"agent_slug": "agent-x", "path": rel_path, "action": "write",
+               "session_id": "00000000-dead-beef-0000-000000000000", "content_b64": ""}
+        _a.run(self._host()._apply_file_changed("m1", msg))
+
+    def test_machinery_path_after_close_is_info_not_warning(self, caplog):
+        import logging as _logging
+        with caplog.at_level(_logging.DEBUG, logger="claude-proxy.satellite"):
+            self._apply("users/dev-admin/.claude/.last-cleanup")
+        records = [r for r in caplog.records if "write-back" in r.getMessage()]
+        assert [r.levelno for r in records] == [_logging.INFO]
+        assert "engine machinery, no session context" in records[0].getMessage()
+
+    def test_normal_path_without_context_keeps_the_warning(self, caplog):
+        import logging as _logging
+        with caplog.at_level(_logging.DEBUG, logger="claude-proxy.satellite"):
+            self._apply("workspace/notes.md")
+        records = [r for r in caplog.records if "write-back" in r.getMessage()]
+        assert [r.levelno for r in records] == [_logging.WARNING]
+        assert "write-back denied" in records[0].getMessage()
+        assert "role=no-ctx" in records[0].getMessage()
+
+
 # ---------------------------------------------------------------------------
 # Per-machine manifest cap override + hash cache (Feature D, 1.4.0)
 # ---------------------------------------------------------------------------

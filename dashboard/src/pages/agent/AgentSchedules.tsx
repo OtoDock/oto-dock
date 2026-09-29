@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask } from '../../api/tasks'
-import { formatNextRun, formatCronDescription, formatIntervalDescription } from '../../lib/format'
+import { formatNextRun, describeSchedule, browserTimeZone } from '../../lib/format'
 import { useAuth } from '../../contexts/AuthContext'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
 import { TaskModelChip } from '../../components/common/TaskModelChip'
@@ -9,6 +9,9 @@ import { TaskModelChip } from '../../components/common/TaskModelChip'
 export default function AgentSchedules() {
   const { name } = useParams<{ name: string }>()
   const { data: tasks, isLoading } = useTasks(name)
+  // "Next" is the browser's clock; the schedule names its own zone when
+  // that differs, so "Daily at 08:00" and "in 3h" never read as a mismatch.
+  const browserTz = browserTimeZone()
   const runNow = useRunTaskNow()
   const deleteTask = useDeleteTask()
   const pauseTask = usePauseTask()
@@ -106,7 +109,7 @@ export default function AgentSchedules() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-xs text-p-text-secondary">
-                    <div>{formatIntervalDescription(task.interval_seconds) || formatCronDescription(task.schedule) || task.run_at || (task.delay_seconds != null ? `in ${task.delay_seconds}s` : '\u2014')}</div>
+                    <div>{describeSchedule(task, browserTz)}</div>
                     {task.schedule && <div className="font-mono text-p-text-light mt-0.5">{task.schedule}</div>}
                     {task.interval_seconds != null && <div className="font-mono text-p-text-light mt-0.5">interval {task.interval_seconds}s</div>}
                   </td>
@@ -184,15 +187,18 @@ export default function AgentSchedules() {
         )}
         {filtered.map((task) => (
           <div key={task.id} className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-2">
-            <div className="flex items-start justify-between">
-              <div>
+            {/* A template-seeded id runs to 120 unbreakable characters: the
+                left column may shrink and the id breaks anywhere, the
+                status pill never shrinks \u2014 the card fits a 360 px phone. */}
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0 flex-1" data-testid="task-card-main">
                 <p className="text-sm font-medium text-p-text">{task.name}</p>
                 <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-                  <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                  <span className="text-xs text-p-text-light font-mono break-all">{task.id}</span>
                   <TaskModelChip task={task} />
                 </div>
               </div>
-              <div className="flex gap-1">
+              <div className="flex gap-1 shrink-0" data-testid="task-card-status">
                 <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${
                   task.enabled
                     ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-300'
@@ -203,14 +209,14 @@ export default function AgentSchedules() {
               </div>
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-p-text-secondary">
-              <span>
+              <span className="min-w-0 break-words">
                 <span className="text-p-text-light">Schedule:</span>{' '}
-                {formatIntervalDescription(task.interval_seconds) || formatCronDescription(task.schedule) || task.run_at || (task.delay_seconds != null ? `in ${task.delay_seconds}s` : '\u2014')}
+                {describeSchedule(task, browserTz)}
               </span>
-              <span>
+              <span className="min-w-0 break-words">
                 <span className="text-p-text-light">Next:</span> {formatNextRun(task.next_run_time)}
               </span>
-              <span>
+              <span className="min-w-0 break-words">
                 <span className="text-p-text-light">Scope:</span> {scopeName(task.scope)}
               </span>
             </div>

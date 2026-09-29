@@ -15,17 +15,20 @@ with the store's least-active order breaking remaining ties.
 Bindings are mirrored to the DB (subscription_session_bindings) so usage
 attribution and stickiness survive proxy restarts.
 
-Auth credentials are returned as env-var-ready values:
-- API key: SubscriptionHandle.api_key → ANTHROPIC_API_KEY
-- OAuth:   a session-file blob — the layer writes it into the session's config
-  dir (Claude: ``_CLAUDE_CREDS_BLOB`` → ``.credentials.json``; Codex:
-  ``_CODEX_OAUTH_TOKEN``/``_CODEX_AUTH_BLOB`` → ``auth.json``). Never an env
-  token: env is frozen at exec, so a live CLI could never pick up a rotation,
-  and providers revoke older access tokens when the refresh token rotates.
-  The CLIs re-read their credential file (Claude: mtime-watch + 401-recovery;
-  Codex: guarded reload), so the pool rotates and FANS OUT — see
-  ``ensure_fresh_and_fan_out`` and ``services/engines/token_fanout``.
-- Local:   SubscriptionHandle.endpoint_url → provider-specific env var
+Auth credentials reach a session through the ENGINE's adapter
+(``ExecutionLayer.subscription_env`` — the pool looks the layer up by the
+acquisition's execution path and hands it the ``SubscriptionHandle``):
+- API key: the engine's key variable (``ANTHROPIC_API_KEY``, ``CODEX_API_KEY``, …)
+- OAuth:   the engine's credential FILE payload, which its ``start_session``
+  writes into the session's config dir (Claude ``.credentials.json``, Codex
+  ``auth.json``). Never an env token: env is frozen at exec, so a live CLI
+  could never pick up a rotation, and providers revoke older access tokens
+  when the refresh token rotates. The CLIs re-read their credential file
+  (Claude: mtime-watch + 401-recovery; Codex: guarded reload), so the pool
+  rotates and FANS OUT — see ``ensure_fresh_and_fan_out`` and
+  ``services/engines/token_fanout``.
+- Local:   the engine's endpoint variable; a minted relay token arrives like
+  a BYO key + endpoint
 
 The pool is the SOLE rotator: session files carry a blank refresh token, so a
 CLI physically cannot self-rotate (a cascade of CLI-side rotations is exactly
@@ -38,14 +41,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import threading
 import time
-from dataclasses import dataclass
 
-import requests
-
-from storage.billing import subscription_store
+from core.execution_layer import DEFAULT_EXECUTION_PATH, SubscriptionHandle
+from core import placement
+from storage.billing import subscription_status, subscription_store
 from services.billing import pool_caps as _pool_caps
 from services.engines import subscription_windows as _windows
 
@@ -222,31 +225,24 @@ def within_boot_grace() -> bool:
 
 
 def _session_registered_live(session_id: str) -> bool | None:
-    """Is this session live in ANY registry that can hold a bound CLI session?
+    """Is this session live in ANY registry that can hold a bound session?
     Checks the pool's own live map, the interactive registry (local + remote
-    PTYs, incl. re-adopted ones), both local headless layers, and the remote
-    layer (incl. post-restart adopted sessions — ``adopt_session`` re-registers
-    there without re-binding, which is exactly why the persisted rows exist).
-    Returns None when a registry can't be consulted (import/attr failure) —
-    the caller must fail SOFT and treat the session as live: wrongly deleting
-    a live session's row breaks its usage attribution and scope pin."""
+    PTYs, incl. re-adopted ones), then every execution layer through the
+    registry (``find_layer_for_session``: the local engines and the remote
+    layer, incl. post-restart adopted sessions — ``adopt_session``
+    re-registers there without re-binding, which is exactly why the
+    persisted rows exist; it never creates the remote layer). Returns None
+    when a registry can't be consulted (import/attr failure) — the caller
+    must fail SOFT and treat the session as live: wrongly deleting a live
+    session's row breaks its usage attribution and scope pin."""
     try:
         if session_id in _session_subscriptions:
             return True
         from core.session import interactive_session
         if interactive_session.get(session_id) is not None:
             return True
-        from core.layers.cli.session import _persistent_sessions
-        if session_id in _persistent_sessions:
-            return True
-        from core.layers.codex.session import _codex_sessions
-        if session_id in _codex_sessions:
-            return True
-        from core.session import session_manager
-        remote_layer = session_manager._remote_layer  # never lazily create here
-        if remote_layer is not None and session_id in remote_layer._sessions:
-            return True
-        return False
+        from core.session.session_manager import find_layer_for_session
+        return find_layer_for_session(session_id) is not None
     except Exception:
         return None
 
@@ -328,51 +324,6 @@ def looks_like_limit_error(message: str) -> bool:
     the cooldown length."""
     return throttle_cooldown_for(message) is not None
 
-# Anthropic OAuth token endpoint and client_id (from Claude Code CLI v2.1.97+)
-_ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-
-
-def _derive_subscription_fields(profile: dict) -> tuple[str, str]:
-    """Map ``/api/oauth/profile`` JSON to the ``(subscriptionType,
-    rateLimitTier)`` pair of ``.credentials.json``. The Claude Code TUI gates
-    plan-included models (e.g. Fable 5 on Max) on ``subscriptionType`` — an
-    empty value makes it classify the login as API/credits and refuse them."""
-    account = profile.get("account") or {}
-    org = profile.get("organization") or {}
-    if account.get("has_claude_max"):
-        sub_type = "max"
-    elif account.get("has_claude_pro"):
-        sub_type = "pro"
-    else:
-        # organization_type is "claude_<tier>" (claude_max, claude_enterprise, …)
-        sub_type = str(org.get("organization_type") or "").removeprefix("claude_")
-    return sub_type, str(org.get("rate_limit_tier") or "")
-
-
-def fetch_anthropic_subscription_fields(access_token: str) -> tuple[str, str]:
-    """Best-effort plan-tier lookup for an Anthropic OAuth access token.
-
-    The token endpoint does not echo the plan tier, so it is resolved from the
-    profile endpoint the CLI itself uses. Returns ``("", "")`` on any failure —
-    callers treat that as "keep whatever is stored"."""
-    try:
-        import httpx as _httpx
-        resp = _httpx.get(
-            _ANTHROPIC_PROFILE_URL,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "anthropic-beta": "oauth-2025-04-20",
-            },
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return "", ""
-        return _derive_subscription_fields(resp.json())
-    except Exception:
-        return "", ""
-
 # Auth types a NON-owner user may borrow from the admin pool. OAuth consumer
 # subscriptions are deliberately excluded (they are strictly per-owner). To
 # restore admin-subscription pooling for users, add 'oauth' here — nothing else
@@ -417,56 +368,44 @@ class NoSubscriptionError(Exception):
         super().__init__(message or self._MESSAGES.get(reason, self._MESSAGES["none"]))
 
 
-@dataclass
-class SubscriptionHandle:
-    """Result of acquiring a subscription for a session."""
-    subscription_id: str
-    layer: str
-    provider: str
-    auth_type: str                  # 'oauth' | 'api_key' | 'local_endpoint' | 'relay'
-    api_key: str | None             # for api_key auth → ANTHROPIC_API_KEY
-    oauth_access_token: str | None  # for OAuth → the session credential file
-    endpoint_url: str | None        # for local models (Ollama, LM Studio)
-    codex_auth_blob: dict | None = None  # full Codex auth.json for session reconstruction
-    # expiresAt (epoch ms) of oauth_access_token — 0/absent for non-expiring
-    # credentials. This is the expiry of the token ACTUALLY issued (the stored
-    # one on a fail-soft refresh), the input to per-session runway tracking.
-    oauth_expires_at_ms: int = 0
-    # Ready-to-write ``claudeAiOauth`` payload for the session's
-    # ``.credentials.json`` (Claude CLI file delivery) — refresh token
-    # neutralized (pool = sole rotator). None for non-OAuth credentials.
-    claude_creds_blob: dict | None = None
-
-
 def _window_readings(candidates: list[dict], now=None) -> dict:
     """The effective provider-window reading per OAuth candidate that has a
     sample (``services.engines.subscription_windows``); empty when the
-    platform setting is off or nothing has been read yet."""
+    platform setting is off or nothing has been read yet. ``candidates`` are
+    subscription ROWS — the row's ``layer`` names the windows its engine's
+    vendor reports, which the reading is settled against."""
     if not _windows.is_enabled():
         return {}
-    ids = [c["id"] for c in candidates if c.get("auth_type") == "oauth"]
-    if not ids:
+    oauth = [c for c in candidates if c.get("auth_type") == "oauth" and c.get("id")]
+    if not oauth:
         return {}
     try:
-        readings = _windows.latest_readings(subscription_store, ids, now)
+        readings = _windows.latest_readings(subscription_store, oauth, now)
     except Exception:
         logger.debug("Pool: window sample read failed", exc_info=True)
         return {}
     return readings if isinstance(readings, dict) else {}
 
 
-def _window_exhausted_overall(sub_id: str) -> bool:
-    """Is the account past its overall spill marks for every model (the
-    exhaustion that moves a pinned scope)?"""
-    reading = _window_readings([{"id": sub_id, "auth_type": "oauth"}]).get(sub_id)
-    return reading is not None and _windows.exhausted_overall(reading)
+def _scope_key(layer: str | None, model: str) -> str:
+    """The per-model window a spawn of ``model`` counts against on ``layer``
+    — the engine's ``usage_scope_key`` (Claude: the model family); "" for no
+    model, no per-model windows, or an engine that is not registered."""
+    if not model or not layer:
+        return ""
+    from core.session.session_manager import get_all_layers
+    engine = get_all_layers().get(layer)
+    return engine.usage_scope_key(model) if engine is not None else ""
 
 
-def _window_exhausted_for(sub_id: str, model: str) -> bool:
+def _window_exhausted_for(row: dict, model: str) -> bool:
     """Is the account out of window for a spawn of ``model`` — overall, or
-    its per-model weekly window (``""`` = overall only)?"""
-    reading = _window_readings([{"id": sub_id, "auth_type": "oauth"}]).get(sub_id)
-    return reading is not None and _windows.exhausted(reading, model)
+    its per-model quota window (``""`` = overall only)? ``row`` is the
+    subscription row (``id``, ``layer``, ``auth_type``); a non-OAuth row has
+    no windows and is never exhausted."""
+    reading = _window_readings([row]).get(row.get("id"))
+    return reading is not None and _windows.exhausted(
+        reading, _scope_key(row.get("layer"), model))
 
 
 def _group_model(session_ids: list[str]) -> str:
@@ -533,7 +472,8 @@ def _select(
     readings = _window_readings(auth_ok)
     exhausted = {
         c["id"] for c in auth_ok
-        if c["id"] in readings and _windows.exhausted(readings[c["id"]], model)
+        if c["id"] in readings
+        and _windows.exhausted(readings[c["id"]], _scope_key(c.get("layer"), model))
     }
     pool = [c for c in auth_ok
             if not _is_throttled(c["id"]) and c["id"] not in exhausted]
@@ -577,8 +517,9 @@ def _select(
             if reading is None:
                 return _FAR_FUTURE
             if fallback:
-                return _epoch_or_inf(_windows.frees_at(reading, model))
-            return _epoch_or_inf(_windows.weekly_reset(reading))
+                return _epoch_or_inf(
+                    _windows.frees_at(reading, _scope_key(s.get("layer"), model)))
+            return _epoch_or_inf(_windows.quota_reset(reading))
 
         pool.sort(key=lambda s: (s.get("auth_type") == "relay",
                                  _instant(s),
@@ -614,7 +555,7 @@ def credential_scope_key(target: str, host_dir: str) -> str:
     direct-llm — env-injected keys, nothing shared on disk)."""
     if not host_dir:
         return ""
-    return f"{target or 'local'}:{host_dir}"
+    return f"{target or placement.LOCAL}:{host_dir}"
 
 
 def _sticky_subscription_id(scope_key: str) -> str | None:
@@ -701,11 +642,11 @@ def _select_sticky(
     match = [c for c in candidates if c["id"] == pinned]
     if not match:
         return None
-    if _window_exhausted_for(pinned, model):
+    if _window_exhausted_for(match[0], model):
         others = [
             c for c in candidates
             if c["id"] != pinned and (allowed_auth is None or c.get("auth_type") in allowed_auth)
-            and not (c.get("auth_type") == "oauth" and _window_exhausted_for(c["id"], model))
+            and not _window_exhausted_for(c, model)
         ]
         if others:
             logger.info(
@@ -914,7 +855,7 @@ def user_scope_block_reason(layer: str, user_sub: str, *, provider: str = "") ->
         stale = subscription_store.list_personal(
             layer, user_sub, provider or None, any_status=True,
         )
-        if any(s.get("status") == "expired" for s in stale):
+        if any(s.get("status") == subscription_status.EXPIRED for s in stale):
             return "own_sub_expired"
     if not subscription_store.get_user_allow_platform_auth(user_sub):
         return "auth_off"
@@ -964,20 +905,31 @@ def layer_platform_configured(layer: str) -> bool:
     return bool(subscription_store.list_platform_pool(layer))
 
 
-# Execution layers (AI engines) eligible for auto-enable on agent create/install,
-# in priority order. ``direct-llm`` is intentionally excluded — it is never the
-# auto-pick for a fresh agent (it needs an explicit model + provider to be useful,
-# and the agent-scope pool path can't borrow an admin OAuth sub the way the CLIs
-# can). A creator can still enable it by hand in the agent's Config tab.
-AUTO_ENABLE_LAYER_ORDER: tuple[str, ...] = ("claude-code-cli", "codex-cli")
+def _auto_enable_candidates() -> list[str]:
+    """The engines a fresh agent may be auto-enabled on, in priority order:
+    the CODING engines (``identity.role``), in AI Engines page order
+    (``identity.sort_order``). A supporting engine — Direct LLM — is never
+    the auto-pick: it needs an explicit model + provider to be useful, and
+    the agent-scope pool path can't borrow an admin OAuth sub the way the
+    CLIs can; a creator can still enable it by hand in the agent's Config
+    tab. The page order doubling as the priority is deliberate: an engine
+    that should display second but never be auto-picked would need a field
+    of its own, and no such engine exists."""
+    from core.session.session_manager import get_all_layers
+    coding = [
+        (layer.capabilities.identity.sort_order, path)
+        for path, layer in get_all_layers().items()
+        if layer.capabilities.identity.role == "coding"
+    ]
+    return [path for _order, path in sorted(coding)]
 
 
 def default_execution_layer_for_creator(user_sub: str) -> str:
     """Pick the execution layer (AI engine) to auto-enable for an agent that
     ``user_sub`` is creating or installing, so the agent runs zero-config.
 
-    Returns the first engine in :data:`AUTO_ENABLE_LAYER_ORDER` (claude-code-cli,
-    then codex-cli) that is connected on BOTH sides:
+    Returns the first coding engine (:func:`_auto_enable_candidates` — Claude
+    Code, then Codex) that is connected on BOTH sides:
 
       - the PLATFORM — an admin has contributed an active subscription for it to
         the shared pool (:func:`subscription_store.list_platform_pool`), so
@@ -986,26 +938,26 @@ def default_execution_layer_for_creator(user_sub: str) -> str:
         subscription for it (:func:`subscription_store.list_personal`), so the
         creator's own user-scope chats run it too.
 
-    Never returns ``direct-llm``. Falls back to ``claude-code-cli`` when no
-    candidate qualifies, so the new agent always has a sensible primary engine
-    the creator can finish configuring.
+    Never returns a supporting engine. Falls back to the platform default
+    engine when no candidate qualifies, so the new agent always has a
+    sensible primary engine the creator can finish configuring.
 
-    The agent's ``default_model`` stays empty (Auto → resolved to the best model
-    of this primary engine) and ``default_effort`` stays empty (→ High), so the
-    pair (engine, model, effort) is fully resolved with zero manual setup.
+    The agent's ``default_model`` stays empty (Auto → the engine's declared
+    default) and ``default_effort`` stays empty (→ High), so the pair
+    (engine, model, effort) is fully resolved with zero manual setup.
 
     Note on the BOTH rule: an admin who *contributes* their only subscription to
     the platform pool but leaves ``use_personal=False`` has no personal row, so
-    that engine won't be auto-picked (we fall back to claude). That's an accepted
-    edge — the pool engine still works for agent-scope runs, and the creator can
-    enable it explicitly afterwards.
+    that engine won't be auto-picked (we fall back to the default). That's an
+    accepted edge — the pool engine still works for agent-scope runs, and the
+    creator can enable it explicitly afterwards.
     """
-    for layer in AUTO_ENABLE_LAYER_ORDER:
+    for layer in _auto_enable_candidates():
         platform_connected = bool(subscription_store.list_platform_pool(layer))
         creator_connected = bool(subscription_store.list_personal(layer, user_sub))
         if platform_connected and creator_connected:
             return layer
-    return "claude-code-cli"
+    return DEFAULT_EXECUTION_PATH
 
 
 def release_subscription(session_id: str) -> None:
@@ -1511,7 +1463,11 @@ def _move_scope_group(
                 handle = None
             elif require_unthrottled and (
                 _is_throttled(handle.subscription_id)
-                or _window_exhausted_for(handle.subscription_id, model)
+                or _window_exhausted_for(
+                    {"id": handle.subscription_id, "layer": handle.layer,
+                     "auth_type": handle.auth_type},
+                    model,
+                )
             ):
                 # Hopping onto another limited or exhausted account is pure
                 # churn: credential-file rewrites on live sessions every
@@ -1529,19 +1485,16 @@ def _move_scope_group(
         )
         return
 
-    claude_blob = handle.claude_creds_blob
-    codex_auth = None
-    if handle.oauth_access_token and handle.codex_auth_blob:
-        from core.layers.codex.helpers import build_auth_json
-        codex_auth = build_auth_json(
-            handle.oauth_access_token, auth_blob=handle.codex_auth_blob,
+    # The replacement's credential FILE, from the token this handle actually
+    # issued (the pair the snapshot below records): None for a key or an
+    # endpoint (env-frozen, undeliverable into a live file session).
+    payload = None
+    if handle.oauth_access_token:
+        from core.session.session_manager import get_layer_by_path
+        payload = get_layer_by_path(layer).credential_file_payload(
+            handle.oauth_access_token, handle.oauth_expires_at_ms, handle.credential,
         )
-    deliverable = []
-    for sid in swappable:
-        t = token_fanout.session_target(sid)
-        if t and ((t.kind == "codex" and codex_auth) or
-                  (t.kind != "codex" and claude_blob)):
-            deliverable.append(sid)
+    deliverable = list(swappable) if payload is not None else []
     if not deliverable:
         stuck_log(
             f"Pool: replacement {handle.subscription_id[:8]} for {cause} "
@@ -1577,7 +1530,7 @@ def _move_scope_group(
         )
 
     token_fanout.fan_out(
-        deliverable, claude_blob=claude_blob, codex_auth=codex_auth,
+        deliverable, layer=layer, payload=payload,
         on_written=_on_written, expected_sub_id=old_sub,
     )
 
@@ -1714,7 +1667,9 @@ def _rebalance_scopes(*, reason: str) -> int:
             model = _group_model(sids)
             if old_sub in _throttled_hard and _is_throttled(old_sub):
                 cause = "rate-limited"
-            elif _window_exhausted_for(old_sub, model):
+            elif _window_exhausted_for(
+                {"id": old_sub, "layer": layer, "auth_type": "oauth"}, model,
+            ):
                 # The vendor's own reading says the account is out of window
                 # for what these sessions run.
                 cause = "window exhausted" + (f" for {model}" if model else "")
@@ -1728,7 +1683,7 @@ def _rebalance_scopes(*, reason: str) -> int:
                 candidates = [
                     c for c in _eligible_candidates(layer, scope_sub, provider)
                     if c["id"] != old_sub and not _is_throttled(c["id"])
-                    and not _window_exhausted_for(c["id"], model)
+                    and not _window_exhausted_for(c, model)
                 ]
                 if not candidates:
                     continue
@@ -1760,28 +1715,24 @@ def _rebalance_scopes(*, reason: str) -> int:
 # High-level helper: resolve provider + acquire + build env vars
 # ---------------------------------------------------------------------------
 
-# Hosted Direct-LLM relay endpoint path per provider. The provider SDK appends
-# its own route suffix to base_url, so the install-side endpoint differs per
-# provider (the Anthropic SDK adds /v1/messages; the OpenAI-compatible SDKs add
-# /chat/completions).
-_RELAY_LLM_PATH = {
-    "anthropic": "/v1/relay/anthropic",
-    "openai": "/v1/relay/openai/v1",
-    "groq": "/v1/relay/groq/v1",
-}
-
-
-def relay_llm_credentials(provider: str, user_sub: str | None) -> tuple[str, str] | None:
-    """For a hosted (``auth_type='relay'``) direct-llm subscription: mint a per-user
-    relay token and build this provider's relay endpoint URL. Returns
-    ``(api_key, endpoint_url)`` where ``api_key`` is the minted token, or ``None``
-    if the relay is unavailable / refuses (out of credit, over seat, not
-    configured) — the caller then surfaces a clean "no credentials" error. Only
-    anthropic / openai / groq are relay-backed (Ollama / LiteLLM are local)."""
+def relay_llm_credentials(layer: str, provider: str, user_sub: str | None) -> tuple[str, str] | None:
+    """For a hosted (``auth_type='relay'``) subscription on ``layer``: mint a
+    per-user relay token and build this provider's relay endpoint URL — the
+    engine's ``providers[]`` entry declares the path (the provider SDK
+    appends its own route suffix to base_url, so the install-side endpoint
+    differs per vendor). Returns ``(api_key, endpoint_url)`` where
+    ``api_key`` is the minted token, or ``None`` if the provider has no relay
+    path or the relay is unavailable / refuses (out of credit, over seat,
+    not configured) — the caller then surfaces a clean "no credentials"
+    error."""
     import config as app_config
+    from core.execution_layer import provider_entry
+    from core.session.session_manager import get_layer_capabilities
     from services.billing import relay_client
 
-    path = _RELAY_LLM_PATH.get(provider)
+    caps = get_layer_capabilities(layer)
+    entry = provider_entry(caps, provider) if caps is not None else None
+    path = (entry or {}).get("relay_path") or ""
     if not path or not app_config.OTODOCK_RELAY_BASE:
         return None
     try:
@@ -1800,37 +1751,44 @@ def resolve_subscription_env(
     agent_info: dict | None = None,
     sticky_scope: str = "",
 ) -> tuple[str, dict[str, str]]:
-    """Acquire a subscription and build layer-specific auth env vars.
+    """Acquire a subscription and build the session's auth env.
 
-    Combines provider resolution, subscription acquisition, and credential-to-
-    env-var mapping in a single call.  This replaces the duplicated if/else
-    pattern that was previously copy-pasted across config_builder,
-    task_config_builder, meeting_orchestrator, and phone_config_builder.py.
+    Provider resolution and acquisition are the pool's; the credential-to-env
+    mapping is the ENGINE's (``ExecutionLayer.subscription_env`` — the layer
+    is looked up by ``execution_path``, fail-closed on an id no engine
+    claims). One call for every config builder (chat, task, meeting, phone).
 
-    ``sticky_scope`` (the spawn's ``credential_scope_key``; CLI builders pass
-    it) pins same-scope sessions to one account — see ``acquire_subscription``.
+    ``sticky_scope`` (the spawn's ``credential_scope_key``; the builders pass
+    it) pins same-scope sessions to one account — see ``acquire_subscription``
+    — and only means anything on an engine whose login is a credential FILE
+    shared by the scope's sessions (``auth.credential_file``); an engine that
+    injects its credential per session env has nothing on disk to share.
 
     Returns (subscription_id, env_vars_dict).  On failure returns ("", {}).
     """
     import config as app_config  # local import to avoid circular dependency
+    from core.session.session_manager import get_layer_by_path
 
-    # 1. Resolve the provider from the model: both multi-provider layers
-    # (direct-llm, codex-cli) carry OpenAI-compatible LOCAL endpoints next to
-    # their vendor accounts, and the model decides which one a session needs.
-    # Claude Code has one provider — no filter.
-    if execution_path in ("direct-llm", "codex-cli"):
-        resolved_provider = (
-            app_config.get_model_provider(model, layer=execution_path) if model else ""
-        )
-    else:
-        resolved_provider = ""
+    layer = get_layer_by_path(execution_path)
+    caps = layer.capabilities
 
-    # 2. Acquire subscription from pool (scope-sticky only meaningful for the
-    # credential-FILE layers — direct-llm injects keys per env, nothing shared)
+    # 1. Resolve the provider from the model on a multi-provider engine (one
+    # that declares MORE THAN ONE provider: Codex and Direct LLM carry
+    # OpenAI-compatible LOCAL endpoints next to their vendor accounts, and
+    # the model decides which one a session needs). A single-provider engine
+    # has no filter: every row on it is its vendor, validated at insert, and
+    # get_model_provider's prefix guess for an unknown id must never gate a
+    # spawn there.
+    resolved_provider = (
+        app_config.get_model_provider(model, layer=execution_path)
+        if len(caps.providers or ()) > 1 and model else ""
+    )
+
+    # 2. Acquire a subscription from the pool.
+    file_delivery = caps.auth.credential_file is not None
     sub_handle = acquire_subscription(
         execution_path, user_sub, provider=resolved_provider,
-        sticky_scope=sticky_scope if execution_path in (
-            "claude-code-cli", "codex-cli") else "",
+        sticky_scope=sticky_scope if file_delivery else "",
         model=model,
     )
     if not sub_handle:
@@ -1850,74 +1808,25 @@ def resolve_subscription_env(
         else:
             _issued_token_expiry.pop(sub_handle.subscription_id, None)
 
-        # 3. Map credentials to layer-specific env vars
-        env: dict[str, str] = {}
-        if execution_path == "claude-code-cli":
-            if sub_handle.api_key:
-                env["ANTHROPIC_API_KEY"] = sub_handle.api_key
-            # OAuth rides a session-file blob, never CLAUDE_CODE_OAUTH_TOKEN env:
-            # env is frozen at exec (a rotation could never reach a live CLI) and
-            # it outranks the credential file in the CLI's auth priority, which
-            # would defeat the file-based fan-out. The layer pops this and writes
-            # ``.credentials.json`` into the session's CLAUDE_CONFIG_DIR.
-            if sub_handle.claude_creds_blob:
-                import json as _json
-                env["_CLAUDE_CREDS_BLOB"] = _json.dumps(sub_handle.claude_creds_blob)
-        elif execution_path == "codex-cli":
-            if sub_handle.auth_type == "local_endpoint":
-                # A key on a LOCAL endpoint rides its own variable: CODEX_API_KEY
-                # would switch Codex into API-key auth against its built-in
-                # OpenAI provider, not the custom one the layer writes.
-                if sub_handle.api_key:
-                    env["_CODEX_LOCAL_API_KEY"] = sub_handle.api_key
-            elif sub_handle.api_key:
-                # Codex CLI uses CODEX_API_KEY for API key auth
-                env["CODEX_API_KEY"] = sub_handle.api_key
-            # ChatGPT OAuth token — layer writes it to .codex/auth.json
-            if sub_handle.oauth_access_token:
-                env["_CODEX_OAUTH_TOKEN"] = sub_handle.oauth_access_token
-            # Full Codex auth blob for auth.json reconstruction (has id_token, account_id, etc.)
-            if sub_handle.codex_auth_blob:
-                import json as _json
-                env["_CODEX_AUTH_BLOB"] = _json.dumps(sub_handle.codex_auth_blob)
-            if sub_handle.endpoint_url:
-                env["_CODEX_ENDPOINT_URL"] = sub_handle.endpoint_url
-                # The provider (ollama / openai_compatible) picks the AGENTS.md
-                # note that tells the model whether its MCP tools reach it
-                # (helpers.local_provider_note). Popped by the layers like the URL.
-                env["_CODEX_ENDPOINT_PROVIDER"] = sub_handle.provider or ""
-                # The provider's codex-cli model rows (id + context window) feed
-                # the per-session model catalog that makes Codex defer its MCP
-                # tools (core/layers/codex/local_model_catalog). Read HERE, off
-                # the event loop (this resolver runs under to_thread), so the
-                # layers never touch the store on the loop. Popped like the URL.
-                from core.layers.codex.local_model_catalog import (
-                    LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
-                )
-                env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(sub_handle.provider or "")
-        else:
-            # Direct LLM and other layers use generic provider env vars.
-            env["_PROVIDER"] = sub_handle.provider
-            if sub_handle.auth_type == "relay":
-                # Hosted relay: mint a per-user token + point the adapter at this
-                # provider's relay endpoint (the vendor key never reaches the install).
-                # Fail-soft — if the relay is unavailable / out of credit / over seat,
-                # surface no creds (clean "no LLM credentials" error) and release the
-                # pool slot we took.
-                creds = relay_llm_credentials(sub_handle.provider, user_sub)
-                if not creds:
-                    subscription_store.decrement_active_sessions(sub_handle.subscription_id)
-                    return "", {}
-                env["_API_KEY"], env["_ENDPOINT_URL"] = creds
-            else:
-                if sub_handle.api_key:
-                    env["_API_KEY"] = sub_handle.api_key
-                if sub_handle.endpoint_url:
-                    env["_ENDPOINT_URL"] = sub_handle.endpoint_url
+        # 3. The hosted relay: mint a per-user token + this provider's relay
+        # endpoint (the vendor key never reaches the install), and hand them
+        # to the engine like any BYO key + endpoint. Fail-soft — if the relay
+        # is unavailable / out of credit / over seat, surface no creds (a
+        # clean "no LLM credentials" error) and give the pool slot back.
+        if sub_handle.auth_type == "relay":
+            creds = relay_llm_credentials(sub_handle.layer, sub_handle.provider, user_sub)
+            if not creds:
+                subscription_store.decrement_active_sessions(sub_handle.subscription_id)
+                return "", {}
+            sub_handle = dataclasses.replace(
+                sub_handle, api_key=creds[0], endpoint_url=creds[1],
+            )
+
+        # 4. The engine maps the credential to its own env.
+        env = layer.subscription_env(sub_handle)
 
     except Exception:
-        release_unbound_seat(sub_handle.subscription_id, sticky_scope if execution_path in (
-            "claude-code-cli", "codex-cli") else "")
+        release_unbound_seat(sub_handle.subscription_id, sticky_scope if file_delivery else "")
         raise
     return sub_handle.subscription_id, env
 
@@ -1926,7 +1835,7 @@ def resolve_subscription_env(
 # Token refresh
 # ---------------------------------------------------------------------------
 
-def _refresh_error_terminal(resp) -> bool:
+def _refresh_error_terminal(out) -> bool:
     """True only for a provider-confirmed dead grant: OAuth2 ``invalid_grant``
     in the error body. Everything else — 429/5xx, WAF challenge pages
     (non-JSON bodies), an ``invalid_scope``-class request bug on our side,
@@ -1934,39 +1843,36 @@ def _refresh_error_terminal(resp) -> bool:
     mass-expire every healthy row over a single request-construction fault.
     Grants whose provider never confirms death this way are caught by the
     sustained-401 streak instead (``_sustained_auth_dead``)."""
-    if resp.status_code not in (400, 401):
+    if out.status not in (400, 401) or not isinstance(out.body, dict):
         return False
-    try:
-        body = resp.json()
-    except Exception:
-        return False
-    err = body.get("error")
+    err = out.body.get("error")
     if isinstance(err, dict):
         err = err.get("type") or err.get("code") or err.get("error")
     return err == "invalid_grant"
 
 
-def _log_refresh_failure(sub_id: str, provider: str, resp) -> None:
+def _log_refresh_failure(sub_id: str, vendor: str, out) -> None:
     detail = ""
     auth_shaped = False
-    with contextlib.suppress(Exception):
-        body = resp.json()
-        err = body.get("error")
+    if isinstance(out.body, dict):
+        err = out.body.get("error")
         if isinstance(err, dict):
             err = err.get("type") or err.get("code") or err.get("error")
-        desc = body.get("error_description") or ""
+        desc = out.body.get("error_description") or ""
         detail = f" ({err}{': ' + desc if desc else ''})"
         # A provider auth rejection (as opposed to a WAF/proxy page): the
         # token endpoint itself answered 401 with a structured error body.
-        auth_shaped = resp.status_code == 401 and err is not None
+        auth_shaped = out.status == 401 and err is not None
+    elif out.error:
+        detail = f" ({out.error})"
     logger.error(
-        f"{provider} OAuth refresh failed for {sub_id[:8]}: "
-        f"{resp.status_code}{detail}"
+        f"{vendor} OAuth refresh failed for {sub_id[:8]}: "
+        f"{out.status or 'no response'}{detail}"
     )
     if auth_shaped:
         first, count = _auth_fail_streaks.get(sub_id) or (time.time(), 0)
         _auth_fail_streaks[sub_id] = (first, count + 1)
-    if resp.status_code == 429:
+    if out.status == 429:
         _throttled_until[sub_id] = time.time() + _REFRESH_RATELIMIT_COOLDOWN_S
 
 
@@ -1996,15 +1902,18 @@ def clear_refresh_backoff(sub_id: str) -> None:
 
 
 def _refresh_oauth_token(
-    sub_id: str, refresh_token: str, provider: str = "anthropic",
+    sub: dict, refresh_token: str, stored: dict | None = None,
 ) -> tuple[str | None, bool]:
     """Refresh an expired OAuth access token using the stored refresh token.
 
-    Supports both Anthropic and OpenAI OAuth providers.
+    The vendor call is the ENGINE's (``ExecutionLayer.refresh_oauth``, looked
+    up by the row's layer); everything around it is the pool's: persisting
+    the record with the platform keys carried across the rotation
+    (``_carry_platform_keys``), the failure verdict, and the fan-out.
     Returns ``(new_access_token, terminal)`` — the token is None on failure,
     and ``terminal`` is True only when the provider confirmed the grant dead
-    (``invalid_grant``; see ``_refresh_error_terminal``).
-    Updates the subscription's credential_data in DB with new tokens.
+    (``invalid_grant``; see ``_refresh_error_terminal``) or the sustained
+    401 streak did.
 
     EVERY successful rotation fans the new token out to all live bound
     sessions' credential files before returning — providers revoke older
@@ -2013,23 +1922,80 @@ def _refresh_oauth_token(
     is the single rotation chokepoint (both the spawn-time resolve and
     ``ensure_fresh_and_fan_out`` land here, already holding the sub's refresh
     lock).
+
+    Fail-soft, deliberately: an engine that is no longer registered, one
+    that takes no login (an OAuth row stored on it by an exchange that did
+    not validate the layer — no migration removes such rows) or an adapter
+    that raises all count as a TRANSIENT failure — logged, backed off, never
+    terminal — the envelope the vendor refreshers always had.
     """
-    if provider == "openai":
-        new_access, terminal = _refresh_openai_oauth_token(sub_id, refresh_token)
-    else:
-        new_access, terminal = _refresh_anthropic_oauth_token(sub_id, refresh_token)
-    if new_access:
-        _fan_out_rotated_token(sub_id)
-    return new_access, terminal
+    sub_id = sub["id"]
+    try:
+        from core.session.session_manager import get_layer_by_path
+        layer = get_layer_by_path(str(sub.get("layer") or ""))
+        vendor = layer.capabilities.identity.vendor_label or layer.capabilities.name
+        vendor_id = layer.capabilities.identity.vendor_id
+        if vendor_id and (sub.get("provider") or vendor_id) != vendor_id:
+            # A row stored on the wrong engine before the login routes
+            # checked it: its refresh token must never reach another
+            # vendor's token endpoint.
+            raise ValueError(f"a {sub.get('provider')} login on a {vendor_id} engine")
+        # ``stored`` is the credential the caller read under the refresh lock
+        # (one read, not a second one racing the caller's).
+        if stored is None:
+            stored = subscription_store.get_credential_data(sub_id)
+        out = layer.refresh_oauth(refresh_token, stored)
+    except Exception as e:
+        logger.error(f"OAuth refresh for {sub_id[:8]} could not run: {e}")
+        return None, False
+    if out.oauth_token is None:
+        _log_refresh_failure(sub_id, vendor, out)
+        return None, _refresh_error_terminal(out) or _sustained_auth_dead(sub_id)
+    new_cred = dict(stored)
+    new_cred["oauth_token"] = _carry_platform_keys(
+        out.oauth_token, stored.get("oauth_token") or {}, out.refresh_token_expires_in,
+    )
+    new_cred.update(out.extra)
+    subscription_store.update_credential_data(sub_id, new_cred)
+    logger.info(f"{vendor} OAuth token refreshed for {sub_id[:8]}")
+    _fan_out_rotated_token(sub)
+    return out.oauth_token.get("accessToken"), False
 
 
-def _fan_out_rotated_token(sub_id: str) -> None:
+def _carry_platform_keys(new_token: dict, old: dict, refresh_token_expires_in) -> dict:
+    """The platform's own keys on the stored ``oauth_token`` record, carried
+    across a rotation the vendor adapter knows nothing about.
+
+    ``refreshTokenExpiresAt`` is the login GRANT's expiry (finite — ~28 days
+    for Claude logins), not the rotated access token's: recomputed when the
+    response reported ``refresh_token_expires_in``, else the stored value
+    carries forward (erasing it on every 8h rotation would blind the
+    pre-expiry warning). ``healthAlerts`` (the warning dedup stamps, see
+    subscription_health) and ``accountUuid`` (the exchange's second match
+    key) ride along for the same reason — a full reconnect rebuilds the blob
+    without them, which is exactly the re-arm."""
+    token = dict(new_token)
+    if refresh_token_expires_in:
+        token["refreshTokenExpiresAt"] = int((time.time() + refresh_token_expires_in) * 1000)
+    elif old.get("refreshTokenExpiresAt"):
+        token["refreshTokenExpiresAt"] = int(old["refreshTokenExpiresAt"])
+    if old.get("healthAlerts"):
+        token["healthAlerts"] = old["healthAlerts"]
+    if old.get("accountUuid") and not token.get("accountUuid"):
+        token["accountUuid"] = old["accountUuid"]
+    return token
+
+
+def _fan_out_rotated_token(sub: dict) -> None:
     """Rewrite every live bound session's credential file with the freshly
-    rotated token (see ``token_fanout``). Per-session expiry snapshots advance
-    only for sessions whose file write landed — a failed write keeps the old
-    snapshot so the turn-start guard retries. Best-effort: a fan-out error
-    must never fail the refresh that triggered it (the backstop is each CLI's
-    own on-401 file re-read)."""
+    rotated token (see ``token_fanout``) — the file payload is the engine's
+    (``credential_file_payload``, from the row's layer), built from the
+    stored token and its expiry, the pair the per-session snapshot records.
+    Snapshots advance only for sessions whose file write landed — a failed
+    write keeps the old snapshot so the turn-start guard retries. Best-effort:
+    a fan-out error must never fail the refresh that triggered it (the
+    backstop is each CLI's own on-401 file re-read)."""
+    sub_id = sub["id"]
     with _session_maps_lock:
         sessions = [
             sid for sid, bound in _session_subscriptions.items() if bound == sub_id
@@ -2037,15 +2003,19 @@ def _fan_out_rotated_token(sub_id: str) -> None:
     if not sessions:
         return
     try:
+        from core.session.session_manager import get_layer_by_path
+        layer = get_layer_by_path(str(sub.get("layer") or ""))
         cred = subscription_store.get_credential_data(sub_id)
         oauth = cred.get("oauth_token") or {}
+        token = oauth.get("accessToken")
         new_expiry = int(oauth.get("expiresAt") or 0)
-        claude_blob = _claude_file_blob(oauth) if oauth.get("accessToken") else None
-        codex_auth = None
-        blob = cred.get("codex_auth_blob")
-        if blob and oauth.get("accessToken"):
-            from core.layers.codex.helpers import build_auth_json
-            codex_auth = build_auth_json(oauth["accessToken"], auth_blob=blob)
+        payload = layer.credential_file_payload(token, new_expiry, cred) if token else None
+        if payload is None:
+            logger.info(
+                f"Token fan-out for {sub_id[:8]}: no credential file to rewrite "
+                f"({len(sessions)} bound session(s) keep their current file)"
+            )
+            return
 
         def _on_written(session_id: str) -> None:
             # Called from the fan-out (worker thread for local writes, event
@@ -2058,7 +2028,7 @@ def _fan_out_rotated_token(sub_id: str) -> None:
 
         from services.engines import token_fanout
         token_fanout.fan_out(
-            sessions, claude_blob=claude_blob, codex_auth=codex_auth,
+            sessions, layer=layer.capabilities.name, payload=payload,
             on_written=_on_written, expected_sub_id=sub_id,
         )
     except Exception:
@@ -2073,30 +2043,9 @@ def fan_out_current_token(sub_id: str) -> None:
     keep the pre-exchange token, which the provider may revoke on the grant
     rotation and which 401-recovery (a re-read of the same stale file) can
     never repair. Sync — call via ``asyncio.to_thread``."""
-    _fan_out_rotated_token(sub_id)
-
-
-def _claude_file_blob(oauth_data: dict) -> dict:
-    """The ``claudeAiOauth`` payload for a session's ``.credentials.json``,
-    from a stored oauth_token dict. The refresh token is NEUTRALIZED (blank):
-    the pool is the sole rotator — a CLI holding no refresh token physically
-    cannot rotate, it can only use the fanned-out access token or 401-recover
-    it from disk, which fails SAFE (auth error repaired by the next fan-out)
-    instead of cascading revocations."""
-    blob = {
-        "accessToken": oauth_data.get("accessToken", ""),
-        "refreshToken": "",
-        "expiresAt": int(oauth_data.get("expiresAt") or 0),
-        "scopes": oauth_data.get("scopes") or [],
-        "subscriptionType": oauth_data.get("subscriptionType", ""),
-        "rateLimitTier": oauth_data.get("rateLimitTier", ""),
-    }
-    # Grant-lifetime expiry rides along when known (CLI ≥2.1.222 stores and
-    # warns on it; older CLIs ignore the extra key). Only when present — a
-    # zero would read as an epoch-expired login.
-    if oauth_data.get("refreshTokenExpiresAt"):
-        blob["refreshTokenExpiresAt"] = int(oauth_data["refreshTokenExpiresAt"])
-    return blob
+    sub = subscription_store.get_subscription(sub_id)
+    if sub:
+        _fan_out_rotated_token(sub)
 
 
 def ensure_fresh_and_fan_out(
@@ -2124,143 +2073,6 @@ def ensure_fresh_and_fan_out(
     if not token:
         return False
     return not expires_at or time.time() * 1000 < expires_at - min_runway_ms
-
-
-def _grant_expiry_fields(data: dict, old: dict) -> dict:
-    """The grant-lifetime keys carried on the stored oauth_token blob.
-
-    ``refreshTokenExpiresAt`` is the login GRANT's expiry (finite — ~28 days
-    for Claude logins), not the rotated access token's: when a response omits
-    ``refresh_token_expires_in`` the previously stored value carries forward
-    (erasing it on every 8h rotation would blind the pre-expiry warning).
-    ``healthAlerts`` (the warning dedup stamps, see subscription_health) ride
-    along for the same reason — a full reconnect rebuilds the blob without
-    them, which is exactly the re-arm."""
-    fields: dict = {}
-    rt_expires_in = data.get("refresh_token_expires_in")
-    if rt_expires_in:
-        fields["refreshTokenExpiresAt"] = int((time.time() + rt_expires_in) * 1000)
-    elif old.get("refreshTokenExpiresAt"):
-        fields["refreshTokenExpiresAt"] = int(old["refreshTokenExpiresAt"])
-    if old.get("healthAlerts"):
-        fields["healthAlerts"] = old["healthAlerts"]
-    return fields
-
-
-def _refresh_anthropic_oauth_token(sub_id: str, refresh_token: str) -> tuple[str | None, bool]:
-    """Refresh an Anthropic OAuth token → ``(access_token, terminal)``.
-
-    Uses JSON body matching the Claude Code CLI (not form-urlencoded).
-    Omits scope parameter — the CLI omits it for Claude.ai (inference) tokens.
-    Including scopes not in the original grant (e.g. org:create_api_key) causes
-    'invalid_scope' errors from Anthropic.
-    """
-    try:
-        import httpx as _httpx
-        json_body = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": _ANTHROPIC_CLIENT_ID,
-        }
-        resp = _httpx.post(
-            _ANTHROPIC_TOKEN_URL,
-            json=json_body,
-            headers={
-                "Content-Type": "application/json",
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            _log_refresh_failure(sub_id, "Anthropic", resp)
-            return None, _refresh_error_terminal(resp) or _sustained_auth_dead(sub_id)
-
-        data = resp.json()
-        new_access = data.get("access_token")
-        new_refresh = data.get("refresh_token", refresh_token)
-        expires_in = data.get("expires_in", 28800)
-
-        # The refresh response does not echo the plan tier — preserve the
-        # stored values (overwriting them with "" strips the tier on every
-        # 8h rotation, and the TUI then gates Max-included models behind
-        # usage credits). Backfill once from the profile endpoint when the
-        # stored values are empty too.
-        old = subscription_store.get_credential_data(sub_id).get("oauth_token") or {}
-        sub_type = data.get("subscriptionType") or old.get("subscriptionType") or ""
-        rate_tier = data.get("rateLimitTier") or old.get("rateLimitTier") or ""
-        if not sub_type and new_access:
-            sub_type, fetched_tier = fetch_anthropic_subscription_fields(new_access)
-            rate_tier = rate_tier or fetched_tier
-
-        new_cred = {
-            "oauth_token": {
-                "accessToken": new_access,
-                "refreshToken": new_refresh,
-                "expiresAt": int((time.time() + expires_in) * 1000),
-                "scopes": data.get("scope", "").split() if data.get("scope") else [],
-                "subscriptionType": sub_type,
-                "rateLimitTier": rate_tier,
-                **_grant_expiry_fields(data, old),
-            }
-        }
-        subscription_store.update_credential_data(sub_id, new_cred)
-        logger.info(f"Anthropic OAuth token refreshed for {sub_id[:8]}")
-        return new_access, False
-    except Exception as e:
-        logger.error(f"Anthropic OAuth refresh error for {sub_id[:8]}: {e}")
-        return None, False
-
-
-def _refresh_openai_oauth_token(sub_id: str, refresh_token: str) -> tuple[str | None, bool]:
-    """Refresh an OpenAI OAuth token → ``(access_token, terminal)``."""
-    try:
-        from auth.openai_oauth import TOKEN_URL as _OPENAI_TOKEN_URL, CLIENT_ID as _OPENAI_CLIENT_ID
-        import urllib.parse
-        body = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "client_id": _OPENAI_CLIENT_ID,
-            "refresh_token": refresh_token,
-        })
-        resp = requests.post(
-            _OPENAI_TOKEN_URL,
-            data=body,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            _log_refresh_failure(sub_id, "OpenAI", resp)
-            return None, _refresh_error_terminal(resp) or _sustained_auth_dead(sub_id)
-
-        data = resp.json()
-        new_access = data.get("access_token")
-        new_refresh = data.get("refresh_token", refresh_token)
-        expires_in = data.get("expires_in", 28800)
-
-        # Preserve existing credential_data (especially codex_auth_blob)
-        existing_cred = subscription_store.get_credential_data(sub_id)
-        old_oauth = existing_cred.get("oauth_token") or {}
-        existing_cred["oauth_token"] = {
-            "accessToken": new_access,
-            "refreshToken": new_refresh,
-            "expiresAt": int((time.time() + expires_in) * 1000),
-            **_grant_expiry_fields(data, old_oauth),
-        }
-        # Keep codex_auth_blob tokens in sync
-        blob = existing_cred.get("codex_auth_blob")
-        if blob and isinstance(blob.get("tokens"), dict):
-            blob["tokens"]["access_token"] = new_access
-            if new_refresh:
-                blob["tokens"]["refresh_token"] = new_refresh
-            from datetime import datetime, timezone
-            blob["last_refresh"] = datetime.now(timezone.utc).isoformat()
-        subscription_store.update_credential_data(sub_id, existing_cred)
-        logger.info(f"OpenAI OAuth token refreshed for {sub_id[:8]}")
-        return new_access, False
-    except Exception as e:
-        logger.error(f"OpenAI OAuth refresh error for {sub_id[:8]}: {e}")
-        return None, False
 
 
 def _resolve_oauth_access_token(
@@ -2291,7 +2103,7 @@ def _resolve_oauth_access_token(
     # known-dead (terminal verdict) or an admin turned it off. Reconnect
     # resets status to active, which re-enables refresh. Bound sessions keep
     # running on the stored token while it lives.
-    if (sub.get("status") or "active") != "active":
+    if (sub.get("status") or subscription_status.ACTIVE) != subscription_status.ACTIVE:
         expires_at = oauth_data.get("expiresAt", 0)
         usable = not expires_at or time.time() * 1000 < expires_at - _HARD_EXPIRY_BUFFER_MS
         return (oauth_data.get("accessToken"), expires_at) if usable else (None, 0)
@@ -2316,7 +2128,8 @@ def _resolve_oauth_access_token(
     with _refresh_lock(sub_id):
         # Re-read under the lock — a concurrent acquisition may have refreshed
         # while we waited, and its rotation consumed our refresh token.
-        latest = subscription_store.get_credential_data(sub_id).get("oauth_token") or oauth_data
+        latest_cred = subscription_store.get_credential_data(sub_id)
+        latest = latest_cred.get("oauth_token") or oauth_data
         token, expires_at, usable, wants_refresh = _stored(latest)
         if not wants_refresh:
             return token, expires_at
@@ -2336,9 +2149,7 @@ def _resolve_oauth_access_token(
         terminal = False
         refresh_token = latest.get("refreshToken")
         if refresh_token:
-            new_access, terminal = _refresh_oauth_token(
-                sub_id, refresh_token, sub.get("provider", "anthropic"),
-            )
+            new_access, terminal = _refresh_oauth_token(sub, refresh_token, latest_cred)
         if new_access:
             _refresh_backoff.pop(sub_id, None)
             _auth_fail_streaks.pop(sub_id, None)
@@ -2408,7 +2219,7 @@ def _auto_expire_subscription(sub_id: str, reason: str = "invalid_grant (login g
     owner (dedup-stamped in the credential blob).
     """
     try:
-        subscription_store.update_subscription(sub_id, status="expired")
+        subscription_store.update_subscription(sub_id, status=subscription_status.EXPIRED)
         _refresh_backoff.pop(sub_id, None)
         _auth_fail_streaks.pop(sub_id, None)
         logger.error(
@@ -2424,41 +2235,26 @@ def _auto_expire_subscription(sub_id: str, reason: str = "invalid_grant (login g
 # ---------------------------------------------------------------------------
 
 def _build_handle(sub: dict) -> SubscriptionHandle:
-    """Build a SubscriptionHandle from a subscription row, decrypting credentials."""
+    """Build a SubscriptionHandle from a subscription row, decrypting the
+    credential. The vendor-shaped parts (a Codex auth blob, the Claude grant
+    metadata) stay inside ``credential`` for the engine's adapter to read;
+    the pool only resolves the OAuth access token with spawn runway."""
     cred_data = subscription_store.get_credential_data(sub["id"])
 
-    api_key = cred_data.get("api_key")
     oauth_access_token: str | None = None
     oauth_expires_at_ms = 0
-    claude_creds_blob: dict | None = None
-    endpoint_url = cred_data.get("endpoint_url")
-
-    # For OAuth subscriptions, extract an access token with spawn runway
     oauth_data = cred_data.get("oauth_token")
     if oauth_data:
         oauth_access_token, oauth_expires_at_ms = _resolve_oauth_access_token(sub, oauth_data)
-        if oauth_access_token:
-            # Session-file payload for the Claude CLI. Built from the token
-            # ACTUALLY issued (post-refresh or fail-soft stored) + the stored
-            # grant metadata; refresh token neutralized.
-            claude_creds_blob = _claude_file_blob({
-                **oauth_data,
-                "accessToken": oauth_access_token,
-                "expiresAt": oauth_expires_at_ms,
-            })
-
-    # Codex auth blob: full auth.json structure for session reconstruction
-    codex_blob = cred_data.get("codex_auth_blob")
 
     return SubscriptionHandle(
         subscription_id=sub["id"],
         layer=sub["layer"],
         provider=sub["provider"],
         auth_type=sub["auth_type"],
-        api_key=api_key,
+        api_key=cred_data.get("api_key"),
         oauth_access_token=oauth_access_token,
-        endpoint_url=endpoint_url,
-        codex_auth_blob=codex_blob,
+        endpoint_url=cred_data.get("endpoint_url"),
         oauth_expires_at_ms=oauth_expires_at_ms,
-        claude_creds_blob=claude_creds_blob,
+        credential=cred_data,
     )

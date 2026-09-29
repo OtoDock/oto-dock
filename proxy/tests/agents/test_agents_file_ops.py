@@ -9,6 +9,7 @@ endpoints against `tmp_path`-backed agent dirs. Covers:
   protection, fallback to empty-only when `recursive=false`.
 """
 
+import os
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
@@ -556,7 +557,18 @@ def _patch_remote(monkeypatch, machine_ids=("m1",)):
         workspace_fanout, "fanout_targets",
         lambda agent_slug, rel_path, *, exclude_machine_id=None: list(machine_ids),
     )
-    return AsyncMock()
+    cm = AsyncMock()
+    pushed: dict[str, bytes] = {}
+
+    async def _push(mid, ref, source, **kw):
+        # A Path source is the checked descriptor's own path, valid only while
+        # the fan-out holds it: read it now, as the real push does.
+        pushed[ref.value] = source if isinstance(source, bytes) else source.read_bytes()
+        return True
+
+    cm.push_file = AsyncMock(side_effect=_push)
+    cm.pushed = pushed
+    return cm
 
 
 def test_move_pushes_new_file_and_deletes_old_on_remote(tmp_path, monkeypatch):
@@ -576,11 +588,11 @@ def test_move_pushes_new_file_and_deletes_old_on_remote(tmp_path, monkeypatch):
 
     # New file pushed to the satellite.
     assert fake_cm.push_file.await_count == 1
-    mid, ref, content = fake_cm.push_file.await_args.args[:3]
+    mid, ref, _source = fake_cm.push_file.await_args.args[:3]
     assert mid == "m1"
     assert ref.kind == "agent_tree"
     assert ref.value == "workspace/dest/f.md"
-    assert content == b"payload"
+    assert fake_cm.pushed == {"workspace/dest/f.md": b"payload"}
     # Old path delete pushed (fire-and-forget).
     assert fake_cm.send_fire_and_forget.await_count == 1
     del_msg = fake_cm.send_fire_and_forget.await_args.args[1]
@@ -605,11 +617,7 @@ def test_copy_dir_pushes_every_file_on_remote(tmp_path, monkeypatch):
     assert resp.status_code == 200, resp.text
 
     # Every file in the copied tree is pushed (recursively).
-    pushed = {
-        call.args[1].value: call.args[2]
-        for call in fake_cm.push_file.await_args_list
-    }
-    assert pushed == {
+    assert fake_cm.pushed == {
         "workspace/dest/src/top.md": b"top",
         "workspace/dest/src/sub/nested.md": b"nested",
     }
@@ -1093,3 +1101,802 @@ def test_zip_collision_renames_top_level(tmp_path, monkeypatch):
         names = zf.namelist()
         assert "notes.md" in names
         assert "notes_1.md" in names
+
+
+def test_rename_contributor_allowed_in_workspace(tmp_path, monkeypatch):
+    """A contributor renames within /workspace/ (the workspace tier)."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="contributor")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "f.md").write_text("x")
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/rename",
+        json={"old_path": "workspace/f.md", "new_path": "workspace/g.md"},
+    )
+    assert resp.status_code == 200
+    assert (agent_dir / "workspace" / "g.md").exists()
+
+
+def test_rename_contributor_blocked_in_knowledge(tmp_path, monkeypatch):
+    """A contributor never touches /knowledge/ (owner-only)."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="contributor")
+    (agent_dir / "knowledge").mkdir()
+    (agent_dir / "knowledge" / "f.md").write_text("x")
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/rename",
+        json={"old_path": "knowledge/f.md", "new_path": "knowledge/g.md"},
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Resolved destinations + the engines' state
+# ---------------------------------------------------------------------------
+
+
+def test_copy_into_symlinked_dest_is_judged_at_the_target(tmp_path, monkeypatch):
+    """A destination symlink into config/ is judged as config/: a
+    contributor may write workspace/ but not the owner-only config."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="contributor")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "evil.md").write_text("x")
+    (agent_dir / "config" / "context").mkdir(parents=True)
+    (agent_dir / "workspace" / "ctx").symlink_to("../config/context")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/evil.md"], "dest_dir": "workspace/ctx"},
+    )
+    assert resp.status_code == 403
+    assert not (agent_dir / "config" / "context" / "evil.md").exists()
+
+
+def test_move_into_symlinked_other_user_dir_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "evil.md").write_text("x")
+    (agent_dir / "users" / "bob" / "workspace").mkdir(parents=True)
+    (agent_dir / "workspace" / "bobs").symlink_to("../users/bob/workspace")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/agents/test-agent/move",
+        json={"src_paths": ["workspace/evil.md"], "dest_dir": "workspace/bobs"},
+    )
+    assert resp.status_code == 403
+    assert not (agent_dir / "users" / "bob" / "workspace" / "evil.md").exists()
+    assert (agent_dir / "workspace" / "evil.md").exists()
+
+
+def test_engine_state_dir_is_not_served_to_any_role(tmp_path, monkeypatch):
+    """The scope-root CLI state (the subscription login, the MCP config with
+    a session token, the hook scripts) is refused to every principal, read
+    and write, admin included; a repo's nested .claude stays reachable."""
+    for role in ("viewer", "contributor", "manager", "admin"):
+        sub = tmp_path / role
+        sub.mkdir()
+        app, agent_dir = _make_app(sub, monkeypatch, role=role)
+        state = agent_dir / "workspace" / ".claude"
+        state.mkdir(parents=True)
+        (state / ".credentials.json").write_text('{"token": "t"}')
+        (agent_dir / "workspace" / "repo" / ".claude").mkdir(parents=True)
+        (agent_dir / "workspace" / "repo" / ".claude" / "settings.json").write_text("{}")
+        client = TestClient(app)
+
+        read = client.get(
+            "/v1/agents/test-agent/files/workspace/.claude/.credentials.json?download=true")
+        assert read.status_code == 403, role
+        write = client.put("/v1/agents/test-agent/files/workspace/.claude/json.py",
+                           json={"content": "x"})
+        assert write.status_code == 403, role
+        assert not (state / "json.py").exists()
+        nested = client.get("/v1/agents/test-agent/files/workspace/repo/.claude/settings.json")
+        assert nested.status_code == 200, (role, nested.text)
+
+
+def test_zip_of_workspace_leaves_out_engine_state(tmp_path, monkeypatch):
+    import zipfile
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="viewer")
+    (agent_dir / "workspace" / ".claude").mkdir(parents=True)
+    (agent_dir / "workspace" / ".claude" / ".credentials.json").write_text("secret")
+    (agent_dir / "workspace" / ".codex").mkdir()
+    (agent_dir / "workspace" / ".codex" / "auth.json").write_text("secret")
+    (agent_dir / "workspace" / "report.md").write_text("ok")
+    client = TestClient(app)
+
+    resp = client.post("/v1/agents/test-agent/zip", json={"paths": ["workspace"]})
+    assert resp.status_code == 200, resp.text
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        names = zf.namelist()
+    assert "workspace/report.md" in names
+    assert not [n for n in names if ".claude" in n or ".codex" in n]
+
+
+def test_copy_of_engine_state_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    (agent_dir / "workspace" / ".claude").mkdir(parents=True)
+    (agent_dir / "workspace" / ".claude" / ".credentials.json").write_text("secret")
+    (agent_dir / "users" / "alice" / "workspace").mkdir(parents=True)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/.claude"], "dest_dir": "users/alice/workspace"},
+    )
+    assert resp.status_code == 403
+    assert not (agent_dir / "users" / "alice" / "workspace" / ".claude").exists()
+
+
+def test_tree_leaves_out_the_platform_only_trees(tmp_path, monkeypatch):
+    """Chat snapshots and release copies are served by their own routes and
+    never listed, for an admin or an agent's own session token."""
+    from auth.providers import UserContext
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="admin")
+    (agent_dir / "shares" / "users" / "bob" / "s1" / "media").mkdir(parents=True)
+    (agent_dir / "shares" / "users" / "bob" / "s1" / "media" / "tok.png").write_text("x")
+    (agent_dir / "app-releases" / "a1").mkdir(parents=True)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "notes.md").write_text("x")
+    client = TestClient(app)
+    names = {e["name"] for e in client.get("/v1/agents/test-agent/files").json()["tree"]}
+    assert "workspace" in names and not names & {"shares", "app-releases"}
+
+    session = UserContext(sub="agent-session", email="", name="agent", role="admin",
+                          agents=["test-agent"], agent_roles={"test-agent": "manager"},
+                          is_api_key=True, agent="test-agent")
+    from auth.providers import get_current_user
+    app.dependency_overrides[get_current_user] = lambda: session
+    names = {e["name"] for e in client.get("/v1/agents/test-agent/files").json()["tree"]}
+    assert "workspace" in names and not names & {"shares", "app-releases"}
+
+
+# ---------------------------------------------------------------------------
+# Zip: one descriptor-based pass, off the loop, bounded
+# ---------------------------------------------------------------------------
+
+
+def _zip_names(resp) -> list[str]:
+    import zipfile
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        return zf.namelist()
+
+
+def test_zip_add_refuses_symlink_leaf(tmp_path, monkeypatch):
+    """A link inside a zipped folder is left out, whatever it points at: a
+    file outside the agents tree or another user's file in the tree."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    big = agent_dir / "workspace" / "big"
+    big.mkdir(parents=True)
+    (big / "real.txt").write_text("real")
+    secret = tmp_path / "config.env"
+    secret.write_text("LEAKED_SECRET=1")
+    (big / "leak.txt").symlink_to(secret)
+    (agent_dir / "users" / "bob" / "workspace").mkdir(parents=True)
+    (agent_dir / "users" / "bob" / "workspace" / "p.txt").write_text("BOB PRIVATE")
+    (big / "bob.txt").symlink_to("../../users/bob/workspace/p.txt")
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/big"]})
+    assert resp.status_code == 200, resp.text
+    names = _zip_names(resp)
+    assert "big/real.txt" in names
+    assert "big/leak.txt" not in names and "big/bob.txt" not in names
+    assert b"LEAKED_SECRET" not in resp.content and b"BOB PRIVATE" not in resp.content
+
+
+def test_zip_walk_skips_symlinked_dir(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    big = agent_dir / "workspace" / "big"
+    big.mkdir(parents=True)
+    (big / "a.txt").write_text("a")
+    (agent_dir / "users" / "bob" / "workspace").mkdir(parents=True)
+    (agent_dir / "users" / "bob" / "workspace" / "p.txt").write_text("BOB PRIVATE")
+    (big / "bobdir").symlink_to("../../users/bob/workspace")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s.txt").write_text("OUTSIDE")
+    (big / "out").symlink_to(outside)
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/big"]})
+    assert resp.status_code == 200, resp.text
+    names = _zip_names(resp)
+    assert names == ["big/", "big/a.txt"]
+    assert b"BOB PRIVATE" not in resp.content and b"OUTSIDE" not in resp.content
+
+
+def test_zip_named_link_to_other_scope_is_403(tmp_path, monkeypatch):
+    """A selected path that IS a link is judged where it lands: an editor
+    cannot zip another user's folder or config/ through a link in
+    workspace/ (the resolved rel is role-checked, as move and copy do)."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "users" / "bob" / "workspace").mkdir(parents=True)
+    (agent_dir / "users" / "bob" / "workspace" / "p.txt").write_text("BOB PRIVATE")
+    (agent_dir / "config").mkdir()
+    (agent_dir / "config" / "agent.md").write_text("CONFIG")
+    (agent_dir / "workspace" / "bobs").symlink_to("../users/bob/workspace")
+    (agent_dir / "workspace" / "cfg").symlink_to("../config")
+    (agent_dir / "workspace" / "cfgfile").symlink_to("../config/agent.md")
+    client = TestClient(app)
+    for path in ("workspace/bobs", "workspace/cfg", "workspace/cfgfile"):
+        resp = client.post("/v1/agents/test-agent/zip", json={"paths": [path]})
+        assert resp.status_code == 403, (path, resp.status_code)
+
+
+def test_zip_named_link_inside_own_scope_is_served(tmp_path, monkeypatch):
+    """A link whose target the caller may read is zipped as its target."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    (agent_dir / "workspace" / "real").mkdir(parents=True)
+    (agent_dir / "workspace" / "real" / "a.txt").write_text("a")
+    (agent_dir / "workspace" / "alias").symlink_to("real")
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/alias"]})
+    assert resp.status_code == 200, resp.text
+    assert "real/a.txt" in _zip_names(resp)
+
+
+def test_zip_over_cap_is_413(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    big = agent_dir / "workspace" / "big"
+    big.mkdir(parents=True)
+    for i in range(3):
+        (big / f"f{i}.bin").write_bytes(os.urandom(512 * 1024))
+    monkeypatch.setattr(config, "ZIP_MAX_INPUT_MB", 1)
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/big"]})
+    assert resp.status_code == 413
+    assert "1 MB" in resp.json()["detail"]
+    monkeypatch.setattr(config, "ZIP_MAX_INPUT_MB", 4096)
+    monkeypatch.setattr(config, "ZIP_MAX_ENTRIES", 2)
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/big"]})
+    assert resp.status_code == 413
+    assert "2 files" in resp.json()["detail"]
+
+
+def test_zip_too_many_paths_is_413(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    for i in range(4):
+        (agent_dir / "workspace" / f"f{i}.txt").write_text("x")
+    monkeypatch.setattr(config, "ZIP_MAX_PATHS", 3)
+    paths = [f"workspace/f{i}.txt" for i in range(4)]
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": paths})
+    assert resp.status_code == 413
+
+
+def test_zip_dedupes_and_drops_nested_paths(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace" / "docs" / "sub").mkdir(parents=True)
+    (agent_dir / "workspace" / "docs" / "top.md").write_text("top")
+    (agent_dir / "workspace" / "docs" / "sub" / "n.md").write_text("n")
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={
+        "paths": ["workspace/docs", "workspace/docs/", "workspace/docs/sub", "workspace/docs/top.md"],
+    })
+    assert resp.status_code == 200, resp.text
+    names = _zip_names(resp)
+    assert names.count("docs/top.md") == 1 and "docs/sub/n.md" in names
+    assert "top.md" not in names and "sub/n.md" not in names
+    assert "docs" in resp.headers["content-disposition"]  # one source
+
+
+def test_zip_members_are_deflated(tmp_path, monkeypatch):
+    import zipfile
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "text.txt").write_text("a" * 100_000)
+    resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/text.txt"]})
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        zi = zf.getinfo("text.txt")
+    assert zi.compress_type == zipfile.ZIP_DEFLATED
+    assert zi.compress_size < 5_000
+
+
+def test_zip_response_is_a_file_with_length_and_range(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "r.md").write_text("# Report\n")
+    client = TestClient(app)
+    before = len(os.listdir("/proc/self/fd"))
+    resp = client.post("/v1/agents/test-agent/zip", json={"paths": ["workspace/r.md"]})
+    assert resp.status_code == 200
+    assert int(resp.headers["content-length"]) == len(resp.content)
+    assert resp.headers["content-type"] == "application/zip"
+    part = client.post("/v1/agents/test-agent/zip", json={"paths": ["workspace/r.md"]},
+                       headers={"range": "bytes=0-1"})
+    assert part.status_code == 206 and part.content == b"PK"
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_zip_second_build_for_same_user_is_429(tmp_path, monkeypatch):
+    import threading
+    from api.agents import files as filesmod
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "r.md").write_text("x")
+    started = threading.Event()
+    release = threading.Event()
+    real_add = filesmod._zip_add_regular_file
+
+    def _slow(*a, **kw):
+        started.set()
+        release.wait(10)
+        return real_add(*a, **kw)
+
+    monkeypatch.setattr(filesmod, "_zip_add_regular_file", _slow)
+    results: list[int] = []
+
+    def _go():
+        results.append(TestClient(app).post(
+            "/v1/agents/test-agent/zip", json={"paths": ["workspace/r.md"]}).status_code)
+
+    t = threading.Thread(target=_go)
+    t.start()
+    assert started.wait(10)
+    second = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/r.md"]})
+    assert second.status_code == 429
+    release.set()
+    t.join(20)
+    assert results == [200]
+
+
+def test_zip_unreadable_folder_is_400(tmp_path, monkeypatch):
+    if os.geteuid() == 0:
+        import pytest
+        pytest.skip("root reads anything")
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    locked = agent_dir / "workspace" / "big" / "locked"
+    locked.mkdir(parents=True)
+    (locked / "x.txt").write_text("x")
+    (agent_dir / "workspace" / "big" / "ok.txt").write_text("ok")
+    locked.chmod(0)
+    try:
+        resp = TestClient(app).post("/v1/agents/test-agent/zip", json={"paths": ["workspace/big"]})
+    finally:
+        locked.chmod(0o755)
+    assert resp.status_code == 400
+    assert "locked" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Read: from the checked descriptor, inline previews capped
+# ---------------------------------------------------------------------------
+
+
+def test_read_refuses_swapped_symlink(tmp_path, monkeypatch):
+    """The file authorized by safe_agent_path is the file opened: a link
+    swapped in at the leaf (to the outside or to another user's file) is
+    refused, while an in-tree link to a readable file still reads."""
+    from api.agents import files as filesmod
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="editor")
+    (agent_dir / "workspace").mkdir()
+    doc = agent_dir / "workspace" / "notes.md"
+    doc.write_text("mine")
+    (agent_dir / "workspace" / "alias.md").symlink_to("notes.md")
+    client = TestClient(app)
+    assert client.get("/v1/agents/test-agent/files/workspace/alias.md").json()["content"] == "mine"
+
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=1")
+    real_safe = filesmod.safe_agent_path
+
+    def _stale(agent_dir_, name, raw, user, *, writing=False, **_kw):
+        # The authorization answers on the pre-swap file; the leaf is then
+        # swapped before the open (the deterministic form of the race).
+        out = real_safe(agent_dir_, name, raw, user, writing=writing)
+        doc.unlink()
+        doc.symlink_to(secret)
+        return out
+
+    monkeypatch.setattr(filesmod, "safe_agent_path", _stale)
+    for suffix in ("", "?download=true"):
+        resp = client.get(f"/v1/agents/test-agent/files/workspace/notes.md{suffix}")
+        assert resp.status_code == 404, suffix
+        assert b"JWT_SECRET" not in resp.content
+        doc.unlink()
+        doc.write_text("mine")
+
+
+def test_read_inline_over_cap_is_413_and_download_still_works(tmp_path, monkeypatch):
+    import config
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "big.log").write_text("x" * 3000)
+    monkeypatch.setattr(config, "INLINE_TEXT_MAX_BYTES", 2048)
+    client = TestClient(app)
+    resp = client.get("/v1/agents/test-agent/files/workspace/big.log")
+    assert resp.status_code == 413
+    assert "download" in resp.json()["detail"]
+    resp = client.get("/v1/agents/test-agent/files/workspace/big.log?download=true")
+    assert resp.status_code == 200 and len(resp.content) == 3000
+    assert resp.headers["content-disposition"].startswith("attachment")
+    (agent_dir / "workspace" / "small.log").write_text("ok")
+    resp = client.get("/v1/agents/test-agent/files/workspace/small.log")
+    assert resp.status_code == 200 and resp.json() == {"content": "ok", "encoding": "utf-8"}
+    assert resp.headers["content-type"].startswith("application/json")
+
+
+# ---------------------------------------------------------------------------
+# A component swapped after the check never redirects a write. The
+# victim tree sits beside the agents root: what a redirected write would reach.
+# ---------------------------------------------------------------------------
+
+
+def _victim(tmp_path):
+    v = tmp_path / "victim"
+    v.mkdir(exist_ok=True)
+    (v / "agent.md").write_text("ORIGINAL")
+    (v / "f.md").write_text("ORIGINAL")
+    return v
+
+
+def _swap_sub_for_link(agent_dir, victim):
+    d = agent_dir / "workspace" / "sub"
+    if d.is_dir() and not d.is_symlink():
+        for child in d.iterdir():
+            child.unlink()
+        d.rmdir()
+    os.symlink(victim, d)
+
+
+def _swap_on_lookup(monkeypatch, agent_dir, victim, username="alice"):
+    """The username lookup is the store hop between the path check and the
+    write; swapping ``workspace/sub`` there models a swap in that window."""
+    from storage import database as task_store
+    state = {"done": False}
+
+    def _lookup(sub):
+        if not state["done"]:
+            state["done"] = True
+            _swap_sub_for_link(agent_dir, victim)
+        return username
+
+    monkeypatch.setattr(task_store, "get_username_by_sub", _lookup)
+
+
+def _swap_on_open(monkeypatch, agent_dir, victim):
+    """The swap lands after every check, right as the helper opens the root:
+    the strict open below the root is what must refuse it."""
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @__import__("contextlib").contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            _swap_sub_for_link(agent_dir, victim)
+        with real(root, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+
+
+def _victim_untouched(victim):
+    assert (victim / "agent.md").read_text() == "ORIGINAL"
+    assert (victim / "f.md").read_text() == "ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["agent.md", "f.md"]
+
+
+def _sub_tree(agent_dir):
+    (agent_dir / "workspace" / "sub").mkdir(parents=True)
+    (agent_dir / "workspace" / "sub" / "f.md").write_text("mine")
+
+
+def test_write_toctou_swap_in_the_check_window_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_lookup(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).put(
+        "/v1/agents/test-agent/files/workspace/sub/agent.md", json={"content": "NEW"},
+    )
+    assert resp.status_code in (403, 404)
+    _victim_untouched(victim)
+
+
+def test_write_toctou_swap_at_the_open_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_open(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).put(
+        "/v1/agents/test-agent/files/workspace/sub/agent.md", json={"content": "NEW"},
+    )
+    assert resp.status_code == 403
+    _victim_untouched(victim)
+
+
+def test_create_file_toctou_swap_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_lookup(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/create-file", json={"path": "workspace/sub/new.md"},
+    )
+    assert resp.status_code in (403, 404)
+    _victim_untouched(victim)
+
+
+def test_mkdir_toctou_swap_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_lookup(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/mkdir", json={"path": "workspace/sub/newdir/deeper"},
+    )
+    assert resp.status_code in (403, 404)
+    _victim_untouched(victim)
+
+
+def test_delete_file_toctou_swap_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_lookup(monkeypatch, agent_dir, victim)
+    with patch("core.remote.satellite_connection.get_connection_manager", return_value=AsyncMock()):
+        resp = TestClient(app).post(
+            "/v1/agents/test-agent/delete", json={"path": "workspace/sub/f.md"},
+        )
+    assert resp.status_code in (403, 404)
+    _victim_untouched(victim)
+
+
+def test_rename_toctou_swap_at_the_open_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    _swap_on_open(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/rename",
+        json={"old_path": "workspace/sub/f.md", "new_path": "workspace/sub/agent.md"},
+    )
+    assert resp.status_code in (403, 404)
+    _victim_untouched(victim)
+
+
+def test_move_toctou_swap_at_the_open_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    (agent_dir / "workspace" / "agent.md").write_text("mine")
+    _swap_on_open(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/move",
+        json={"src_paths": ["workspace/agent.md"], "dest_dir": "workspace/sub"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["moved"] == [] and len(resp.json()["failed"]) == 1
+    _victim_untouched(victim)
+    assert (agent_dir / "workspace" / "agent.md").read_text() == "mine"
+
+
+def test_copy_toctou_swap_at_the_open_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    (agent_dir / "workspace" / "agent.md").write_text("mine")
+    _swap_on_open(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/copy",
+        json={"src_paths": ["workspace/agent.md"], "dest_dir": "workspace/sub"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["copied"] == [] and len(resp.json()["failed"]) == 1
+    _victim_untouched(victim)
+
+
+def test_restore_toctou_swap_at_the_open_is_denied(tmp_path, monkeypatch):
+    import config
+    from storage.files import recover_bin_store
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    _sub_tree(agent_dir)
+    monkeypatch.setattr(config, "RECOVER_BIN_DIR", tmp_path / "recover-bin")
+    entry_id = "e1"
+    entry = {
+        "entry_id": entry_id, "agent_slug": "test-agent", "rel_path": "workspace/sub/agent.md",
+        "original_name": "agent.md", "reason": "deleted", "scope": "shared", "owner_sub": "",
+        "size": 3, "binned_at": "2026-01-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(recover_bin_store, "get", lambda eid: entry if eid == entry_id else None)
+    monkeypatch.setattr(recover_bin_store, "read_bytes", lambda e: b"NEW")
+    monkeypatch.setattr(recover_bin_store, "delete", lambda eid: None)
+    _swap_on_open(monkeypatch, agent_dir, victim)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/recover-bin/restore", json={"entry_ids": [entry_id]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["denied"] == [entry_id]
+    _victim_untouched(victim)
+
+
+def test_write_through_a_swapped_agent_folder_is_refused(tmp_path, monkeypatch):
+    """The rel the helper opens starts with the agent's own name, so an agent
+    folder replaced by a link is refused at the first component."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    victim = _victim(tmp_path)
+    (agent_dir / "workspace").mkdir()
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @__import__("contextlib").contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            import shutil
+            shutil.rmtree(agent_dir)
+            os.symlink(victim, agent_dir)
+        with real(root, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+    resp = TestClient(app).put(
+        "/v1/agents/test-agent/files/agent.md", json={"content": "NEW"},
+    )
+    assert resp.status_code == 403
+    _victim_untouched(victim)
+
+
+def test_move_source_that_is_a_link_into_another_scope_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="admin")
+    (agent_dir / "workspace" / "dest").mkdir(parents=True)
+    (agent_dir / "config").mkdir()
+    (agent_dir / "config" / "secret.md").write_text("s")
+    (agent_dir / "workspace" / "lnk").symlink_to("../config")
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/move",
+        json={"src_paths": ["workspace/lnk"], "dest_dir": "workspace/dest"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["moved"] == []
+    assert (agent_dir / "config" / "secret.md").read_text() == "s"
+    assert (agent_dir / "workspace" / "lnk").is_symlink()
+
+
+def test_rename_directory_with_an_escaping_link_is_refused(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch, role="admin")
+    (agent_dir / "workspace" / "d").mkdir(parents=True)
+    (agent_dir / "config").mkdir()
+    (agent_dir / "config" / "secret.md").write_text("s")
+    (agent_dir / "workspace" / "d" / "leak").symlink_to("../../config/secret.md")
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/rename",
+        json={"old_path": "workspace/d", "new_path": "workspace/e"},
+    )
+    assert resp.status_code == 403
+    assert (agent_dir / "workspace" / "d").is_dir()
+
+
+def test_mkdir_on_a_file_is_409_and_empty_dir_delete_keeps_a_racing_child(tmp_path, monkeypatch):
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "f.md").write_text("x")
+    client = TestClient(app)
+    resp = client.post("/v1/agents/test-agent/mkdir", json={"path": "workspace/f.md/sub"})
+    assert resp.status_code == 409
+    resp = client.post("/v1/agents/test-agent/mkdir", json={"path": "workspace/f.md"})
+    assert resp.status_code == 409
+
+
+def test_session_token_for_another_agent_is_refused_on_every_write_route(tmp_path, monkeypatch):
+    """A session token acts only on the agent it was started for."""
+    import config
+    from api.agents import agents
+    from auth.providers import UserContext, get_current_user
+    from storage.agents import agent_store
+    from storage import database as task_store
+
+    agents_dir = tmp_path / "agents"
+    for a in ("test-agent", "other-agent"):
+        (agents_dir / a / "workspace").mkdir(parents=True)
+    (agents_dir / "test-agent" / "workspace" / "f.md").write_text("x")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+    monkeypatch.setattr(agent_store, "agent_exists", lambda name: name in ("test-agent", "other-agent"))
+    monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice")
+    session_user = UserContext(
+        sub="user-alice-sub", email="a@t.com", name="Alice", role="creator",
+        agents=["test-agent", "other-agent"],
+        agent_roles={"test-agent": "manager", "other-agent": "manager"},
+        is_api_key=True, agent="other-agent",
+    )
+
+    async def _stub():
+        return session_user
+
+    app = FastAPI()
+    app.include_router(agents.router)
+    app.dependency_overrides[get_current_user] = _stub
+    client = TestClient(app)
+    calls = [
+        ("put", "/v1/agents/test-agent/files/workspace/g.md", {"content": "y"}),
+        ("post", "/v1/agents/test-agent/create-file", {"path": "workspace/h.md"}),
+        ("post", "/v1/agents/test-agent/mkdir", {"path": "workspace/d"}),
+        ("post", "/v1/agents/test-agent/delete", {"path": "workspace/f.md"}),
+        ("post", "/v1/agents/test-agent/rename", {"old_path": "workspace/f.md", "new_path": "workspace/k.md"}),
+        ("post", "/v1/agents/test-agent/move", {"src_paths": ["workspace/f.md"], "dest_dir": "workspace"}),
+        ("post", "/v1/agents/test-agent/copy", {"src_paths": ["workspace/f.md"], "dest_dir": "workspace"}),
+        ("post", "/v1/agents/test-agent/zip", {"paths": ["workspace/f.md"]}),
+        ("post", "/v1/agents/test-agent/recover-bin/restore", {"entry_ids": ["x"]}),
+        ("get", "/v1/agents/test-agent/files", None),
+        ("get", "/v1/agents/test-agent/files/workspace/f.md", None),
+    ]
+    for method, url, body in calls:
+        resp = getattr(client, method)(url, json=body) if body is not None else getattr(client, method)(url)
+        assert resp.status_code == 403, (url, resp.status_code, resp.text)
+    assert (agents_dir / "test-agent" / "workspace" / "f.md").read_text() == "x"
+    # The same token on its own agent keeps working.
+    resp = client.put("/v1/agents/other-agent/files/workspace/g.md", json={"content": "y"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_write_routes_run_the_filesystem_work_off_the_loop(tmp_path, monkeypatch):
+    """The helpers run in a worker thread (a running loop in the
+    calling thread means the write ran on the loop)."""
+    import asyncio
+    from services.infra import safe_fs
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    real = safe_fs.atomic_write_beneath
+
+    def _guard(*a, **kw):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return real(*a, **kw)
+        raise AssertionError("the write ran on the event loop")
+
+    monkeypatch.setattr(safe_fs, "atomic_write_beneath", _guard)
+    resp = TestClient(app).put("/v1/agents/test-agent/files/workspace/n.md", json={"content": "y"})
+    assert resp.status_code == 200
+    assert (agent_dir / "workspace" / "n.md").read_text() == "y"
+
+
+def test_a_file_in_the_way_of_a_new_path_answers_409(tmp_path, monkeypatch):
+    """A file at any parent of the new path, not only the direct one, is a
+    name in use: the answer is the same 409, never a server error."""
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    (agent_dir / "workspace" / "afile").write_text("x")
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/agents/test-agent/create-file", json={"path": "workspace/afile/deeper/new.md"},
+    )
+    assert resp.status_code == 409, resp.text
+    resp = client.put(
+        "/v1/agents/test-agent/files/workspace/afile/deeper/n.md", json={"content": "y"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert (agent_dir / "workspace" / "afile").read_text() == "x"
+    (agent_dir / "workspace" / "adir").mkdir()
+    resp = client.put("/v1/agents/test-agent/files/workspace/adir", json={"content": "y"})
+    assert resp.status_code == 409, resp.text
+    assert (agent_dir / "workspace" / "adir").is_dir()
+
+
+def test_restore_never_writes_through_a_link_inside_the_tree(tmp_path, monkeypatch):
+    """The entry's own path is the authorized destination: a link a manager
+    planted inside the workspace must not carry a restored file into
+    another person's private tree."""
+    import config
+    from storage.files import recover_bin_store
+    app, agent_dir = _make_app(tmp_path, monkeypatch)
+    (agent_dir / "workspace").mkdir()
+    bob = agent_dir / "users" / "bob" / "context"
+    bob.mkdir(parents=True)
+    (agent_dir / "workspace" / "lnk").symlink_to(bob)
+    monkeypatch.setattr(config, "RECOVER_BIN_DIR", tmp_path / "recover-bin")
+    entry_id = "e2"
+    entry = {
+        "entry_id": entry_id, "agent_slug": "test-agent", "rel_path": "workspace/lnk/notes.md",
+        "original_name": "notes.md", "reason": "deleted", "scope": "shared", "owner_sub": "",
+        "size": 3, "binned_at": "2026-01-01T00:00:00+00:00",
+    }
+    monkeypatch.setattr(recover_bin_store, "get", lambda eid: entry if eid == entry_id else None)
+    monkeypatch.setattr(recover_bin_store, "read_bytes", lambda e: b"NEW")
+    monkeypatch.setattr(recover_bin_store, "delete", lambda eid: None)
+    resp = TestClient(app).post(
+        "/v1/agents/test-agent/recover-bin/restore", json={"entry_ids": [entry_id]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["denied"] == [entry_id]
+    assert list(bob.iterdir()) == []

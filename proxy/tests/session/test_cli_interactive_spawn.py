@@ -51,6 +51,10 @@ def test_headless_argv_has_p_and_stream_json():
     # deny-and-surface flow needs the model to be able to CALL the tool).
     assert "--permission-prompt-tool" in cmd
     assert cmd[cmd.index("--permission-prompt-tool") + 1] == "stdio"
+    # Claude Code ≥ 2.1.267 records the system prompt and re-sends the record
+    # on --resume; the platform re-ships a fresh prompt file every resume, so
+    # the recording is off (the flag exists on the previous pin 2.1.263 too).
+    assert cmd[cmd.index("--system-prompt-snapshot") + 1] == "off"
     # Headless does not force TERM.
     assert "TERM" not in env or env.get("TERM") != "xterm-256color" or True  # no assertion either way
 
@@ -155,6 +159,7 @@ async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_pat
     """config.interactive=True → CLIExecutionLayer.start_session spawns the TUI
     via interactive_session.register (not the headless -p pool), with the right
     argv/env. Proves the full config → build_spawn_command → register wiring."""
+    from auth.path_policy import SecurityContext
     from core.execution_layer import AgentConfig
     from core.layers.cli.layer import CLIExecutionLayer
     from core.session import interactive_session
@@ -183,6 +188,10 @@ async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_pat
         permission_mode="default",
         interactive=True,
         sandbox_host_claude_dir=str(claude_dir),
+        # Every builder sets one; a session with none is refused (it would
+        # run as nobody from the agent's own CLI state).
+        security_context=SecurityContext(role="manager", username="", agent="agent",
+                                         is_admin_agent=False, session_scope="agent"),
     )
     await CLIExecutionLayer().start_session("sess-interactive-1", cfg)
 

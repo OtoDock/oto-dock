@@ -1,7 +1,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { User } from '../../api/auth'
-import RemoteBadge from '../RemoteBadge'
+import RemoteBadge, { FELLBACK_LOCAL, type BadgeState } from '../RemoteBadge'
+import { isAdmin } from '../../lib/permissions'
+import { isLocalTarget, type PairingScope } from '../../lib/placement'
+import { MACHINE_STATE, type MachineState } from '../../lib/status/machine'
 
 interface Props {
   agentName: string
@@ -20,12 +23,13 @@ interface Props {
   executionTarget?: string | null
   fallbackReason?: string | null
   machineName?: string | null
-  machineStatus?: 'online' | 'stale' | 'disconnected' | 'never_connected' | null
+  // The target's live state (`lib/status/machine.ts`; `paused` included).
+  machineStatus?: MachineState | null
   machineLastHeartbeatAgeS?: number | null
   // 'user' = the caller's own paired machine (amber when offline — soft
   // fallback to local); 'admin' = the agent's platform default (red when
   // offline — blocks everyone).
-  machineScope?: 'admin' | 'user'
+  machineScope?: PairingScope
   machineLastSeenIso?: string | null
 }
 
@@ -52,13 +56,13 @@ export default function TopBar({
   // or user-paired-only) but the session's resolved target is remote,
   // we still show the dot from the session — preserves the prior
   // behavior for legacy machines without status data.
-  let badgeState: 'online' | 'stale' | 'disconnected' | 'never_connected' | 'fellback_local' | null = null
+  let badgeState: BadgeState = null
   if (machineStatus) {
     badgeState = machineStatus
-  } else if (executionTarget && executionTarget !== 'local') {
-    badgeState = 'online'
+  } else if (!isLocalTarget(executionTarget)) {
+    badgeState = MACHINE_STATE.ONLINE
   } else if (fallbackReason) {
-    badgeState = 'fellback_local'
+    badgeState = FELLBACK_LOCAL
   }
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -191,7 +195,7 @@ export default function TopBar({
                 </button>
               )}
 
-              {user.role === 'admin' && (
+              {isAdmin(user) && (
                 <button
                   onClick={() => { setMenuOpen(false); navigate('/admin') }}
                   className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"

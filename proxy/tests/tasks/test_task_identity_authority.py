@@ -23,6 +23,7 @@ Run: cd proxy && python -m pytest tests/tasks/test_task_identity_authority.py -v
 """
 
 import sys
+import uuid
 
 import pytest
 from fastapi import HTTPException
@@ -293,3 +294,225 @@ def test_member_can_create_own_user_scope(monkeypatch):
     monkeypatch.setattr(agent_store, "get_agent",
                         lambda a: {"collaborative": True, "default_scope": "user"})
     tasks._enforce_task_scope(_member("u-vw", "acme", "viewer"), "user", "acme")  # no raise
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# A session token's agent is the token's claim, never the X-Agent-Name header
+# (the header is the master key's alone) — the tasks routes, end to end.
+# ───────────────────────────────────────────────────────────────────────────
+
+X, Y = "holes-x", "holes-y"
+
+
+@pytest.fixture
+def routes(temp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import app
+    from services.scheduler import scheduler
+    from storage.agents import agent_store
+    for slug in (X, Y):
+        agent_store.create_agent(slug, slug.title(), collaborative=True, default_scope="user")
+    monkeypatch.setattr(scheduler, "_register_task", lambda task: None)
+    fired: list[str] = []
+
+    async def _fire(task, **kw):
+        fired.append(task.id)
+        return "run-1"
+
+    monkeypatch.setattr(scheduler, "trigger_task_now", _fire)
+    client = TestClient(app)
+    client.fired = fired
+    return client
+
+
+def _session_headers(agent: str, named: str, user_sub: str = "") -> dict:
+    from auth.session_token import create_session_token
+    return {"Authorization": f"Bearer {create_session_token(f'sid-{agent}', agent, user_sub)}",
+            "X-Agent-Name": named}
+
+
+def _one_time(client, headers: dict, agent: str, scope: str = "agent"):
+    return client.post("/v1/tasks/one-time", headers=headers, json={
+        "name": "n", "agent": agent, "prompt": "p", "delay_seconds": 600,
+        "scope": scope, "notification_mode": "none",
+    })
+
+
+def _agent_task(agent: str) -> str:
+    from storage import database as task_store
+    tid = f"dyn-{uuid.uuid4().hex[:8]}"
+    task_store.create_dynamic_task(tid, agent, "T", "p", "auto", "one_time", None, None, 600,
+                                   300, agent, scope="agent", notification_mode="none")
+    return tid
+
+
+def test_no_user_session_creates_on_its_own_agent_or_a_wired_target_only(routes):
+    from storage import database as task_store
+    from storage.agents import agent_store
+    # Naming the other agent in the header buys nothing: the token says X.
+    assert _one_time(routes, _session_headers(X, Y), Y).status_code == 403
+    r = _one_time(routes, _session_headers(X, X), X)
+    assert r.status_code == 200, r.text
+    assert task_store.get_dynamic_task(r.json()["task_id"])["created_by"] == X
+    # A wired edge is the cross-agent grant; the attribution stays the token's agent.
+    agent_store.set_delegation_targets(X, [Y])
+    r = _one_time(routes, _session_headers(X, Y), Y)
+    assert r.status_code == 200, r.text
+    assert task_store.get_dynamic_task(r.json()["task_id"])["created_by"] == X
+    # A user-backed session on X is held to the same reach for the other agent.
+    agent_store.set_delegation_targets(X, [])
+    assert _one_time(routes, _session_headers(X, Y, "user-viewer"), Y, scope="user").status_code == 403
+
+
+def test_no_user_session_mutates_and_runs_its_own_agents_tasks_only(routes):
+    from storage import database as task_store
+    theirs = _agent_task(Y)
+    mine = _agent_task(X)
+    h = _session_headers(X, Y)
+    assert routes.delete(f"/v1/tasks/{theirs}", headers=h).status_code == 403
+    assert routes.post(f"/v1/tasks/{theirs}/pause", headers=h).status_code == 403
+    assert routes.patch(f"/v1/tasks/{theirs}", headers=h, json={"name": "x"}).status_code == 403
+    assert routes.post(f"/v1/tasks/{theirs}/run", headers=h).status_code == 403
+    assert routes.fired == []
+    assert routes.post(f"/v1/tasks/{mine}/run", headers=_session_headers(X, X)).status_code == 200
+    assert routes.fired == [mine]
+    assert routes.delete(f"/v1/tasks/{mine}", headers=_session_headers(X, X)).status_code == 200
+    assert task_store.get_dynamic_task(theirs) is not None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# A session minted for a person reaches no further than that person; a
+# callback returns only to the caller's own session; a cancel takes the
+# role a cookie takes; a no-user listing holds no user's private run.
+# ───────────────────────────────────────────────────────────────────────────
+
+MEMBER = "user-viewer"  # seeded platform member
+
+
+def _person_on(agent: str, role: str, sub: str = MEMBER) -> None:
+    from storage import database as task_store
+    task_store.add_user_agent(sub, agent, role, "test")
+
+
+def _user_task(agent: str, created_by: str = MEMBER) -> str:
+    from storage import database as task_store
+    tid = f"dyn-{uuid.uuid4().hex[:8]}"
+    task_store.create_dynamic_task(tid, agent, "T", "p", "auto", "one_time", None, None, 600,
+                                   300, created_by, scope="user", notification_mode="none")
+    return tid
+
+
+def _run(agent: str, scope: str, created_by: str, output: str = "") -> str:
+    from storage import database as task_store
+    rid = f"run-{uuid.uuid4().hex[:8]}"
+    task_store.create_run(rid, "dyn-gone", agent, "manual", None, "secret prompt",
+                          "one_time", scope, created_by)
+    if output:
+        task_store.update_run(rid, status="completed", output_text=output, session_id=f"s-{rid}")
+    return rid
+
+
+def test_a_person_session_creates_and_runs_only_on_agents_the_person_reaches(routes):
+    from storage.agents import agent_store
+    _person_on(X, "editor")
+    agent_store.set_delegation_targets(X, [Y])  # X's edge, not the member's access
+    h = _session_headers(X, X, MEMBER)
+    assert _one_time(routes, h, Y, scope="user").status_code == 403
+    r = routes.post("/v1/tasks/scheduled", headers=h, json={
+        "name": "n", "agent": Y, "prompt": "p", "schedule": "0 9 * * *",
+        "scope": "user", "notification_mode": "none",
+    })
+    assert r.status_code == 403
+    assert routes.post(f"/v1/tasks/{_user_task(Y)}/run", headers=h).status_code == 403
+    assert routes.fired == []
+    # Their own agent stays open to them.
+    r = _one_time(routes, h, X, scope="user")
+    assert r.status_code == 200, r.text
+    assert routes.post(f"/v1/tasks/{r.json()['task_id']}/run", headers=h).status_code == 200
+
+
+def test_a_callback_returns_only_to_the_callers_own_session_and_chat(routes):
+    from storage import database as task_store
+    _person_on(X, "editor")
+    victim_chat = str(uuid.uuid4())
+    task_store.create_chat(victim_chat, "user-manager", X)
+    task_store.update_chat(victim_chat, session_id="victim-sid")
+    own_chat = str(uuid.uuid4())
+    task_store.create_chat(own_chat, MEMBER, X)
+    task_store.update_chat(own_chat, session_id=f"sid-{X}")
+    h = _session_headers(X, X, MEMBER)
+
+    def _create(**cb):
+        return routes.post("/v1/tasks/one-time", headers=h, json={
+            "name": "n", "agent": X, "prompt": "p", "delay_seconds": 600, "scope": "user",
+            "notification_mode": "none", "on_complete_prompt": "{{output}}", **cb,
+        })
+
+    assert _create(on_complete_agent=X, on_complete_session_id="victim-sid").status_code == 403
+    assert _create(on_complete_agent=Y, on_complete_session_id=f"sid-{X}").status_code == 403
+    assert _create(on_complete_agent=X, on_complete_session_id=f"sid-{X}").status_code == 200
+
+    tid = _user_task(X)
+    url = f"/v1/tasks/{tid}/on-complete"
+    for body in ({"on_complete_session_id": "victim-sid"},
+                 {"on_complete_chat_id": victim_chat},
+                 {"on_complete_agent": Y, "on_complete_session_id": f"sid-{X}"}):
+        r = routes.patch(url, headers=h, json={"on_complete_prompt": "x", **body})
+        assert r.status_code == 403, body
+    assert task_store.get_dynamic_task(tid)["on_complete_session_id"] is None
+    r = routes.patch(url, headers=h, json={
+        "on_complete_agent": X, "on_complete_prompt": "x", "on_complete_chat_id": own_chat,
+    })
+    assert r.status_code == 200, r.text
+    assert task_store.get_dynamic_task(tid)["on_complete_chat_id"] == own_chat
+    # Clearing the callback names nobody and stays open.
+    assert routes.patch(url, headers=h, json={}).status_code == 200
+
+
+def test_a_session_cancels_with_the_persons_role(routes):
+    _person_on(X, "viewer")
+    _person_on(X, "editor", sub="user-viewer2")
+    theirs = _run(X, "agent", "user-manager")
+    viewer = _session_headers(X, X, MEMBER)
+    editor = _session_headers(X, X, "user-viewer2")
+    assert routes.post(f"/v1/tasks/runs/{theirs}/cancel", headers=viewer).status_code == 403
+    assert routes.post(f"/v1/tasks/runs/{theirs}/cancel", headers=editor).status_code == 403
+    own = _run(X, "agent", "user-viewer2")
+    r = routes.post(f"/v1/tasks/runs/{own}/cancel", headers=editor)
+    assert r.status_code == 200 and r.json()["status"] == "not_running"
+
+
+def test_a_no_user_session_cancels_on_its_own_agent_not_on_an_edge_target(routes):
+    from storage.agents import agent_store
+    agent_store.set_delegation_targets(X, [Y])
+    h = _session_headers(X, X)
+    assert routes.post(f"/v1/tasks/runs/{_run(Y, 'agent', 'user-manager')}/cancel",
+                       headers=h).status_code == 403
+    assert routes.post(f"/v1/tasks/runs/{_run(Y, 'agent', Y)}/cancel", headers=h).status_code == 403
+    # Its own agent's shared runs, and the work it started on the target.
+    assert routes.post(f"/v1/tasks/runs/{_run(X, 'agent', 'user-manager')}/cancel",
+                       headers=h).status_code == 200
+    assert routes.post(f"/v1/tasks/runs/{_run(Y, 'agent', X)}/cancel", headers=h).status_code == 200
+    assert routes.post(f"/v1/tasks/runs/{_run(X, 'user', 'user-manager')}/cancel",
+                       headers=h).status_code == 403
+
+
+def test_a_no_user_listing_holds_no_users_private_run(routes):
+    private = _run(X, "user", "user-manager", output="alice's private output")
+    shared_run = _run(X, "agent", X, output="shared output")
+    r = routes.get("/v1/tasks/runs", headers=_session_headers(X, X),
+                   params={"include_delegates": "true"})
+    assert r.status_code == 200, r.text
+    ids = {row["id"] for row in r.json()["runs"]}
+    assert shared_run in ids
+    assert private not in ids
+    assert r.json()["total"] == 1
+
+
+def test_a_task_session_with_no_task_row_is_not_handed_out(routes):
+    from storage import database as task_store
+    rid = _run(Y, "user", "user-manager", output="x")
+    task_store.update_run(rid, session_id="theirs-sid")
+    r = routes.get("/v1/tasks/dyn-gone/session", headers=_session_headers(X, X, MEMBER))
+    assert r.status_code == 404
+    assert "theirs-sid" not in r.text

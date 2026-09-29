@@ -7,16 +7,24 @@ synchronous (called via ``asyncio.to_thread`` from async code).
 
 import logging
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from storage.pg import get_conn
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.db-users")
 
 
-def _make_username_slug(name: str, conn) -> str:
+def _make_username_slug(name: str, conn, taken: frozenset[str] = frozenset()) -> str:
     """Generate a filesystem-safe username slug from a display name.
 
-    Lowercase, replace spaces/special chars with hyphens, deduplicate if collision.
+    Lowercase, replace spaces/special chars with hyphens, deduplicate if
+    collision. A name is taken by a live user, by a person deleted since
+    (``retired_usernames``: their archived tree keeps the name for ever)
+    and by anything in ``taken``, the names with a ``users/<name>``
+    directory under an agent (``usernames_on_disk``, built by the caller
+    BEFORE its connection opens: a newcomer must never inherit a tree).
     """
     import re
     slug = name.lower().strip()
@@ -28,8 +36,10 @@ def _make_username_slug(name: str, conn) -> str:
     base = slug
     counter = 1
     while True:
-        existing = conn.execute(
-            "SELECT sub FROM users WHERE username=%s", (slug,)
+        existing = slug in taken or conn.execute(
+            "SELECT 1 FROM users WHERE username=%s "
+            "UNION ALL SELECT 1 FROM retired_usernames WHERE username=%s",
+            (slug, slug),
         ).fetchone()
         if not existing:
             break
@@ -38,16 +48,47 @@ def _make_username_slug(name: str, conn) -> str:
     return slug
 
 
+def usernames_on_disk() -> frozenset[str]:
+    """Every name with a ``users/<name>`` directory under some agent
+    directory (dot entries of ``AGENTS_DIR`` skipped: the offboarding
+    archive lives in one). A scan that fails is logged and reads as none."""
+    import os
+    import config as _cfg
+    names: set[str] = set()
+    try:
+        with os.scandir(_cfg.AGENTS_DIR) as agents:
+            for agent in agents:
+                if agent.name.startswith(".") or not agent.is_dir(follow_symlinks=False):
+                    continue
+                users = os.path.join(agent.path, layout.USERS)
+                try:
+                    with os.scandir(users) as homes:
+                        names.update(h.name for h in homes)
+                except FileNotFoundError:
+                    continue
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("The agent trees could not be scanned for usernames", exc_info=True)
+    return frozenset(names)
+
+
 def upsert_user(sub: str, email: str, name: str, role: str,
-                display_name: str = "") -> None:
+                display_name: str = "") -> str | None:
+    """Create or refresh a user row; returns the platform role it had
+    before (None for a new user), so a login that lowers it can run the
+    offboarding hook."""
     # The slug dedup in _make_username_slug is SELECT-then-INSERT — under two
     # concurrent first-logins with the same display name both can see a slug
     # as free. The uq_users_username partial unique index is the arbiter; the
     # loser lands here again and re-dedupes against the winner's row.
+    # The names in use on disk, read before the transaction opens (a
+    # scan must not hold a pooled connection idle) and only when a slug is
+    # about to be minted.
+    taken = frozenset() if get_username_by_sub(sub) else usernames_on_disk()
     for _attempt in range(3):
         try:
-            _upsert_user_once(sub, email, name, role, display_name)
-            return
+            return _upsert_user_once(sub, email, name, role, display_name, taken)
         except Exception as exc:
             if "uq_users_username" in str(exc) and _attempt < 2:
                 continue
@@ -55,11 +96,11 @@ def upsert_user(sub: str, email: str, name: str, role: str,
 
 
 def _upsert_user_once(sub: str, email: str, name: str, role: str,
-                      display_name: str = "") -> None:
+                      display_name: str = "", taken: frozenset[str] = frozenset()) -> str | None:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT created_at, default_agent, username, display_name FROM users WHERE sub=%s",
+            "SELECT created_at, default_agent, username, display_name, role FROM users WHERE sub=%s",
             (sub,),
         ).fetchone()
         created = existing["created_at"] if existing else now
@@ -70,7 +111,7 @@ def _upsert_user_once(sub: str, email: str, name: str, role: str,
         final_display = display_name or existing_display or ""
         # Generate username slug on first login
         if not username:
-            username = _make_username_slug(name, conn)
+            username = _make_username_slug(name, conn, taken)
         conn.execute(
             """INSERT INTO users
                (sub, email, name, role, created_at, last_login, default_agent, username, display_name)
@@ -81,6 +122,7 @@ def _upsert_user_once(sub: str, email: str, name: str, role: str,
             (sub, email, name, role, created, now, default_agent, username, final_display),
         )
         conn.commit()
+    return existing["role"] if existing else None
 
 
 def update_user_display_name(sub: str, display_name: str) -> None:
@@ -197,8 +239,17 @@ def get_agent_users_with_profile(agent_slug: str) -> list[dict]:
         ]
 
 
+class MembershipChange(NamedTuple):
+    """What ``set_user_agents`` replaced and wrote, read under the person's
+    row lock: the platform role and the rows (``{agent: role}``) the
+    offboarding hook compares (``services/agents/offboarding.py``)."""
+    platform_role: str | None
+    before: dict[str, str]
+    after: dict[str, str]
+
+
 def set_user_agents(sub: str, agents: list[str], assigned_by: str,
-                    agent_roles: dict[str, str] | None = None) -> None:
+                    agent_roles: dict[str, str] | None = None) -> MembershipChange:
     """Set agent assignments. agent_roles maps agent→role
     ('manager'|'editor'|'viewer')
 
@@ -209,36 +260,55 @@ def set_user_agents(sub: str, agents: list[str], assigned_by: str,
     that agent. Added with community-agents — both manually-created
     user-scope items and template-seeded items would otherwise keep firing
     against a user no longer permitted to use the agent.
+
+    The person's ``users`` row is locked for the transaction: every other
+    writer of their rows or role (``add_user_agent``'s foreign-key check,
+    ``update_user_role``, ``delete_user``) waits, so the returned diff is
+    exact. Blocking: call it from a worker thread. Nothing after the commit
+    raises (a change the caller cannot see would skip the hook).
     """
     now = datetime.now(timezone.utc).isoformat()
+    username = get_username_by_sub(sub)
+    after = {agent: (agent_roles or {}).get(agent, roles.VIEWER) for agent in agents}
     with get_conn() as conn:
-        existing = {
-            row["agent"]
-            for row in conn.execute(
-                "SELECT agent FROM user_agents WHERE sub=%s", (sub,)
-            ).fetchall()
-        }
-        new_set = set(agents)
-        removed = existing - new_set
+        urow = conn.execute("SELECT role FROM users WHERE sub=%s FOR UPDATE", (sub,)).fetchone()
+        before = _agent_roles_in(conn, sub)
+        removed = set(before) - set(after)
         for agent in removed:
             _cascade_remove_user_scope_items(conn, sub, agent)
         conn.execute("DELETE FROM user_agents WHERE sub=%s", (sub,))
-        for agent in agents:
-            role = (agent_roles or {}).get(agent, "viewer")
+        for agent, role in after.items():
             conn.execute(
                 "INSERT INTO user_agents (sub, agent, assigned_at, assigned_by, agent_role) VALUES (%s,%s,%s,%s,%s)",
                 (sub, agent, now, assigned_by, role),
             )
         conn.commit()
-    # Create user workspace/context dirs for newly assigned agents
-    _ensure_user_agent_dirs(sub, agents)
-    # If this left the user with a single agent and no favorite, adopt it.
-    maybe_autoset_default_agent(sub)
+    try:
+        for agent in removed:
+            _remove_user_scope_memory(sub, username, agent)
+        # Create user workspace/context dirs for newly assigned agents
+        _ensure_user_agent_dirs(sub, agents)
+        # If this left the user with a single agent and no favorite, adopt it.
+        maybe_autoset_default_agent(sub)
+    except Exception:
+        logger.exception("Post-commit steps of the membership change of %s failed", sub)
+    return MembershipChange(urow["role"] if urow else None, before, after)
 
 
-def _cascade_remove_user_scope_items(conn, sub: str, agent: str) -> None:
+def _agent_roles_in(conn, sub: str) -> dict[str, str]:
+    return {
+        row["agent"]: row["agent_role"]
+        for row in conn.execute(
+            "SELECT agent, COALESCE(agent_role, 'viewer') AS agent_role "
+            "FROM user_agents WHERE sub=%s", (sub,)
+        ).fetchall()
+    }
+
+
+def _cascade_remove_user_scope_items(conn, sub: str, agent: str | None) -> None:
     """Hard-delete user-scope tasks/triggers/notifications owned by ``sub``
-    under ``agent``. Called from set_user_agents when (sub, agent) is removed.
+    under ``agent`` (None: under every agent, a deletion). Called from
+    set_user_agents when (sub, agent) is removed.
 
     Catches both manually-created user-scope items and template-seeded items.
     Agent-scope items are owned by the agent itself and stay.
@@ -247,16 +317,18 @@ def _cascade_remove_user_scope_items(conn, sub: str, agent: str) -> None:
     # so the user's machine is no longer targeted by an agent they no longer
     # have access to.
     conn.execute(
-        "DELETE FROM user_remote_targets WHERE user_sub = %s AND agent_slug = %s",
-        (sub, agent),
+        "DELETE FROM user_remote_targets WHERE user_sub = %s AND (agent_slug = %s OR %s::text IS NULL)",
+        (sub, agent, agent),
     )
     conn.execute(
-        "DELETE FROM dynamic_tasks WHERE agent = %s AND created_by = %s AND scope = 'user'",
-        (agent, sub),
+        "DELETE FROM dynamic_tasks WHERE (agent = %s OR %s::text IS NULL) AND created_by = %s "
+        "AND scope = 'user'",
+        (agent, agent, sub),
     )
     conn.execute(
-        "DELETE FROM triggers WHERE agent = %s AND created_by = %s AND scope = 'user'",
-        (agent, sub),
+        "DELETE FROM triggers WHERE (agent = %s OR %s::text IS NULL) AND created_by = %s "
+        "AND scope = 'user'",
+        (agent, agent, sub),
     )
     # User-scope notifications target the specific user (target = sub) for the
     # given agent. Delete their deliveries first to avoid orphaned rows.
@@ -265,33 +337,37 @@ def _cascade_remove_user_scope_items(conn, sub: str, agent: str) -> None:
         "WHERE user_sub = %s "
         "AND notification_id IN ("
         "  SELECT id FROM notifications "
-        "  WHERE agent_slug = %s AND scope = 'user' AND target = %s"
+        "  WHERE (agent_slug = %s OR %s::text IS NULL) AND scope = 'user' AND target = %s"
         ")",
-        (sub, agent, sub),
+        (sub, agent, agent, sub),
     )
     conn.execute(
-        "DELETE FROM notifications WHERE agent_slug = %s AND scope = 'user' AND target = %s",
-        (agent, sub),
+        "DELETE FROM notifications WHERE (agent_slug = %s OR %s::text IS NULL) AND scope = 'user' "
+        "AND target = %s",
+        (agent, agent, sub),
     )
-    # User-scope memory lives at
-    # ``agents/{agent}/users/{username}/context/memory/``. Remove it so a
-    # later reassignment doesn't resurrect ghost memories. Best-effort: a
-    # missing dir or username is silently ignored — the cleanup primarily
-    # protects against memory leak across reassignments. (Git history in
-    # the per-user context repo still allows recovery.)
-    try:
-        username = get_username_by_sub(sub)
-        if username:
-            import shutil as _shutil
 
-            import config as _cfg
-            agent_dir = _cfg.get_agent_dir(agent)
-            mem_dir = agent_dir / "users" / username / "context" / "memory"
-            if mem_dir.is_dir():
-                _shutil.rmtree(mem_dir)
+
+def _remove_user_scope_memory(sub: str, username: str | None, agent: str) -> None:
+    """Delete ``agents/{agent}/users/{username}/context/memory/`` after the
+    removal commits, so a later reassignment doesn't resurrect ghost
+    memories (git history in the per-user context repo still allows
+    recovery). Beneath the agent root with no symlink followed: the person's
+    own sessions write under ``users/{username}``. Best-effort: a missing
+    dir or username is silently ignored."""
+    if not username:
+        return
+    try:
+        import config as _cfg
+        from services.infra import safe_fs
+        # From AGENTS_DIR with the agent as the first component: the agent's
+        # own folder is not a root (a sidecar can swap it for a link).
+        rel = f"{agent}/{layout.USERS}/{username}/{layout.CONTEXT}/memory"
+        safe_fs.rmtree_beneath(_cfg.AGENTS_DIR, rel)
+    except FileNotFoundError:
+        pass
     except Exception as exc:
-        # Non-critical: dir may not exist yet
-        logger.debug(f"User-scope memory cleanup for agent {agent} failed: {exc}")
+        logger.warning(f"User-scope memory cleanup of {sub} on agent {agent} failed: {exc}")
 
 
 def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
@@ -313,8 +389,8 @@ def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
             agent_dir = _cfg.get_agent_dir(agent_name)
             if not agent_dir.exists():
                 continue
-            user_dir = agent_dir / "users" / username
-            (user_dir / "workspace").mkdir(parents=True, exist_ok=True)
+            user_dir = layout.user_dir(agent_dir, username)
+            (user_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
             (user_dir / "context").mkdir(parents=True, exist_ok=True)
             try:
                 from services.infra import git_writer
@@ -385,8 +461,70 @@ def update_user_role(sub: str, role: str) -> None:
 
 
 def delete_user(sub: str) -> bool:
+    """Delete the person. Their ``user_agents`` rows cascade with the row;
+    their user-scope tasks, triggers and notifications (no foreign key to
+    ``users``) go in the same transaction on every agent (a platform admin
+    holds them on agents without a row), so none fires for a person who no
+    longer exists. Their username retires with them (``retired_usernames``):
+    never minted again, and the offboarding archive finds their trees by
+    it. A name retired once before (an older dump restored, the person
+    deleted again) is stamped afresh."""
+    now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
+        row = conn.execute("SELECT username FROM users WHERE sub=%s FOR UPDATE", (sub,)).fetchone()
+        for agent in _agent_roles_in(conn, sub):
+            _cascade_remove_user_scope_items(conn, sub, agent)
+        _cascade_remove_user_scope_items(conn, sub, None)
+        if row and row["username"]:
+            conn.execute(
+                """INSERT INTO retired_usernames (username, sub, retired_at, archived_at)
+                   VALUES (%s, %s, %s, '')
+                   ON CONFLICT (username) DO UPDATE
+                   SET sub=EXCLUDED.sub, retired_at=EXCLUDED.retired_at, archived_at=''""",
+                (row["username"], sub, now),
+            )
         cur = conn.execute("DELETE FROM users WHERE sub=%s", (sub,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def remove_user_scope_items(sub: str, agents: list[str] | None) -> None:
+    """The person's user-scope tasks, triggers and notifications on
+    ``agents`` (None: every agent) go, as a removal from an agent cascades
+    them. The offboarding transfer calls this for the agents a person lost
+    without a membership row there."""
+    with get_conn() as conn:
+        for agent in ([None] if agents is None else agents):
+            _cascade_remove_user_scope_items(conn, sub, agent)
+        conn.commit()
+
+
+def list_retired_usernames(*, unarchived_only: bool = False) -> list[dict]:
+    with get_conn() as conn:
+        where = "WHERE archived_at = ''" if unarchived_only else ""
+        rows = conn.execute(
+            f"SELECT username, sub, retired_at, archived_at FROM retired_usernames {where} "
+            "ORDER BY retired_at").fetchall()
+        return [dict(r) for r in rows]
+
+
+def retired_subs() -> set[str]:
+    with get_conn() as conn:
+        return {r["sub"] for r in conn.execute("SELECT sub FROM retired_usernames").fetchall()}
+
+
+def mark_username_archived(username: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE retired_usernames SET archived_at=%s WHERE username=%s",
+                     (datetime.now(timezone.utc).isoformat(), username))
+        conn.commit()
+
+
+def drop_retired_username(username: str) -> bool:
+    """The person is back (a dump from before their deletion was restored):
+    the name is theirs again."""
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM retired_usernames WHERE username=%s", (username,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -469,6 +607,7 @@ def create_local_user(
     import uuid
     sub = f"local:{uuid.uuid4()}"
     now = datetime.now(timezone.utc).isoformat()
+    taken = usernames_on_disk()
     with get_conn() as conn:
         # Check email uniqueness
         existing = conn.execute(
@@ -476,7 +615,7 @@ def create_local_user(
         ).fetchone()
         if existing:
             raise ValueError(f"Email already in use: {email}")
-        username = _make_username_slug(name or display_name or email.split("@")[0], conn)
+        username = _make_username_slug(name or display_name or email.split("@")[0], conn, taken)
         try:
             conn.execute(
                 """INSERT INTO users

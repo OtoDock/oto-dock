@@ -121,9 +121,9 @@ export default function WorkspaceOverlay({
   initialRecover,
   onRecoverConsumed,
 }: Props) {
-  // Editor + manager + admin can write to /workspace/. Default canEdit to
-  // canManage when caller hasn't been updated (preserves the owner-only
-  // behavior — workspace gated to manager).
+  // The workspace tier (contributor + editor + manager + admin) writes
+  // /workspace/. Default canEdit to canManage when the caller hasn't been
+  // updated (preserves the owner-only behavior — workspace gated to manager).
   const effectiveCanEdit = canEdit ?? canManage
   const { user } = useAuth()
   const { data: tree = [] } = useAgentFiles(agent)

@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_auth
 from services.billing import hosted_instances, relay_client
 from storage import database as db
 
@@ -43,7 +43,8 @@ class ConnectStartRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(user: UserContext) -> None:
+def _require_admin(user: UserContext | None) -> None:
+    user = require_auth(user)
     if user.is_service:
         return  # the trusted master key is admin-equivalent (service-to-service)
     if not user.is_admin:

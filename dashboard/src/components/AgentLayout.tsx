@@ -3,15 +3,9 @@ import { Outlet, NavLink, Link, useParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useAgentInfo } from '../api/agents'
 import { useSwipeGesture } from '../hooks/useSwipeGesture'
-import { canManageAgent } from '../lib/permissions'
+import { canManageAgent, roleBadge } from '../lib/permissions'
 import ResponsiveDrawer from './ui/ResponsiveDrawer'
 import NavGroup from './ui/NavGroup'
-
-const ROLE_BADGE: Record<string, string> = {
-  admin: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  manager: 'bg-brand-100 text-brand',
-  viewer: 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary',
-}
 
 export default function AgentLayout() {
   const { name } = useParams<{ name: string }>()
@@ -33,6 +27,9 @@ export default function AgentLayout() {
     { path: `/agents/${name}/mcps`, label: 'MCPs', visible: canManage },
     { path: `/agents/${name}/skills`, label: 'Skills', visible: canManage },
     { path: `/agents/${name}/config`, label: 'Configuration', visible: canManage },
+    // Checks (CHECKS.md): everyone sees the offered checks and the verdicts
+    // they may see; managers create and edit the agent's.
+    { path: `/agents/${name}/checks`, label: 'Checks', visible: true },
   ]
 
   // Monitoring = read-only operational views, grouped under a collapsible
@@ -102,7 +99,7 @@ export default function AgentLayout() {
             <div className="p-3 border-t border-p-border-light">
               <p className="text-xs text-p-text-secondary truncate">{user.name}</p>
               <div className="flex items-center gap-2 mt-1">
-                <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${ROLE_BADGE[user.role] || ''}`}>
+                <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${roleBadge(user.role)}`}>
                   {user.role}
                 </span>
                 <button onClick={logout} className="text-xs text-p-text-light hover:text-p-text-secondary">

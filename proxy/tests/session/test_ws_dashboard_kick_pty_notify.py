@@ -239,12 +239,15 @@ class TestNotificationDelivery:
             "delivered_at": "2026-07-07T00:00:00+00:00",
             "agent_slug": "", "chat_id": "",
         }
+        # Golden-frame change note: ``href`` (the page a tap opens, SHARING.md)
+        # was ADDED to the delivery payload deliberately; empty when the
+        # notification has no page of its own.
         payload = {
             "id": 7, "notification_id": 3, "title": "Backup done",
             "body": "45GB transferred", "severity": "success",
             "scope": "user", "source": "task",
             "delivered_at": "2026-07-07T00:00:00+00:00",
-            "agent_slug": "", "chat_id": "",
+            "agent_slug": "", "chat_id": "", "href": "",
         }
 
         async def scenario():
@@ -397,3 +400,104 @@ class TestInteractiveColdFirstPrompt:
 
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
+
+
+class TestInteractiveColdFirstPromptArgv:
+    """An engine whose TUI takes the cold prompt as a launch argument
+    (``runtime.interactive_first_prompt_via_argv``) gets it stamped by the
+    SERVER where the argv delivery is decided — time and viewer-focus line,
+    the same shape the PTY submit path builds — so the dashboard sends raw
+    text on every engine and the rollout tailer's duplicate-skip meets what
+    the TUI journals (engine-contract phase 5e)."""
+
+    def _run(self, temp_db, monkeypatch, *, focus: str):
+        import dataclasses
+        from core.session import interactive_session
+        from core.session import transcript_tool_events as tte
+        from storage.db_settings import set_platform_setting
+
+        registered: list[FakeInteractiveSession] = []
+
+        class _InteractiveSpawnLayer(FakeExecutionLayer):
+            async def start_session(self, sid, agent_cfg):
+                await super().start_session(sid, agent_cfg)
+                if getattr(agent_cfg, "interactive", False):
+                    isess = FakeInteractiveSession(sid, "")
+                    registered.append(isess)
+                    monkeypatch.setitem(interactive_session._sessions, sid, isess)
+
+        layer = _InteractiveSpawnLayer()
+        # The harness's real Claude descriptor, with the one flag the argv
+        # decision reads flipped — the agent stays on the harness's path.
+        layer.capabilities = dataclasses.replace(
+            layer.capabilities,
+            runtime=dataclasses.replace(
+                layer.capabilities.runtime, interactive_first_prompt_via_argv=True,
+            ),
+        )
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        set_platform_setting("interactive_cli_enabled", "true")
+        monkeypatch.setattr(tte, "_sent_prompts", {})
+        from services.apps import focus_context
+        monkeypatch.setattr(focus_context, "focus_line", lambda *a, **k: focus)
+
+        out: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({
+                    "type": "warmup", "agent": slug,
+                    "text": "cold argv prompt",
+                    "execution_mode": "interactive",
+                })
+                started = await ws.next_frame()
+                assert started["type"] == "warmup_started"
+                chat_id = started["chat_id"]
+                for _ in range(10):
+                    frame = await ws.next_frame()
+                    if frame["type"] == "warmup_ready":
+                        break
+                else:
+                    raise AssertionError("no warmup_ready")
+                assert frame["interactive"] is True
+                for _ in range(50):
+                    if layer.started:
+                        break
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.1)  # the spawn tail's submit window
+                _sid, agent_cfg = layer.started[0]
+                out["stamped"] = agent_cfg.interactive_first_prompt
+                out["submitted"] = list(registered[0].submitted) if registered else []
+                out["rows"] = [(m["role"], m["content"]) for m in temp_db.get_chat_messages(chat_id)]
+                out["title"] = temp_db.get_chat(chat_id)["title"]
+                out["consumed"] = tte.consume_sent_prompt(chat_id, agent_cfg.interactive_first_prompt)
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+        return out
+
+    def test_argv_prompt_is_stamped_server_side_and_noted(self, temp_db, monkeypatch):
+        out = self._run(temp_db, monkeypatch, focus="")
+        stamped = out["stamped"]
+        assert stamped.startswith("[Current time: ")
+        assert stamped.endswith("\n\ncold argv prompt")
+        assert "looking at the app" not in stamped
+        # The TUI auto-runs the argument: nothing is submitted through the PTY.
+        assert out["submitted"] == []
+        # The DB row is the RAW prompt and the title comes from it.
+        assert out["rows"] == [("user", "cold argv prompt")]
+        assert out["title"] == "cold argv prompt"
+        # The note holds the STAMPED bytes the rollout will journal.
+        assert out["consumed"] is True
+
+    def test_argv_prompt_carries_the_focus_line_after_the_time(self, temp_db, monkeypatch):
+        focus = '[The user is looking at the app "Home" (home) right now.]'
+        out = self._run(temp_db, monkeypatch, focus=focus)
+        first, second, rest = out["stamped"].split("\n\n", 2)
+        assert first.startswith("[Current time: ")
+        assert second == focus
+        assert rest == "cold argv prompt"
+        assert out["rows"] == [("user", "cold argv prompt")]

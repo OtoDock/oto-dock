@@ -23,6 +23,7 @@ import {
   RequestStatus,
 } from '../../api/community'
 import { useMcpInstances } from '../../api/mcps'
+import { MCP_REQUEST_STATUS } from '../../lib/status/mcpRequest'
 
 const NEEDS_INSTANCE_TONE =
   'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
@@ -214,10 +215,10 @@ function BatchCard({
 }) {
   const [collapsed, setCollapsed] = useState(false)
   const total = rows.length
-  const installed = rows.filter(r => r.status === 'installed').length
-  const needsInst = rows.filter(r => r.status === 'install_failed' && r.needs_instance).length
-  const failed = rows.filter(r => r.status === 'install_failed' && !r.needs_instance).length
-  const open = rows.filter(r => r.status === 'pending').length
+  const installed = rows.filter(r => r.status === MCP_REQUEST_STATUS.INSTALLED).length
+  const needsInst = rows.filter(r => r.status === MCP_REQUEST_STATUS.INSTALL_FAILED && r.needs_instance).length
+  const failed = rows.filter(r => r.status === MCP_REQUEST_STATUS.INSTALL_FAILED && !r.needs_instance).length
+  const open = rows.filter(r => r.status === MCP_REQUEST_STATUS.PENDING).length
   const requester = rows[0]
   const agent = rows[0].agent_slug
   return (
@@ -280,8 +281,8 @@ function Row({
   onRetry: () => void
   pending: boolean
 }) {
-  const isPending = req.status === 'pending'
-  const isFailed = req.status === 'install_failed'
+  const isPending = req.status === MCP_REQUEST_STATUS.PENDING
+  const isFailed = req.status === MCP_REQUEST_STATUS.INSTALL_FAILED
   // install_failed + needs_instance is not a failure — the install went
   // fine, only admin instance work remains. Present it as its own state.
   const needsInstance = isFailed && !!req.needs_instance
@@ -349,7 +350,7 @@ function Row({
               <span className="text-p-text-light">Admin note:</span> {req.admin_note}
             </p>
           )}
-          {(isFailed || req.status === 'installed') && req.install_log && (
+          {(isFailed || req.status === MCP_REQUEST_STATUS.INSTALLED) && req.install_log && (
             <details className="mt-1.5">
               <summary className="text-[11px] text-p-text-light cursor-pointer">Install log</summary>
               <pre className={`mt-1 text-[10px] rounded-sm p-2 overflow-x-auto max-h-40 whitespace-pre-wrap ${

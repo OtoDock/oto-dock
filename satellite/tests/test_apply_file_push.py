@@ -193,3 +193,78 @@ class TestDeletePrunesEmptyParents:
                                    "action": "delete"})
         assert not d.exists()
         assert (tmp_path / "users" / "alice").exists()
+
+
+# ---------------------------------------------------------------------------
+# The applier opens beneath the agent root; a link component is
+# refused, and a swap after the check never redirects a write
+# ---------------------------------------------------------------------------
+
+
+def _agent(tmp_path):
+    agent = tmp_path / "agents" / "a1"
+    (agent / "workspace" / "sub").mkdir(parents=True)
+    (agent / "users" / "other").mkdir(parents=True)
+    return agent
+
+
+def test_an_in_tree_link_component_is_refused_on_write(tmp_path):
+    import os
+    agent = _agent(tmp_path)
+    os.symlink("../users/other", agent / "workspace" / "alias")
+    with pytest.raises(OSError):
+        apply_file_push(agent, {"path": "workspace/alias/f.txt", "action": "write",
+                                "content_b64": _b64(b"x")})
+    assert not (agent / "users" / "other" / "f.txt").exists()
+
+
+def test_a_component_swapped_after_the_check_is_refused(tmp_path, monkeypatch):
+    import contextlib
+    import os
+    from satellite.host import safe_fs
+    agent = _agent(tmp_path)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "f.txt").write_bytes(b"ORIGINAL")
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @contextlib.contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            d = agent / "workspace" / "sub"
+            d.rmdir()
+            os.symlink(victim, d)
+        with real(root, rel) as r:
+            yield r
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+    with pytest.raises(OSError):
+        apply_file_push(agent, {"path": "workspace/sub/f.txt", "action": "write",
+                                "content_b64": _b64(b"NEW"), "hash": _h(b"NEW")})
+    assert (victim / "f.txt").read_bytes() == b"ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["f.txt"]
+
+
+def test_delete_mkdir_and_chunks_stay_beneath_the_root(tmp_path):
+    import os
+    agent = _agent(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "f.txt").write_bytes(b"ORIGINAL")
+    os.symlink(outside, agent / "workspace" / "lnk")
+    with pytest.raises(OSError):
+        apply_file_push(agent, {"path": "workspace/lnk/f.txt", "action": "delete"})
+    with pytest.raises(OSError):
+        apply_file_push(agent, {"path": "workspace/lnk/deeper", "action": "mkdir"})
+    assert (outside / "f.txt").read_bytes() == b"ORIGINAL"
+    # A link planted at the staging name is replaced by the fresh partial.
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"ORIGINAL")
+    os.symlink(victim, agent / "workspace" / "big.bin.partial")
+    data = b"A" * 4 + b"B" * 4
+    apply_file_push(agent, _chunk("workspace/big.bin", 0, 2, data[:4]))
+    apply_file_push(agent, _chunk("workspace/big.bin", 1, 2, data[4:], last_hash=_h(data)))
+    assert (agent / "workspace" / "big.bin").read_bytes() == data
+    assert victim.read_bytes() == b"ORIGINAL"

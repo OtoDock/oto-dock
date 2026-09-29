@@ -166,8 +166,24 @@ async def list_tools() -> list[Tool]:
                             "Optional. ID of an existing task to run on fire. "
                             "MUST have task_type='trigger' AND match this trigger's "
                             "scope/agent/owner. Use create_one_time_task with "
-                            "task_type='trigger' to make one."
+                            "task_type='trigger' to make one. Never together with app_slug."
                         ),
+                    },
+                    "app_slug": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Wake an APP's handler instead of a task: the slug of a "
+                            "folder app of this agent (scope='agent' → the shared app; "
+                            "scope='user' → your user's personal app) whose app.json declares "
+                            "the handler under handlers.on_trigger. The app must be approved "
+                            "(409 'approve the app first' otherwise); debounce_seconds must "
+                            "stay 0. An older platform answers 400 'at least one action' — "
+                            "then handlers are not available there yet."
+                        ),
+                    },
+                    "handler": {
+                        "type": "string",
+                        "description": "With app_slug: the on_trigger handler name to wake.",
                     },
                     "notify": {
                         "type": "object",
@@ -192,15 +208,17 @@ async def list_tools() -> list[Tool]:
                                     "Recipient scope. For user-scoped triggers only 'user' is "
                                     "valid (and target is locked to creator). For agent-scoped, "
                                     "'agent' broadcasts to all agent users; 'user' notifies a "
-                                    "specific user (target = username)."
+                                    "specific user of this agent (target = username); 'global' "
+                                    "(every user) needs a platform admin."
                                 ),
                             },
                             "target": {
                                 "type": "string",
                                 "description": (
-                                    "Username for target_scope='user' or agent name for "
-                                    "target_scope='agent'. Omit to default to creator (user-scope) "
-                                    "or this agent (agent-scope)."
+                                    "Username for target_scope='user' or, for "
+                                    "target_scope='agent', this agent's name (no other agent). "
+                                    "Omit to default to creator (user-scope) or this agent "
+                                    "(agent-scope)."
                                 ),
                             },
                         },
@@ -219,9 +237,16 @@ async def list_tools() -> list[Tool]:
                             "Optional. ID of a vendor webhook subscription (from "
                             "list_subscriptions). When set, this trigger fires ONLY "
                             "when the subscription receives a matching event — not "
-                            "from a generic webhook URL. Scope must match: "
-                            "user-scope subscription with user-scope trigger; "
-                            "service-scope subscription with agent-scope trigger. "
+                            "from a generic webhook URL. Scope must match: a "
+                            "personal (user-scope) subscription with a user-scope "
+                            "trigger; an agent's (service-scope) subscription with "
+                            "an agent-scope trigger. list_subscriptions shows each "
+                            "row's scope. An agent trigger (e.g. one that wakes a "
+                            "shared app) needs a subscription created FOR THE AGENT: "
+                            "the user does that in Agent Settings → MCPs → the MCP → "
+                            "Subscribe to events for this agent (or Connected "
+                            "Accounts → Subscribe as: the agent). A personal "
+                            "subscription can never be linked to an agent trigger. "
                             "IMPORTANT: before creating a vendor-subscribed trigger, "
                             "call list_triggers() and check if one already exists with "
                             "the same subscription_id + same event_filter + same "
@@ -270,9 +295,12 @@ async def list_tools() -> list[Tool]:
                 "vendor_target (e.g. GitHub repo or Slack channel), the events the "
                 "subscription receives, status (active / failed / renew_failed), "
                 "and the manifest's event_catalog so you know which event_type "
-                "values are valid for event_filter. Subscriptions are CREATED via "
-                "the OtoDock dashboard (Connected Accounts → Subscribe to events) — "
-                "this tool is READ-ONLY."
+                "values are valid for event_filter, and its scope: [personal] "
+                "rows link to user-scope triggers, [agent <name>] rows to "
+                "agent-scope triggers of that agent. Subscriptions are CREATED via "
+                "the OtoDock dashboard (Connected Accounts → Subscribe to events, "
+                "choosing Me or an agent; or Agent Settings → MCPs → Subscribe to "
+                "events for this agent) — this tool is READ-ONLY."
             ),
             inputSchema={
                 "type": "object",
@@ -285,6 +313,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Filter by bound OAuth account label",
                     },
+                    "mcp_name": {
+                        "type": "string",
+                        "description": "Filter by the MCP the subscription belongs to (e.g. github-mcp)",
+                    },
                 },
             },
         ),
@@ -293,8 +325,13 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List triggers visible to the current user. By default returns own "
                 "user-scoped triggers + all agent-scoped triggers for this agent. "
-                "Each row includes the webhook path, status (active/paused), "
-                "scope, linked task name, last_fired_at, and fired_count. "
+                "Each row: slug, name, scope (user/<creator> or agent), status "
+                "(active/paused), fired_count, last_fired_at, its action — "
+                "`task=<name> model=<id> [pinned|agent default|layer default, "
+                "tier N]` (the linked task's effective model: a trigger has no "
+                "model of its own), `app=<slug>/<handler>`, or "
+                "`notify(<severity>)` — and id. get_trigger returns the webhook "
+                "path. "
                 "With `agent`, reads another accessible agent's triggers instead "
                 "(read-only — mutations stay same-agent)."
             ),
@@ -332,7 +369,9 @@ async def list_tools() -> list[Tool]:
             name="edit_trigger",
             description=(
                 "Edit an existing trigger without deleting and recreating. Pass only "
-                "the fields to change. Scope, slug, agent, and creator are immutable. "
+                "the fields to change. Scope, slug, agent, and creator are immutable; "
+                "subscription_id can be set later (an app's trigger is often made "
+                "before the agent's subscription exists) under the same scope rule. "
                 "Static triggers (loaded from triggers.json) cannot be edited."
             ),
             inputSchema={
@@ -341,6 +380,11 @@ async def list_tools() -> list[Tool]:
                     "id": {"type": "string"},
                     "name": {"type": "string"},
                     "task_id": {"type": "string"},
+                    "app_slug": {
+                        "type": "string",
+                        "description": "Aim the trigger at an app's handler (clears task_id); '' removes the app target.",
+                    },
+                    "handler": {"type": "string"},
                     "notify_enabled": {"type": "boolean"},
                     "notify_severity": {
                         "type": "string",
@@ -360,6 +404,17 @@ async def list_tools() -> list[Tool]:
                             "Vendor-trigger event filter (see create_trigger). "
                             "Pass empty {} to match every event from the linked "
                             "subscription."
+                        ),
+                    },
+                    "subscription_id": {
+                        "type": "string",
+                        "description": (
+                            "Bind (or re-bind) the trigger to a vendor webhook "
+                            "subscription from list_subscriptions — the same scope "
+                            "rule as create_trigger (an agent trigger takes the "
+                            "agent's own subscription, a user trigger yours); '' "
+                            "unbinds. A trigger with no subscription never hears a "
+                            "vendor event, whatever the app declares."
                         ),
                     },
                 },
@@ -488,6 +543,10 @@ async def _handle_create(args: dict) -> list[TextContent]:
         payload["slug"] = slug
     if task_id := args.get("task_id"):
         payload["task_id"] = task_id
+    # The app action (APPS.md "Handlers").
+    if app_slug := args.get("app_slug"):
+        payload["app_slug"] = app_slug
+        payload["handler"] = args.get("handler") or ""
     # vendor-subscription linkage.
     if sid := args.get("subscription_id"):
         payload["subscription_id"] = sid
@@ -549,15 +608,23 @@ async def _handle_list_subscriptions(args: dict) -> list[TextContent]:
             type="text",
             text=("No webhook subscriptions yet. Subscriptions are created in "
                   "the OtoDock dashboard: Connected Accounts → expand an account → "
-                  "Subscribe to events. Then come back and link triggers to them "
-                  "via create_trigger(subscription_id=...).")
+                  "Subscribe to events (Subscribe as: Me for a personal one, or "
+                  "an agent for one its agent-scope triggers can use; the agent "
+                  "option also lives in Agent Settings → MCPs). Then come back "
+                  "and link triggers to them via create_trigger(subscription_id=...).")
         )]
     lines = [f"Webhook subscriptions ({len(rows)}):"]
     for r in rows:
         events = ", ".join(r.get("selected_events") or [])
+        scope = (
+            f"agent {r.get('agent')}" if r.get("scope") == "service" else "personal"
+        )
+        # The kind says what the target covers (GitHub: one repository or
+        # every repository in an organization); the default kind is unnamed.
+        kind = f" ({r.get('target_kind')})" if r.get("target_kind") else ""
         lines.append(
             f"  • {r.get('provider_id')}/{r.get('account_label')} → "
-            f"{r.get('vendor_target')}  events={events or '—'}  "
+            f"{r.get('vendor_target')}{kind}  [{scope}]  events={events or '—'}  "
             f"status={r.get('status')}  id={r.get('id', '')}"
         )
     return [TextContent(type="text", text="\n".join(lines))]
@@ -585,7 +652,17 @@ async def _handle_list(args: dict) -> list[TextContent]:
         last = r.get("last_fired_at") or "never"
         actions = []
         if r.get("task_id"):
-            actions.append(f"task={r.get('task_name') or r['task_id']}")
+            # A trigger has no model of its own: the linked task's pin or
+            # its agent's default decides, so the listing says which.
+            model = r.get("task_effective_model") or ""
+            source = r.get("task_effective_model_source") or (
+                "pinned" if r.get("task_override_model") else "agent default")
+            tier = r.get("task_effective_model_tier")
+            tier_bit = f", tier {tier}" if tier else ""
+            model_bit = f" model={model} [{source}{tier_bit}]" if model else ""
+            actions.append(f"task={r.get('task_name') or r['task_id']}{model_bit}")
+        if r.get("app_slug"):
+            actions.append(f"app={r['app_slug']}/{r.get('handler') or ''}")
         if r.get("notify_enabled"):
             actions.append(f"notify({r.get('notify_severity')})")
         action_str = " + ".join(actions) or "—"
@@ -610,14 +687,14 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     trigger_id = args.pop("id", "")
     if not trigger_id:
         return [TextContent(type="text", text="Error: id required")]
-    # Filter to known editable fields. `event_filter` is editable for
-    # vendor-subscribed triggers; subscription_id and slug remain
-    # immutable once set.
+    # Filter to known editable fields. `event_filter` and `subscription_id`
+    # are editable for vendor-subscribed triggers (the proxy re-checks the
+    # scope rule); slug, scope, agent and creator remain immutable.
     editable = {
-        "name", "task_id",
+        "name", "task_id", "app_slug", "handler",
         "notify_enabled", "notify_severity", "notify_title", "notify_body",
         "notify_target_scope", "notify_target", "debounce_seconds",
-        "event_filter",
+        "event_filter", "subscription_id",
     }
     payload = {k: v for k, v in args.items() if k in editable}
     if not payload:

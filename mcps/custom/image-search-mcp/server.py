@@ -6,7 +6,9 @@ Three tools:
   - search_by_image:   SerpAPI Google Lens (requires the platform's
                        /v1/images/temp/* endpoint, since Lens only accepts
                        URLs — not base64 or file uploads)
-  - save_image:        HTTPS download → scope-correct workspace path
+  - save_image:        HTTP(S) download → scope-correct workspace path (the
+                       host and every redirect hop must answer with a
+                       public address — the vendored ``_url_guard``)
 
 Cost is declared in the manifest's `costs` block and evaluated by the proxy
 at TOOL_RESULT time — this server does NOT report cost itself. Stock
@@ -31,6 +33,8 @@ from PIL import Image
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+
+from _url_guard import validate_outbound_url
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -85,6 +89,7 @@ def _has_serpapi() -> bool:
 # Limits
 MAX_SAVE_BYTES = 15 * 1024 * 1024  # 15 MB hard cap for save_image downloads
 SAVE_CHUNK_SIZE = 64 * 1024
+MAX_REDIRECTS = 5                  # save_image follows redirects by hand, re-checking each hop
 DEFAULT_SAVE_SUBDIR = "images"     # auto-saved files land under workspace/images/
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
 
@@ -705,6 +710,28 @@ def _resolve_save_path(dest_path: str, ext: str) -> tuple[str | None, str | None
     return os.path.join(workspace, normalized), None
 
 
+async def _open_final(client: httpx.AsyncClient, method: str, url: str):
+    """Send ``method url`` without following redirects; on a 3xx validate
+    the joined ``Location`` and try again, at most ``MAX_REDIRECTS`` hops —
+    ``follow_redirects=True`` would let a public URL bounce the fetch into
+    the machine's LAN or the loopback tunnel. Returns ``(response, url,
+    None)`` with a streaming response the caller must close, or
+    ``(None, url, reason)``."""
+    for _hop in range(MAX_REDIRECTS + 1):
+        resp = await client.send(client.build_request(method, url), stream=True)
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            return resp, url, None
+        location = resp.headers.get("location", "")
+        await resp.aclose()
+        if not location:
+            return None, url, f"HTTP {resp.status_code} without a Location"
+        url = str(httpx.URL(url).join(location))
+        reason = validate_outbound_url(url)
+        if reason:
+            return None, url, f"redirect refused: {reason}"
+    return None, url, "too many redirects"
+
+
 async def _tool_save_image(args: dict) -> dict:
     url = (args.get("url") or "").strip()
     dest_path = (args.get("dest_path") or "").strip()
@@ -715,23 +742,33 @@ async def _tool_save_image(args: dict) -> dict:
         return {"error": "url is required"}
     if not url.startswith(("http://", "https://")):
         return {"error": "url must be http:// or https://"}
+    # The fetch runs in this process — on a satellite with the machine's LAN
+    # in reach — so the host must answer with a public address, on every hop.
+    if reason := validate_outbound_url(url):
+        return {"error": f"url refused: {reason}"}
 
     # HEAD pre-check: content-type + size. Some hosts refuse HEAD —
     # fall back to allowing the GET if HEAD returns 405/501.
     mime = "application/octet-stream"
     declared_size = 0
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
         try:
-            head = await client.head(url)
-            if head.status_code in (200, 204):
-                mime = (head.headers.get("content-type") or "").split(";")[0].strip().lower()
-                cl = head.headers.get("content-length")
-                if cl and cl.isdigit():
-                    declared_size = int(cl)
-            elif head.status_code in (405, 501):
-                pass  # HEAD not supported — fall through to GET with stream guard
-            else:
-                return {"error": f"URL returned HTTP {head.status_code} on HEAD"}
+            head, _final, reason = await _open_final(client, "HEAD", url)
+            if reason and reason.startswith("redirect refused"):
+                return {"error": reason}
+            if head is not None:
+                try:
+                    if head.status_code in (200, 204):
+                        mime = (head.headers.get("content-type") or "").split(";")[0].strip().lower()
+                        cl = head.headers.get("content-length")
+                        if cl and cl.isdigit():
+                            declared_size = int(cl)
+                    elif head.status_code in (405, 501):
+                        pass  # HEAD not supported — fall through to GET with stream guard
+                    else:
+                        return {"error": f"URL returned HTTP {head.status_code} on HEAD"}
+                finally:
+                    await head.aclose()
         except Exception:
             # Treat HEAD failures as "unknown" — proceed to GET with guards.
             pass
@@ -758,8 +795,11 @@ async def _tool_save_image(args: dict) -> dict:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         tmp_path = save_path + f".tmp.{uuid.uuid4().hex[:6]}"
         total = 0
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            async with client.stream("GET", url) as resp:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
+            resp, _final, reason = await _open_final(client, "GET", url)
+            if reason:
+                return {"error": reason}
+            try:
                 if resp.status_code != 200:
                     return {"error": f"download HTTP {resp.status_code}"}
                 got_ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -781,6 +821,8 @@ async def _tool_save_image(args: dict) -> dict:
                                 )
                             }
                         f.write(chunk)
+            finally:
+                await resp.aclose()
         os.replace(tmp_path, save_path)
     except Exception as e:
         return {"error": f"download/write failed: {e}"}

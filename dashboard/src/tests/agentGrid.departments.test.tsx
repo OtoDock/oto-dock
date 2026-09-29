@@ -47,12 +47,29 @@ vi.mock('../api/departments', () => ({
   useDepartments: () => ({
     data: [{
       id: 'd-eng', name: 'Engineering', created_by_sub: 'u1',
-      auto_delegation: false, reach: 'adjacent', position_hint: '',
+      mode: 'off', reach: 'adjacent', position_hint: '',
       levels: [
         { id: 'lv-senior', rank: 1, name: 'Senior' },
         { id: 'lv-head', rank: 0, name: 'Head' },
       ],
+      // The feed's members list is what the server knows; the grid groups
+      // by the agents payload, so this fixture keeps it empty on purpose.
+      members: [{ name: 'astro', level_id: 'lv-senior', accessible: true }],
+      can_edit: false,
+    }, {
+      // Empty for everyone (just created): renders as a group with no
+      // cards, the way the map keeps its dais, so it can be filled.
+      id: 'd-fresh', name: 'Design', created_by_sub: 'u1',
+      mode: 'off', reach: 'adjacent', position_hint: '',
+      levels: [{ id: 'lv-d-head', rank: 0, name: 'Head' }],
       members: [], can_edit: false,
+    }, {
+      // Has members, none of them visible to this viewer: stays hidden.
+      id: 'd-secret', name: 'Secret', created_by_sub: 'u2',
+      mode: 'off', reach: 'adjacent', position_hint: '',
+      levels: [{ id: 'lv-s-head', rank: 0, name: 'Head' }],
+      members: [{ name: 'someone-else', level_id: 'lv-s-head', accessible: false }],
+      can_edit: false,
     }],
   }),
 }))
@@ -102,5 +119,14 @@ describe('AgentGrid departments', () => {
       .filter(t => !['BOSS', 'ASTRO', 'DRIFTER'].includes(t ?? ''))
     // zeta (favorite) first; ghost's department isn't rendered → shown here.
     expect(independents).toEqual(['ZETA', 'GHOST', 'OMEGA'])
+  })
+
+  it('an empty department renders as a group with no cards; one with invisible members stays hidden', () => {
+    mount()
+    const fresh = screen.getByText('Design').closest('section')!
+    expect(within(fresh).getByText('0 agents')).toBeInTheDocument()
+    expect(within(fresh).getByText(/No agents yet/)).toBeInTheDocument()
+    expect(within(fresh).queryAllByRole('heading', { level: 3 })).toHaveLength(0)
+    expect(screen.queryByText('Secret')).not.toBeInTheDocument()
   })
 })

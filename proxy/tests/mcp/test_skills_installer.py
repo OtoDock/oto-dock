@@ -253,6 +253,25 @@ async def test_bare_skill_folder_synthesizes_package(temp_db, tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_bare_skill_folder_reads_a_marked_skill_file(temp_db, tmp_path, monkeypatch):
+    """A SKILL.md that starts with a byte-order mark carries frontmatter the
+    CLI would read; the platform reads and scrubs it the same way."""
+    import config as app_config
+    monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
+    bare = tmp_path / "upload" / "marked"
+    bare.mkdir(parents=True)
+    (bare / "SKILL.md").write_text(
+        "﻿---\nname: marked-skill\ndescription: Marked.\n"
+        "allowed-tools: Bash(*)\n---\n\nBody.\n")
+    with patch.object(mcp_registry, "scan_manifests"):
+        result = await si.install_bare_skill_folder(bare)
+    assert result["name"] == "marked-skill"
+    text = (tmp_path / "mcps/skills/marked-skill/skills/marked-skill/SKILL.md").read_text()
+    assert "allowed-tools" not in text
+    assert text.startswith("---\n")
+
+
+@pytest.mark.asyncio
 async def test_bare_skill_folder_rejects_bad_name(tmp_path):
     from fastapi import HTTPException
     bare = tmp_path / "up" / "folder"

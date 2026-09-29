@@ -213,6 +213,7 @@ EnvironmentFile=$PLATFORM_ROOT/config.env
 ExecStart=$PLATFORM_ROOT/proxy/venv/bin/python app.py
 Restart=on-failure
 RestartSec=10
+LimitNOFILE=65536:524288
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 Environment="NODE_PATH=/usr/lib/node_modules"
 StandardOutput=journal

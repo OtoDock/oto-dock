@@ -10,6 +10,7 @@ framework seam; the context-only (transport "none") mechanism tests below
 use a synthetic manifest — the mechanism outlived ssh-hosts's server flip.
 """
 
+import dataclasses
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,10 @@ if _proxy_root not in sys.path:
 from tests.mcp.test_mcp_broker_activation import (  # noqa: E402
     _FakeManifest, _stub_assembly,
 )
+from core import placement  # noqa: E402
+
+_ADMIN_PAIRED = placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m")
+_USER_PAIRED = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m")
 
 
 def _context_only_manifest(name="ssh-hosts"):
@@ -72,7 +77,7 @@ def test_context_only_mcp_emits_no_server_entry_locally(monkeypatch, tmp_path):
     )
 
     path, _env, excluded, bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=False,
+        "agent", None, placement=placement.LOCAL_PLACEMENT,
     )
 
     assert "ssh-hosts" not in excluded  # active — just serverless
@@ -90,7 +95,7 @@ def test_context_only_mcp_excluded_on_remote(monkeypatch, tmp_path):
     )
 
     _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True,
+        "agent", None, placement=_USER_PAIRED,
     )
 
     # Default (no target_admin_paired) fails closed — user-paired and unknown
@@ -122,7 +127,7 @@ def test_provider_renders_authorized_hosts():
         {"name": "", "host": "backup.lan", "username": "oto"},
     )
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
-        text = _ssh_hosts_context("agent")
+        text = _ssh_hosts_context("agent", user_role="manager")
 
     assert "## SSH Hosts" in text
     # accept-new on every line: the first connect in a non-interactive shell
@@ -153,11 +158,12 @@ def test_provider_mux_gated_by_target_os():
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         linux = _ssh_hosts_context(
-            "agent", is_remote=True, target_admin_paired=True, target_os="linux")
+            "agent", placement=dataclasses.replace(_ADMIN_PAIRED, os="linux"),
+            user_role="manager")
         windows = _ssh_hosts_context(
-            "agent", is_remote=True, target_admin_paired=True, target_os="windows")
-        unknown = _ssh_hosts_context(
-            "agent", is_remote=True, target_admin_paired=True)
+            "agent", placement=dataclasses.replace(_ADMIN_PAIRED, os="windows"),
+            user_role="manager")
+        unknown = _ssh_hosts_context("agent", placement=_ADMIN_PAIRED, user_role="manager")
 
     assert "ControlMaster=auto" in linux
     assert "ControlMaster" not in windows
@@ -169,10 +175,10 @@ def test_provider_silent_when_remote_or_unauthorized():
     from services.mcp.dynamic_context import _ssh_hosts_context
 
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=[]):
-        assert _ssh_hosts_context("agent") is None
+        assert _ssh_hosts_context("agent", user_role="manager") is None
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
-        assert _ssh_hosts_context("agent", is_remote=True) is None
+        assert _ssh_hosts_context("agent", placement=_USER_PAIRED, user_role="manager") is None
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +292,7 @@ def test_admin_paired_only_included_locally(monkeypatch, tmp_path):
     )
 
     _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=False,
+        "agent", None, placement=placement.LOCAL_PLACEMENT,
     )
     assert "ssh-hosts" not in excluded
 
@@ -299,7 +305,7 @@ def test_admin_paired_only_included_on_admin_paired_remote(monkeypatch, tmp_path
     )
 
     _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True, target_admin_paired=True,
+        "agent", None, placement=_ADMIN_PAIRED,
     )
     assert "ssh-hosts" not in excluded
 
@@ -312,7 +318,7 @@ def test_admin_paired_only_excluded_on_user_paired_remote(monkeypatch, tmp_path)
     )
 
     _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True,
+        "agent", None, placement=_USER_PAIRED,
     )
     assert "ssh-hosts" in excluded
     assert "admin-paired" in excluded["ssh-hosts"]
@@ -349,7 +355,7 @@ def test_provider_block_cross_links_the_tool():
 
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
-        text = _ssh_hosts_context("agent")
+        text = _ssh_hosts_context("agent", user_role="manager")
     assert "list_ssh_hosts" in text
 
 
@@ -369,10 +375,15 @@ def _ssh_hosts_app(user):
     return app
 
 
-def _session_user(agent="agent"):
+def _session_user(agent="agent", agent_roles=None):
+    """A session-token principal: an editor of the agent unless told otherwise
+    (the tool answers by tier, so the bare "member" shape is the 403 case)."""
     from auth.providers import UserContext
+    if agent_roles is None:
+        agent_roles = {"agent": "editor"}
     return UserContext(
         sub="user-1", email="", name="", role="member",
+        agents=list(agent_roles), agent_roles=agent_roles,
         is_api_key=True, session_id="sid-1", agent=agent,
     )
 
@@ -438,3 +449,161 @@ def test_endpoint_403_when_not_enabled_for_agent():
          patch("services.mcp.mcp_registry.get_agent_mcps", return_value=[]):
         resp = client.get("/v1/agents/agent/ssh-hosts")
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# The editor tier: keys, the prompt block and the tool answer
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+def _ctx(role, username="pm", **extra):
+    from auth.path_policy import SecurityContext
+    return SecurityContext(role=role, username=username, agent="agent",
+                           is_admin_agent=False, **extra)
+
+
+@pytest.mark.parametrize("role", ["viewer", "contributor"])
+def test_below_editor_never_takes_ssh_keys(role):
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    assert session_takes_ssh_keys(_ctx(role)) is False
+
+
+@pytest.mark.parametrize("role", ["editor", "manager", "admin"])
+def test_editor_and_above_take_ssh_keys(role):
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    assert session_takes_ssh_keys(_ctx(role)) is True
+
+
+def test_judge_external_and_missing_context_take_no_keys():
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    assert session_takes_ssh_keys(_ctx("manager", read_only=True)) is False
+    assert session_takes_ssh_keys(_ctx("manager", principal="external")) is False
+    assert session_takes_ssh_keys(None) is False
+    assert session_takes_ssh_keys(SimpleNamespace(read_only=False)) is False
+
+
+@pytest.mark.parametrize("role", ["viewer", "contributor", ""])
+def test_provider_block_hidden_below_editor(role):
+    from services.mcp.dynamic_context import _ssh_hosts_context
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u", "key_name": "k"})
+    with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
+        assert _ssh_hosts_context("agent", user_role=role) is None
+        assert _ssh_hosts_context("agent") is None  # no role passed: no block
+        assert "## SSH Hosts" in _ssh_hosts_context("agent", user_role="editor")
+        assert "## SSH Hosts" in _ssh_hosts_context("agent", user_role="manager")
+
+
+def test_endpoint_refuses_a_session_caller_below_editor():
+    from fastapi.testclient import TestClient
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    p1, p2, p3 = _endpoint_patches(rows)
+    for agent_roles in ({"agent": "contributor"}, {"agent": "viewer"}, {}):
+        client = TestClient(_ssh_hosts_app(_session_user(agent_roles=agent_roles)))
+        with p1, p2, p3:
+            resp = client.get("/v1/agents/agent/ssh-hosts")
+        assert resp.status_code == 403, agent_roles
+
+
+def test_endpoint_no_user_session_is_judged_on_its_live_context():
+    """An agent-scope session token names no person: the answer follows the
+    role its registered SecurityContext carries, and no live context is
+    refused."""
+    from fastapi.testclient import TestClient
+    from auth import roles
+    from auth.providers import UserContext
+    from core.session import session_state
+
+    rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
+    p1, p2, p3 = _endpoint_patches(rows)
+    user = UserContext(sub="session:sid-task", email="", name="", role=roles.SERVICE,
+                       is_api_key=True, session_id="sid-task", agent="agent")
+    client = TestClient(_ssh_hosts_app(user))
+    with p1, p2, p3:
+        assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403
+    session_state.set_session_security("sid-task", _ctx("manager", username=""))
+    try:
+        with p1, p2, p3:
+            assert client.get("/v1/agents/agent/ssh-hosts").status_code == 200
+        session_state.set_session_security("sid-task", _ctx("contributor", username=""))
+        with p1, p2, p3:
+            assert client.get("/v1/agents/agent/ssh-hosts").status_code == 403
+    finally:
+        session_state._session_security.pop("sid-task", None)
+
+
+def test_clear_removes_a_leftover_key_dir(tmp_path):
+    """A person demoted below editor keeps nothing from an earlier session:
+    the config dir's ``ssh`` is removed (a planted link is unlinked, never
+    followed)."""
+    from core.sandbox.session_config_dir import clear_ssh_keys_for_sandbox
+    cfg = tmp_path / ".claude"
+    (cfg / "ssh").mkdir(parents=True)
+    (cfg / "ssh" / "k").write_text("PRIVATE")
+    clear_ssh_keys_for_sandbox(cfg)
+    assert not (cfg / "ssh").exists()
+    clear_ssh_keys_for_sandbox(cfg)  # idempotent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+    (cfg / "ssh").symlink_to(outside)
+    clear_ssh_keys_for_sandbox(cfg)
+    assert not (cfg / "ssh").is_symlink() and (outside / "keep").exists()
+
+
+# ---------------------------------------------------------------------------
+# One rule at spawn: keys for the editor tier, a cleared dir below it, an
+# untouched dir for a judge and an external caller
+# ---------------------------------------------------------------------------
+
+def _keyed_config_dir(tmp_path):
+    cfg = tmp_path / ".claude"
+    (cfg / "ssh").mkdir(parents=True)
+    (cfg / "ssh" / "k").write_text("PRIVATE")
+    return cfg
+
+
+@pytest.mark.parametrize("role", ["viewer", "contributor"])
+def test_below_editor_spawn_clears_the_leftover_key_dir(tmp_path, role):
+    from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
+    cfg = _keyed_config_dir(tmp_path)
+    assert provision_ssh_keys_for_sandbox(_ctx(role), "agent", cfg, "/users/pm/.claude") == ""
+    assert not (cfg / "ssh").exists()
+
+
+def test_editor_spawn_materialises_the_keys(tmp_path, monkeypatch):
+    from core.sandbox import session_config_dir as scd
+    cfg = _keyed_config_dir(tmp_path)
+    src = tmp_path / "keys" / "prod"
+    src.parent.mkdir()
+    src.write_text("NEW")
+    monkeypatch.setattr(scd, "collect_authorized_ssh_keys", lambda agent: {"prod": src})
+    out = scd.provision_ssh_keys_for_sandbox(_ctx("editor"), "agent", cfg, "/users/pm/.claude")
+    assert out == "/users/pm/.claude/ssh"
+    assert (cfg / "ssh" / "prod").read_text() == "NEW" and not (cfg / "ssh" / "k").exists()
+    # No key authorised: nothing to point at, and the stale dir is gone.
+    monkeypatch.setattr(scd, "collect_authorized_ssh_keys", lambda agent: {})
+    assert scd.provision_ssh_keys_for_sandbox(_ctx("manager"), "agent", cfg, "/users/pm/.claude") == ""
+    assert not (cfg / "ssh").exists()
+
+
+def test_a_judge_and_an_external_caller_leave_the_dir_alone(tmp_path):
+    from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
+    cfg = _keyed_config_dir(tmp_path)
+    judge = _ctx("manager", read_only=True)
+    assert provision_ssh_keys_for_sandbox(judge, "agent", cfg, "/users/pm/.claude") == ""
+    external = _ctx("viewer", username="", principal="external", external_claim="phone:+30210")
+    assert provision_ssh_keys_for_sandbox(external, "agent", cfg, "/workspace/.claude") == ""
+    assert provision_ssh_keys_for_sandbox(None, "agent", cfg, "/workspace/.claude") == ""
+    assert (cfg / "ssh" / "k").read_text() == "PRIVATE"
+
+
+def test_both_local_layers_route_through_the_one_rule():
+    from pathlib import Path
+    from tests._paths import PROXY_DIR
+    for rel in ("core/layers/cli/layer.py", "core/layers/codex/layer.py"):
+        src = (Path(PROXY_DIR) / rel).read_text()
+        assert "provision_ssh_keys_for_sandbox(" in src, rel
+        assert "materialize_ssh_keys_for_sandbox" not in src, rel

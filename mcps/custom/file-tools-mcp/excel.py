@@ -6,7 +6,6 @@ handle_write_xlsx (28 operations covering full spreadsheet functionality).
 
 import contextlib
 import datetime
-import os
 import re
 import uuid
 from copy import copy
@@ -23,9 +22,10 @@ from shared import (
     _push_preview,
     _resolve_path,
     _to_agents_relative,
-    _WORKER_TMP_SUFFIX,
     _WRITE_OP_ADVICE,
     logger,
+    cleanup_partials,
+    safe_open_write,
 )
 
 # ---------------------------------------------------------------------------
@@ -1883,8 +1883,7 @@ async def handle_write_xlsx(args: dict) -> str:
             _advice=_WRITE_OP_ADVICE,
         )
     except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(path + _WORKER_TMP_SUFFIX)
+        cleanup_partials(path)
         raise
     await _push_preview(path)
     return msg + ("\n\n" + help_text if help_text else "")
@@ -1910,7 +1909,6 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
         # rewritten with their anchors and series).
         wb = load_workbook(path)
     else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
         wb = Workbook()
 
     errors = []
@@ -2617,9 +2615,8 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     # Save even if some operations failed (partial success). Atomic: a
     # killed worker must never leave the user's workbook truncated.
     try:
-        tmp = path + _WORKER_TMP_SUFFIX
-        wb.save(tmp)
-        os.replace(tmp, path)
+        with safe_open_write(path) as fh:
+            wb.save(fh)
     finally:
         for tmp_path in eq_tmp_files:
             with contextlib.suppress(OSError):

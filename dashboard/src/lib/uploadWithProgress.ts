@@ -252,12 +252,13 @@ async function uploadChunked(
     onProgress(file.size, file.size)
     return done as UploadResponse
   } catch (e: any) {
-    if (e?.name === 'AbortError') {
-      // Best-effort staging cleanup; keepalive survives page teardown.
-      void fetch(`/v1/upload/chunked/${uploadId}`, {
-        method: 'DELETE', credentials: 'same-origin', keepalive: true,
-      }).catch(() => {})
-    }
+    // Every error reaching here is terminal for this upload (an abort, a
+    // refused chunk or complete, exhausted retries): release the staging
+    // now rather than holding a slot of the caller's cap until the sweep.
+    // Best-effort; keepalive survives page teardown.
+    void fetch(`/v1/upload/chunked/${uploadId}`, {
+      method: 'DELETE', credentials: 'same-origin', keepalive: true,
+    }).catch(() => {})
     throw e
   }
 }

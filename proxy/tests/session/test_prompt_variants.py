@@ -18,6 +18,7 @@ from auth.path_policy import (  # noqa: E402
     SecurityContext,
     _build_execution_environment_section,
 )
+from core import placement
 
 
 def _ctx(
@@ -32,14 +33,8 @@ def _ctx(
     return SecurityContext(
         role="manager", username="alice", agent="my-agent",
         is_admin_agent=False,
-        target_kind=target_kind,
-        target_label=target_label,
-        target_machine_id="m1" if target_kind != "local" else "",
-        target_home_dir=home_dir if target_kind != "local" else "",
-        target_allow_full_fs=allow_full_fs,
-        target_os_user=os_user if target_kind != "local" else "",
-        target_user_dirs=user_dirs or {},
-    )
+        placement=placement.PlacementCapabilities(kind=target_kind, label=target_label, machine_id="m1" if target_kind != "local" else "", home_dir=home_dir if target_kind != "local" else "", allow_full_fs=allow_full_fs, os_user=os_user if target_kind != "local" else "", user_dirs=user_dirs or {}),
+        )
 
 
 class TestLocalSandbox:

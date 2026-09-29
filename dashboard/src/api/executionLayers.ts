@@ -7,6 +7,8 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { EngineDescriptor } from './engineDescriptor'
+import type { EngineSubscriptionStatus } from '../lib/status/engineSubscription'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,7 +46,7 @@ export interface Subscription {
   label: string
   oauth_email: string
   active_sessions: number
-  status: string          // 'active' | 'disabled' | 'expired'
+  status: EngineSubscriptionStatus
   created_at: string
   updated_at: string
   // Absent on non-OAuth rows and while the platform setting is off.
@@ -66,6 +68,11 @@ export interface LayerModel {
   pricing_cache_read: number
   supports_reasoning: number
   supports_xhigh: number
+  // Capability tier (1 = frontier … 4 = fast; null = untiered) and the
+  // one-line "good at". Builtins carry the platform's; admins tag custom
+  // rows. Optional: absent on an older proxy.
+  tier?: number | null
+  good_at?: string
   created_at: string
   updated_at: string
 }
@@ -80,7 +87,9 @@ export interface PoolStats {
 export interface ExecutionLayerInfo {
   name: string
   display_name: string
-  capabilities: Record<string, unknown>
+  // The engine's descriptor — the card reads its vendor, auth types, login
+  // flow, pricing policy from here (lib/engines.ts), never from `name`.
+  capabilities: EngineDescriptor
   subscriptions: {
     platform: Subscription[]
     user_count: number
@@ -92,6 +101,10 @@ export interface ExecutionLayerInfo {
 export interface UserLayerInfo {
   name: string
   display_name: string
+  // The engine's descriptor rides with the row (as on the admin tab), so the
+  // user card reads the vendor, the account label, the auth types and the
+  // login flow from it instead of comparing the engine id.
+  capabilities: EngineDescriptor
   user_subscriptions: Subscription[]
   platform_available: boolean
   allow_platform_auth: boolean
@@ -127,7 +140,7 @@ export interface LocalEndpointGroup {
   endpoint_url: string
   label: string
   has_api_key: boolean
-  engines: Record<string, { id: string; status: string; active_sessions: number; is_mine: boolean }>
+  engines: Record<string, { id: string; status: EngineSubscriptionStatus; active_sessions: number; is_mine: boolean }>
 }
 
 interface AdminEnginesPayload {
@@ -414,6 +427,10 @@ export function useUpdateModel() {
       pricing_cache_read?: number
       supports_reasoning?: boolean
       supports_xhigh?: boolean
+      // `tier: null` clears the tier; custom rows only (a builtin's tier
+      // comes with the platform and the server refuses the edit).
+      tier?: number | null
+      good_at?: string
     }) => {
       const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models/${id}`, {
         method: 'PUT',
@@ -541,22 +558,59 @@ export function useStartClaudeOAuth() {
   })
 }
 
+/** What a code paste did: `created` is false when the login matched an
+ * account already connected (its tokens were refreshed, nothing added);
+ * `previous_status` is that row's status before the refresh. */
+export interface ClaudeExchangeResult {
+  subscription: Subscription
+  subscription_type: string
+  rate_limit_tier: string
+  created: boolean
+  previous_status: string | null
+}
+
+/** A refused exchange. The state was consumed by the attempt, so the forms
+ * start a fresh flow before offering another try; a 403 (another user's
+ * state) is not retried. */
+export class ClaudeExchangeError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ClaudeExchangeError'
+    this.status = status
+  }
+}
+
 export function useExchangeClaudeOAuth() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ code, state, layer, label }: { code: string; state: string; layer: string; label?: string }) => {
+    mutationFn: async ({ code, state, layer, label }: { code: string; state: string; layer: string; label?: string }): Promise<ClaudeExchangeResult> => {
       const res = await apiFetch('/v1/oauth/claude/exchange', {
         method: 'POST',
         body: JSON.stringify({ code, state, layer, label }),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to exchange OAuth code')
+        throw new ClaudeExchangeError(res.status, err.detail || 'Failed to exchange OAuth code')
       }
       return res.json()
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
+}
+
+/** The sentence both connect forms show above the code box: the popup's
+ * session decides which account is connected. */
+export const CLAUDE_SECOND_ACCOUNT_HINT =
+  'The popup signs you in on platform.claude.com; to add a second account, sign out of your Claude account there first or use a private window.'
+
+/** The message when a paste matched an account that is already connected. */
+export function alreadyConnectedMessage(email: string): string {
+  return (
+    `That is the account you already connected (${email || 'the same account'}). ` +
+    'Its login was refreshed and no new account was added. To add a different account, ' +
+    'sign out of platform.claude.com in this browser first, or use a private window, then start again.'
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +644,13 @@ export function useOpenAIOAuthStatus() {
       return res.json() as Promise<{ status: 'pending' | 'completed' | 'failed'; message?: string }>
     },
   })
+}
+
+/** A finish that answers "not found" met a login an earlier finish already
+ *  consumed, with the subscription stored; any other refusal is a real one
+ *  and belongs on the card. */
+export function loginAlreadyFinished(err: unknown): boolean {
+  return err instanceof Error && /not found/i.test(err.message)
 }
 
 export function useFinishOpenAIOAuth() {

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from services.mcp import mcp_installer, mcp_registry, mcp_tarball
+from services.mcp import mcp_manifest_types as _mt
 
 logger = logging.getLogger("claude-proxy.mcp-sync")
 
@@ -243,7 +244,7 @@ async def sync_mcps_for_session(
             if manifest is None:
                 logger.warning("sync_mcps: unknown MCP in desired set: %s", name)
                 continue
-            if manifest.server.runtime in ("docker", "none"):
+            if not _mt.installs_on_host(manifest.server):
                 # Docker MCPs live on the platform host; context-only MCPs
                 # (runtime "none") have no server to install anywhere. Skip
                 # satellite install for both.
@@ -254,26 +255,7 @@ async def sync_mcps_for_session(
                 logger.exception("tarball build failed for %s: %s", name, e)
                 continue
             shipped_hashes[name] = tb.version_hash
-            specs.append({
-                "name": name,
-                "category": manifest.category,
-                "runtime": manifest.server.runtime,
-                "source": manifest.server.source,
-                "manifest_data": _manifest_to_dict(manifest),
-                "tarball_b64": tb.tarball_b64,
-                "version_hash": tb.version_hash,
-                # Optional: system_requirements forwarded so the satellite
-                # installer runs its pre-install checks.
-                "system_requirements": {
-                    "debian": manifest.system_requirements.debian,
-                    "ubuntu": manifest.system_requirements.ubuntu,
-                    "rhel": manifest.system_requirements.rhel,
-                    "arch": manifest.system_requirements.arch,
-                    "macos_brew": manifest.system_requirements.macos_brew,
-                    "node_min": manifest.system_requirements.node_min,
-                    "notes": manifest.system_requirements.notes,
-                },
-            })
+            specs.append(_install_spec(name, manifest, tb))
 
         command_id = str(uuid.uuid4())
 
@@ -394,7 +376,7 @@ def _diff(
         manifest = mcp_registry.get_manifest(name)
         if manifest is None:
             continue
-        if manifest.server.runtime in ("docker", "none"):
+        if not _mt.installs_on_host(manifest.server):
             # Docker = platform-hosted; "none" = context-only (no server).
             # Neither ever installs on a satellite.
             continue
@@ -414,6 +396,34 @@ def _diff(
             to_remove.add(name)
 
     return to_install, to_update, to_remove
+
+
+def _install_spec(name: str, manifest, tb) -> dict:
+    """One entry of ``mcps_to_install``: what the satellite's installer needs
+    beside the tarball, ``source_build`` included (the packages the manifest
+    allows to build from source; a satellite older than 0.5.130 ignores the
+    key and installs the way its own vendored installer does)."""
+    return {
+        "name": name,
+        "category": manifest.category,
+        "runtime": manifest.server.runtime,
+        "source": manifest.server.source,
+        "source_build": list(getattr(manifest.server, "source_build", None) or []),
+        "manifest_data": _manifest_to_dict(manifest),
+        "tarball_b64": tb.tarball_b64,
+        "version_hash": tb.version_hash,
+        # Optional: system_requirements forwarded so the satellite
+        # installer runs its pre-install checks.
+        "system_requirements": {
+            "debian": manifest.system_requirements.debian,
+            "ubuntu": manifest.system_requirements.ubuntu,
+            "rhel": manifest.system_requirements.rhel,
+            "arch": manifest.system_requirements.arch,
+            "macos_brew": manifest.system_requirements.macos_brew,
+            "node_min": manifest.system_requirements.node_min,
+            "notes": manifest.system_requirements.notes,
+        },
+    }
 
 
 def _manifest_to_dict(manifest) -> dict:

@@ -1,24 +1,21 @@
 import { Outlet, Navigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
-
-const ROLE_LEVEL: Record<string, number> = {
-  admin: 0,
-  creator: 1,
-  member: 2,
-}
+import { PLATFORM_RANK, ROLE, type PlatformRole } from '../lib/permissions'
 
 interface RequireRoleProps {
-  minRole: 'admin' | 'creator'
+  minRole: Exclude<PlatformRole, 'member'>
 }
 
+/** The platform-role gate for a route: a role the table does not know is
+ * redirected, and a floor it does not know admits nobody but the admin. */
 export default function RequireRole({ minRole }: RequireRoleProps) {
   const { user } = useAuth()
   if (!user) return <Navigate to="/" replace />
 
-  const userLevel = ROLE_LEVEL[user.role] ?? 99
-  const requiredLevel = ROLE_LEVEL[minRole] ?? 0
+  const userRank = PLATFORM_RANK[user.role] ?? -1
+  const requiredRank = PLATFORM_RANK[minRole] ?? PLATFORM_RANK[ROLE.ADMIN]
 
-  if (userLevel > requiredLevel) {
+  if (userRank < requiredRank) {
     return <Navigate to="/" replace />
   }
 

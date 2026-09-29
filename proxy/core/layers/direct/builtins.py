@@ -100,7 +100,7 @@ def decide(tier: str, mode: str) -> str:
     session mode — the CLI hook's dashboard branch, tier by tier."""
     if tier == TIER_OPEN:
         return "allow"
-    if mode == "plan":
+    if mode in ("plan", "judge"):
         return "deny"
     if mode in ("dontAsk", "auto"):
         return "allow"
@@ -129,6 +129,8 @@ def gate(session, tool_call: dict, mode: str) -> tuple[str, str]:
             return "deny", decision.reason or f"{name} denied by the session's file policy"
     outcome = decide(builtin.tier, mode)
     if outcome == "deny":
+        if mode == "judge":
+            return "deny", f"{name} is not available to a judge — a judge reads, it does not write."
         return "deny", f"{name} is not available in plan mode (reads only)."
     return outcome, ""
 

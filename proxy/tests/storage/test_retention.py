@@ -100,6 +100,37 @@ def test_aged_chat_files_deleted_and_flagged(temp_db, monkeypatch):
     assert stats["bytes_freed"] == 400
 
 
+def test_flag_skips_a_chat_resumed_after_the_candidate_query(temp_db, monkeypatch):
+    """A chat resumed between the candidate query and the flag keeps its
+    session id AND its files: the sweep flags first, with the candidate
+    cutoff, and unlinks only what it flagged."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    sid_a, sid_b = _uuid(), _uuid()
+    for cid, sid in (("ca", sid_a), ("cb", sid_b)):
+        db.create_chat(cid, "user-admin", "a1")
+        db.update_chat(cid, session_id=sid)
+        _backdate_chat(cid, 60)
+    fa = _mk_claude(_home("a1", "alice"), sid_a)
+    fb = _mk_claude(_home("a1", "alice"), sid_b)
+    real_flag = retention.task_store.flag_chats_for_retention
+
+    def resumed_then_flag(chat_ids, *args, **kwargs):
+        db.update_chat("ca", session_id=sid_a)  # a resume bumps updated_at
+        return real_flag(chat_ids, *args, **kwargs)
+
+    monkeypatch.setattr(retention.task_store, "flag_chats_for_retention", resumed_then_flag)
+
+    stats = _sweep(days=30)
+
+    assert db.get_chat("ca")["session_id"] == sid_a and fa.exists()
+    assert db.get_chat("ca")["pending_history_seed"] == ""
+    assert db.get_chat("cb")["session_id"] is None and not fb.exists()
+    assert stats["chats_flagged"] == 1
+    assert stats["session_files_deleted"] == 1
+
+
 def test_aged_agent_scope_chat_uses_workspace_home(temp_db, monkeypatch):
     monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
     db = temp_db
@@ -402,3 +433,86 @@ def test_storage_usage_shape(temp_db):
     assert usage["retention"]["enabled"] is True
     assert usage["retention"]["days"] == retention.DEFAULT_DAYS
     assert usage["retention"]["last_sweep"] is None
+
+
+def test_storage_usage_counts_the_upload_staging(temp_db, monkeypatch):
+    """Chunked uploads in flight hold disk outside every agent tree; the
+    admin breakdown shows them."""
+    from api.media import uploads
+    monkeypatch.setattr(uploads, "staged_bytes_total", lambda: 4321)
+    assert retention.compute_storage_usage()["upload_staging_bytes"] == 4321
+
+
+# ---------------------------------------------------------------------------
+# The sweep entry point off the loop, and the batched verdict deletion
+# ---------------------------------------------------------------------------
+
+def test_run_sweep_reads_and_writes_off_the_loop(temp_db, loop_db_guard, monkeypatch):
+    """The settings read and the last-run stats write of ``run_sweep`` are
+    executor work: the loop-thread guard stays silent and the stats land."""
+    import asyncio
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    monkeypatch.setattr(retention, "_build_live_snapshot", LiveSnapshot)
+    db = temp_db
+
+    async def scenario():
+        with loop_db_guard.active():
+            return await retention.run_sweep()
+
+    stats = asyncio.run(scenario())
+    assert stats["dry_run"] is False and stats["errors"] == 0
+    assert db.get_platform_setting("session_retention_last_sweep")
+
+
+def _verdict(days_old: float) -> str:
+    from storage.checks import db_checks
+    from storage.pg import get_conn
+    row = db_checks.insert_verdict(
+        agent="a1", owner="", check_name="coding", section="judge", status="pass", passed=True,
+        score=1.0, findings=[], summary="fine", reason="", session_id="s", chat_id="c", run_id="",
+        judge_run_id="", user_sub="", round_no=1, ran_on="local", engine="", model="",
+        cost_usd=0.0, duration_ms=1, script_sha256="")
+    iso = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    with get_conn() as conn:
+        conn.execute("UPDATE check_verdicts SET created_at=%s WHERE id=%s", (iso, row["id"]))
+        conn.commit()
+    return row["id"]
+
+
+def test_verdict_deletion_runs_in_batches(temp_db, monkeypatch):
+    """Aged verdicts go in committed batches, each statement bounded, so the
+    first sweep of a large install never runs one delete for minutes."""
+    import contextlib
+    from storage.checks import db_checks
+    from storage import pg
+    aged = [_verdict(40) for _ in range(5)]
+    fresh = _verdict(3)
+    monkeypatch.setattr(db_checks, "_VERDICT_DELETE_BATCH", 2, raising=False)
+    deletes: list[str] = []
+
+    class _Spy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.lstrip().upper().startswith("DELETE"):
+                deletes.append(sql)
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_get_conn = pg.get_conn
+
+    @contextlib.contextmanager
+    def spied(**kw):
+        with real_get_conn(**kw) as conn:
+            yield _Spy(conn)
+
+    monkeypatch.setattr(db_checks, "get_conn", spied)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    assert db_checks.delete_verdicts_before(cutoff, dry_run=True) == 5
+    assert db_checks.delete_verdicts_before(cutoff) == 5
+    assert len(deletes) == 3  # 2 + 2 + 1, the short batch ends the loop
+    assert [r["id"] for r in db_checks.list_verdicts("a1")] == [fresh]
+    assert not any(r["id"] in aged for r in db_checks.list_verdicts("a1"))

@@ -18,7 +18,7 @@ You have access to a notification system that can deliver alerts to users via th
 
 ### Rules
 
-- **Scope**: `user` (default) goes to the user you're talking to — any agent can create these; `agent` goes to ALL users of this agent and requires manager or admin role. When in doubt, `scope: "user"`.
+- **Scope**: `user` (default) goes to the user you're talking to — any agent can create these; `agent` goes to ALL users of this agent and requires the editor, manager or admin role. When in doubt, `scope: "user"`.
 - **Simple reminders**: prefer `create_notification` with `run_at` over `create_one_time_task` — a notification is lighter and needs no LLM session. Use a task only when the reminder must perform actions.
 - `run_at` = one-time future, `schedule` = cron recurring, omit both for immediate delivery.
 - **Managing**: call `list_notifications` first to find the id; prefer `edit_notification` over cancel+recreate; `pause_notification` for temporary stops; `cancel_notification` permanently deletes and cannot be undone.

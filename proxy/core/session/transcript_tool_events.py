@@ -29,6 +29,9 @@ import json
 import logging
 import threading
 
+from core.events import tool_roles
+from core.session import session_kind
+
 logger = logging.getLogger("claude-proxy.transcript_tool_events")
 
 # Result-content cap before persisting — the PostToolUse hook's exact policy,
@@ -37,12 +40,20 @@ RESULT_MAX_LINES = 500
 RESULT_MAX_CHARS = 50000
 
 # Tools whose result the hook never forwards headless (dedicated rendering /
-# pure noise) — mirror it: persist the block, attach no result fields.
-SKIP_RESULT_ATTACH = frozenset({
-    "AskUserQuestion", "Task", "EnterPlanMode", "ExitPlanMode",
-    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskStop", "TaskOutput",
+# pure noise) — mirror it: persist the block, attach no result fields. By
+# ROLE (the question cards, the plan-mode rows, the task list) plus the
+# display MCP's own tools (the image / link itself just appeared).
+SKIP_RESULT_ATTACH_ROLES = frozenset({
+    tool_roles.QUESTION, tool_roles.PLAN_ENTER, tool_roles.PLAN_EXIT,
+    tool_roles.TASK_READ, tool_roles.TASK_WRITE,
+})
+SKIP_RESULT_ATTACH_MCP = frozenset({
     "mcp__display__display_image", "mcp__display__send_url", "mcp__display__send_file",
 })
+
+
+def skips_result_attach(name: str) -> bool:
+    return tool_roles.role_of(name) in SKIP_RESULT_ATTACH_ROLES or name in SKIP_RESULT_ATTACH_MCP
 
 
 class TailLocks:
@@ -93,6 +104,7 @@ def note_sent_prompt(chat_id: str, text: str) -> None:
         if now - ts > _SENT_PROMPT_TTL_S:
             _sent_prompts.pop(cid, None)
     _sent_prompts[chat_id] = (text, now)
+    logger.debug("sent-prompt note chat=%s len=%d", chat_id[:8], len(text))
 
 
 def _whitespace_folded(text: str) -> str:
@@ -118,7 +130,14 @@ def consume_sent_prompt(chat_id: str, text: str) -> bool:
     rec = _sent_prompts.get(chat_id)
     if rec and _whitespace_folded(rec[0]) == _whitespace_folded(text):
         _sent_prompts.pop(chat_id, None)
+        logger.debug("sent-prompt consumed chat=%s len=%d", chat_id[:8], len(text))
         return True
+    if rec:
+        # A note that does not match what the CLI journaled is the shape
+        # drifting somewhere between the delivery and the journal — the
+        # first user row will land twice; say so where the T1 log is read.
+        logger.info("sent-prompt mismatch chat=%s note_len=%d journal_len=%d",
+                    chat_id[:8], len(rec[0]), len(text or ""))
     return False
 
 
@@ -161,23 +180,25 @@ def truncate_result(text: str) -> str:
 
 
 def result_summary(tool_name: str, result_text: str) -> str:
-    """One-line result summary — the hook's ``_extract_summary`` heuristics."""
-    if tool_name == "Bash":
+    """One-line result summary — the hook's ``_extract_summary`` heuristics,
+    by role."""
+    role = tool_roles.role_of(tool_name)
+    if role == tool_roles.SHELL:
         lines = result_text.count("\n") + 1 if result_text.strip() else 0
         return f"{lines} lines" if lines else "ok"
-    if tool_name == "Grep":
+    if role == tool_roles.SEARCH:
         if not result_text.strip():
             return "no matches"
         return f"{len([l for l in result_text.strip().splitlines() if l.strip()])} results"
-    if tool_name == "Glob":
+    if role == tool_roles.GLOB:
         if not result_text.strip():
             return "no files"
         return f"{len([l for l in result_text.strip().splitlines() if l.strip()])} files"
-    if tool_name == "Read":
+    if role == tool_roles.READ:
         if not result_text.strip():
             return "empty file"
         return f"{result_text.count(chr(10)) + 1} lines"
-    if tool_name in ("Write", "Edit"):
+    if role == tool_roles.WRITE:
         if "error" in result_text.lower()[:100]:
             first_line = result_text.strip().splitlines()[0] if result_text.strip() else ""
             return f"error: {first_line[:80]}"
@@ -193,7 +214,7 @@ def result_summary(tool_name: str, result_text: str) -> str:
 def attach_result(block: dict, result_text: str, *, is_error: bool = False) -> dict:
     """Attach a (truncated) result to a pending tool block — unless the tool is
     in the hook's skip set, in which case the block persists input-only."""
-    if block.get("name") in SKIP_RESULT_ATTACH:
+    if skips_result_attach(block.get("name", "")):
         return block
     block["tool_result"] = truncate_result(result_text)
     block["result_summary"] = result_summary(block.get("name", ""), result_text)
@@ -234,6 +255,7 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
                 session_id[:8], chat_id)
             return 0
         from core.session import visibility as _vis
+        from core.session.session_state import get_session_client_type
         from services.billing import usage_service
         from services.engines import subscription_pool
         from config import get_model_pricing, get_model_provider
@@ -267,7 +289,13 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
                 "user_sub": user_sub,
                 "agent": agent,
                 "scope": scope,
-                "source_type": rec.get("source_type") or "interactive",
+                # The DRIVER's kind (the session's, not the row's — pump
+                # parity): an interactive task run bills as a task turn, a
+                # person's session as a chat turn; "interactive" only for a
+                # row that carries no kind at all.
+                "source_type": (session_kind.driver_source_type(
+                                    get_session_client_type(session_id), rec)
+                                if rec.get("source_type") else "interactive"),
                 "source_id": chat_id,
                 "cost_usd": max(0.0, round(cost, 6)),
                 "input_tokens": acc["input_tokens"],

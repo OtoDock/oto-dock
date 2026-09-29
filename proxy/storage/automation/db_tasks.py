@@ -5,9 +5,11 @@ Part of the ``storage.database`` facade; import names from
 synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
-from datetime import datetime, timezone
+import contextlib
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from storage.automation import run_status
 from storage.pg import get_conn
 
 
@@ -21,7 +23,7 @@ def create_run(run_id: str, task_id: str, agent: str, trigger_type: str,
                status, prompt_preview, prompt_text, task_type, scope, created_by)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (run_id, task_id, agent, trigger_type, trigger_source,
-             "pending", prompt[:200], prompt, task_type, scope, created_by),
+             run_status.PENDING, prompt[:200], prompt, task_type, scope, created_by),
         )
         conn.commit()
 
@@ -30,10 +32,13 @@ def update_run(run_id: str, *, status: str | None = None, output_text: str | Non
                error_message: str | None = None, session_id: str | None = None,
                started_at: str | None = None, completed_at: str | None = None,
                duration_ms: int | None = None, cost_usd: float | None = None,
-               chat_id: str | None = None) -> None:
+               chat_id: str | None = None,
+               background_pending: int | None = None) -> None:
     fields: list[tuple[str, Any]] = []
     if status is not None:
         fields.append(("status", status))
+    if background_pending is not None:
+        fields.append(("background_pending", background_pending))
     if output_text is not None:
         fields.append(("output_text", output_text))
     if error_message is not None:
@@ -58,13 +63,31 @@ def update_run(run_id: str, *, status: str | None = None, output_text: str | Non
     with get_conn() as conn:
         conn.execute(sql, values)
         conn.commit()
+    if run_status.is_terminal(status):
+        for hook in list(_run_finished_hooks):
+            with contextlib.suppress(Exception):
+                hook(run_id, status)
+
+
+# The listeners told after a terminal write commits (the platform catalog's
+# ``tasks`` feed, APPS.md). Every writer of a terminal status goes through
+# ``update_run``, so this is the one site; the vocabulary is
+# ``storage/automation/run_status.py``.
+_run_finished_hooks: list = []
+
+
+def on_run_finished(hook) -> None:
+    """Register ``hook(run_id, status)``; called after the terminal write
+    commits, on the writer's thread."""
+    if hook not in _run_finished_hooks:
+        _run_finished_hooks.append(hook)
 
 
 def list_orphaned_runs() -> list[dict]:
     """Task runs stuck in running/pending after a proxy restart (recovery)."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM task_runs WHERE status IN ('running', 'pending')"
+            "SELECT * FROM task_runs WHERE status = ANY(%s)", (sorted(run_status.LIVE),),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -80,22 +103,28 @@ def mark_orphaned_runs_failed(
     Returns the number of rows updated.  Idempotent — safe to call on every
     startup even if no runs are orphaned.
     """
+    from services.scheduler import task_kinds
     now = datetime.now(timezone.utc).isoformat()
+    # An app handler's run follows its delivery row, which survives the
+    # restart (APPS.md "Handlers") — never blind-failed here.
     with get_conn() as conn:
         if exclude_ids:
             cur = conn.execute(
-                "UPDATE task_runs SET status='failed', "
+                "UPDATE task_runs SET status=%s, "
                 "error_message=%s, completed_at=%s "
-                "WHERE status IN ('running', 'pending') "
+                "WHERE status = ANY(%s) "
+                "AND COALESCE(task_type, '') <> %s "
                 "AND id != ALL(%s)",
-                (reason, now, list(exclude_ids)),
+                (run_status.FAILED, reason, now, sorted(run_status.LIVE), task_kinds.RUN_APP,
+                 list(exclude_ids)),
             )
         else:
             cur = conn.execute(
-                "UPDATE task_runs SET status='failed', "
+                "UPDATE task_runs SET status=%s, "
                 "error_message=%s, completed_at=%s "
-                "WHERE status IN ('running', 'pending')",
-                (reason, now),
+                "WHERE status = ANY(%s) "
+                "AND COALESCE(task_type, '') <> %s",
+                (run_status.FAILED, reason, now, sorted(run_status.LIVE), task_kinds.RUN_APP),
             )
         conn.commit()
         return cur.rowcount
@@ -122,6 +151,20 @@ def get_run_for_chat(chat_id: str) -> dict | None:
             (chat_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_runs_by_ids(run_ids: list[str]) -> dict[str, dict]:
+    """``run_id → row`` for the ids that exist, one query; ``{}`` for an
+    empty list with no query. The Active-now seed resolves the run behind
+    every live task chat this way instead of one ``get_run`` per row."""
+    ids = list(dict.fromkeys(r for r in run_ids if r))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ANY(%s)", (ids,),
+        ).fetchall()
+        return {r["id"]: dict(r) for r in rows}
 
 
 def get_runs_for_chats(chat_ids: list[str]) -> dict[str, dict]:
@@ -152,9 +195,9 @@ def list_live_run_chats(task_id: str) -> list[str]:
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT DISTINCT chat_id FROM task_runs
-                WHERE task_id=%s AND status IN ('running','pending')
+                WHERE task_id=%s AND status = ANY(%s)
                   AND chat_id IS NOT NULL AND chat_id <> ''""",
-            (task_id,),
+            (task_id, sorted(run_status.LIVE)),
         ).fetchall()
         return [r["chat_id"] for r in rows]
 
@@ -169,8 +212,8 @@ def has_live_run(chat_id: str) -> bool:
     with get_conn() as conn:
         row = conn.execute(
             """SELECT 1 AS live FROM task_runs
-                WHERE chat_id=%s AND status IN ('running','pending') LIMIT 1""",
-            (chat_id,),
+                WHERE chat_id=%s AND status = ANY(%s) LIMIT 1""",
+            (chat_id, sorted(run_status.LIVE)),
         ).fetchone()
         return row is not None
 
@@ -215,28 +258,10 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     ``chat_read`` upserts for personal AND shared-only chats). Runs without a
     chat are never unread.
     """
-    conditions = []
-    params: list[Any] = []
-    if exclude_task_type:
-        conditions.append("tr.task_type IS DISTINCT FROM %s")
-        params.append(exclude_task_type)
-    if agent:
-        conditions.append("tr.agent=%s")
-        params.append(agent)
-    if agents_filter is not None:
-        if edge_agents_filter:
-            conditions.append(
-                "(tr.agent = ANY(%s) OR (tr.agent = ANY(%s) "
-                "AND tr.scope IS DISTINCT FROM 'user'))"
-            )
-            params.append(list(agents_filter))
-            params.append(list(edge_agents_filter))
-        else:
-            conditions.append("tr.agent = ANY(%s)")
-            params.append(list(agents_filter))
-    if status:
-        conditions.append("tr.status=%s")
-        params.append(status)
+    conditions, params = _run_conditions(
+        "tr.", agent, status, scope_user_sub, created_by, exclude_task_type,
+        agents_filter, edge_agents_filter,
+    )
     if task_id:
         conditions.append("tr.task_id=%s")
         params.append(task_id)
@@ -246,14 +271,10 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
     if chat_id:
         conditions.append("tr.chat_id=%s")
         params.append(chat_id)
-    if scope_user_sub is not None:
-        conditions.append("(tr.scope='agent' OR (tr.scope='user' AND tr.created_by=%s))")
-        params.append(scope_user_sub)
-    if created_by:
-        conditions.append("tr.created_by=%s")
-        params.append(created_by)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     params += [limit, offset]
+    # NULLS LAST keeps the order the COALESCE sort gave (a pending run has
+    # no start) and lets idx_runs_agent_started serve it (schema.py).
     with get_conn() as conn:
         rows = conn.execute(
             f"""SELECT tr.*,
@@ -264,10 +285,57 @@ def list_runs(limit: int = 50, offset: int = 0, agent: str | None = None,
                   FROM task_runs tr
              LEFT JOIN chats c ON c.id = tr.chat_id
              LEFT JOIN chat_reads r ON r.chat_id = c.id AND r.user_sub = c.user_sub
-                {where} ORDER BY COALESCE(tr.started_at, '') DESC LIMIT %s OFFSET %s""",
+                {where} ORDER BY tr.started_at DESC NULLS LAST LIMIT %s OFFSET %s""",
             params,
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def _run_conditions(prefix: str, agent: str | None, status: str | None,
+                    scope_user_sub: str | None, created_by: str | None,
+                    exclude_task_type: str | None, agents_filter: list[str] | None,
+                    edge_agents_filter: list[str] | None,
+                    ) -> tuple[list[str], list[Any]]:
+    """The WHERE terms the run listing and its count share, so a page and
+    its total always agree. A reach of exactly one agent is an equality
+    (the agent index's first key); a wider reach is ``= ANY``."""
+    conditions: list[str] = []
+    params: list[Any] = []
+    if exclude_task_type:
+        conditions.append(f"{prefix}task_type IS DISTINCT FROM %s")
+        params.append(exclude_task_type)
+    if agent:
+        conditions.append(f"{prefix}agent=%s")
+        params.append(agent)
+    if agents_filter is not None and agent and agent in agents_filter:
+        pass  # the equality already keeps the query inside the reach
+    elif agents_filter is not None and agent and edge_agents_filter and agent in edge_agents_filter:
+        conditions.append(f"{prefix}scope IS DISTINCT FROM 'user'")
+    elif agents_filter is not None:
+        if edge_agents_filter:
+            conditions.append(
+                f"({prefix}agent = ANY(%s) OR ({prefix}agent = ANY(%s) "
+                f"AND {prefix}scope IS DISTINCT FROM 'user'))"
+            )
+            params.append(list(agents_filter))
+            params.append(list(edge_agents_filter))
+        elif len(agents_filter) == 1:
+            conditions.append(f"{prefix}agent=%s")
+            params.append(agents_filter[0])
+        else:
+            conditions.append(f"{prefix}agent = ANY(%s)")
+            params.append(list(agents_filter))
+    if status:
+        conditions.append(f"{prefix}status=%s")
+        params.append(status)
+    if scope_user_sub is not None:
+        conditions.append(
+            f"({prefix}scope='agent' OR ({prefix}scope='user' AND {prefix}created_by=%s))")
+        params.append(scope_user_sub)
+    if created_by:
+        conditions.append(f"{prefix}created_by=%s")
+        params.append(created_by)
+    return conditions, params
 
 
 def update_latest_run_status_for_chat(
@@ -280,9 +348,10 @@ def update_latest_run_status_for_chat(
     pre-resume terminal state. The scheduler's own runs are never clobbered:
     a chat-sourced pump only exists on a task chat while no scheduler run
     drives it. ``only_from`` guards the transition: the pump's terminal flip
-    passes ``("running",)`` so it only closes a turn IT opened — a wedged-pump
-    reap stamps ``failed`` + reason first, and that richer verdict must win.
-    Returns the flipped run id (None: no runs / guard didn't match)."""
+    passes ``(run_status.RUNNING,)`` so it only closes a turn IT opened — a
+    wedged-pump reap stamps ``failed`` + reason first, and that richer
+    verdict must win. Returns the flipped run id (None: no runs / guard
+    didn't match)."""
     if not chat_id:
         return None
     guard = ""
@@ -305,14 +374,32 @@ def update_latest_run_status_for_chat(
 def count_active_delegate_runs(created_by: str) -> int:
     """Active (pending/running) delegated-worker runs attributed to one
     creator — the input to the per-creator spawn cap."""
+    from services.scheduler import task_kinds
     with get_conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS cnt FROM task_runs "
-            "WHERE task_type='delegate' AND status IN ('pending','running') "
+            "WHERE task_type=%s AND status = ANY(%s) "
             "AND created_by=%s",
-            (created_by,),
+            (task_kinds.RUN_DELEGATE, sorted(run_status.LIVE), created_by),
         ).fetchone()
         return row["cnt"] if row else 0
+
+
+def count_runs_by_task(task_ids: list[str]) -> dict[str, int]:
+    """Runs recorded in ``task_runs`` per task id — what a task view shows as
+    its run count. The ``dynamic_tasks.run_count`` column is a continuation's
+    bound (``increment_dynamic_task_run_count``) and stays 0 for every
+    scheduled task, so it must never be read as "how many times it ran"."""
+    ids = [t for t in dict.fromkeys(task_ids) if t]
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT task_id, COUNT(*) AS cnt FROM task_runs "
+            "WHERE task_id = ANY(%s) GROUP BY task_id",
+            (ids,),
+        ).fetchall()
+    return {row["task_id"]: int(row["cnt"]) for row in rows}
 
 
 def get_run_count(agent: str | None = None, status: str | None = None,
@@ -321,34 +408,10 @@ def get_run_count(agent: str | None = None, status: str | None = None,
                   exclude_task_type: str | None = None,
                   agents_filter: list[str] | None = None,
                   edge_agents_filter: list[str] | None = None) -> int:
-    conditions = []
-    params: list[Any] = []
-    if exclude_task_type:
-        conditions.append("task_type IS DISTINCT FROM %s")
-        params.append(exclude_task_type)
-    if agent:
-        conditions.append("agent=%s")
-        params.append(agent)
-    if agents_filter is not None:
-        if edge_agents_filter:
-            conditions.append(
-                "(agent = ANY(%s) OR (agent = ANY(%s) "
-                "AND scope IS DISTINCT FROM 'user'))"
-            )
-            params.append(list(agents_filter))
-            params.append(list(edge_agents_filter))
-        else:
-            conditions.append("agent = ANY(%s)")
-            params.append(list(agents_filter))
-    if status:
-        conditions.append("status=%s")
-        params.append(status)
-    if scope_user_sub is not None:
-        conditions.append("(scope='agent' OR (scope='user' AND created_by=%s))")
-        params.append(scope_user_sub)
-    if created_by:
-        conditions.append("created_by=%s")
-        params.append(created_by)
+    conditions, params = _run_conditions(
+        "", agent, status, scope_user_sub, created_by, exclude_task_type,
+        agents_filter, edge_agents_filter,
+    )
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with get_conn() as conn:
         row = conn.execute(f"SELECT COUNT(*) AS cnt FROM task_runs {where}", params).fetchone()
@@ -361,17 +424,22 @@ def get_run_count(agent: str | None = None, status: str | None = None,
 
 
 def get_stats() -> dict:
-    today = datetime.now(timezone.utc).date().isoformat()
+    # A day is a range on the ISO text (idx_runs_started_at serves it); a
+    # LIKE on the prefix could not use the index.
+    today = datetime.now(timezone.utc).date()
+    day, next_day = today.isoformat(), (today + timedelta(days=1)).isoformat()
     with get_conn() as conn:
         total_today = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM task_runs WHERE started_at LIKE %s", (f"{today}%",)
+            "SELECT COUNT(*) AS cnt FROM task_runs WHERE started_at >= %s AND started_at < %s",
+            (day, next_day),
         ).fetchone()["cnt"]
         running = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM task_runs WHERE status='running'"
+            "SELECT COUNT(*) AS cnt FROM task_runs WHERE status=%s", (run_status.RUNNING,),
         ).fetchone()["cnt"]
         failed_today = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM task_runs WHERE status='failed' AND started_at LIKE %s",
-            (f"{today}%",),
+            "SELECT COUNT(*) AS cnt FROM task_runs "
+            "WHERE status=%s AND started_at >= %s AND started_at < %s",
+            (run_status.FAILED, day, next_day),
         ).fetchone()["cnt"]
         return {"total_today": total_today, "running": running, "failed_today": failed_today}
 
@@ -400,8 +468,15 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                         max_runs: int | None = None,
                         until_at: str | None = None,
                         override_model: str | None = None,
-                        override_execution_path: str | None = None) -> None:
+                        override_execution_path: str | None = None,
+                        app_id: str | None = None,
+                        app_handler: str | None = None,
+                        checks: str = "") -> None:
     """Insert a dynamic_tasks row.
+
+    ``app_id`` + ``app_handler`` mark an app handler's schedule row
+    (``task_type='app'``, APPS.md "Handlers"): the runner writes a delivery
+    for it instead of opening a session.
 
     ``community_template`` + ``community_template_item_slug`` are populated
     when the row is seeded by the community-agents installer. The
@@ -428,8 +503,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                 notification_mode, notify_severity, user_tz,
                 community_template, community_template_item_slug,
                 target_chat_id, max_runs, until_at,
-                override_model, override_execution_path)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                override_model, override_execution_path, app_id, app_handler, checks)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (task_id, agent, name, prompt, llm_mode, task_type, schedule, run_at,
              delay_seconds, interval_seconds, timeout_seconds, now, created_by,
              on_complete_agent, on_complete_prompt, on_complete_session_id,
@@ -437,15 +512,54 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
              notification_mode, notify_severity, user_tz,
              community_template, community_template_item_slug,
              target_chat_id, max_runs, until_at,
-             override_model or "", override_execution_path or ""),
+             override_model or "", override_execution_path or "", app_id, app_handler,
+             checks or ""),
         )
         conn.commit()
+
+
+def find_template_task(agent: str, item_slug: str, created_by: str | None = None) -> dict | None:
+    """The task a template or bundle item seeded (the idempotency key)."""
+    with get_conn() as conn:
+        if created_by:
+            row = conn.execute(
+                "SELECT * FROM dynamic_tasks WHERE agent=%s AND community_template_item_slug=%s "
+                "AND created_by=%s", (agent, item_slug, created_by)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM dynamic_tasks WHERE agent=%s AND community_template_item_slug=%s "
+                "AND scope='agent'", (agent, item_slug)).fetchone()
+        return dict(row) if row else None
+
+
+def list_app_handler_tasks(app_id: str) -> list[dict]:
+    """The schedule rows of one app's handlers (APPS.md "Handlers")."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dynamic_tasks WHERE app_id=%s ORDER BY app_handler", (app_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_dynamic_task(task_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM dynamic_tasks WHERE id=%s", (task_id,)).fetchone()
         return dict(row) if row else None
+
+
+def get_dynamic_task_names(task_ids: list[str]) -> dict[str, str]:
+    """``task_id → name`` for the definitions that exist AND carry a name,
+    one query; ``{}`` for an empty list with no query. A row with no name is
+    absent, so ``names.get(task_id)`` reads exactly as ``dyn.get("name")``
+    did per row."""
+    ids = list(dict.fromkeys(t for t in task_ids if t))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name FROM dynamic_tasks WHERE id = ANY(%s)", (ids,),
+        ).fetchall()
+        return {r["id"]: r["name"] for r in rows if r["name"]}
 
 
 def list_dynamic_tasks(agent: str | None = None, enabled_only: bool = False) -> list[dict]:
@@ -508,6 +622,194 @@ def count_recent_runs_by_agent(since: str, user_sub: str) -> dict[str, int]:
         return {r["agent"]: r["cnt"] for r in rows}
 
 
+def count_active_clocked_tasks(*, created_by: str | None = None, scope: str | None = None,
+                               agent: str | None = None) -> int:
+    """The rows that count toward the task caps (``api/tasks/task_quota.py``,
+    whose ``counted_task`` is this predicate's Python twin): enabled,
+    scheduled or one-time and not yet fired, not an app handler's row, not
+    seeded by a template."""
+    from services.scheduler import task_kinds
+    conditions = ["enabled = TRUE", "task_type = ANY(%s)", "NOT fired",
+                  "app_id IS NULL", "community_template IS NULL"]
+    params: list[Any] = [[task_kinds.SCHEDULED, task_kinds.ONE_TIME]]
+    if created_by is not None:
+        conditions.append("created_by = %s")
+        params.append(created_by)
+    if scope is not None:
+        conditions.append("scope = %s")
+        params.append(scope)
+    if agent is not None:
+        conditions.append("agent = %s")
+        params.append(agent)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM dynamic_tasks WHERE {' AND '.join(conditions)}",
+            params,
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def count_active_continuations(*, target_chat_id: str | None = None,
+                               agent: str | None = None) -> int:
+    """The pending self-continuations of one chat or one agent."""
+    from services.scheduler import task_kinds
+    conditions = ["enabled = TRUE", "task_type = %s"]
+    params: list[Any] = [task_kinds.CONTINUATION]
+    if target_chat_id is not None:
+        conditions.append("target_chat_id = %s")
+        params.append(target_chat_id)
+    if agent is not None:
+        conditions.append("agent = %s")
+        params.append(agent)
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM dynamic_tasks WHERE {' AND '.join(conditions)}",
+            params,
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+def _transferable(kinds: list[str]) -> tuple[str, list[Any]]:
+    """The predicate over agent-scope ``dynamic_tasks`` rows, with its
+    parameters, of the tasks of ``kinds`` a transfer visits. A
+    self-continuation is visited only when its chat runs as the agent itself
+    (a Shared-only agent's shared chat or an agent-scope task chat, which
+    take the editor tier to drive) or is gone: one on a phone call's chat
+    is its caller's wake at their own role, whatever that role is, and
+    stays theirs."""
+    from core.session.visibility import SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX
+    from services.scheduler import task_kinds
+    others = [k for k in kinds if k != task_kinds.CONTINUATION]
+    if task_kinds.CONTINUATION not in kinds:
+        return "task_type = ANY(%s) AND app_id IS NULL", [others]
+    return ("app_id IS NULL AND (task_type = ANY(%s) OR (task_type = %s AND NOT EXISTS ("
+            "SELECT 1 FROM chats c WHERE c.id = dynamic_tasks.target_chat_id "
+            "AND NOT starts_with(c.user_sub, %s) AND NOT starts_with(c.user_sub, %s))))",
+            [others, task_kinds.CONTINUATION, SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX])
+
+
+def agents_with_automations_by(sub: str, kinds: list[str]) -> list[str]:
+    """Every agent holding an agent-scope task of ``kinds`` (see
+    ``_transferable``), trigger or scheduled notification the person
+    created, or an agent-scope trigger whose inline notification names them
+    (the offboarding transfer's work list)."""
+    tasks_where, tasks_params = _transferable(kinds)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT agent FROM dynamic_tasks
+               WHERE scope='agent' AND created_by=%s AND {tasks_where}
+               UNION SELECT agent FROM triggers
+               WHERE scope='agent' AND created_by=%s AND app_id IS NULL
+               UNION SELECT agent FROM triggers
+               WHERE scope='agent' AND notify_target_scope='user' AND notify_target=%s
+               UNION SELECT agent_slug FROM notifications
+               WHERE scope='agent' AND created_by=%s AND agent_slug IS NOT NULL
+               ORDER BY 1""",
+            (sub, *tasks_params, sub, sub, sub),
+        ).fetchall()
+        return [r["agent"] for r in rows]
+
+
+def agents_with_user_scope_automations(sub: str) -> list[str]:
+    """Every agent holding a user-scope task or trigger the person created
+    or a user-scope notification aimed at them."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT agent FROM dynamic_tasks WHERE scope='user' AND created_by=%s
+               UNION SELECT agent FROM triggers WHERE scope='user' AND created_by=%s
+               UNION SELECT agent_slug FROM notifications
+               WHERE scope='user' AND target=%s AND agent_slug IS NOT NULL
+               ORDER BY 1""",
+            (sub, sub, sub),
+        ).fetchall()
+        return [r["agent"] for r in rows]
+
+
+def list_automation_creators(kinds: list[str]) -> list[tuple[str, str]]:
+    """Every distinct ``(agent, created_by)`` over the agent-scope rows a
+    transfer can move (the boot reconcile's work list; the tasks as
+    ``_transferable`` selects them)."""
+    tasks_where, tasks_params = _transferable(kinds)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT agent, created_by FROM dynamic_tasks
+               WHERE scope='agent' AND created_by <> '' AND {tasks_where}
+               UNION SELECT agent, created_by FROM triggers
+               WHERE scope='agent' AND created_by <> '' AND app_id IS NULL
+               UNION SELECT agent_slug, created_by FROM notifications
+               WHERE scope='agent' AND created_by <> '' AND agent_slug IS NOT NULL
+               ORDER BY 1, 2""",
+            tasks_params,
+        ).fetchall()
+        return [(r["agent"], r["created_by"]) for r in rows]
+
+
+def transfer_agent_scope_automations(agent: str, from_sub: str, to_sub: str, kinds: list[str],
+                                     *, from_names: tuple[str, ...] = ()) -> dict | None:
+    """Move the person's agent-scope automations on ``agent`` to ``to_sub``
+    in one transaction: their tasks of ``kinds`` (an app handler's row stays
+    with its app), their triggers, their scheduled notifications, and the
+    inline notification target of any agent-scope trigger on the agent that
+    names them. Each moved row keeps its first creator in
+    ``transferred_from`` across hops and stamps the hop in
+    ``transferred_at``. Their self-continuations on a chat that runs as the
+    agent (when ``kinds`` names the kind; ``_transferable``) are deleted
+    instead: a chat's own bounded wake is not a standing automation, and it
+    never changes hands. They are returned under ``continuations``. A
+    continuation on a phone call's chat is the caller's own and stays.
+
+    The person's ``users`` row is locked FOR SHARE for the transaction (the
+    membership writers take it FOR UPDATE), and their standing is read
+    under that lock: a person who holds the editor tier there again was
+    re-added since the event, and None is returned with nothing moved. A
+    deleted person has no row, locks nothing and always moves.
+    """
+    from auth import roles
+    from services.scheduler import task_kinds
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        person = conn.execute(
+            "SELECT role FROM users WHERE sub=%s FOR SHARE", (from_sub,)).fetchone()
+        if person:
+            agent_roles = {r["agent"]: r["agent_role"] for r in conn.execute(
+                "SELECT agent, COALESCE(agent_role, 'viewer') AS agent_role "
+                "FROM user_agents WHERE sub=%s", (from_sub,)).fetchall()}
+            if roles.can_edit(roles.effective_role(person["role"], agent_roles, agent)):
+                conn.rollback()
+                return None
+        ended = []
+        if task_kinds.CONTINUATION in kinds:
+            ended_where, ended_params = _transferable([task_kinds.CONTINUATION])
+            ended = conn.execute(
+                f"""DELETE FROM dynamic_tasks
+                   WHERE agent=%s AND scope='agent' AND created_by=%s AND {ended_where}
+                   RETURNING id, name, task_type""",
+                (agent, from_sub, *ended_params),
+            ).fetchall()
+        tasks = conn.execute(
+            """UPDATE dynamic_tasks
+               SET created_by=%s, transferred_from=COALESCE(NULLIF(transferred_from, ''), created_by),
+                   transferred_at=%s
+               WHERE agent=%s AND scope='agent' AND created_by=%s AND task_type = ANY(%s)
+                 AND app_id IS NULL
+               RETURNING id, name, task_type""",
+            (to_sub, now, agent, from_sub, [k for k in kinds if k != task_kinds.CONTINUATION]),
+        ).fetchall()
+        from storage.automation import notification_store, trigger_store
+        triggers, retargeted = trigger_store.transfer_agent_scope(
+            conn, agent, from_sub, to_sub, now, from_names=from_names)
+        notifications = notification_store.transfer_agent_scope(conn, agent, from_sub, to_sub, now)
+        conn.commit()
+    return {
+        "tasks": [dict(r) for r in tasks],
+        "continuations": [dict(r) for r in ended],
+        "triggers": triggers,
+        "notifications": notifications,
+        "retargeted": retargeted,
+        "transferred_at": now,
+    }
+
+
 def delete_dynamic_task(task_id: str) -> bool:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM dynamic_tasks WHERE id=%s", (task_id,))
@@ -523,7 +825,7 @@ def list_running_task_runs() -> list[dict]:
             "SELECT r.id AS run_id, r.task_id, r.agent, r.task_type, r.scope, "
             "       r.created_by, r.chat_id, COALESCE(d.name, '') AS name "
             "FROM task_runs r LEFT JOIN dynamic_tasks d ON d.id = r.task_id "
-            "WHERE r.status='running'",
+            "WHERE r.status=%s", (run_status.RUNNING,),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -533,11 +835,12 @@ def list_continuations_for_chat(chat_id: str) -> list[dict]:
     chat delete (a deleted chat must never be woken)."""
     if not chat_id:
         return []
+    from services.scheduler import task_kinds
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM dynamic_tasks "
-            "WHERE task_type='continuation' AND target_chat_id=%s",
-            (chat_id,),
+            "WHERE task_type=%s AND target_chat_id=%s",
+            (task_kinds.CONTINUATION, chat_id),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -594,8 +897,9 @@ def set_dynamic_task_enabled(task_id: str, enabled: bool) -> None:
 
 
 # Columns the edit_task API and MCP tool may touch. Anything outside this
-# whitelist (id, agent, scope, created_by, source-internal fields, callback
-# fields) is rejected at the helper level.
+# whitelist (id, agent, scope, source-internal fields, callback fields) is
+# rejected at the helper level; the last three below are set by the route
+# alone, never from a request body.
 _EDITABLE_TASK_COLUMNS = {
     "name",
     "prompt",
@@ -607,11 +911,19 @@ _EDITABLE_TASK_COLUMNS = {
     "notify_severity",
     "task_type",  # auto-derived by the service helper when timing fields change
     "user_tz",  # IANA timezone snapshot — change forces re-register with new trigger TZ
+    "checks",  # CHECKS.md: the refs attached to the task's runs (a JSON list, '' = none)
     # Per-task execution overrides — retune a live schedule onto another
     # model / engine, or pass "" to fall back to the agent's default. Both
     # are re-validated against the agent's envelope by the API layer.
     "override_model",
     "override_execution_path",
+    # An adopting prompt edit (the offboarding transfer) clears the record
+    # and makes the row the adopter's.
+    "transferred_from",
+    "created_by",
+    # Cleared when an edit gives a seeded row a clock (the row then counts
+    # toward the task caps).
+    "community_template",
 }
 
 
@@ -645,8 +957,8 @@ def get_task_session(task_id: str) -> str | None:
     """Return session_id from the most recent completed run of a task."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT session_id FROM task_runs WHERE task_id=%s AND status='completed' "
-            "ORDER BY started_at DESC LIMIT 1", (task_id,)
+            "SELECT session_id FROM task_runs WHERE task_id=%s AND status=%s "
+            "ORDER BY started_at DESC LIMIT 1", (task_id, run_status.COMPLETED),
         ).fetchone()
         return row["session_id"] if row else None
 

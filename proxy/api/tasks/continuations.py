@@ -8,7 +8,8 @@ schedules-mcp ``schedule_continuation`` tool.
 
 One-shot: exactly one of ``at`` / ``in_seconds``. Recurring: ``repeat_cron``
 or ``repeat_interval_seconds``, ALWAYS bounded — ``max_runs`` (default 5)
-and/or an ``until`` time; a chat must never wake itself forever. Rows are
+and/or an ``until`` time no further off than ``INTERVAL_MAX_SECONDS`` (a
+year); a chat must never wake itself forever. Rows are
 ordinary dynamic tasks (task_type='continuation'): they show in list_tasks,
 cancel via delete_task, pause via pause_task, and auto-cancel when the chat
 is deleted.
@@ -17,15 +18,17 @@ is deleted.
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from api.tasks import task_quota
 from auth.providers import UserContext, get_current_user, require_auth
 from core.session.session_state import get_user_tz
-from services.scheduler import scheduler
+from services.scheduler import scheduler, task_kinds
 from storage import database as task_store
+from core.session.visibility import is_synthetic_owner
 
 logger = logging.getLogger("claude-proxy.continuations")
 router = APIRouter()
@@ -104,7 +107,7 @@ async def create_continuation(
             404, "This session has no chat yet — nothing to continue.")
 
     owner = chat.get("user_sub") or ""
-    synthetic = "::" in owner or owner == "phone"
+    synthetic = is_synthetic_owner(owner)
     scope = "agent" if synthetic else "user"
     created_by = (u.acting_sub or u.agent or chat["agent"]) if synthetic else owner
     user_tz = get_user_tz(created_by) if scope == "user" else None
@@ -115,7 +118,7 @@ async def create_continuation(
         name=req.name or f"Continuation: {req.prompt[:40]}",
         agent=chat["agent"],
         prompt=req.prompt,
-        task_type="continuation",
+        task_type=task_kinds.CONTINUATION,
         target_chat_id=chat["id"],
         run_at=req.at,
         delay_seconds=req.in_seconds,
@@ -128,7 +131,21 @@ async def create_continuation(
         notification_mode="none",
         user_tz=user_tz,
     )
-    await scheduler.add_dynamic_task(task)
+    if recurring and req.until is not None:
+        # The end of a recurring wake is read in the row's zone at every
+        # fire; it must fall within the longest interval a task may have.
+        until = datetime.fromisoformat(req.until)
+        if until.tzinfo is None:
+            # The platform zone may be read from the database.
+            until = until.replace(tzinfo=await asyncio.to_thread(scheduler._resolve_task_tz, task))
+        ceiling = datetime.now(timezone.utc) + timedelta(seconds=scheduler.INTERVAL_MAX_SECONDS)
+        if until > ceiling:
+            raise HTTPException(
+                400, f"until must be at most {scheduler.INTERVAL_MAX_SECONDS} seconds (a year) "
+                     f"from now; a recurring continuation always ends.")
+    async with task_quota.creating():
+        await task_quota.enforce_continuation_caps(chat["id"], chat["agent"])
+        await scheduler.add_dynamic_task(task)
 
     fires = {
         "at": f"at {req.at}",

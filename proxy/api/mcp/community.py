@@ -19,8 +19,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_admin, require_human
 from services.community import community_catalog, community_installer
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.community-api")
 router = APIRouter()
@@ -28,7 +29,7 @@ router = APIRouter()
 
 def _require_admin(user: UserContext | None) -> UserContext:
     """Admin-only entry point (install / approve / reject)."""
-    if not user or user.role != "admin":
+    if not user or not user.is_admin:
         raise HTTPException(403, "Admin only")
     return user
 
@@ -42,7 +43,7 @@ def _require_creator_or_admin(user: UserContext | None) -> UserContext:
     """
     if not user:
         raise HTTPException(403, "Authentication required")
-    if user.role not in ("admin", "creator"):
+    if not roles.is_creator_or_above(user.role):
         raise HTTPException(403, "Admin or creator only")
     return user
 
@@ -639,7 +640,7 @@ async def create_mcp_request(
     except ValueError as exc:
         raise HTTPException(409, str(exc))
 
-    if user.role == "admin":
+    if user.is_admin:
         # Admin requester → no queue paperwork; resolve inline.
         # ``approve_request`` handles the full cascade (install if
         # missing → attach to instance for explicit-mode MCPs → enable
@@ -677,7 +678,7 @@ async def list_agent_mcp_requests(
         raise HTTPException(403, "Manager access required for this agent")
 
     from storage.mcp import mcp_request_store
-    requested_by = None if user.role == "admin" else user.sub
+    requested_by = None if user.is_admin else user.sub
     rows = await asyncio.to_thread(
         mcp_request_store.list_requests_for_agent, slug, requested_by,
     )
@@ -781,10 +782,21 @@ async def list_community_agents(
         raise HTTPException(502, f"Could not load community-agents catalog: {exc}")
 
     installed_as = await community_agents_catalog.collect_local_state()
-    augmented = [
-        community_agents_catalog.augment_entry(entry, installed_as)
-        for entry in registry.get("agents", [])
-    ]
+    from services.community import community_agent_updater
+    versions = await community_agent_updater.installed_versions()
+    augmented = []
+    for entry in registry.get("agents", []):
+        a = community_agents_catalog.augment_entry(entry, installed_as)
+        # One template is often several agents: each with its version and
+        # whether the catalog is newer (COMMUNITY-AGENTS-REGISTRY.md "Updates").
+        a["installed"] = [{
+            "agent_slug": slug, "version": versions.get(slug, {}).get("version", ""),
+            "update_available": community_agent_updater.detect(
+                {"community_template": entry.get("slug"),
+                 "community_template_version": versions.get(slug, {}).get("version", "")}, entry,
+            )["update_available"],
+        } for slug in a.get("installed_as") or []]
+        augmented.append(a)
     return {
         "registry_version": registry.get("registry_version"),
         "updated_at": registry.get("updated_at"),
@@ -792,6 +804,88 @@ async def list_community_agents(
         "fetched_from": community_agents_catalog.REGISTRY_RAW_URL,
         "agents": augmented,
     }
+
+
+# ---------------------------------------------------------------------------
+# Template updates (COMMUNITY-AGENTS-REGISTRY.md "Updates")
+# ---------------------------------------------------------------------------
+
+class ApplyTemplateUpdateBody(BaseModel):
+    from_version: str
+    approve_apps: dict[str, str] | None = None
+    approve_checks: dict[str, str] | None = None
+
+
+class TakeNewVersionBody(BaseModel):
+    new_path: str
+
+
+def _require_updater(user: UserContext | None, agent_slug: str) -> UserContext:
+    """A person at the dashboard who manages this agent, whatever their
+    platform role (an admin manages every agent): a manager runs the agent
+    entirely, and an update installs nothing an admin has not allowed — a
+    non-admin's MCP cascade only requests — while the consent it records
+    reaches exactly what their role may approve (the shared apps and their
+    own copy)."""
+    u = require_human(user)
+    if not u.can_manage_agent(agent_slug):
+        raise HTTPException(403, "Only a manager of this agent can update it")
+    return u
+
+
+@router.post("/v1/agents/{agent_slug}/update-template/plan")
+async def plan_template_update(
+    agent_slug: str,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """What updating this agent to the catalog's version would replace, add
+    and keep, plus the consent lines of the new version's apps and checks.
+    Reads only."""
+    u = _require_updater(user, agent_slug)
+    from services.community import community_agent_updater
+    return await community_agent_updater.plan(agent_slug, u.sub, u.role)
+
+
+@router.post("/v1/agents/{agent_slug}/update-template", status_code=202)
+async def apply_template_update(
+    agent_slug: str,
+    body: ApplyTemplateUpdateBody,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """Run the update as a job (202 with its id): the report reaches the
+    presser by notification and ``…/update-template/status``. 409 when the
+    agent moved since the plan or an update is already running."""
+    u = _require_updater(user, agent_slug)
+    from services.community import community_agent_updater
+    return await community_agent_updater.apply(
+        agent_slug, u.sub, u.role, from_version=body.from_version,
+        app_consent=body.approve_apps, check_consent=body.approve_checks)
+
+
+@router.get("/v1/agents/{agent_slug}/update-template/status")
+async def template_update_status(
+    agent_slug: str,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    if not user:
+        raise HTTPException(403, "Authentication required")
+    if not user.can_manage_agent(agent_slug):
+        raise HTTPException(403, "Only a manager of this agent can see its updates")
+    from services.community import community_agent_updater
+    return community_agent_updater.status(agent_slug)
+
+
+@router.post("/v1/agents/{agent_slug}/update-template/take")
+async def take_new_version(
+    agent_slug: str,
+    body: TakeNewVersionBody,
+    user: UserContext = Depends(get_current_user),
+) -> dict:
+    """"Take the new version" of a piece an update kept: the copy stored
+    beside it replaces the live one."""
+    u = _require_updater(user, agent_slug)
+    from services.community import community_agent_updater
+    return await community_agent_updater.take(agent_slug, body.new_path, u.sub, u.role)
 
 
 @router.get("/v1/community/agents/{template_slug}")
@@ -920,7 +1014,7 @@ async def preview_community_agent_install(
         if instances:
             mcp_status.append({
                 "name": name, "installed": True, "request_type": "access",
-                "blocked": False, "needs_request": user.role != "admin",
+                "blocked": False, "needs_request": not user.is_admin,
                 "reason": "Explicit-mode — agent will be attached to an instance",
             })
         else:
@@ -930,6 +1024,36 @@ async def preview_community_agent_install(
                 "reason": "Explicit-mode — no instances configured (admin must create one first)",
             })
 
+    # The apps and checks the template ships, the way the approval card
+    # shows them, with the signature the dialog consents to
+    # (COMMUNITY-AGENTS-REGISTRY.md "Consent"); an older registry entry
+    # carries none.
+    from services.community import template_app_seeder
+    apps = []
+    for a in entry.get("apps") or []:
+        if not isinstance(a, dict) or not isinstance(a.get("app_json"), dict):
+            continue
+        visibility = "user" if a.get("visibility") == "user" else "agent"
+        bp = a.get("blueprint_json") if isinstance(a.get("blueprint_json"), dict) else None
+        row = template_app_seeder.preview_shape(a["app_json"], visibility, bp)
+        row["slug"] = str(a.get("slug") or "")
+        apps.append({
+            "slug": row["slug"], "title": row["title"] or row["slug"], "visibility": visibility,
+            "sig": str(a.get("sig") or ""), "owner_approval": bool(a.get("owner_approval")),
+            "row": row,
+            "blueprint_tasks": [{"slug": str(t.get("slug") or ""), "description": str(t.get("description") or ""),
+                                 "prompt": str(t.get("prompt") or "")}
+                                for t in (bp or {}).get("tasks") or [] if isinstance(t, dict)],
+            "blueprint_triggers": [{"slug": str(t.get("slug") or ""), "handler": str(t.get("handler") or ""),
+                                    "description": str(t.get("description") or "")}
+                                   for t in (bp or {}).get("triggers") or [] if isinstance(t, dict)],
+        })
+    checks = [{
+        "name": str(c.get("name") or ""), "description": str(c.get("description") or ""),
+        "mandatory": bool(c.get("mandatory")), "applies": list(c.get("applies") or []),
+        "script": str(c.get("script") or ""), "sig": str(c.get("sig") or ""),
+        "words": template_app_seeder.check_words(c),
+    } for c in (entry.get("checks") or []) if isinstance(c, dict) and c.get("name")]
     return {
         "template_slug": template_slug,
         "target_slug": proposed_slug,
@@ -942,6 +1066,11 @@ async def preview_community_agent_install(
         "platform_compat_ok": community_catalog.platform_version_ok(
             entry.get("platform_min_version"),
         ),
+        "apps": apps,
+        "checks": checks,
+        # Whose copies the caller's consent may cover: an admin's every
+        # member's, anyone else's the shared apps and their own copy.
+        "consent_scope": "everyone" if user.is_admin else "own",
     }
 
 
@@ -960,11 +1089,13 @@ async def admin_reseed_template_items(
     Idempotent: each per-user seed call hits ``idx_dyn_tasks_tpl_user`` /
     ``idx_triggers_tpl_user`` / ``idx_notifs_tpl_user`` so existing items
     don't get duplicated. Returns the sum of newly-seeded items across
-    all users.
+    all users; a member's missing per-user apps are queued for the seeder
+    (``apps`` counts the queued ones, the worker reports a failure by
+    notification).
 
-    Admin only.
+    Admin only — a person, not a bearer.
     """
-    _require_admin(user)
+    require_admin(user)
     from storage.agents import agent_store
     from storage import database as user_store
     from services.community import community_agent_installer
@@ -986,7 +1117,8 @@ async def admin_reseed_template_items(
         )
 
     pairs = await asyncio.to_thread(user_store.get_agent_users, slug)
-    totals = {"tasks": 0, "triggers": 0, "notifications": 0, "users": len(pairs)}
+    totals = {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "apps": 0,
+              "users": len(pairs)}
     per_user: list[dict] = []
     for pair in pairs:
         sub = pair["sub"]
@@ -1007,9 +1139,8 @@ async def admin_reseed_template_items(
                 "error": f"{type(exc).__name__} (see proxy logs)",
             })
             continue
-        totals["tasks"] += counts["tasks"]
-        totals["triggers"] += counts["triggers"]
-        totals["notifications"] += counts["notifications"]
+        for key in ("tasks", "triggers", "notifications", "dashboards", "apps"):
+            totals[key] += counts.get(key, 0)
         per_user.append({"sub": sub, "role": role, **counts})
 
     logger.info("Admin reseed for %s: %s", slug, totals)
@@ -1019,7 +1150,12 @@ async def admin_reseed_template_items(
 class InstallFromCommunityBody(BaseModel):
     template_slug: str
     target_slug: str | None = None  # default to template_slug
+    display_name: str | None = None  # default to the template's
     manager_user: str | None = None  # admin-only: install on behalf of someone
+    # The dialog's consent (COMMUNITY-AGENTS-REGISTRY.md "Consent"): the
+    # signature the caller saw per app and check they approve.
+    approve_apps: dict[str, str] | None = None
+    approve_checks: dict[str, str] | None = None
 
 
 @router.post("/v1/agents/install-from-community")
@@ -1029,16 +1165,19 @@ async def install_from_community(
 ) -> dict:
     """Install a community-agents template into a new agent.
 
-    Manager-callable. Cascades required MCPs — pending requests for
+    A person at the dashboard (never a bearer: the consent it may carry
+    approves apps, the decision ``/v1/apps/{id}/approve`` reserves for a
+    human), creator or admin. Cascades required MCPs — pending requests for
     missing/explicit MCPs are tagged with a shared ``batch_id`` so the admin
-    sees one combined notification instead of N.
+    sees one combined notification instead of N. The consent is always the
+    caller's own, whoever ``manager_user`` names.
     """
-    u = _require_creator_or_admin(user)
+    u = _require_creator_or_admin(require_human(user))
     from services.community import community_agent_installer
 
     installer_sub = u.sub
     if body.manager_user:
-        if u.role != "admin":
+        if not u.is_admin:
             raise HTTPException(403, "Only admins can install on behalf of others")
         installer_sub = body.manager_user
 
@@ -1049,6 +1188,10 @@ async def install_from_community(
             target_slug=target,
             installer_user_sub=installer_sub,
             installer_role=u.role,
+            display_name=(body.display_name or "").strip(),
+            app_consent=body.approve_apps,
+            check_consent=body.approve_checks,
+            consent_by=u.sub if (body.approve_apps or body.approve_checks) else "",
         )
         return result
     except HTTPException:

@@ -1,6 +1,7 @@
 import type { ChatMessage } from '@/api/chats'
 import type { MessageBlock } from '@/components/chat/types'
 import { eventToBlock } from './messageBlocks'
+import { REPLAYABLE_ARTIFACT_EVENT_TYPES, identityKey } from './kinds/artifact'
 
 // Replay-on-open rule for interactive PiP artifact windows.
 //
@@ -16,17 +17,15 @@ import { eventToBlock } from './messageBlocks'
 // every loaded row is newer than the last prompt, so all of it qualifies.
 //
 // On top of that:
-//   - document_preview dedupes by file_id and ui by path (latest wins) — the
-//     same in-place-replace identity the live pty_artifact handler uses;
+//   - a kind with an identity (lib/kinds/artifact.ts: a document_preview by
+//     file_id, a ui by path) dedupes on it, latest wins — the same in-place
+//     replace identity the live pty_artifact handler uses;
 //   - rows the server marked dismissed (chat-level preview dismissals) and
 //     ids in the caller's per-browser X-dismiss set are dropped;
 //   - capped to the newest MAX_REPLAY_WINDOWS so a display-heavy turn can't
 //     storm the terminal with popups.
 export const MAX_REPLAY_WINDOWS = 6
 
-const REPLAYABLE_TYPES = new Set([
-  'images', 'url', 'file', 'video', 'audio', 'document_preview', 'ui',
-])
 
 export interface ReplayArtifact {
   /** chat_messages row id — the stable dedupe/dismissal key. */
@@ -45,19 +44,18 @@ export function replayableDisplayEvents(
   const out: ReplayArtifact[] = []
   for (let i = lastUserIdx + 1; i < messages.length; i++) {
     const m = messages[i]
-    if (m.role !== 'event' || !REPLAYABLE_TYPES.has(m.event_type) || !m.event_data) continue
+    if (m.role !== 'event' || !REPLAYABLE_ARTIFACT_EVENT_TYPES.has(m.event_type) || !m.event_data) continue
     let evt: any
     try { evt = JSON.parse(m.event_data) } catch { continue }
     if (!evt || evt.dismissed) continue
     const block = eventToBlock(evt, m.id)
     if (!block) continue
-    // Latest-wins identity dedupe (chronological walk → later replaces earlier).
-    if (block.type === 'document_preview') {
-      const idx = out.findIndex((r) => r.block.type === 'document_preview' && r.block.fileId === block.fileId)
-      if (idx >= 0) { out[idx] = { dbId: m.id, block }; continue }
-    }
-    if (block.type === 'ui' && block.path) {
-      const idx = out.findIndex((r) => r.block.type === 'ui' && r.block.path === block.path)
+    // Latest-wins identity dedupe (chronological walk → later replaces
+    // earlier) on the kind's identity field (lib/kinds/artifact.ts: a
+    // preview by its file, a ui page by its path when it has one).
+    const key = identityKey(block)
+    if (key) {
+      const idx = out.findIndex((r) => r.block.type === block.type && identityKey(r.block) === key)
       if (idx >= 0) { out[idx] = { dbId: m.id, block }; continue }
     }
     out.push({ dbId: m.id, block })

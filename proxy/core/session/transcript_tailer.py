@@ -59,11 +59,27 @@ from core.session.transcript_tool_events import (
     TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
     extract_result_text, persist_event, record_batch_usage, truncate_result,
 )
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.transcript_tailer")
 
-# session_id → number of transcript lines already processed. The Claude JSONL is
-# append-only within a session, so a line offset is a sufficient, cheap cursor.
+
+# The batch's ``last_signal`` words that leave a turn open (both engines'
+# tailers report the same): a prompt opened one, or a tool call is under way.
+SIGNAL_PROMPT = "user"
+SIGNAL_TOOL_USE = "tool_use"
+
+
+def leaves_turn_open(last_signal: str | None) -> bool:
+    """Whether a batch's ``last_signal`` leaves a turn open."""
+    return last_signal in (SIGNAL_PROMPT, SIGNAL_TOOL_USE)
+
+# session_id → number of transcript lines already processed. The Claude JSONL
+# grows by appends within a session — except the file-history-snapshot line
+# the CLI inserts BEFORE a prompt it already appended, which a cursor that
+# consumed the prompt in between re-reads (the satellite's byte offset polls
+# every 0.8 s and hits it); the per-line uuid claims below absorb that, so a
+# line offset stays a sufficient, cheap cursor.
 _offsets: dict[str, int] = {}
 # session_id → wall-clock at attach (set by seek_past_existing). The replay
 # guard for RESUME REWARMS: `claude --resume <old> --session-id <new>` writes a
@@ -171,14 +187,17 @@ def resolve_and_tail(session_id: str, chat_id: str) -> dict:
     return tail_transcript(session_id, chat_id, path)
 
 
-# Injected `[Current time: ...]` stamp line(s) — the platform prepends them to
-# interactive prompts and the PTY transcript persists them verbatim. Twin of the
-# dashboard's transcriptCleanup.ts matcher: start-anchored exact shape only.
-_TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)")
+# Injected prelude line(s) — the `[Current time: ...]` stamp and the viewer
+# focus line (APPS.md "Live apps") the platform prepends to interactive
+# prompts; the PTY transcript persists them verbatim. Twin of the dashboard's
+# transcriptCleanup.ts matcher: start-anchored exact shapes only.
+_TIME_PRELUDE_RE = re.compile(
+    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+)
 
 # Twin of ``ws/dashboard_chat._APP_ACTION_HEADER_RE`` — see there.
 _APP_ACTION_HEADER_RE = re.compile(
-    r'^\[action from mini-app "(.{1,200}?)" — (.{1,80}?)\]'
+    r'^\[action from (?:mini-)?app "(.{1,200}?)" — (.{1,80}?)\]'
 )
 
 
@@ -317,7 +336,7 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
                  block: dict, open_questions: set[str]) -> int:
     """Dispatch one assistant ``tool_use`` block; returns rows persisted now.
 
-    Mirrors the pump's block mapping (``_SKIP_TOOL_PERSIST`` + dedicated
+    Mirrors the pump's block mapping (``_skips_tool_persist`` + dedicated
     events): Task/Agent → pending ``task_spawn``; plan-mode + question tools →
     immediate rows (their results are never attached headless); the delegation
     MCP is skipped (the delegation endpoint writes its own ``delegate_spawn``
@@ -349,7 +368,7 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
             return 0
         reg.register_spawn(tuid, tuid)
         buf.open(tuid, {
-            "type": "task_spawn",
+            "type": wire.TASK_SPAWN,
             "description": tool_input.get("description", "?"),
             "subagent_type": tool_input.get("subagent_type", ""),
             "run_in_background": bool(tool_input.get("run_in_background", False)),
@@ -362,7 +381,7 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
         return 0  # duplicate id (overlapping tails) — already handled
 
     if name in ("EnterPlanMode", "ExitPlanMode"):
-        evt: dict = {"type": "plan_mode",
+        evt: dict = {"type": wire.PLAN_MODE,
                      "action": "enter" if name == "EnterPlanMode" else "exit"}
         if name == "ExitPlanMode":
             evt["tool_input"] = tool_input
@@ -377,13 +396,13 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
         if tuid:
             open_questions.add(tuid)
         persist_event(task_store, chat_id, {
-            "type": "question", "tool_name": name, "tool_input": tool_input,
+            "type": wire.QUESTION, "tool_name": name, "tool_input": tool_input,
         })
         return 1
 
     from core.layers.cli.helpers import _extract_tool_summary
     tool_block = {
-        "type": "tool", "name": name, "tool_id": tuid or name,
+        "type": wire.PERSISTED_TOOL, "name": name, "tool_id": tuid or name,
         "summary": _extract_tool_summary(name, tool_input),
         "active": False, "tool_input": tool_input,
     }
@@ -462,6 +481,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     buf = _tool_events.setdefault(session_id, ToolEventBuffer())
 
     persisted = 0
+    message_rows = 0
     # Early-title counters (interactive_session accumulates them across
     # batches and fires the LLM title upgrade mid-turn at char/tool
     # thresholds — the interactive twin of the pump's early triggers).
@@ -539,8 +559,8 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
             # Same subtype the live headless compact path appends — SystemEvent
             # renders the amber "Context compressed" separator for both.
             persist_event(task_store, chat_id, {
-                "type": "system",
-                "subtype": "context_compressed",
+                "type": wire.SYSTEM,
+                "subtype": wire.SUBTYPE_CONTEXT_COMPRESSED,
                 "message": f"Conversation compacted{detail}",
                 "trigger": trigger,
             })
@@ -610,6 +630,15 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                     else:
                         attach_result(blk, text,
                                       is_error=bool(rb.get("is_error")))
+                        # The Claude terminal's ONE post_tool source is this
+                        # tailer (the forwarder stands down under
+                        # OTO_INTERACTIVE) — session_events / HOOKS.md.
+                        from core.session import session_events
+                        session_events.post_tool(
+                            session_id, blk.get("name") or "", tool_use_id=tuid,
+                            tool_input=blk.get("tool_input") or {},
+                            is_error=bool(rb.get("is_error")), source="tailer",
+                        )
                     persist_event(task_store, chat_id, blk)
                     persisted += 1
                     tool_rows += 1  # blocks in the buffer are tool/task_spawn
@@ -640,6 +669,14 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                 cleaned = _strip_command_noise(text)
                 if cleaned is None:
                     continue  # slash-command record — local output, not a prompt
+                # Claimed by line uuid like assistant text: the CLI inserts
+                # its file-history-snapshot line BEFORE the prompt it just
+                # appended, so a byte-offset tail (the satellite's, polling
+                # every 0.8 s) can read the shifted prompt line a second
+                # time and the row landed twice (T1, 2026-09-21).
+                luid = obj.get("uuid")
+                if luid and not buf.claim(f"user:{luid}"):
+                    continue
                 # A fg subagent can't span a user turn — a new REAL prompt
                 # means any still-pending fg spawn was interrupted without a
                 # result line. Un-pend it (drop the block, complete the
@@ -659,9 +696,10 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                     continue
                 task_store.add_chat_message(
                     chat_id, "user", cleaned,
-                    author_sub=author_sub_for(session_id),
+                    author_sub=author_sub_for(session_id), sync_search=False,
                 )
                 persisted += 1
+                message_rows += 1
 
         elif kind == "assistant" and isinstance(content, list):
             # Usage accounting: the CLI writes one transcript line PER CONTENT
@@ -700,8 +738,10 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                         luid = obj.get("uuid") or ""
                         if luid and not buf.claim(f"text:{luid}:{bi}"):
                             continue
-                        task_store.add_chat_message(chat_id, "assistant", text)
+                        task_store.add_chat_message(chat_id, "assistant", text,
+                                                    sync_search=False)
                         persisted += 1
+                        message_rows += 1
                         assistant_chars += len(text)
                         msg_text_parts.append(text)
                 elif btype == "thinking":
@@ -716,7 +756,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                         if luid and not buf.claim(f"think:{luid}:{bi}"):
                             continue
                         persist_event(task_store, chat_id,
-                                      {"type": "thinking", "content": t})
+                                      {"type": wire.THINKING, "content": t})
                         persisted += 1
                 elif btype == "tool_use":
                     persisted += _on_tool_use(buf, reg, task_store, chat_id,
@@ -740,6 +780,10 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     question_pending = bool(open_questions) and last_signal in ("tool_use", None)
     if question_pending:
         last_signal = "end_turn"
+
+    # The message rows skipped the per-row search rebuild: one per batch.
+    if message_rows and chat_id:
+        task_store.rebuild_chat_search(chat_id)
 
     # Backfill the chat title from the first user prompt — interactive chats
     # can't title at send-time (the prompt rides the PTY). Only when still

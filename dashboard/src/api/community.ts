@@ -8,6 +8,8 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { McpRuntime } from '../lib/kinds/mcpRuntime'
+import type { McpRequestStatus } from '../lib/status/mcpRequest'
 
 export interface CommunityMcpEntry {
   name: string
@@ -15,7 +17,7 @@ export interface CommunityMcpEntry {
   description: string
   category: 'community'
   version: string
-  runtime: 'python' | 'node' | 'docker'
+  runtime: McpRuntime
   source: string
   // Optional (absent on a stale cached registry.json): node/python auto-update
   // bound (PEP 440; "" = unbounded) + a hash of the integration manifest used to
@@ -165,7 +167,7 @@ export function useCommunitySkills(enabled: boolean = true, agentSlug?: string) 
 export interface CatalogInstallJob {
   name: string
   label: string
-  runtime: 'python' | 'node' | 'docker' | ''
+  runtime: McpRuntime | ''
   status: 'running' | 'done' | 'failed'
   // fetch | prepare | install | image | start | finalize | done | failed
   phase: string
@@ -264,14 +266,9 @@ export function useCatalogInstallJobs(enabled: boolean) {
 // Request flow — managers create + cancel; admins approve/reject
 // ---------------------------------------------------------------------------
 
-export type RequestStatus =
-  | 'pending'
-  | 'approved'
-  | 'installing'
-  | 'installed'
-  | 'install_failed'
-  | 'rejected'
-  | 'cancelled'
+// The request's status is the mirror's (lib/status/mcpRequest.ts); the
+// name this module always exported is kept for its importers.
+export type RequestStatus = McpRequestStatus
 
 export interface McpRequest {
   id: number

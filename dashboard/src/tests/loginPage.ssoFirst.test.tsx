@@ -21,6 +21,7 @@ vi.mock('@/api/webauthn', () => ({
   passkeyLogin: vi.fn(),
   passkeySecondFactor: vi.fn(),
   passkeySupported: () => true,
+  startNativeHandoff: vi.fn(),
 }))
 vi.mock('@/components/TurnstileWidget', () => ({
   TurnstileWidget: () => null,

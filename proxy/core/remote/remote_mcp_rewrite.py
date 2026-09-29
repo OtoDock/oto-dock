@@ -11,6 +11,7 @@ must be monkeypatched HERE (core.remote.remote_mcp_rewrite), not on remote_execu
 
 import json
 import re
+from core import host_os
 
 # ---------------------------------------------------------------------------
 # MCP config rewriting for remote execution
@@ -101,7 +102,7 @@ def _rewrite_mcp_json_for_remote(
       (``~/.oto-dock/mcps/...venv/bin/...`` on Unix, ``~/OtoDock/mcps/
       ...venv/Scripts/...exe`` on Windows). They are installed by
       ``sync_mcps_for_session`` before the CLI starts; failures get
-      filtered out afterward via ``_strip_excluded_mcps_from_payload``.
+      filtered out afterward by the engine's ``RemoteEngineAdapter.without_mcps``.
     - SSE/HTTP MCPs (Docker on platform): URL rewritten to
       ``http://127.0.0.1:{sat_port}/mcp/{name}/...`` so the satellite's
       local tunnel server forwards over WS to the platform-side dispatcher.
@@ -474,18 +475,13 @@ def _rewrite_stdio_paths(
     """Rewrite stdio MCP command and args to satellite-side paths.
 
     Platform paths like ``<platform>/mcps/custom/X/venv/bin/python``
-    become ``~/<otodock_dirname>/mcps/<satellite_category>/X/venv/<bin_seg>/python<ext>``
-    on the satellite, where the per-OS bits are:
-
-    | target_os | otodock_dirname | venv layout            | exe suffix |
-    |-----------|-----------------|------------------------|------------|
-    | linux/mac | .oto-dock       | venv/bin/<bin>         | (none)     |
-    | windows   | OtoDock         | venv/Scripts/<bin>.exe | .exe       |
-
-    The constants mirror the satellite's ``config.OTODOCK_DIRNAME`` and
-    ``config._VENV_BIN_DIR`` / ``_EXE_SUFFIX``. ``python3`` collapses to
-    ``python`` on Windows because the official Python distribution ships
-    only ``python.exe``.
+    become ``~/<dirname>/mcps/<satellite_category>/X/venv/<venv_bin>/python<exe_suffix>``
+    on the satellite — the per-OS bits (``.oto-dock`` / ``OtoDock``,
+    ``venv/bin/<bin>`` / ``venv/Scripts/<bin>.exe``, ``python3`` collapsing
+    to the ``python`` Windows ships) are the machine's row in the host OS
+    table (``core/host_os.py``, the twin of the satellite's own
+    ``config.py``), looked up by the reported ``os`` word; an unreported or
+    unknown word rewrites for Linux, as it always did.
 
     Why the category swap is load-bearing: the platform's on-disk
     grouping (``mcps/{core,custom,community}/``) is historical, but the
@@ -510,19 +506,17 @@ def _rewrite_stdio_paths(
     import config as app_config
     platform_mcps = str(app_config.MCPS_DIR.resolve())
 
-    otodock_dirname = "OtoDock" if target_os == "windows" else ".oto-dock"
+    row = host_os.of(target_os) or host_os.ROWS[host_os.LINUX]
 
     def _rewrite_one(s: str) -> str:
         if platform_mcps not in s:
             return s
         if platform_dir and satellite_category and mcp_name:
-            new_prefix = f"~/{otodock_dirname}/mcps/{satellite_category}/{mcp_name}"
+            new_prefix = f"~/{row.dirname}/mcps/{satellite_category}/{mcp_name}"
             s = s.replace(platform_dir, new_prefix)
         else:
-            s = s.replace(platform_mcps, f"~/{otodock_dirname}/mcps")
-        if target_os == "windows":
-            s = _translate_venv_for_windows(s)
-        return s
+            s = s.replace(platform_mcps, f"~/{row.dirname}/mcps")
+        return host_os.translate_venv(s, row)
 
     command = _rewrite_one(command)
     new_args = [
@@ -530,30 +524,6 @@ def _rewrite_stdio_paths(
         for arg in args
     ]
     return command, new_args
-
-
-def _translate_venv_for_windows(s: str) -> str:
-    """Translate ``venv/bin/<binary>`` → ``venv/Scripts/<binary>.exe``.
-
-    Windows venvs created by ``python -m venv`` place executables under
-    ``Scripts\\`` (not ``bin/``) and binaries carry the ``.exe`` suffix.
-    ``python3`` collapses to ``python`` because Windows Python ships
-    only as ``python.exe``.
-
-    Idempotent: an input that already contains ``venv/Scripts/`` is left
-    alone, and an existing ``.exe`` suffix is not doubled.
-    """
-    import re
-
-    def _replace(m: re.Match) -> str:
-        binary = m.group(1)
-        if binary == "python3":
-            binary = "python"
-        if not binary.endswith(".exe"):
-            binary = f"{binary}.exe"
-        return f"venv/Scripts/{binary}"
-
-    return re.sub(r"venv/bin/([^/\s\"']+)", _replace, s)
 
 
 def _rewrite_env_for_remote(env: dict, sat_port: int) -> dict:

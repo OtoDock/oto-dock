@@ -10,7 +10,7 @@ interface Props {
   agents?: AgentSummary[]
   onDismiss: (id: string) => void
   onStopAlarm?: () => void
-  onNavigate?: (agentSlug: string, chatId: string) => void
+  onNavigate?: (agentSlug: string, chatId: string, href?: string) => void
 }
 
 const SEVERITY_STYLES: Record<string, string> = {
@@ -27,10 +27,10 @@ const SEVERITY_TITLE_COLOR: Record<string, string> = {
   danger: 'text-p-accent-red',
 }
 
-function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; agents?: AgentSummary[]; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string) => void }) {
+function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; agents?: AgentSummary[]; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string, href?: string) => void }) {
   const [visible, setVisible] = useState(false)
   const { delivery } = toast
-  const hasLink = !!(delivery.agent_slug && delivery.chat_id)
+  const hasLink = !!delivery.href || !!(delivery.agent_slug && delivery.chat_id)
 
   // Slide-in animation
   useEffect(() => {
@@ -45,7 +45,7 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
 
   const handleClick = () => {
     if (hasLink && onNavigate) {
-      onNavigate(delivery.agent_slug!, delivery.chat_id!)
+      onNavigate(delivery.agent_slug || '', delivery.chat_id || '', delivery.href || undefined)
       handleDismiss()
     }
   }

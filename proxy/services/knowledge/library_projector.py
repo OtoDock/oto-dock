@@ -87,17 +87,20 @@ import shutil
 import time
 from pathlib import Path
 
+import config
 from storage.knowledge import db_knowledge_libraries
 from storage.knowledge import db_library_mirror_state
 from storage.files import recover_bin_store
 from storage.knowledge.db_knowledge_libraries import subtree_covers
+from services.infra import safe_fs
 from services.infra.path_confinement import join_under, safe_agent_dir
+from core import layout
 
 logger = logging.getLogger("claude-proxy.knowledge-libraries")
 
 SHARED_SUBDIR = "shared"
 _EXCLUDED_TOP = frozenset({"memory", SHARED_SUBDIR})
-_EXCLUDED_SEGMENTS = frozenset({".git", ".credentials"})
+_EXCLUDED_SEGMENTS = frozenset({".git", layout.CREDENTIALS_DIR})
 RECONCILE_INTERVAL_S = 300
 # Turn-end kick debounce per source (a burst of turn ends on one library
 # collapses into one reconcile every 10 s at most).
@@ -107,6 +110,12 @@ RECONCILE_KICK_DEBOUNCE_S = 10.0
 # library; more than that is treated as a wiped mirror and healed instead.
 MASS_DELETE_MIN = 25
 MASS_DELETE_FRACTION = 0.5
+# A projected file gets the bits a plain ``open(..., "wb")`` gives (the
+# umask's), never the source's: a read-only source must not make a writable
+# mirror that its consumer cannot edit in place.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+_MIRROR_MODE = 0o666 & ~_UMASK
 
 # Serializes work per source agent — overlapping reconciles would race
 # their .partial files and double-fan-out.
@@ -121,14 +130,14 @@ def _lock(source_agent: str) -> asyncio.Lock:
 
 
 def source_knowledge_dir(source_agent: str) -> Path:
-    return safe_agent_dir(source_agent) / "knowledge"
+    return safe_agent_dir(source_agent) / layout.KNOWLEDGE
 
 
 def mirror_dir(consumer_agent: str, source_agent: str) -> Path:
     """The consumer's mirror root for one SOURCE (slug segment). Library
     subtrees of that source live below it at their own ``subdir``."""
     return join_under(
-        safe_agent_dir(consumer_agent) / "knowledge" / SHARED_SUBDIR, source_agent,
+        safe_agent_dir(consumer_agent) / layout.KNOWLEDGE / SHARED_SUBDIR, source_agent,
     )
 
 
@@ -153,14 +162,22 @@ def parse_library_rel(rel_path: str) -> tuple[str, str] | None:
     store's ``attachment_covering`` / ``library_covering``.
     """
     parts = rel_path.split("/")
-    if len(parts) >= 4 and parts[0] == "knowledge" and parts[1] == SHARED_SUBDIR:
+    if len(parts) >= 4 and parts[0] == layout.KNOWLEDGE and parts[1] == SHARED_SUBDIR:
         return parts[2], "/".join(parts[3:])
     return None
 
 
+def _agent_rel(path: Path) -> str:
+    """A source or mirror path as a rel below ``AGENTS_DIR`` (every path
+    this module builds is ``safe_agent_dir(slug)/…``)."""
+    return safe_fs.rel_under(path, config.AGENTS_DIR)
+
+
 def _hash_file(path: Path) -> str:
+    """sha256 of a regular file reached with no symlink followed (a link
+    raises, an ``OSError`` the callers already treat as "skip")."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with safe_fs.open_file_for_read(config.AGENTS_DIR, _agent_rel(path)) as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -203,29 +220,19 @@ def _walk_rel(root: Path, *, prune_top: bool = True) -> dict[str, os.stat_result
 
 
 def _copy_file(src: Path, dest: Path) -> str:
-    """`.partial` + fsync + atomic replace; carries the source mtime so the
-    freshness comparison stays meaningful on the copy. Returns the sha256
-    of the copied bytes (hashed while streaming — no second read) so the
-    caller can record the merge base."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".partial")
+    """`.partial` + fsync + atomic replace, both sides beneath ``AGENTS_DIR``
+    with no symlink followed: the source must be a regular file (a link,
+    planted in a source or in a mirror, raises and is never projected or
+    adopted), and a link at the destination name is replaced, never written
+    through. Carries the source mtime so the freshness comparison stays
+    meaningful on the copy. Returns the sha256 of the copied bytes (hashed
+    while streaming, no second read) so the caller can record the merge
+    base."""
     h = hashlib.sha256()
-    try:
-        with open(src, "rb") as fin, open(tmp, "wb") as fout:
-            while True:
-                chunk = fin.read(1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-                fout.write(chunk)
-            fout.flush()
-            os.fsync(fout.fileno())
-        os.replace(tmp, dest)
-        st = src.stat()
-        os.utime(dest, (st.st_atime, st.st_mtime))
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
+    safe_fs.copy_file_beneath(
+        config.AGENTS_DIR, _agent_rel(src), config.AGENTS_DIR, _agent_rel(dest),
+        mode=_MIRROR_MODE, mkdirs=True, fsync=True, on_chunk=h.update,
+    )
     return h.hexdigest()
 
 
@@ -257,9 +264,11 @@ async def _fan_out(agent_slug: str, rel_path: str, path: Path | None) -> None:
 
 def _capture_and_log(agent_slug: str, rel_path: str, path: Path, reason: str) -> None:
     try:
-        content = path.read_bytes()
+        content = safe_fs.read_bytes_beneath(
+            config.AGENTS_DIR, _agent_rel(path), max_size=config.RECOVER_BIN_MAX_BYTES,
+        )
     except OSError:
-        return
+        return  # a link, a special file or one over the bin's cap: nothing to keep
     try:
         recover_bin_store.capture(agent_slug, rel_path, content, reason)
     except Exception:
@@ -346,8 +355,8 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
     jobs: list[tuple[str, str, Path | None]] = []
     adopt = writable
     src_exists, mir_exists = src_file.is_file(), mir_file.is_file()
-    mirror_rel = f"knowledge/{SHARED_SUBDIR}/{source}/{sub_rel}"
-    source_rel = f"knowledge/{sub_rel}"
+    mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source}/{sub_rel}"
+    source_rel = f"{layout.KNOWLEDGE}/{sub_rel}"
 
     def _set(h: str, st: os.stat_result) -> None:
         if book is not None:
@@ -373,13 +382,13 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
                     try:
                         if not _quick_same(om.stat(), src_st):
                             _capture_and_log(
-                                oc, f"knowledge/{SHARED_SUBDIR}/{source}/{sub_rel}",
+                                oc, f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source}/{sub_rel}",
                                 om, "conflict")
                         om.unlink(missing_ok=True)
                     except OSError:
                         logger.exception("library mirror delete failed: %s %s", oc, sub_rel)
                         continue
-                    jobs.append((oc, f"knowledge/{SHARED_SUBDIR}/{source}/{sub_rel}", None))
+                    jobs.append((oc, f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source}/{sub_rel}", None))
                 _drop(oc)
             logger.info("library delete propagated from mirror %s → source %s: %s",
                         consumer, source, sub_rel)
@@ -431,7 +440,7 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
         src_hash = _hash_file(src_file)
         if src_hash == _hash_file(mir_file):
             if int(src_st.st_mtime) != int(mir_st.st_mtime):
-                os.utime(mir_file, (src_st.st_atime, src_st.st_mtime))
+                os.utime(mir_file, (src_st.st_atime, src_st.st_mtime), follow_symlinks=False)
             _set(src_hash, src_st)
             return jobs, False
 
@@ -559,7 +568,7 @@ async def reconcile_source(source_agent: str) -> None:
                 if any(subtree_covers(s, sub_rel) for s in covered):
                     continue
                 mir_file = mir_root / sub_rel
-                mirror_rel = f"knowledge/{SHARED_SUBDIR}/{source_agent}/{sub_rel}"
+                mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source_agent}/{sub_rel}"
                 _capture_and_log(consumer, mirror_rel, mir_file, "conflict")
                 mir_file.unlink(missing_ok=True)
                 book.drop(consumer, sub_rel)
@@ -611,7 +620,7 @@ async def propagate_source_write(source_agent: str, knowledge_rel: str, *,
         for att in attachments:
             consumer = att["consumer_agent"]
             mir_file = mirror_dir(consumer, source_agent) / knowledge_rel
-            mirror_rel = f"knowledge/{SHARED_SUBDIR}/{source_agent}/{knowledge_rel}"
+            mirror_rel = f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source_agent}/{knowledge_rel}"
             try:
                 if deleted or not src_file.is_file():
                     if mir_file.is_file():
@@ -664,7 +673,13 @@ async def propagate_mirror_write(consumer_agent: str, source_agent: str,
         if not mir_file.is_file():
             return False
         src_file = source_knowledge_dir(source_agent) / sub_rel
-        h = await asyncio.to_thread(_copy_file, mir_file, src_file)
+        try:
+            h = await asyncio.to_thread(_copy_file, mir_file, src_file)
+        except safe_fs.SafeFsError as exc:
+            # A link planted in the mirror is not content to adopt.
+            logger.warning("library adoption refused: %s %s (%s)",
+                           consumer_agent, sub_rel, type(exc).__name__)
+            return False
         try:
             st = src_file.stat()
             await asyncio.to_thread(
@@ -673,7 +688,7 @@ async def propagate_mirror_write(consumer_agent: str, source_agent: str,
         except Exception:
             logger.exception("library merge-base update failed: %s %s",
                              consumer_agent, sub_rel)
-        await _fan_out(source_agent, f"knowledge/{sub_rel}", src_file)
+        await _fan_out(source_agent, f"{layout.KNOWLEDGE}/{sub_rel}", src_file)
     # Other mirrors pick the change up outside the source lock.
     await propagate_source_write(source_agent, sub_rel)
     return True
@@ -696,10 +711,10 @@ async def propagate_mirror_delete(consumer_agent: str, source_agent: str,
         src_file = source_knowledge_dir(source_agent) / sub_rel
         if src_file.is_file():
             await asyncio.to_thread(
-                _capture_and_log, source_agent, f"knowledge/{sub_rel}",
+                _capture_and_log, source_agent, f"{layout.KNOWLEDGE}/{sub_rel}",
                 src_file, "deleted")
             await asyncio.to_thread(src_file.unlink)
-            await _fan_out(source_agent, f"knowledge/{sub_rel}", None)
+            await _fan_out(source_agent, f"{layout.KNOWLEDGE}/{sub_rel}", None)
     await propagate_source_write(source_agent, sub_rel, deleted=True)
     return True
 
@@ -751,7 +766,7 @@ async def detach_teardown(source_agent: str, consumer_agent: str,
         sub_rel = f"{subdir}/{lib_rel}" if subdir else lib_rel
         await _fan_out(
             consumer_agent,
-            f"knowledge/{SHARED_SUBDIR}/{source_agent}/{sub_rel}", None)
+            f"{layout.KNOWLEDGE}/{SHARED_SUBDIR}/{source_agent}/{sub_rel}", None)
 
 
 async def teardown_library(source_agent: str, subdir: str,

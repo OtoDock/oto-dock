@@ -12,7 +12,12 @@ import uuid
 
 import pytest
 
+from core import placement
 from storage import remote_store
+
+
+def _p(kind: str, machine_id: str):
+    return placement.PlacementCapabilities(kind=kind, machine_id=machine_id)
 
 SECRET_COLUMNS = (
     "pairing_token_hash",
@@ -100,7 +105,7 @@ def test_browser_token_never_rides_a_row_but_flags_presence(machine):
         _assert_clean(row)
         assert row["browser_extension_token_set"] is True
         assert row["browser_mode"] == "own"
-    settings = remote_store.get_target_browser_settings("admin_remote", machine["id"])
+    settings = remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"]))
     assert settings.mode == "own"
     assert settings.extension_token == "tok-" + "x" * 40
 

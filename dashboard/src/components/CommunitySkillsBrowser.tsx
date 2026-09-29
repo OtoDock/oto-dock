@@ -28,6 +28,7 @@ import {
 } from '../api/community'
 import { useAgentSkills, useSetAgentSkill } from '../api/mcps'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 
 interface Props {
   open: boolean
@@ -206,7 +207,7 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
   const agentSkills = useAgentSkills(agentSlug || '')
   const setSkill = useSetAgentSkill()
   const { user, loading: authLoading } = useAuth()
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   const showAdminInstall = !agentSlug
   const [error, setError] = useState<string | null>(null)
   const [enabling, setEnabling] = useState(false)

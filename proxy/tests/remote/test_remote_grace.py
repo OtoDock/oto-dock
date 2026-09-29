@@ -154,6 +154,13 @@ class TestPumpDurableMarker:
         from core.events import stream_pump as sp
         monkeypatch.setattr(sp.task_store, "add_chat_message",
                             lambda *a, **k: saved.append((a, k)))
+        # The turn's rows go through the batch: one (args, kwargs) per row,
+        # in the shape add_chat_message was called with.
+        monkeypatch.setattr(
+            sp.task_store, "add_chat_messages_batch",
+            lambda chat_id, rows: saved.extend(
+                ((chat_id, role, content), {"event_type": et, "event_data": ed})
+                for role, content, et, ed in rows))
         monkeypatch.setattr(sp.task_store, "get_last_chat_message_id",
                             lambda cid: len(saved))
         eq: _aio.Queue = _aio.Queue()

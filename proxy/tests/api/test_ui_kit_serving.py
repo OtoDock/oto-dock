@@ -93,8 +93,10 @@ def test_ui_kit_compressed_sibling_served_with_cors(client):
     assert r.headers["content-type"].startswith("text/javascript")
     assert r.headers["access-control-allow-origin"] == "*"
     assert r.headers["vary"].lower() == "accept-encoding"
-    # Kit names are stable across releases: revalidated, never immutable.
-    assert "cache-control" not in r.headers
+    # Kit names are stable across releases: revalidated on every load through
+    # the ETag, never immutable and never left to heuristic freshness (the
+    # share host's runtime is a kit file — APPS.md "External links", 2026-09-18).
+    assert r.headers["cache-control"] == "no-cache"
 
 
 def test_ui_kit_identity_when_not_accepted(client):

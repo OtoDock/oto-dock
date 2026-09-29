@@ -15,7 +15,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from core import placement
 from storage import remote_store
+
+
+def _p(kind: str, machine_id: str):
+    return placement.PlacementCapabilities(kind=kind, machine_id=machine_id)
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +46,7 @@ def test_defaults_are_dedicated_without_token(machine):
     row = remote_store.get_remote_machine(machine["id"])
     assert row["browser_mode"] == "dedicated"
     assert row["browser_extension_token_set"] is False
-    s = remote_store.get_target_browser_settings("admin_remote", machine["id"])
+    s = remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"]))
     assert (s.mode, s.extension_token) == ("dedicated", None)
 
 
@@ -56,15 +61,15 @@ def test_token_is_encrypted_at_rest_and_decrypted_only_when_own(machine):
             (machine["id"],),
         ).fetchone()["browser_extension_token_enc"]
     assert enc and "A" * 43 not in enc  # ciphertext, not the value
-    assert remote_store.get_target_browser_settings("user_remote", machine["id"]).extension_token == "A" * 43
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_USER_REMOTE, machine["id"])).extension_token == "A" * 43
     # Back to dedicated: the token STAYS stored (it belongs to the machine)
     # but is not delivered — only own mode reads it; switching back to own
     # needs no re-paste.
     remote_store.set_browser_mode(machine["id"], "dedicated")
     assert remote_store.get_remote_machine(machine["id"])["browser_extension_token_set"] is True
-    assert remote_store.get_target_browser_settings("admin_remote", machine["id"]).extension_token is None
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"])).extension_token is None
     remote_store.set_browser_mode(machine["id"], "own")
-    assert remote_store.get_target_browser_settings("admin_remote", machine["id"]).extension_token == "A" * 43
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"])).extension_token == "A" * 43
 
 
 def test_revoking_browser_grant_resets_mode_and_token(machine):
@@ -79,7 +84,7 @@ def test_revoking_browser_grant_resets_mode_and_token(machine):
     remote_store.set_device_grants(machine["id"], ["computer"])
     row = remote_store.get_remote_machine(machine["id"])
     assert row["browser_mode"] == "dedicated" and row["browser_extension_token_set"] is False
-    assert remote_store.get_target_browser_settings("admin_remote", machine["id"]).mode == "dedicated"
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"])).mode == "dedicated"
 
 
 def test_clear_token_keeps_mode(machine):
@@ -87,7 +92,7 @@ def test_clear_token_keeps_mode(machine):
     remote_store.set_browser_mode(machine["id"], "own")
     remote_store.set_browser_extension_token(machine["id"], "C" * 43)
     remote_store.set_browser_extension_token(machine["id"], None)
-    s = remote_store.get_target_browser_settings("admin_remote", machine["id"])
+    s = remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"]))
     assert (s.mode, s.extension_token) == ("own", None)
 
 
@@ -102,10 +107,10 @@ def test_local_or_unknown_target_is_dedicated(machine, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("local target must not read the DB")
     monkeypatch.setattr(_pg, "get_conn", _boom)
-    assert remote_store.get_target_browser_settings("local", "") == remote_store.BrowserTargetSettings()
-    assert remote_store.get_target_browser_settings("local", "m") == remote_store.BrowserTargetSettings()
+    assert remote_store.get_target_browser_settings(placement.LOCAL_PLACEMENT) == remote_store.BrowserTargetSettings()
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_LOCAL, "m")) == remote_store.BrowserTargetSettings()
     monkeypatch.undo()
-    assert remote_store.get_target_browser_settings("admin_remote", str(uuid.uuid4())).mode == "dedicated"
+    assert remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, str(uuid.uuid4()))).mode == "dedicated"
 
 
 def test_undecryptable_token_degrades_to_no_token(machine, monkeypatch):
@@ -117,7 +122,7 @@ def test_undecryptable_token_degrades_to_no_token(machine, monkeypatch):
     def _bad(_enc):
         raise ValueError("key mismatch")
     monkeypatch.setattr(credential_store, "decrypt_secret", _bad)
-    s = remote_store.get_target_browser_settings("admin_remote", machine["id"])
+    s = remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"]))
     assert (s.mode, s.extension_token) == ("own", None)
 
 

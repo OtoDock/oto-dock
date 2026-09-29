@@ -11,12 +11,18 @@
 
 import { Outlet, useLocation, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin } from '../lib/permissions'
+import { useExecutionLayers } from '../api/agents'
+import { codingEngineNames, joinOr } from '../lib/engines'
 
 export function SetupBanner() {
   const { user } = useAuth()
+  // The coding engines the banner names come from the catalog (the same
+  // `identity.role === 'coding'` the server's has_own_engine counts).
+  const { data: layers } = useExecutionLayers()
 
   // Per-user nudge, shown to ANY role until the user connects their OWN AI
-  // engine (a personal Claude Code or Codex subscription). It keeps showing even
+  // engine (a personal subscription on a coding engine). It keeps showing even
   // when they can borrow a platform sub, because borrowing covers agent/voice
   // work — their own user-scoped chats need their own engine. Clicks through to
   // User Settings → AI Engines (where admins can also tick "contribute to the
@@ -24,6 +30,7 @@ export function SetupBanner() {
   if (!user || user.has_own_engine !== false) {
     return null
   }
+  const engines = joinOr(codingEngineNames(Object.values(layers ?? {}))) || 'a coding engine'
 
   return (
     <div className="bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-800 px-4 py-2.5 flex items-center justify-between relative z-50">
@@ -32,7 +39,7 @@ export function SetupBanner() {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.268 16.5c-.77.833.192 2.5 1.732 2.5z" />
         </svg>
         <span>
-          <strong>Connect an AI engine</strong> — add Claude Code or Codex in your User Settings to run your own chats and agents.
+          <strong>Connect an AI engine</strong> — add {engines} in your User Settings to run your own chats and agents.
         </span>
       </div>
       <Link
@@ -55,7 +62,7 @@ export default function PlatformSetupGuard() {
   }
 
   // Always allow admin pages (admin needs access to configure)
-  if (user?.role === 'admin') {
+  if (isAdmin(user)) {
     return <Outlet />
   }
 

@@ -9,6 +9,7 @@ from storage import database as task_store
 from storage.billing import subscription_store
 
 import asyncio
+from auth import roles
 
 router = APIRouter()
 
@@ -240,7 +241,7 @@ async def admin_set_limit(
         raise HTTPException(400, "limit_type must be role_default, user_override, or agent")
     if req.period not in ("weekly", "monthly"):
         raise HTTPException(400, "period must be weekly or monthly")
-    if req.limit_type == "role_default" and req.target not in ("admin", "creator", "member"):
+    if req.limit_type == "role_default" and req.target not in roles.PLATFORM_ROLES:
         raise HTTPException(400, "target must be a valid role name")
     await asyncio.to_thread(
         task_store.upsert_usage_limit,

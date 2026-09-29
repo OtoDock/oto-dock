@@ -7,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import psycopg
+
 from storage.pg import get_conn
 
 
@@ -71,6 +73,20 @@ def create_notification(
         )
         row = conn.execute("SELECT * FROM notifications WHERE id=%s", (nid,)).fetchone()
         return dict(row)
+
+
+def transfer_agent_scope(conn: psycopg.Connection, agent: str, from_sub: str, to_sub: str, now: str) -> list[dict]:
+    """Inside the caller's transaction: the person's agent-scope scheduled
+    notifications on ``agent`` change hands. Returns the rows moved."""
+    rows = conn.execute(
+        """UPDATE notifications
+           SET created_by=%s, transferred_from=COALESCE(NULLIF(transferred_from, ''), created_by),
+               transferred_at=%s
+           WHERE agent_slug=%s AND scope='agent' AND created_by=%s
+           RETURNING id, title""",
+        (to_sub, now, agent, from_sub),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_notification(notification_id: str) -> dict | None:
@@ -190,18 +206,21 @@ def create_delivery(
     notification_id: str | None = None,
     agent_slug: str | None = None,
     chat_id: str | None = None,
+    href: str = "",
 ) -> dict:
-    """Create a delivery record for a specific user. Returns the full row."""
+    """Create a delivery record for a specific user. Returns the full row.
+    ``href`` is a dashboard path the row opens instead of the agent/chat
+    deep link (a shared app, a shared chat)."""
     did = str(uuid.uuid4())
     now = _now()
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO notification_deliveries
                (id, notification_id, user_sub, title, body, severity, scope,
-                source, delivered_at, agent_slug, chat_id)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                source, delivered_at, agent_slug, chat_id, href)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (did, notification_id, user_sub, title, body, severity, scope,
-             source, now, agent_slug, chat_id),
+             source, now, agent_slug, chat_id, href or ""),
         )
         row = conn.execute(
             "SELECT * FROM notification_deliveries WHERE id=%s", (did,)
@@ -368,10 +387,12 @@ def delete_push_subscription_by_data(
 
 
 def resolve_username_to_sub(username: str) -> str | None:
-    """Resolve a human-readable username to user sub ID.
-
-    Returns the sub if found, None otherwise. Also returns the input
-    unchanged if it already looks like a sub (long hex string).
+    """Resolve a username to the user's sub — the ``username`` column (the
+    slug minted once at first login, TRIGGERS.md "Webhook URLs"), falling
+    back to the display name, which is what these lookups matched until
+    2026-09-19 (an address or a notification target written with the
+    display name keeps working). Returns the input unchanged when it
+    already looks like a sub (a long string).
     """
     if not username:
         return None
@@ -380,18 +401,77 @@ def resolve_username_to_sub(username: str) -> str | None:
         return username
     with get_conn() as conn:
         row = conn.execute(
+            "SELECT sub FROM users WHERE LOWER(username) = LOWER(%s)", (username,)
+        ).fetchone()
+        if row:
+            return row["sub"]
+        row = conn.execute(
             "SELECT sub FROM users WHERE LOWER(name) = LOWER(%s)", (username,)
         ).fetchone()
         return row["sub"] if row else None
 
 
+def resolve_username_candidates(username: str) -> list[str]:
+    """Every sub a webhook address segment may name: the ``username`` match
+    first, then the display-name matches (what addresses were written with
+    until 2026-09-19), de-duplicated. A segment that already looks like a
+    sub is its own only candidate. The caller keeps the one its key proves."""
+    if not username:
+        return []
+    if len(username) > 30:
+        return [username]
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT sub FROM users WHERE LOWER(username) = LOWER(%s) "
+            "UNION ALL SELECT sub FROM users WHERE LOWER(name) = LOWER(%s)",
+            (username, username),
+        ).fetchall()
+    return list(dict.fromkeys(r["sub"] for r in rows))
+
+
 def resolve_sub_to_username(sub: str) -> str | None:
-    """Resolve a user sub ID to human-readable username."""
+    """Resolve a user sub to the user's username (the slug), the display
+    name only for a row that never got one. What a user-scoped webhook
+    address carries."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT name FROM users WHERE sub=%s", (sub,)
+            "SELECT username, name FROM users WHERE sub=%s", (sub,)
         ).fetchone()
-        return row["name"] if row else None
+        return (row["username"] or row["name"]) if row else None
+
+
+def resolve_sub_to_display_name(sub: str) -> str | None:
+    """The name a listing prints for a user: the self-service display name
+    (``users.display_name``, what ``PUT /v1/users/me/profile`` writes), else
+    the auth provider's ``users.name``, else the username — the rule
+    ``api/events/subscriptions.py::_decorate_creators`` applies."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT display_name, name, username FROM users WHERE sub=%s", (sub,)
+        ).fetchone()
+        return (row["display_name"] or row["name"] or row["username"]) if row else None
+
+
+def resolve_subs_to_display_names(subs: list[str]) -> dict[str, str]:
+    """``resolve_sub_to_display_name`` for many subs in one query: ``{sub:
+    name}`` for the users that exist and resolve to a non-empty name (the
+    same ``display_name``, ``name``, ``username`` order); a sub with no row
+    or no name is absent, so ``names.get(sub) or fallback`` reads as the
+    per-row call did. An empty list answers ``{}`` with no query."""
+    ids = list(dict.fromkeys(s for s in subs if s))
+    if not ids:
+        return {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT sub, display_name, name, username FROM users WHERE sub = ANY(%s)",
+            (ids,),
+        ).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        name = r["display_name"] or r["name"] or r["username"]
+        if name:
+            out[r["sub"]] = name
+    return out
 
 
 def get_all_user_subs() -> list[str]:

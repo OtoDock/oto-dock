@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   useMyIntegrations,
 } from '../api/credentials'
@@ -177,6 +178,19 @@ function ApiKeysSection() {
 
 export function IntegrationsTab() {
   const { data: integrations, isLoading } = useMyIntegrations()
+  // `?provider=<mcp name>` (an app's "Connect X" button, navigation by kind)
+  // scrolls to that integration's row and lights it for a moment. Only a
+  // click on the row starts a connect flow — never the arrival itself.
+  const [searchParams] = useSearchParams()
+  const provider = searchParams.get('provider') || ''
+  const [highlight, setHighlight] = useState('')
+  useEffect(() => {
+    if (!provider || !integrations?.some((i) => i.mcp_name === provider)) return
+    setHighlight(provider)
+    document.getElementById(`integration-${provider}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    const timer = setTimeout(() => setHighlight(''), 2500)
+    return () => clearTimeout(timer)
+  }, [provider, integrations])
   return (
     <div>
       <div className="mb-8">
@@ -189,7 +203,13 @@ export function IntegrationsTab() {
         ) : integrations && integrations.length > 0 ? (
           <div className="space-y-3">
             {integrations.map(i => (
-              <UserAccountsManager key={i.mcp_name} integration={i} />
+              <div
+                key={i.mcp_name}
+                id={`integration-${i.mcp_name}`}
+                className={`rounded-xl transition-shadow ${highlight === i.mcp_name ? 'ring-2 ring-brand ring-offset-2 ring-offset-p-bg' : ''}`}
+              >
+                <UserAccountsManager integration={i} />
+              </div>
             ))}
           </div>
         ) : (

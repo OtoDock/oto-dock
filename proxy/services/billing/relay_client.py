@@ -37,8 +37,10 @@ Two-level gating:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import ssl
 import threading
 import time
 
@@ -309,6 +311,57 @@ def _link_identity() -> dict:
 _RELAY_TIMEOUT_SECONDS = 15.0
 
 
+class _RelayLoopState:
+    """One HTTP client per loop (the test suite runs several), built under a
+    lock so concurrent first calls share it."""
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.client_lock: asyncio.Lock | None = None
+        self.client = None
+
+    def current(self) -> "_RelayLoopState":
+        loop = asyncio.get_running_loop()
+        if self.loop is not loop:
+            self.loop = loop
+            self.client_lock = asyncio.Lock()
+            self.client = None
+        return self
+
+
+_relay_state = _RelayLoopState()
+_ssl_context: ssl.SSLContext | None = None
+
+
+def reset_relay_client_state() -> None:
+    """Drop the per-loop client (tests)."""
+    global _relay_state
+    _relay_state = _RelayLoopState()
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    import certifi
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+async def _relay_http_client():
+    """The SSL context is what makes a client construction cost several
+    milliseconds on the loop: built once, in a thread, shared by every call
+    on the loop."""
+    import httpx
+
+    global _ssl_context
+    state = _relay_state.current()
+    if state.client is None:
+        async with state.client_lock:
+            if state.client is None:
+                if _ssl_context is None:
+                    _ssl_context = await asyncio.to_thread(_build_ssl_context)
+                state.client = httpx.AsyncClient(
+                    verify=_ssl_context, timeout=_RELAY_TIMEOUT_SECONDS)
+    return state.client
+
+
 async def _relay_post(path: str, payload: dict) -> dict:
     """POST ``payload`` to ``{OTODOCK_RELAY_BASE}{path}`` → parsed JSON.
 
@@ -319,11 +372,9 @@ async def _relay_post(path: str, payload: dict) -> dict:
     downgrade a paying customer on a transient outage. :func:`_require_relay`
     must gate the call first (guarantees a configured base).
     """
-    import httpx
-
     base = config.OTODOCK_RELAY_BASE.rstrip("/")
-    async with httpx.AsyncClient(timeout=_RELAY_TIMEOUT_SECONDS) as client:
-        resp = await client.post(f"{base}{path}", json=payload)
+    client = await _relay_http_client()
+    resp = await client.post(f"{base}{path}", json=payload)
     if 400 <= resp.status_code < 500:
         code = ""
         with contextlib.suppress(Exception):

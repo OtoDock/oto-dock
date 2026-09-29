@@ -18,6 +18,18 @@ State categories:
 import time
 from typing import Any
 
+# The live-state vocabulary, named once (core-seams phase 8; the dashboard
+# mirror is ``lib/status/machine.ts``). The persisted column keeps its own
+# three words (``remote_store.STATUS_*``); every route overlays this state.
+ONLINE = "online"
+STALE = "stale"
+PAUSED = "paused"
+DISCONNECTED = "disconnected"
+NEVER_CONNECTED = "never_connected"
+STATES: frozenset[str] = frozenset({ONLINE, STALE, PAUSED, DISCONNECTED, NEVER_CONNECTED})
+#: The machine can accept commands right now.
+REACHABLE: frozenset[str] = frozenset({ONLINE, STALE})
+
 # Heartbeat age thresholds. The satellite sends a heartbeat every 30s and the
 # proxy heartbeat monitor flips DB status to `disconnected` after 90s. We use
 # tighter UI thresholds so the dashboard shows `stale` before the DB catches up.
@@ -59,11 +71,11 @@ def get_live_machine_status(
     if conn is not None:
         age = time.monotonic() - conn.last_heartbeat
         if age < _ONLINE_MAX_AGE_S:
-            state = "online"
+            state = ONLINE
         elif age < _STALE_MAX_AGE_S:
-            state = "stale"
+            state = STALE
         else:
-            state = "disconnected"
+            state = DISCONNECTED
         last_seen = getattr(conn, "last_seen_iso", "") or ""
         if not last_seen:
             if machine is None:
@@ -73,7 +85,7 @@ def get_live_machine_status(
             "state": state,
             "last_heartbeat_age_s": int(age),
             "last_seen_iso": last_seen,
-            "reachable": state in ("online", "stale"),
+            "reachable": state in REACHABLE,
         }
 
     if machine is None:
@@ -85,7 +97,7 @@ def get_live_machine_status(
     # admin offline evaluator already skips it). Still not reachable.
     if machine and machine.get("paused"):
         return {
-            "state": "paused",
+            "state": PAUSED,
             "last_heartbeat_age_s": None,
             "last_seen_iso": last_seen,
             "reachable": False,
@@ -95,14 +107,14 @@ def get_live_machine_status(
     # DB last_seen.
     if not machine or not last_seen:
         return {
-            "state": "never_connected",
+            "state": NEVER_CONNECTED,
             "last_heartbeat_age_s": None,
             "last_seen_iso": last_seen,
             "reachable": False,
         }
 
     return {
-        "state": "disconnected",
+        "state": DISCONNECTED,
         "last_heartbeat_age_s": None,
         "last_seen_iso": last_seen,
         "reachable": False,

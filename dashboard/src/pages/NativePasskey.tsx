@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { NATIVE_HANDOFF_STATE, nativePasskeyLogin, passkeySupported } from '../api/webauthn'
 
 /**
@@ -6,8 +7,12 @@ import { NATIVE_HANDOFF_STATE, nativePasskeyLogin, passkeySupported } from '../a
  * this page via openAuthBrowser (the webview can't run WebAuthn); a successful
  * ceremony deep-links the one-time handoff token back through the existing
  * OIDC-callback rails, and the app's webview exchanges it for its session.
+ * The `h` parameter is the nonce the app's webview holds: the token is bound
+ * to it, so no other browser can take the sign-in.
  */
 export default function NativePasskey() {
+  const [searchParams] = useSearchParams()
+  const handoff = searchParams.get('h') || ''
   const [error, setError] = useState('')
   const [done, setDone] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -16,7 +21,7 @@ export default function NativePasskey() {
     setError('')
     setLoading(true)
     try {
-      const token = await nativePasskeyLogin()
+      const token = await nativePasskeyLogin(handoff)
       setDone(true)
       window.location.href =
         `otodock://auth/callback?code=${encodeURIComponent(token)}&state=${NATIVE_HANDOFF_STATE}`
@@ -42,7 +47,12 @@ export default function NativePasskey() {
                 Use your passkey to sign in to the OtoDock app.
               </p>
               {error && <div className="text-sm text-p-accent-red mb-4">{error}</div>}
-              {passkeySupported() ? (
+              {!handoff ? (
+                // Opened by an app page older than the handoff binding.
+                <p className="text-sm text-p-text-secondary">
+                  Close this page, then close and reopen the OtoDock app and sign in again.
+                </p>
+              ) : passkeySupported() ? (
                 <button onClick={handleSignIn} disabled={loading}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50 transition-colors">
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

@@ -3,6 +3,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { useFcmPush } from '../hooks/useFcmPush'
 import { useWakeWord } from '../hooks/useWakeWord'
 import { useBuildWatch } from '../hooks/useBuildWatch'
+import { useOpenAppToast } from '../hooks/useOpenAppToast'
 import WakeDiagBadge from './WakeDiagBadge'
 import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
@@ -24,6 +25,10 @@ export default function RequireAuth() {
   // Pages without a dashboard socket learn about a new build when they
   // return to the foreground (chat pages learn it over the socket).
   useBuildWatch(!!user)
+
+  // An agent's request to show one of its apps that the current page could
+  // not handle itself becomes a notice with an Open button, route-independent.
+  const openAppToast = useOpenAppToast(navigate, !!user)
 
   if (loading) {
     return (
@@ -80,6 +85,7 @@ export default function RequireAuth() {
     <>
       <Outlet />
       <WakeDiagBadge />
+      {openAppToast}
     </>
   )
 }

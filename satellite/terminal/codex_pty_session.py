@@ -36,6 +36,7 @@ from ..sessions.codex_session import (
     _validate_config_toml, _write_codex_hook_scripts, _write_codex_hooks,
 )
 from ..config import otodock_dir
+from .._vendored import layout
 from ..sessions.codex_session import (
     CODEX_TOOLS_TABLE, chmod_private, local_provider_toml, write_or_drop_auth_json,
     write_or_drop_model_catalog,
@@ -225,7 +226,7 @@ class CodexPtySession(BasePtySession):
             toml_content = path_translator.translate_codex_mcp_env_paths(
                 toml_content,
                 agent_dir=self.agent_dir,
-                username=path_translator.derive_username_from_cwd_relative(
+                username=layout.user_of(
                     self.config.get("cwd_relative", ""),
                 ),
                 session_id=self.session_id,
@@ -272,7 +273,7 @@ class CodexPtySession(BasePtySession):
         # --- build the INTERACTIVE command ------------------------------------
         from ..host.cli_versions import resolve_spawn_bin_async
         codex_bin = await resolve_spawn_bin_async(
-            "codex", self.sat_config.codex_bin, for_pty=True,
+            "codex", self.sat_config.bin_hint("codex"), for_pty=True,
         )
         sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
         approval = approval_for_sandbox(sandbox_mode)

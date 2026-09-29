@@ -22,16 +22,19 @@
  * needed (a second copy breaks zustand's Object.is selector guard).
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { SearchProvider } from '../../contexts/SearchContext'
 import { useAgents, useExecutionLayers, useAgentTargetStatus } from '../../api/agents'
+import { engineLabels, runsInteractive, supportsCompact } from '../../lib/engines'
 import { useChats, useTaskChats } from '../../api/chats'
 import { useRunByChat } from '../../api/runs'
 import ChatMessages from '../../components/chat/ChatMessages'
 import { ChatFileProvider } from '../../components/chat/ChatFileContext'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
 import type { PendingImage, PendingFile } from '../../components/chat/ChatInput'
+import type { QueuedMessage } from '../../store/types'
+import type { WireImage } from '../../hooks/useDashboardWs'
 import TopBar from '../../components/chat/TopBar'
 import AppSettingsModal from '../../components/chat/AppSettingsModal'
 import { SetupBanner } from '../../components/PlatformSetupGuard'
@@ -40,6 +43,7 @@ import { useChatNotifications } from '../../hooks/useChatNotifications'
 import { useSwipeGesture } from '../../hooks/useSwipeGesture'
 import ChatHistory from '../../components/chat/ChatHistory'
 import ActiveChatsPanel from '../../components/chat/ActiveChatsPanel'
+import { CHAT_PHASE } from '../../lib/status/chat'
 import ChatComposerBar from './chat/ChatComposerBar'
 import ChatBanners from './chat/ChatBanners'
 import ChatSidePanels from './chat/ChatSidePanels'
@@ -56,16 +60,19 @@ import { useArtifactWindows } from '../../hooks/useArtifactWindows'
 import { useAgentChatStream } from './chat/useAgentChatStream'
 import { useFindBar } from './chat/useFindBar'
 import { useChatAttachments } from './chat/useChatAttachments'
-import { useModelEngineSelection, useModelEngineReconcile, useModelEngineHandlers } from './chat/useModelEngineSelection'
+import {
+  useModelEngineSelection, useModelEngineReconcile, useModelEngineHandlers, usePermissionModeInvariant,
+} from './chat/useModelEngineSelection'
 import { useChatDuplexVoice, useDuplexWakeArm, duplexVoiceProp } from './chat/useChatDuplexVoice'
-import { useOverlayPanels, useAppSendPrompt } from './chat/useOverlayPanels'
+import { useOverlayPanels, useAppSendPrompt, usePendingAppAction } from './chat/useOverlayPanels'
 import { useInteractiveHandlers } from './chat/useInteractiveHandlers'
+import { isTaskChatId } from '../../lib/session/kind'
 
 // Stable empty-array references for the chatStore selectors below. Zustand
 // uses Object.is to detect selector-result changes — returning a fresh `[]`
 // literal on every call ([] !== []) would trigger an infinite re-render
 // loop (React error #185 "max update depth exceeded").
-const EMPTY_QUEUED_MESSAGES: string[] = []
+const EMPTY_QUEUED_MESSAGES: QueuedMessage[] = []
 const EMPTY_PENDING_IMAGES: PendingImage[] = []
 const EMPTY_PENDING_FILES: PendingFile[] = []
 
@@ -98,8 +105,10 @@ export default function AgentChat() {
   const { data: agentTargetStatus } = useAgentTargetStatus(agentName ?? '')
   const { data: layers } = useExecutionLayers()
   const currentAgent = agents?.find(a => a.name === agentName)
-  const agentExecutionPath = currentAgent?.execution_path || 'claude-code-cli'
-  const agentExecutionPaths = currentAgent?.execution_paths || [agentExecutionPath]
+  // The agent row always carries its primary engine; until the agents query
+  // settles the page has no engine (no default is assumed).
+  const agentExecutionPath = currentAgent?.execution_path ?? ''
+  const agentExecutionPaths = currentAgent?.execution_paths || (agentExecutionPath ? [agentExecutionPath] : [])
   const agentLayerModels = agentExecutionPaths.flatMap(p => layers?.[p]?.models?.filter((m: { value: string }) => m.value !== '') || [])
   const agentDefaultModel = currentAgent?.default_model || ''
   const agentDisplayName = currentAgent?.display_name
@@ -153,6 +162,7 @@ export default function AgentChat() {
   const {
     ws,
     messages, setMessages,
+    pendingSteers,
     loadOlder, hasMoreOlder, loadingOlder, seedDbHistory,
     chatId, setChatId, chatIdRef,
     sessionId, setSessionId,
@@ -218,30 +228,26 @@ export default function AgentChat() {
 
   // Compound model value for dropdown matching (layer::model_id)
   const modelCompound = `${chatActiveLayer || selectedLayer || agentExecutionPath}::${model}`
-  // Plan mode is a Claude-Code-CLI-only feature — hide the option for Codex /
-  // Direct LLM (their layers declare supports_plan_mode=false). Gate on the
-  // effective layer (committed → selected → agent default).
+  // The permission modes the effective engine declares (committed → selected
+  // → agent default): the menu offers exactly those; undefined until the
+  // catalog loads.
   const effectiveLayer = chatActiveLayer || selectedLayer || agentExecutionPath
-  const supportsPlanMode = layers?.[effectiveLayer]?.supports_plan_mode ?? true
-  // Interactive CLI: show the toggle when the agent has
-  // an interactive-capable CLI layer (claude-code-cli OR codex-cli). Gated on
-  // AGENT capability — not the selected model — so it stays put when a direct-llm
-  // model is picked (the toggle is simply ignored for that layer). Hidden for
-  // direct-llm-only agents, and platform-wide when the interactive
-  // kill-switch is off (sessions always spawn headless then).
+  const permissionModes = layers?.[effectiveLayer]?.permission_modes
+  // Interactive CLI: show the toggle when one of the agent's engines has a
+  // native TUI (`runtime.supports_interactive_pty` on its descriptor). Gated
+  // on AGENT capability — not the selected model — so it stays put when a
+  // model on an engine without a TUI is picked (the toggle is simply ignored
+  // for that layer). Hidden for agents with no such engine, until the catalog
+  // loads, and platform-wide when the interactive kill-switch is off
+  // (sessions always spawn headless then).
   const interactiveAvailable =
-    (agentExecutionPaths.includes('claude-code-cli') || agentExecutionPaths.includes('codex-cli'))
+    agentExecutionPaths.some(p => runsInteractive(layers?.[p]))
     && user?.feature_flags?.interactive_terminal_enabled !== false
   // The toggle is free to flip any time EXCEPT while a cold-start is warming or a
   // live switch (kill+rewarm) is in flight — both would race a second
   // toggle. A live session is switchable (via confirm).
   const interactiveLocked = warmingUp || interactive.switching
-  // Invariant: never leave the permission mode on "plan" for a layer that
-  // doesn't support it (Codex / Direct LLM) — covers a model switch and a
-  // stale per-agent sticky "plan" being restored onto such a layer.
-  useEffect(() => {
-    if (mode === 'plan' && !supportsPlanMode) setMode('default')
-  }, [mode, supportsPlanMode, setMode])
+  usePermissionModeInvariant(mode, permissionModes, setMode)
 
   // A live meeting/voice session would be lost on an install switch — flag the
   // native switcher so it confirms first (LLM streaming is reported separately).
@@ -263,14 +269,14 @@ export default function AgentChat() {
   // "Getting ready…" badge signal — true from send until warmup_ready. warmingUp
   // is the local send-time flag; the chatStore 'warming' status also covers a
   // resumed in-flight warmup after a refresh/navigate.
-  const warmingStatus = useChatStore((s) => (draftKey ? s.byChat[draftKey]?.status === 'warming' : false))
+  const warmingStatus = useChatStore((s) => (draftKey ? s.byChat[draftKey]?.status === CHAT_PHASE.WARMING : false))
   const warming = warmingUp || warmingStatus
   // Stop button / live-input state derive from the VIEWED chat's slice (per-chat),
   // NOT connection-global ws.streaming — else the stop button + "type to queue" leak
   // onto whatever chat you switch to while another streams. The slice is set
-  // 'streaming' by every turn-start path (user_message / queue_sent / server_turn_start
+  // 'streaming' by every turn-start path (queue_sent / server_turn_start
   // / live_state / server-kick) and back to 'ready' on done/aborted, keyed by chat_id.
-  const viewedStreaming = useChatStore((s) => (chatId ? s.byChat[chatId]?.status === 'streaming' : false))
+  const viewedStreaming = useChatStore((s) => (chatId ? s.byChat[chatId]?.status === CHAT_PHASE.STREAMING : false))
   // Pin-vs-current target mismatch for the VIEWED chat. Read from the
   // per-chat slice (warmup_ready stores it there) rather than useChatStream
   // state so the sidebar kebab reads the exact same fact — and the slice is
@@ -357,7 +363,7 @@ export default function AgentChat() {
   // hold time; the flush effect below routes it once the query settles.
   const heldForAgentsRef = useRef<{
     text: string
-    images?: Array<{ base64: string; name: string }>
+    images?: WireImage[]
     files?: Array<{ path: string; name: string }>
   } | null>(null)
 
@@ -380,7 +386,7 @@ export default function AgentChat() {
   // The sidebar's Task history toggle is page state so ?tasks=1 deep links
   // (notifications, the /runs resolver, Active-now task rows) open with the
   // task view on.
-  const isTaskChat = !!chatId?.startsWith('task-')
+  const isTaskChat = isTaskChatId(chatId)
   const { data: taskRun } = useRunByChat(isTaskChat ? chatId : null)
   const [tasksMode, setTasksMode] = useState(() => searchParams.get('tasks') === '1')
   useEffect(() => {
@@ -391,10 +397,10 @@ export default function AgentChat() {
   const { data: taskChats } = useTaskChats(
     agentName, tasksMode || isTaskChat, duplexVoice.active)
 
-  // ---- Overlays: workspace, pinned mini-apps, Dock (see chat/useOverlayPanels.ts) ----
+  // ---- Overlays: workspace, pinned apps, Dock (see chat/useOverlayPanels.ts) ----
   const {
-    workspace, canManageThisAgent, canEditThisAgent, recoverRequested, setRecoverRequested,
-    appsActive, setAppsOpen, showHomeActive, toggleApps,
+    workspace, canManageThisAgent, canWriteThisWorkspace, recoverRequested, setRecoverRequested,
+    appsActive, setAppsOpen, showHomeActive, toggleApps, appsActiveId, selectApp,
     setProjectsOpen, isProjectChat, chatPins, dockAvailable, projectsActive,
   } = useOverlayPanels({
     messages, agentName, user, chatId, searchParams, setSearchParams, urlChatId, chats, taskChats, keepAppsOnChatEntryRef,
@@ -486,7 +492,7 @@ export default function AgentChat() {
       if (!agentName) return
       // Live conversation: a typed send rides the duplex socket as a
       // SPOKEN-mode turn — the reply comes back as TTS, and none of the
-      // overlay-closing below runs (an open mini-app view survives the
+      // overlay-closing below runs (an open app view survives the
       // send). Attachments can't ride the frame — fall through to a
       // normal typed send when any are pending, or if the socket is gone.
       if (duplexActiveRef.current && pendingImages.length === 0
@@ -533,7 +539,13 @@ export default function AgentChat() {
           blocks.push({ type: 'file_attachments', files: uploadedFiles.map(f => ({ name: f.name, path: f.path })) })
         }
         if (images) {
-          blocks.push({ type: 'image_attachments', images: images.map(i => i.base64) })
+          // A fresh photo renders from its data URL; one handed back from a
+          // cancelled queued message from its saved path (the files URL).
+          blocks.push({
+            type: 'image_attachments',
+            images: images.map(i => i.base64 ?? i.name),
+            paths: images.every(i => i.path) ? images.map(i => i.path ?? null) : undefined,
+          })
         }
         blocks.push({ type: 'text', content: text })
 
@@ -554,7 +566,7 @@ export default function AgentChat() {
         setTurnStartTime(Date.now())
       }
 
-      const wsImages = images?.map(i => ({ base64: i.base64, name: i.name }))
+      const wsImages = images?.map(i => ({ base64: i.base64, path: i.path, name: i.name }))
       const wsFiles = uploadedFiles?.length ? uploadedFiles : undefined
 
       // First send racing the agents query: with no explicit per-chat mode and
@@ -581,7 +593,10 @@ export default function AgentChat() {
       // null when not interactive, so we fall through to the normal `-p` path.
       const routed = interactive.routeSend(text, {
         chatId, sessionId, warmingUp,
-        warmupParams: { agentName, chatId: chatId || undefined, mode, model, layer: chatActiveLayer ?? selectedLayer ?? undefined },
+        warmupParams: {
+          agentName, chatId: chatId || undefined, mode, model,
+          layer: chatActiveLayer ?? selectedLayer ?? undefined,
+        },
         onColdStart: () => {
           addUserAndPlaceholder(text)
           sentWithBubbleRef.current = text
@@ -859,18 +874,19 @@ export default function AgentChat() {
     [agentName, agentDefaultModel, chatId, ws, navigate, workspace, interactive.resetSession],
   )
 
-  // Mini-app send_prompt router (see chat/useOverlayPanels.ts).
+  // App send_prompt router (see chat/useOverlayPanels.ts).
   const { handleAppSendPrompt } = useAppSendPrompt({
     interactive, chatId, ws, sessionId, warmingUp, mode, model, chatActiveLayer, selectedLayer,
     setAppsOpen, setWarmingUp, serverKickPendingRef, sendAppAction, agentName, keepAppsOnChatEntryRef, handleSelectChat,
   })
+  usePendingAppAction({ chatId, agentName, connected: ws.connected, handleAppSendPrompt })
 
   const handleModeChange = useCallback((m: string) => {
-    ws.changeMode(m)
+    ws.changeMode(m, chatId)
     setMode(m)
     // Sticky for the same agent's next new chat.
     if (agentName) useAgentPrefsStore.getState().setLastMode(agentName, m)
-  }, [ws, agentName])
+  }, [ws, agentName, chatId])
 
   // Codex plan card "Implement": leave plan mode (→ the next turn clears codex's
   // plan collaboration mode) and kick the build turn. Codex has no plan file, so
@@ -882,7 +898,7 @@ export default function AgentChat() {
 
   // handleModelChange + the cross-engine switch confirm/cancel (chat/useModelEngineSelection.ts).
   const { handleModelChange, handleEngineSwitchConfirm, handleEngineSwitchCancel } = useModelEngineHandlers({
-    ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming, isTaskChat,
+    ws, parseModelValue, agentName, chatId, chatActiveLayer, viewedStreaming, warming, isTaskChat,
     setEngineSwitchBusy, setEngineSwitchError, setPendingEngineSwitch, setModel, setSelectedLayer, pendingEngineSwitch,
   })
 
@@ -933,6 +949,7 @@ export default function AgentChat() {
         }}
         streaming={viewedStreaming}
         queuedMessages={queuedMessages}
+        pendingSteers={pendingSteers}
         onCancelQueued={handleCancelQueued}
         onLoadOlder={loadOlder}
         hasMoreOlder={hasMoreOlder}
@@ -1027,12 +1044,15 @@ export default function AgentChat() {
         {workspace.state.open && agentName ? (
           <ChatWorkspaceSlot
             isTaskChat={isTaskChat} currentAgent={currentAgent} taskRun={taskRun} agentName={agentName}
-            canManageThisAgent={canManageThisAgent} canEditThisAgent={canEditThisAgent} workspace={workspace}
+            canManageThisAgent={canManageThisAgent} canWriteThisWorkspace={canWriteThisWorkspace} workspace={workspace}
             recoverRequested={recoverRequested} setRecoverRequested={setRecoverRequested}
           />
         ) : appsActive && agentName ? (
           <div className="flex-1 min-h-0 flex flex-col">
-            <AppsOverlay agent={agentName} onSendPrompt={handleAppSendPrompt} topPadding={!showHomeActive} />
+            <AppsOverlay
+              agent={agentName} onSendPrompt={handleAppSendPrompt} topPadding={!showHomeActive}
+              activeId={appsActiveId} onSelect={selectApp}
+            />
           </div>
         ) : projectsActive && chatId && agentName ? (
           <div className="flex-1 min-h-0 flex flex-col">
@@ -1089,14 +1109,15 @@ export default function AgentChat() {
           thinkingActive={thinkingActive} compressingActive={compressingActive} activeAgents={activeAgents}
           mode={mode} pendingEngineSwitch={pendingEngineSwitch} model={model} modelCompound={modelCompound}
           totalCost={totalCost} costBilled={costBilled} contextUsed={contextUsed} contextMax={contextMax}
-          cacheStats={cacheStats} meetingActive={meetingActive} supportsPlanMode={supportsPlanMode}
+          cacheStats={cacheStats} meetingActive={meetingActive} permissionModes={permissionModes}
           agentLayerModels={agentLayerModels} modelGroups={modelGroups}
           interactiveAvailable={interactiveAvailable} interactive={interactive}
           interactiveLocked={interactiveLocked} handleInteractiveToggle={handleInteractiveToggle}
-          handleToggleRichView={handleToggleRichView} isTaskChat={isTaskChat} chatId={chatId} ws={ws}
+          handleToggleRichView={handleToggleRichView} isTaskChat={isTaskChat} chatId={chatId} agentName={agentName} ws={ws}
           handleModeChange={handleModeChange} handleModelChange={handleModelChange}
-          chatActiveLayer={chatActiveLayer} effectiveLayer={effectiveLayer} limitReached={limitReached}
-          limitReachedInfo={limitReachedInfo}
+          chatActiveLayer={chatActiveLayer} effectiveLayer={effectiveLayer}
+          supportsCompact={supportsCompact(layers, effectiveLayer)} limitReached={limitReached}
+          limitReachedInfo={limitReachedInfo} engineLabels={engineLabels(layers)}
           limitWarning={limitWarning} setLimitWarning={setLimitWarning} draftInput={draftInput}
           setDraftInput={setDraftInput} handleSend={handleSend} handleAbort={handleAbort}
           handleEditQueued={handleEditQueued} handleEngage={handleEngage} permissionPending={permissionPending}

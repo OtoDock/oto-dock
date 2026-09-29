@@ -46,6 +46,8 @@ class _Captured(list):
     updates: list
     events: list
     order: list
+    sync: list       # each message row's sync_search flag
+    rebuilds: list   # the chat ids whose search row was rebuilt, in order
 
 
 @pytest.fixture(autouse=True)
@@ -53,18 +55,22 @@ def _capture(monkeypatch):
     rows = _Captured()
     rows.events = []
     rows.order = []
+    rows.sync = []
+    rows.rebuilds = []
     updates = []
     import storage.database as db
 
-    def _add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
+    def _add(chat_id, role, content="", event_type="", event_data="", author_sub="", **kw):
         if role == "event":
             rows.events.append((event_type, json.loads(event_data)))
             rows.order.append(("event", event_type))
         else:
             rows.append((role, content))
             rows.order.append((role, content))
+            rows.sync.append(kw.get("sync_search", True))
 
     monkeypatch.setattr(db, "add_chat_message", _add)
+    monkeypatch.setattr(db, "rebuild_chat_search", rows.rebuilds.append)
     monkeypatch.setattr(db, "update_chat", lambda cid, **kw: updates.append(kw))
     monkeypatch.setattr(db, "get_chat", lambda cid: {"user_sub": "u", "title": "", "codex_thread_id": ""})
     monkeypatch.setattr(db, "get_chat_messages", lambda cid, limit=500: [])
@@ -426,6 +432,37 @@ def test_custom_tool_call_apply_patch_summary(tmp_path, _capture):
     assert evt["tool_result"] == "patch applied"
 
 
+def test_apply_patch_records_its_paths_for_the_checks(tmp_path, _capture):
+    # The terminal's post_tool record carries the patch's files the way the
+    # headless translator's fileChange paths do (a move keyed by its source),
+    # so a check's changed set sees an edit-only turn as a write.
+    from core.session import session_events
+    patch = ("*** Begin Patch\n*** Add File: notes/new.md\n+x\n"
+             "*** Update File: notes/old.md\n*** Move to: notes/moved.md\n@@\n-a\n+b\n"
+             "*** Delete File: notes/gone.md\n*** End Patch")
+    path = _write(
+        tmp_path,
+        _meta("tt5p"),
+        _line({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "name": "apply_patch",
+            "call_id": "call_ap", "input": patch}}),
+        _line({"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "call_ap",
+            "output": "patch applied"}}),
+    )
+    session_events.cleanup_session("st5p")
+    try:
+        C.tail_rollout("st5p", "ct5p", path)
+        rec, = session_events.tool_records("st5p")
+    finally:
+        session_events.cleanup_session("st5p")
+    assert rec.tool_name == "apply_patch" and rec.source == "tailer"
+    assert rec.paths == ("notes/new.md", "notes/old.md", "notes/gone.md")
+    # The persisted row keeps the raw input only.
+    (_, evt), = _capture.events
+    assert evt["tool_input"] == {"input": patch}
+
+
 def test_tool_result_truncation_mirrors_hook_policy(tmp_path, _capture):
     big = "\n".join(f"line {i}" for i in range(600))
     path = _write(
@@ -525,7 +562,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     release = threading.Event()
     rows = []
 
-    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
+    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub="", **kw):
         rows.append((role, content))
         entered.set()
         release.wait(timeout=5)
@@ -1026,10 +1063,78 @@ def test_token_count_rate_limits_recorded_with_the_line_timestamp(tmp_path, _cap
                                               "total_token_usage": {"total_tokens": 12}},
                                      "rate_limits": snapshot}})
     path = _write(tmp_path, _meta("019ec-tid"), _msg("user", "hi"), token_count)
-    with patch("services.engines.subscription_windows.record_codex_snapshot") as rec:
+    with patch("core.layers.codex.usage.record_snapshot") as rec:
         C.tail_rollout("s1", "c1", path)
         rec.assert_called_once_with("s1", snapshot, "2026-09-11T05:00:00.123Z")
         rec.reset_mock()
         C._offsets.clear()          # force a full re-read: the claim dedups it
         C.tail_rollout("s1", "c1", path)
         rec.assert_not_called()
+
+
+# ───────────── the first-tail backstop against raw and stamped rows ─────────────
+
+def test_first_tail_prefix_matches_raw_rows_against_stamped_lines(tmp_path, monkeypatch, _capture):
+    # The DB holds the RAW prompts (the cold first prompt and a composer send
+    # are persisted by the dashboard at send time) and a stamped one this
+    # tailer persisted from a line typed straight into the PTY; the rollout
+    # journals every prompt stamped, single-lined on a satellite. On a first
+    # tail that re-reads the file from line 0 the merge must take each pair
+    # as one row and persist only what is genuinely new.
+    stamp = "[Current time: Monday, September 21, 2026 06:10 (6:10 AM) Europe/Athens (UTC+03:00)]"
+    focus = '[The user is looking at the app "Home" (home) right now.]'
+    path = _write(
+        tmp_path,
+        _meta("tid-bs"),
+        _msg("user", f"{stamp} {focus} first prompt"),
+        _msg("assistant", "a1"),
+        _msg("user", f"{stamp}\n\nsecond prompt"),
+        _msg("assistant", "a2"),
+        _msg("user", f"{stamp}\n\ntyped into the PTY"),
+        _msg("assistant", "a3"),
+        _msg("user", f"{stamp}\n\nthe new one"),
+    )
+    import storage.database as db
+    persisted = [
+        ("user", "first prompt"), ("assistant", "a1"),
+        ("user", "second prompt"), ("assistant", "a2"),
+        ("user", f"{stamp}\n\ntyped into the PTY"), ("assistant", "a3"),
+    ]
+    monkeypatch.setattr(
+        db, "get_chat_messages",
+        lambda cid, limit=500: [{"role": r, "content": c} for r, c in reversed(persisted)],
+    )
+    res = C.tail_rollout("s-bs", "c-bs", path)
+    assert _capture == [("user", f"{stamp}\n\nthe new one")]
+    assert res["persisted"] == 1
+
+
+def test_first_tail_prefix_keeps_assistant_rows_byte_equal(tmp_path, monkeypatch, _capture):
+    # Only user rows compare through the prelude strip; an assistant row that
+    # differs is new.
+    path = _write(tmp_path, _meta("tid-bs2"), _msg("user", "q1"), _msg("assistant", "a1 revised"))
+    import storage.database as db
+    persisted = [("user", "q1"), ("assistant", "a1")]
+    monkeypatch.setattr(
+        db, "get_chat_messages",
+        lambda cid, limit=500: [{"role": r, "content": c} for r, c in reversed(persisted)],
+    )
+    assert C.tail_rollout("s-bs2", "c-bs2", path)["persisted"] == 1
+    assert _capture == [("assistant", "a1 revised")]
+
+
+def test_a_batch_rebuilds_the_search_row_once(tmp_path, _capture):
+    """The message rows skip the per-row search rebuild; one rebuild
+    closes the batch, and a batch with nothing new rebuilds nothing."""
+    path = _write(
+        tmp_path,
+        _meta("019ec-tid"),
+        _msg("user", "one"),
+        _msg("assistant", "two"),
+        _msg("assistant", "three"),
+    )
+    C.tail_rollout("s9", "c9", path)
+    assert _capture.sync == [False, False, False]
+    assert _capture.rebuilds == ["c9"]
+    C.tail_rollout("s9", "c9", path)
+    assert _capture.rebuilds == ["c9"]

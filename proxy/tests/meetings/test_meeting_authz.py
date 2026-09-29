@@ -122,3 +122,158 @@ def test_master_key_unclamped(temp_db):
                       is_api_key=True)
     out = _create(svc, ["a1", "a2"], scope="agent", x_agent_name="a1")
     assert out["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Reading a meeting: every participant, or nothing. Acting in one: the
+# creator, an admin, or a session of the participant it is about.
+# ---------------------------------------------------------------------------
+
+from api.meetings.meetings import (  # noqa: E402
+    end_meeting_endpoint, get_meeting_endpoint, get_transcript_endpoint,
+    leave_meeting_endpoint, list_meetings_endpoint, propose_conclude_endpoint,
+    start_meeting_endpoint,
+)
+from storage import database as task_store  # noqa: E402
+from storage.chat import meeting_status  # noqa: E402
+
+
+def _nouser_on(agent: str, sid: str) -> UserContext:
+    return UserContext(sub=f"session:{sid}", email="", name="", role="agent",
+                       is_api_key=True, session_id=sid, agent=agent)
+
+
+def _office():
+    for slug in ("head", "alpha", "beta"):
+        agent_store.create_agent(slug, slug.title(), default_scope="agent", collaborative=True)
+    agent_store.set_delegation_targets("head", ["alpha", "beta"])
+
+
+def _turns(mid: str) -> None:
+    import json
+    task_store.add_meeting_turn(mid, 1, 0, "head", "assistant", "HEAD office margin",
+                                "x" * 400, json.dumps([{"name": "Read", "input": "office/x.xlsx"}]),
+                                "s-head", 0.0)
+    task_store.add_meeting_turn(mid, 2, 0, "beta", "assistant", "BETA other project", "",
+                                "[]", "s-beta", 0.0)
+
+
+def _list(user, agent=None):
+    return asyncio.run(list_meetings_endpoint(agent=agent, status=None, created_by=None,
+                                              limit=50, offset=0, user=user))
+
+
+def _status_of(call, *args, **kw) -> int:
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(call(*args, **kw))
+    return ei.value.status_code
+
+
+def test_pm_cannot_read_meeting_with_foreign_participants(temp_db):
+    """A contributor on one project agent never lists, opens or transcribes
+    an agent-scope meeting that includes agents they cannot read, nor
+    another person's user-scope meeting by id; a reader of every
+    participant does, and the page's total counts what it lists."""
+    _office()
+    mid = _create(_nouser_on("head", "s-h"), ["head", "alpha", "beta"], scope="agent",
+                  x_agent_name="head")["meeting_id"]
+    _turns(mid)
+    pm = _user({"alpha": "contributor"}, sub="pm-1")
+    rows = _list(pm)
+    assert rows["meetings"] == [] and rows["total"] == 0
+    assert _list(pm, agent="alpha")["meetings"] == []
+    for call in (get_meeting_endpoint, get_transcript_endpoint):
+        assert _status_of(call, mid, user=pm) == 404
+    # Readers of every participant: the CEO, and the head's own run.
+    ceo = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="ceo-1")
+    assert {t["agent"] for t in asyncio.run(get_transcript_endpoint(mid, user=ceo))["turns"]} == {"head", "beta"}
+    listed = _list(ceo)
+    assert [m["id"] for m in listed["meetings"]] == [mid] and listed["total"] == 1
+    assert asyncio.run(get_meeting_endpoint(mid, user=_nouser_on("head", "s-h2")))["id"] == mid
+    # A no-user session on alpha reads alpha's own meetings only.
+    assert _list(_nouser_on("alpha", "s-a"))["meetings"] == []
+    assert _status_of(get_meeting_endpoint, mid, user=_nouser_on("alpha", "s-a")) == 404
+
+    # A user-scope meeting is its creator's: not listed to a run on alpha,
+    # not readable by id by the PM, nor by another manager of both agents.
+    mid2 = _create(ceo, ["head", "alpha"], scope="user", x_agent_name="head")["meeting_id"]
+    _turns(mid2)
+    assert mid2 not in [m["id"] for m in _list(_nouser_on("alpha", "s-a"))["meetings"]]
+    assert _status_of(get_transcript_endpoint, mid2, user=pm) == 404
+    assert _status_of(get_meeting_endpoint, mid2, user=_nouser_on("alpha", "s-a")) == 404
+    cfo = _user({"head": "manager", "alpha": "manager"}, sub="cfo-1")
+    assert _status_of(get_meeting_endpoint, mid2, user=cfo) == 404
+    assert asyncio.run(get_meeting_endpoint(mid2, user=ceo))["id"] == mid2
+    assert [m["id"] for m in _list(ceo)["meetings"]] == [mid2, mid]
+
+
+def test_the_verbs_take_the_creator_or_the_participants_own_session(temp_db, monkeypatch):
+    """start and end: the creator, an admin or the moderator's own session;
+    leave and propose-conclude: the creator, an admin or a session of the
+    participant named. A header a cookie sends grants nothing; a session
+    acts for its own agent whatever it sends; a caller who can neither read
+    nor act gets 404."""
+    from services.meetings import meeting_orchestrator
+
+    async def _no_start(meeting_id):
+        return None
+    monkeypatch.setattr(meeting_orchestrator, "start_meeting", _no_start)
+    _office()
+    ceo = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="ceo-1")
+    mid = _create(ceo, ["head", "alpha", "beta"], scope="agent", x_agent_name="head")["meeting_id"]
+    pm = _user({"alpha": "contributor"}, sub="pm-1")
+    reader = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="cfo-1")
+    head, alpha, beta = (_nouser_on(a, f"s-{a}") for a in ("head", "alpha", "beta"))
+
+    # start
+    assert _status_of(start_meeting_endpoint, mid, user=pm, x_agent_name="head") == 404
+    assert _status_of(start_meeting_endpoint, mid, user=reader, x_agent_name="head") == 403
+    assert _status_of(start_meeting_endpoint, mid, user=alpha, x_agent_name="head") == 403
+    assert asyncio.run(start_meeting_endpoint(mid, user=head, x_agent_name="beta"))["status"] == "starting"
+    task_store.update_meeting(mid, status=meeting_status.ACTIVE)
+
+    # propose-conclude: the session's own agent is the proposer
+    assert _status_of(propose_conclude_endpoint, mid, user=pm, x_agent_name="alpha") == 404
+    assert _status_of(propose_conclude_endpoint, mid, user=reader, x_agent_name="alpha") == 403
+    out = asyncio.run(propose_conclude_endpoint(mid, user=alpha, x_agent_name="head"))
+    assert out["status"] == "paused" and out["proposed_by"] == "alpha"
+    task_store.update_meeting(mid, status=meeting_status.ACTIVE)
+
+    # leave: beta's session leaves beta; the creator names the agent
+    assert _status_of(leave_meeting_endpoint, mid, user=reader, x_agent_name="beta") == 403
+    assert asyncio.run(leave_meeting_endpoint(mid, user=beta, x_agent_name="head"))["agent"] == "beta"
+    assert asyncio.run(leave_meeting_endpoint(mid, user=ceo, x_agent_name="alpha"))["agent"] == "alpha"
+
+    # end: a participant's session cannot, the moderator's can
+    assert _status_of(end_meeting_endpoint, mid, user=pm, x_agent_name="head") == 404
+    assert _status_of(end_meeting_endpoint, mid, user=reader, x_agent_name="head") == 403
+    assert _status_of(end_meeting_endpoint, mid, user=alpha, x_agent_name="head") == 403
+    assert asyncio.run(end_meeting_endpoint(mid, user=head, x_agent_name=None))["status"] == "concluding"
+
+
+def test_a_paused_resume_never_overwrites_an_end(temp_db):
+    """The orchestrator's read-then-write steps run on the DB executor now:
+    the resume after a propose-conclude and the conclusion are conditional
+    writes, and a leave takes the row's lock."""
+    _office()
+    mid = task_store.create_meeting("mtg-atomic", "t", '["head", "alpha", "beta"]', "head",
+                                    "round_robin", 30, "chat-1", None, None, "agent", "ceo-1")["id"]
+    task_store.update_meeting(mid, status=meeting_status.PAUSED)
+    assert task_store.update_meeting_if(mid, meeting_status.ENDABLE,
+                                        status=meeting_status.CONCLUDING) is True
+    # The resume that lost the race writes nothing.
+    assert task_store.update_meeting_if(mid, (meeting_status.PAUSED,),
+                                        status=meeting_status.ACTIVE) is False
+    assert task_store.get_meeting(mid)["status"] == meeting_status.CONCLUDING
+    # The conclusion keeps a terminal row as it is.
+    task_store.update_meeting(mid, status=meeting_status.FAILED)
+    assert task_store.update_meeting_if(mid, meeting_status.STATUSES - meeting_status.TERMINAL,
+                                        status=meeting_status.CONCLUDED) is False
+    assert task_store.get_meeting(mid)["status"] == meeting_status.FAILED
+
+    task_store.update_meeting(mid, status=meeting_status.ACTIVE)
+    assert task_store.remove_active_participant(mid, "beta", meeting_status.LEAVABLE) == ["head", "alpha"]
+    assert task_store.remove_active_participant(mid, "alpha", meeting_status.LEAVABLE) == ["head"]
+    assert task_store.remove_active_participant(mid, "beta", meeting_status.LEAVABLE) is None
+    task_store.update_meeting(mid, status=meeting_status.CONCLUDED)
+    assert task_store.remove_active_participant(mid, "head", meeting_status.LEAVABLE) is None

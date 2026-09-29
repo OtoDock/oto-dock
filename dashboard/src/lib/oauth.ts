@@ -8,13 +8,23 @@
  */
 
 import { Capacitor } from '@capacitor/core'
+import { hasNativeBridge, openNativeBrowser } from './nativeBridge'
 
 // ---------------------------------------------------------------------------
 // Deep link callback system (native only)
 // ---------------------------------------------------------------------------
 
-type DeepLinkResolver = (url: string) => void
-let pendingDeepLink: DeepLinkResolver | null = null
+interface DeepLinkWaiter {
+  promise: Promise<string>
+  resolve: (url: string) => void
+  reject: (err: Error) => void
+}
+
+// The waiter the next otodock://oauth/* link resolves.
+let pendingDeepLink: DeepLinkWaiter | null = null
+// The waiter openOAuthWindow made for its caller, handed over by the caller's
+// next waitForDeepLink() (settled or not).
+let handedOver: DeepLinkWaiter | null = null
 
 /** True while a deep-link callback is awaited — a page reload in that
  * window would drop the link silently (the resolver lives in memory). */
@@ -24,29 +34,42 @@ export function deepLinkPending(): boolean {
 
 /** Called from Android native via evaluateJavascript when an otodock://oauth/* deep link fires. */
 ;(window as any)._handleDeepLink = (url: string) => {
-  if (pendingDeepLink) {
-    pendingDeepLink(url)
-    pendingDeepLink = null
+  pendingDeepLink?.resolve(url)
+}
+
+function createWaiter(timeoutMs: number): DeepLinkWaiter {
+  let resolvePromise!: (url: string) => void
+  let rejectPromise!: (err: Error) => void
+  const promise = new Promise<string>((res, rej) => { resolvePromise = res; rejectPromise = rej })
+  // Handled here so a decline settled before the caller awaits is never reported
+  // as unhandled; the caller's own await still receives it.
+  promise.catch(() => {})
+  const settle = () => {
+    clearTimeout(timer)
+    if (pendingDeepLink === waiter) pendingDeepLink = null
   }
+  const waiter: DeepLinkWaiter = {
+    promise,
+    resolve: (url) => { settle(); resolvePromise(url) },
+    reject: (err) => { settle(); rejectPromise(err) },
+  }
+  const timer = setTimeout(
+    () => waiter.reject(new Error('OAuth timeout: no response from browser')), timeoutMs)
+  pendingDeepLink?.reject(new Error('Superseded by a newer sign-in'))
+  pendingDeepLink = waiter
+  return waiter
 }
 
 /**
  * Wait for a deep link callback from Android.
  * Returns the full callback URL (e.g., "otodock://oauth/google?code=X&state=Y").
- * Rejects after timeout (default 5 min, matching server state TTL).
+ * Rejects after timeout (default 5 min, matching server state TTL), and at once
+ * when the person declined the app's confirm for the flow just opened.
  */
 export function waitForDeepLink(timeoutMs = 300_000): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingDeepLink = null
-      reject(new Error('OAuth timeout — no response from browser'))
-    }, timeoutMs)
-
-    pendingDeepLink = (url: string) => {
-      clearTimeout(timer)
-      resolve(url)
-    }
-  })
+  const mine = handedOver
+  handedOver = null
+  return mine ? mine.promise : createWaiter(timeoutMs).promise
 }
 
 // ---------------------------------------------------------------------------
@@ -70,15 +93,16 @@ export async function openOAuthWindow(
   options?: { useDeepLink?: boolean },
 ): Promise<boolean> {
   if (Capacitor.isNativePlatform()) {
-    if (options?.useDeepLink) {
-      // Deep link mode: open system browser via Android JS interface.
-      // The browser will redirect to otodock:// which Android routes
-      // back to the app via onNewIntent → handleDeepLink.
-      const android = (window as any).Android
-      if (android?.openAuthBrowser) {
-        android.openAuthBrowser(url)
-        return true
-      }
+    if (options?.useDeepLink && hasNativeBridge()) {
+      // Deep link mode: the app opens the system browser (after the person
+      // confirms another site); the browser redirects to otodock://, which the
+      // app routes back via onNewIntent → handleDeepLink. The waiter exists
+      // before the ask, so a build reload waits while the confirm is open.
+      const waiter = createWaiter(300_000)
+      handedOver = waiter
+      if (await openNativeBrowser(url, 'oauth')) return true
+      waiter.reject(new Error('Sign-in cancelled'))
+      return false
     }
 
     // Chrome Custom Tab mode (used for Claude OAuth code-paste flow)

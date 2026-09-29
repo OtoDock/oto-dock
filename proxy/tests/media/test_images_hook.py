@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,12 +27,12 @@ client = TestClient(app)
 
 
 def _post_hook_images(payload: dict, session_id: str = "sess-1") -> object:
-    """POST with the master API key. verify_session_match accepts master+match.
+    """POST with the master API key. verify_session_match_async accepts master+match.
 
     The endpoint takes the session_id from the body, not the header. We mock
-    verify_session_match to a no-op so the call doesn't need a real session.
+    verify_session_match_async to a no-op so the call doesn't need a real session.
     """
-    with patch("api.hooks.artifacts.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match_async"):
         return client.post(
             "/v1/hooks/images",
             json=payload,
@@ -145,7 +145,7 @@ def tmp_agent_image(tmp_path, monkeypatch):
 
 
 def _post_temp_url(abs_path: str, session_id: str = "sess-temp-1", ttl: int = 60):
-    with patch("api.media.images.verify_session_match"):
+    with patch("api.media.images.verify_session_match_async", new_callable=AsyncMock):
         # DASHBOARD_PUBLIC_URL must be set to mint a URL
         with patch.object(config, "DASHBOARD_PUBLIC_URL", "https://platform.example"):
             return client.post(
@@ -252,8 +252,7 @@ def test_temp_url_returns_410_after_expiry(tmp_agent_image):
     token = resp.json()["url"].rsplit("/", 1)[-1]
 
     # Force-expire
-    path, _exp = images._temp_image_tokens[token]
-    images._temp_image_tokens[token] = (path, time.monotonic() - 1)
+    images._temp_image_tokens[token].expires_at = time.monotonic() - 1
 
     serve = client.get(f"/v1/images/temp/{token}")
     assert serve.status_code == 410
@@ -269,7 +268,7 @@ def test_temp_url_returns_404_for_unknown_token():
 def test_temp_url_requires_dashboard_public_url(tmp_agent_image):
     """Without DASHBOARD_PUBLIC_URL configured we can't mint a public URL."""
     abs_path, _ = tmp_agent_image
-    with patch("api.media.images.verify_session_match"):
+    with patch("api.media.images.verify_session_match_async", new_callable=AsyncMock):
         with patch.object(config, "DASHBOARD_PUBLIC_URL", ""):
             resp = client.post(
                 "/v1/images/temp",
@@ -279,3 +278,85 @@ def test_temp_url_requires_dashboard_public_url(tmp_agent_image):
             )
     assert resp.status_code == 500
     assert "DASHBOARD_PUBLIC_URL" in resp.json()["detail"]
+
+
+# ─────────────── raster-only mint + snapshot at mint ──────────────
+
+
+def _write_image(tmp_agent_image, name: str, body: bytes) -> str:
+    abs_path, _ = tmp_agent_image
+    p = Path(abs_path).parent / name
+    p.write_bytes(body)
+    return str(p)
+
+
+@pytest.mark.parametrize("name,body", [
+    ("x.svg", b'<svg xmlns="http://www.w3.org/2000/svg" onload="1"/>'),
+    ("x.html", b"<script>fetch('/v1/auth/me')</script>"),
+    ("x.xhtml", b'<html xmlns="http://www.w3.org/1999/xhtml"><script>1</script></html>'),
+    ("x.xml", b"<?xml version='1.0'?><a/>"),
+    ("notes.pdf", b"%PDF-1.4"),
+    ("noext", b"\x89PNG"),
+])
+def test_temp_url_refuses_non_raster_types(tmp_agent_image, name, body):
+    resp = _post_temp_url(_write_image(tmp_agent_image, name, body))
+    assert resp.status_code == 415, resp.text
+
+
+def test_temp_url_serves_raster_with_fixed_mime_and_inert_headers(tmp_agent_image):
+    # A .png whose bytes are HTML still serves as image/png, inert.
+    path = _write_image(tmp_agent_image, "page.png", b"<script>alert(1)</script>")
+    token = _post_temp_url(path).json()["url"].rsplit("/", 1)[-1]
+    serve = client.get(f"/v1/images/temp/{token}")
+    assert serve.status_code == 200
+    assert serve.headers["content-type"] == "image/png"
+    assert serve.headers["x-content-type-options"] == "nosniff"
+    assert "sandbox" in serve.headers["content-security-policy"]
+    assert "default-src 'none'" in serve.headers["content-security-policy"]
+    assert serve.headers["cache-control"] == "no-store"
+    assert "content-disposition" not in serve.headers
+    # Upper-case suffixes from cameras mint too.
+    path = _write_image(tmp_agent_image, "IMG_1.JPG", b"\xff\xd8\xff\xe0x")
+    resp = _post_temp_url(path)
+    assert resp.status_code == 200
+    token = resp.json()["url"].rsplit("/", 1)[-1]
+    assert client.get(f"/v1/images/temp/{token}").headers["content-type"] == "image/jpeg"
+
+
+def test_temp_url_symlink_swap_after_mint_not_followed(tmp_agent_image, tmp_path):
+    abs_path, _ = tmp_agent_image
+    token = _post_temp_url(abs_path, ttl=60).json()["url"].rsplit("/", 1)[-1]
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=proxy-host-secret\n")
+    Path(abs_path).unlink()
+    Path(abs_path).symlink_to(secret)
+    serve = client.get(f"/v1/images/temp/{token}")
+    assert serve.status_code == 200
+    assert serve.content == b"\xff\xd8\xff\xe0fake-jpeg"   # the snapshot
+    assert b"JWT_SECRET" not in serve.content
+
+
+def test_temp_url_mint_of_a_symlink_to_outside_is_refused(tmp_agent_image, tmp_path):
+    abs_path, _ = tmp_agent_image
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=proxy-host-secret\n")
+    link = Path(abs_path).parent / "link.png"
+    link.symlink_to(secret)
+    resp = _post_temp_url(str(link))
+    assert resp.status_code in (403, 404)
+
+
+def test_temp_url_caps(tmp_agent_image, monkeypatch):
+    from api.media import images
+    abs_path, _ = tmp_agent_image
+    monkeypatch.setattr(config, "TEMP_IMAGE_MAX_BYTES", 4)
+    assert _post_temp_url(abs_path).status_code == 413
+    monkeypatch.setattr(config, "TEMP_IMAGE_MAX_BYTES", 1024)
+    monkeypatch.setattr(config, "TEMP_IMAGE_MAX_PER_SESSION", 2)
+    images._temp_image_tokens.clear()
+    assert _post_temp_url(abs_path).status_code == 200
+    assert _post_temp_url(abs_path).status_code == 200
+    assert _post_temp_url(abs_path).status_code == 429
+    monkeypatch.setattr(config, "TEMP_IMAGE_MAX_TOTAL_BYTES", 8)
+    images._temp_image_tokens.clear()
+    assert _post_temp_url(abs_path).status_code == 503

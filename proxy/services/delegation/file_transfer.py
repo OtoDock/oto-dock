@@ -38,12 +38,14 @@ from fastapi import HTTPException
 import config
 from auth.providers import UserContext
 from core.session.visibility import available_scopes_for
+from services.infra.path_confinement import PathOutsideRoot, join_under, normalize_rel_path, resolve_under
 from storage.agents import agent_store
 from storage.files import db_file_transfers
 from storage.mcp import mcp_store
 from storage import remote_store
 from storage import database as task_store
 from storage.pg import run_db
+from core import layout
 
 logger = logging.getLogger("claude-proxy.delegation")
 
@@ -64,15 +66,27 @@ def _config_int(key: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _clean_rel(value: str) -> str:
+    """The collapsed relative form, ``./`` and ``//`` free — what
+    ``src_root / rel`` resolves to and what the satellite manifest reports —
+    checked by ``normalize_rel_path`` (a ``..`` segment or a NUL raises
+    ``PathOutsideRoot``); ``""`` when the value names the root itself."""
+    parts = [s for s in value.strip().strip("/").split("/") if s not in ("", ".")]
+    if not parts:
+        return ""
+    return normalize_rel_path("/".join(parts))
+
+
 def validate_rel_dir(value: str) -> str | None:
     """Safe relative directory (dest_dir) — same rules as the MCP client's
     output_dir check. Returns an error message or None."""
     if value.startswith(("/", "\\")):
         return "must be a relative path"
-    parts = Path(value).parts
-    if ".." in parts:
+    try:
+        rel = _clean_rel(value)
+    except PathOutsideRoot:
         return "must not contain '..'"
-    if any(p.startswith(".") for p in parts):
+    if any(p.startswith(".") for p in rel.split("/") if p):
         return "must not contain hidden directories"
     return None
 
@@ -99,15 +113,17 @@ def validate_send_path(raw: str) -> str:
     rel = (raw or "").strip().strip("/")
     if not rel:
         raise HTTPException(status_code=400, detail="Empty path in `paths`.")
-    if raw.strip().startswith(("/", "\\")) or ".." in Path(rel).parts:
+    try:
+        clean = "" if raw.strip().startswith(("/", "\\")) else _clean_rel(rel)
+    except PathOutsideRoot:
+        clean = ""
+    if not clean:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid path '{raw}': paths are relative to your "
                    "workspace and must not contain '..'.",
         )
-    # Path() collapses `./` and doubled slashes — the form `src_root / rel`
-    # resolves to anyway, and the form the satellite manifest reports.
-    return Path(rel).as_posix()
+    return clean
 
 
 @dataclass
@@ -214,8 +230,8 @@ def authorize_send_files(
             raise HTTPException(status_code=400, detail="User has no username configured")
     src_agent_dir = config.get_agent_dir(source)
     source_root = (
-        src_agent_dir / "users" / src_username / "workspace"
-        if requested_scope == "user" else src_agent_dir / "workspace"
+        layout.user_dir(src_agent_dir, src_username) / layout.WORKSPACE
+        if requested_scope == "user" else src_agent_dir / layout.WORKSPACE
     )
 
     # 3. Clamp the destination scope to what the target's mode offers
@@ -242,13 +258,14 @@ def authorize_send_files(
     # 4. Identity for the FINAL scope.
     created_by = acting if acting is not None else source
 
-    # 5. Shared-workspace drops from a real user are gated at the editor
-    #    tier — the same bar as agent-scoped workers (viewers are read-only).
-    if dest_scope == "agent" and acting is not None and not user.can_edit_agent(target_agent):
+    # 5. Shared-workspace drops from a real user are gated at the workspace
+    #    tier — a drop is a file write, not an act as the agent (viewers are
+    #    read-only).
+    if dest_scope == "agent" and acting is not None and not user.can_write_workspace(target_agent):
         raise HTTPException(
             status_code=403,
-            detail="Sending into the shared workspace requires editor, "
-                   "manager, or admin role for the target agent.",
+            detail="Sending into the shared workspace requires contributor, "
+                   "editor, manager, or admin role for the target agent.",
         )
 
     # 6. Destination tree owner. User scope lands in the SAME user's tree
@@ -262,8 +279,8 @@ def authorize_send_files(
             raise HTTPException(status_code=400, detail="User has no username configured")
     tgt_agent_dir = config.get_agent_dir(target_agent)
     dest_base = (
-        tgt_agent_dir / "users" / dest_username / "workspace"
-        if dest_scope == "user" else tgt_agent_dir / "workspace"
+        layout.user_dir(tgt_agent_dir, dest_username) / layout.WORKSPACE
+        if dest_scope == "user" else tgt_agent_dir / layout.WORKSPACE
     )
 
     # 7. Per-creator quota — policy "no" before any file is touched.
@@ -337,18 +354,16 @@ def perform_send_files(
         err = validate_rel_dir(dest_dir)
         if err:
             raise HTTPException(status_code=400, detail=f"Invalid dest_dir '{dest_dir}': {err}")
-        clean_dest_dir = str(Path(dest_dir))
-        dest_base = dest_base / clean_dest_dir
+        clean_dest_dir = _clean_rel(dest_dir)
+        if clean_dest_dir:
+            dest_base = join_under(dest_base, clean_dest_dir)
 
     def _contained(p: Path) -> Path | None:
         """The resolved path when it stays inside the source tree, else None."""
         try:
-            resolved = p.resolve()
-        except OSError:
+            return resolve_under(p, src_root)
+        except (PathOutsideRoot, OSError, ValueError):
             return None
-        if resolved == src_root or str(resolved).startswith(str(src_root) + os.sep):
-            return resolved
-        return None
 
     # Expand paths → (resolved source file, dest path relative to dest_base).
     picked: list[tuple[Path, Path]] = []

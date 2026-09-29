@@ -2,17 +2,18 @@
 
 Bug being guarded against: the satellite's per-turn ``detect_file_changes``
 sweep (sha256 of every file under the agent_dir) can exceed the proxy's 2s
-``_drain_until_turn_ended`` budget. When that happens the late ``turn_ended``
+``drain_until_turn_ended`` budget. When that happens the late ``turn_ended``
 ends up in ``info.event_queue`` AFTER the user's next message has already
-kicked off the next turn. Without a turn-id, ``_stream_cli_turn`` would read
-that stale marker and yield DONE immediately, terminating the new turn with
-zero events — the CLI keeps running on the satellite and tools/notifications
-still fire, but nothing is persisted to ``chat_messages``.
+kicked off the next turn. Without a turn-id, the adapter's ``stream_turn``
+would read that stale marker and yield DONE immediately, terminating the new
+turn with zero events — the CLI keeps running on the satellite and
+tools/notifications still fire, but nothing is persisted to ``chat_messages``.
 
 The fix: every ``send_message`` pre-mints a ``command_id``, the satellite
-echoes it in ``turn_ended``, and ``_stream_cli_turn`` / ``_stream_codex_turn``
-/ ``_drain_until_turn_ended`` only honor a turn_ended whose command_id matches
-the current turn — stale ones are discarded so the real turn can stream.
+echoes it in ``turn_ended``, and each engine's ``RemoteEngineAdapter.stream_turn``
+/ ``cli_remote.drain_until_turn_ended`` only honor a turn_ended whose
+command_id matches the current turn — stale ones are discarded so the real
+turn can stream.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from core.events.common_events import DONE
+from core.layers.cli import remote as cli_remote
+from core.layers.cli.remote import ClaudeRemoteState
 from core.layers.cli.settle import SettleController
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
@@ -38,9 +41,14 @@ def _make_info(session_id: str = "sess-1", machine_id: str = "m-1") -> RemoteSes
         execution_path="claude-code-cli",
         event_queue=asyncio.Queue(),
     )
-    info.cli_translator = translator
-    info.cli_settle = settle
+    # The engine's per-turn state, as begin_turn / adopt_state would set it.
+    info.engine_state = ClaudeRemoteState(translator=translator, settle=settle)
     return info
+
+
+def _stream(layer, info):
+    """One turn through the session's ENGINE adapter (what _send_turn does)."""
+    return layer._adapter(info).stream_turn(info, layer._cm)
 
 
 @pytest.mark.asyncio
@@ -66,7 +74,7 @@ async def test_stale_turn_ended_is_discarded_until_real_one_arrives():
     info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "new-cmd"})
 
     events = []
-    async for event in layer._stream_cli_turn(info):
+    async for event in _stream(layer, info):
         events.append(event)
 
     # Stream should yield exactly one DONE — the stale turn_ended is dropped,
@@ -87,7 +95,7 @@ async def test_matching_turn_ended_terminates_turn():
     info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd-A"})
 
     events = []
-    async for event in layer._stream_cli_turn(info):
+    async for event in _stream(layer, info):
         events.append(event)
 
     assert len(events) == 1
@@ -109,7 +117,7 @@ async def test_turn_ended_without_command_id_still_honored():
     info.event_queue.put_nowait({"type": "_turn_ended"})  # no command_id
 
     events = []
-    async for event in layer._stream_cli_turn(info):
+    async for event in _stream(layer, info):
         events.append(event)
 
     assert len(events) == 1
@@ -130,7 +138,7 @@ async def test_drain_until_turn_ended_skips_stale_marker():
     info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "old"})
     info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "current"})
 
-    await layer._drain_until_turn_ended(
+    await cli_remote.drain_until_turn_ended(
         info, timeout=1.0, expected_command_id="current",
     )
     # Both markers consumed — nothing left in the queue.
@@ -149,7 +157,7 @@ async def test_drain_until_turn_ended_times_out_on_only_stale():
     info = _make_info()
     info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "old"})
 
-    await layer._drain_until_turn_ended(
+    await cli_remote.drain_until_turn_ended(
         info, timeout=0.2, expected_command_id="current",
     )
     # Stale was drained; queue is empty; we returned via the timeout path.
@@ -158,7 +166,10 @@ async def test_drain_until_turn_ended_times_out_on_only_stale():
 
 @pytest.mark.asyncio
 async def test_codex_turn_filters_stale_turn_ended():
-    """Same filter for the Codex stream path."""
+    """Same filter for the Codex stream path (its router feeds the turn's
+    consumer, so the markers land there)."""
+    from core.layers.codex.remote import CodexRemoteState
+    from core.layers.codex.translator import CodexEventTranslator
     layer = RemoteExecutionLayer.__new__(RemoteExecutionLayer)
     layer._cm = MagicMock()
     layer._sessions = {}
@@ -166,11 +177,14 @@ async def test_codex_turn_filters_stale_turn_ended():
     info = _make_info()
     info.execution_path = "codex-cli"
     info.current_send_command_id = "new-cmd"
-    info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "old-cmd"})
-    info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "new-cmd"})
+    state = CodexRemoteState(translator=CodexEventTranslator(model="m", supervised_bg=True))
+    state.default_consumer = asyncio.Queue()
+    info.engine_state = state
+    state.default_consumer.put_nowait({"type": "_turn_ended", "command_id": "old-cmd"})
+    state.default_consumer.put_nowait({"type": "_turn_ended", "command_id": "new-cmd"})
 
     events = []
-    async for event in layer._stream_codex_turn(info):
+    async for event in _stream(layer, info):
         events.append(event)
 
     assert len(events) == 1
@@ -221,7 +235,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         texts = [e for e in events if e.type not in (DONE,)
                  and e.data.get("content") == "THE REAL ANSWER"]
         assert texts, f"real answer lost: {events}"
@@ -241,7 +255,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         assert any(e.data.get("content") == "THE REAL ANSWER"
                    for e in events if e.type not in (DONE,))
         assert events[-1].type == DONE
@@ -261,7 +275,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         assert [e.type for e in events].count(DONE) == 1
         assert events[-1].type == DONE
 
@@ -275,7 +289,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         # Zero content, but an error result must still close the turn.
         assert events[-1].type == DONE
 
@@ -296,7 +310,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         assert any(e.data.get("content") == "THE REAL ANSWER"
                    for e in events if e.type not in (DONE,))
         assert [e.type for e in events].count(DONE) == 1
@@ -315,7 +329,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait(_result_event("No response requested."))
 
         events = await asyncio.wait_for(
-            _collect(layer._stream_cli_turn(info)), timeout=5.0)
+            _collect(_stream(layer, info)), timeout=5.0)
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
@@ -334,7 +348,7 @@ class TestForeignResultGate:
                                          "subtype": "status"})
 
         events = await asyncio.wait_for(
-            _collect(layer._stream_cli_turn(info)), timeout=5.0)
+            _collect(_stream(layer, info)), timeout=5.0)
         assert events[-1].type == DONE
 
     @pytest.mark.asyncio
@@ -359,7 +373,7 @@ class TestForeignResultGate:
 
         delivery = asyncio.create_task(_late_delivery())
         events = await asyncio.wait_for(
-            _collect(layer._stream_cli_turn(info)), timeout=5.0)
+            _collect(_stream(layer, info)), timeout=5.0)
         await delivery
         assert any(e.data.get("content") == "THE REAL ANSWER"
                    for e in events if e.type not in (DONE,))
@@ -372,16 +386,16 @@ class TestForeignResultGate:
         before the driven prompt's first token (incident empty turn #2)."""
         layer = _mk_layer()
         info = _make_info()
-        info.cli_settle = SettleController(
-            info.session_id, 30, info.cli_translator)
+        info.engine_state.settle = SettleController(
+            info.session_id, 30, info.engine_state.translator)
         info.current_send_command_id = "new-cmd"
         info.event_queue.put_nowait(_result_event("No response requested."))
 
         collector = asyncio.create_task(
-            _collect(layer._stream_cli_turn(info)))
+            _collect(_stream(layer, info)))
         await asyncio.sleep(0.3)  # let the loop consume the foreign result
         try:
-            assert info.cli_settle.settling is False
+            assert info.engine_state.settle.settling is False
         finally:
             collector.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -405,7 +419,7 @@ class TestForeignResultGate:
         info.event_queue.put_nowait({"type": "_turn_ended",
                                      "command_id": "new-cmd"})
 
-        events = [e async for e in layer._stream_cli_turn(info)]
+        events = [e async for e in _stream(layer, info)]
         assert any(e.data.get("content") == "THE REAL ANSWER"
                    for e in events if e.type not in (DONE,))
         assert [e.type for e in events].count(DONE) == 1
@@ -418,7 +432,7 @@ async def _collect(agen):
 
 class TestAdoptSession:
     """Mode C: re-adopt a satellite-alive turn by replaying its retained
-    buffer through _stream_cli_turn."""
+    buffer through ClaudeRemoteAdapter.stream_turn."""
 
     @pytest.mark.asyncio
     async def test_adopt_replays_finished_turn(self):
@@ -447,7 +461,7 @@ class TestAdoptSession:
         events = []
         async for e in layer.adopt_session(
             machine_id="m-1", session_id="s-1", agent_name="pa",
-            command_id="cmd-1",
+            execution_path="claude-code-cli", command_id="cmd-1",
         ):
             events.append(e)
         assert sent and sent[0]["type"] == "resume_session_stream"
@@ -474,7 +488,7 @@ class TestAdoptSession:
         layer._sessions = {}
         events = [e async for e in layer.adopt_session(
             machine_id="m-1", session_id="s-1", agent_name="pa",
-            command_id="cmd-1")]
+            execution_path="claude-code-cli", command_id="cmd-1")]
         assert any("truncated" in (e.data.get("content") or "")
                    for e in events if e.type not in (DONE,))
 
@@ -505,3 +519,118 @@ async def test_abort_does_not_block_on_satellite_ack():
     layer._cm.send_fire_and_forget.assert_called_once()
     args, _ = layer._cm.send_fire_and_forget.call_args
     assert args[1] == {"type": "abort", "session_id": info.session_id}
+
+
+class TestSteerReadThrough:
+    """A steer the turn did not consume becomes the CLI's next turn on its
+    own (init right after the result). With a frame written or an RPC still
+    in flight, the stream peeks for it instead of sending stop_turn, and
+    reads that turn through as the same stream — the twin of the local
+    _drive_turn's grace read."""
+
+    def _stop_turns(self, layer) -> int:
+        return sum(
+            1 for c in layer._cm.send_fire_and_forget.call_args_list
+            if c.args[1].get("type") == "stop_turn"
+        )
+
+    @pytest.mark.asyncio
+    async def test_written_steer_reads_the_next_turn_through(self):
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.engine_state.steer_written = True
+        info.event_queue.put_nowait(_text_event("first answer"))
+        info.event_queue.put_nowait(_result_event("first answer"))
+        info.event_queue.put_nowait({"type": "system", "subtype": "init"})
+        info.event_queue.put_nowait(_text_event("STEER ANSWER"))
+        info.event_queue.put_nowait(_result_event("STEER ANSWER"))
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd"})
+
+        events = [e async for e in _stream(layer, info)]
+        texts = [e.data.get("content") for e in events if e.type not in (DONE,)]
+        assert "STEER ANSWER" in texts
+        assert [e.type for e in events].count(DONE) == 1
+        assert self._stop_turns(layer) == 1
+        assert info.engine_state.steer_written is False
+        assert info.engine_state.result_seen is True
+
+    @pytest.mark.asyncio
+    async def test_pending_rpc_peeks_too(self):
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.engine_state.steer_pending = 1
+        info.event_queue.put_nowait(_text_event("first"))
+        info.event_queue.put_nowait(_result_event("first"))
+        info.event_queue.put_nowait({"type": "system", "subtype": "init"})
+        info.event_queue.put_nowait(_text_event("RACED STEER"))
+        info.event_queue.put_nowait(_result_event("RACED STEER"))
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd"})
+
+        events = [e async for e in _stream(layer, info)]
+        assert any(e.data.get("content") == "RACED STEER"
+                   for e in events if e.type not in (DONE,))
+        assert [e.type for e in events].count(DONE) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_frame_after_the_result_ends_the_turn(self, monkeypatch):
+        from core.layers.cli import remote as cli_remote_mod
+        monkeypatch.setattr(cli_remote_mod, "_STEER_INIT_GRACE_S", 0.2)
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.engine_state.steer_written = True
+        info.event_queue.put_nowait(_text_event("only"))
+        info.event_queue.put_nowait(_result_event("only"))
+
+        events = await asyncio.wait_for(_collect(_stream(layer, info)), timeout=5.0)
+        assert events[-1].type == DONE
+        assert self._stop_turns(layer) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bg_frame_after_the_result_ends_the_turn(self):
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.engine_state.steer_written = True
+        info.event_queue.put_nowait(_text_event("only"))
+        info.event_queue.put_nowait(_result_event("only"))
+        info.event_queue.put_nowait({"type": "system", "subtype": "status"})
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd"})
+
+        events = [e async for e in _stream(layer, info)]
+        assert [e.type for e in events].count(DONE) == 1
+        assert self._stop_turns(layer) == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_turn_ended_is_skipped_in_the_peek(self):
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.engine_state.steer_written = True
+        info.event_queue.put_nowait(_text_event("first"))
+        info.event_queue.put_nowait(_result_event("first"))
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "old"})
+        info.event_queue.put_nowait({"type": "system", "subtype": "init"})
+        info.event_queue.put_nowait(_text_event("AFTER STALE"))
+        info.event_queue.put_nowait(_result_event("AFTER STALE"))
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd"})
+
+        events = [e async for e in _stream(layer, info)]
+        assert any(e.data.get("content") == "AFTER STALE"
+                   for e in events if e.type not in (DONE,))
+        assert [e.type for e in events].count(DONE) == 1
+
+    @pytest.mark.asyncio
+    async def test_without_a_steer_the_result_ends_at_once(self):
+        layer = _mk_layer()
+        info = _make_info()
+        info.current_send_command_id = "cmd"
+        info.event_queue.put_nowait(_text_event("plain"))
+        info.event_queue.put_nowait(_result_event("plain"))
+        info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "cmd"})
+
+        events = await asyncio.wait_for(_collect(_stream(layer, info)), timeout=2.0)
+        assert events[-1].type == DONE
+        assert info.engine_state.result_seen is True

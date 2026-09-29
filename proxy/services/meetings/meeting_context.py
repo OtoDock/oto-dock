@@ -24,6 +24,8 @@ from services.mcp import dynamic_context
 from services.engines import subscription_pool
 from core.execution_layer import AgentConfig
 from auth.path_policy import SecurityContext, build_permission_context
+from core.execution_layer import DEFAULT_EXECUTION_PATH
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy")
 
@@ -106,33 +108,38 @@ async def build_meeting_agent_config(
     # the creator's user_sub for target resolution (user-paired override) or
     # fall to the agent-level default (admin-paired). Resolve ONCE (user
     # override > agent default > local) so SecurityContext metadata and
-    # AgentConfig.execution_target agree; get_target_metadata expects the
-    # RESOLVED target (the raw DB default mislabeled user-override targets).
+    # AgentConfig.execution_target agree; placement_of expects the RESOLVED
+    # target (the raw DB default mislabeled user-override targets).
+    from core import placement as _placement
     from storage import remote_store as _remote_store
     resolved_target = (await asyncio.to_thread(
         _remote_store.resolve_execution_target,
         agent_name, user_sub_for_creds, task_role,
     ))[0]
-    _meeting_target_kind, _meeting_target_label = await asyncio.to_thread(
-        _remote_store.get_target_metadata,
-        resolved_target, user_sub_for_creds, agent_name,
-    )
-    is_remote = _meeting_target_kind in ("admin_remote", "user_remote")
-    target_has_display = await asyncio.to_thread(
-        _remote_store.get_target_has_display, _meeting_target_kind, resolved_target,
-    )
-    target_device_grants = await asyncio.to_thread(
-        _remote_store.get_target_device_grants, _meeting_target_kind, resolved_target,
+    target = await asyncio.to_thread(
+        _remote_store.placement_of, resolved_target, user_sub_for_creds, agent_name,
     )
     target_browser = await asyncio.to_thread(
-        _remote_store.get_target_browser_settings, _meeting_target_kind, resolved_target,
+        _remote_store.get_target_browser_settings, target,
     )
+    # The participant's SecurityContext carries the KIND and the LABEL of
+    # its placement and no more — no machine id, no home, no agents dir, no
+    # pairing flag, no grants — exactly what it carried before the
+    # descriptor: a remote participant fail-closes satellite paths and
+    # device tools, is reached by neither live refresher nor the
+    # revocation check, and a Codex participant's sandbox mode ignores the
+    # machine's flag. Carrying the full object would open all five (the
+    # task builder does); that is the operator's decision, not this
+    # refactor's (core-seams phase 7, D17).
+    context_placement = _placement.PlacementCapabilities(kind=target.kind, label=target.label)
 
     # Codex needs the MCP config in TOML (config.toml [mcp_servers.*]), not the
     # Claude JSON format — a JSON blob written into config.toml makes Codex's
     # parser exit 1. Mirrors core/config/config_builder.py (the chat path).
-    execution_path = (agent_info or {}).get("execution_path", "claude-code-cli")
-    mcp_format = "toml" if execution_path == "codex-cli" else "json"
+    execution_path = ((agent_info or {}).get("execution_path")
+                      or DEFAULT_EXECUTION_PATH)
+    from core.session.session_manager import capabilities_for_path
+    mcp_format = capabilities_for_path(execution_path).mcp_config_format
 
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
         await asyncio.to_thread(
@@ -150,9 +157,7 @@ async def build_meeting_agent_config(
             mcp_config_format=mcp_format,
             task_owner=session_task_owner,
             task_username=session_task_username,
-            is_remote=is_remote,
-            target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
+            placement=target,
             target_browser=target_browser,
         )
     )
@@ -171,8 +176,7 @@ async def build_meeting_agent_config(
         username=task_username,
         agent=agent_name,
         is_admin_agent=is_admin_only,
-        target_kind=_meeting_target_kind,
-        target_label=_meeting_target_label,
+        placement=context_placement,
         # Visibility-modes: a Shared-only participant mounts agent scope even in a
         # user-scope meeting (no user dirs; shared workspace) — drives the prompt's
         # scope/folder variants + the sandbox mount decouple.
@@ -191,8 +195,7 @@ async def build_meeting_agent_config(
     # right scope. Agent-scope meetings fall back to service accounts.
     # Async — builder blocks invoke remote MCP tools.
     assigned_mcp_names = [m.name for m in (mcp_registry.get_agent_mcps(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        agent_name, placement=target,
     ) or [])]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
         agent_name, assigned_mcp_names,
@@ -222,10 +225,8 @@ async def build_meeting_agent_config(
         excluded_mcps=excluded_mcps or None,
         dynamic_contexts=dynamic_contexts or None,
         sandboxed=True,
-        client_type="meeting",
-        is_remote=is_remote,
-        target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        client_type=session_kind.MEETING.name,
+        placement=target,
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
     )
@@ -287,7 +288,7 @@ async def build_meeting_agent_config(
         credential_env=credential_env or {},
         mcp_secret_bundles=secret_bundles or {},
         permission_mode="auto",
-        client_type="meeting",
+        client_type=session_kind.MEETING.name,
         model=resolved_model,
         effort=resolved_effort,
         resume=False,

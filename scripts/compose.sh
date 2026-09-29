@@ -53,7 +53,9 @@ source "$_here/versions.sh"   # exports PYTHON_IMAGE / NODE_IMAGE / POSTGRES_IMA
 
 if [ ! -f "$_root/config.env" ]; then
     echo "compose.sh: $_root/config.env not found." >&2
-    echo "  Container-only flow: printf 'POSTGRES_PASSWORD=%s\\n' \"\$(openssl rand -hex 24)\" > config.env" >&2
+    printf '%s\n' \
+      "  Container-only flow:" \
+      "    (umask 077; printf 'POSTGRES_PASSWORD=%s\\n' \"\$(openssl rand -hex 24)\" > config.env)" >&2
     echo "  Native/dev flow:     cd proxy && ./setup.sh   (or scripts/dev-setup.sh for the full bootstrap)" >&2
     exit 1
 fi

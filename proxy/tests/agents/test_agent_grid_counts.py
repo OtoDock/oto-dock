@@ -104,3 +104,113 @@ class TestUserVisibleCounts:
         assert trigger_store.count_user_visible_triggers_by_agent(V).get("shared-agent") == 2
         # Global (admin / API-key path) counts all 3.
         assert trigger_store.count_triggers_by_agent().get("shared-agent") == 3
+
+
+# ---------------------------------------------------------------------------
+# The listing off the loop: one job, a bulk MCP view, one model per engine
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+from auth.providers import UserContext  # noqa: E402
+
+
+def _manifest(name, *, assignment_mode="auto", category="custom", cap=None):
+    from services.mcp.mcp_registry import CredentialConfig, McpManifest, ServerConfig
+    return McpManifest(
+        name=name, label=name, description="", version="1.0.0", category=category,
+        server=ServerConfig(runtime="python", transport="stdio"),
+        credentials=CredentialConfig(type="none"), config=[], env={}, agent_env={},
+        exclude_from=[], skills=[], assignment_mode=assignment_mode,
+        requires_capability=cap,
+    )
+
+
+def _member(*slugs: str) -> UserContext:
+    return UserContext(sub=V, email="v@t.com", name="Viewer", role="member",
+                       agents=list(slugs), agent_roles={s: "viewer" for s in slugs})
+
+
+class TestListingOffLoop:
+    def _seed_mcps(self, monkeypatch, *, tts_available: bool):
+        from services.mcp import mcp_registry
+        from services.media import audio_service
+        from storage.mcp import mcp_store
+        manifests = {
+            "auto-a": _manifest("auto-a"),
+            "expl-b": _manifest("expl-b", assignment_mode="explicit"),
+            "skill-c": _manifest("skill-c", category="skill"),
+            "cap-d": _manifest("cap-d", cap="audio_tts"),
+            "off-e": _manifest("off-e"),
+        }
+        monkeypatch.setattr(mcp_registry, "_manifests", manifests)
+        monkeypatch.setattr(audio_service, "tts_capability_available", lambda: tts_available)
+        for name in manifests:
+            mcp_store.set_mcp_enabled(name, name != "off-e")
+        for slug in ("ag1", "ag2", "ag3"):
+            agent_store.create_agent(slug, slug.upper(), created_by=A)
+        mcp_store.set_manager_enabled_mcps("ag1", list(manifests) + ["unknown-z"])
+        mcp_store.set_manager_enabled_mcps("ag2", ["expl-b", "auto-a"])
+        mcp_store.upsert_mcp_instance("expl-b", {"instance_name": "i1", "field_values": {},
+                                                 "agents": ["ag1"]})
+
+    def test_bulk_mcp_view_matches_the_per_agent_badge(self, temp_db, monkeypatch):
+        from api.agents import discovery
+        from services.media import audio_service
+        self._seed_mcps(monkeypatch, tts_available=True)
+        for available in (True, False):
+            monkeypatch.setattr(audio_service, "tts_capability_available", lambda: available)
+            slugs = ["ag1", "ag2", "ag3"]
+            bulk = discovery._mcp_names_by_agent(slugs)
+            assert bulk == {s: discovery._get_mcp_info(s)[1] for s in slugs}
+            assert bulk["ag1"] == (["auto-a", "cap-d", "expl-b"] if available
+                                   else ["auto-a", "expl-b"])
+            assert bulk["ag2"] == ["auto-a"]  # expl-b: no instance names ag2
+            assert bulk["ag3"] == []
+
+    def test_listing_runs_off_the_loop_and_answers_the_same_rows(self, temp_db, monkeypatch, loop_db_guard):
+        """The handler is one executor job; awaited on this thread
+        with the guard armed it answers what the on-loop listing did."""
+        from api.agents import discovery
+        self._seed_mcps(monkeypatch, tts_available=True)
+        u = _member("ag1", "ag2")
+        admin = UserContext(sub=A, email="a@t.com", name="Admin", role="admin")
+
+        async def scenario():
+            before = await discovery.list_agents(all=False, user=u)
+            with loop_db_guard.active():
+                after = await discovery.list_agents(all=False, user=u)
+                everyone = await discovery.list_agents(all=True, user=admin)
+                info = await discovery.get_agent_info("ag1", user=u)
+            return before, after, everyone, info
+
+        before, after, everyone, info = asyncio.run(scenario())
+        assert after == before
+        assert [a["name"] for a in after["agents"]] == ["ag1", "ag2"]
+        by = {a["name"]: a for a in after["agents"]}
+        assert by["ag1"]["mcp_names"] == ["auto-a", "cap-d", "expl-b"]
+        assert by["ag1"]["mcp_count"] == 3 and by["ag2"]["mcp_count"] == 1
+        assert [a["name"] for a in everyone["agents"]] == ["ag1", "ag2", "ag3"]
+        assert info["mcps"] == ["auto-a", "cap-d", "expl-b"]
+
+    def test_the_layer_default_model_is_resolved_once_per_engine(self, temp_db, monkeypatch):
+        import config
+        from api.agents import discovery
+        for slug, model in (("un1", ""), ("un2", ""), ("pin", "claude-fable-5-1")):
+            agent_store.create_agent(slug, slug, created_by=A, default_model=model)
+        agent_store.create_agent("other", "other", created_by=A, execution_path="codex-cli")
+        calls: list[str] = []
+
+        def fake_default(layer, *, agent_name=""):
+            calls.append(layer)
+            if layer == "codex-cli":
+                raise RuntimeError("nothing enabled")
+            return "m-default"
+
+        monkeypatch.setattr(config, "resolve_layer_default_model", fake_default)
+        u = _member("un1", "un2", "pin", "other")
+        rows = {a["name"]: a["default_model"]
+                for a in asyncio.run(discovery.list_agents(all=False, user=u))["agents"]}
+        assert rows == {"un1": "m-default", "un2": "m-default",
+                        "pin": "claude-fable-5-1", "other": ""}
+        assert sorted(calls) == ["claude-code-cli", "codex-cli"]

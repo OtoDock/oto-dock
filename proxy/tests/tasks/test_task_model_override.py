@@ -35,7 +35,7 @@ AGENT = "briefer"
 # Enabled on the agent's layer in the stubbed registry below; the agent's own
 # default stays MODEL_DEFAULT so "pinned" and "inherited" are distinguishable.
 MODEL_DEFAULT = "claude-sonnet-5"
-MODEL_STRONG = "claude-opus-5"
+MODEL_STRONG = "claude-opus-5-5"
 
 
 def _admin():
@@ -222,6 +222,31 @@ class TestEdit:
         assert client.post(f"/v1/tasks/{tid}/edit",
                            json={"layer": "codex-cli"}).status_code == 400
 
+    def test_a_scheduled_fire_runs_the_edited_definition(self, client, monkeypatch):
+        """An edit that leaves the timing alone does not re-register the
+        job, which holds the definition it was registered with: the fire
+        reads the row again."""
+        import asyncio
+        from services.scheduler import runner
+        tid = _create_scheduled(client).json()["task_id"]
+        registered = scheduler._row_to_task(task_store.get_dynamic_task(tid))
+        assert client.post(f"/v1/tasks/{tid}/edit", json={
+            "prompt": "brief me on the new thing", "model": MODEL_STRONG,
+        }).status_code == 200
+        fired: list = []
+
+        async def _capture(task, trigger_type="scheduled", **kw):
+            fired.append(task)
+            return "run-x"
+        monkeypatch.setattr(runner, "_execute_task", _capture)
+
+        async def _fire():
+            await runner._fire_task(registered)
+            await asyncio.sleep(0)
+        asyncio.run(_fire())
+        assert fired[0].prompt == "brief me on the new thing"
+        assert fired[0].override_model == MODEL_STRONG
+
     def test_edit_leaves_pins_alone_when_omitted(self, client):
         tid = _create_scheduled(client, model=MODEL_STRONG).json()["task_id"]
         r = client.post(f"/v1/tasks/{tid}/edit", json={"name": "Renamed"})
@@ -292,10 +317,153 @@ class TestListing:
         import config as app_config
         _create_scheduled(client)
 
-        def _boom(agent):
+        def _boom(agent, layer=None):
             raise RuntimeError("no enabled model")
 
         monkeypatch.setattr(app_config, "resolve_agent_model", _boom)
         r = client.get("/v1/tasks")
         assert r.status_code == 200
         assert r.json()["tasks"][0]["effective_model"] == ""
+
+    def test_layer_pin_without_model_resolves_the_layer_default(self, client):
+        """The runner resolves the default WITH the pinned engine: an agent
+        default the engine does not serve is skipped for the engine's own
+        first choice, and the listing must say the same."""
+        _create_scheduled(client, layer="direct-llm")
+        t = client.get("/v1/tasks").json()["tasks"][0]
+        assert t["effective_execution_path"] == "direct-llm"
+        assert t["effective_model"] == "hosted-mini"
+        assert t["effective_model_source"] == "layer default"
+
+    def test_app_handler_rows_claim_no_model(self, client):
+        task_store.create_dynamic_task(
+            "app-kanban-republish", AGENT, "Kanban: republish", "", "cli", "app",
+            "0 6 * * 1-5", None, None, 600, "user-admin", scope="agent",
+            app_id="app-1", app_handler="republish",
+        )
+        rows = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}
+        row = rows["app-kanban-republish"]
+        assert row["effective_model"] == "" and row["effective_model_tier"] is None
+        one = client.get("/v1/tasks/app-kanban-republish").json()
+        assert one["effective_model"] == "" and one["triggers"] == []
+
+    def test_tier_and_source_ride_along(self, client):
+        _create_scheduled(client, model=MODEL_STRONG)
+        t = client.get("/v1/tasks").json()["tasks"][0]
+        assert t["effective_model_source"] == "pinned"
+        assert t["effective_model_tier"] == 2 and t["tier_label"] == "strong"
+        assert t["pin_warnings"] == []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# GET /v1/tasks/{task_id} — the full definition an agent reads back
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _set_row(task_id: str, **cols):
+    from storage.database import get_conn
+    sets = ", ".join(f"{k} = %s" for k in cols)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE dynamic_tasks SET {sets} WHERE id = %s",
+                     [*cols.values(), task_id])
+        conn.commit()
+
+
+class TestGetTask:
+    def test_returns_the_definition_with_prompt_and_model(self, client):
+        r = _create_scheduled(client, model=MODEL_STRONG)
+        tid = r.json()["task_id"]
+        t = client.get(f"/v1/tasks/{tid}").json()
+        assert t["id"] == tid and t["prompt"] == "brief me"
+        assert t["schedule"] == "0 7 * * *" and t["notification_mode"] == "none"
+        assert t["effective_model"] == MODEL_STRONG
+        assert t["effective_model_source"] == "pinned"
+        assert t["run_count"] == 0 and t["fired"] is False
+        assert t["triggers"] == [] and t["pin_warnings"] == []
+        assert t["can_run"] is True
+
+    def test_pin_warnings_name_a_disabled_model_and_a_dropped_engine(self, client, monkeypatch):
+        from storage.billing import subscription_store
+        r = _create_scheduled(client, model="hosted-mini", layer="direct-llm")
+        assert r.status_code == 200, r.text
+        tid = r.json()["task_id"]
+        # After the fact the admin disabled the model and removed the engine.
+        monkeypatch.setattr(subscription_store, "list_models",
+                            lambda layer=None, **kw: [{"model_id": "hosted-mini", "enabled": False}])
+        agent_store.update_agent(AGENT, execution_paths='["claude-code-cli"]')
+        t = client.get(f"/v1/tasks/{tid}").json()
+        assert any("disabled" in w for w in t["pin_warnings"])
+        assert any("not enabled for this agent" in w for w in t["pin_warnings"])
+
+    def test_missing_foreign_and_delegate_rows_are_404(self, client):
+        assert client.get("/v1/tasks/dyn-nope").status_code == 404
+        tid = _create_scheduled(client).json()["task_id"]
+        _set_row(tid, created_by="someone-else")
+        assert client.get(f"/v1/tasks/{tid}").status_code == 404
+        # The admin audit view reads it, as the listing's audit view does.
+        assert client.get(f"/v1/tasks/{tid}?audit=true").status_code == 200
+        tid2 = _create_scheduled(client).json()["task_id"]
+        _set_row(tid2, use_persistent=True)
+        assert client.get(f"/v1/tasks/{tid2}").status_code == 404
+
+    def test_trigger_type_row_lists_the_triggers_pointing_at_it(self, client):
+        from storage.automation import trigger_store
+        r = _create_one_time(client, task_type="trigger", delay_seconds=None)
+        assert r.status_code == 200, r.text
+        tid = r.json()["task_id"]
+        trigger_store.create_trigger(
+            slug="on-push", name="On push", scope="user", agent=AGENT,
+            created_by="user-admin", task_id=tid, subscription_id=None,
+        )
+        t = client.get(f"/v1/tasks/{tid}").json()
+        assert t["task_type"] == "trigger"
+        (trig,) = t["triggers"]
+        assert trig["name"] == "On push" and trig["slug"] == "on-push"
+        assert trig["scope"] == "user" and trig["enabled"] is True
+        assert trig["fired_count"] == 0
+
+    def test_static_task_routes_still_win(self, client):
+        # /v1/tasks/runs and /v1/tasks/stats are registered before the
+        # parameterised route and must keep matching themselves.
+        assert client.get("/v1/tasks/runs").status_code == 200
+        assert client.get("/v1/tasks/stats").status_code == 200
+
+
+class TestFireOfAGoneRow:
+    def test_a_fire_of_a_deleted_or_paused_row_removes_the_job_and_runs_nothing(
+            self, client, monkeypatch):
+        """A row deleted in plain SQL (a removal cascade) or paused fires
+        nothing: the job goes with it. Only a read that FAILED fires the
+        registered definition."""
+        import asyncio
+        from services.scheduler import runner
+        gone = scheduler._row_to_task(task_store.get_dynamic_task(
+            _create_scheduled(client).json()["task_id"]))
+        paused = scheduler._row_to_task(task_store.get_dynamic_task(
+            _create_scheduled(client).json()["task_id"]))
+        for t in (gone, paused):
+            scheduler._register_task(t)
+        task_store.delete_dynamic_task(gone.id)
+        task_store.set_dynamic_task_enabled(paused.id, False)
+        fired: list = []
+
+        async def _capture(task, trigger_type="scheduled", **kw):
+            fired.append(task.id)
+            return "run-x"
+        monkeypatch.setattr(runner, "_execute_task", _capture)
+
+        async def _fire():
+            await runner._fire_task(gone)
+            await runner._fire_task(paused)
+            await asyncio.sleep(0)
+        asyncio.run(_fire())
+        assert fired == []
+        assert scheduler._scheduler.get_job(f"task_{gone.id}") is None
+        assert scheduler._scheduler.get_job(f"task_{paused.id}") is None
+
+        # A read that raised fires as registered (the job's own definition).
+        def _boom(task_id):
+            raise RuntimeError("db down")
+        monkeypatch.setattr(task_store, "get_dynamic_task", _boom)
+        asyncio.run(_fire())
+        assert fired == [gone.id, paused.id]

@@ -8,17 +8,15 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 
 import asyncio
 import logging
+import re as _re
 import uuid
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from auth.path_policy import (
-    EXTERNAL_DENIED_CLI_TOOLS,
-    check_tool_access,
-    _SHELL_COMMAND_TOOLS,
-)
-from api.sessions.sessions import verify_session_match
+from auth.path_policy import TIER_ADMIN, TIER_EDIT, TIER_READ, check_tool_access
+from core.events import tool_roles
+from api.sessions.sessions import verify_session_match_async
 from core.session.session_state import (
     get_session_mode,
     set_session_mode,
@@ -32,9 +30,22 @@ from core.session.session_state import (
     get_session_security,
 )
 from api.hooks import routing
+from core.session import session_kind
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
+
+#: The tool ROLES auto-approved in every mode (read-only / safe / internal):
+#: reads, globs, searches, the web tools, tool discovery, a subagent spawn,
+#: the task list's reads, the checklist. Everything else prompts in
+#: ``default`` — a file edit by path runs in ``acceptEdits``; a patch, a
+#: delete, a skill, a workflow, the task list's edits prompt there too.
+_AUTO_APPROVED_ROLES = frozenset({
+    tool_roles.READ, tool_roles.GLOB, tool_roles.SEARCH, tool_roles.WEB_FETCH,
+    tool_roles.WEB_SEARCH, tool_roles.DISCOVERY, tool_roles.SUBAGENT,
+    tool_roles.TASK_READ, tool_roles.CHECKLIST,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +72,7 @@ async def hook_permission(req: HookPermissionRequest, authorization: str | None 
     ``decide_tool_permission`` — the single decision authority, reused in-process
     by the local Codex app-server approval handler.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     return await decide_tool_permission(
         req.session_id, req.tool_name, req.tool_input,
         live_permission_mode=req.permission_mode,
@@ -85,8 +96,11 @@ async def hook_codex_question(
     answer). Returns ``{"answers": {<id>: {"answers": [...]}}}`` — the same
     authority the local Codex layer uses in-process.
     """
-    verify_session_match(authorization, req.session_id)
-    answers = await ask_user_question(req.session_id, req.questions)
+    await verify_session_match_async(authorization, req.session_id)
+    from core.session.session_manager import engine_layer_for_session
+    layer = engine_layer_for_session(req.session_id)
+    names = layer.capabilities.behaviour.tools.get(tool_roles.QUESTION, ()) if layer else ()
+    answers = await ask_user_question(req.session_id, req.questions, tool_name=names[0] if names else "")
     return {"answers": answers}
 
 
@@ -246,12 +260,23 @@ async def _decide_tool_permission(
     carries Pass-1 side data (currently ``updated_input``) back to the
     wrapper without threading it through every mode-branch return."""
     tool_input = tool_input or {}
-    # Codex's hook names MCP tools with a sanitized server key
-    # (``mcp__meetings_mcp__direct_to``); everything below keys on the
-    # manifest's server name.
-    if tool_name.startswith("mcp__"):
-        from services.mcp.mcp_permissions import canonical_tool_name
-        tool_name = canonical_tool_name(tool_name)
+    # The engine behind the session translates its native names into the
+    # platform's (Codex's hook names MCP tools with a sanitized server key,
+    # ``mcp__meetings_mcp__direct_to``; everything below keys on the
+    # manifest's server name and on the tool's ROLE — core/events/tool_roles).
+    from core.session.session_manager import engine_layer_for_session
+    layer = engine_layer_for_session(session_id)
+    if layer is not None:
+        tool_name = layer.canonical_tool_name(session_id, tool_name)
+    role = tool_roles.role_of(tool_name)
+    payload = tool_roles.payload_of(tool_name)
+    # The roles that run in every mode without a prompt: reads, searches,
+    # the web tools, tool discovery, a subagent spawn (its tools are gated
+    # on their own), the task list's reads, the checklist.
+    auto_approved = role in _AUTO_APPROVED_ROLES
+    # A file edit by path (auto-approved in acceptEdits; a patch is not, and
+    # a delete never is).
+    file_edit = role == tool_roles.WRITE and payload == tool_roles.FILE_PATH
     mode = get_session_mode(session_id)
     client_type = get_session_client_type(session_id)
 
@@ -261,7 +286,7 @@ async def _decide_tool_permission(
     route = routing.resolve_hook_route(session_id)
     if route.is_meeting:
         mode = get_session_mode(route.parent_session_id)
-        client_type = "dashboard"  # apply dashboard mode logic
+        client_type = session_kind.DASHBOARD.name  # apply dashboard mode logic
 
     # Interactive TUI: the hook reports the CLI's LIVE permission mode on every
     # call — the mode the human at the terminal actually chose via Shift+Tab —
@@ -297,6 +322,25 @@ async def _decide_tool_permission(
     record_hook_activity(session_id)
     logger.info(f"Hook permission: session={session_id}, tool={tool_name}, mode={mode}, client={client_type}")
 
+    # Fail CLOSED, before anything is enqueued or allowed. The SecurityContext
+    # is persisted (set at warmup, reloaded on startup, cleared on close —
+    # core/session/session_state.py), so a live session ALWAYS has one here,
+    # including one that survived a proxy crash on a satellite. A None
+    # therefore means a dead/unknown session — most importantly a CLOSED
+    # session whose self-contained 24h JWT was replayed
+    # (auth/session_token.py validates only signature+expiry, no liveness
+    # check). Deny it rather than fall through ungated (the old fail-OPEN
+    # skip let a replayed token bypass path policy).
+    security_ctx = get_session_security(session_id)
+    if security_ctx is None:
+        logger.warning(
+            f"Hook denied (no security context): session={session_id}, tool={tool_name}"
+        )
+        return {
+            "decision": "deny",
+            "reason": "Session is no longer active. Send a new message to continue.",
+        }
+
     # Meeting participants: a routed turn is over — deny what follows (and
     # record the routing tool itself). Ahead of every other branch: no mode,
     # tier or allow-memory may lift it.
@@ -305,27 +349,36 @@ async def _decide_tool_permission(
         if over is not None:
             return over
 
-    # EnterPlanMode: always auto-approve (it's just a mode transition)
-    if tool_name == "EnterPlanMode":
+    # Entering plan mode: always auto-approve (it's just a mode transition)
+    if role == tool_roles.PLAN_ENTER:
         return {"decision": "allow"}
 
-    # AskUserQuestion: emit the question event for rendering in the pipe,
-    # then DENY the tool so Claude Code doesn't auto-select answers in
-    # non-interactive mode (which causes the model to retry 3+ times).
-    # The deny reason tells the model the questions were shown to the user.
-    if tool_name == "AskUserQuestion":
-        # Interactive TUI with a HUMAN present: let the tool RUN — the native
-        # terminal renders the question cards and the user answers inline (don't
-        # deny + show a dashboard card, which is the headless -p surrogate). An
-        # autonomous interactive TASK (client_type "task", no viewer) must NOT —
-        # the cards would block on an answer nobody gives. It falls
-        # through to the deny-and-inform below, exactly like a headless -p task.
-        if _is_interactive_session(session_id) and client_type != "task":
+    # The engine's question tool, in this order:
+    #  * an interactive TUI with a HUMAN present: let the tool RUN — the
+    #    native terminal renders the question cards / picker and the human
+    #    answers inline (don't deny + show a dashboard card, which is the
+    #    headless surrogate); park the turn the moment the dialog opens,
+    #    since the hook call precedes it deterministically;
+    #  * an engine whose question tool holds the turn open for the
+    #    platform's answers (Codex's request_user_input →
+    #    ask_user_question, which declines unattended callers): allow;
+    #  * otherwise — Claude headless, and an autonomous interactive TASK on
+    #    either engine (no viewer; a picker would block on an answer nobody
+    #    gives) — emit the question event for the chat and DENY the tool so
+    #    the model doesn't auto-select answers and retry; the reason says
+    #    the questions reached the user.
+    if role == tool_roles.QUESTION:
+        interactive = _is_interactive_session(session_id)
+        if interactive and session_kind.attended(client_type):
             _park_interactive_on_dialog(session_id, tool_name)
+            return {"decision": "allow"}
+        holds_turn = (layer is not None
+                      and layer.capabilities_for(session_id).behaviour.question_tool_holds_turn)
+        if holds_turn and not interactive:
             return {"decision": "allow"}
         queue = get_permission_queue(route.queue_session_id)
         await queue.put({
-            "event_type": "question",
+            "event_type": wire.ITEM_QUESTION,
             "tool_name": tool_name,
             "tool_input": tool_input,
         })
@@ -334,32 +387,23 @@ async def _decide_tool_permission(
             "reason": (
                 "Questions have been displayed to the user in the chat interface. "
                 "The user will reply in their next message. "
-                "Do NOT re-ask these questions or call AskUserQuestion again this turn."
+                f"Do NOT re-ask these questions or call {tool_name} again this turn."
             ),
         }
 
-    # Codex's question picker (interactive TUI only — the headless app-server
-    # bridges request_user_input to a dashboard card without this hook): park
-    # the human-driven session's turn the moment the picker opens, like
-    # AskUserQuestion above. The rollout tailer persists the card. Codex runs
-    # the gate deny-only, so "allow" is the no-op it expects.
-    if tool_name == "request_user_input":
-        if _is_interactive_session(session_id) and client_type != "task":
-            _park_interactive_on_dialog(session_id, tool_name)
-        return {"decision": "allow"}
+    # The judge profile (CHECKS.md): ``git`` is edit tier in the shell
+    # classifier as a family, but a judge needs its read subcommands
+    # (status, diff, log, …) — one plain command, no pipe or redirect.
+    _JUDGE_READ_GIT_RE = _re.compile(
+        r"^\s*git\s+(?:(?:-C|--git-dir|--work-tree)\s+\S+\s+|--no-pager\s+)*"
+        r"(?:status|diff|log|show|blame|rev-parse|ls-files|ls-tree|branch|remote|describe|"
+        r"shortlog|grep|cat-file|stash\s+list|tag\s+-l|tag\s+--list|worktree\s+list)\b"
+        r"[^|;&<>`$]*$")
 
-    # Tools auto-approved in all modes (read-only / safe / internal)
-    _READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch",
-                        "ToolSearch", "Agent", "TaskGet", "TaskList",
-                        "TaskOutput", "CronList",
-                        "TodoWrite", "TodoRead"}
-    # File edit tools auto-approved in acceptEdits
-    _FILE_EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
-
-    # ExitPlanMode: gate with plan_review in plan mode (dashboard only),
+    # Leaving plan mode: gate with plan_review in plan mode (dashboard only),
     # auto-approve in all other modes (prevents permission prompt after
     # mode was already changed by implement/cancel actions)
-    if tool_name == "ExitPlanMode":
+    if role == tool_roles.PLAN_EXIT:
         # Interactive TUI with a HUMAN present: the plan review IS the CLI's
         # native ExitPlanMode dialog — defer, like every other residual ask
         # (the terminal owns approvals). The dashboard plan_review card is
@@ -372,10 +416,10 @@ async def _decide_tool_permission(
         # hook call (live mode). An autonomous interactive TASK is not a
         # dashboard client, so it falls through to the unconditional allow
         # below.
-        if _is_interactive_session(session_id) and client_type != "task":
+        if _is_interactive_session(session_id) and session_kind.attended(client_type):
             _park_interactive_on_dialog(session_id, tool_name)
             return {"decision": "defer"}
-        if mode == "plan" and client_type == "dashboard":
+        if mode == "plan" and client_type == session_kind.DASHBOARD.name:
             # Auto-approve if user already clicked implement (session resumed after death)
             from core.events.stream_pump import _active_pumps
             pump = _active_pumps.get(session_id) if session_id else None
@@ -396,7 +440,7 @@ async def _decide_tool_permission(
             request_id = str(uuid.uuid4())
             queue = get_permission_queue(route.queue_session_id)
             await queue.put({
-                "event_type": "plan_review",
+                "event_type": wire.ITEM_PLAN_REVIEW,
                 "request_id": request_id,
                 "plan": plan_content,
                 "tool_input": tool_input or {},
@@ -410,7 +454,7 @@ async def _decide_tool_permission(
                     set_session_mode(session_id, "default")
                     queue2 = get_permission_queue(route.queue_session_id)
                     await queue2.put({
-                        "event_type": "mode_restored",
+                        "event_type": wire.ITEM_MODE_RESTORED,
                         "mode": "default",
                     })
                     logger.info(f"Hook permission: plan_review fallback -- mode was still plan, restored to default")
@@ -430,31 +474,15 @@ async def _decide_tool_permission(
     # Check file paths in tool arguments against session's security context.
     # Runs BEFORE mode-based logic. If path check denies, tool is blocked
     # regardless of permission mode (even dontAsk).
-    path_decision = None  # Available for Pass 2 Bash tier logic
-    security_ctx = get_session_security(session_id)
-    if security_ctx is None:
-        # Fail CLOSED. The SecurityContext is persisted (set at warmup,
-        # reloaded on startup, cleared on close — core/session/session_state.py), so a
-        # live session ALWAYS has one here, including one that survived a proxy
-        # crash on a satellite. A None therefore means a dead/unknown session —
-        # most importantly a CLOSED session whose self-contained 24h JWT was
-        # replayed (auth/session_token.py validates only signature+expiry, no
-        # liveness check). Deny it rather than fall through to Pass-2 ungated
-        # (the old fail-OPEN skip, which let a replayed token bypass path policy).
-        logger.warning(
-            f"Hook denied (no security context): session={session_id}, tool={tool_name}"
-        )
-        return {
-            "decision": "deny",
-            "reason": "Session is no longer active. Send a new message to continue.",
-        }
+    path_decision = None  # Available for Pass 2 shell tier logic
     # External sessions (a phone caller who is not a platform user) never
-    # get a shell — the hook floor of that rule (the CLI argv and the
-    # settings deny list are the other two layers). Before the path gate and
-    # before every mode branch: no role, mode or allow-memory can lift it.
-    # The web tools are not floored; WebFetch goes through the SSRF gate in
-    # check_tool_access below like every other session.
-    if getattr(security_ctx, "principal", None) == "external" and tool_name in EXTERNAL_DENIED_CLI_TOOLS:
+    # get a shell — the hook floor of that rule, by ROLE (the CLI argv and
+    # the settings deny list, the other two layers, carry the engine's own
+    # shell names). Before the path gate and before every mode branch: no
+    # role, mode or allow-memory can lift it. The web tools are not floored;
+    # a URL fetch goes through the SSRF gate in check_tool_access below like
+    # every other session.
+    if getattr(security_ctx, "principal", None) == "external" and role == tool_roles.SHELL:
         logger.warning(
             f"Hook denied (external session, no shell): session={session_id}, "
             f"tool={tool_name}, agent={security_ctx.agent}"
@@ -472,7 +500,7 @@ async def _decide_tool_permission(
     if revoked:
         logger.warning(
             f"Hook target revoked: session={session_id}, "
-            f"tool={tool_name}, machine_id={security_ctx.target_machine_id}, "
+            f"tool={tool_name}, machine_id={security_ctx.placement.machine_id}, "
             f"reason={revoked}"
         )
         return {"decision": "deny", "reason": revoked}
@@ -501,14 +529,23 @@ async def _decide_tool_permission(
     # RELAX (open never prompts, even in plan mode) and TIGHTEN (critical
     # prompts even in dontAsk, and is denied in no-human sessions) the
     # mode-only outcome. Non-MCP tools: tier stays None, nothing changes.
+    # A device MCP's high-risk tools (raw code execution on the machine,
+    # ``device_high_risk_tools``) are critical in effect whatever tier the
+    # manifest gives them: they prompt in every attended mode, Don't Ask
+    # included, skip the device auto-approve and the allow-memory, and are
+    # refused where nobody can answer. A manifest can only pin a tool, never
+    # un-pin one.
     mcp_server = mcp_tool_only = ""
     mcp_tier = None
     if tool_name.startswith("mcp__"):
-        from services.mcp import mcp_permissions
+        from services.mcp import mcp_permissions, mcp_registry
         _parts = tool_name.split("__", 2)
         mcp_server = _parts[1] if len(_parts) >= 2 else ""
         mcp_tool_only = _parts[2] if len(_parts) >= 3 else ""
         mcp_tier = mcp_permissions.resolve_tool_tier(mcp_server, mcp_tool_only)
+        if mcp_tier != "critical" and mcp_registry.is_high_risk_device_tool(
+                mcp_server, mcp_tool_only):
+            mcp_tier = "critical"
 
     # Helper: check Bash tier against current mode.
     # Returns {"decision": "allow"} if auto-approved, None if should fall through to prompt.
@@ -525,16 +562,16 @@ async def _decide_tool_permission(
         tier = path_decision.permission_tier
         # Unknown commands carry tier "ask" → fall through to the prompt (like
         # "extended"): prompt in default/acceptEdits, allowed in dontAsk/auto.
-        if tier == "read":
+        if tier == TIER_READ:
             # Read-tier bash: auto-approve in default, acceptEdits, dontAsk
             return {"decision": "allow"}
-        if tier == "edit":
+        if tier == TIER_EDIT:
             # "auto" is the task permission mode — treat it like "dontAsk"
             # so a continued (re-warmed) task doesn't prompt on edits.
             if mode in ("acceptEdits", "dontAsk", "auto"):
                 return {"decision": "allow"}
             return None  # default mode: prompt
-        if tier == "admin":
+        if tier == TIER_ADMIN:
             if mode in ("dontAsk", "auto"):
                 return {"decision": "allow"}
             return None  # default/acceptEdits: prompt
@@ -543,7 +580,7 @@ async def _decide_tool_permission(
     # Plan mode: allow read-only tools + plan file writes/edits, deny rest
     # (ExitPlanMode/EnterPlanMode already handled above)
     if mode == "plan":
-        if tool_name in _READ_ONLY_TOOLS:
+        if auto_approved:
             return {"decision": "allow"}
 
         # Open-tier MCP tools (pure reads, dashboard display, recoverable
@@ -551,24 +588,46 @@ async def _decide_tool_permission(
         if mcp_tier == "open":
             return {"decision": "allow"}
 
-        # Shell read-tier in plan mode: safe read-only commands (Bash / Monitor /
-        # PowerShell — all classified by _check_bash / _check_powershell).
-        if tool_name in _SHELL_COMMAND_TOOLS and path_decision and path_decision.permission_tier == "read":
+        # Shell read-tier in plan mode: safe read-only commands (every shell
+        # dialect is classified by _check_bash / _check_powershell).
+        if role == tool_roles.SHELL and path_decision and path_decision.permission_tier == "read":
             return {"decision": "allow"}
 
         # Allow writing/editing plan files in ~/.claude/plans/. Normalize
         # separators: a Windows-satellite session sends the host-absolute
         # path with backslashes (C:\Users\...\.claude\plans\x.md) — without
         # this the plan write is denied as a generic plan-mode write.
-        if tool_name in ("Write", "Edit"):
-            file_path = ((tool_input or {}).get("file_path", "") or "").replace("\\", "/")
+        if file_edit:
+            file_path = tool_roles.payload_value(tool_name, tool_input).replace("\\", "/")
             if "/.claude/plans/" in file_path:
                 return {"decision": "allow"}
 
         return {"decision": "deny"}
 
+    # The judge profile (CHECKS.md): a check's judge session reads and
+    # never writes — the read tools and the read tier of the shell run, the
+    # MCP tools the check listed run below the critical tier (the session
+    # has no other MCPs), everything that writes is refused with a reason
+    # the model can act on. Enforced here for every placement, a machine
+    # over the tunnel included; the kernel mounts say the same locally.
+    if mode == "judge":
+        if auto_approved:
+            return {"decision": "allow"}
+        if role == tool_roles.SHELL and path_decision and (
+                path_decision.permission_tier == "read"
+                and not getattr(path_decision, "destructive", False)):
+            return {"decision": "allow"}
+        if (role == tool_roles.SHELL and path_decision and path_decision.allowed
+                and not getattr(path_decision, "destructive", False)
+                and _JUDGE_READ_GIT_RE.match(tool_roles.payload_value(tool_name, tool_input))):
+            return {"decision": "allow"}
+        if tool_name.startswith("mcp__") and mcp_tier in ("open", "standard", "sensitive"):
+            return {"decision": "allow"}
+        return {"decision": "deny",
+                "reason": "a judge reads, it does not write — report the finding instead"}
+
     # Dashboard sessions: permission behavior depends on mode
-    if client_type == "dashboard":
+    if client_type == session_kind.DASHBOARD.name:
         # "auto" is the task permission mode (set at task creation). A continued
         # task is a dashboard client, so without this it would fall through to
         # the prompt path even though the UI shows "Don't Ask". Treat auto ≡ dontAsk.
@@ -579,25 +638,25 @@ async def _decide_tool_permission(
             if mcp_tier != "critical":
                 return {"decision": "allow"}
 
-        # Shell tier-based handling (before generic tool checks). Bash / Monitor /
-        # PowerShell all carry a tier + destructive flag from the command gate, so
+        # Shell tier-based handling (before generic tool checks). Every shell
+        # tool carries a tier + destructive flag from the command gate, so
         # the same tier→mode auto-approve applies (read→default, edit→acceptEdits,
         # ask/extended→prompt, destructive→prompt even in acceptEdits).
-        if tool_name in _SHELL_COMMAND_TOOLS:
+        if role == tool_roles.SHELL:
             result = _bash_tier_auto_approve()
             if result:
                 return result
             # Fall through to permission prompt
 
         elif mode == "acceptEdits":
-            # Auto-approve read-only + file edit tools
-            # Prompt for MCP tools and destructive tools
-            if tool_name in _READ_ONLY_TOOLS or tool_name in _FILE_EDIT_TOOLS:
+            # Auto-approve the read-only roles + a file edit by path
+            # Prompt for MCP tools, patches, deletes and destructive tools
+            if auto_approved or file_edit:
                 return {"decision": "allow"}
             # Fall through to prompt
 
-        elif tool_name in _READ_ONLY_TOOLS:
-            # "default" mode: only auto-allow read-only tools
+        elif auto_approved:
+            # "default" mode: only auto-allow the read-only roles
             return {"decision": "allow"}
 
         # Device-local MCP tools (computer / browser / app control): the owner
@@ -614,47 +673,32 @@ async def _decide_tool_permission(
         # the fallthrough below; only dashboard sessions carry target grants.)
         if tool_name.startswith("mcp__"):  # security_ctx is non-None past the Pass-1 gate
             from services.mcp import mcp_permissions, mcp_registry
-            # Critical-tier tools skip EVERY auto-approve below (device grant,
-            # session allow-memory, tier table) — they exist to prompt per
-            # call, so they drop straight to the prompt path.
+            # Critical-tier tools (a device MCP's high-risk tools included:
+            # the tier promotion above) skip EVERY auto-approve below (device
+            # grant, session allow-memory, tier table): they exist to prompt
+            # per call, so they drop straight to the prompt path.
             if mcp_tier != "critical":
                 cap = mcp_registry.device_capability_for_server(mcp_server)
-                granted = getattr(security_ctx, "target_device_grants", None) or set()
+                granted = security_ctx.placement.device_grants or set()
                 if cap and cap in granted:
-                    # High-risk app-connector tools (e.g. execute_blender_code = raw
-                    # RCE inside the app, bypassing the bash-tier system) are EXCLUDED
-                    # from the blanket device auto-approve: they still prompt even
-                    # though the capability is granted.
-                    if mcp_registry.is_high_risk_device_tool(mcp_server, mcp_tool_only):
-                        logger.info(
-                            f"Hook permission: device tool {tool_name} is high-risk "
-                            f"(capability '{cap}' granted) — prompting instead of auto-approving"
-                        )
-                    else:
-                        logger.info(
-                            f"Hook permission: auto-approving device tool {tool_name} "
-                            f"(capability '{cap}' granted on machine "
-                            f"{security_ctx.target_machine_id[:8] if security_ctx.target_machine_id else '?'})"
-                        )
-                        return {"decision": "allow"}
+                    logger.info(
+                        f"Hook permission: auto-approving device tool {tool_name} "
+                        f"(capability '{cap}' granted on machine "
+                        f"{security_ctx.placement.machine_id[:8] or '?'})"
+                    )
+                    return {"decision": "allow"}
 
                 # Session allow-memory: the user already clicked Allow for this
                 # exact tool this session — one Allow covers its later calls
-                # instead of raising a fresh card per call. High-risk device
-                # tools never enter the set (see the prompt resolution below),
-                # so they keep prompting.
+                # instead of raising a fresh card per call. Critical tools
+                # never enter the set (see the prompt resolution below), so
+                # they keep prompting.
                 if is_session_tool_allowed(session_id, tool_name):
                     return {"decision": "allow"}
 
                 # Manifest permission tier: open never prompts; standard is
-                # silent in acceptEdits. High-risk device tools are exempt
-                # from the tier auto-approve — their per-call prompt pinning
-                # outranks any manifest declaration (a community manifest
-                # must not be able to un-pin them).
-                if (
-                    mcp_permissions.tier_decision(mcp_tier, mode) == "allow"
-                    and not mcp_registry.is_high_risk_device_tool(mcp_server, mcp_tool_only)
-                ):
+                # silent in acceptEdits.
+                if mcp_permissions.tier_decision(mcp_tier, mode) == "allow":
                     return {"decision": "allow"}
 
         # Interactive TUI with a human at the keyboard: DEFER — the platform
@@ -668,22 +712,14 @@ async def _decide_tool_permission(
         # (Pass-1) and the carve-outs below are unaffected; stored dontAsk
         # still hard-allowed above (an explicit silence choice the TUI
         # cannot express). Operator decision 2026-07-26.
-        if _is_interactive_session(session_id) and client_type != "task":
+        if _is_interactive_session(session_id) and session_kind.attended(client_type):
             # Carve-outs keep the platform "ask" — it feeds the CLI's ONE
             # native prompt (never a second dialog), so this is pure floor:
-            # critical-tier MCP tools (contract: prompt in EVERY mode),
-            # high-risk device tools (pinned per-call even when the
-            # capability is granted), and destructive Bash (must never ride
-            # a permissive CLI mode).
-            _high_risk = False
-            if tool_name.startswith("mcp__"):
-                from services.mcp import mcp_registry as _reg
-                _high_risk = _reg.is_high_risk_device_tool(mcp_server, mcp_tool_only)
-            if (
-                mcp_tier == "critical"
-                or _high_risk
-                or bool(getattr(path_decision, "destructive", False))
-            ):
+            # critical-tier MCP tools (contract: prompt in EVERY mode; a
+            # device MCP's high-risk tools are critical by the promotion
+            # above) and destructive Bash (must never ride a permissive CLI
+            # mode).
+            if mcp_tier == "critical" or bool(getattr(path_decision, "destructive", False)):
                 return {
                     "decision": "ask",
                     "reason": "OtoDock: this action always needs your approval",
@@ -709,7 +745,7 @@ async def _decide_tool_permission(
         request_id = str(uuid.uuid4())
         queue = get_permission_queue(route.queue_session_id)
         prompt_data = {
-            "event_type": "permission_prompt",
+            "event_type": wire.ITEM_PERMISSION_PROMPT,
             "request_id": request_id,
             "tool_name": tool_name,
             "tool_input": tool_input,
@@ -722,12 +758,9 @@ async def _decide_tool_permission(
         logger.info(f"Hook permission: dashboard resolved {tool_name}, approved={approved}")
         if approved and tool_name.startswith("mcp__"):
             # Feed the session allow-memory (checked above before prompting).
-            # High-risk device tools and critical-tier tools re-prompt per
-            # call by design — never remembered. `mcp_registry` is bound by
-            # the mcp__ branch above.
-            if mcp_tier != "critical" and not mcp_registry.is_high_risk_device_tool(
-                mcp_server, mcp_tool_only
-            ):
+            # Critical-tier tools, a device MCP's high-risk tools included,
+            # re-prompt per call by design, never remembered.
+            if mcp_tier != "critical":
                 remember_session_tool_allow(session_id, tool_name)
         return {"decision": "allow" if approved else "deny"}
 
@@ -746,7 +779,8 @@ async def _decide_tool_permission(
 
 
 async def ask_user_question(
-    session_id: str, questions: list, timeout: float = 604800.0,
+    session_id: str, questions: list, timeout: float = 604800.0, *,
+    tool_name: str = "",
 ) -> dict:
     """Surface a Codex ``request_user_input`` question set to the dashboard and
     block for the human answer. The single question authority, reused in-process
@@ -756,21 +790,21 @@ async def ask_user_question(
     session's permission queue (the pump surfaces the card + the "needs your
     input" ephemeral), then wait for the answer keyed by the VERBATIM question id.
     Returns the answers MAP ``{<id>: {"answers": [...]}}`` (``{}`` on timeout /
-    abort, so the held turn unwinds cleanly).
+    abort, so the held turn unwinds cleanly). ``tool_name`` is the engine's
+    question tool as the card records it (the caller's descriptor says).
     """
     # Belt-and-braces: only interactive dashboard chats have a human to answer.
     # The config flag already keeps request_user_input off for autonomous runs;
     # decline empty here too so a task/phone/meeting session never hangs a turn.
-    from core.execution_layer import UNATTENDED_CLIENT_TYPES
-    if get_session_client_type(session_id) in UNATTENDED_CLIENT_TYPES:
+    if not session_kind.attended(get_session_client_type(session_id)):
         return {}
     route = routing.resolve_hook_route(session_id)
     request_id = str(uuid.uuid4())
     queue = get_permission_queue(route.queue_session_id)
     await queue.put({
-        "event_type": "question_prompt",
+        "event_type": wire.ITEM_QUESTION_PROMPT,
         "request_id": request_id,
-        "tool_name": "request_user_input",
+        "tool_name": tool_name,
         "tool_input": {"questions": questions},
     })
     logger.info(f"Codex question: dashboard blocking, request_id={request_id}")

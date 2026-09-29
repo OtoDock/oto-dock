@@ -7,6 +7,7 @@ import PermissionDialog from './PermissionDialog'
 import SubagentInfo from './SubagentInfo'
 import BgCommandInfo from './BgCommandInfo'
 import DelegateTaskInfo from './DelegateTaskInfo'
+import CheckVerdictCard from './checks/CheckVerdictCard'
 import SystemEvent from './SystemEvent'
 import ImageGallery from './media/ImageGallery'
 import VideoPlayer from './media/VideoPlayer'
@@ -197,7 +198,7 @@ export default function BlockRenderer({
               </svg>
               <span className="text-xs text-p-text-secondary">
                 {block.name === 'mcp__display__pin_app'
-                  ? 'Working on a mini-app…'
+                  ? 'Working on an app…'
                   : 'Working on an interactive artifact…'}
               </span>
             </div>
@@ -235,6 +236,15 @@ export default function BlockRenderer({
           status={block.status}
           prompt={block.prompt}
           workerChatId={block.workerChatId}
+        />
+      )
+
+    case 'checkverdict':
+      return (
+        <CheckVerdictCard
+          check={block.check} status={block.status} score={block.score} summary={block.summary}
+          findings={block.findings} findingsTotal={block.findingsTotal} round={block.round}
+          rounds={block.rounds} ranOn={block.ranOn} costUsd={block.costUsd}
         />
       )
 
@@ -477,7 +487,7 @@ export default function BlockRenderer({
     }
 
     case 'app_action': {
-      // Provenance chip: a declared mini-app action delivered into the chat —
+      // Provenance chip: a declared app action delivered into the chat —
       // visibly NOT a user message.
       const promptPreview = (block.prompt || '').length > 120
         ? (block.prompt || '').slice(0, 117) + '…'
@@ -492,7 +502,7 @@ export default function BlockRenderer({
           </svg>
           <div className="min-w-0">
             <span className="font-medium text-p-text-secondary">
-              action from mini-app{block.title ? ` “${block.title}”` : ''}{block.label ? ` — ${block.label}` : ''}
+              action from app{block.title ? ` “${block.title}”` : ''}{block.label ? ` — ${block.label}` : ''}
             </span>
             {promptPreview && (
               <span className="ml-1.5 break-all text-[11px] text-p-text-light">{promptPreview}</span>

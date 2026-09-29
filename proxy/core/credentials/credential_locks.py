@@ -6,10 +6,8 @@ refreshed tokens:
      session at any time when an access token is near expiry).
   2. Background refresh worker (``services/oauth_refresh_worker``) scanning
      and refreshing tokens with <5 min remaining lifetime.
-  3. End-of-session writeback (``core/credential_writeback``) copying the
-     per-session credentials_dir back to the central token store.
 
-Without serialization, two of these can race and produce a token file that
+Without serialization, the two can race and produce a token file that
 mixes fields from different refreshes — particularly bad when a vendor
 rotates refresh tokens on every refresh and one writer overwrites with
 a stale refresh value.

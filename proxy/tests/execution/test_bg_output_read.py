@@ -82,10 +82,11 @@ def test_read_allows_own_bg_output_user_scope():
     assert _check_read_path(p, _ctx(role="viewer", username="alice")).allowed
 
 
-def test_read_still_denies_plain_tmp_file():
-    # A non-bg /tmp path stays denied (outside the agent tree).
+def test_read_allows_plain_tmp_file_locally():
+    # The sandbox's /tmp is a private tmpfs: the local gate admits all of it,
+    # so the bg-output rule only matters for remote targets now.
     p = Path("/tmp/claude-1000/sess/secrets.txt")
-    assert not _check_read_path(p, _ctx(username="")).allowed
+    assert _check_read_path(p, _ctx(username="")).allowed
 
 
 def test_bg_allow_does_not_bypass_cross_user_deny():

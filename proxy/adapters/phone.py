@@ -51,10 +51,10 @@ PHONE_OUTBOUND = (
 class PhoneAdapter(ClientAdapter):
     """Adapter for phone server sessions (WebSocket)."""
 
-    # The client-type discriminator: it selects this adapter (registry keys on
-    # ``name``) and is the token matched by ``client_type=="phone"`` /
-    # ``source_type`` / the manifests' ``exclude_from: ["phone"]``. Must stay in
-    # lockstep with the producer in core/config/phone_config_builder.py.
+    # The kind's name: it selects this adapter (the registry keys on ``name``)
+    # and must equal ``session_kind.PHONE.name`` — the one spelling every
+    # builder passes (``core/session/session_kind.py``; the manifests'
+    # ``exclude_from: ["phone"]`` is the same word).
     name = "phone"
 
     @staticmethod

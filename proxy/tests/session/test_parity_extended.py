@@ -603,7 +603,7 @@ def test_codex_translator_rate_limits_recorded_not_emitted():
     snapshot = {"limitName": "codex", "planType": "plus",
                 "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1789114918},
                 "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1789447223}}
-    with patch("services.engines.subscription_windows.record_codex_snapshot_async") as rec:
+    with patch("core.layers.codex.usage.record_snapshot_async") as rec:
         t = CodexEventTranslator(session_id="sess-1")
         assert t.translate(CodexEvent(type="account/rateLimits/updated",
                                       data={"rateLimits": snapshot})) == []

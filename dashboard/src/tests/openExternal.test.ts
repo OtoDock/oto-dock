@@ -20,6 +20,18 @@ describe('openExternalUrl', () => {
     expect(window.open).toHaveBeenCalledWith('https://example.com/x', '_blank', 'noopener,noreferrer')
   })
 
+  // `noopener` makes window.open answer null by design, so null means
+  // "blocked" only when no user activation vouched for the open.
+  it('reads noopener\'s null as opened while a gesture vouches, blocked without one', async () => {
+    const nav = navigator as Navigator & { userActivation?: { isActive: boolean } }
+    Object.defineProperty(nav, 'userActivation', { value: { isActive: true }, configurable: true })
+    expect(await openExternalUrl('https://example.com/x')).toBe('opened')
+    Object.defineProperty(nav, 'userActivation', { value: { isActive: false }, configurable: true })
+    expect(await openExternalUrl('https://example.com/x')).toBe('blocked')
+    delete (nav as { userActivation?: unknown }).userActivation
+    expect(await openExternalUrl('https://example.com/x')).toBe('opened')
+  })
+
   it('refuses non-http(s) schemes', async () => {
     await openExternalUrl('javascript:alert(1)')
     await openExternalUrl('file:///etc/passwd')

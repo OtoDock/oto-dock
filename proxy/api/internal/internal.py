@@ -4,7 +4,6 @@ Used by the standalone scheduler to fire tasks and notifications on the proxy.
 Protected by PROXY_API_KEY — only accepts API key auth, rejects session cookies.
 """
 
-import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -35,18 +34,22 @@ async def internal_fire_task(
     if not u.is_service:
         raise HTTPException(403, "Internal endpoint requires the master service key")
 
+    from services.scheduler import scheduler, task_kinds
+
     body = await request.json()
     task_id = body.get("task_id")
-    trigger_type = body.get("trigger_type", "scheduled")
+    trigger_type = body.get("trigger_type", task_kinds.TRIGGER_SCHEDULED)
 
     if not task_id:
         raise HTTPException(400, "task_id is required")
 
-    from services.scheduler import scheduler
-
-    dyn = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
+    from storage.pg import run_db
+    dyn = await run_db(task_store.get_dynamic_task, task_id)
     if not dyn:
         raise HTTPException(404, f"Task not found: {task_id}")
+    if not dyn.get("enabled", True):
+        # The runner drops a paused row's fire; this channel follows it.
+        raise HTTPException(409, f"Task is paused: {task_id}")
     task_def = scheduler._row_to_task(dyn)
 
     run_id = await scheduler.trigger_task_now(

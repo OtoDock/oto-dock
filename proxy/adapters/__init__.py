@@ -1,7 +1,8 @@
 """Client adapter registry.
 
-Adapters are registered at startup and looked up by client_type string
-(sent via X-Claude-Client header or inferred from transport).
+Adapters are registered at startup and looked up by the session kind's
+name (``core/session/session_kind.py``: the ``client_type`` the layer
+recorded for the session).
 """
 
 from adapters.base import ClientAdapter

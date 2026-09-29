@@ -39,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 
 import config
+from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_updater
 from storage import database as task_store
 from storage.mcp import mcp_autoupdate_store as log_store
@@ -198,7 +199,7 @@ async def run_auto_update(trigger: str = "auto") -> dict:
                     info.get("current", "?"), info.get("latest", "?"),
                     mcp_updater.HOLD_MARKER,
                 )
-            if targets[name].server.runtime == "docker":
+            if _mt.is_container(targets[name].server):
                 pending_docker.append(name)
                 continue
             status, err = await _update_and_record(run_id, name, info, targets[name], trigger)

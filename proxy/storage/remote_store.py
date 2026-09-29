@@ -14,7 +14,22 @@ from datetime import datetime, timezone, timedelta
 
 from storage.pg import get_conn
 
+from auth import roles
+# The placement vocabulary (the stored target value, the resolved kind, the
+# pairing scope) and the descriptor this store builds from a machine row.
+from core import placement
+
 logger = logging.getLogger("claude-proxy.remote-store")
+
+# The persisted ``remote_machines.status`` column's three words, named once
+# (core-seams phase 8): ``offline`` (the row a pairing mints), ``online``
+# (the satellite authenticated or heartbeats), ``disconnected`` (its
+# socket closed or its heartbeat lapsed). Every route overlays the LIVE
+# state (``services/remote/remote_status.py``: online / stale / paused /
+# disconnected / never_connected) — the column never reaches a client.
+STATUS_OFFLINE = "offline"
+STATUS_ONLINE = "online"
+STATUS_DISCONNECTED = "disconnected"
 
 
 def _now() -> str:
@@ -73,7 +88,7 @@ def create_remote_machine(
 
     Returns the machine dict with ``pairing_token`` (plaintext, not stored).
     """
-    if pairing_scope not in ("admin", "user"):
+    if pairing_scope not in placement.PAIRING_SCOPES:
         raise ValueError(f"invalid pairing_scope: {pairing_scope!r}")
 
     now = _now()
@@ -93,8 +108,8 @@ def create_remote_machine(
                (id, name, status, registered_by, pairing_scope,
                 pairing_token_hash, pairing_token_created_at, capabilities,
                 allow_full_fs, created_at)
-               VALUES (%s, %s, 'offline', %s, %s, %s, %s, '{}', %s, %s)""",
-            (machine_id, name, registered_by, pairing_scope,
+               VALUES (%s, %s, %s, %s, %s, %s, %s, '{}', %s, %s)""",
+            (machine_id, name, STATUS_OFFLINE, registered_by, pairing_scope,
              token_hash, now, bool(allow_full_fs), now),
         )
         conn.commit()
@@ -129,93 +144,29 @@ def get_remote_machine(machine_id: str) -> dict | None:
         return _strip_secret_columns(dict(row)) if row else None
 
 
-def get_target_metadata(
+def placement_of(
     target: str, user_sub: str | None, agent_slug: str,
-) -> tuple[str, str]:
-    """Classify a resolved execution target into (kind, human label).
+) -> placement.PlacementCapabilities:
+    """The resolved placement of one session — the ONE builder the session
+    builders call, once, from what ``resolve_execution_target`` (or a
+    chat's pin) answered: ``local`` | a machine id | the offline sentinel.
 
-    Used by the prompt's ``# Execution Environment`` section and by the
-    bash hook to gate admin-tier commands. ``target`` is what
-    ``resolve_execution_target`` returned (``"local"`` | ``machine_id``
-    | ``"__offline__:..."``).
-
-    Returns:
-        ``("local", "")`` — local bwrap sandbox.
-        ``("user_remote", machine_name)`` — when ``user_remote_targets``
-            for this (user_sub, agent_slug) pair points at ``target``.
-        ``("admin_remote", machine_name)`` — when the agent-level default
-            (``agents.execution_target``) provided the target (i.e.
-            admin paired this machine to this agent).
-
-    Offline-sentinel targets resolve to ``("local", "")`` — the caller
-    won't actually run there; the warmup handler short-circuits with an
-    error event.
+    The local placement for an empty, ``local`` or sentinel target (a
+    sentinel's session never starts — every consumer refuses before the
+    registration; see ``core.placement``); the user-paired kind when
+    ``user_remote_targets`` for this (user, agent) pair names the machine,
+    else the agent-level default (admin-paired); the machine row read once
+    and its facts parsed by ``placement.from_machine`` (a missing row: the
+    kind with every fact empty — the path gate fail-closes).
     """
-    if not target or target == "local" or target.startswith("__offline__:"):
-        return ("local", "")
-    # User-paired? (user_remote_targets row points at this machine for
-    # this (user, agent) pair.)
+    if placement.is_local(target) or placement.is_offline_sentinel(target):
+        return placement.LOCAL_PLACEMENT
+    kind = placement.KIND_ADMIN_REMOTE
     if user_sub:
         ut = get_user_remote_target(user_sub, agent_slug)
         if ut and ut.get("machine_id") == target:
-            machine = get_remote_machine(target) or {}
-            return ("user_remote", str(machine.get("name") or ""))
-    # Otherwise the agent-level default (admin-paired) was the path.
-    machine = get_remote_machine(target) or {}
-    return ("admin_remote", str(machine.get("name") or ""))
-
-
-def get_target_os(target_kind: str, target_value: str) -> str:
-    """The remote target's OS as the satellite reported it — ``"windows"`` /
-    ``"linux"`` / ``"darwin"``, or ``""`` for local targets, unreachable
-    machines, and satellites that predate the capability. Callers gating
-    OS-specific behavior must treat ``""`` conservatively (capability absent,
-    not "assume Linux"). Same shape as ``get_target_has_display`` below:
-    ``config_builder`` derives it inline from the capabilities read it already
-    performs; other builders call this.
-    """
-    if target_kind not in ("admin_remote", "user_remote") or not target_value:
-        return ""
-    machine = get_remote_machine(target_value)
-    if not machine:
-        return ""
-    caps_raw = machine.get("capabilities") or "{}"
-    try:
-        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-    except (json.JSONDecodeError, TypeError):
-        return ""
-    return str(caps.get("os", "") or "")
-
-
-def get_target_has_display(target_kind: str, target_value: str) -> bool | None:
-    """Whether a remote execution target last reported an interactive display.
-
-    Gates ``requires_display`` device-local MCPs:
-      - ``True``  — the satellite reported a usable GUI session.
-      - ``False`` — the satellite reported no display (headless / locked).
-      - ``None``  — unknown: a local target, an unreachable machine, or a
-        satellite that predates the display probe. The placement filter
-        treats ``None`` as "don't exclude" — only an explicit ``False``
-        excludes; an attached MCP reports "no display" at call time.
-
-    ``config_builder`` derives the same value inline from the fuller
-    capabilities read it already performs; the task / meeting / phone
-    builders (which don't otherwise read capabilities) call this.
-    """
-    if target_kind not in ("admin_remote", "user_remote") or not target_value:
-        return None
-    machine = get_remote_machine(target_value)
-    if not machine:
-        return None
-    caps_raw = machine.get("capabilities") or "{}"
-    try:
-        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-    except (json.JSONDecodeError, TypeError):
-        return None
-    display = caps.get("display")
-    if not isinstance(display, dict) or "has_display" not in display:
-        return None
-    return bool(display["has_display"])
+            kind = placement.KIND_USER_REMOTE
+    return placement.from_machine(kind, get_remote_machine(target))
 
 
 def get_all_remote_machines() -> list[dict]:
@@ -351,19 +302,6 @@ def set_remote_machine_max_sessions(machine_id: str, value: int | None) -> None:
         conn.commit()
 
 
-def _parse_device_grants(raw) -> set[str]:
-    """Parse the ``device_grants`` TEXT column (a JSON array) into a set of
-    granted capability keys. Tolerates None / malformed JSON / non-list →
-    empty set (fail-closed: an empty set blocks every device-local MCP)."""
-    if not raw:
-        return set()
-    try:
-        val = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
-        return set()
-    return {str(x) for x in val} if isinstance(val, list) else set()
-
-
 def set_device_grants(machine_id: str, grants: list[str]) -> None:
     """Set the per-machine device-control consent set — the capabilities
     (``computer`` / ``browser`` / ``app``) the owner
@@ -394,24 +332,6 @@ def set_device_grants(machine_id: str, grants: list[str]) -> None:
                 (json.dumps(cleaned), machine_id),
             )
         conn.commit()
-
-
-def get_target_device_grants(target_kind: str, target_value: str) -> set[str]:
-    """The set of device-control capabilities the remote target's owner has
-    granted. Empty set for a local target, an
-    unreachable machine, or one with no grants — fail-closed: an empty set
-    blocks every device-local MCP.
-
-    Parallels ``get_target_has_display``: task / meeting / phone / scheduler use
-    this; ``config_builder`` parses ``device_grants`` inline from the machine
-    row it already reads.
-    """
-    if target_kind not in ("admin_remote", "user_remote") or not target_value:
-        return set()
-    machine = get_remote_machine(target_value)
-    if not machine:
-        return set()
-    return _parse_device_grants(machine.get("device_grants"))
 
 
 # --- Own-browser mode (browser-control) ---
@@ -465,20 +385,21 @@ def set_browser_extension_token(machine_id: str, token: str | None) -> None:
         conn.commit()
 
 
-def get_target_browser_settings(target_kind: str, target_value: str) -> BrowserTargetSettings:
+def get_target_browser_settings(target: placement.PlacementCapabilities) -> BrowserTargetSettings:
     """Browser-control mode + decrypted extension token for a remote target.
-    Dedicated (no token) for a local target, an unknown machine, or one on
-    the dedicated profile — the token is decrypted only when the mode is
+    Dedicated (no token) for a local placement, an unknown machine, or one
+    on the dedicated profile — the token is decrypted only when the mode is
     ``own``, through this targeted SELECT (the column never rides a machine
-    row; see ``_SECRET_COLUMNS``). A decrypt failure (key mismatch) is logged
-    and degrades to "no token" — the session then asks in the browser."""
-    if target_kind not in ("admin_remote", "user_remote") or not target_value:
+    row, and never the placement the session persists; see
+    ``_SECRET_COLUMNS``). A decrypt failure (key mismatch) is logged and
+    degrades to "no token" — the session then asks in the browser."""
+    if not target.is_remote or not target.machine_id:
         return BrowserTargetSettings()
     with get_conn() as conn:
         row = conn.execute(
             "SELECT browser_mode, browser_extension_token_enc "
             "FROM remote_machines WHERE id = %s",
-            (target_value,),
+            (target.machine_id,),
         ).fetchone()
     if not row or _parse_browser_mode(row["browser_mode"]) != "own":
         return BrowserTargetSettings()
@@ -492,49 +413,9 @@ def get_target_browser_settings(target_kind: str, target_value: str) -> BrowserT
             logger.warning(
                 "Failed to decrypt the browser extension token of machine %s "
                 "(key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
-                target_value[:8],
+                target.machine_id[:8],
             )
     return BrowserTargetSettings(mode="own", extension_token=token)
-
-
-_EMPTY_PATH_POLICY = {
-    "agents_dir": "", "machine_id": "", "home_dir": "",
-    "allow_full_fs": False, "os_user": "", "user_dirs": {},
-    "claude_runtime_root": "",
-}
-
-
-def get_target_path_policy(target_kind: str, target_value: str) -> dict:
-    """SecurityContext path-policy fields from a remote machine's
-    last-reported capabilities (``target_agents_dir`` / ``target_home_dir``
-    / ``target_os_user`` / ``target_user_dirs`` + the machine's
-    ``allow_full_fs`` flag and id).
-
-    Zero-values for a local target or an unreachable/unparseable machine —
-    with an empty ``agents_dir``, no ``home_dir`` and ``allow_full_fs=False``
-    the satellite path gate fail-closes to sandbox-virtual paths only.
-    Task / meeting / phone builders use this; ``config_builder`` parses the
-    same fields inline from the machine row it already reads.
-    """
-    if target_kind not in ("admin_remote", "user_remote") or not target_value:
-        return dict(_EMPTY_PATH_POLICY)
-    try:
-        machine = get_remote_machine(target_value)
-        if not machine:
-            return dict(_EMPTY_PATH_POLICY)
-        caps_raw = machine.get("capabilities") or "{}"
-        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-        return {
-            "agents_dir": caps.get("agents_dir", "") or "",
-            "machine_id": machine.get("id", "") or "",
-            "home_dir": caps.get("home_dir", "") or "",
-            "allow_full_fs": bool(machine.get("allow_full_fs") or False),
-            "os_user": caps.get("os_user", "") or "",
-            "user_dirs": caps.get("user_dirs", {}) or {},
-            "claude_runtime_root": caps.get("claude_runtime_root", "") or "",
-        }
-    except Exception:
-        return dict(_EMPTY_PATH_POLICY)
 
 
 # ---------------------------------------------------------------------------
@@ -1051,13 +932,14 @@ def clear_user_remote_targets_for_agent(agent_slug: str) -> int:
 def resolve_execution_target(
     agent_slug: str,
     user_sub: str | None = None,
-    role: str = "manager",
+    role: str = roles.MANAGER,
 ) -> tuple[str, str | None]:
     """Resolve effective execution target: user override > agent default > local.
 
     Returns (target, fallback_reason) where:
-    - target is a machine_id, 'local', or the sentinel '__offline__:<machine_id>'
-      when the intended remote target is unreachable and fallback is disabled.
+    - target is a machine_id, ``placement.LOCAL``, or the offline sentinel
+      (``placement.offline_sentinel``) when the intended remote target is
+      unreachable and fallback is disabled.
     - fallback_reason is a short slug describing *why* the target differs from
       the user-configured/admin-configured intent. Values:
         * None — target matches intent (user override or agent default)
@@ -1090,13 +972,15 @@ def resolve_execution_target(
     # of them believed the pin and shaped a remote placement prompt + device
     # MCP set for a session that then ran on the server (2026-09-07).
     agent = agent_store.get_agent(agent_slug)
-    if (agent or {}).get("execution_path") == "direct-llm":
-        if (agent or {}).get("execution_target", "local") != "local":
+    from core.session.session_manager import get_layer_capabilities
+    _ec = get_layer_capabilities((agent or {}).get("execution_path") or "")
+    if _ec is not None and not _ec.runtime.supports_remote_execution:
+        if not placement.is_local((agent or {}).get("execution_target")):
             logger.info(
                 "resolve_execution_target: %s runs on the Direct LLM engine — "
                 "its remote target is ignored (always local)", agent_slug,
             )
-        return ("local", None)
+        return (placement.LOCAL, None)
 
     fallback_user = _db.get_platform_setting("remote_fallback_user_override")
     fallback_agent = _db.get_platform_setting("remote_fallback_agent_default")
@@ -1118,7 +1002,7 @@ def resolve_execution_target(
                 user_sub[:16], machine_id[:8], allow_fallback_user,
             )
             if not allow_fallback_user:
-                return (f"__offline__:{machine_id}", "user-override-offline-hard-fail")
+                return (placement.offline_sentinel(machine_id), "user-override-offline-hard-fail")
             # Soft fall-through to agent default — continues below with reason.
             _user_override_fallback = True
         else:
@@ -1127,12 +1011,12 @@ def resolve_execution_target(
         _user_override_fallback = False
 
     # 2. Agent-level default (the row was loaded above)
-    agent_target = (agent or {}).get("execution_target", "local")
+    agent_target = (agent or {}).get("execution_target") or placement.LOCAL
 
-    if agent_target == "local":
+    if placement.is_local(agent_target):
         if _user_override_fallback:
-            return ("local", "user-override-offline")
-        return ("local", None)
+            return (placement.LOCAL, "user-override-offline")
+        return (placement.LOCAL, None)
 
     # 3. Agent-set remote target. Only OWNERS (manager/admin) can run on
     #    admin-paired remotes — satellite has no bwrap kernel isolation,
@@ -1142,9 +1026,9 @@ def resolve_execution_target(
     #    preserves the role isolation guarantee. Users who paired their own
     #    machine via User Settings still hit it via user_remote_targets in
     #    step 1 (above) — that's their own hardware, machine-trust model.
-    if role not in ("manager", "admin"):
+    if not roles.can_manage(role):
         reason = "viewer-on-admin-remote"  # historical name; extended to editor+viewer
-        return ("local", reason)
+        return (placement.LOCAL, reason)
 
     # 4. Owner (manager/admin) with agent remote target — honor if reachable.
     if is_reachable(agent_target):
@@ -1154,5 +1038,5 @@ def resolve_execution_target(
 
     # Agent target offline.
     if allow_fallback_agent:
-        return ("local", "agent-default-offline")
-    return (f"__offline__:{agent_target}", "agent-default-offline-hard-fail")
+        return (placement.LOCAL, "agent-default-offline")
+    return (placement.offline_sentinel(agent_target), "agent-default-offline-hard-fail")

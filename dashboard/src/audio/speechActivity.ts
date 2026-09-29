@@ -1,7 +1,7 @@
 // Speech-activity signal — "is agent TTS audibly playing right now?"
 //
 // The turn-end UI burst (message-list rebuild, markdown re-parse, query
-// refetches, mini-app iframe reloads) runs on the same main thread that
+// refetches, app iframe reloads) runs on the same main thread that
 // schedules TTS audio; the duplex player holds only ~250ms of lookahead, so
 // a long task at exactly turn end is an audible gap. Heavy non-visible work
 // routes through onIdle(): it runs SYNCHRONOUSLY when nothing is speaking

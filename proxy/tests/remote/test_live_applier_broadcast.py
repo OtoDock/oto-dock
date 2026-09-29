@@ -16,6 +16,8 @@ guard returns before anything touches the platform tree).
 import base64
 import sys
 from types import SimpleNamespace
+
+from core import placement
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -39,7 +41,7 @@ async def _run(role, username, path, action="write"):
         "hash": "sha256:abc",
         "content_b64": base64.b64encode(b"x").decode() if action == "write" else "",
     }
-    sec = SimpleNamespace(role=role, username=username, agent="my-agent")
+    sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role=role, username=username, agent="my-agent")
     bcast = AsyncMock()
 
     with patch("core.session.session_state.get_session_security", return_value=sec), \

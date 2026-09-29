@@ -70,6 +70,70 @@ def test_chat_mode_excludes_all_task_chats(temp_db, _as):
     assert "task-run-x2" not in ids  # delegate workers moved to task mode
 
 
+def test_the_mint_writes_the_kind_and_both_lists_agree(temp_db, _as, monkeypatch):
+    """core-seams phase 4: a row the scheduler mints carries source_type
+    'task' on BOTH branches of _create_task_chat_row; chat mode excludes a
+    task row by the resolved list as much as by the id, task mode lists it
+    by either half; a row minted BEFORE the write (the default 'chat' with a
+    task- id) sorts the same way; a chat-surface delegate worker (a uuid id,
+    the default column) stays a chat."""
+    import config
+    from core.session import session_kind
+    from services.scheduler import runner, shared
+    monkeypatch.setattr(config, "get_cli_model", lambda *a, **k: "m")
+    _as(_user())
+    pre = _mk_task_chat(scope="user", created_by="user-alice")
+    assert task_store.get_chat(pre)["source_type"] == "chat"
+    assert session_kind.of_chat(task_store.get_chat(pre)) is session_kind.TASK
+    plain = shared.TaskDefinition(id="dyn-m1", name="t", agent=AGENT, prompt="p", scope="user",
+                                  created_by="user-alice")
+    task_store.create_run("run-m1", "dyn-m1", AGENT, "scheduled", None, "p", task_type="scheduled",
+                          scope="user", created_by="user-alice")
+    runner._create_task_chat_row("task-run-m1", "run-m1", plain)
+    worker = shared.TaskDefinition(id="dyn-m2", name="w", agent=AGENT, prompt="p", scope="user",
+                                   created_by="user-alice", task_type="delegate")
+    task_store.create_run("run-m2", "dyn-m2", AGENT, "manual", "orch", "p", task_type="delegate",
+                          scope="user", created_by="user-alice")
+    runner._create_task_chat_row("task-run-m2", "run-m2", worker)
+    for cid in ("task-run-m1", "task-run-m2"):
+        row = task_store.get_chat(cid)
+        assert row["source_type"] == "task" and row["user_sub"] == "user-alice"
+        assert session_kind.of_chat(row) is session_kind.TASK
+    # The list clause alone (no task- id): a task-kind row with a uuid id.
+    task_store.create_chat("by-column-only", "user-alice", AGENT, source_type="task")
+    task_store.create_run("run-m3", "dyn-m3", AGENT, "scheduled", None, "p", task_type="scheduled",
+                          scope="user", created_by="user-alice")
+    task_store.update_run("run-m3", chat_id="by-column-only", started_at="2026-07-12T00:00:00+00:00")
+    # A chat-surface delegate worker: a uuid id, the default column, a run row.
+    task_store.create_chat("worker-uuid", "user-alice", AGENT, origin="delegated", delegate_role="worker")
+    task_store.create_run("run-m4", "dyn-m4", AGENT, "manual", "orch", "p", task_type="delegate",
+                          scope="user", created_by="user-alice")
+    task_store.update_run("run-m4", chat_id="worker-uuid", started_at="2026-07-12T00:00:00+00:00")
+    chat_ids = {c["id"] for c in client.get(f"/v1/chats?agent={AGENT}").json()["chats"]}
+    task_ids = {c["id"] for c in client.get(f"/v1/chats?agent={AGENT}&kind=tasks").json()["chats"]}
+    assert not ({pre, "task-run-m1", "task-run-m2", "by-column-only"} & chat_ids)
+    assert "worker-uuid" in chat_ids
+    assert {pre, "task-run-m1", "task-run-m2", "by-column-only"} <= task_ids
+    assert "worker-uuid" not in task_ids
+
+
+def test_the_conversations_tab_lists_the_external_kinds_only(temp_db):
+    """The agent Conversations tab takes the resolved list of the externally
+    driven kinds (phone today): a task row — minted before or after the
+    column was written — never lists there, nor does a dashboard chat."""
+    from core.session import session_kind
+    task_store.create_chat("phone-1", "phone", AGENT, "auto", source_type="phone")
+    task_store.create_chat(str(uuid.uuid4()), "user-alice", AGENT)
+    _mk_task_chat()
+    task_store.create_chat("task-run-new", f"task::{AGENT}", AGENT, "auto", source_type="task")
+    kinds = session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES
+    assert [r["id"] for r in task_store.get_agent_conversations(AGENT, source_types=kinds)] == ["phone-1"]
+    assert task_store.count_agent_conversations(AGENT, source_types=kinds) == 1
+    assert [r["id"] for r in task_store.get_agent_conversations(
+        AGENT, source_type="phone", source_types=kinds)] == ["phone-1"]
+    assert task_store.get_agent_conversations(AGENT, source_type="task", source_types=kinds) == []
+
+
 def test_unread_finished_backfill_excludes_delegated_task_chats(temp_db):
     task_store.create_chat("task-run-d9", "user-alice", AGENT, origin="delegated")
     task_store.update_chat("task-run-d9",
@@ -236,3 +300,51 @@ async def test_ephemeral_push_task_chat_deep_link(temp_db, monkeypatch):
     # Unknown chat row → the /runs resolver fallback.
     await nm.fire_ephemeral("user1", "Done", "", chat_id="task-run-gone")
     assert captured["payload"]["click_url"] == "/runs/run-gone"
+
+
+# ---------------------------------------------------------------------------
+# Off the loop: the task-mode listing and search are one executor job each
+# ---------------------------------------------------------------------------
+
+def test_task_mode_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
+    """The task-history list (and its search twin) never reads the
+    store on the event loop thread. The handler coroutines are awaited
+    directly on this thread with the guard armed; rows and flags are the
+    ones the on-loop listing produced."""
+    from api.agents import chats as api
+    import asyncio
+    task_store.create_dynamic_task(
+        "dyn-off", AGENT, "Nightly report", "p", "cli", "scheduled",
+        "0 9 * * *", None, None, 3600, "user-alice", scope="agent")
+    cid = _mk_task_chat(task_id="dyn-off", prompt="elephant census off loop",
+                        created_by="user-alice")
+    u = _user()
+
+    async def scenario():
+        with loop_db_guard.active():
+            listed = await api.list_chats(agent=AGENT, kind="tasks", limit=50, user=u)
+            found = await api.search_chats(q="elephant", agent=AGENT, kind="tasks",
+                                           limit=20, user=u)
+        return listed["chats"], found["chats"]
+
+    listed, found = asyncio.run(scenario())
+    assert [r["id"] for r in listed] == [cid]
+    assert listed[0]["task_name"] == "Nightly report"
+    assert listed[0]["can_rename"] is True and listed[0]["can_delete"] is True
+    assert [r["id"] for r in found] == [cid]
+
+
+def test_task_mode_listing_answers_400_and_403_from_the_job(temp_db):
+    from fastapi import HTTPException
+    from api.agents import chats as api
+    import asyncio
+
+    async def scenario():
+        with pytest.raises(HTTPException) as no_agent:
+            await api.list_chats(agent=None, kind="tasks", limit=50, user=_user())
+        with pytest.raises(HTTPException) as denied:
+            await api.list_chats(agent="agent-not-mine", kind="tasks", limit=50,
+                                 user=_user())
+        return no_agent.value.status_code, denied.value.status_code
+
+    assert asyncio.run(scenario()) == (400, 403)

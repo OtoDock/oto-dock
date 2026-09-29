@@ -15,6 +15,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from storage.billing import subscription_status
 from storage.identity.credential_store import _encrypt, _decrypt
 from storage.pg import get_conn
 
@@ -87,7 +88,8 @@ def list_subscriptions(
             sql += " AND contribute_platform = %s"
             params.append(contribute_platform)
         if not include_disabled:
-            sql += " AND status != 'disabled'"
+            sql += " AND status != %s"
+            params.append(subscription_status.DISABLED)
         sql += " ORDER BY active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -107,10 +109,10 @@ def list_platform_pool(layer: str | None = None, provider: str | None = None) ->
         sql = (
             "SELECT s.* FROM execution_layer_subscriptions s "
             "LEFT JOIN users u ON s.owner_sub = u.sub "
-            "WHERE s.contribute_platform = TRUE AND s.status = 'active' "
+            "WHERE s.contribute_platform = TRUE AND s.status = %s "
             "AND (s.owner_sub = '' OR u.role = 'admin')"
         )
-        params: list = []
+        params: list = [subscription_status.ACTIVE]
         if layer:
             sql += " AND s.layer = %s"
             params.append(layer)
@@ -143,9 +145,10 @@ def list_personal(
             "SELECT * FROM execution_layer_subscriptions "
             "WHERE owner_sub = %s AND use_personal = TRUE"
         )
-        if not any_status:
-            sql += " AND status = 'active'"
         params: list = [owner_sub]
+        if not any_status:
+            sql += " AND status = %s"
+            params.append(subscription_status.ACTIVE)
         if layer:
             sql += " AND layer = %s"
             params.append(layer)
@@ -171,7 +174,8 @@ def list_admin_managed(layer: str | None = None, *, include_disabled: bool = Tru
             sql += " AND layer = %s"
             params.append(layer)
         if not include_disabled:
-            sql += " AND status != 'disabled'"
+            sql += " AND status != %s"
+            params.append(subscription_status.DISABLED)
         sql += " ORDER BY active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
@@ -218,9 +222,9 @@ def add_subscription(
                    (id, layer, provider, auth_type, owner_sub, use_personal,
                     contribute_platform, label, credential_data_enc,
                     oauth_email, active_sessions, status, created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'active', %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s)""",
                 (sub_id, layer, provider, auth_type, owner_sub, use_personal,
-                 contribute_platform, label, enc, oauth_email, now, now),
+                 contribute_platform, label, enc, oauth_email, subscription_status.ACTIVE, now, now),
             )
             conn.commit()
         except _pg_errors.UniqueViolation as e:
@@ -245,6 +249,9 @@ def update_subscription(
         "label", "status", "use_personal", "contribute_platform", "oauth_email",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    status = updates.get("status")
+    if status is not None and status not in subscription_status.STATUSES:
+        raise ValueError(f"invalid subscription status: {status!r}")
     if not updates:
         return get_subscription(sub_id)
 
@@ -370,7 +377,7 @@ def group_local_endpoint_rows(rows: list[tuple[dict, dict]]) -> list[dict]:
         g["has_api_key"] = g["has_api_key"] or bool(creds.get("api_key"))
         g["engines"][row["layer"]] = {
             "id": row["id"],
-            "status": row.get("status", "active"),
+            "status": row.get("status", subscription_status.ACTIVE),
             "active_sessions": row.get("active_sessions", 0),
             "owner_sub": row.get("owner_sub", ""),
         }
@@ -405,7 +412,7 @@ def get_pool_stats(layer: str) -> dict:
         total = len(rows)
         active_count = sum(1 for r in rows if r["active_sessions"] > 0)
         total_sessions = sum(r["active_sessions"] for r in rows)
-        available = sum(1 for r in rows if r["status"] == "active")
+        available = sum(1 for r in rows if r["status"] == subscription_status.ACTIVE)
         return {
             "total": total,
             "active": active_count,
@@ -864,8 +871,12 @@ def add_model(
     pricing_cache_read: float = 0,
     supports_reasoning: bool = False,
     supports_xhigh: bool = False,
+    tier: int | None = None,
+    good_at: str = "",
 ) -> dict:
-    """Add a model with optional pricing info. Returns the created record."""
+    """Add a model with optional pricing info. Returns the created record.
+    An existing (layer, model_id) row is left untouched (ON CONFLICT DO
+    NOTHING), so a re-add never changes a tier."""
     now = _now()
     with get_conn() as conn:
         conn.execute(
@@ -873,13 +884,13 @@ def add_model(
                (layer, provider, model_id, display_name, is_builtin, enabled,
                 context_window, pricing_input, pricing_output,
                 pricing_cache_write, pricing_cache_read, supports_reasoning,
-                supports_xhigh, created_at, updated_at)
-               VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                supports_xhigh, tier, good_at, created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT DO NOTHING""",
             (layer, provider, model_id, display_name, is_builtin,
              context_window, pricing_input, pricing_output,
              pricing_cache_write, pricing_cache_read,
-             supports_reasoning, supports_xhigh, now, now),
+             supports_reasoning, supports_xhigh, tier, good_at or "", now, now),
         )
         conn.commit()
         row = conn.execute(
@@ -900,10 +911,26 @@ def update_model(
     pricing_cache_read: float | None = None,
     supports_reasoning: bool | None = None,
     supports_xhigh: bool | None = None,
+    tier: int | None = None,
+    clear_tier: bool = False,
+    good_at: str | None = None,
 ) -> dict | None:
-    """Update a model (enable/disable, pricing, context window, reasoning, xhigh)."""
+    """Update a model (enable/disable, pricing, context window, reasoning,
+    xhigh, tier). A tier describes the model, not one (layer, model) row:
+    ``tier`` / ``clear_tier`` / ``good_at`` are applied to every row sharing
+    the model_id so the id never carries two tiers."""
     sets = []
     vals = []
+    tier_sets: list[str] = []
+    tier_vals: list = []
+    if clear_tier:
+        tier_sets.append("tier = NULL")
+    elif tier is not None:
+        tier_sets.append("tier = %s")
+        tier_vals.append(tier)
+    if good_at is not None:
+        tier_sets.append("good_at = %s")
+        tier_vals.append(good_at)
     if enabled is not None:
         sets.append("enabled = %s")
         vals.append(enabled)
@@ -928,21 +955,34 @@ def update_model(
     if supports_xhigh is not None:
         sets.append("supports_xhigh = %s")
         vals.append(supports_xhigh)
-    if not sets:
+    if not sets and not tier_sets:
         return None
     now = _now()
-    sets.append("updated_at = %s")
-    vals.append(now)
-    vals.append(model_db_id)
     with get_conn() as conn:
-        conn.execute(
-            f"UPDATE execution_layer_models SET {', '.join(sets)} WHERE id = %s",
-            vals,
-        )
+        if sets:
+            conn.execute(
+                f"UPDATE execution_layer_models SET {', '.join(sets)}, updated_at = %s WHERE id = %s",
+                [*vals, now, model_db_id],
+            )
+        if tier_sets:
+            conn.execute(
+                f"""UPDATE execution_layer_models SET {', '.join(tier_sets)}, updated_at = %s
+                    WHERE model_id = (SELECT model_id FROM execution_layer_models WHERE id = %s)""",
+                [*tier_vals, now, model_db_id],
+            )
         conn.commit()
         row = conn.execute(
             "SELECT * FROM execution_layer_models WHERE id = %s",
             (model_db_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_model(model_db_id: int) -> dict | None:
+    """One execution_layer_models row by its db id."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM execution_layer_models WHERE id = %s", (model_db_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -992,8 +1032,11 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
             p_cr = m.get("pricing_cache_read", 0)
             reasoning = m.get("supports_reasoning", False)
             xhigh = m.get("supports_xhigh", False)
+            tier = m.get("tier")
+            good_at = m.get("good_at") or ""
             # Promote any existing custom row with the same (layer, model_id)
-            # to builtin and apply the registry's metadata. Runs BEFORE the
+            # to builtin and apply the registry's metadata (the admin's tier
+            # on that row is replaced by the registry's). Runs BEFORE the
             # insert so the UNIQUE(layer, model_id) constraint doesn't block it.
             conn.execute(
                 """UPDATE execution_layer_models
@@ -1007,25 +1050,27 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                        pricing_cache_read = %s,
                        supports_reasoning = %s,
                        supports_xhigh = %s,
+                       tier = %s,
+                       good_at = %s,
                        updated_at = %s
                    WHERE layer = %s AND model_id = %s AND is_builtin = FALSE""",
                 (display_name, provider, ctx_win, p_in, p_out, p_cw, p_cr,
-                 reasoning, xhigh, now, layer, model_id),
+                 reasoning, xhigh, tier, good_at, now, layer, model_id),
             )
-            # Insert new builtins (with pricing + reasoning + xhigh flags)
+            # Insert new builtins (with pricing + reasoning + xhigh + tier)
             conn.execute(
                 """INSERT INTO execution_layer_models
                    (layer, provider, model_id, display_name, is_builtin, enabled,
                     context_window, pricing_input, pricing_output,
                     pricing_cache_write, pricing_cache_read, supports_reasoning,
-                    supports_xhigh, created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, TRUE, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    supports_xhigh, tier, good_at, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, TRUE, TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT DO NOTHING""",
                 (layer, provider, model_id, display_name,
-                 ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh, now, now),
+                 ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh, tier, good_at, now, now),
             )
             # Update existing builtins to fully match the registry — provider,
-            # context_window, pricing, reasoning, and xhigh all follow the
+            # context_window, pricing, reasoning, xhigh and tier all follow the
             # registry. The platform owns builtin model definitions, so price /
             # context updates shipped in a release propagate to existing installs
             # on the next sync (no DB shadow). `enabled` is NOT touched here, so
@@ -1041,9 +1086,12 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                        pricing_cache_read = %s,
                        supports_reasoning = %s,
                        supports_xhigh = %s,
+                       tier = %s,
+                       good_at = %s,
                        updated_at = %s
                    WHERE layer = %s AND model_id = %s AND is_builtin = TRUE""",
-                (provider, ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh, now, layer, model_id),
+                (provider, ctx_win, p_in, p_out, p_cw, p_cr, reasoning, xhigh,
+                 tier, good_at, now, layer, model_id),
             )
         # Remove stale builtins no longer in config
         if current_ids:
@@ -1055,6 +1103,52 @@ def sync_builtin_models(layer: str, models: list[dict]) -> None:
                 (layer, list(current_ids)),
             )
         conn.commit()
+
+
+def custom_model_exists(model_id: str) -> bool:
+    """Whether an admin has (re-)added ``model_id`` as a custom row on any
+    layer (``is_builtin = FALSE``). The boot walk over ``MODEL_SUCCESSORS``
+    skips such an id: the admin chose to keep the retired model, so the pins
+    on it stay."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM execution_layer_models WHERE model_id = %s AND is_builtin = FALSE LIMIT 1",
+            (model_id,),
+        ).fetchone()
+        return row is not None
+
+
+def _chain_end(successors: dict[str, str], model_id: str) -> str:
+    """``model_id`` followed through ``successors`` to the end of its chain
+    (cycle-safe) — the same rule as ``config.successor_model``, kept local so
+    storage never imports the registry."""
+    cur, seen = model_id, set()
+    while cur in successors and cur not in seen:
+        seen.add(cur)
+        cur = successors[cur]
+    return cur
+
+
+def remap_retired_models(successors: dict[str, str]) -> dict[str, int]:
+    """The boot walk over ``config.MODEL_SUCCESSORS`` (startup.py): every
+    retired id is remapped to the END of its chain (``claude-opus-4-8[1m]``
+    lands on ``claude-opus-5-5`` however the dict is ordered), and an id an
+    admin has re-added as a custom row is skipped — the walk runs on every
+    boot and would otherwise rewrite those pins at each restart. Returns
+    ``{old_id: rows remapped}`` (skipped ids absent); one failing entry
+    never stops the others."""
+    remapped: dict[str, int] = {}
+    for old_id in successors:
+        new_id = _chain_end(successors, old_id)
+        try:
+            if custom_model_exists(old_id):
+                logger.info("retired-model remap %s -> %s skipped: %s is re-added as a custom model",
+                            old_id, new_id, old_id)
+                continue
+            remapped[old_id] = remap_retired_model(old_id, new_id)
+        except Exception:
+            logger.exception("retired-model remap %s -> %s failed (non-fatal)", old_id, new_id)
+    return remapped
 
 
 def remap_retired_model(old_id: str, new_id: str) -> int:
@@ -1089,9 +1183,11 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
     return total
 
 
-def seed_hosted_llm_subscriptions() -> None:
+def seed_hosted_llm_subscriptions(relay_rows: list[tuple[str, str]]) -> None:
     """Default-on hosted LLM: ensure a relay platform subscription exists for each
-    relay-backed provider on the direct-llm layer, ONCE.
+    ``(layer, provider)`` in ``relay_rows`` — the relay-backed providers of
+    every engine that takes ``relay`` rows, resolved by the caller from the
+    descriptors (storage reads no registry) — ONCE.
 
     A ``hosted_llm_seeded`` platform-settings flag guards re-seeding, so an admin
     who later disables a provider isn't silently re-enabled on the next restart.
@@ -1102,19 +1198,20 @@ def seed_hosted_llm_subscriptions() -> None:
     from storage import database as db
     if db.get_platform_setting("hosted_llm_seeded"):
         return
-    existing = {
-        s.get("provider") for s in list_subscriptions(
-            layer="direct-llm", contribute_platform=True, include_disabled=True,
-        )
-        if s.get("auth_type") == "relay"
-    }
-    for provider in ("anthropic", "openai", "groq"):
-        if provider not in existing:
-            add_subscription(
-                layer="direct-llm", provider=provider, auth_type="relay",
-                owner_sub="", use_personal=False, contribute_platform=True,
-                label="OtoDock Hosted", credential_data={},
+    for layer in sorted({layer for layer, _ in relay_rows}):
+        existing = {
+            s.get("provider") for s in list_subscriptions(
+                layer=layer, contribute_platform=True, include_disabled=True,
             )
+            if s.get("auth_type") == "relay"
+        }
+        for row_layer, provider in relay_rows:
+            if row_layer == layer and provider not in existing:
+                add_subscription(
+                    layer=layer, provider=provider, auth_type="relay",
+                    owner_sub="", use_personal=False, contribute_platform=True,
+                    label="OtoDock Hosted", credential_data={},
+                )
     db.set_platform_setting("hosted_llm_seeded", "1")
 
 

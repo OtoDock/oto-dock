@@ -44,13 +44,17 @@ from pathlib import Path
 import config
 from fastapi import HTTPException
 
+from services.scheduler import task_kinds
 from storage.agents.community_agent_template_store import (
     CommunityAgentTemplate,
     TemplateValidationError,
     load_template_from_dict,
     load_template_from_dir,
+    substitute_template_vars,
     template_to_persistable_dict,
 )
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.community-agent-installer")
 
@@ -64,6 +68,12 @@ async def install_from_catalog(
     target_slug: str,
     installer_user_sub: str | None,
     installer_role: str,
+    *,
+    display_name: str = "",
+    app_consent: dict[str, str] | None = None,
+    check_consent: dict[str, str] | None = None,
+    consent_by: str = "",
+    consent_all: bool = False,
 ) -> dict:
     """Fetch + install a template from ``OtoDock/community-agents``.
 
@@ -74,9 +84,15 @@ async def install_from_catalog(
 
     ``installer_user_sub`` is the installing user: the admin created by the
     first-boot setup wizard (``api/auth/setup.py``) for the bundled
-    ``personal-assistant-lite`` install, or the logged-in user for
+    ``personal-assistant`` install, or the logged-in user for
     dashboard-driven installs. The ``| None`` is defensive — live callers
     always pass a real sub.
+
+    The consent (COMMUNITY-AGENTS-REGISTRY.md "Consent"): the dialog's
+    signatures per app and check with the person who gave them, or
+    ``consent_all`` for the platform's own default template at first boot —
+    the tarball's signatures stand in for a dialog nobody saw, and the
+    owner-only rule still applies to every copy.
     """
     from services.community import community_agents_catalog, community_catalog
 
@@ -104,6 +120,10 @@ async def install_from_catalog(
         template = await asyncio.to_thread(load_template_from_dir, extracted)
     except TemplateValidationError as exc:
         raise HTTPException(400, f"Invalid catalog template: {exc}")
+    if consent_all and installer_user_sub:
+        app_consent = {a.slug: a.sig for a in template.apps}
+        check_consent = {c.name: c.sig for c in template.checks}
+        consent_by = installer_user_sub
     try:
         return await install_from_extracted_template(
             template=template,
@@ -111,6 +131,10 @@ async def install_from_catalog(
             installer_user_sub=installer_user_sub,
             installer_role=installer_role,
             source_label=template_slug,
+            display_name=display_name,
+            app_consent=app_consent,
+            check_consent=check_consent,
+            consent_by=consent_by,
         )
     finally:
         # extracted dir is a tempdir owned by the catalog fetcher
@@ -130,8 +154,13 @@ async def install_from_extracted_template(
     source_label: str,
     template_ref: str | None = None,
     allow_default_for_new_users: bool = True,
+    display_name: str = "",
+    app_consent: dict[str, str] | None = None,
+    check_consent: dict[str, str] | None = None,
+    consent_by: str = "",
 ) -> dict:
-    """Install a parsed template into an agent.
+    """Install a parsed template into an agent. ``display_name`` is the
+    installer's name for it; empty means the template's.
 
     ``template_ref`` overrides what lands in the agent's
     ``community_template`` column. Catalog installs leave it unset (the
@@ -145,6 +174,13 @@ async def install_from_extracted_template(
     local-template route passes ``False`` for non-admins and reports the
     field as ignored.
 
+    ``app_consent`` / ``check_consent`` are the signatures the installing
+    human saw on the dialog, ``consent_by`` that person (COMMUNITY-AGENTS-
+    REGISTRY.md "Consent"): a matching signature approves the copies that
+    person's authority covers; anything else lands on a card, or as an
+    offered check. The agent-creator route passes none (a bearer never
+    consents).
+
     Returns an install envelope::
 
         {
@@ -155,6 +191,8 @@ async def install_from_extracted_template(
           "seeded_tasks": 3,
           "seeded_triggers": 0,
           "seeded_notifications": 1,
+          "seeded_apps": {"seeded": [...], "user": [...], "pending": [...], "failed": [...]},
+          "seeded_checks": {"consented": [...], "offered": [...], "failed": [...]},
           "copied_context": 5,
           "setup_md_copied": True,
         }
@@ -223,7 +261,7 @@ async def install_from_extracted_template(
     try:
         agent = await asyncio.to_thread(
             agent_store.create_agent,
-            target_slug, template.display_name,
+            target_slug, display_name.strip()[:80] or template.display_name,
             admin_only=False,
             execution_path=execution_path,
             default_model="",
@@ -240,11 +278,16 @@ async def install_from_extracted_template(
         shutil.rmtree(agent_dir, ignore_errors=True)
         raise HTTPException(500, f"Failed to create agent record: {exc}")
 
-    # Persist the parsed template so on_user_added_to_agent can
-    # re-seed per-user items for users attached after the installer.
+    # Persist the parsed template so on_user_added_to_agent can re-seed
+    # per-user items for users attached after the installer, with the
+    # baseline an update compares against and the installer's consent.
+    from services.community import template_app_seeder
+    template_data = template_to_persistable_dict(template, agent_slug=target_slug)
+    stamp_core_mcps(template_data, template)
+    consent_ignored = template_app_seeder.record_consent(
+        template_data, template, app_consent, check_consent, consent_by)
     await asyncio.to_thread(
-        agent_store.set_community_template_data,
-        target_slug, template_to_persistable_dict(template),
+        agent_store.set_community_template_data, target_slug, template_data,
     )
     # Copy the manifest's default_for_new_users.role into the agent's own
     # admin-editable column. Empty when the manifest doesn't declare the
@@ -329,6 +372,10 @@ async def install_from_extracted_template(
     seeded_dashboards = await asyncio.to_thread(
         _seed_dashboards, target_slug, template, installer_user_sub,
     )
+    seeded_apps = await template_app_seeder.seed_for_install(
+        target_slug, template, template_data, installer_user_sub)
+    if template.apps:
+        logger.info("template %s: apps %s", template.slug, seeded_apps)
 
     # 6. Copy context/ + setup.md. Apply variable substitution to setup.md
     # so template authors can use {agent_slug} placeholders (handy for
@@ -340,6 +387,7 @@ async def install_from_extracted_template(
         await asyncio.to_thread(
             seed_user_setup_file, target_slug, installer_user_sub,
         )
+    seeded_checks = await asyncio.to_thread(_seed_checks, target_slug, template, template_data)
 
     # 7. Notifications.
     if batch_id and installer_user_sub:
@@ -369,6 +417,9 @@ async def install_from_extracted_template(
         "seeded_triggers": seeded_triggers,
         "seeded_notifications": seeded_notifs,
         "seeded_dashboards": seeded_dashboards,
+        "seeded_apps": seeded_apps,
+        "seeded_checks": seeded_checks,
+        "consent_ignored": consent_ignored,
         "copied_context": copied_context,
         "setup_md_copied": setup_copied,
         "skill_packages": skill_results,
@@ -505,7 +556,7 @@ async def _cascade_skill_packages(
         try:
             manifest = await asyncio.to_thread(mcp_registry.get_manifest, req.name)
             if manifest is None:
-                if installer_role != "admin":
+                if not roles.is_admin(installer_role):
                     if not installer_user_sub:
                         failed.append({
                             "name": req.name,
@@ -559,12 +610,12 @@ def _propose_free_slug(base: str) -> str:
 
 
 def _create_agent_folder(agent_dir: Path, template: CommunityAgentTemplate) -> None:
-    (agent_dir / "config" / "context").mkdir(parents=True, exist_ok=True)
-    (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
-    (agent_dir / "users").mkdir(parents=True, exist_ok=True)
+    (agent_dir / layout.CONFIG / layout.CONTEXT).mkdir(parents=True, exist_ok=True)
+    (agent_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
+    (agent_dir / layout.USERS).mkdir(parents=True, exist_ok=True)
     # Always write the current persona filename regardless of which name the
     # template tarball carried (legacy catalogs still ship prompt.md).
-    persona_file = agent_dir / "config" / "agent.md"
+    persona_file = agent_dir / layout.CONFIG / "agent.md"
     persona_file.write_text(template.prompt_md, encoding="utf-8")
 
 
@@ -574,13 +625,13 @@ def _copy_template_context(
     """Copy template context/ into agent's config/context/. Returns (count, setup_md_copied).
 
     ``setup.md`` and every file under ``context/`` are run through
-    :func:`_substitute_template_vars` so template authors can use
+    :func:`substitute_template_vars` so template authors can use
     ``{agent_slug}`` placeholders (for deep-links into the agent's own UI
     or for prompts that reference the slug). The substitution set is
     intentionally narrow — `{agent_slug}` only for v1 — to avoid
     accidentally mangling content that uses braces for other reasons.
     """
-    context_target = agent_dir / "config" / "context"
+    context_target = agent_dir / layout.CONFIG / layout.CONTEXT
     context_target.mkdir(parents=True, exist_ok=True)
     count = 0
     for rel, content in template.context_files.items():
@@ -588,12 +639,12 @@ def _copy_template_context(
         rel_stripped = rel.split("/", 1)[1] if rel.startswith("context/") else rel
         dest = context_target / rel_stripped
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(_substitute_template_vars(content, target_slug), encoding="utf-8")
+        dest.write_text(substitute_template_vars(content, target_slug), encoding="utf-8")
         count += 1
     setup_copied = False
     if template.setup_md is not None:
         (context_target / "setup.md").write_text(
-            _substitute_template_vars(template.setup_md, target_slug),
+            substitute_template_vars(template.setup_md, target_slug),
             encoding="utf-8",
         )
         setup_copied = True
@@ -601,23 +652,15 @@ def _copy_template_context(
     # context/, so it never auto-loads agent-wide. Substituted once here;
     # per-user seeds are plain copies of this file.
     if template.user_setup_md is not None:
-        (agent_dir / "config" / _USER_SETUP_FILENAME).write_text(
-            _substitute_template_vars(template.user_setup_md, target_slug),
+        (agent_dir / layout.CONFIG / _USER_SETUP_FILENAME).write_text(
+            substitute_template_vars(template.user_setup_md, target_slug),
             encoding="utf-8",
         )
     return count, setup_copied
 
 
-def _substitute_template_vars(content: str, agent_slug: str) -> str:
-    """Replace ``{agent_slug}`` literals in template content with the actual
-    slug. Intentionally narrow — v1 only supports this one variable so we
-    don't accidentally chew up other braces in markdown/code fences.
-    """
-    return content.replace("{agent_slug}", agent_slug)
-
-
 # ---------------------------------------------------------------------------
-# Dashboard seeding (S5 — template-shipped mini-app dashboards)
+# Dashboard seeding (S5 — template-shipped app dashboards)
 # ---------------------------------------------------------------------------
 
 def _seed_dashboards(
@@ -639,23 +682,23 @@ def _seed_dashboards(
     from storage import database as task_store
 
     agent_dir = app_config.get_agent_dir(agent_slug)
-    src_dir = agent_dir / "config" / "community" / "dashboards"
+    src_dir = agent_dir / layout.CONFIG / "community" / "dashboards"
     src_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for item in template.dashboards:
-        html = _substitute_template_vars(item.html or "", agent_slug)
+        html = substitute_template_vars(item.html or "", agent_slug)
         if not html.strip():
             logger.warning("dashboard %s: empty html — skipped", item.slug)
             continue
         (src_dir / f"{item.slug}.html").write_text(html, encoding="utf-8")
         if item.visibility == "agent":
-            target = agent_dir / "workspace" / "apps" / f"{item.slug}.html"
+            target = agent_dir / layout.WORKSPACE / "apps" / f"{item.slug}.html"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(html, encoding="utf-8")
             task_store.upsert_app(
                 agent_slug, "", None, item.slug,
                 title=item.title,
-                rel_path=f"workspace/apps/{item.slug}.html",
+                rel_path=f"{layout.WORKSPACE}/apps/{item.slug}.html",
                 actions_json="[]",
             )
             count += 1
@@ -664,6 +707,31 @@ def _seed_dashboards(
                 agent_slug, item.slug, item.title, html, installer_user_sub,
             )
     return count
+
+
+def _seed_checks(agent_slug: str, template: CommunityAgentTemplate, data: dict) -> dict:
+    """Template checks into ``config/checks/`` through the checks' own
+    write path (the document, the script, the config commit, the index;
+    CHECKS.md). A check the installer did not consent to lands offered
+    (``mandatory: false``); a manager flips it on the Checks page. No
+    satellite fan-out here: a fresh agent has no machine yet."""
+    from services.checks import documents
+    from services.community import template_app_seeder
+    out: dict = {"consented": [], "offered": [], "failed": []}
+    for item in template.checks:
+        entry = template_app_seeder.consent_entry(data, "checks", item.name)
+        consented = bool(entry and item.sig and entry.get("sig") == item.sig)
+        doc = dict(item.doc)
+        if not consented:
+            doc["mandatory"] = False
+        try:
+            documents.write_check(agent_slug, "", doc, item.script,
+                                  updated_by=f"template:{template.slug}@{template.version}")
+        except documents.CheckError as e:
+            out["failed"].append({"name": item.name, "reason": str(e)})
+            continue
+        (out["consented"] if consented else out["offered"]).append(item.name)
+    return out
 
 
 def _pin_user_dashboard(
@@ -679,13 +747,13 @@ def _pin_user_dashboard(
     if not username:
         return 0
     agent_dir = app_config.get_agent_dir(agent_slug)
-    target = agent_dir / "users" / username / "workspace" / "apps" / f"{slug}.html"
+    target = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "apps" / f"{slug}.html"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(html, encoding="utf-8")
     task_store.upsert_app(
         agent_slug, username, user_sub, slug,
         title=title or slug,
-        rel_path=f"users/{username}/workspace/apps/{slug}.html",
+        rel_path=f"{layout.user_rel(username)}/{layout.WORKSPACE}/apps/{slug}.html",
         actions_json="[]",
     )
     return 1
@@ -722,20 +790,17 @@ def _seed_dashboards_for_user(
 # ---------------------------------------------------------------------------
 
 async def _assign_installer_as_manager(user_sub: str, agent_slug: str) -> None:
-    """Add ``user_sub`` as a manager of ``agent_slug``, preserving existing
-    assignments.
+    """Add ``user_sub`` as a manager of ``agent_slug``: one additive row under
+    the person's row lock, so a concurrent admin change to their other
+    agents is never read and written back. An existing row keeps its role.
     """
     from storage import database as task_store
 
-    current_roles = await asyncio.to_thread(task_store.get_user_agent_roles, user_sub)
-    if agent_slug in current_roles:
-        return
-    current_roles[agent_slug] = "manager"
     await asyncio.to_thread(
-        task_store.set_user_agents,
-        user_sub, list(current_roles.keys()), user_sub,
-        agent_roles=current_roles,
+        task_store.add_user_agent, user_sub, agent_slug, roles.MANAGER, user_sub,
     )
+    from services.notifications.notification_manager import invalidate_audience
+    invalidate_audience(agent_slug)
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +844,7 @@ async def _cascade_required_mcps(
 
         if manifest is None:
             # Not installed — either admin auto-installs or manager queues.
-            if installer_role == "admin":
+            if roles.is_admin(installer_role):
                 # Admin self-installs inline. We model this as creating a
                 # request row + immediately approving it — same orchestration
                 # as the auto-approve branch in api/mcp/community.py.
@@ -794,7 +859,7 @@ async def _cascade_required_mcps(
                     batch_id=batch_id,
                 )
                 created_requests.append(row)
-                if row["status"] == "installed":
+                if row["status"] == mcp_request_store.INSTALLED:
                     ready_mcps.append(mcp_name)
             elif installer_user_sub:
                 row = await asyncio.to_thread(
@@ -830,7 +895,7 @@ async def _cascade_required_mcps(
             continue
 
         # No covering instance → admin attaches to lowest-id, or manager queues.
-        if installer_role == "admin" and instances:
+        if roles.is_admin(installer_role) and instances:
             target = sorted(instances, key=lambda i: i["id"])[0]
             await asyncio.to_thread(
                 mcp_store.add_agent_to_instance, target["id"], target_slug,
@@ -839,7 +904,7 @@ async def _cascade_required_mcps(
             await _seed_skills_for_mcp(target_slug, mcp_name, req.skills)
             ready_mcps.append(mcp_name)
             continue
-        if installer_role == "admin" and installer_user_sub:
+        if roles.is_admin(installer_role) and installer_user_sub:
             # Zero instances. Run the same inline-approve the not-installed
             # branch uses so this terminates in the SAME state as its
             # sibling (install step skipped, needs-instance guidance on the
@@ -858,7 +923,7 @@ async def _cascade_required_mcps(
                 batch_id=batch_id,
             )
             created_requests.append(row)
-            if row["status"] == "installed":
+            if row["status"] == mcp_request_store.INSTALLED:
                 ready_mcps.append(mcp_name)
             continue
         if installer_user_sub:
@@ -986,9 +1051,15 @@ def _create_task_idempotent(
     (idempotent guard catches the unique-index violation)."""
     from storage import database as db
     import psycopg
+    from core.session.session_state import get_user_tz
 
     task_id = f"task-{template_slug}-{item.slug}-{agent_slug}-{created_by or 'agent'}"[:120]
     enabled = item.default_state == "active"
+    # The template author wrote the cron for the company clock: an
+    # agent-scope task stays NULL so it follows the platform timezone (a
+    # literal never follows a later change of that setting); a user-scope
+    # task takes the installer's own zone when their dashboard reported one.
+    user_tz = get_user_tz(created_by) if item.scope == "user" and created_by else None
     schedule = item.cron if item.schedule_kind == "cron" else None
     interval = item.interval_seconds if item.schedule_kind == "interval" else None
     run_at = item.run_at if item.schedule_kind == "run_at" else None
@@ -1009,7 +1080,7 @@ def _create_task_idempotent(
             on_complete_session_id=None, on_complete_chat_id=None,
             continue_session=None, use_persistent=False,
             notification_mode="manual", notify_severity="info",
-            user_tz="UTC",
+            user_tz=user_tz,
             community_template=template_slug,
             community_template_item_slug=item.slug,
         )
@@ -1023,12 +1094,52 @@ def _create_task_idempotent(
                     (task_id,),
                 )
                 conn.commit()
+        schedule_task_row(task_id)
         return True
     except psycopg.errors.UniqueViolation:
         return False
     except Exception:
         logger.exception("Failed to seed task %s for agent %s", item.slug, agent_slug)
         return False
+
+
+def schedule_task_row(task_id: str) -> None:
+    """A seeded or rewritten task row reaches the running scheduler now —
+    the store write alone registers it only at the next start (and a job
+    keeps the task as it was registered: its prompt, its timing). Any
+    thread: the asyncio scheduler takes a job from a worker thread. A
+    paused row is left unregistered, as ``resume`` expects."""
+    if config.SCHEDULER_MODE == "standalone":
+        return
+    try:
+        from services.scheduler import scheduler
+        from storage.automation import db_tasks
+        if not scheduler.get_scheduler().running:
+            return
+        with contextlib.suppress(Exception):          # no job yet
+            scheduler.get_scheduler().remove_job(f"task_{task_id}")
+        row = db_tasks.get_dynamic_task(task_id)
+        if row and row.get("enabled"):
+            scheduler._register_task(scheduler._row_to_task(row))
+    except Exception:
+        logger.exception("task %s: not registered with the scheduler (the next start does it)",
+                         task_id)
+
+
+def schedule_notification_row(notification_id: str) -> None:
+    """The same for a seeded or rewritten scheduled notification."""
+    if config.SCHEDULER_MODE == "standalone":
+        return
+    try:
+        from services.notifications import notification_manager
+        from storage.automation import notification_store
+        notification_manager.unregister_notification(notification_id)
+        row = notification_store.get_notification(notification_id)
+        if row and row.get("enabled"):
+            notification_manager._register_notification(row)
+    except Exception:
+        logger.exception("notification %s: not registered with the scheduler (the next start "
+                         "does it)", notification_id)
 
 
 def _seed_triggers(
@@ -1093,6 +1204,7 @@ def _seed_trigger_with_paired_task(
     from storage import database as db
     from storage.automation import trigger_store
     import psycopg
+    from core.session.session_state import get_user_tz
 
     # Stable IDs derived from template + agent (+ user for user-scope) so
     # re-installs are idempotent.
@@ -1100,6 +1212,9 @@ def _seed_trigger_with_paired_task(
     task_id = f"task-{template_slug}-{item.slug}-{agent_slug}-{suffix}"[:120]
     trig_id = f"trig-{template_slug}-{item.slug}-{suffix}"[:120]
     enabled = item.default_state == "active"
+    # Same zone rule as _create_task_idempotent (display only here: the
+    # scheduler never registers a trigger-type task).
+    user_tz = get_user_tz(created_by) if item.scope == "user" and created_by else None
 
     # Ensure the paired trigger task exists. An existing task (UniqueViolation)
     # is fine — same idempotency contract as task seeder.
@@ -1108,7 +1223,7 @@ def _seed_trigger_with_paired_task(
             db.create_dynamic_task(
                 task_id=task_id, agent=agent_slug,
                 name=f"[trigger] {item.description or item.slug}",
-                prompt=item.prompt, llm_mode="cli", task_type="trigger",
+                prompt=item.prompt, llm_mode="cli", task_type=task_kinds.TRIGGER,
                 schedule=None, run_at=None,
                 delay_seconds=None, interval_seconds=None,
                 timeout_seconds=600, created_by=created_by, scope=item.scope,
@@ -1116,7 +1231,7 @@ def _seed_trigger_with_paired_task(
                 on_complete_session_id=None, on_complete_chat_id=None,
                 continue_session=None, use_persistent=False,
                 notification_mode="manual", notify_severity="info",
-                user_tz="UTC",
+                user_tz=user_tz,
                 community_template=template_slug,
                 community_template_item_slug=f"{item.slug}__task",
             )
@@ -1176,6 +1291,7 @@ def _seed_notifications(
                 community_template=template.slug,
                 community_template_item_slug=item.slug,
             )
+            schedule_notification_row(notif_id)
             count += 1
         except psycopg.errors.UniqueViolation:
             continue
@@ -1230,6 +1346,7 @@ def _seed_notifs_for_user(
                 community_template=template.slug,
                 community_template_item_slug=item.slug,
             )
+            schedule_notification_row(notif_id)
             count += 1
         except Exception:
             logger.exception("Failed to seed user-scope notification %s", item.slug)
@@ -1241,6 +1358,16 @@ def _seed_notifs_for_user(
 # ---------------------------------------------------------------------------
 
 _USER_SETUP_FILENAME = "user-setup.md"
+
+
+def stamp_core_mcps(data: dict, template: CommunityAgentTemplate) -> None:
+    """The record remembers which core MCPs the platform had when it was
+    written (``core_mcps``), so a template update enables only the core
+    MCPs the platform gained since — one a manager disabled stays disabled
+    (COMMUNITY-AGENTS-REGISTRY.md "Updates"). Empty for a template that
+    opted out of the core set."""
+    from services.mcp import mcp_registry
+    data["core_mcps"] = [] if template.core_mcps == "none" else list(mcp_registry.core_mcp_names())
 
 
 def seed_user_setup_file(agent_slug: str, user_sub: str) -> int:
@@ -1262,11 +1389,11 @@ def seed_user_setup_file(agent_slug: str, user_sub: str) -> int:
     if not username:
         return 0
     agent_dir = config.AGENTS_DIR / agent_slug
-    canonical = agent_dir / "config" / _USER_SETUP_FILENAME
+    canonical = agent_dir / layout.CONFIG / _USER_SETUP_FILENAME
     if not canonical.is_file():
         return 0
-    rel = f"users/{username}/context/{_USER_SETUP_FILENAME}"
-    dest = agent_dir / "users" / username / "context" / _USER_SETUP_FILENAME
+    rel = f"{layout.user_rel(username)}/{layout.CONTEXT}/{_USER_SETUP_FILENAME}"
+    dest = layout.context_dir(agent_dir, username) / _USER_SETUP_FILENAME
     if dest.exists():
         return 0
     try:
@@ -1313,7 +1440,7 @@ def on_user_added_to_agent(
     user_setup = seed_user_setup_file(agent_slug, user_sub) if seed_user_setup else 0
 
     empty = {"tasks": 0, "triggers": 0, "notifications": 0,
-             "dashboards": 0, "user_setup": user_setup}
+             "dashboards": 0, "apps": 0, "user_setup": user_setup}
     agent = agent_store.get_agent(agent_slug)
     if not agent or not agent.get("community_template"):
         return empty
@@ -1328,11 +1455,15 @@ def on_user_added_to_agent(
             agent_slug,
         )
         return empty
+    from services.community import template_app_seeder
     return {
         "tasks": _seed_tasks_for_user(agent_slug, template, user_sub, role),
         "triggers": _seed_triggers_for_user(agent_slug, template, user_sub, role),
         "notifications": _seed_notifs_for_user(agent_slug, template, user_sub, role),
         "dashboards": _seed_dashboards_for_user(agent_slug, template, user_sub),
+        # The per-user apps are a loop-side job (this hook runs in a
+        # thread); the count is what was queued.
+        "apps": template_app_seeder.enqueue_for_member(agent_slug, template, user_sub, role),
         "user_setup": user_setup,
     }
 

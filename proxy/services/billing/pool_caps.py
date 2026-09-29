@@ -14,8 +14,9 @@ decides what a hit does at spawn time: ``stop`` acquires nothing,
 ``continue`` drops the OAuth accounts and lets an API key take the spawn.
 
 The same numbers are evaluated for every engine's pool separately (a full
-ChatGPT pool never blocks Claude work), and only the two CLI engines carry
-OAuth accounts. A pool with no OAuth account has nothing to cap: allowed.
+ChatGPT pool never blocks Claude work), and only an engine that takes a
+vendor login (``oauth`` among its declared auth types) carries OAuth
+accounts. A pool with no OAuth account has nothing to cap: allowed.
 
 Every reading is cached for ``_CACHE_TTL_S`` per (scope, target, layer) —
 the chat send path asks on every message — and the cap endpoints
@@ -36,7 +37,6 @@ from storage.billing import subscription_store
 
 logger = logging.getLogger(__name__)
 
-CAP_LAYERS = ("claude-code-cli", "codex-cli")
 CAP_FIELDS = ("week_pct", "day_pct", "week_usd", "day_usd")
 ON_REACHED = ("stop", "continue")
 WARN_RATIO = 0.8
@@ -45,7 +45,19 @@ _CACHE_TTL_S = 30.0
 _DAY = timedelta(hours=24)
 _WEEK = timedelta(days=7)
 
-_ACCOUNT_NAMES = {"claude-code-cli": "Claude", "codex-cli": "ChatGPT"}
+
+def _oauth_layers() -> list[str]:
+    """The engines whose pool can hold an OAuth account — the only pools
+    with something to cap — in registry order. Read from the descriptors
+    per call (registry-pull; the session manager is imported here, never at
+    module level, so this module stays free of the layer packages)."""
+    from core.session.session_manager import get_all_layers
+    return [
+        path for path, layer in get_all_layers().items()
+        if "oauth" in layer.capabilities.auth.auth_types
+    ]
+
+
 _FIELD_LABELS = {
     "week_pct": ("the week", "pct"),
     "day_pct": ("today", "pct"),
@@ -86,7 +98,10 @@ class CapStatus:
 
     @property
     def account_name(self) -> str:
-        return _ACCOUNT_NAMES.get(self.layer, self.layer)
+        """What the engine's subscriptions are called ("Claude", "ChatGPT");
+        the layer id for an engine that is no longer registered."""
+        from core.session.session_manager import account_label_for
+        return account_label_for(self.layer, self.layer)
 
     def _describe(self, key: str) -> str:
         period, unit = _FIELD_LABELS[key]
@@ -132,28 +147,42 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def _week_pct(sub_ids: list[str], now: datetime) -> float | None:
-    """Mean of the accounts' effective weekly-window percentage; None when
+def _quota_key(layer: str) -> str:
+    """The key of the engine's declared quota window ("" when it declares
+    none) — the window the ``week_pct`` / ``day_pct`` caps read. The cap
+    columns are named for the week because both engines' quota windows are
+    weekly; a non-weekly quota would still be read here, under those names."""
+    spec = sw.quota_spec(sw.window_specs(layer))
+    return spec.key if spec else ""
+
+
+def _week_pct(accounts: list[dict], now: datetime) -> float | None:
+    """Mean of the accounts' effective quota-window percentage; None when
     no account has a reading."""
-    readings = sw.latest(sub_ids, now)
-    return _mean([r.seven_day.pct for r in readings.values() if r.seven_day is not None])
+    readings = sw.latest(accounts, now)
+    values = []
+    for r in readings.values():
+        win = r.windows.get(r.quota_key)
+        if win is not None:
+            values.append(win.pct)
+    return _mean(values)
 
 
-def _day_pct_one(sub_id: str, since: str) -> float | None:
-    """What one account consumed of its weekly window in the last day: the
-    positive steps of ``seven_day_pct`` across its samples (a reset is a
-    negative step, ignored, so a window that turned over mid-day counts what
-    was used on both sides of it). None without any sample, 0 with one."""
+def _day_pct_one(sub_id: str, since: str, key: str) -> float | None:
+    """What one account consumed of its quota window in the last day: the
+    positive steps of that window's percentage across its samples (a reset
+    is a negative step, ignored, so a window that turned over mid-day counts
+    what was used on both sides of it). None without any sample, 0 with one."""
     rows = subscription_store.window_samples_since(sub_id, since)
-    pcts = [float(r["seven_day_pct"]) for r in rows if r.get("seven_day_pct") is not None]
+    pcts = [w.pct for row in rows if (w := sw.sample_window(row, key)) is not None]
     if not pcts:
         return None
     return sum(max(b - a, 0.0) for a, b in zip(pcts, pcts[1:]))
 
 
-def _day_pct(sub_ids: list[str], now: datetime) -> float | None:
+def _day_pct(accounts: list[dict], now: datetime, key: str) -> float | None:
     since = (now - _DAY).isoformat()
-    per_account = [_day_pct_one(s, since) for s in sub_ids]
+    per_account = [_day_pct_one(a["id"], since, key) for a in accounts]
     return _mean([v for v in per_account if v is not None])
 
 
@@ -178,7 +207,7 @@ def _evaluate(scope: str, target: str, layer: str, now: datetime) -> CapStatus:
         status.configured = True
         status.caps = {f: cap.get(f) for f in CAP_FIELDS}
         status.on_reached = cap.get("on_reached") if cap.get("on_reached") in ON_REACHED else "stop"
-    if layer not in CAP_LAYERS:
+    if layer not in _oauth_layers():
         return status
     accounts = _pool_accounts(scope, target, layer)
     status.accounts = len(accounts)
@@ -186,8 +215,9 @@ def _evaluate(scope: str, target: str, layer: str, now: datetime) -> CapStatus:
         return status
     ids = [a["id"] for a in accounts]
     if sw.is_enabled():
-        status.readings["week_pct"] = _week_pct(ids, now)
-        status.readings["day_pct"] = _day_pct(ids, now)
+        status.readings["week_pct"] = _week_pct(accounts, now)
+        quota = _quota_key(layer)
+        status.readings["day_pct"] = _day_pct(accounts, now, quota) if quota else None
     status.readings["week_usd"] = _dollars(ids, now - _WEEK, scope, target)
     status.readings["day_usd"] = _dollars(ids, now - _DAY, scope, target)
     if not status.configured:
@@ -233,10 +263,10 @@ def evaluate(scope: str, target: str, layer: str, *, now: datetime | None = None
 
 
 def evaluate_engines(scope: str, target: str) -> dict[str, dict]:
-    """The ``engines`` map of the usage endpoints: every CLI engine whose
-    pool holds an OAuth account, keyed by layer."""
+    """The ``engines`` map of the usage endpoints: every login-taking engine
+    whose pool holds an OAuth account, keyed by layer."""
     out: dict[str, dict] = {}
-    for layer in CAP_LAYERS:
+    for layer in _oauth_layers():
         status = evaluate(scope, target, layer)
         if status.accounts:
             out[layer] = status.to_public()

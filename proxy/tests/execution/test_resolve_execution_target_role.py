@@ -23,6 +23,22 @@ def test_viewer_forced_to_local_when_agent_has_remote_target(temp_db):
         assert reason == "viewer-on-admin-remote"
 
 
+def test_contributor_forced_to_local_like_a_viewer(temp_db):
+    """The workspace tier is below manager: a contributor's chat on an
+    admin-targeted agent runs locally too, and the reason travels with the
+    target so the badge can say so."""
+    from storage.remote_store import resolve_execution_target
+
+    with patch("storage.agents.agent_store.get_agent",
+               return_value={"execution_target": "machine-admin"}), \
+         patch("services.remote.remote_status.is_reachable", return_value=True):
+        target, reason = resolve_execution_target(
+            "test-agent", user_sub="pm-1", role="contributor",
+        )
+        assert target == "local"
+        assert reason == "viewer-on-admin-remote"
+
+
 def test_manager_uses_agent_remote_target_when_online(temp_db):
     """Manager on agent with remote target — no fallback when online."""
     from storage.remote_store import resolve_execution_target

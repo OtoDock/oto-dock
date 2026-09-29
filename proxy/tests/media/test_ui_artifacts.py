@@ -24,13 +24,18 @@ import config
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
+from auth.session_token import create_session_token
 from core.session import session_state
 from storage import database as task_store
+from pathlib import Path
 
 client = TestClient(app)
 
 SID = "sess-ui-1"
 AGENT = "ui-agent"
+# A session token, as the MCP sidecars send: a body past 64 KB with a bearer
+# that does not verify is refused before the route runs.
+_BEARER = {"Authorization": f"Bearer {create_session_token(SID, AGENT, '')}"}
 
 
 def _user(sub: str = "user-viewer", role: str = "member",
@@ -75,9 +80,9 @@ def agent_tree(tmp_path, monkeypatch):
 
 def _post_ui(payload: dict) -> object:
     payload.setdefault("session_id", SID)
-    with patch("api.hooks.artifacts.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match_async"):
         return client.post("/v1/hooks/ui", json=payload,
-                           headers={"Authorization": "Bearer dummy"})
+                           headers=_BEARER)
 
 
 def _queue_items() -> list[dict]:
@@ -244,7 +249,7 @@ def _assert_sandbox_headers(resp):
 
 
 def test_serve_ui_fragment_wrapped_with_concrete_origin_csp(agent_tree, tmp_path):
-    f = tmp_path / "frag.html"
+    f = agent_tree / "workspace" / "frag.html"
     f.write_text("<div class='card'>chart here</div>")
     token = _mint_ui_token(str(f))
     resp = client.get(f"/v1/ui/{token}?theme=dark")
@@ -268,7 +273,7 @@ def test_csp_origin_prefers_public_url_on_matching_host(agent_tree, tmp_path, mo
     subresource and artifacts render UNSTYLED (live trusted-VM find,
     2026-07-10). When Host matches DASHBOARD_PUBLIC_URL, its origin wins
     verbatim; any other host keeps the request-derived origin."""
-    f = tmp_path / "frag.html"
+    f = agent_tree / "workspace" / "frag.html"
     f.write_text("<p>x</p>")
     token = _mint_ui_token(str(f))
 
@@ -290,7 +295,7 @@ def test_csp_origin_prefers_public_url_on_matching_host(agent_tree, tmp_path, mo
 
 def test_serve_ui_full_document_gets_runtime_injected(agent_tree, tmp_path):
     doc = "<!DOCTYPE html><html><head></head><body>standalone</body></html>"
-    f = tmp_path / "full.html"
+    f = agent_tree / "workspace" / "full.html"
     f.write_text(doc)
     token = _mint_ui_token(str(f))
     resp = client.get(f"/v1/ui/{token}")
@@ -320,7 +325,7 @@ def test_inject_runtime_placement():
 def test_serve_ui_runtime_carries_open_url_bridge(agent_tree, tmp_path):
     # The click bridge gates on the AUTHORED href attribute (a.href is
     # DOM-absolutized) and posts open_url up; the host answers open_url_ack.
-    f = tmp_path / "frag.html"
+    f = agent_tree / "workspace" / "frag.html"
     f.write_text("<a href='https://example.com'>x</a>")
     token = _mint_ui_token(str(f))
     body = client.get(f"/v1/ui/{token}").text
@@ -342,7 +347,7 @@ def test_serve_ui_unknown_token_is_sandboxed_404(agent_tree):
 
 
 def test_serve_ui_missing_file_is_styled_escaped_404(agent_tree, tmp_path):
-    gone = tmp_path / "<img src=x onerror=alert(1)>.html"
+    gone = agent_tree / "workspace" / "<img src=x onerror=alert(1)>.html"
     token = _mint_ui_token(str(gone))
     resp = client.get(f"/v1/ui/{token}")
     assert resp.status_code == 404
@@ -353,7 +358,7 @@ def test_serve_ui_missing_file_is_styled_escaped_404(agent_tree, tmp_path):
 
 def test_serve_ui_rejects_non_ui_tokens(agent_tree, tmp_path):
     import secrets as _secrets
-    f = tmp_path / "clip.mp4"
+    f = agent_tree / "workspace" / "clip.mp4"
     f.write_bytes(b"fake-mp4")
     token = _secrets.token_urlsafe(32)
     task_store.create_media_token(
@@ -381,7 +386,7 @@ def test_full_document_detector():
 
 
 def test_serve_media_rejects_ui_tokens(agent_tree, tmp_path):
-    f = tmp_path / "artifact.html"
+    f = agent_tree / "workspace" / "artifact.html"
     f.write_text("<script>alert(1)</script>")
     token = _mint_ui_token(str(f))
     resp = client.get(f"/v1/media/{token}")
@@ -399,23 +404,23 @@ def _mint_media_token(abs_path: str, mime: str, media_kind: str = "") -> str:
     return token
 
 
-def test_serve_media_inline_allowlist(tmp_path):
+def test_serve_media_inline_allowlist(agent_tree):
     # text/html (any non-ui kind) → attachment, never inline same-origin.
-    page = tmp_path / "page.html"
+    page = agent_tree / "workspace" / "page.html"
     page.write_text("<script>alert(1)</script>")
     resp = client.get(f"/v1/media/{_mint_media_token(str(page), 'text/html')}")
     assert resp.status_code == 200
     assert resp.headers["content-disposition"].startswith("attachment")
 
     # SVG keeps its forced-download behavior under the allowlist.
-    svg = tmp_path / "img.svg"
+    svg = agent_tree / "workspace" / "img.svg"
     svg.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
     resp = client.get(f"/v1/media/{_mint_media_token(str(svg), 'image/svg+xml')}")
     assert resp.status_code == 200
     assert resp.headers["content-disposition"].startswith("attachment")
 
     # Known-inert types still serve inline (no disposition header).
-    mp4 = tmp_path / "clip.mp4"
+    mp4 = agent_tree / "workspace" / "clip.mp4"
     mp4.write_bytes(b"fake-mp4")
     resp = client.get(f"/v1/media/{_mint_media_token(str(mp4), 'video/mp4', 'video')}")
     assert resp.status_code == 200
@@ -426,10 +431,10 @@ def test_serve_media_inline_allowlist(tmp_path):
 
 
 def test_serve_routes_require_auth(agent_tree, tmp_path):
-    f = tmp_path / "frag.html"
+    f = agent_tree / "workspace" / "frag.html"
     f.write_text("<p>x</p>")
     ui_token = _mint_ui_token(str(f))
-    mp4 = tmp_path / "clip.mp4"
+    mp4 = agent_tree / "workspace" / "clip.mp4"
     mp4.write_bytes(b"fake-mp4")
     media_token = _mint_media_token(str(mp4), "video/mp4", "video")
 
@@ -469,7 +474,7 @@ def _mint_chat_bound_ui_token(abs_path: str, chat_id: str) -> str:
 
 def test_chat_bound_token_uses_chat_access_rule(agent_tree, tmp_path):
     task_store.create_chat("chat-ui-acl", "user-viewer", AGENT)
-    f = tmp_path / "c.html"
+    f = agent_tree / "workspace" / "c.html"
     f.write_text("<p>c</p>")
     token = _mint_chat_bound_ui_token(str(f), "chat-ui-acl")
 
@@ -483,7 +488,7 @@ def test_chat_bound_token_uses_chat_access_rule(agent_tree, tmp_path):
 def test_shared_only_chat_token_serves_any_assigned_user(agent_tree, tmp_path):
     from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
     task_store.create_chat("chat-ui-shared", f"{SHARED_CHAT_OWNER_PREFIX}{AGENT}", AGENT)
-    f = tmp_path / "s.html"
+    f = agent_tree / "workspace" / "s.html"
     f.write_text("<p>s</p>")
     token = _mint_chat_bound_ui_token(str(f), "chat-ui-shared")
 
@@ -496,7 +501,7 @@ def test_shared_only_chat_token_serves_any_assigned_user(agent_tree, tmp_path):
 def test_pre_stamp_rows_fall_back_to_any_authed_user(agent_tree, tmp_path):
     # _mint_ui_token writes neither chat_id nor agent — the shape of rows
     # minted before the access columns existed (restore-friendly, no backfill).
-    f = tmp_path / "legacy.html"
+    f = agent_tree / "workspace" / "legacy.html"
     f.write_text("<p>old</p>")
     token = _mint_ui_token(str(f))
     _as(_user(sub="user-viewer2", agents=()))
@@ -516,10 +521,10 @@ def test_hook_file_mints_durable_media_token(agent_tree):
     try:
         report = agent_tree / "users" / "alice" / "workspace" / "report.txt"
         report.write_text("hello")
-        with patch("api.hooks.artifacts.verify_session_match"):
+        with patch("api.hooks.artifacts.verify_session_match_async"):
             r = client.post("/v1/hooks/file", json={
                 "session_id": SID, "path": str(report), "description": "d",
-            }, headers={"Authorization": "Bearer dummy"})
+            }, headers=_BEARER)
         assert r.status_code == 200
         url = r.json()["download_url"]
         assert url.startswith("/v1/media/")
@@ -543,7 +548,7 @@ def test_hook_file_mints_durable_media_token(agent_tree):
 
 def test_file_token_dies_with_its_chat(agent_tree, tmp_path):
     task_store.create_chat("chat-file-life", "user-viewer", AGENT)
-    doc = tmp_path / "r.txt"
+    doc = agent_tree / "workspace" / "r.txt"
     doc.write_text("x")
     import secrets as _secrets
     token = _secrets.token_urlsafe(32)
@@ -598,7 +603,8 @@ def test_pump_artifact_queue_cap_and_abort_clear():
         for i in range(QUEUE_CAP):
             assert p.queue_artifact({"token": f"t{i}"}) is True
         assert p.queue_artifact({"token": "overflow"}) is False
-        p.queue_message("user words")
+        from core.events.common_events import TurnInput
+        p.queue_message(TurnInput("user words"))
         p.cancel_all_queued()
         assert p.artifact_queue == [] and p.message_queue == []
         producer.cancel()
@@ -607,7 +613,7 @@ def test_pump_artifact_queue_cap_and_abort_clear():
 
 
 def test_serve_ui_runtime_carries_action_ack_bridge(agent_tree, tmp_path):
-    f = tmp_path / "frag.html"
+    f = agent_tree / "workspace" / "frag.html"
     f.write_text("<p>x</p>")
     token = _mint_ui_token(str(f))
     body = client.get(f"/v1/ui/{token}").text
@@ -659,3 +665,144 @@ async def test_pump_persists_ui_block_and_roundtrips_fields(temp_db):
                           "path": "workspace/generated-ui/t.html"}
     finally:
         pump.producer.cancel()
+
+
+# ───────────── serve from the checked descriptor (safe_fs) ─────────────
+
+
+def _outside_secret(tmp_path) -> Path:
+    secret = Path(tmp_path) / "config.env"
+    secret.write_text("JWT_SECRET=proxy-host-secret\n")
+    return secret
+
+
+def test_serve_media_refuses_swapped_symlink(agent_tree, tmp_path):
+    # A real web-safe file is minted, then swapped for a link after the mint:
+    # out of the agents tree first, then to another user's file in the tree.
+    clip = agent_tree / "users" / "alice" / "workspace" / "a.mp3"
+    clip.write_bytes(b"ID3real-mp3")
+    token = _mint_media_token(str(clip), "audio/mpeg", "audio")
+    assert client.get(f"/v1/media/{token}").content == b"ID3real-mp3"
+
+    secret = _outside_secret(tmp_path)
+    clip.unlink()
+    clip.symlink_to(secret)
+    resp = client.get(f"/v1/media/{token}")
+    assert resp.status_code == 404
+    assert b"JWT_SECRET" not in resp.content
+
+    bob = agent_tree / "users" / "bob" / "workspace"
+    bob.mkdir(parents=True)
+    (bob / "private.mp3").write_bytes(b"BOB PRIVATE")
+    clip.unlink()
+    clip.symlink_to(bob / "private.mp3")
+    resp = client.get(f"/v1/media/{token}")
+    assert resp.status_code == 404
+    assert b"BOB PRIVATE" not in resp.content
+    # The download form takes the same path.
+    resp = client.get(f"/v1/media/{token}?download=1&fn=a.mp3")
+    assert resp.status_code == 404
+
+
+def test_serve_media_binds_agent_segment(agent_tree, tmp_path):
+    # A row stamped for one agent never serves a path under another agent's
+    # tree, however it got there.
+    other = config.AGENTS_DIR / "other-agent" / "workspace"
+    other.mkdir(parents=True)
+    (other / "clip.mp3").write_bytes(b"OTHER")
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
+    task_store.create_media_token(
+        token, str(other / "clip.mp3"), mime="audio/mpeg", media_kind="audio",
+        chat_id=None, session_id=SID, agent=AGENT, expires_at="",
+    )
+    resp = client.get(f"/v1/media/{token}")
+    assert resp.status_code == 404
+    assert resp.content != b"OTHER"
+
+
+def test_serve_media_admits_the_caches(agent_tree, tmp_path, monkeypatch):
+    # Transcodes live in the media cache and re-pulls in the host media
+    # cache; both are proxy-owned roots and keep serving.
+    from services.media import media_pipeline
+    media_cache = tmp_path / "media-cache"
+    host_cache = tmp_path / "host-media-cache"
+    media_cache.mkdir()
+    host_cache.mkdir()
+    monkeypatch.setattr(media_pipeline, "_CACHE_DIR", media_cache)
+    monkeypatch.setattr(media_pipeline, "_HOST_CACHE_DIR", host_cache)
+    (media_cache / "abc.mp4").write_bytes(b"TRANSCODE")
+    (host_cache / "repull-x.mp4").write_bytes(b"REPULL")
+    t1 = _mint_media_token(str(media_cache / "abc.mp4"), "video/mp4", "video")
+    t2 = _mint_media_token(str(host_cache / "repull-x.mp4"), "video/mp4", "video")
+    assert client.get(f"/v1/media/{t1}").content == b"TRANSCODE"
+    assert client.get(f"/v1/media/{t2}").content == b"REPULL"
+    # A path under none of the roots is refused.
+    stray = tmp_path / "stray.mp4"
+    stray.write_bytes(b"STRAY")
+    t3 = _mint_media_token(str(stray), "video/mp4", "video")
+    assert client.get(f"/v1/media/{t3}").status_code == 404
+
+
+def test_fd_response_serves_the_checked_inode_with_ranges(agent_tree, tmp_path):
+    # The response streams the inode the check saw: a swap of the name after
+    # the open changes nothing, and Range / HEAD keep working on it.
+    import os
+    from api.media.media import FdFileResponse
+    from services.infra import safe_fs
+    clip = agent_tree / "workspace" / "clip.mp3"
+    clip.write_bytes(bytes(range(256)) * 4)
+    fd, st = safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{AGENT}/workspace/clip.mp3")
+    clip.unlink()
+    clip.symlink_to(_outside_secret(tmp_path))
+
+    async def _run(headers: dict, method: str = "GET"):
+        import httpx
+        resp = FdFileResponse(fd, st, media_type="audio/mpeg")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=resp),
+                                     base_url="http://t") as c:
+            return await c.request(method, "/", headers=headers)
+
+    r = asyncio.run(_run({"range": "bytes=256-259"}))
+    assert r.status_code == 206 and r.content == bytes([0, 1, 2, 3])
+    assert r.headers["content-range"] == "bytes 256-259/1024"
+    # The descriptor is closed once the response has been sent.
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    # HEAD on a descriptor whose name was removed after the open.
+    real = agent_tree / "workspace" / "real.mp3"
+    real.write_bytes(bytes(range(256)) * 4)
+    fd, st = safe_fs.open_regular_for_read(config.AGENTS_DIR, f"{AGENT}/workspace/real.mp3")
+    real.unlink()
+    r = asyncio.run(_run({}, "HEAD"))
+    assert r.status_code == 200 and r.headers["content-length"] == "1024" and r.content == b""
+
+
+def test_serve_media_never_leaks_a_descriptor(agent_tree, monkeypatch):
+    import os
+    from services.media import media_pipeline
+    clip = agent_tree / "workspace" / "clip.mp3"
+    clip.write_bytes(b"ID3x")
+    token = _mint_media_token(str(clip), "", "audio")  # mime guessed after the open
+
+    def _boom(path):
+        raise RuntimeError("mime guess failed")
+
+    monkeypatch.setattr(media_pipeline, "guess_media_mime", _boom)
+    before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(RuntimeError):
+        client.get(f"/v1/media/{token}")
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_serve_ui_refuses_swapped_symlink(agent_tree, tmp_path):
+    f = agent_tree / "workspace" / "art.html"
+    f.write_text("<p>real</p>")
+    token = _mint_ui_token(str(f))
+    assert "real" in client.get(f"/v1/ui/{token}").text
+    f.unlink()
+    f.symlink_to(_outside_secret(tmp_path))
+    resp = client.get(f"/v1/ui/{token}")
+    assert resp.status_code == 404
+    assert "JWT_SECRET" not in resp.text
+    _assert_sandbox_headers(resp)

@@ -19,14 +19,120 @@ Access) the platform sits behind. Same requirement as
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 
 from fastapi import APIRouter, Request, Response
+from starlette.requests import ClientDisconnect
 
+import config
+from auth import rate_limiter
+from auth.lan_check import client_address
 from services.webhooks import webhook_dispatcher
 
 logger = logging.getLogger("claude-proxy.api.webhooks")
 router = APIRouter()
+
+# The unauthenticated body read: capped at MAX_WEBHOOK_BODY_BYTES (the
+# HTTP middleware's body cap is the outer bound), a gap limit
+# between two chunks and a limit for the whole body, and a bound on bodies
+# read at once, per client address and in all.
+_CHUNK_GAP_S = 10.0
+_BODY_S = 30.0
+_READS_PER_CLIENT = 4
+_READS_TOTAL = 256
+_reads = {"total": 0}
+_reads_by_client: dict[str, int] = {}
+# The refusals counted against the client address in ``webhook_receive_ip``:
+# the ones a request earns before any subscription is found. A 404 or 410 (a
+# deleted or disabled subscription a vendor keeps posting to) never counts,
+# nor does a delivered event: the relay forwards every vendor from one address.
+_COUNTED_REFUSALS = frozenset({400, 401, 408, 413})
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+def _refusal(status: int, error: str, *, retry_after: int | None = None) -> Response:
+    headers = {"Connection": "close"}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return Response(content=json.dumps({"error": error}).encode(), status_code=status,
+                    media_type="application/json", headers=headers)
+
+
+async def _read_body(request: Request) -> bytes:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _BODY_S
+    cap = config.MAX_WEBHOOK_BODY_BYTES
+    chunks: list[bytes] = []
+    total = 0
+    stream = request.stream().__aiter__()
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        try:
+            chunk = await asyncio.wait_for(stream.__anext__(), timeout=min(_CHUNK_GAP_S, remaining))
+        except StopAsyncIteration:
+            break
+        total += len(chunk)
+        if cap and total > cap:
+            raise _BodyTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _release_read(key: str) -> None:
+    _reads["total"] -= 1
+    left = _reads_by_client.get(key, 1) - 1
+    if left > 0:
+        _reads_by_client[key] = left
+    else:
+        _reads_by_client.pop(key, None)
+
+
+async def _receive(request: Request, dispatch) -> Response:
+    """The receive steps every vendor and relay POST takes before the
+    dispatcher: the per-address throttle (a distinct client only: behind an
+    edge whose address every client shares, one bucket would let one sender
+    block every vendor), the read bounds, the capped read; the dispatcher's
+    answer passes through unchanged. The read bounds count bodies being
+    read: the slot is given back when the read ends, before the dispatch,
+    which the dispatcher's own pre-auth gate bounds."""
+    addr = client_address(request)
+    key = f"ip:{addr.client}"
+    if not addr.shared:
+        ok, retry_after = rate_limiter.check_rate_limit("webhook_receive_ip", key)
+        if not ok:
+            return _refusal(429, "too_many_requests", retry_after=retry_after)
+    if (_reads["total"] >= _READS_TOTAL
+            or (not addr.shared and _reads_by_client.get(key, 0) >= _READS_PER_CLIENT)):
+        return _refusal(503, "busy", retry_after=5)
+    _reads["total"] += 1
+    _reads_by_client[key] = _reads_by_client.get(key, 0) + 1
+    try:
+        raw_body = await _read_body(request)
+    except (_BodyTooLarge, ClientDisconnect):
+        status, response = 413, _refusal(413, "body_too_large")
+    except TimeoutError:
+        status, response = 408, _refusal(408, "body_timeout")
+    else:
+        status = 0
+    finally:
+        _release_read(key)
+    if not status:
+        status, body, headers = await dispatch(raw_body)
+        response = Response(
+            content=body if isinstance(body, bytes) else (
+                json.dumps(body) if isinstance(body, (dict, list)) else str(body)).encode("utf-8"),
+            status_code=status, headers=headers or {},
+        )
+    if status in _COUNTED_REFUSALS and not addr.shared:
+        rate_limiter.record_attempt("webhook_receive_ip", key)
+    return response
 
 
 @router.post(
@@ -43,30 +149,23 @@ async def receive_relay_webhook(provider_id: str, request: Request) -> Response:
     forward signature over the verbatim body (X-OtoDock-Event-* headers);
     same reverse-proxy forward-auth bypass requirement as the vendor route.
     """
-    raw_body = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()}
-    try:
-        status, body, response_headers = await webhook_dispatcher.dispatch_relay_webhook(
-            provider_id=provider_id,
-            raw_body=raw_body,
-            headers=headers,
-        )
-    except Exception:
-        logger.exception(
-            "relay webhook dispatcher raised unexpectedly for provider=%s",
-            provider_id,
-        )
-        return Response(
-            content=b'{"error":"internal_error"}',
-            status_code=500,
-            media_type="application/json",
-        )
-    import json
-    return Response(
-        content=json.dumps(body).encode("utf-8"),
-        status_code=status,
-        headers=response_headers or {},
-    )
+
+    async def dispatch(raw_body: bytes):
+        try:
+            return await webhook_dispatcher.dispatch_relay_webhook(
+                provider_id=provider_id,
+                raw_body=raw_body,
+                headers=headers,
+            )
+        except Exception:
+            logger.exception(
+                "relay webhook dispatcher raised unexpectedly for provider=%s",
+                provider_id,
+            )
+            return 500, {"error": "internal_error"}, {"content-type": "application/json"}
+
+    return await _receive(request, dispatch)
 
 
 @router.api_route(
@@ -89,37 +188,25 @@ async def receive_webhook(
       * 404 when subscription_id is unknown
       * 410 when subscription is disabled / failed
     """
-    raw_body = await request.body()
     # Lowercase + simple-string headers for the dispatcher.
     headers = {k.lower(): v for k, v in request.headers.items()}
     query_params = dict(request.query_params)
-    try:
-        status, body, response_headers = await webhook_dispatcher.dispatch_webhook(
-            provider_id=provider_id,
-            subscription_id=subscription_id,
-            raw_body=raw_body,
-            headers=headers,
-            query_params=query_params,
-            http_method=request.method,
-        )
-    except Exception:
-        logger.exception(
-            "webhook dispatcher raised unexpectedly for provider=%s sub=%s",
-            provider_id, subscription_id,
-        )
-        return Response(
-            content=b'{"error":"internal_error"}',
-            status_code=500,
-            media_type="application/json",
-        )
 
-    if isinstance(body, (dict, list)):
-        import json
-        body_bytes = json.dumps(body).encode("utf-8")
-    else:
-        body_bytes = str(body).encode("utf-8")
-    return Response(
-        content=body_bytes,
-        status_code=status,
-        headers=response_headers or {},
-    )
+    async def dispatch(raw_body: bytes):
+        try:
+            return await webhook_dispatcher.dispatch_webhook(
+                provider_id=provider_id,
+                subscription_id=subscription_id,
+                raw_body=raw_body,
+                headers=headers,
+                query_params=query_params,
+                http_method=request.method,
+            )
+        except Exception:
+            logger.exception(
+                "webhook dispatcher raised unexpectedly for provider=%s sub=%s",
+                provider_id, subscription_id,
+            )
+            return 500, {"error": "internal_error"}, {"content-type": "application/json"}
+
+    return await _receive(request, dispatch)

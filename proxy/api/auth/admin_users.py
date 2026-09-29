@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 import config
 from auth.license import check_seat_limit
-from auth.password import check_password_strength, generate_temp_password, hash_password
+from auth.password import HashBusy, check_password_strength_async, generate_temp_password, hash_password_async
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from storage.agents import agent_store
 from storage.identity import credential_store
@@ -21,8 +21,19 @@ from storage import database as task_store
 
 from api.auth._common import _build_user_response
 from api.auth._router import router
+from auth import roles as _roles
+from services.agents import offboarding, offboarding_sessions
 
 logger = logging.getLogger("claude-proxy")
+
+
+async def _hash_or_503(plain: str) -> str:
+    """The password hash, off the event loop (``auth.password``)."""
+    try:
+        return await hash_password_async(plain)
+    except HashBusy:
+        raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
+                            headers={"Retry-After": "5"})
 
 # Invite links are signed JWTs (purpose="invite"), same pattern as the
 # password-reset flow. Single-use is enforced structurally: accept-invite only
@@ -45,7 +56,7 @@ def mint_invite_url(sub: str) -> str:
 
 class UpdateAgentsRequest(BaseModel):
     agents: list[str]
-    agent_roles: dict[str, str] | None = None  # {agent: "manager"|"editor"|"viewer"}
+    agent_roles: dict[str, str] | None = None  # {agent: a member of _roles.AGENT_ROLES}
 
 
 class UpdateRoleRequest(BaseModel):
@@ -103,7 +114,7 @@ async def admin_set_user_agents(
         raise HTTPException(status_code=404, detail="User not found")
 
     # Security: high-clearance agents only assignable to admins
-    if target["role"] != "admin":
+    if not _roles.is_admin(target["role"]):
         blocked = [a for a in req.agents if agent_store.is_admin_only(a)]
         if blocked:
             raise HTTPException(
@@ -124,7 +135,7 @@ async def admin_set_user_agents(
     roles = req.agent_roles or {}
     # Validate role values (editor added alongside manager/viewer).
     for a, r in roles.items():
-        if r not in ("manager", "editor", "viewer"):
+        if r not in _roles.AGENT_ROLES:
             raise HTTPException(status_code=400, detail=f"Invalid agent_role '{r}' for {a}")
 
     # Detect newly-added attachments BEFORE the DELETE+INSERT
@@ -134,9 +145,29 @@ async def admin_set_user_agents(
     # implementation, but conceptually unchanged from the admin's view).
     existing_agents = set(await asyncio.to_thread(task_store.get_user_agents, sub))
     added_agents = set(req.agents) - existing_agents
+    removed_agents = existing_agents - set(req.agents)
 
-    task_store.set_user_agents(sub, req.agents, u.sub, agent_roles=roles)
+    change = await asyncio.to_thread(
+        task_store.set_user_agents, sub, req.agents, u.sub, agent_roles=roles)
     logger.info(f"Admin {mask_email(u.email)} set agents for {sub}: {req.agents} roles={roles}")
+    from services.notifications.notification_manager import invalidate_audience
+    for added in added_agents:
+        invalidate_audience(added)
+    await offboarding.dispatch_losses(
+        sub, offboarding.losses(change.platform_role, change.before,
+                                change.platform_role, change.after),
+        u.sub, person=target, platform_before=change.platform_role,
+        platform_after=change.platform_role,
+    )
+
+    # The member's template-seeded apps stop and hide with the membership
+    # (COMMUNITY-AGENTS-REGISTRY.md); a re-attach brings them back.
+    for agent_slug in removed_agents:
+        try:
+            from services.community import template_app_seeder
+            await template_app_seeder.on_user_removed(agent_slug, sub)
+        except Exception:
+            logger.exception("template apps of (%s, %s) not parked on removal", agent_slug, sub)
 
     if added_agents:
         from services.community import community_agent_installer
@@ -180,9 +211,9 @@ async def admin_add_user_agent(
         raise HTTPException(status_code=404, detail="User not found")
     if not agent_store.agent_exists(agent):
         raise HTTPException(status_code=404, detail="Agent not found")
-    if req.role not in ("manager", "editor", "viewer"):
+    if req.role not in _roles.AGENT_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid agent_role '{req.role}'")
-    if target["role"] != "admin" and agent_store.is_admin_only(agent):
+    if not _roles.is_admin(target["role"]) and agent_store.is_admin_only(agent):
         raise HTTPException(
             status_code=403, detail=f"Agent '{agent}' requires admin role"
         )
@@ -194,6 +225,8 @@ async def admin_add_user_agent(
         logger.info(
             f"Admin {mask_email(u.email)} added agent {agent} ({req.role}) to {sub}"
         )
+        from services.notifications.notification_manager import invalidate_audience
+        invalidate_audience(agent)
         from services.community import community_agent_installer
         try:
             await asyncio.to_thread(
@@ -217,7 +250,7 @@ async def admin_update_role(
     u = require_admin(user)
     if sub == u.sub:
         raise HTTPException(status_code=400, detail="Cannot change your own role")
-    if req.role not in config.ROLE_PRIORITY:
+    if req.role not in _roles.PLATFORM_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role: {req.role}")
     target = task_store.get_user(sub)
     if not target:
@@ -228,35 +261,76 @@ async def admin_update_role(
         raise HTTPException(status_code=403, detail="Cannot change the owner account's role")
 
     # Last admin protection
-    if target["role"] == "admin" and req.role != "admin":
+    if _roles.is_admin(target["role"]) and not _roles.is_admin(req.role):
         admin_count = await asyncio.to_thread(task_store.count_admins)
         if admin_count <= 1:
             raise HTTPException(status_code=400, detail="Cannot demote the last admin")
 
-    task_store.update_user_role(sub, req.role)
+    rows_before = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
+    await asyncio.to_thread(task_store.update_user_role, sub, req.role)
+    await apply_platform_role_change(sub, target, req.role, rows_before, u.sub)
+    logger.info(f"Admin {mask_email(u.email)} changed role for {sub} to {req.role}")
+    return {"status": "updated", "role": req.role}
+
+
+async def apply_platform_role_change(sub: str, person: dict, new_role: str,
+                                     rows_before: dict, actor_sub: str) -> None:
+    """What a platform role change means once the users row carries it, for
+    the admin route and a login whose identity provider changed the role
+    (``actor_sub=""``: no person made the change, the subscribers fall back to
+    the owner). Every admin stands in every agent's audience; below admin the
+    admin-only agent rows go (the roles of the rows that stay are kept) and
+    the person's subscriptions leave the shared platform pool; then the losses
+    are dispatched to the offboarding subscribers."""
+    before = person.get("role")
+    if _roles.is_admin(new_role) != _roles.is_admin(before):
+        from services.notifications.notification_manager import invalidate_audience
+        invalidate_audience()
 
     # If downgrading from admin, remove high-clearance agent assignments and pull
     # the user's subscriptions out of the shared platform pool (a non-admin may not
     # contribute). The resolver's owner-is-admin JOIN already excludes them in real
     # time; this is the durable cleanup so the pool view and any later re-promotion
     # stay correct.
-    if req.role != "admin":
-        current_agents = task_store.get_user_agents(sub)
-        safe_agents = [a for a in current_agents if not agent_store.is_admin_only(a)]
+    if not _roles.is_admin(new_role):
+        def _drop_admin_only() -> tuple[list[str], list[str]]:
+            current = task_store.get_user_agents(sub)
+            safe = [a for a in current if not agent_store.is_admin_only(a)]
+            if len(safe) != len(current):
+                # Keep the roles on the agents that stay (without them every
+                # row fell back to viewer).
+                task_store.set_user_agents(
+                    sub, safe, actor_sub,
+                    agent_roles={a: rows_before[a] for a in safe if a in rows_before})
+            return current, safe
+
+        current_agents, safe_agents = await asyncio.to_thread(_drop_admin_only)
         if len(safe_agents) != len(current_agents):
-            task_store.set_user_agents(sub, safe_agents, u.sub)
-            logger.info(f"Removed high-clearance agents from {sub} after role change to {req.role}")
+            logger.info(f"Removed high-clearance agents from {sub} after role change to {new_role}")
+            from services.community import template_app_seeder
+            for agent_slug in set(current_agents) - set(safe_agents):
+                try:
+                    await template_app_seeder.on_user_removed(agent_slug, sub)
+                except Exception:
+                    logger.exception("template apps of (%s, %s) not parked on demotion", agent_slug, sub)
         from storage.billing import subscription_store
-        cleared = subscription_store.clear_contribute_platform_for_owner(sub)
+        cleared = await asyncio.to_thread(subscription_store.clear_contribute_platform_for_owner, sub)
         if cleared:
             logger.info(f"Cleared platform-pool contribution on {cleared} sub(s) for demoted user {sub}")
             # Agent-scope sessions running on the demoted admin's pool subs are
-            # now delisted — re-home them onto the remaining pool.
+            # now delisted: re-home them onto the remaining pool (scheduled
+            # from the loop: the rebind is a loop task).
             from services.engines import subscription_pool
             subscription_pool.schedule_rebind("admin demotion")
 
-    logger.info(f"Admin {mask_email(u.email)} changed role for {sub} to {req.role}")
-    return {"status": "updated", "role": req.role}
+    def _after() -> tuple[dict, list[str]]:
+        return task_store.get_user_agent_roles(sub), agent_store.get_agent_slugs()
+
+    rows_after, all_agents = await asyncio.to_thread(_after)
+    await offboarding.dispatch_losses(
+        sub, offboarding.losses(before, rows_before, new_role, rows_after, all_agents),
+        actor_sub, person=person, platform_before=before, platform_after=new_role,
+    )
 
 
 @router.delete("/v1/admin/users/{sub}")
@@ -273,10 +347,19 @@ async def admin_delete_user(
     if target and target.get("is_owner"):
         raise HTTPException(status_code=403, detail="Cannot delete the owner account")
     # Last admin protection
-    if target and target["role"] == "admin":
+    if target and _roles.is_admin(target["role"]):
         admin_count = await asyncio.to_thread(task_store.count_admins)
         if admin_count <= 1:
             raise HTTPException(status_code=400, detail="Cannot delete the last admin")
+    # The user's personal app servers stop BEFORE the rows cascade away
+    # (APPS.md "Lifecycle"), and their release copies and databases go
+    # with the rows.
+    try:
+        from services.apps import app_lifecycle
+        await app_lifecycle.stop_user_apps(sub)
+        await app_lifecycle.remove_user_app_dirs(sub)
+    except Exception:
+        logger.exception("App servers of user %s did not stop cleanly (continuing)", sub)
     # Best-effort vendor DELETE for all webhook subscriptions
     # this user owns. Must happen BEFORE task_store.delete_user (which
     # cascades to triggers/credentials and revokes the OAuth tokens we
@@ -289,10 +372,22 @@ async def admin_delete_user(
             "Subscription cleanup raised for user %s (continuing with user delete)",
             sub,
         )
-    # Drop any `service_agent_bindings` that pointed at this user's accounts.
-    # Affected agents revert to their MCP's platform default at next resolve.
-    # No tokens to clean up here — the user's own `user_credentials` rows +
-    # token files are removed by the FK cascade on `task_store.delete_user`.
+    # The bindings lending this person's accounts go while their token still
+    # exists, so each binding's service-scope subscriptions are unregistered
+    # at the vendor through the lender (the offboarding subscriber can only
+    # sweep the rows once the token is gone); the owner cleanup below is the
+    # safety net. Affected agents revert to their MCP's platform default at
+    # next resolve.
+    try:
+        from services.agents import offboarding_bindings
+        for row in await asyncio.to_thread(
+                credential_store.list_service_agent_bindings_for_owner, sub):
+            await offboarding_bindings.clear_binding(row, sub)
+    except Exception:
+        logger.exception(
+            "Service-binding subscription cleanup raised for user %s "
+            "(continuing with user delete)", sub,
+        )
     try:
         await asyncio.to_thread(
             credential_store.cleanup_service_agent_bindings_for_owner, sub,
@@ -335,10 +430,26 @@ async def admin_delete_user(
         logger.exception(
             "Usage cap cleanup raised for user %s (continuing with user delete)", sub,
         )
-    deleted = task_store.delete_user(sub)
+    # The user's chat snapshots (their shares cascade with the row; the
+    # copies live in the agent trees under their own bucket).
+    try:
+        from services.sharing import chat_snapshot
+        uname = task_store.get_username_by_sub(sub) or ""
+        await asyncio.to_thread(chat_snapshot.remove_user_snapshots, uname)
+    except Exception:
+        logger.exception(
+            "Chat snapshot cleanup raised for user %s (continuing with user delete)", sub,
+        )
+    rows_before = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
+    all_agents = await asyncio.to_thread(agent_store.get_agent_slugs)
+    deleted = await asyncio.to_thread(task_store.delete_user, sub)
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
     logger.info(f"Admin {mask_email(u.email)} deleted user {sub}")
+    await offboarding.dispatch_losses(
+        sub, offboarding.losses(target["role"], rows_before, None, {}, all_agents),
+        u.sub, deleted=True, person=target, platform_before=target["role"],
+    )
     return {"status": "deleted"}
 
 
@@ -358,7 +469,7 @@ async def admin_create_user(
 ):
     """Create a new local user. Admin only."""
     u = require_admin(user)
-    if req.role not in config.ROLE_PRIORITY:
+    if req.role not in _roles.PLATFORM_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role: {req.role}")
 
     # Seat-limit check (deployment-aware; two-stage grace on self-host expiry).
@@ -380,10 +491,10 @@ async def admin_create_user(
 
     if req.password:
         # Admin sets a temporary password
-        ok, msg, _ = check_password_strength(req.password)
+        ok, msg, _ = await check_password_strength_async(req.password)
         if not ok:
             raise HTTPException(status_code=400, detail=msg)
-        password_hash_val = hash_password(req.password)
+        password_hash_val = await _hash_or_503(req.password)
         must_change = True
         temp_password = req.password
     elif req.send_invite:
@@ -461,10 +572,13 @@ async def admin_reset_password(
         raise HTTPException(status_code=400, detail="Cannot reset password for OIDC users")
 
     temp = generate_temp_password()
-    pw_hash = hash_password(temp)
+    pw_hash = await _hash_or_503(temp)
     await asyncio.to_thread(task_store.set_user_password, sub, pw_hash)
     await asyncio.to_thread(task_store.update_user_auth_fields, sub, must_change_password=True)
     logger.info(f"Admin {mask_email(u.email)} reset password for {mask_email(target['email'])}")
+    # The person's warm chats hold session tokens the reset just invalidated.
+    await offboarding_sessions.close_person_sessions(
+        sub, target.get("username") or "", "password_changed")
     return {"temp_password": temp}
 
 

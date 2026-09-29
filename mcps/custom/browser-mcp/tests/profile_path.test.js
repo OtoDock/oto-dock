@@ -6,7 +6,8 @@
 const assert = require("assert");
 const path = require("path");
 const {
-  sanitizeAgent, computeProfileDir, resolveCliPath, detectBrowser,
+  sanitizeAgent, computeProfileDir, platformStateDirname, migrateLegacyProfileDir,
+  resolveCliPath, detectBrowser,
   resolveBrowserConfig, isChromiumFamily, findOrphanHolders, agentDisplayName,
   readDevtoolsPort, seedProfileDisplayName,
   LineSplitter, peekRpc, rewriteInitId, buildErrorResponse,
@@ -27,8 +28,13 @@ assert.strictEqual(sanitizeAgent("../../etc"), "______etc"); // separators + dot
 
 // --- computeProfileDir ---------------------------------------------------
 {
-  const dir = computeProfileDir("/home/u", "sales");
+  const dir = computeProfileDir("/home/u", "sales", "linux");
   assert.strictEqual(dir, path.join("/home/u", ".oto-dock", "browser-profiles", "sales"));
+  // Windows keeps the profiles under the platform's own folder there.
+  assert.strictEqual(platformStateDirname("win32"), "OtoDock");
+  assert.strictEqual(platformStateDirname("darwin"), ".oto-dock");
+  assert.strictEqual(computeProfileDir("C:\\Users\\u", "sales", "win32"),
+    path.join("C:\\Users\\u", "OtoDock", "browser-profiles", "sales"));
   // Lives under the satellite persistent root, OUTSIDE any MCP/workspace dir.
   assert.ok(dir.includes(path.join(".oto-dock", "browser-profiles")));
   assert.ok(!dir.includes("node_modules"));
@@ -42,6 +48,23 @@ assert.strictEqual(sanitizeAgent("../../etc"), "______etc"); // separators + dot
   assert.ok(path.resolve(evil).startsWith(path.resolve(base)), "no path traversal via agent name");
   const evil2 = computeProfileDir("/home/u", "..");
   assert.ok(path.resolve(evil2).startsWith(path.resolve(base)), "'..' agent cannot traverse");
+}
+
+// --- migrateLegacyProfileDir (Windows only; the logins survive the move) --
+{
+  const os = require("os");
+  const fs = require("fs");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "bmcp-home-"));
+  const legacy = path.join(home, ".oto-dock", "browser-profiles", "sales");
+  fs.mkdirSync(legacy, { recursive: true });
+  fs.writeFileSync(path.join(legacy, "Local State"), "{}");
+  assert.strictEqual(migrateLegacyProfileDir(home, "sales", "linux"), false); // not on Linux
+  assert.ok(fs.existsSync(legacy));
+  assert.strictEqual(migrateLegacyProfileDir(home, "sales", "win32"), true);
+  assert.ok(!fs.existsSync(legacy));
+  assert.ok(fs.existsSync(path.join(home, "OtoDock", "browser-profiles", "sales", "Local State")));
+  assert.strictEqual(migrateLegacyProfileDir(home, "sales", "win32"), false); // nothing left to move
+  fs.rmSync(home, { recursive: true, force: true });
 }
 
 // --- resolveCliPath ------------------------------------------------------

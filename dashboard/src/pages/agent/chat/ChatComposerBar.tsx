@@ -14,6 +14,7 @@ import type { computeModelGroups } from '../../../lib/modelGroups'
 import { useChatStore } from '../../../store/chatStore'
 import ChatStatusBar from '../../../components/chat/ChatStatusBar'
 import ChatInput, { PendingImage, PendingFile } from '../../../components/chat/ChatInput'
+import type { QueuedMessage } from '../../../store/types'
 import type { ChatInputVoice } from '../../../components/chat/ChatInput'
 import TerminalControlBar from '../../../components/chat/terminal/TerminalControlBar'
 import { describeLimitReached, describeLimitWarning } from '../../../components/usage/poolCap'
@@ -38,7 +39,7 @@ interface Props {
   contextMax: number
   cacheStats: Stream['cacheStats']
   meetingActive: boolean
-  supportsPlanMode: boolean
+  permissionModes: string[] | undefined
   agentLayerModels: LayerCapabilities['models']
   modelGroups: ReturnType<typeof computeModelGroups>
   interactiveAvailable: boolean
@@ -48,16 +49,23 @@ interface Props {
   handleToggleRichView: () => void
   isTaskChat: boolean
   chatId: string | null
+  agentName?: string
   ws: Stream['ws']
   handleModeChange: (m: string) => void
   handleModelChange: (compound: string) => void
   chatActiveLayer: string | null
   effectiveLayer: string
+  // The effective engine compacts on request (its descriptor's
+  // behaviour.supports_compact — lib/engines supportsCompact).
+  supportsCompact: boolean
   // Usage limit banner + toast
   limitReached: boolean
   limitReachedInfo: Stream['limitReachedInfo']
   limitWarning: Stream['limitWarning']
   setLimitWarning: Stream['setLimitWarning']
+  /** Engine id → label (lib/engines engineLabels over the page's catalog), so
+   *  the banner names the engine whose pool cap blocked the turn. */
+  engineLabels: Record<string, string>
   // ChatInput
   draftInput: string
   setDraftInput: (text: string) => void
@@ -68,7 +76,7 @@ interface Props {
   permissionPending: boolean
   warmingUp: boolean
   aborting: boolean
-  queuedMessages: string[]
+  queuedMessages: QueuedMessage[]
   editText: Stream['editText']
   setEditText: Stream['setEditText']
   pendingImages: PendingImage[]
@@ -92,11 +100,11 @@ interface Props {
 export default function ChatComposerBar({
   viewedStreaming, warming, turnStartTime, thinkingActive, compressingActive, activeAgents,
   mode, pendingEngineSwitch, model, modelCompound, totalCost, costBilled, contextUsed,
-  contextMax, cacheStats, meetingActive, supportsPlanMode, agentLayerModels, modelGroups,
+  contextMax, cacheStats, meetingActive, permissionModes, agentLayerModels, modelGroups,
   interactiveAvailable, interactive, interactiveLocked, handleInteractiveToggle,
-  handleToggleRichView, isTaskChat, chatId, ws, handleModeChange, handleModelChange,
-  chatActiveLayer, effectiveLayer,
-  limitReached, limitReachedInfo, limitWarning, setLimitWarning,
+  handleToggleRichView, isTaskChat, chatId, agentName, ws, handleModeChange, handleModelChange,
+  chatActiveLayer, effectiveLayer, supportsCompact,
+  limitReached, limitReachedInfo, limitWarning, setLimitWarning, engineLabels,
   draftInput, setDraftInput, handleSend, handleAbort, handleEditQueued, handleEngage,
   permissionPending, warmingUp, aborting, queuedMessages, editText, setEditText,
   pendingImages, draftKey, pendingFiles, handleAddFiles, handleRemoveFile, handleRetryFile,
@@ -131,7 +139,7 @@ export default function ChatComposerBar({
           contextMax={contextMax}
           cacheStats={cacheStats}
           meetingActive={meetingActive}
-          supportsPlanMode={supportsPlanMode}
+          permissionModes={permissionModes}
           modelOptions={agentLayerModels}
           modelGroups={modelGroups}
           interactiveAvailable={interactiveAvailable}
@@ -167,10 +175,12 @@ export default function ChatComposerBar({
             ? () => ws.probeLiveness()
             : undefined}
           onCompactContext={
-            // Manual compaction is Codex-only (thread/compact/start) and
-            // headless-only (interactive users type /compact in the TUI);
-            // hidden while a compaction is already in flight.
-            (effectiveLayer || '').startsWith('codex')
+            // Manual compaction is offered where the engine's descriptor
+            // declares it (behaviour.supports_compact — Codex's
+            // thread/compact/start today) and headless-only (interactive
+            // users type /compact in the TUI); hidden while a compaction is
+            // already in flight.
+            supportsCompact
             && !interactive.sessionInteractive && !compressingActive
               ? () => ws.compactContext()
               : undefined
@@ -181,8 +191,8 @@ export default function ChatComposerBar({
           budget, own API-key budget, or the subscription pool cap). */}
       {limitReached && (
         <div data-testid="limit-banner" className="mx-4 mb-2 p-3 rounded-lg bg-p-error/10 border border-p-error/30 text-sm text-p-error">
-          <strong>{describeLimitReached(limitReachedInfo).title}</strong>{' '}
-          {describeLimitReached(limitReachedInfo).body}
+          <strong>{describeLimitReached(limitReachedInfo, engineLabels).title}</strong>{' '}
+          {describeLimitReached(limitReachedInfo, engineLabels).body}
         </div>
       )}
       {/* Usage limit warning toast */}
@@ -192,7 +202,7 @@ export default function ChatComposerBar({
             <span className="text-p-accent-yellow text-lg leading-none">&#9888;</span>
             <div>
               <p className="font-medium text-p-text">Usage limit warning</p>
-              <p className="text-p-text-secondary mt-0.5">{describeLimitWarning(limitWarning)}</p>
+              <p className="text-p-text-secondary mt-0.5">{describeLimitWarning(limitWarning, engineLabels)}</p>
             </div>
             <button onClick={() => setLimitWarning(null)} className="text-p-text-light hover:text-p-text ml-auto">&times;</button>
           </div>
@@ -200,6 +210,8 @@ export default function ChatComposerBar({
       )}
       <ChatInput
         value={draftInput}
+        agentName={agentName}
+        draftKey={draftKey}
         onChange={setDraftInput}
         onSend={handleSend}
         onAbort={handleAbort}

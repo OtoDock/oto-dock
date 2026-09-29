@@ -1,14 +1,18 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin } from '../lib/permissions'
+import type { PairingScope } from '../lib/placement'
+import type { MachineState } from '../lib/status/machine'
+import type { BootstrapOs, DisplayServer } from '../lib/hostOs/os'
 
 export interface RemoteMachine {
   id: string
   name: string
-  // Live status merged from in-memory WS connection manager. The proxy
-  // overlays in-memory last_heartbeat over the DB status row before
-  // returning to the UI.
-  status: 'online' | 'stale' | 'offline' | 'disconnected' | 'never_connected' | 'paused'
+  // The live state (lib/status/machine.ts): every route overlays the
+  // in-memory connection's state on the DB row before returning it, so
+  // the column's `offline` never arrives.
+  status: MachineState
   last_seen: string | null
   last_heartbeat_age_s?: number | null
   reachable?: boolean
@@ -16,12 +20,17 @@ export interface RemoteMachine {
   // 'admin' = paired via the admin Remote Machines page (platform
   // infrastructure, can be agent-scope default). 'user' = paired via
   // UserSettings (personal scope, only the owner's user-scope chats run there).
-  pairing_scope: 'admin' | 'user'
+  pairing_scope: PairingScope
   capabilities: {
     os?: string
     arch?: string
     installed_clis?: string[]
     installed_mcps?: string[]
+    // The engine ids (execution_path values) this satellite can run
+    // (0.5.124+). Absent on an older satellite — the proxy then assumes the
+    // two CLI engines; the card shows no engine chips rather than repeat
+    // that assumption.
+    engines?: string[]
     // The OS account the satellite runs as + its home dir. Meaningful now
     // that the satellite is a per-user service (identity = the real user,
     // never root/SYSTEM). Surfaced as a "Running as" subtitle on the cards.
@@ -33,7 +42,7 @@ export interface RemoteMachine {
     // control (computer/browser) won't work on a headless satellite.
     display?: {
       has_display?: boolean
-      server?: 'x11' | 'wayland' | 'quartz' | 'windows' | 'none'
+      server?: DisplayServer
       session_active_unlocked?: boolean
     }
     // Per-CLI {version, path} the satellite's pin reconcile resolved
@@ -90,23 +99,12 @@ export interface RemoteMachine {
   owner_role?: string
 }
 
-export type SatelliteOs = 'linux' | 'macos' | 'windows'
-
 export interface PairResult {
   machine_id: string
   name: string
   pairing_token: string
   expires_in_hours: number
-  install_commands: Record<SatelliteOs, string>
-}
-
-/** Best-effort detection of the user's OS via navigator.userAgent. */
-export function detectSatelliteOs(): SatelliteOs {
-  if (typeof navigator === 'undefined') return 'linux'
-  const ua = navigator.userAgent.toLowerCase()
-  if (ua.includes('win')) return 'windows'
-  if (ua.includes('mac')) return 'macos'
-  return 'linux'
+  install_commands: Record<BootstrapOs, string>
 }
 
 export const useRemoteMachines = () => {
@@ -124,7 +122,7 @@ export const useRemoteMachines = () => {
       return data.machines ?? []
     },
     refetchInterval: 15000,
-    enabled: user?.role === 'admin',
+    enabled: isAdmin(user),
   })
 }
 
@@ -305,6 +303,9 @@ export const useDeleteMachine = () => {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['remote-machines'] })
       qc.invalidateQueries({ queryKey: ['agents'] })
+      // An admin may remove a USER-paired machine; their own User Settings
+      // tab lists it too when they are its owner.
+      qc.invalidateQueries({ queryKey: ['my-remote-machines'] })
     },
   })
 }

@@ -15,6 +15,8 @@ import asyncio
 import json
 import sys
 
+import pytest
+
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
@@ -81,7 +83,7 @@ def _process(row: dict, body: dict, monkeypatch, *, triggers=None, fired_log=Non
     monkeypatch.setattr(
         webhook_subscription_store, "record_event_received", lambda sid: None)
     monkeypatch.setattr(
-        trigger_store, "list_triggers", lambda enabled_only=True: triggers or [])
+        trigger_store, "list_triggers", lambda **kw: triggers or [])
 
     async def fake_fan_out(*, triggers, body, event, trigger_source):
         if fired_log is not None:
@@ -243,6 +245,7 @@ def _forward_headers(body: bytes, *, ts: str | None = None,
 def _setup_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
     """Manifest + forward secret + subscription rows stubbed; returns the
     list that records which subscription ids got processed."""
+    webhook_dispatcher.reset_caches()
     manifest = SimpleNamespace(credentials=SimpleNamespace(
         webhooks={**_WEBHOOKS_BLOCK, "workspace_id_path": "body.team_id"},
         oauth=None,
@@ -412,6 +415,7 @@ def _notion_sig_headers(body: bytes, secret: str = _NOTION_TOKEN) -> dict:
 def _setup_notion_sub(monkeypatch, *, row_secret: str):
     """Stub the store + manifest around dispatch_webhook for one notion row.
     Returns (stored_secrets, processed) recorders."""
+    webhook_dispatcher.reset_caches()
     row = {
         "id": "nsub-1", "provider_id": "notion", "mcp_name": "notion-mcp",
         "status": "active", "selected_events": "[]",
@@ -445,7 +449,7 @@ def _setup_notion_sub(monkeypatch, *, row_secret: str):
     monkeypatch.setattr(
         webhook_subscription_store, "record_event_received", lambda sid: None)
     monkeypatch.setattr(
-        trigger_store, "list_triggers", lambda enabled_only=True: [])
+        trigger_store, "list_triggers", lambda **kw: [])
     return stored
 
 
@@ -507,6 +511,7 @@ def test_notion_unsigned_non_token_body_401(monkeypatch):
 # --- notion: relay fan-in (workspace-scoped) -------------------------------------
 
 def _setup_notion_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
+    webhook_dispatcher.reset_caches()
     manifest = SimpleNamespace(credentials=SimpleNamespace(
         webhooks=_NOTION_BLOCK, oauth=None))
     monkeypatch.setattr(
@@ -581,6 +586,7 @@ def _zoom_event_body(account_id: str = "ACC1") -> dict:
 
 
 def _setup_zoom_relay_env(monkeypatch, rows: list[dict]) -> list[str]:
+    webhook_dispatcher.reset_caches()
     manifest = SimpleNamespace(credentials=SimpleNamespace(
         webhooks=_ZOOM_BLOCK, oauth=None))
     monkeypatch.setattr(
@@ -651,3 +657,499 @@ def test_zoom_relay_ingest_no_account_id_ignored(monkeypatch):
         headers=_forward_headers(body, provider="zoom")))
     assert status == 200 and resp.get("reason") == "no_workspace_id"
     assert processed == []
+
+
+# --- the Zoom handshake cannot sign a firing payload ---------------------------
+
+def test_zoom_handshake_signs_nothing_the_dispatcher_fires(monkeypatch):
+    """Through the public route with a Zoom-class manifest: a handshake whose
+    plainToken is shaped like a signed payload is not answered, and under a
+    template that signs the bare body the only strings the handshake still
+    signs are ones the dispatcher never fires (a body that is not a JSON
+    object fires nothing)."""
+    import time
+    import uuid
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.events import webhooks as webhooks_api
+
+    secret = "zoom-secret-token"
+    block = {
+        "available": True, "provider_id": "zoom",
+        "signature": {
+            "algorithm": "hmac-sha256", "header": "x-zm-signature", "prefix": "",
+            "version_prefix": "v0=", "timestamp_header": "x-zm-request-timestamp",
+            "timestamp_format": "unix", "signed_payload_template": "{body}",
+            "max_age_seconds": 300, "per_subscription_secret": False,
+            "secret_credential_key": "ZOOM_WEBHOOK_SECRET_TOKEN",
+        },
+        "url_verification": {
+            "kind": "zoom_endpoint_validation", "request_field": "plainToken",
+            "request_source": "body", "response_field": "encryptedToken",
+            "response_content_type": "application/json",
+        },
+        "event_catalog": [{"key": "meeting.started", "label": "Meeting started"}],
+        "payload_normalization": {"event_type_path": "body.event"},
+        "event_id_field": "headers.x-zm-request-id",
+    }
+    sub = str(uuid.uuid4())
+    row = {"id": sub, "provider_id": "zoom", "mcp_name": "zoom-mcp", "status": "active",
+           "delivery_mode": "vendor", "selected_events": json.dumps(["meeting.started"])}
+    manifest = SimpleNamespace(credentials=SimpleNamespace(
+        webhooks=block, oauth={"app_credential": "zoom-oauth-app"}))
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription",
+                        lambda sid: row if sid == sub else None)
+    monkeypatch.setattr(webhook_subscription_store, "record_event_received", lambda sid: None)
+    monkeypatch.setattr(webhook_subscription_store, "update_subscription_status",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(webhook_dispatcher.mcp_registry, "get_manifest",
+                        lambda name: manifest if name == "zoom-mcp" else None)
+    monkeypatch.setattr(credential_store, "get_infra_credentials",
+                        lambda slug: {"ZOOM_WEBHOOK_SECRET_TOKEN": secret}
+                        if slug == "zoom-oauth-app" else {})
+    monkeypatch.setattr(trigger_store, "list_triggers", lambda **kw: [
+        {"id": "t-1", "subscription_id": sub, "event_filter": "{}"}])
+    fired: list = []
+
+    async def fake_fan_out(*, triggers, body, event, trigger_source):
+        fired.append(body)
+        return (len(triggers), [])
+    monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
+
+    app = FastAPI()
+    app.include_router(webhooks_api.router)
+    client = TestClient(app)
+    ts = str(int(time.time()))
+    event_body = json.dumps({"event": "meeting.started", "payload": {}}, separators=(",", ":"))
+
+    # A payload-shaped token is not answered: the request falls through to
+    # signature verification, which refuses it.
+    r = client.post(f"/v1/webhooks/zoom/{sub}", json={
+        "event": "endpoint.url_validation", "payload": {"plainToken": event_body}})
+    assert r.status_code != 200 or "encryptedToken" not in r.text
+    # A token inside the alphabet is answered, but what it signs is never a
+    # JSON object, so the signed body fires nothing.
+    r = client.post(f"/v1/webhooks/zoom/{sub}", json={
+        "event": "endpoint.url_validation", "payload": {"plainToken": "1234567890"}})
+    assert r.status_code == 200
+    sig = r.json()["encryptedToken"]
+    r = client.post(f"/v1/webhooks/zoom/{sub}", content="1234567890",
+                    headers={"content-type": "application/json",
+                             "x-zm-request-timestamp": ts, "x-zm-signature": "v0=" + sig,
+                             "x-zm-request-id": "r1"})
+    assert fired == []
+    assert r.status_code != 200 or r.json().get("fired", 0) == 0
+    # A real event with a wrong signature stays refused.
+    r = client.post(f"/v1/webhooks/zoom/{sub}", content=event_body,
+                    headers={"content-type": "application/json",
+                             "x-zm-request-timestamp": ts, "x-zm-signature": "v0=" + sig,
+                             "x-zm-request-id": "r2"})
+    assert r.status_code == 401 and fired == []
+
+
+# --- the receive path off the loop ------------------------------------------
+
+import uuid  # noqa: E402
+
+from auth.webhook_providers.base import NormalizedEvent  # noqa: E402
+
+_L5_PROVIDER = "l5vendor"
+_L5_SECRET = "l5-signing-secret"
+_L5_BLOCK = {
+    "available": True, "provider_id": _L5_PROVIDER,
+    "signature": {
+        "algorithm": "hmac-sha256", "header": "x-l5-signature",
+        "version_prefix": "v0=", "timestamp_header": "x-l5-timestamp",
+        "timestamp_format": "unix", "signed_payload_template": "v0:{timestamp}:{body}",
+        "max_age_seconds": 300, "per_subscription_secret": True,
+    },
+    "url_verification": {
+        "kind": "verification_token_capture", "request_field": "verification_token",
+        "response_field": "ok",
+    },
+    "event_catalog": [{"key": "thing.changed", "label": "Things"}],
+    "payload_normalization": {"event_type_path": "body.type"},
+    "event_id_field": "body.id",
+}
+
+
+class _BatchProvider(GenericWebhookProvider):
+    """One event per ``items[]`` entry (the shape of a batched vendor)."""
+
+    def normalize_payload_batch(self, *, body, headers, manifest_block):
+        return [NormalizedEvent(event_type=i.get("type", ""), vendor_event_id=i.get("id", ""))
+                for i in (body.get("items") or [body])]
+
+
+def _l5_sign(body: bytes, secret: str = _L5_SECRET) -> dict:
+    ts = str(int(time.time()))
+    mac = hmac_mod.new(secret.encode(), f"v0:{ts}:".encode() + body, hashlib.sha256).hexdigest()
+    return {"x-l5-timestamp": ts, "x-l5-signature": "v0=" + mac}
+
+
+def _l5_manifest(monkeypatch, mcp_name: str = "l5-mcp"):
+    manifest = SimpleNamespace(credentials=SimpleNamespace(webhooks=_L5_BLOCK, oauth=None))
+    monkeypatch.setattr(webhook_dispatcher.mcp_registry, "get_manifest",
+                        lambda name: manifest if name == mcp_name else None)
+    monkeypatch.setitem(webhook_providers._MANIFEST_CACHE, _L5_PROVIDER,
+                        _BatchProvider(provider_id=_L5_PROVIDER))
+
+
+def _l5_stub_row(monkeypatch, *, secret: str = _L5_SECRET, status: str = "active") -> str:
+    """A stubbed active row with a per-subscription secret; returns its id."""
+    webhook_dispatcher.reset_caches()
+    _l5_manifest(monkeypatch)
+    sid = str(uuid.uuid4())
+    row = {"id": sid, "provider_id": _L5_PROVIDER, "mcp_name": "l5-mcp", "status": status,
+           "selected_events": "[]", "delivery_mode": "vendor"}
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription",
+                        lambda s: row if s == sid else None)
+    monkeypatch.setattr(webhook_subscription_store, "get_signing_secret", lambda s: secret)
+    monkeypatch.setattr(webhook_subscription_store, "record_event_received", lambda s: None)
+    return sid
+
+
+def _l5_dispatch(sid: str, body: bytes, headers: dict):
+    return asyncio.run(webhook_dispatcher.dispatch_webhook(
+        provider_id=_L5_PROVIDER, subscription_id=sid, raw_body=body,
+        headers=headers, query_params={}))
+
+
+def test_batch_scans_the_subscription_triggers_once(monkeypatch):
+    sid = _l5_stub_row(monkeypatch)
+    calls: list[dict] = []
+
+    def fake_list(**kw):
+        calls.append(kw)
+        return [{"id": "t-1", "subscription_id": sid, "event_filter": "{}"}]
+    monkeypatch.setattr(trigger_store, "list_triggers", fake_list)
+    fired: list[int] = []
+
+    async def fake_fan_out(*, triggers, body, event, trigger_source):
+        fired.append(len(triggers))
+        return (len(triggers), [])
+    monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
+
+    body = json.dumps({"items": [{"type": "thing.changed", "id": f"e{i}"} for i in range(10)]}).encode()
+    status, resp, _ = _l5_dispatch(sid, body, _l5_sign(body))
+    assert status == 200 and resp["fired"] == 10 and fired == [1] * 10
+    assert len(calls) == 1 and calls[0] == {"enabled_only": True, "subscription_id": sid}
+    # A batch of nothing but repeats (a vendor retry) costs no query at all.
+    status, resp, _ = _l5_dispatch(sid, body, _l5_sign(body))
+    assert status == 200 and resp["status"] == "duplicate"
+    assert len(calls) == 1
+
+
+def test_refused_signature_writes_nothing_and_notes_once_a_minute(monkeypatch):
+    sid = _l5_stub_row(monkeypatch)
+    monkeypatch.setattr(webhook_subscription_store, "update_subscription_status",
+                        lambda *a, **k: pytest.fail("a refused signature ran a status write"))
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(webhook_subscription_store, "note_last_error",
+                        lambda s, text: notes.append((s, text)) or True, raising=False)
+    body = json.dumps({"type": "thing.changed", "id": "e1"}).encode()
+
+    for _ in range(5):
+        status, _resp, _ = _l5_dispatch(sid, body, _l5_sign(body, "wrong"))
+        assert status == 401
+    status, _resp, _ = _l5_dispatch(sid, body, {})  # no signature header at all
+    assert status == 401
+    assert notes == [(sid, "signature: signature_mismatch (1 refused)")]
+
+    # Past the window, the next refusal writes the aggregate since the note.
+    count, last = webhook_dispatcher._signature_failures[sid]
+    webhook_dispatcher._signature_failures[sid] = (count, last - 61)
+    status, _resp, _ = _l5_dispatch(sid, body, _l5_sign(body, "wrong"))
+    assert status == 401
+    assert notes[-1] == (sid, "signature: signature_mismatch (6 refused)")
+    assert len(notes) == 2
+
+
+def test_receive_store_work_leaves_the_loop(temp_db, loop_db_guard, monkeypatch):
+    """A real row and a real trigger: a valid event and a refused one are
+    dispatched with the loop-thread guard armed; the trigger fires (the fan-out
+    itself is stubbed, its reads are other packages') and the counters land."""
+    webhook_dispatcher.reset_caches()
+    _l5_manifest(monkeypatch)
+    row = webhook_subscription_store.create_subscription(
+        scope="user", owner="user-admin", agent=None, mcp_name="l5-mcp",
+        provider_id=_L5_PROVIDER, account_label="", vendor_target="ws-1",
+        selected_events=[], selected_subevents={}, signing_secret=_L5_SECRET,
+        created_by="user-admin")
+    webhook_subscription_store.update_subscription_status(row["id"], "active")
+    trigger_store.create_trigger(slug="l5-t", name="t", scope="user", agent="a1",
+                                 created_by="user-admin", subscription_id=row["id"],
+                                 event_filter={})
+    fired: list[str] = []
+
+    async def fake_fan_out(*, triggers, body, event, trigger_source):
+        fired.extend(t["id"] for t in triggers)
+        return (len(triggers), [])
+    monkeypatch.setattr(webhook_dispatcher, "_fan_out_fire", fake_fan_out)
+    body = json.dumps({"type": "thing.changed", "id": "e1"}).encode()
+
+    async def scenario():
+        with loop_db_guard.active():
+            ok = await webhook_dispatcher.dispatch_webhook(
+                provider_id=_L5_PROVIDER, subscription_id=row["id"], raw_body=body,
+                headers=_l5_sign(body), query_params={})
+            refused = await webhook_dispatcher.dispatch_webhook(
+                provider_id=_L5_PROVIDER, subscription_id=row["id"], raw_body=body,
+                headers=_l5_sign(body, "wrong"), query_params={})
+            unknown = await webhook_dispatcher.dispatch_webhook(
+                provider_id=_L5_PROVIDER, subscription_id=str(uuid.uuid4()), raw_body=body,
+                headers={}, query_params={})
+        after = await asyncio.to_thread(webhook_subscription_store.get_subscription, row["id"])
+        return ok, refused, unknown, after
+
+    ok, refused, unknown, after = asyncio.run(scenario())
+    assert ok[0] == 200 and ok[1]["fired"] == 1 and len(fired) == 1
+    assert refused[0] == 401 and unknown[0] == 404
+    assert after["event_count"] == 1
+    assert after["last_error"] == "signature: signature_mismatch (1 refused)"
+    assert after["status"] == "active"
+
+
+def test_large_unsigned_body_is_verified_before_it_is_parsed(monkeypatch):
+    """Only a body small enough to be a handshake is looked at before the
+    signature check; a bigger one carrying the handshake field is refused."""
+    sid = _l5_stub_row(monkeypatch, secret="")
+    stored: list[str] = []
+    monkeypatch.setattr(webhook_subscription_store, "update_signing_secret",
+                        lambda s, secret: stored.append(secret))
+    big = json.dumps({"verification_token": "tok-1", "pad": "x" * (17 * 1024)}).encode()
+    status, _resp, _ = _l5_dispatch(sid, big, {})
+    assert status == 401 and stored == []
+    small = json.dumps({"verification_token": "tok-1"}).encode()
+    status, resp, _ = _l5_dispatch(sid, small, {})
+    assert status == 200 and resp == {"ok": True} and stored == ["tok-1"]
+
+
+def test_preauth_gate_refuses_when_saturated(monkeypatch):
+    sid = _l5_stub_row(monkeypatch)
+    monkeypatch.setattr(webhook_dispatcher, "_PREAUTH_MAX_WAITING", 0, raising=False)
+    body = json.dumps({"type": "thing.changed", "id": "e1"}).encode()
+    status, resp, headers = _l5_dispatch(sid, body, _l5_sign(body))
+    assert status == 503 and resp == {"error": "busy"}
+    assert headers.get("retry-after") == "5"
+
+
+def test_relay_forward_secret_is_cached_and_rechecked_on_refusal(monkeypatch):
+    processed = _setup_relay_env(monkeypatch, _relay_rows())
+    reads: list[str] = []
+    secret = {"value": _FORWARD_SECRET}
+    monkeypatch.setattr(
+        credential_store, "get_infra_credentials",
+        lambda slug: (reads.append(slug) or {relay_client.EVENTS_FORWARD_SECRET_KEY: secret["value"]})
+        if slug == relay_client.EVENTS_FORWARD_SECRET_SLUG else {})
+    body = json.dumps({"team_id": "T1", "event": {"type": "reaction_added"}}).encode()
+
+    def forward(headers):
+        return asyncio.run(webhook_dispatcher.dispatch_relay_webhook(
+            provider_id="slack", raw_body=body, headers=headers))
+
+    assert forward(_forward_headers(body))[0] == 200
+    assert forward(_forward_headers(body))[0] == 200
+    assert len(reads) == 1 and len(processed) == 4
+    # A refusal against a value read moments ago does not re-read.
+    assert forward(_forward_headers(body, secret="wrong"))[0] == 401
+    assert len(reads) == 1
+    # The relay rotated the secret: once the cached value is old enough, a
+    # refusal re-reads once and the event signed with the new secret passes.
+    secret["value"] = "rotated"
+    value, at = webhook_dispatcher._relay_secret
+    webhook_dispatcher._relay_secret = (value, at - 6)
+    assert forward(_forward_headers(body, secret="rotated"))[0] == 200
+    assert len(reads) == 2 and len(processed) == 6
+
+
+# ── the receive routes before the dispatcher ─────────
+
+
+def _receive_request(chunks, *, ip="198.51.100.60", delay=0.0, path="/v1/webhooks/relay/slack"):
+    from starlette.requests import Request
+    pending = list(chunks)
+
+    async def receive():
+        if delay:
+            await asyncio.sleep(delay)
+        if not pending:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        chunk = pending.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(pending)}
+
+    return Request({"type": "http", "method": "POST", "path": path, "headers": [],
+                    "client": (ip, 1234), "server": ("testserver", 80), "scheme": "http",
+                    "query_string": b""}, receive)
+
+
+@pytest.fixture
+def _receivers(monkeypatch):
+    import config
+    from api.events import webhooks
+    from auth import lan_check, rate_limiter
+    monkeypatch.setattr(config, "RUNNING_IN_DOCKER", False)
+    monkeypatch.setattr(config, "TRUSTED_PROXIES", [])
+    lan_check.reset_state()
+    rate_limiter._attempts.clear()
+    calls = []
+
+    async def fake_relay(*, provider_id, raw_body, headers):
+        calls.append(len(raw_body))
+        return 401, {"error": "forward signature verification failed"}, {"content-type": "application/json"}
+
+    monkeypatch.setattr(webhook_dispatcher, "dispatch_relay_webhook", fake_relay)
+    yield webhooks, calls
+    rate_limiter._attempts.clear()
+
+
+def test_a_body_over_the_cap_is_refused_413_and_never_dispatched(_receivers, monkeypatch):
+    import config
+    webhooks, calls = _receivers
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
+    r = asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request([b"x" * 600] * 4)))
+    assert r.status_code == 413 and r.headers["connection"] == "close" and calls == []
+
+
+def test_a_stalled_body_is_refused_408(_receivers, monkeypatch):
+    webhooks, calls = _receivers
+    monkeypatch.setattr(webhooks, "_CHUNK_GAP_S", 0.05)
+    r = asyncio.run(webhooks.receive_relay_webhook(
+        "slack", _receive_request([b"{", b"}"], delay=0.2)))
+    assert r.status_code == 408 and calls == []
+
+
+def test_the_read_bounds_answer_503_before_reading(_receivers, monkeypatch):
+    webhooks, calls = _receivers
+    monkeypatch.setattr(webhooks, "_READS_PER_CLIENT", 1)
+
+    async def scenario():
+        slow = asyncio.create_task(webhooks.receive_relay_webhook(
+            "slack", _receive_request([b"{", b"}"], delay=0.1)))
+        await asyncio.sleep(0.02)
+        second = await webhooks.receive_relay_webhook("slack", _receive_request([b"{}"]))
+        other = await webhooks.receive_relay_webhook("slack", _receive_request([b"{}"], ip="198.51.100.61"))
+        return second, other, await slow
+
+    second, other, first = asyncio.run(scenario())
+    assert second.status_code == 503 and second.headers["retry-after"] == "5"
+    assert other.status_code == 401 and first.status_code == 401
+
+
+def test_the_read_bounds_cover_the_body_read_only(_receivers, monkeypatch):
+    """A burst of deliveries from one address (the relay forwards every
+    vendor from one) is refused only while its bodies are being read: a
+    slow dispatch holds no read slot."""
+    webhooks, _calls = _receivers
+    in_dispatch = {"now": 0, "most": 0}
+
+    async def slow_relay(*, provider_id, raw_body, headers):
+        in_dispatch["now"] += 1
+        in_dispatch["most"] = max(in_dispatch["most"], in_dispatch["now"])
+        await asyncio.sleep(0.2)
+        in_dispatch["now"] -= 1
+        return 200, {"status": "ok"}, {"content-type": "application/json"}
+
+    monkeypatch.setattr(webhook_dispatcher, "dispatch_relay_webhook", slow_relay)
+
+    async def scenario():
+        deliveries = []
+        for _ in range(3 * webhooks._READS_PER_CLIENT):
+            deliveries.append(asyncio.create_task(
+                webhooks.receive_relay_webhook("slack", _receive_request([b"{}"]))))
+            await asyncio.sleep(0.01)
+        return [r.status_code for r in await asyncio.gather(*deliveries)]
+
+    codes = asyncio.run(scenario())
+    assert codes == [200] * (3 * webhooks._READS_PER_CLIENT)
+    assert in_dispatch["most"] > webhooks._READS_PER_CLIENT
+    assert webhooks._reads == {"total": 0} and webhooks._reads_by_client == {}
+
+
+def test_a_refused_read_gives_its_slot_back(_receivers, monkeypatch):
+    webhooks, _calls = _receivers
+    monkeypatch.setattr(webhooks, "_CHUNK_GAP_S", 0.05)
+    r = asyncio.run(webhooks.receive_relay_webhook(
+        "slack", _receive_request([b"{", b"}"], delay=0.2)))
+    assert r.status_code == 408
+    assert webhooks._reads == {"total": 0} and webhooks._reads_by_client == {}
+
+
+def test_only_preauth_refusals_count_against_a_distinct_address(_receivers, monkeypatch):
+    import config
+    webhooks, calls = _receivers
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "webhook_receive_ip",
+                        {"max": 3, "window": 60, "base_block": 60, "max_block": 600})
+    codes = [asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request([b"{}"]))).status_code
+             for _ in range(5)]
+    assert codes == [401, 401, 401, 429, 429]
+
+    async def gone(*, provider_id, subscription_id, raw_body, headers, query_params, http_method):
+        return 404, {"error": "unknown subscription"}, {"content-type": "application/json"}
+
+    monkeypatch.setattr(webhook_dispatcher, "dispatch_webhook", gone)
+    codes = [asyncio.run(webhooks.receive_webhook(
+        "github", str(uuid.uuid4()), _receive_request([b"{}"], ip="198.51.100.62",
+                                                      path="/v1/webhooks/github/x"))).status_code
+             for _ in range(5)]
+    assert codes == [404] * 5
+
+
+def test_no_per_address_throttle_for_a_shared_address(_receivers, monkeypatch):
+    import config
+    webhooks, calls = _receivers
+    monkeypatch.setitem(config.RATE_LIMIT_RULES, "webhook_receive_ip",
+                        {"max": 2, "window": 60, "base_block": 60, "max_block": 600})
+    # A private peer sending forwarding headers without being a trusted proxy:
+    # every client behind it shares its address.
+    from starlette.requests import Request
+
+    def shared():
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        return Request({"type": "http", "method": "POST", "path": "/v1/webhooks/relay/slack",
+                        "headers": [(b"x-forwarded-for", b"203.0.113.9")],
+                        "client": ("10.200.0.1", 1), "server": ("testserver", 80),
+                        "scheme": "http", "query_string": b""}, receive)
+
+    codes = [asyncio.run(webhooks.receive_relay_webhook("slack", shared())).status_code
+             for _ in range(5)]
+    assert codes == [401] * 5
+
+
+def test_the_dispatchers_503_passes_through(_receivers, monkeypatch):
+    webhooks, _calls = _receivers
+
+    async def busy(*, provider_id, raw_body, headers):
+        return 503, {"error": "busy"}, {"content-type": "application/json", "retry-after": "5"}
+
+    monkeypatch.setattr(webhook_dispatcher, "dispatch_relay_webhook", busy)
+    r = asyncio.run(webhooks.receive_relay_webhook("slack", _receive_request([b"{}"])))
+    assert r.status_code == 503 and r.headers["retry-after"] == "5"
+
+
+def test_a_large_body_signature_check_runs_off_the_loop():
+    """The HMAC over a body above 256 KB takes a worker thread; a small
+    one stays on the loop, where the hop would cost more than the digest."""
+    import threading
+
+    seen: list[int] = []
+
+    class _Provider:
+        def verify_signature(self, *, raw_body: bytes, **_kw):
+            seen.append(threading.get_ident())
+            return "ok"
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        small = await webhook_dispatcher._verified(_Provider(), raw_body=b"x" * 64, headers={})
+        large = await webhook_dispatcher._verified(
+            _Provider(), raw_body=b"x" * (webhook_dispatcher._VERIFY_OFF_LOOP_BYTES + 1), headers={})
+        return loop_thread, small, large
+
+    loop_thread, small, large = asyncio.run(scenario())
+    assert (small, large) == ("ok", "ok")
+    assert seen[0] == loop_thread and seen[1] != loop_thread

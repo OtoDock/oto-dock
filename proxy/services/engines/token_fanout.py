@@ -11,6 +11,15 @@ MUST reach every live session's on-disk credential file immediately:
 - Codex reads ``auth.json`` in ``CODEX_HOME`` — its guarded reload re-reads the
   file before refreshing and skips its own refresh when the token changed.
 
+WHERE a session's file lives is the target the layer registered at spawn;
+WHAT the file is called and how it is named on the satellite wire is the
+engine's declaration (``LayerCapabilities.auth.credential_file`` — the
+``CredentialFileSpec`` with the wire kind, the scope dir name, the filename
+and the start-payload key). The satellite clamps exactly that triple by the
+wire kind (``satellite/sessions/session_manager.py``), so the two values the
+released fleet knows — ``claude`` / ``codex`` — are frozen vocabulary the
+descriptor declares and this module never derives.
+
 Credential files live in the SCOPE config dir (``users/<u>/.claude`` or
 ``workspace/.claude`` — shared by every session of that scope), so writes are
 deduped per directory. Local dirs are written synchronously; satellite dirs get
@@ -39,30 +48,26 @@ from pathlib import Path
 from typing import Callable
 import contextlib
 
+from core.execution_layer import CredentialFileSpec
+
 logger = logging.getLogger("claude-proxy.token-fanout")
 
 _FRESHNESS_INTERVAL_S = 300
-
-# Claude's 401 recovery polls the credentials file for a rotated token for up
-# to this long before giving up (CLAUDE_CODE_OAUTH_401_WAIT_MS). Set on REMOTE
-# sessions only: a satellite's file lands after a WS round-trip, so a request
-# racing the push needs the poll window; local writes are synchronous.
-REMOTE_CLAUDE_401_WAIT_MS = 20_000
 
 
 @dataclass(frozen=True)
 class CredentialFileTarget:
     """Where one session's credential file lives.
 
-    ``kind`` picks the file format: ``"claude"`` → ``.credentials.json``
-    (claudeAiOauth schema), ``"codex"`` → ``auth.json``. Local sessions carry
-    the absolute ``host_dir``; remote sessions carry ``machine_id`` +
-    ``agent_name`` + ``dir_relative`` (agent-dir-rooted, the satellite resolves
-    its own tree).
+    ``layer`` is the session's engine (its execution path); the file's name,
+    wire kind and scope-dir name are the engine's declaration
+    (``credential_file_spec``). Local sessions carry the absolute
+    ``host_dir``; remote sessions carry ``machine_id`` + ``agent_name`` +
+    ``dir_relative`` (agent-dir-rooted, the satellite resolves its own tree).
     """
-    kind: str                  # "claude" | "codex"
+    layer: str                 # execution path: "claude-code-cli" | "codex-cli" | …
     machine_id: str = ""       # "" = local proxy host
-    host_dir: str = ""         # local: absolute .claude/.codex dir
+    host_dir: str = ""         # local: absolute scope config dir
     agent_name: str = ""       # remote: agent slug
     dir_relative: str = ""     # remote: e.g. "users/alice/.claude"
 
@@ -74,6 +79,17 @@ _targets_lock = threading.Lock()
 # captured by start_worker() at startup. None (tests / pre-startup) skips
 # remote pushes with a log line.
 _loop: asyncio.AbstractEventLoop | None = None
+
+
+def credential_file_spec(layer: str) -> CredentialFileSpec:
+    """The engine's credential-file declaration. Fails closed: a target for
+    an engine that is not registered, or for one that delivers credentials
+    by env, is a bug at the registration site, not a runtime condition."""
+    from core.session.session_manager import capabilities_for_path
+    spec = capabilities_for_path(layer).auth.credential_file
+    if spec is None:
+        raise ValueError(f"{layer} delivers credentials by env — it has no credential file")
+    return spec
 
 
 def register_session_target(session_id: str, target: CredentialFileTarget) -> None:
@@ -95,27 +111,18 @@ def session_target(session_id: str) -> CredentialFileTarget | None:
 
 
 # ---------------------------------------------------------------------------
-# Credential file writers — the single source for each file's on-disk shape
+# The credential file writer — one for every engine, named by its spec
 # ---------------------------------------------------------------------------
 
-def write_claude_credentials_file(config_dir: Path, claude_blob: dict) -> None:
-    """Write ``.credentials.json`` (the CLI's ``claudeAiOauth`` schema) into a
-    session's ``CLAUDE_CONFIG_DIR``. ``claude_blob`` comes from the pool with a
-    neutralized (blank) refreshToken — the pool is the sole rotator."""
+def write_credential_file(config_dir: Path, filename: str, payload: dict) -> None:
+    """Write a session's credential file — the full file content the engine's
+    ``credential_file_payload`` produced (refresh token already neutralized
+    there; the pool is the sole rotator) — 0600, into its scope config dir.
+    Never through a link the agent planted at the name (the dir is
+    agent-writable): the proxy would write the token over the link's target."""
+    from core.sandbox.session_config_dir import write_no_follow
     config_dir.mkdir(parents=True, exist_ok=True)
-    path = config_dir / ".credentials.json"
-    path.write_text(json.dumps({"claudeAiOauth": claude_blob}))
-    path.chmod(0o600)
-
-
-def write_codex_auth_file(config_dir: Path, auth: dict) -> None:
-    """Write ``auth.json`` into a session's ``CODEX_HOME`` (already the full
-    file payload — built by ``codex.helpers.build_auth_json``, refresh token
-    neutralized there)."""
-    config_dir.mkdir(parents=True, exist_ok=True)
-    path = config_dir / "auth.json"
-    path.write_text(json.dumps(auth))
-    path.chmod(0o600)
+    write_no_follow(config_dir / filename, json.dumps(payload).encode(), mode=0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -125,16 +132,22 @@ def write_codex_auth_file(config_dir: Path, auth: dict) -> None:
 def fan_out(
     session_ids: list[str],
     *,
-    claude_blob: dict | None,
-    codex_auth: dict | None,
+    layer: str,
+    payload: dict,
     on_written: Callable[[str], None],
     expected_sub_id: str | None = None,
 ) -> None:
-    """Deliver a freshly rotated token to every listed session's credential
-    file. Deduped per credential DIRECTORY (scope dirs are shared across a
-    scope's sessions). Local writes are synchronous; satellite writes are
-    scheduled on the captured loop and ack-gated. ``on_written(session_id)``
-    fires per session once its file landed. Sync — safe from pool threads.
+    """Deliver one credential-file payload to every listed session's file.
+
+    The sessions of one subscription run one engine, so one ``payload`` (the
+    full file content, from ``layer``'s ``credential_file_payload``) serves
+    them all; a target registered for another engine is skipped with a
+    warning — impossible by construction (a session bound to a Claude row is
+    a Claude session), and a silent wrong-format write is the worse failure.
+    Deduped per credential DIRECTORY (scope dirs are shared across a scope's
+    sessions). Local writes are synchronous; satellite writes are scheduled
+    on the captured loop and ack-gated. ``on_written(session_id)`` fires per
+    session once its file landed. Sync — safe from pool threads.
 
     ``expected_sub_id`` guards against cross-account clobber: a session whose
     pool binding is no longer that subscription — it was re-homed by a
@@ -149,6 +162,7 @@ def fan_out(
             sid for sid in session_ids
             if _pool.get_session_subscription(sid) == expected_sub_id
         ]
+    spec = credential_file_spec(layer)
     # Group sessions by their (deduped) credential directory.
     local: dict[str, tuple[CredentialFileTarget, list[str]]] = {}
     remote: dict[tuple[str, str, str], tuple[CredentialFileTarget, list[str]]] = {}
@@ -156,22 +170,21 @@ def fan_out(
         t = session_target(sid)
         if t is None:
             continue  # no credential file (API key / pre-restart session)
+        if t.layer != layer:
+            logger.warning(
+                "fan-out: session %s is registered for %s, not %s — skipped",
+                sid[:8], t.layer, layer,
+            )
+            continue
         if t.machine_id:
             key = (t.machine_id, t.agent_name, t.dir_relative)
             remote.setdefault(key, (t, []))[1].append(sid)
         else:
             local.setdefault(t.host_dir, (t, []))[1].append(sid)
 
-    for host_dir, (t, sids) in local.items():
+    for host_dir, (_t, sids) in local.items():
         try:
-            if t.kind == "codex":
-                if codex_auth is None:
-                    continue
-                write_codex_auth_file(Path(host_dir), codex_auth)
-            else:
-                if claude_blob is None:
-                    continue
-                write_claude_credentials_file(Path(host_dir), claude_blob)
+            write_credential_file(Path(host_dir), spec.filename, payload)
         except OSError:
             logger.exception("fan-out: local write failed for %s", host_dir)
             continue
@@ -189,19 +202,12 @@ def fan_out(
             len(remote),
         )
         return
-    for (machine_id, agent_name, dir_relative), (t, sids) in remote.items():
+    for (machine_id, agent_name, dir_relative), (_t, sids) in remote.items():
         # The push carries the FULL file payload (the satellite writes it
-        # verbatim — same shape as the start_session credentials_json /
-        # auth_json payloads).
-        if t.kind == "codex":
-            content = codex_auth
-        else:
-            content = {"claudeAiOauth": claude_blob} if claude_blob else None
-        if content is None:
-            continue
+        # verbatim — the same content the start_session payload carried).
         asyncio.run_coroutine_threadsafe(
-            _push_remote(machine_id, agent_name, dir_relative, t.kind,
-                         content, sids, on_written, expected_sub_id),
+            _push_remote(machine_id, agent_name, dir_relative, spec.wire_kind,
+                         payload, sids, on_written, expected_sub_id),
             _loop,
         )
 
@@ -217,8 +223,10 @@ async def _push_remote(
     expected_sub_id: str | None = None,
 ) -> None:
     """Push one credential file to a satellite and ack-gate the snapshot
-    update. Failure is logged and left to the backstops (Claude's 401-recovery
-    poll window / codex's guarded reload after the next successful push)."""
+    update. ``kind`` is the engine's wire kind — ``"claude"`` / ``"codex"``,
+    the values the released satellites clamp on. Failure is logged and left
+    to the backstops (Claude's 401-recovery poll window / codex's guarded
+    reload after the next successful push)."""
     if expected_sub_id is not None:
         # Re-check at dispatch: the push was scheduled from a pool thread and a
         # selection-change rebind may have re-homed these sessions meanwhile.
@@ -266,8 +274,8 @@ async def _push_remote(
 async def _tick() -> None:
     from services.engines import subscription_pool as pool
     try:
-        # Provider windows FIRST: a fresh reading of each account's 5-hour /
-        # weekly state lets the rebind and rebalance passes below converge in
+        # Provider windows FIRST: a fresh reading of each account's session /
+        # quota state lets the rebind and rebalance passes below converge in
         # this tick instead of the next. Runs before the boot-grace return
         # too, so a restart never starves the idle accounts' samples.
         from services.engines import subscription_windows as _windows
@@ -310,6 +318,7 @@ async def _tick() -> None:
     if pool.within_boot_grace():
         return
     try:
+        from storage.billing import subscription_status
         from storage.billing import subscription_store as _store
         persisted = await asyncio.to_thread(_store.list_persisted_binding_sub_ids)
         rows = await asyncio.to_thread(_store.list_subscriptions)
@@ -318,7 +327,7 @@ async def _tick() -> None:
         return
     for sub in rows:
         sub_id = sub.get("id") or ""
-        if (sub.get("auth_type") != "oauth" or sub.get("status") != "active"
+        if (sub.get("auth_type") != "oauth" or sub.get("status") != subscription_status.ACTIVE
                 or sub_id in bound or sub_id in persisted):
             continue
         try:

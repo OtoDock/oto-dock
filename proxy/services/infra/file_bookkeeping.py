@@ -11,6 +11,12 @@ tools, recover-bin restore, knowledge-library rename projection):
   idle satellite APPLIES the delete instead of resurrecting the file), fan
   the delete out.
 
+Every filesystem step opens beneath ``AGENTS_DIR`` through ``safe_fs`` with
+the agent's name as the first component (SAFE-FS.md): a walk never follows a
+link, a capture reads the file it lists, a delete removes the name it checked.
+The ``*_sync`` twins carry the store half for a caller already in a worker
+thread (the files routes run their whole filesystem step in one thread).
+
 Moved out of ``api/agents/files.py`` (Plan B, 2026-09) so the Direct-LLM
 builtins run the identical sequence instead of a second copy. Every caller
 goes through THIS module (no private re-exports), so one monkeypatch point
@@ -22,13 +28,70 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import stat
 import time
 from pathlib import Path
 
 import config
-from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from core import layout
+from services.infra import safe_fs
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.agents")
+
+
+def _rel_of(agent_dir: Path, path: Path) -> str | None:
+    """The agent-relative form of ``path`` (a Path under ``agent_dir``, as
+    joined or as resolved), judged on the text; None for the agent dir
+    itself or a path outside it."""
+    try:
+        rel = safe_fs.rel_under(path, os.path.realpath(agent_dir))
+    except OSError:
+        try:
+            rel = safe_fs.rel_under(path, agent_dir)
+        except OSError:
+            return None
+    return rel or None
+
+
+def _root_of(agent_dir: Path) -> tuple[Path, str]:
+    """``(agents root, agent name)`` for a caller's ``agent_dir``
+    (``AGENTS_DIR/<slug>`` as joined, never resolved): the root the helpers
+    open and the first component of every rel, so a linked agent folder is
+    refused at the open."""
+    return Path(agent_dir).parent, Path(agent_dir).name
+
+
+def walk_files_beneath(agent_dir: Path, rel: str) -> list[str]:
+    """Agent-relative paths of the regular files at or under ``rel`` (a file
+    or a directory of the agent's tree), read from a walk beneath the agents
+    root that never follows a link and never lists one. Blocking: a
+    worker-thread call."""
+    root, name = _root_of(agent_dir)
+    top = f"{name}/{rel}"
+    st = safe_fs.lstat_beneath(root, top)
+    if stat.S_ISREG(st.st_mode):
+        return [rel]
+    if not stat.S_ISDIR(st.st_mode):
+        return []
+    out: list[str] = []
+    for step in safe_fs.walk_beneath(root, top):
+        base = step.rel[len(name) + 1:]
+        out.extend(f"{base}/{n}" if base else n for n in step.files)
+    return out
+
+
+async def _has_candidates(agent_slug: str, rel_path: str) -> bool:
+    """``has_fanout_candidates`` with the Shared-only read done on the DB
+    lane (only a ``users/`` path asks it)."""
+    from services.remote import workspace_fanout
+    shared_only = None
+    if layout.is_personal(rel_path):
+        from core.session.visibility import is_shared_only
+        shared_only = await run_db(is_shared_only, agent_slug)
+    return workspace_fanout.has_fanout_candidates(
+        agent_slug, rel_path, include_idle=True, shared_only=shared_only,
+    )
 
 
 async def record_platform_write(agent_slug: str, rel_path: str, writer: str | None) -> None:
@@ -43,15 +106,20 @@ async def record_platform_write(agent_slug: str, rel_path: str, writer: str | No
     schedule_library_projection(agent_slug, rel_path, deleted=False)
 
 
+def tombstone_path_sync(agent_slug: str, rel_path: str) -> None:
+    """The store half of ``tombstone_path``: the tombstone row and the author
+    cleared, for a caller already in a worker thread (the projection is the
+    caller's, on the loop)."""
+    from storage.files import file_tombstones_store
+    from storage.files import file_author_store
+    file_tombstones_store.record(agent_slug, rel_path, time.time(), origin="dashboard")
+    file_author_store.clear(agent_slug, rel_path)
+
+
 async def tombstone_path(agent_slug: str, rel_path: str) -> None:
     """Record a delete tombstone + forget the author for one platform file path,
     so an idle satellite APPLIES the delete (never resurrects it) at next sync."""
-    from storage.files import file_tombstones_store
-    from storage.files import file_author_store
-    await asyncio.to_thread(
-        file_tombstones_store.record, agent_slug, rel_path, time.time(), origin="dashboard",
-    )
-    await asyncio.to_thread(file_author_store.clear, agent_slug, rel_path)
+    await asyncio.to_thread(tombstone_path_sync, agent_slug, rel_path)
     schedule_library_projection(agent_slug, rel_path, deleted=True)
 
 
@@ -84,27 +152,32 @@ def schedule_library_projection(agent_slug: str, rel_path: str, *, deleted: bool
                 agent_slug, knowledge_rel, deleted=deleted))
 
 
+def tombstone_subtree_sync(agent_slug: str, agent_dir: Path, rel: str) -> list[str]:
+    """Tombstone every regular file at or under ``rel`` (agent-relative) from
+    a worker thread; returns their paths so the caller schedules the
+    projections on the loop. A source that cannot be walked yields nothing."""
+    try:
+        files = walk_files_beneath(agent_dir, rel)
+    except OSError:
+        return []
+    for f in files:
+        tombstone_path_sync(agent_slug, f)
+    return files
+
+
 async def tombstone_subtree(agent_slug: str, agent_dir: Path, src: Path) -> None:
     """Tombstone every file under ``src`` (a file or dir) BEFORE it is deleted /
     moved / renamed on disk — so an idle satellite removes the old path(s) instead
     of resurrecting them. Per-file (a directory has no file hash to key on)."""
-    base = Path(os.path.realpath(agent_dir))
-    try:
-        src = resolve_under(src, base)
-    except PathOutsideRoot:
+    rel = _rel_of(agent_dir, src)
+    if rel is None:
         return
-    if src.is_file():
-        files = [src]
-    elif src.is_dir():
-        files = [f for f in src.rglob("*") if f.is_file() and not f.is_symlink()]
-    else:
+    try:
+        files = await asyncio.to_thread(walk_files_beneath, agent_dir, rel)
+    except OSError:
         return
     for f in files:
-        try:
-            rel = f.resolve().relative_to(base).as_posix()
-        except (OSError, ValueError):
-            continue
-        await tombstone_path(agent_slug, rel)
+        await tombstone_path(agent_slug, f)
 
 
 async def push_file_write(
@@ -118,17 +191,14 @@ async def push_file_write(
     per-role isolation that gates session-start sync applies here too: a write
     under ``users/{alice}/`` or ``config/`` only reaches machines whose active
     session is allowed to see it. The author/tombstone bookkeeping runs even when
-    no remote session is active (it's platform state, not a push)."""
+    no remote session is active (it's platform state, not a push). The Path is
+    handed on: the fan-out opens the platform copy beneath the agents root and
+    streams from that descriptor (nothing is read whole here)."""
     await record_platform_write(agent_slug, rel_path, writer)
+    if not await _has_candidates(agent_slug, rel_path):
+        return
     from services.remote import workspace_fanout
-    if not workspace_fanout.has_fanout_candidates(agent_slug, rel_path, include_idle=True):
-        return
-    try:
-        content = host_path.read_bytes()
-    except OSError as e:
-        logger.warning("Cannot read %s for satellite push: %s", host_path, e)
-        return
-    await workspace_fanout.fan_out_write(agent_slug, rel_path, content, include_idle=True)
+    await workspace_fanout.fan_out_write(agent_slug, rel_path, host_path, include_idle=True)
 
 
 async def push_file_delete(agent_slug: str, rel_path: str) -> None:
@@ -145,64 +215,65 @@ async def push_tree_write(
     """Publish a written FILE — or every file under a moved/copied DIRECTORY: record
     platform authorship + retire any tombstone per file, then fan out to active
     remote sessions so a platform move/copy reaches the satellite immediately
-    instead of only at the next manifest sync. Each file is fanned out with
-    per-file isolation; the disk read happens only when a file has an allowed
-    target. Best-effort."""
-    base = Path(os.path.realpath(agent_dir))
-    try:
-        root = resolve_under(root, base)
-    except PathOutsideRoot:
+    instead of only at the next manifest sync. The walk never follows a link
+    (a link is not published); each file is fanned out with per-file
+    isolation from the platform copy's descriptor. Best-effort."""
+    rel = _rel_of(agent_dir, root)
+    if rel is None:
         return
-    if root.is_file():
-        files = [root]
-    elif root.is_dir():
-        files = [f for f in root.rglob("*") if f.is_file()]
-    else:
+    try:
+        files = await asyncio.to_thread(walk_files_beneath, agent_dir, rel)
+    except OSError as e:
+        logger.warning("Cannot walk %s/%s for satellite push: %s", agent_slug, rel, e)
         return
     from services.remote import workspace_fanout
     for f in files:
+        await record_platform_write(agent_slug, f, writer)
+        if not await _has_candidates(agent_slug, f):
+            continue
+        await workspace_fanout.fan_out_write(
+            agent_slug, f, Path(agent_dir) / f, include_idle=True,
+        )
+
+
+def _delete_file_sync(agent_slug: str, agent_dir: Path, rel: str) -> bool:
+    """Capture (under the cap), unlink and tombstone ONE regular file at
+    ``rel`` beneath the agents root; a link or a special file at the name is
+    ``FileNotFoundError`` (never captured, never removed). Returns True when
+    the capture was skipped for size."""
+    from storage.files import recover_bin_store
+    root, name = _root_of(agent_dir)
+    top = f"{name}/{rel}"
+    st = safe_fs.lstat_beneath(root, top)
+    if not stat.S_ISREG(st.st_mode):
+        raise FileNotFoundError(top)
+    cap = config.RECOVER_BIN_MAX_BYTES
+    bin_skipped = st.st_size > cap
+    if not bin_skipped:
         try:
-            rel = f.relative_to(base).as_posix()
-        except ValueError:
-            continue
-        await record_platform_write(agent_slug, rel, writer)
-        if not workspace_fanout.has_fanout_candidates(agent_slug, rel, include_idle=True):
-            continue
-        try:
-            content = f.read_bytes()
-        except OSError as e:
-            logger.warning("Cannot read %s for satellite push: %s", f, e)
-            continue
-        await workspace_fanout.fan_out_write(agent_slug, rel, content, include_idle=True)
+            content = safe_fs.read_bytes_beneath(root, top, max_size=cap)
+        except safe_fs.FileTooLarge:
+            bin_skipped, content = True, b""
+        if content:
+            recover_bin_store.capture(agent_slug, rel, content, "deleted")
+    safe_fs.unlink_beneath(root, top)
+    tombstone_path_sync(agent_slug, rel)
+    return bin_skipped
 
 
 async def delete_platform_file(agent_slug: str, agent_dir: Path, target: Path) -> bool:
-    """The platform delete sequence for ONE regular file (``target`` resolved,
-    inside ``agent_dir``): Recover-bin capture (best-effort; a voluntary delete
+    """The platform delete sequence for ONE regular file (``target`` inside
+    ``agent_dir``): Recover-bin capture (best-effort; a voluntary delete
     → no notification), unlink, tombstone + author clear, fan-out. Files above
     the bin cap are NOT captured (Windows-Recycle-Bin-style) — don't even read
-    them. Returns True when the capture was skipped so the caller can say
-    "cannot be undone"."""
-    rel = target.relative_to(Path(os.path.realpath(agent_dir))).as_posix()
-    bin_skipped = False
-    try:
-        size = target.stat().st_size
-    except OSError:
-        size = 0
-    if size > config.RECOVER_BIN_MAX_BYTES:
-        bin_skipped = True
-    else:
-        try:
-            content = target.read_bytes()
-        except OSError:
-            content = b""
-        if content:
-            from storage.files import recover_bin_store
-            await asyncio.to_thread(
-                recover_bin_store.capture, agent_slug, rel, content, "deleted",
-            )
-    target.unlink()
-    logger.info(f"Deleted file: {target}")
-    await tombstone_path(agent_slug, rel)  # idle satellites apply the delete
+    them. The capture, the removal and the tombstone run in one thread on the
+    name checked beneath the root. Returns True when the capture was skipped
+    so the caller can say "cannot be undone"."""
+    rel = _rel_of(agent_dir, target)
+    if rel is None:
+        raise FileNotFoundError(str(target))
+    bin_skipped = await asyncio.to_thread(_delete_file_sync, agent_slug, agent_dir, rel)
+    logger.info("Deleted file: %s/%s", agent_slug, rel)
+    schedule_library_projection(agent_slug, rel, deleted=True)
     await push_file_delete(agent_slug, rel)
     return bin_skipped

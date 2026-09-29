@@ -23,6 +23,7 @@ import {
 } from '../api/community'
 import { useAgentMcps, useSetAgentMcps } from '../api/mcps'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 import { safeHref } from '../lib/safeUrl'
 import McpIcon from './McpIcon'
 
@@ -213,7 +214,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   // click during that window opens the (admin-unwanted) reason modal
   // — the backend still resolves correctly because role is checked
   // server-side, but the UX feels wrong.
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   const showAdminInstall = !agentSlug
   const [error, setError] = useState<string | null>(null)
   // Reason modal is a 2-step: click Request → modal opens → optional

@@ -7,7 +7,7 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 ``docs/architecture/DATABASE-SCHEMA.md``.
 """
 
-from storage.schema_base import _index_exists
+from storage.schema_base import _drop_invalid_indexes, _index_exists
 
 
 def init_tasks(conn) -> None:
@@ -34,14 +34,35 @@ def init_tasks(conn) -> None:
             chat_id TEXT,
             scope TEXT DEFAULT 'agent',
             created_by TEXT,
-            execution_target TEXT NOT NULL DEFAULT 'local'
+            execution_target TEXT NOT NULL DEFAULT 'local',
+            background_pending INTEGER NOT NULL DEFAULT 0
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_agent ON task_runs(agent)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON task_runs(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_task_id ON task_runs(task_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_started_at ON task_runs(started_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_scope_created ON task_runs(scope, created_by)")
+    # A chat's latest run (the task-history list, the sidebar's run lookup,
+    # the task-chat pump), a session's runs (the task-pump poll) and one
+    # agent's run history newest first (the Tasks page poll) each read an
+    # index: a sequential scan there holds the event loop. The COALESCE expression
+    # must stay textually identical to the chat queries' ORDER BY, and the
+    # agent index must say NULLS LAST like the run listing's ORDER BY (a
+    # DESC key is NULLS FIRST otherwise, and every run of the agent gets
+    # sorted); test_schema_indexes.py holds both. The agent index covers a
+    # single-column agent lookup as its prefix, so idx_runs_agent is dropped.
+    _drop_invalid_indexes(conn, "idx_runs_chat_started", "idx_runs_session",
+                          "idx_runs_agent_started")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_chat_started "
+        "ON task_runs (chat_id, (COALESCE(started_at, '')) DESC)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_session ON task_runs (session_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_agent_started "
+        "ON task_runs (agent, started_at DESC NULLS LAST)"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_runs_agent")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS dynamic_tasks (
@@ -89,7 +110,21 @@ def init_tasks(conn) -> None:
             -- against the agent's envelope on WRITE
             -- (spawn_authz.validate_spawn_overrides), never at fire time.
             override_model TEXT DEFAULT '',
-            override_execution_path TEXT DEFAULT ''
+            override_execution_path TEXT DEFAULT '',
+            -- An app handler on a schedule (task_type='app', APPS.md
+            -- "Handlers"): the app row and the handler name; the prompt
+            -- stays empty and the runner never opens a session for it.
+            -- Existing DBs: run_migrations (with the partial unique index).
+            app_id TEXT,
+            app_handler TEXT,
+            -- The offboarding transfer (services/agents/offboarding_transfer.py):
+            -- an agent-scope row whose creator lost the editor tier moves to
+            -- the admin who made the change. transferred_from keeps the FIRST
+            -- creator across hops (the prompt's author, whose provenance the
+            -- knowledge-write grant follows), transferred_at the last hop.
+            -- Empty on a row that never moved. Existing DBs: run_migrations.
+            transferred_from TEXT NOT NULL DEFAULT '',
+            transferred_at TEXT NOT NULL DEFAULT ''
         )
     """)
     # Template-idempotency partial indexes — one row per
@@ -134,7 +169,10 @@ def init_notifications(conn) -> None:
             chat_id TEXT,
             user_tz TEXT,
             community_template TEXT,
-            community_template_item_slug TEXT
+            community_template_item_slug TEXT,
+            -- The offboarding transfer record, as on dynamic_tasks.
+            transferred_from TEXT NOT NULL DEFAULT '',
+            transferred_at TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("""
@@ -164,7 +202,10 @@ def init_notifications(conn) -> None:
             read_at TEXT,
             dismissed_at TEXT,
             agent_slug TEXT,
-            chat_id TEXT
+            chat_id TEXT,
+            -- A dashboard path the row opens when set (a shared app, a
+            -- shared chat); empty = the agent/chat deep link as before.
+            href TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_user ON notification_deliveries(user_sub)")
@@ -229,7 +270,10 @@ def init_webhooks(conn) -> None:
             -- event-relay delivery: 'vendor' = the vendor calls this install's
             -- webhook URL directly; 'relay' = events arrive via the OtoDock
             -- relay's forwarded ingest (/v1/webhooks/relay/{provider}).
-            delivery_mode TEXT NOT NULL DEFAULT 'vendor'
+            delivery_mode TEXT NOT NULL DEFAULT 'vendor',
+            -- the manifest's vendor_target_spec.target_kinds key the row
+            -- registered as; '' = the default kind (a repository, for GitHub).
+            target_kind TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_owner ON webhook_subscriptions(scope, owner)")
@@ -283,7 +327,15 @@ def init_triggers(conn) -> None:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             community_template TEXT,
-            community_template_item_slug TEXT
+            community_template_item_slug TEXT,
+            -- The app action (APPS.md "Handlers"): a fire wakes this app's
+            -- handler instead of a task; never set together with task_id
+            -- (service-layer rule, no CHECK). Existing DBs: run_migrations.
+            app_id TEXT,
+            handler TEXT,
+            -- The offboarding transfer record, as on dynamic_tasks.
+            transferred_from TEXT NOT NULL DEFAULT '',
+            transferred_at TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_triggers_agent ON triggers(agent)")

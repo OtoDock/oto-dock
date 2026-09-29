@@ -39,10 +39,15 @@ EXPECTED_ORDER = [
     "init_recover_bin",
     "init_pinned_apps",
     "init_pinned_app_user_hides",
+    "init_app_state",
+    "init_app_handler_deliveries",
+    "init_app_secrets",
+    "init_shares",
     "init_pinned_files",
     "init_file_sync",
     "init_file_transfers",
     "init_knowledge_libraries",
+    "init_checks",
 ]
 
 HOMES = {
@@ -59,9 +64,12 @@ HOMES = {
     ],
     "storage.phone.schema": ["init_audio_telephony", "init_phone_call_log"],
     "storage.billing.schema": ["init_usage", "init_execution_layers"],
+    "storage.sharing.schema": ["init_shares"],
+    "storage.checks.schema": ["init_checks"],
     "storage.schema": [
         "init_storage_quotas", "init_remote_machines", "init_pinned_apps",
-        "init_pinned_app_user_hides",
+        "init_pinned_app_user_hides", "init_app_state", "init_app_handler_deliveries",
+        "init_app_secrets",
     ],
 }
 

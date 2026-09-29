@@ -5,6 +5,8 @@ import { replayableDisplayEvents } from '@/lib/displayReplay'
 import { loadDismissedPips, recordDismissedPip } from '@/lib/pipDismissals'
 import { fetchChatPage } from '@/api/chats'
 import type { InteractiveWs } from './useInteractiveTerminal'
+import { WIRE } from '../api/wireEvents'
+import { evictedBy, identityKey, isArtifactBlock } from '../lib/kinds/artifact'
 
 /**
  * Owns the floating display/file-tools artifact windows for an interactive CLI
@@ -12,16 +14,12 @@ import type { InteractiveWs } from './useInteractiveTerminal'
  * drainer forwards display-mcp/file-tools artifacts there — there is no inline
  * message list in interactive), converts each to a renderable MessageBlock via
  * the shared `eventToBlock` mapper, and maintains the open-window list. The
- * placeholder/dedup rules mirror the -p pump (stream_pump `_handle_perm_event`):
- *   - image_generating  → a placeholder window
- *   - images            → replaces the latest image_generating placeholder
- *   - image_gen_failed  → removes the latest image_generating placeholder
- *   - media_processing  → a placeholder window
- *   - video / audio     → replaces the latest media_processing placeholder
- *   - media_failed      → removes the latest media_processing placeholder
- *   - document_preview  → replaces the window with the same file_id (in place)
- *   - ui                → replaces the window with the same path (in place)
- *   - url / file / images → a new window each
+ * placeholder/dedup rules are the artifact kinds' facts (lib/kinds/artifact.ts,
+ * the mirror of the pump's table): a placeholder kind opens a window, the
+ * kind that `evicts` it removes the latest one (the real artifact replaces
+ * it, a failure only removes), a kind with an `identity` replaces the window
+ * with the same key in place (a preview by file_id, a ui page by path),
+ * every other block kind opens a new window.
  *
  * REPLAY-ON-OPEN: the drainer also persists every final artifact as a chat row
  * and stamps its row id on the frame (`db_message_id`). When the terminal
@@ -84,8 +82,9 @@ function removeLatestOfType(wins: ArtifactWindow[], type: MessageBlock['type']):
 }
 
 /** Insert/replace one artifact block in the window list: skip when its row id
- * is already showing (seed ⇄ live race), replace in place on the
- * document_preview file_id / ui path identity, else append a new window. */
+ * is already showing (seed ⇄ live race), replace in place on the kind's
+ * identity (a preview by file_id, a ui page by path — the PiP twin of the
+ * inline chat's supersede-to-chip rule), else append a new window. */
 function upsertWindow(
   wins: ArtifactWindow[],
   block: MessageBlock,
@@ -102,16 +101,9 @@ function upsertWindow(
     copy[idx] = { ...copy[idx], block, title: titleFor(block), dbId }
     return copy
   }
-  if (block.type === 'document_preview') {
-    const idx = wins.findIndex(
-      (w) => w.block.type === 'document_preview' && w.block.fileId === block.fileId,
-    )
-    if (idx >= 0) return replaceAt(idx)
-  }
-  if (block.type === 'ui' && block.path) {
-    // A re-shown artifact (same workspace file) replaces its window in
-    // place — the PiP twin of the inline chat's supersede-to-chip rule.
-    const idx = wins.findIndex((w) => w.block.type === 'ui' && w.block.path === block.path)
+  const key = identityKey(block)
+  if (key) {
+    const idx = wins.findIndex((w) => w.block.type === block.type && identityKey(w.block) === key)
     if (idx >= 0) return replaceAt(idx)
   }
   return [...wins, { id: allocId(), block, title: titleFor(block), dbId }]
@@ -166,18 +158,16 @@ export function useArtifactWindows(ws: InteractiveWs, chatId: string) {
     setMinimized(new Set())
     if (!chatId) return
 
-    const unsub = subscribe('pty_artifact', (msg: any) => {
+    const unsub = subscribe(WIRE.PTY_ARTIFACT, (msg: any) => {
       if (msg.chat_id && msg.chat_id !== chatId) return
       const event = msg.event
       const t = event?.type
       if (!t) return
-      // Removal events carry no renderable block — drop the placeholder window.
-      if (t === 'image_gen_failed') {
-        setWindows((prev) => removeLatestOfType(prev, 'image_generating'))
-        return
-      }
-      if (t === 'media_failed') {
-        setWindows((prev) => removeLatestOfType(prev, 'media_processing'))
+      const evicts = evictedBy(t)
+      // A removal kind carries no renderable block — it only drops the
+      // latest window of the placeholder it evicts.
+      if (!isArtifactBlock(t)) {
+        if (evicts) setWindows((prev) => removeLatestOfType(prev, evicts as MessageBlock['type']))
         return
       }
       const block = eventToBlock(event)
@@ -185,8 +175,7 @@ export function useArtifactWindows(ws: InteractiveWs, chatId: string) {
       const dbId = typeof event.db_message_id === 'number' ? event.db_message_id : undefined
       setWindows((prev) => {
         let next = prev
-        if (t === 'images') next = removeLatestOfType(next, 'image_generating')
-        if (t === 'video' || t === 'audio') next = removeLatestOfType(next, 'media_processing')
+        if (evicts) next = removeLatestOfType(next, evicts as MessageBlock['type'])
         return upsertWindow(next, block, dbId, allocId)
       })
     })

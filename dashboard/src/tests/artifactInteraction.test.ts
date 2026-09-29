@@ -39,12 +39,12 @@ describe('buildArtifactInteractionText (PTY backchannel framing)', () => {
   })
 })
 
-describe('buildAppActionText (PTY mini-app framing)', () => {
+describe('buildAppActionText (PTY app framing)', () => {
   it('frames the substituted prompt inside a fence with the app trailer', () => {
     const r = buildAppActionText('Brief', 'Ask', 'Analyze March')
     expect('framed' in r).toBe(true)
     const framed = (r as { framed: string }).framed
-    expect(framed).toContain('[action from mini-app "Brief" — Ask]')
+    expect(framed).toContain('[action from app "Brief" — Ask]')
     expect(framed).toContain('```text\nAnalyze March\n```')
     expect(framed).toContain('template was approved by the user')
   })

@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useParams, useNavigate, Navigate } from 'react-router-dom'
 import { useRun, ForbiddenError } from '../api/runs'
+import { isTaskChatId, taskChatId } from '../lib/session/kind'
 
 /**
  * /runs/:runId resolver — task runs render on the chat page now, but old
@@ -15,8 +16,8 @@ export default function RunRedirect() {
 
   useEffect(() => {
     if (!run) return
-    const chatId = run.chat_id || `task-${run.id}`
-    const suffix = chatId.startsWith('task-') ? '?tasks=1' : ''
+    const chatId = run.chat_id || taskChatId(run.id)
+    const suffix = isTaskChatId(chatId) ? '?tasks=1' : ''
     navigate(`/chat/${run.agent}/${chatId}${suffix}`, { replace: true })
   }, [run, navigate])
 

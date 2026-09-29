@@ -101,6 +101,31 @@ describe('computeModelGroups', () => {
     })).toEqual(['codex-cli'])
   })
 
+  it('orders a group by capability tier and carries the tier fields', () => {
+    const layers = {
+      'claude-code-cli': {
+        display_name: 'Claude Code CLI',
+        models: [
+          { value: 'local-x', label: 'Local X' },
+          { value: 'claude-sonnet-5', label: 'Sonnet 5', tier: 3, tier_label: 'balanced', good_at: 'everyday coding' },
+          { value: 'claude-fable-5-1', label: 'Fable 5.1', tier: 1, tier_label: 'frontier', good_at: 'judgement' },
+        ],
+      },
+    }
+    const groups = computeModelGroups({ ...base, layers, agentPaths: ['claude-code-cli'] })!
+    expect(groups[0].models.map(m => m.value)).toEqual([
+      'claude-code-cli::claude-fable-5-1', 'claude-code-cli::claude-sonnet-5', 'claude-code-cli::local-x',
+    ])
+    // The label stays bare: the dropdown draws the tier as the four-dot
+    // mark and puts the word in the tooltip.
+    expect(groups[0].models[0]).toEqual({
+      value: 'claude-code-cli::claude-fable-5-1', label: 'Fable 5.1',
+      tier: 1, tierLabel: 'frontier', goodAt: 'judgement',
+    })
+    // Untiered rows keep a bare label and no tier fields.
+    expect(groups[0].models[2]).toEqual({ value: 'claude-code-cli::local-x', label: 'Local X' })
+  })
+
   it('returns undefined while the catalog is loading or empty', () => {
     expect(computeModelGroups({ ...base, layers: undefined })).toBeUndefined()
     expect(computeModelGroups({ ...base, agentPaths: [] })).toBeUndefined()

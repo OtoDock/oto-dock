@@ -25,7 +25,6 @@ import logging
 import os
 import socket
 import struct
-import sys
 from pathlib import Path
 
 from .otodock_proto import (
@@ -33,6 +32,7 @@ from .otodock_proto import (
     T_OPEN, T_INPUT, T_RESIZE, T_DETACH, T_LIST,
     T_OPENED, T_ERROR, T_OUTPUT, T_EXIT, T_LISTED,
 )
+from .. import config
 
 logger = logging.getLogger("satellite")
 
@@ -342,7 +342,7 @@ class LocalControlServer:
         self._pipe_servers: "list | None" = None
 
     async def start(self) -> None:
-        if sys.platform == "win32":
+        if not config.HOST.posix:
             await self._start_windows()
             return
         self._path = socket_path()
@@ -456,10 +456,10 @@ class LocalControlServer:
         """Defense-in-depth on top of the 0600/0700 file perms: on Linux verify the
         connecting process's uid == ours via SO_PEERCRED, on Windows the peer's
         token-user SID == ours via the named-pipe client PID. Best-effort elsewhere."""
-        if sys.platform == "win32":
+        if not config.HOST.posix:
             return _check_peer_windows(writer)
         sock = writer.get_extra_info("socket")
-        if sock is None or not sys.platform.startswith("linux"):
+        if sock is None or not config.HOST.peercred:
             return True  # rely on the socket-file permissions
         try:
             creds = sock.getsockopt(
@@ -476,7 +476,7 @@ class LocalControlServer:
         session_id = ""
         conn: "_LocalConn | None" = None
         try:
-            if sys.platform == "win32":
+            if not config.HOST.posix:
                 # Match the AF_UNIX byte stream: stdlib pipes are message-mode,
                 # which would tear down on the first >64 KiB output frame.
                 set_pipe_byte_mode(writer)

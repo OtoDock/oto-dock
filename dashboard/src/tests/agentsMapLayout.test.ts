@@ -50,7 +50,7 @@ const dept = (
   id,
   name,
   created_by_sub: '',
-  auto_delegation: true,
+  mode: 'both',
   reach: 'adjacent',
   position_hint: '',
   levels: [
@@ -201,7 +201,7 @@ describe('computeMapLayout', () => {
     expect(bySlug['lone-other'].grayed).toBe(true) // standalone non-member
   })
 
-  it('hideNonMember drops departments with no member agent', () => {
+  it("hideNonMember drops a department whose members are all someone else's", () => {
     const mine = dept('d1', 'Mine', [{ name: 'me', level_id: 'd1-l0' }])
     const other = dept('d2', 'Other', [
       { name: 'them', level_id: 'd2-l0', accessible: false },
@@ -212,6 +212,21 @@ describe('computeMapLayout', () => {
       { hideNonMember: true },
     )
     expect(layout.clusters.map((c) => c.departmentId)).toEqual(['d1'])
+    expect(layout.nodes.map((n) => n.slug)).toEqual(['me'])
+  })
+
+  it('hideNonMember keeps a department with no members at all (a dais to move onto)', () => {
+    // A freshly created department has nobody in it — it must stay on the
+    // map so an agent can be moved there; the feed's `members` (the
+    // server's truth) is what decides, not the polled agents list.
+    const mine = dept('d1', 'Mine', [{ name: 'me', level_id: 'd1-l0' }])
+    const fresh = dept('d3', 'Fresh', [])
+    const layout = computeMapLayout(
+      [agent('me', 'd1', 'd1-l0')],
+      [mine, fresh],
+      { hideNonMember: true, memberOf: new Set(['me']) },
+    )
+    expect(layout.clusters.map((c) => c.departmentId)).toEqual(['d1', 'd3'])
     expect(layout.nodes.map((n) => n.slug)).toEqual(['me'])
   })
 

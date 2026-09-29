@@ -14,6 +14,9 @@
 
 export type DefaultScope = 'user' | 'agent'
 
+/** The two scopes (the proxy's `visibility.SCOPES`); compare `SCOPE.*`, never a quoted word. */
+export const SCOPE = { USER: 'user', AGENT: 'agent' } as const
+
 export type VisibilityMode =
   | 'personal_shared' // collaborative + user  default
   | 'shared_personal' // collaborative + agent default
@@ -115,3 +118,12 @@ export const MODE_GROUPS: { label: string; modes: VisibilityMode[] }[] = [
   { label: 'Collaborative — a team shares this agent', modes: ['personal_shared', 'shared_personal'] },
   { label: 'Private — one space only', modes: ['personal_only', 'shared_only'] },
 ]
+
+/** The synthetic owner of a Shared-only agent's chats (`chats.user_sub`) —
+ *  the mirror of `visibility.py`'s `SHARED_CHAT_OWNER_PREFIX` /
+ *  `is_shared_chat_owner`; the lock-step test reads both. */
+export const SHARED_CHAT_OWNER_PREFIX = 'agent::'
+
+export function isSharedChatOwner(owner: string | null | undefined): boolean {
+  return !!owner && owner.startsWith(SHARED_CHAT_OWNER_PREFIX)
+}

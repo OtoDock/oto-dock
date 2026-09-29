@@ -197,7 +197,7 @@ def test_resolve_via_proxy_posts_writing_flag(monkeypatch):
     creation path on remote sessions instead of failing the lazy pull."""
     captured = {}
     _wire_proxy(monkeypatch, captured)
-    rel, reason = asyncio.run(shared._resolve_via_proxy(
+    rel, agent, reason = asyncio.run(shared._resolve_via_proxy(
         "/users/u/workspace/f.png", writing=True,
     ))
     assert rel == "agent/users/u/workspace/f.png"
@@ -207,7 +207,7 @@ def test_resolve_via_proxy_posts_writing_flag(monkeypatch):
 def test_resolve_via_proxy_defaults_to_read(monkeypatch):
     captured = {}
     _wire_proxy(monkeypatch, captured)
-    rel, reason = asyncio.run(shared._resolve_via_proxy("/users/u/workspace/f.png"))
+    rel, agent, reason = asyncio.run(shared._resolve_via_proxy("/users/u/workspace/f.png"))
     assert rel == "agent/users/u/workspace/f.png"
     assert captured["json"]["writing"] is False
 
@@ -221,8 +221,8 @@ def test_container_absolute_paths_go_through_the_proxy(monkeypatch):
     async def fake_proxy(p, writing=False):
         calls.append((p, writing))
         if "other-agent" in p:
-            return None, "403: outside this session's scope"
-        return p, ""
+            return None, "", "403: outside this session's scope"
+        return p, "pa", ""
 
     monkeypatch.setattr(shared, "_resolve_via_proxy", fake_proxy)
     monkeypatch.setattr(shared, "_unicode_match_on_disk", lambda p: p)
@@ -286,3 +286,80 @@ def test_edit_pdf_resolves_input_as_write(monkeypatch):
     out = asyncio.run(pdf.handle_edit_pdf({"path": "/knowledge/doc.pdf"}))
     assert "File not found" in out
     assert calls == [("/knowledge/doc.pdf", True)]
+
+
+# ---------------------------------------------------------------------------
+# The answer is confined to the caller's own tree
+# ---------------------------------------------------------------------------
+
+
+def _mount(tmp_path, monkeypatch):
+    mount = tmp_path / "agents"
+    (mount / "proj-a/users/pm/workspace").mkdir(parents=True)
+    (mount / "proj-b/config").mkdir(parents=True)
+    (mount / "proj-b/config/agent.md").write_text("VICTIM PERSONA")
+    monkeypatch.setattr(shared, "MOUNT_AGENTS_DIR", str(mount))
+    return mount
+
+
+def _proxy_says(monkeypatch, agents_rel, agent=None):
+    """The hook always names the agent its answer sits in (the host-cache
+    pseudo-agent for a satellite-host pull); a test that gives none gets the
+    answer's first segment, as the hook computes it."""
+    echoed = agents_rel.split("/", 1)[0] if agent is None else agent
+
+    async def fake(path, writing=False):
+        return agents_rel, echoed, ""
+    monkeypatch.setattr(shared, "_resolve_via_proxy", fake)
+
+
+def test_resolve_refuses_a_path_that_lands_in_another_agents_tree(tmp_path, monkeypatch):
+    """The proxy authorized the caller's own (then absent) output; a link now
+    sits there. The answer leaves the caller's tree, so it is refused and the
+    other tree is untouched."""
+    import pytest
+    mount = _mount(tmp_path, monkeypatch)
+    _proxy_says(monkeypatch, "proj-a/users/pm/workspace/out.docx")
+    victim = mount / "proj-b/config/agent.md"
+    selfw = mount / "proj-a/users/pm/workspace"
+    (selfw / "out.docx").symlink_to(os.path.relpath(victim, selfw))
+    with pytest.raises(ValueError, match="leaves this session's agent tree"):
+        asyncio.run(shared._resolve_path("/workspace/out.docx", writing=True))
+    assert victim.read_text() == "VICTIM PERSONA"
+
+
+def test_resolve_admits_the_callers_own_tree_and_prefers_the_echoed_slug(tmp_path, monkeypatch):
+    mount = _mount(tmp_path, monkeypatch)
+    _proxy_says(monkeypatch, "proj-a/users/pm/workspace/out.docx")
+    out = asyncio.run(shared._resolve_path("/workspace/out.docx", writing=True))
+    assert out == str(mount / "proj-a/users/pm/workspace/out.docx")
+    # The proxy's echoed slug binds the tree even when the answer's first
+    # segment says otherwise.
+    import pytest
+    _proxy_says(monkeypatch, "proj-b/config/agent.md", agent="proj-a")
+    with pytest.raises(ValueError, match="leaves this session's agent tree"):
+        asyncio.run(shared._resolve_path("/config/agent.md"))
+    # A slug that is not a plain name binds nothing.
+    _proxy_says(monkeypatch, "../etc/passwd", agent="..")
+    with pytest.raises(ValueError):
+        asyncio.run(shared._resolve_path("/etc/passwd"))
+
+
+def test_resolve_admits_the_sessions_own_host_cache_only(tmp_path, monkeypatch):
+    import pytest
+    mount = _mount(tmp_path, monkeypatch)
+    cache = mount / ".remote-host-cache"
+    (cache / "sess-1" / "d1").mkdir(parents=True)
+    (cache / "sess-2" / "d2").mkdir(parents=True)
+    (cache / "sess-1" / "d1" / "x.docx").write_text("mine")
+    (cache / "sess-2" / "d2" / "y.docx").write_text("theirs")
+    shared.set_request_context("sess-1", "Bearer t")
+    _proxy_says(monkeypatch, ".remote-host-cache/sess-1/d1/x.docx")
+    assert asyncio.run(shared._resolve_path("C:/Users/u/Desktop/x.docx")).endswith("sess-1/d1/x.docx")
+    _proxy_says(monkeypatch, ".remote-host-cache/sess-2/d2/y.docx")
+    with pytest.raises(ValueError, match="leaves this session's agent tree"):
+        asyncio.run(shared._resolve_path("C:/Users/u/Desktop/y.docx"))
+    shared.set_request_context("", "")
+    _proxy_says(monkeypatch, ".remote-host-cache/sess-1/d1/x.docx")
+    with pytest.raises(ValueError):
+        asyncio.run(shared._resolve_path("C:/Users/u/Desktop/x.docx"))

@@ -14,6 +14,7 @@ from tests._paths import REPO_ROOT as _REPO_ROOT
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from satellite import config as sat_config  # noqa: E402
 from satellite.sessions.session_manager import (  # noqa: E402
     _detect_os_user_and_home,
     _detect_user_dirs,
@@ -49,7 +50,7 @@ class TestDetectUserDirsLinux:
             'XDG_MUSIC_DIR="$HOME/Tunes"\n'
             'XDG_VIDEOS_DIR="$HOME/Vids"\n'
         )
-        monkeypatch.setattr("platform.system", lambda: "Linux")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
         dirs = _detect_user_dirs(str(home))
         assert dirs["desktop"]   == f"{home}/CustomDesktop"
         assert dirs["downloads"] == f"{home}/CustomDownloads"
@@ -61,7 +62,7 @@ class TestDetectUserDirsLinux:
     def test_missing_xdg_uses_defaults(self, tmp_path, monkeypatch):
         home = tmp_path / "newhome"
         home.mkdir()
-        monkeypatch.setattr("platform.system", lambda: "Linux")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
         dirs = _detect_user_dirs(str(home))
         # All six keys present with conventional layout.
         assert dirs["desktop"]   == str(home / "Desktop")
@@ -79,7 +80,7 @@ class TestDetectUserDirsLinux:
             'XDG_DESKTOP_DIR="$HOME/CustomDesktop"\n'
             'XDG_DOWNLOAD_DIR="$HOME/CustomDownloads"\n'
         )
-        monkeypatch.setattr("platform.system", lambda: "Linux")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
         dirs = _detect_user_dirs(str(home))
         assert dirs["desktop"]   == f"{home}/CustomDesktop"
         assert dirs["downloads"] == f"{home}/CustomDownloads"
@@ -95,7 +96,7 @@ class TestDetectUserDirsLinux:
             'XDG_PUBLICSHARE_DIR="$HOME/Public"\n'
             'XDG_DESKTOP_DIR="$HOME/Desktop"\n'
         )
-        monkeypatch.setattr("platform.system", lambda: "Linux")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
         dirs = _detect_user_dirs(str(home))
         assert "templates" not in dirs
         assert "publicshare" not in dirs
@@ -106,7 +107,7 @@ class TestDetectUserDirsLinux:
 class TestDetectUserDirsMacOS:
     def test_fixed_layout(self, tmp_path, monkeypatch):
         home = "/Users/dave"
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.DARWIN])
         dirs = _detect_user_dirs(home)
         assert dirs["desktop"]   == "/Users/dave/Desktop"
         assert dirs["downloads"] == "/Users/dave/Downloads"
@@ -120,7 +121,7 @@ class TestDetectUserDirsMacOS:
 class TestDetectUserDirsWindows:
     def test_fixed_layout_forward_slash(self, monkeypatch):
         home = "c:/Users/dave"
-        monkeypatch.setattr("platform.system", lambda: "Windows")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.WINDOWS])
         dirs = _detect_user_dirs(home)
         assert dirs["desktop"]   == "c:/Users/dave/Desktop"
         assert dirs["downloads"] == "c:/Users/dave/Downloads"
@@ -131,7 +132,29 @@ class TestDetectUserDirsWindows:
 
     def test_no_backslashes(self, monkeypatch):
         home = "c:/Users/dave"
-        monkeypatch.setattr("platform.system", lambda: "Windows")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.WINDOWS])
         dirs = _detect_user_dirs(home)
         for value in dirs.values():
             assert "\\" not in value
+
+
+class TestTheTableGatesTheProbes:
+    def test_macos_never_reads_xdg_user_dirs(self, tmp_path, monkeypatch):
+        """A ``~/.config/user-dirs.dirs`` on a Mac (a dotfiles repo, a cross-
+        platform tool) must not turn the Finder layout into XDG folders — the
+        read is the LINUX row's fact alone (core-seams phase 10, audit B4)."""
+        home = tmp_path / "Users" / "dave"
+        (home / ".config").mkdir(parents=True)
+        (home / ".config" / "user-dirs.dirs").write_text('XDG_VIDEOS_DIR="$HOME/Vids"\n')
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.DARWIN])
+        dirs = _detect_user_dirs(str(home))
+        assert dirs["videos"] == str(home / "Movies")
+        monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
+        assert _detect_user_dirs(str(home))["videos"] == f"{home}/Vids"
+
+    def test_a_host_outside_the_families_takes_the_flat_layout(self, tmp_path, monkeypatch):
+        home = tmp_path / "home" / "x"
+        (home / ".config").mkdir(parents=True)
+        (home / ".config" / "user-dirs.dirs").write_text('XDG_VIDEOS_DIR="$HOME/Vids"\n')
+        monkeypatch.setattr(sat_config, "HOST", sat_config.OTHER)
+        assert _detect_user_dirs(str(home))["videos"] == str(home / "Videos")

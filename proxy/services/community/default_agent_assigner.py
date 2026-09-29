@@ -58,6 +58,8 @@ def assign_default_agents(user_sub: str) -> dict[str, str]:
                 user_sub, slug, role, assigned_by="system",
             )
             if inserted:
+                from services.notifications.notification_manager import invalidate_audience
+                invalidate_audience(slug)
                 # Seed per-user template items for the freshly-attached pair.
                 # Failures here don't undo the attach — the user can still
                 # use the agent; admin can re-run reseed-template-items.

@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { MeetingStatus } from '../lib/status/meeting'
 
 export interface Meeting {
   id: string
@@ -10,7 +11,7 @@ export interface Meeting {
   strategy: string
   max_turns: number
   current_round: number
-  status: string
+  status: MeetingStatus
   parent_chat_id: string
   parent_session_id: string | null
   parent_run_id: string | null

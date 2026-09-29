@@ -341,3 +341,38 @@ async def test_continued_task_chat_pump_keeps_ping(pump_end):
     await asyncio.sleep(0)
     assert pump_end["ready"] == [("task-42", "ready")]
     assert pump_end["ephemeral"] == [("u", "task-42")]
+
+
+# --- file_updated: the catalog's file_changes delta ------------------------
+
+
+async def test_a_file_change_is_one_catalog_delta_whoever_watches(monkeypatch):
+    """Frames go to each active member who may see the path, but the
+    catalog's ``file_changes`` delta (app servers, handlers) is emitted
+    once per change: not once per watching member, and not skipped when
+    nobody watches."""
+    from api.apps import catalog
+    from core.remote import file_sync
+    from storage import database as task_store
+    deltas: list[list[str]] = []
+    monkeypatch.setattr(catalog, "file_changed",
+                        lambda users, agent, rel, **kw: deltas.append(sorted(users)))
+    monkeypatch.setattr(nm, "resolve_targets", lambda scope, target: ["u1", "u2", "u3"])
+    monkeypatch.setattr(nm, "acting_role_of", lambda sub, agent: "editor")
+    monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: sub)
+    monkeypatch.setattr(file_sync, "should_sync_to_target", lambda rel, username, role: True)
+    c1, c2 = _conn("c1", active=True), _conn("c2", active=True)
+    nm._user_connections.clear()
+    nm._user_connections.update({"u1": [c1], "u2": [c2]})
+    try:
+        await nm.broadcast_file_updated("agent-x", "workspace/a.md")
+        assert [f["type"] for f in _frames(c1)] == ["file_updated"]
+        assert [f["type"] for f in _frames(c2)] == ["file_updated"]
+        assert deltas == [["u1", "u2"]]
+
+        nm._user_connections.clear()
+        await nm.broadcast_file_updated("agent-x", "workspace/b.md")
+        assert deltas[-1] == []
+        assert len(deltas) == 2
+    finally:
+        nm._user_connections.clear()

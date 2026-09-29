@@ -33,6 +33,8 @@ from pathlib import Path
 
 import config
 from storage.pg import get_conn
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.recover-bin")
 
@@ -82,7 +84,7 @@ def _resolve_scope_owner(rel_path: str) -> tuple[str, str]:
     The scope is derived server-side here, never trusted from a client.
     """
     parts = rel_path.split("/")
-    if len(parts) >= 2 and parts[0] == "users" and parts[1]:
+    if len(parts) >= 2 and parts[0] == layout.USERS and parts[1]:
         # Lazy import: storage.database pulls in heavier deps; importing it at
         # module load risks a cycle (mirrors storage/remote_store.py).
         from storage import database
@@ -92,7 +94,7 @@ def _resolve_scope_owner(rel_path: str) -> tuple[str, str]:
     return ("shared", "")
 
 
-_NON_RECOVERABLE_SEGMENTS = frozenset({".claude", ".codex", ".credentials", ".config"})
+_NON_RECOVERABLE_SEGMENTS = frozenset({".claude", ".codex", layout.CREDENTIALS_DIR, ".config"})
 
 
 def _is_recoverable_path(rel_path: str) -> bool:
@@ -131,13 +133,14 @@ def restore_tier(rel_path: str) -> str:
     """The permission tier required to restore a path — mirrors who may WRITE it.
 
     ``user`` → personal ``users/<slug>/`` (the owner); ``editor`` → shared
-    ``workspace/`` (editor + manager); ``manager`` → ``knowledge/`` + ``config/``
-    (manager only). Anything else falls back to ``manager`` (most restrictive).
+    ``workspace/`` (the workspace tier: contributor, editor, manager);
+    ``manager`` → ``knowledge/`` + ``config/`` (manager only). Anything else
+    falls back to ``manager`` (most restrictive).
     """
     parts = rel_path.split("/")
-    if parts and parts[0] == "users":
+    if parts and parts[0] == layout.USERS:
         return "user"
-    if parts and parts[0] == "workspace":
+    if parts and parts[0] == layout.WORKSPACE:
         return "editor"
     return "manager"
 
@@ -149,8 +152,10 @@ def can_restore(
     """Whether the requester may list / restore / discard this entry.
 
     Mirrors the write-permission tier of the path (you can recover what you
-    could have written). Admins count as manager-tier for the SHARED scopes
-    (workspace/knowledge/config — admins manage agents; ``can_edit`` /
+    could have written): ``can_edit`` is the requester's workspace-tier
+    answer (``UserContext.can_write_workspace``). Admins count as
+    manager-tier for the SHARED scopes (workspace/knowledge/config — admins
+    manage agents; ``can_edit`` /
     ``can_manage`` already include them, ``is_admin`` is a defensive belt for
     callers passing per-agent-only flags) but get NO bypass for personal
     entries: a ``users/<slug>/`` file is restorable by its owner alone. Used
@@ -159,9 +164,9 @@ def can_restore(
     """
     manager_tier = can_manage or is_admin
     tier = restore_tier(entry.get("rel_path", ""))
-    if tier == "manager":
+    if tier == roles.MANAGER:
         return manager_tier
-    if tier == "editor":
+    if tier == roles.EDITOR:
         return can_edit or is_admin
     # tier == "user": the owner restores — nobody else, admins included; an
     # orphaned personal file (slug no longer maps to a user → no owner_sub)
@@ -182,20 +187,30 @@ def _enforce_agent_cap(agent_slug: str, incoming: int) -> None:
     cap = config.RECOVER_BIN_AGENT_MAX_BYTES
     if cap <= 0:
         return
+    # One aggregate per capture; the rows are fetched only when the cap is
+    # exceeded, oldest first, in bounded rounds (the bin is capped in bytes,
+    # not rows, and a capture must never scale with the bin's row count).
     with get_conn() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT entry_id, size FROM recover_bin "
-            "WHERE agent_slug=%s ORDER BY binned_at ASC",
+        total = int(conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS total FROM recover_bin WHERE agent_slug=%s",
             (agent_slug,),
-        ).fetchall()]
-    total = sum(int(r["size"] or 0) for r in rows)
+        ).fetchone()["total"] or 0)
     evicted = 0
-    for r in rows:
-        if total + incoming <= cap:
+    while total + incoming > cap:
+        with get_conn() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT entry_id, size FROM recover_bin "
+                "WHERE agent_slug=%s ORDER BY binned_at ASC LIMIT 200",
+                (agent_slug,),
+            ).fetchall()]
+        if not rows:
             break
-        delete(r["entry_id"])
-        total -= int(r["size"] or 0)
-        evicted += 1
+        for r in rows:
+            if total + incoming <= cap:
+                break
+            delete(r["entry_id"])
+            total -= int(r["size"] or 0)
+            evicted += 1
     if evicted:
         logger.info(
             "recover-bin: evicted %d oldest entries for %s to stay under cap %d bytes",

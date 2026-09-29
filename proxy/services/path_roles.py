@@ -30,6 +30,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from auth.roles import OWNER_TIER, WORKSPACE_TIER
+from core import layout
+
 # Literal token left in path values for session-scoped roles. Expanded at
 # subprocess-spawn time by the bwrap launcher (local) and the satellite
 # path translator (remote) — both have ``session_id`` available there.
@@ -120,19 +123,40 @@ def command_references_protected_path(command: str) -> bool:
 # Agent-config protection — the agent's OWN session config files
 # ---------------------------------------------------------------------------
 
-def is_protected_agent_config_path(path: Path | str) -> bool:
+# The platform's own hook and interceptor scripts, copied into every
+# session's ``.claude`` / ``.codex`` dir, executable, and run on every tool
+# call: writable, they would let an agent remove the permission authority
+# for the rest of the session (no bwrap behind it on a satellite).
+_HOOK_SCRIPTS = frozenset({
+    "permission_gate.py", "tool_result_forwarder.py", "subagent_tracker.py",
+    "stop_tracker.py", "stdio_path_interceptor.py",
+})
+_CODEX_SECRET_FILES = frozenset({"config.toml", "auth.json"})
+
+
+def is_protected_agent_config_path(path: Path | str, *, writing: bool = False) -> bool:
     """True if ``path`` is a platform-generated CLI config file carrying THIS
     session's own secrets — the broker capability token (``OTO_MCP_FETCH_TOKEN``),
     the swapped-in HTTP bearer (local), the session JWT (``PROXY_API_KEY``),
-    the Codex model token (``auth.json``), and instance-config field values.
+    the Codex model token (``auth.json``), and instance-config field values —
+    or, for a WRITE, one of the files the permission system itself runs from.
 
     Matched: ``.claude/*.json`` and ``.codex/{config.toml,auth.json}`` located at
     a session SCOPE ROOT — i.e. the ``.claude``/``.codex`` dir sits directly under
     ``users/<u>/``, ``workspace/`` or ``knowledge/`` (where the platform points
-    ``CLAUDE_CONFIG_DIR``/``CODEX_HOME``). A ``.claude``/``.codex`` nested deeper
-    (e.g. ``workspace/<repo>/.claude/settings.json``) is NOT matched, so an agent
-    working on a repo that itself uses Claude Code / Codex can still read that
-    repo's config — those files hold none of the session's secrets.
+    ``CLAUDE_CONFIG_DIR``/``CODEX_HOME``), or directly under ``/tmp``, the
+    sandbox's ``HOME`` (``/tmp/.claude.json`` included), in case a CLI ever
+    falls back to it. With ``writing`` the set widens to the scope-root dir
+    itself and EVERY direct child of it, plus a package's ``__init__`` one
+    level down: the hook scripts run as ``python3 <dir>/permission_gate.py``,
+    which puts ``<dir>`` first on ``sys.path``, so a planted ``json.py`` (or
+    ``json/__init__.py``) there would run inside the gate; and a directive
+    file there (``CLAUDE.md``, ``AGENTS.md``) is read by every session the
+    dir configures. A ``.claude``/``.codex``
+    nested deeper (e.g. ``workspace/<repo>/.claude/settings.json``) is NOT
+    matched, so an agent working on a repo that itself uses Claude Code /
+    Codex can still read and edit that repo's config — those files hold none
+    of the session's secrets and run none of its hooks.
 
     Prompt-injection / casual-read defense: blocks "read your own config
     and paste the token in chat" plus accidental reads via Read / cat / grep /
@@ -152,22 +176,40 @@ def is_protected_agent_config_path(path: Path | str) -> bool:
     if len(parts) < 2:
         return False
     dotdir, name = parts[-2], parts[-1].lower()
+    if dotdir == "tmp" and name == ".claude.json":
+        return len(parts) == 3 and parts[0] == "/"
+    if writing:
+        if parts[-1] in _STATE_DIRS:
+            return _at_scope_root(parts[:-1])
+        if (len(parts) >= 3 and parts[-3] in _STATE_DIRS and name.startswith("__init__.")
+                and _at_scope_root(parts[:-3])):
+            return True
+        return dotdir in _STATE_DIRS and _at_scope_root(parts[:-2])
     if dotdir == ".claude":
         if not name.endswith(".json"):
             return False
     elif dotdir == ".codex":
-        if name not in ("config.toml", "auth.json"):
+        if name not in _CODEX_SECRET_FILES:
             return False
     else:
         return False
-    # The .claude/.codex dir must sit at a session scope root — not nested in a
-    # repo under workspace/ (a third-party config, secret-free).
-    before = parts[:-2]
+    return _at_scope_root(parts[:-2])
+
+
+_STATE_DIRS = (".claude", ".codex")
+
+
+def _at_scope_root(before: tuple[str, ...]) -> bool:
+    """Whether a ``.claude``/``.codex`` dir under ``before`` is a session's
+    own (a scope root), not one nested in a repo under workspace/ (a
+    third-party config, secret-free)."""
     if not before:
         return False
-    if before[-1] in ("workspace", "knowledge"):
+    if before[-1] in (layout.WORKSPACE, layout.KNOWLEDGE):
         return True
-    if len(before) >= 2 and before[-2] == "users":  # users/<username>/.<dir>
+    if len(before) >= 2 and before[-2] == layout.USERS:  # users/<username>/.<dir>
+        return True
+    if before == ("/", "tmp"):  # the sandbox HOME
         return True
     # An external caller's tree — CLAUDE_CONFIG_DIR / CODEX_HOME of a phone
     # session that is not a platform user: sandbox-virtual ``/caller/.<dir>``,
@@ -180,6 +222,17 @@ def is_protected_agent_config_path(path: Path | str) -> bool:
         if len(rest) in (2, 3):
             return True
     return False
+
+
+def in_session_state_dir(path: Path | str) -> bool:
+    """True for a scope-root ``.claude``/``.codex`` dir or anything under it:
+    the engines' own state (the subscription login, the MCP config with the
+    session token, the hook scripts), which the files API serves to nobody."""
+    if not path:
+        return False
+    parts = Path(str(path)).parts
+    return any(part in _STATE_DIRS and _at_scope_root(parts[:i])
+               for i, part in enumerate(parts))
 
 
 _BG_PATH_SPLIT = re.compile(r"[\\/]+")
@@ -245,21 +298,26 @@ def is_session_runtime_path(
 
 # Scope-root-anchored match for the raw-command backstop below — same boundary
 # as ``is_protected_agent_config_path`` (a repo's nested ``.claude``/``.codex``
-# config is NOT matched), so the two never diverge.
+# config is NOT matched), so the two never diverge. The raw text cannot tell
+# a read from a write, so it carries the WRITE set: a Bash reference to a
+# hook script is refused in both directions.
+_HOOK_SCRIPTS_ALT = "|".join(re.escape(s) for s in sorted(_HOOK_SCRIPTS))
 _AGENT_CONFIG_CMD_RE = re.compile(
-    r'(?:^|[\s/\\"\'=])'                            # boundary before
-    r'(?:users/[^/\s"\']+|workspace|knowledge)/'    # session scope root
-    r'\.(?:claude/[^/\s"\']*\.json'                 # .claude/<x>.json
-    r'|codex/(?:config\.toml|auth\.json))'          # .codex/{config.toml,auth.json}
-    r'(?:$|[\s"\';|&)<>])'                          # boundary after
+    r'(?:^|[\s/\\"\'=])'                                   # boundary before
+    r'(?:(?:users/[^/\s"\']+|workspace|knowledge|tmp)/'    # session scope root
+    r'\.(?:claude/(?:[^/\s"\']*\.json|' + _HOOK_SCRIPTS_ALT + r')'
+    r'|codex/(?:config\.toml|auth\.json|hooks\.json|' + _HOOK_SCRIPTS_ALT + r'))'
+    r'|tmp/\.claude\.json)'                                # the sandbox HOME's own
+    r'(?:$|[\s"\';|&)<>])'                                 # boundary after
 )
 
 
 def command_references_protected_agent_config(command: str) -> bool:
     """Raw-text backstop for ``is_protected_agent_config_path``: catch a
     bash command referencing the agent's own scope-root CLI config
-    (``users/<u>/.claude/*.json``, ``workspace/.codex/config.toml``, …) BEFORE
-    the admin-on-admin-agent bash fast-path, so the read-deny is universal —
+    (``users/<u>/.claude/*.json``, ``workspace/.codex/config.toml``, …) or
+    the hook scripts and settings the permission system runs from BEFORE
+    the admin-on-admin-agent bash fast-path, so the deny is universal —
     mirrors the credentials ``command_references_protected_path`` placement.
     This matches on the RAW command BEFORE any unwrap, so a literal reference
     wrapped in ``bash -c "cat .codex/auth.json"`` / ``$(cat …/auth.json)`` is
@@ -295,12 +353,11 @@ ROLES = (
 #
 # Two distinct tiers (`/config/` is OWNER-ONLY, but `/workspace/`
 # is collaborative).
-#   - ``_PRIVILEGED`` (editor+manager+admin) gates ``shared_workspace`` —
-#     editor needs the path rendered so MCPs writing to /workspace/ work.
-#   - ``_OWNER_TIER`` (manager+admin) gates ``config`` — editor/viewer
+#   - ``WORKSPACE_TIER`` (contributor+editor+manager+admin) gates ``shared_workspace`` —
+#     they need the path rendered so MCPs writing to /workspace/ work.
+#   - ``OWNER_TIER`` (manager+admin) gates ``config`` — editor/viewer
 #     get empty (no /config/ in their session at all).
-_PRIVILEGED = ("manager", "editor", "admin")
-_OWNER_TIER = ("manager", "admin")
+# Both are the authority's (``auth/roles``).
 
 # Where an external caller's private tree is mounted (one fixed name — a
 # session only ever sees its own caller). Owned by external_identity.
@@ -362,9 +419,9 @@ def resolve_role(
 
     if role == "workspace":
         if external:
-            base = f"{_EXTERNAL_HOME}/workspace"
+            base = f"{_EXTERNAL_HOME}/{layout.WORKSPACE}"
         else:
-            base = f"/users/{username}/workspace" if username else "/workspace"
+            base = layout.virtual_workspace(username)
         return f"{base}/{sp}" if sp else base
 
     if role == "user_root":
@@ -377,24 +434,24 @@ def resolve_role(
         elif not username:
             return ""
         else:
-            base = f"/users/{username}"
+            base = layout.virtual_user_root(username)
         return f"{base}/{sp}" if sp else base
 
     if role == "shared_workspace":
         # The agent-shared workspace mount. Available to:
-        #   - manager/admin user-scoped sessions (mounted alongside their
+        #   - workspace-tier user-scoped sessions (mounted alongside their
         #     own user dir)
         #   - agent-scoped sessions (the only workspace they have)
         #   - external callers with a private tree, per the route role
         # Viewer user-scoped / viewer external: no access; return empty.
         if external:
-            if user_role not in _PRIVILEGED:
+            if user_role not in WORKSPACE_TIER:
                 return ""
-            base = "/workspace"
+            base = layout.V_WORKSPACE
         elif not username:
-            base = "/workspace"  # agent-scoped
-        elif user_role in _PRIVILEGED:
-            base = "/workspace"
+            base = layout.V_WORKSPACE  # agent-scoped
+        elif user_role in WORKSPACE_TIER:
+            base = layout.V_WORKSPACE
         else:
             return ""
         return f"{base}/{sp}" if sp else base
@@ -412,8 +469,8 @@ def resolve_role(
         # here), but is still the manager and DOES get /config. The visibility
         # resolver passes ``force_config=config_visible`` so this stays in
         # lock-step with the bwrap mount.
-        if force_config or (username and user_role in _OWNER_TIER):
-            return "/config"
+        if force_config or (username and user_role in OWNER_TIER):
+            return layout.V_CONFIG
         return ""
 
     if role == "knowledge_dir":
@@ -421,7 +478,7 @@ def resolve_role(
         # (RW for manager/admin; RO for editor/viewer; RO for agent-scope
         # sessions). Universally available — unlike workspace, knowledge
         # reads from the SAME dir regardless of session scope.
-        return f"/knowledge/{sp}" if sp else "/knowledge"
+        return f"{layout.V_KNOWLEDGE}/{sp}" if sp else layout.V_KNOWLEDGE
 
     if role == "credentials_dir":
         if not sp:
@@ -435,8 +492,8 @@ def resolve_role(
         #   knowledge dir (universally visible to agent-scope sessions of
         #   this agent; never visible to user-scope sessions).
         if username:
-            return f"/users/{username}/.credentials/{sp}"
-        return f"/knowledge/.credentials/{sp}"
+            return f"{layout.virtual_user_root(username)}/{layout.CREDENTIALS_DIR}/{sp}"
+        return f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}/{sp}"
 
     raise ValueError(f"Unknown path role: {role!r}; valid roles: {ROLES}")
 

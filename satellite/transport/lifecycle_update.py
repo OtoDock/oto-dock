@@ -18,6 +18,8 @@ import os
 import time
 
 from ..config import otodock_dir, relaunch_self, venv_exe
+from ..host import auth_paths
+from .. import config
 
 logger = logging.getLogger("satellite")
 
@@ -78,7 +80,6 @@ async def _self_uninstall_and_exit() -> None:
     import os
     import shutil
     import subprocess
-    import sys
     from pathlib import Path
 
     # Guard against double-invocation. BOTH the inbound `uninstall` WS message
@@ -91,10 +92,8 @@ async def _self_uninstall_and_exit() -> None:
     _self_uninstall_and_exit._started = True
 
     oto_dir = otodock_dir()
-    is_windows = sys.platform == "win32"
-    uninstall_script = (
-        oto_dir / "satellite" / ("uninstall.ps1" if is_windows else "uninstall.sh")
-    )
+    is_windows = not config.HOST.posix
+    uninstall_script = oto_dir / "satellite" / f"uninstall{config.HOST.script_suffix}"
 
     script_spawned = False
     try:
@@ -128,7 +127,7 @@ async def _self_uninstall_and_exit() -> None:
                     ),
                 }
                 spawned = False
-                if sys.platform == "linux" and shutil.which("systemd-run"):
+                if config.HOST.service_manager == config.SERVICE_SYSTEMD and shutil.which("systemd-run"):
                     try:
                         subprocess.Popen(
                             ["systemd-run", "--user", "--collect",
@@ -234,13 +233,10 @@ def _resolve_base_python() -> str:
     import shutil
     import sys
 
-    if sys.platform == "win32":
-        # Base python sits at the prefix root on Windows (Scripts/ is venv-only).
-        cand = os.path.join(sys.base_prefix, "python.exe")
-        name = "python.exe"
-    else:
-        cand = os.path.join(sys.base_prefix, "bin", "python3")
-        name = "python3"
+    # The base interpreter's place under the prefix is the host's fact
+    # (Windows keeps it at the prefix root — Scripts/ is venv-only).
+    cand = os.path.join(sys.base_prefix, *config.HOST.base_python)
+    name = config.HOST.base_python[-1]
     if os.path.exists(cand):
         return cand
     for nm in ("python3", "python"):
@@ -407,8 +403,7 @@ async def _self_update_and_restart(payload: dict) -> None:
         sat_new.mkdir(parents=True, exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz") as tar:
             for member in tar.getmembers():
-                mpath = (sat_new / member.name).resolve()
-                if not str(mpath).startswith(str(sat_new.resolve())):
+                if not auth_paths.is_path_under_root(sat_new / member.name, sat_new):
                     raise ValueError(f"tarball escaped: {member.name}")
             tar.extractall(sat_new, filter="data")
 
@@ -426,7 +421,7 @@ async def _self_update_and_restart(payload: dict) -> None:
         new_req = new_req_path.read_text() if new_req_path.is_file() else ""
         reuse_venv = old_venv.is_dir() and old_req == new_req
 
-        if sys.platform == "win32":
+        if config.HOST.locks_running_files:
             # --- Windows path: stage everything into sat_new/, let runner.ps1
             # do the rename on the next logon-task start (pre-import, so no
             # files are open yet). The in-process os.replace below would fail

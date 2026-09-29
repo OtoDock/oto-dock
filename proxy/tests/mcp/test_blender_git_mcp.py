@@ -16,6 +16,7 @@ from services.mcp import mcp_registry as reg
 from services.mcp import mcp_installer as inst
 
 from tests._paths import REPO_ROOT as _ROOT
+from core import placement
 _MANIFEST = _ROOT / "mcps" / "community" / "blender" / "manifest.json"
 if not _MANIFEST.is_file():
     # community/* MCPs ship from the separate community-mcps repo and are
@@ -112,9 +113,10 @@ def test_manifest_declares_git_system_requirement(manifest):
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, r=False, d=None, g=None):
-    return reg._device_placement_reason(
-        m, is_remote=r, target_has_display=d, target_device_grants=g or set()
-    )
+    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+        kind=placement.KIND_ADMIN_REMOTE if r else placement.KIND_LOCAL,
+        machine_id="m" if r else "", has_display=d, device_grants=g or set(),
+    ))
 
 
 def test_gate_local_excluded(manifest):

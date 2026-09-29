@@ -87,7 +87,7 @@ If SerpAPI isn't configured, returns an `{"error": "..."}` — surface it to the
 
 Download an image URL and save it to the agent's workspace. Use only when the user explicitly asks to save an image (e.g. "save the second one to my photos folder").
 
-- `url`: HTTPS URL to download.
+- `url`: http(s) URL to download. The host, and every redirect it answers with, must resolve to a public address; a private or internal host is refused with the reason.
 - `dest_path`:
   - Empty (default) → auto-generates `images/saved_<uuid>.<ext>`.
   - Relative (e.g. `"iceland/landscape1.jpg"`) → joined under your workspace root.

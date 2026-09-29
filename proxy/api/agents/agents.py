@@ -16,22 +16,30 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, require_auth, require_write
+from core import placement
+from auth.providers import (
+    UserContext, get_current_user, require_admin, require_auth, require_creator, require_write,
+    session_bound_to,
+)
 from storage.agents import agent_store
 from storage import database as task_store
 
 from api.agents._common import _get_execution_paths
 from api.agents._router import router
+from core.session import session_kind
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.agents")
 
-# Human labels for the engine-enablement gate's 403s (capabilities aren't
-# imported here to keep this module free of layer machinery).
-_ENGINE_LABELS = {
-    "claude-code-cli": "Claude Code",
-    "codex-cli": "Codex",
-    "direct-llm": "Direct LLM",
-}
+
+
+def _engine_label(execution_path: str) -> str:
+    """The engine's display name for the enablement gate's 403s — read from
+    the registry, so a fourth engine names itself."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(execution_path)
+    return caps.display_name if caps else execution_path
 
 # Section route modules — imported for their ``@router`` registrations. ORDER
 # MATTERS: discovery -> files -> user-context, then the CRUD routes below, to
@@ -41,6 +49,7 @@ from api.agents import files as _files
 from api.agents import user_context as _user_context
 from api.agents import activity as _activity
 from api.agents import knowledge_libraries as _knowledge_libraries
+from core.execution_layer import DEFAULT_EXECUTION_PATH
 
 # Backwards-compatible re-exports: api.media.* and the test-suite import these
 # helpers/handlers from ``api.agents.agents``.
@@ -60,18 +69,6 @@ discard_recover_bin = _files.discard_recover_bin
 # pins the route set against exactly that.
 _SECTION_MODULES = (_discovery, _files, _user_context, _activity,
                     _knowledge_libraries)
-
-
-def _require_admin(user: UserContext | None) -> UserContext:
-    if not user or user.role != "admin":
-        raise HTTPException(403, "Admin only")
-    return user
-
-
-def _require_manage(user: UserContext | None) -> UserContext:
-    if not user or user.role not in ("admin", "creator"):
-        raise HTTPException(403, "Admin or creator only")
-    return user
 
 
 class CreateAgentRequest(BaseModel):
@@ -101,7 +98,7 @@ class UpdateAgentRequest(BaseModel):
     default_effort: str | None = None
     color: str | None = None
     description: str | None = None
-    execution_target: str | None = None  # "local" or machine_id
+    execution_target: str | None = None  # placement.LOCAL or a machine id
     default_scope: str | None = None  # "user" | "agent"
     collaborative: bool | None = None  # visibility-modes second axis
     # Per-agent default execution mode: "" (unset) | "interactive" | "-p".
@@ -126,9 +123,9 @@ class SetDefaultForNewUsersBody(BaseModel):
 @router.post("/v1/agents")
 async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_current_user)):
     """Create a new agent with folder structure and DB record."""
-    u = _require_manage(user)
+    u = require_creator(user)
 
-    if req.admin_only and u.role != "admin":
+    if req.admin_only and not u.is_admin:
         raise HTTPException(403, "Only admins can create admin-only agents")
 
     # Generate/validate slug
@@ -165,22 +162,24 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     # connected on BOTH the platform and the creator's own account — claude-code-cli,
     # then codex-cli, never direct-llm — so the agent works zero-config. Falls back
     # to claude-code-cli. See subscription_pool.default_execution_layer_for_creator.
-    valid_paths = {"claude-code-cli", "direct-llm", "codex-cli"}
+    from core.session.session_manager import valid_execution_paths
+    valid_paths = valid_execution_paths()
     if req.execution_path:
         if req.execution_path not in valid_paths:
-            raise HTTPException(400, f"Invalid execution_path. Valid: {valid_paths}")
+            raise HTTPException(
+                400, f"Invalid execution_path. Valid: {sorted(valid_paths)}")
         # Same platform-configured gate as PATCH (cookie-admin bypass; see
         # update_agent). The no-picker auto-default below is deliberately NOT
         # gated — it may fall back to claude-code-cli on a bare platform so a
         # fresh install can always create its first agent.
-        if not (u.role == "admin" and not u.is_api_key):
+        if not (u.is_admin and not u.is_api_key):
             from services.engines import subscription_pool
             if not await asyncio.to_thread(
                 subscription_pool.layer_platform_configured, req.execution_path
             ):
                 raise HTTPException(
                     403,
-                    f"No {_ENGINE_LABELS.get(req.execution_path, req.execution_path)} "
+                    f"No {_engine_label(req.execution_path)} "
                     "subscription is connected on this platform",
                 )
         execution_path = req.execution_path
@@ -196,11 +195,11 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
 
     # Create folder structure
     try:
-        (agent_dir / "config" / "context").mkdir(parents=True, exist_ok=True)
-        (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
-        (agent_dir / "users").mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.CONFIG / layout.CONTEXT).mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.USERS).mkdir(parents=True, exist_ok=True)
 
-        persona_file = agent_dir / "config" / "agent.md"
+        persona_file = agent_dir / layout.CONFIG / "agent.md"
         persona_file.write_text(f"# {req.display_name}\n\n")
     except Exception as e:
         # Clean up on failure
@@ -237,16 +236,13 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
         # Non-critical
         logger.debug(f"Seeding core MCPs/skills for new agent {slug} failed: {exc}")
 
-    # Assign creator as manager of the new agent (preserve existing assignments)
+    # The creator manages the new agent. One additive insert: rewriting the
+    # person's whole role list here would undo an admin's concurrent change.
     from storage import database as task_store
     try:
-        current_roles = await asyncio.to_thread(task_store.get_user_agent_roles, u.sub)
-        if slug not in current_roles:
-            current_roles[slug] = "manager"
-            await asyncio.to_thread(
-                task_store.set_user_agents, u.sub, list(current_roles.keys()), u.sub,
-                agent_roles=current_roles,
-            )
+        await asyncio.to_thread(task_store.add_user_agent, u.sub, slug, roles.MANAGER, u.sub)
+        from services.notifications.notification_manager import invalidate_audience
+        invalidate_audience(slug)
     except Exception as exc:
         # Non-critical
         logger.debug(f"Assigning creator as manager of new agent {slug} failed: {exc}")
@@ -254,7 +250,7 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     return agent
 
 
-@router.patch("/v1/agents/{name}")
+@router.patch("/v1/agents/{name}", dependencies=[Depends(session_bound_to("name"))])
 async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = Depends(get_current_user)):
     """Update agent configuration."""
     # Editing an agent's config requires manager authority OVER THIS AGENT and
@@ -268,15 +264,18 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     if not agent_store.agent_exists(name):
         raise HTTPException(404, "Agent not found")
 
-    if req.admin_only and u.role != "admin":
+    if req.admin_only and not u.is_admin:
         raise HTTPException(403, "Only admins can set admin-only flag")
 
-    valid_paths = {"claude-code-cli", "direct-llm", "codex-cli"}
+    from core.session.session_manager import valid_execution_paths
+    valid_paths = valid_execution_paths()
 
     if req.execution_paths is not None:
         for p in req.execution_paths:
             if p not in valid_paths:
-                raise HTTPException(400, f"Invalid execution path: {p}. Valid: {valid_paths}")
+                raise HTTPException(
+                    400,
+                    f"Invalid execution path: {p}. Valid: {sorted(valid_paths)}")
         if len(req.execution_paths) == 0:
             raise HTTPException(400, "At least one execution path required")
         # Platform-configured gate on NEWLY-ADDED engines only (set difference
@@ -286,7 +285,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         # only: the config-MCP authenticates with a session token carrying the
         # session owner's sub, so an admin-created task/trigger session would
         # otherwise hand the bypass to a prompt-injectable LLM turn.
-        if not (u.role == "admin" and not u.is_api_key):
+        if not (u.is_admin and not u.is_api_key):
             from services.engines import subscription_pool
             _stored = agent_store.get_agent(name) or {}
             _current_set = set(_get_execution_paths(_stored))
@@ -298,7 +297,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                 ):
                     raise HTTPException(
                         403,
-                        f"No {_ENGINE_LABELS.get(p, p)} subscription is "
+                        f"No {_engine_label(p)} subscription is "
                         "connected on this platform",
                     )
 
@@ -327,22 +326,27 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                 req.execution_paths if req.execution_paths is not None
                 else _get_execution_paths(_existing)
             )
-            if _layers and not ({"claude-code-cli", "codex-cli"} & _layers & _paths):
+            from core.session.session_manager import get_all_layers
+            _pty_layers = {
+                p for p, l in get_all_layers().items()
+                if l.capabilities.runtime.supports_interactive_pty
+            }
+            if _layers and not (_pty_layers & _layers & _paths):
                 raise HTTPException(
                     400,
                     "default_execution_mode can only be set when the agent's default "
-                    "model runs on a CLI execution layer (claude-code-cli or codex-cli) "
-                    "that this agent uses.",
+                    "model runs on an engine with an interactive terminal "
+                    f"({' or '.join(sorted(_pty_layers))}) that this agent uses.",
                 )
 
     # Validate execution_target
-    if req.execution_target is not None and req.execution_target != "local":
+    if req.execution_target is not None and not placement.is_local(req.execution_target):
         # Per-user satellite isolation: setting an agent's default
         # execution target is admin-only AND the target machine must be
         # admin-owned. Non-admin users (managers) cannot point an agent at
         # any remote machine via this endpoint; they may set a personal
         # override via PUT /v1/users/me/remote-target instead.
-        if u.role != "admin":
+        if not u.is_admin:
             raise HTTPException(
                 403,
                 "Only admins can set an agent's default remote execution target. "
@@ -352,7 +356,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         machine = remote_store.get_remote_machine(req.execution_target)
         if not machine:
             raise HTTPException(400, "Remote machine not found")
-        if machine.get("pairing_scope", "") != "admin":
+        if not placement.machine_is_admin_paired(machine):
             raise HTTPException(
                 403,
                 "Agent default execution targets must be admin-paired machines. "
@@ -360,11 +364,13 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                 "is user-paired; user-paired machines are for "
                 "personal session overrides only.",
             )
-        # Direct LLM cannot run remotely
+        # An engine that cannot run on a satellite refuses a remote target
         agent = agent_store.get_agent(name)
         ep = req.execution_paths[0] if req.execution_paths else (agent or {}).get("execution_path", "")
-        if ep == "direct-llm":
-            raise HTTPException(400, "Direct LLM agents always run locally")
+        from core.session.session_manager import get_layer_capabilities
+        _ec = get_layer_capabilities(ep)
+        if _ec is not None and not _ec.runtime.supports_remote_execution:
+            raise HTTPException(400, f"{_ec.display_name} agents always run locally")
 
     # Department assignment (agents map). The endpoint gate above
     # (can_manage_agent) still applies — this field gate NARROWS within it,
@@ -384,7 +390,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     _req_dept = getattr(req, "department_id", None)
     _req_dept_level = getattr(req, "department_level_id", None)
     if _req_dept is not None or _req_dept_level is not None:
-        if u.acting_sub is None or u.role not in ("admin", "creator"):
+        if u.acting_sub is None or not roles.is_creator_or_above(u.role):
             raise HTTPException(
                 403,
                 "Only admins and creators can change an agent's department.",
@@ -412,7 +418,7 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     fields = req.model_dump(exclude_none=True)
     # Keep the PRIMARY execution layer consistent with the default model whenever
     # EITHER is updated. A no-picker session/task uses (primary layer + default
-    # model), and a model only runs on its OWN layer (e.g. gpt-5.6-sol is codex-cli-
+    # model), and a model only runs on its OWN layer (e.g. gpt-6-sol is codex-cli-
     # only), so a mismatch makes delegated/no-picker runs hard-reject the model
     # (the personal-assistant delegate bug). resolve_execution_path reads the
     # scalar `execution_path`, so reconciling it here is what fixes those runs.
@@ -426,7 +432,8 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
             paths = list(fields.pop("execution_paths"))
         else:
             paths = _get_execution_paths(existing)  # current enabled set [primary, …]
-        primary = paths[0] if paths else (existing.get("execution_path") or "claude-code-cli")
+        primary = paths[0] if paths else (
+            existing.get("execution_path") or DEFAULT_EXECUTION_PATH)
         dm = fields.get("default_model") or existing.get("default_model", "")
         if dm:
             dm_layers = config.get_model_layers(dm)
@@ -451,9 +458,9 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     if "execution_target" in fields:
         from storage import remote_store
         _target = fields.pop("execution_target")
-        current = (agent_store.get_agent(name) or {}).get("execution_target", "local")
+        current = (agent_store.get_agent(name) or {}).get("execution_target") or placement.LOCAL
         if _target != current:
-            if _target == "local":
+            if placement.is_local(_target):
                 await asyncio.to_thread(remote_store.remove_agent_remote_target, name)
             else:
                 await asyncio.to_thread(
@@ -512,14 +519,15 @@ async def admin_set_default_for_new_users(
     the attach pass. Admin can manually attach existing users via the
     user settings page.
     """
-    _require_admin(user)
+    require_admin(user)
     if not agent_store.agent_exists(name):
         raise HTTPException(404, "Agent not found")
     if body.enabled:
-        if body.role not in ("viewer", "editor", "manager"):
+        if body.role not in roles.AGENT_ROLES:
             raise HTTPException(
                 400,
-                "When enabled=True, role must be one of 'viewer', 'editor', 'manager'",
+                "When enabled=True, role must be one of "
+                + ", ".join(repr(r) for r in roles.AGENT_ROLES),
             )
         new_role = body.role
     else:
@@ -541,7 +549,7 @@ async def admin_set_default_for_new_users(
 @router.delete("/v1/agents/{name}")
 async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = Depends(get_current_user)):
     """Delete an agent permanently. Admin only, requires slug confirmation."""
-    _require_admin(user)
+    require_admin(user)
 
     if req.confirm_slug != name:
         raise HTTPException(400, "Slug confirmation does not match")
@@ -561,6 +569,14 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
             "Subscription cleanup raised for agent %s (continuing with agent delete)",
             name,
         )
+
+    # App servers stop BEFORE the tree goes (a process on an unlinked
+    # release would linger until its idle stop; APPS.md "Lifecycle").
+    try:
+        from services.apps import app_lifecycle
+        await app_lifecycle.stop_agent_apps(name)
+    except Exception:
+        logger.exception("App servers of agent %s did not stop cleanly (continuing)", name)
 
     # Knowledge-library consumers must be read BEFORE the DB cascade wipes
     # the attachment rows — their mirror dirs live in OTHER agents' trees,
@@ -619,18 +635,37 @@ async def list_agent_conversations(
     # Matches the frontend tab gate (canManage, AgentLayout.tsx).
     require_write(u, name)
 
-    # The Conversations tab is for EXTERNAL conversations (phone today, more
-    # sources later). Dashboard chats (source_type='chat') live on the
-    # chat-history page — exclude them here so the tab works for every agent.
+    # The Conversations tab is for EXTERNAL conversations — the kinds an
+    # out-of-band driver owns (phone today; a new one declares itself in
+    # core/session/session_kind). Dashboard chats and task runs live in the
+    # sidebar, so the tab works for every agent.
     conversations = await asyncio.to_thread(
         task_store.get_agent_conversations, name,
-        source_type=source_type, exclude_sources=("chat",), offset=offset, limit=limit,
+        source_type=source_type, source_types=session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES,
+        offset=offset, limit=limit,
     )
     total = await asyncio.to_thread(
         task_store.count_agent_conversations, name,
-        source_type=source_type, exclude_sources=("chat",),
+        source_type=source_type, source_types=session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES,
     )
     return {"conversations": conversations, "total": total}
+
+
+def can_open_chat(u: UserContext, chat: dict) -> bool:
+    """May this user open this chat BY ID — the rule the detail route and
+    the dashboard's ``resume_chat`` share. The REST rule
+    (``api/agents/chats.py::can_access_chat``: the owner, an admin, a
+    Shared-only agent's ``agent::`` pool for its assigned users, a task
+    run's chat by its run) plus phone conversations for the agent's
+    managers, which is who the conversations list serves. The chat's OWNER
+    decides, never the agent's current mode: a per-user chat from before an
+    agent turned Shared-only stays its owner's."""
+    from api.agents.chats import can_access_chat
+    from core.session.visibility import is_phone_chat_owner
+    if session_kind.of_chat(chat) is session_kind.PHONE \
+            or is_phone_chat_owner(chat.get("user_sub")):
+        return u.is_admin or u.can_manage_agent(chat.get("agent", ""))
+    return can_access_chat(u, chat)
 
 
 @router.get("/v1/chats/{chat_id}/detail")
@@ -638,27 +673,14 @@ async def get_chat_detail(
     chat_id: str,
     user: UserContext = Depends(get_current_user),
 ):
-    """Get chat metadata with access control.
-
-    Accessible to: chat owner, admins, or managers of Shared-only/phone agents.
+    """Get chat metadata with access control (``can_open_chat``): the
+    owner, an admin, an assigned user for a Shared-only agent's shared
+    history or an agent-scope task run, a manager for a phone conversation.
     """
     u = require_auth(user)
     chat = await asyncio.to_thread(task_store.get_chat, chat_id)
     if not chat:
         raise HTTPException(404, "Chat not found")
-
-    # Access check: owner, admin, or an assigned user of a Shared-only agent's
-    # agent-scoped chat (phone conversations, tasks, meetings, shared history).
-    if chat["user_sub"] != u.sub and u.role != "admin":
-        from core.session.visibility import is_shared_chat_owner, is_shared_only
-        agent = chat.get("agent", "")
-        is_assigned = u.can_access_agent(agent)
-        is_agent_scoped = (
-            is_shared_only(agent)
-            or chat.get("source_type") == "phone"
-            or is_shared_chat_owner(chat.get("user_sub", ""))
-        )
-        if not (is_assigned and is_agent_scoped):
-            raise HTTPException(403, "Access denied")
-
+    if not await asyncio.to_thread(can_open_chat, u, chat):
+        raise HTTPException(403, "Access denied")
     return chat

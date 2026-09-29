@@ -8,6 +8,45 @@ import { useActivityDisplay } from '../../hooks/useActivityDisplay'
 import BlockRenderer from './ChatBlockRenderer'
 import ActivityGroup from './ActivityGroup'
 import ErrorBoundary from '../ErrorBoundary'
+import type { QueuedMessage } from '../../store/types'
+
+/** The chips of a queued or held message, from the meta the frame carried:
+ * the saved photos through the agent files URL (the same URL the history
+ * bubbles use) and one badge per file. */
+function QueuedAttachments({ item, agentName }: { item: QueuedMessage; agentName?: string }) {
+  const images = (item.images ?? []).filter(i => i.path)
+  const files = item.files ?? []
+  if (!images.length && !files.length) return null
+  return (
+    <div className="flex flex-col gap-1 mb-1" data-testid="queued-attachments">
+      {images.length > 0 && (
+        <div className="flex gap-2 flex-wrap">
+          {images.map((img, i) => (
+            agentName ? (
+              <img
+                key={`qi-${i}`}
+                src={`/v1/agents/${agentName}/files/${encodeURI(img.path!)}`}
+                alt={img.name}
+                className="w-14 h-14 rounded-lg object-cover border border-white/30"
+              />
+            ) : (
+              <span key={`qi-${i}`} className="text-xs text-white/80">{img.name}</span>
+            )
+          ))}
+        </div>
+      )}
+      {files.map((f, i) => (
+        <div key={`qf-${i}`} className="flex items-center gap-1.5 text-xs text-white/80 bg-white/10 rounded-md px-2.5 py-1.5 w-fit">
+          <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          <span className="truncate max-w-[200px]">{f.name}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 interface Props {
   messages: DisplayMessage[]
@@ -29,7 +68,11 @@ interface Props {
   onDismissPreview?: (fileId: string, key?: { snapshotId?: string; dbMessageId?: number }) => void
   onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }>
   streaming?: boolean
-  queuedMessages?: string[]
+  queuedMessages?: QueuedMessage[]
+  /** Steers the engine accepted but has not reached yet (held until the
+   * next block boundary): shown, never editable — they already sit in the
+   * running turn. */
+  pendingSteers?: QueuedMessage[]
   onCancelQueued?: (index: number) => void
   // Lazy chat-history scroll-back (loads older turns when the top comes into view).
   onLoadOlder?: () => void
@@ -156,6 +199,7 @@ export default function ChatMessages({
   onArtifactInteraction,
   streaming,
   queuedMessages,
+  pendingSteers,
   onCancelQueued,
   onLoadOlder,
   hasMoreOlder,
@@ -703,17 +747,35 @@ export default function ChatMessages({
           )
         })}
 
+        {/* Held steers: in the engine already, waiting for its next step —
+            shown as the message they are, with no caption (the bubble alone
+            says it was sent). */}
+        {pendingSteers && pendingSteers.length > 0 && (
+          <div className="space-y-2" data-testid="pending-steers">
+            {pendingSteers.map((item, i) => (
+              <div key={`s-${i}`} className="flex justify-end">
+                <div className="max-w-[85%] rounded-xl px-4 py-3 bg-brand/40 text-white opacity-60">
+                  <QueuedAttachments item={item} agentName={agentName} />
+                  {item.text && <p className="text-sm whitespace-pre-wrap">{item.text}</p>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Queued messages */}
         {queuedMessages && queuedMessages.length > 0 && (
           <div className="space-y-2">
-            {queuedMessages.map((text, i) => (
+            {queuedMessages.map((item, i) => (
               <div key={`q-${i}`} className="flex justify-end">
                 <div className="max-w-[85%] rounded-xl px-4 py-3 bg-brand/40 text-white opacity-60 relative group">
-                  <p className="text-sm">{text}</p>
+                  <QueuedAttachments item={item} agentName={agentName} />
+                  {item.text && <p className="text-sm whitespace-pre-wrap">{item.text}</p>}
                   <span className="text-xs opacity-75">queued</span>
                   {onCancelQueued && (
                     <button
                       onClick={() => onCancelQueued(i)}
+                      aria-label="Cancel queued message"
                       className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white text-xs
                                  opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center"
                     >

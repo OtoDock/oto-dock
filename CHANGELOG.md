@@ -6,13 +6,98 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 OtoDock uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each
 release's entry is also published as its [GitHub Release](https://github.com/OtoDock/oto-dock/releases).
 
-Upgrading is `git pull`, then `docker compose pull && docker compose up -d` —
-the compose file pins each release's image version, so pulling the repo is what
-moves an install to the new release. Anything that
-changes the behaviour of a running install — a config key, a schema migration, a
-changed default — is called out explicitly under its version.
+A Docker install upgrades with `scripts/upgrade.sh`, a source checkout with
+`git pull` and a rebuild (docs.otodock.io/administration/upgrading). Anything
+that changes the behaviour of a running install, a config key, a schema
+migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
+
+## [1.7.0] — 2026-09-29
+
+### Added
+- **Apps are now a platform of their own.** Every app has its own page, can have a
+  server and a database everyone works on live, wake on a schedule, a webhook or a
+  finished task, and talk to outside services with keys the agent never sees.
+- **The agent checks and deploys its own apps.** The platform refuses what the sandbox
+  would block, viewers keep the last copy until the new one answers, a change in what an
+  app may do waits for your approval, said in plain words, and you can roll back.
+- **Share an app or a chat** with a teammate, or with anyone by a password link. A
+  shared chat is read-only, a link's buttons stay off until you turn them on, and a
+  link can be set never to expire while no admin cap on share expiry is in force.
+- **Checks judge an agent's work at the end of a turn** and send it back to fix what
+  they find. A check is a script, an app's handler, a schema or a rubric. Agent
+  templates come with their own apps and checks and follow new versions.
+- **A contributor role: files without the agent's identity.** Between viewer and editor:
+  a contributor adds files to the shared workspace, and nothing else runs in the agent's
+  name.
+- **Each AI engine has a default model chosen by tier.** An agent without a pinned model
+  runs its engine's strongest tier below the frontier; every model list shows its tier.
+- **One GitHub subscription covers a whole organization** (GitHub MCP 1.2.0, needs the
+  Organization webhooks permission), and an agent can subscribe on its own behalf.
+- **Hold the microphone button to pick the dictation language.** Admins can remove any user's machine.
+
+### Changed
+- **Upgrading from 1.6.** A Docker install takes new compose files: use the upgrade script,
+  not a version bump alone. Behind a reverse proxy set `TRUSTED_PROXY` or local-only
+  accounts are refused, the phone ports listen on the IP your PBX dials, `/docs` is gone,
+  `/health` shows no versions, and new caps apply. More at docs.otodock.io/administration/upgrading.
+- **Shared-only agents: chatting takes the editor role.** Their chats run as the agent
+  itself, so a viewer or contributor there now gets a message instead of a session. Give
+  them the editor role, or turn on personal chats for the agent.
+- **Departments pick a delegation mode.** Off, down only (the default for a new one),
+  down and across, or all directions, each drawn on its card, with a reach of one level
+  or the whole department. Existing departments keep their wiring.
+- **Claude Opus 5.5, GPT-6 Sol and GPT-6 Luna replace Opus 5, GPT-5.6 Sol and GPT-5.6 Luna.**
+  Cheaper, same capabilities. Pins move at the next start, and a custom model under the
+  old id keeps its pins.
+- **Claude Code 2.1.281, Codex 0.156.1 and satellite 0.5.130.** Installs update on
+  restart, paired machines on reconnect (or by hand where automatic updates are off).
+- **A message typed while the agent works reaches it mid-turn**, wherever the agent runs.
+- **Mini-apps are now called apps**, an app's card says whose account its buttons use,
+  and Codex chats ask before every command and edit, as Claude chats do.
+- **Architectural improvements under the hood.** One shared vocabulary for run statuses,
+  placements, roles and tool kinds, and one contract every AI engine follows. A paused
+  machine shows as paused and a usage limit ends its run.
+
+### Fixed
+- **Chats stay in their lane.** A pick right after New Chat no longer changes the
+  previous chat, a draft or a steered message no longer lands in another chat, dictation
+  stops on a switch, and attachments sent while the agent works reach it.
+- **Paired machines.** Mode and model changes take effect, a Codex chat keeps its thread
+  across a restart, a prompt no longer lands twice, and a follow-up to a worker open as
+  a terminal lands in that terminal.
+- **Wakes, automations and load.** A chat woken by a check-back or a delegated task's
+  result comes back as the person who asked, and a Codex chat resumes its conversation;
+  the automations of a removed person pass to the admin; a hundred streaming chats or a
+  database hiccup no longer freeze everyone else.
+- **AI engine setup is honest.** The "Auto" model names the model that runs, a
+  misconfigured engine fails with a clear message, and custom prices are honoured.
+- **Tasks and triggers.** A run says what fired it, cancelling closes its output at
+  once, and a prompt edit applies from the next run. Template tasks run right after
+  install. Webhook addresses written with a display name fire again.
+- **Dashboard details.** A refused photo no longer leaves the chat busy, the MCPs page
+  shows its read-only notice, a wrong passkey password shows its error, the company
+  map's top bar is dark in light mode, schedules say 21st, and on a phone the app menu,
+  the approval card and a user's agent roles fit the screen.
+- **A slow first start no longer fails `docker compose up`**, which gave the server a minute.
+
+### Security
+- **A security review of the whole platform ran before 1.7.** Every file an agent writes
+  or the platform serves stays inside that agent's folder, sign-in and sessions are
+  stricter, a paired machine's own OtoDock folder is off limits to the sessions it runs,
+  and an MCP update never changes where its package comes from.
+- **Access checks tightened after a full review of roles, apps, tasks and calls.**
+  Nobody reaches another person's chat, terminal, call or task run by its id, a session
+  never sees the agent's own engine settings or logins, apps and shares keep to their
+  own app and agent, and phone calls and SSH keys take the editor role.
+- **The perimeter holds under hostile input.** Sign-in, passkeys and webhooks are rate
+  limited per address and never stall the platform, Require 2FA holds a passkey holder
+  to a second factor, bodies are capped, the dashboard socket refuses other origins, and
+  every fetch to an address a person or an agent picks checks where the host really points.
+- **Connecting a ChatGPT or Claude account is a dashboard action**, rate limited per
+  person, each device login in its own private directory. The Android app's native
+  features answer only the dashboard's own page, and its release build is signed.
 
 ## [1.6.1] — 2026-09-15
 
@@ -768,7 +853,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/OtoDock/oto-dock/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...v1.5.0

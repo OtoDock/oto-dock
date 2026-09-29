@@ -2,24 +2,25 @@ import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAgentConversations } from '../../api/chats'
 import { formatRelativeTime } from '../../lib/format'
+import { SOURCE_TYPE } from '../../lib/session/kind'
 
 // Dashboard chats are excluded server-side — this tab lists external sessions
 // (phone today, webhook/other in future). No "Chat" filter option.
 const SOURCE_OPTIONS = [
   { value: '', label: 'All Sources' },
-  { value: 'phone', label: 'Phone' },
+  { value: SOURCE_TYPE.PHONE, label: 'Phone' },
 ]
 
 function SourceBadge({ source }: { source?: string }) {
   switch (source) {
-    case 'phone':
+    case SOURCE_TYPE.PHONE:
       return (
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-xs bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-300">
           <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" /></svg>
           Phone
         </span>
       )
-    case 'task':
+    case SOURCE_TYPE.TASK:
       return (
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-xs bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300">
           <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -99,7 +100,7 @@ export default function AgentConversations() {
                     className="border-b border-p-border-light last:border-0 hover:bg-p-surface-hover cursor-pointer transition-colors"
                   >
                     <td className="px-4 py-3 text-p-text">
-                      {c.title || (c.source_type === 'phone' ? 'Phone Call' : 'New Chat')}
+                      {c.title || (c.source_type === SOURCE_TYPE.PHONE ? 'Phone Call' : 'New Chat')}
                     </td>
                     <td className="px-4 py-3">
                       <SourceBadge source={c.source_type} />
@@ -129,7 +130,7 @@ export default function AgentConversations() {
               >
                 <div className="flex items-start justify-between mb-2">
                   <p className="text-sm font-medium text-p-text line-clamp-1">
-                    {c.title || (c.source_type === 'phone' ? 'Phone Call' : 'New Chat')}
+                    {c.title || (c.source_type === SOURCE_TYPE.PHONE ? 'Phone Call' : 'New Chat')}
                   </p>
                   <SourceBadge source={c.source_type} />
                 </div>

@@ -1,17 +1,10 @@
 import { useParams } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { canManageAgent } from '../../lib/permissions'
+import { canManageAgent, roleBadge } from '../../lib/permissions'
 import { useAgentInfo, useAgentUsers } from '../../api/agents'
 import { useRuns } from '../../api/runs'
 import { MODE_LABEL, MODE_SUMMARY, modeOfAgent } from '../../lib/visibility'
 import GroupedRunsTable from '../../components/GroupedRunsTable'
-
-const USER_ROLE_BADGE: Record<string, string> = {
-  admin: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  manager: 'bg-brand-100 text-brand',
-  editor: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300',
-  viewer: 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary',
-}
 
 export default function AgentOverview() {
   const { name } = useParams<{ name: string }>()
@@ -106,7 +99,7 @@ function AgentUsersCard({ name }: { name: string }) {
                 <p className="text-sm text-p-text truncate">{u.name}</p>
                 {u.email && <p className="text-xs text-p-text-light truncate">{u.email}</p>}
               </div>
-              <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${USER_ROLE_BADGE[u.role] || USER_ROLE_BADGE.viewer}`}>
+              <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${roleBadge(u.role)}`}>
                 {u.role}
               </span>
             </li>

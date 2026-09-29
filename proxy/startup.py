@@ -10,6 +10,7 @@ import contextlib
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -39,6 +40,80 @@ _bg_tasks: list[asyncio.Task] = []
 _ARM_EXIT_FAILSAFE = True
 _EXIT_FAILSAFE_GRACE_S = 3.0
 
+# Open descriptors the proxy asks for. The systemd and Docker default soft
+# limit is 1024 (hard 524288): about a thousand idle sockets, or a few dozen
+# Direct-LLM sessions (~2 fds per stdio MCP), and uvloop silently drops every
+# new connection. Capped so children that close-loop up to their soft limit
+# stay cheap.
+_NOFILE_TARGET = 65536
+_NOFILE_WARN_BELOW = 8192
+
+
+def raise_nofile_limit(target: int = _NOFILE_TARGET) -> int | None:
+    """Raise the soft RLIMIT_NOFILE to ``min(hard, target)``, never lowering
+    it (a unit or compose file that already grants more keeps it). Returns
+    the effective soft limit (None where the platform has no rlimits)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = target if hard == resource.RLIM_INFINITY else min(hard, target)
+    if soft != resource.RLIM_INFINITY and want > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            soft = want
+        except (ValueError, OSError) as e:
+            logger.warning("Could not raise the open-file limit from %s: %s", soft, e)
+    if soft != resource.RLIM_INFINITY and soft < _NOFILE_WARN_BELOW:
+        logger.warning(
+            "Open-file limit is %s (hard %s): below %d, the proxy runs out of "
+            "descriptors well before 100 sessions. Raise LimitNOFILE (systemd) "
+            "or ulimits.nofile (compose).", soft, hard, _NOFILE_WARN_BELOW)
+    else:
+        logger.info("Open-file limit: %s (hard %s)", soft, hard)
+    return soft
+
+
+def set_default_executor(loop: asyncio.AbstractEventLoop) -> ThreadPoolExecutor:
+    """Size the loop's default executor (``asyncio.to_thread``) explicitly:
+    left alone it is ``min(32, cpus + 4)``, and slow jobs (image pulls, a PTY
+    reap, an HTTP fetch) queue ahead of file reads and bcrypt. More threads
+    also mean more GIL contention for the loop, so it is not open-ended."""
+    import config
+    ex = ThreadPoolExecutor(max_workers=max(1, config.DEFAULT_EXECUTOR_WORKERS),
+                            thread_name_prefix="asyncio")
+    loop.set_default_executor(ex)
+    return ex
+
+
+# A path no route serves: the warm-up matches every route against it.
+_WARMUP_PATH = "/__otodock_route_warmup__/x"
+
+
+def warm_routes(app: FastAPI) -> None:
+    """Build FastAPI's per-route state before the server listens. It builds
+    each included router's effective routes lazily, on the first request that
+    falls through them (0.38 s of loop on this proxy's routes). Every
+    top-level route is matched on its own (the router's dispatch would stop
+    at the SPA catch-all's full match), for an http and a websocket scope;
+    no handler runs, and a route that fails to match is skipped."""
+    common = {
+        "path": _WARMUP_PATH, "raw_path": _WARMUP_PATH.encode(), "root_path": "",
+        "query_string": b"", "headers": [], "server": ("127.0.0.1", 80),
+        "client": ("127.0.0.1", 0), "app": app,
+    }
+    scopes = (
+        {"type": "http", "method": "GET", "http_version": "1.1", "scheme": "http", **common},
+        {"type": "websocket", "subprotocols": [], "scheme": "ws", **common},
+    )
+    for route in list(app.router.routes):
+        for scope in scopes:
+            try:
+                route.matches(dict(scope))
+            except Exception:
+                logger.debug("route warm-up skipped %r", route, exc_info=True)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +125,9 @@ async def lifespan(app: FastAPI):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     except (ValueError, AttributeError, OSError):
         pass  # non-main thread or no SIGUSR1 on this platform
+
+    raise_nofile_limit()
+    default_executor = set_default_executor(asyncio.get_running_loop())
 
     # Startup — register client adapters
     from adapters import register_adapter
@@ -82,7 +160,8 @@ async def lifespan(app: FastAPI):
                     return False
                 pump.system_queue.append(text)
             else:
-                if pump.queue_message(text) < 0:
+                from core.events.common_events import TurnInput
+                if pump.queue_message(TurnInput(text)) < 0:
                     return False  # queue full — don't pretend it was delivered
             return True
         return False
@@ -142,8 +221,12 @@ async def lifespan(app: FastAPI):
     from services.infra.storage_quota import quotas_preflight
     quotas_preflight()
 
-    # Initialize PostgreSQL schema (all tables + migrations)
-    with pg_pool.get_conn() as _pg_conn:
+    # Initialize PostgreSQL schema (all tables + migrations). One
+    # transaction; its DDL may wait on locks a running pg_dump holds, so the
+    # pool's statement timeout does not apply to it, and it waits longer for
+    # a connection than a request would (Postgres may still be starting).
+    with pg_pool.get_conn(timeout=60) as _pg_conn:
+        _pg_conn.execute("SET LOCAL statement_timeout = 0")
         pg_schema.init_schema(_pg_conn)
         pg_schema.run_migrations(_pg_conn)
         _pg_conn.commit()
@@ -151,6 +234,26 @@ async def lifespan(app: FastAPI):
         # code expects (a CREATE TABLE-only addition never reaches existing
         # installs) instead of scattered UndefinedColumn 500s at query time.
         pg_schema.check_schema_drift(_pg_conn)
+    # Network self-check (T2 tripwire): warn if a control plane was re-added to
+    # the shared network (undoing the compose split). No-op on bare metal.
+    from services.infra.network_selfcheck import network_selfcheck
+    await asyncio.to_thread(network_selfcheck)
+    # Token files live only in the central store; a copy found in an agent
+    # tree goes once, before any session could mount the tree.
+    from services.oauth import credential_resolver as _cred_resolver
+    try:
+        await asyncio.to_thread(_cred_resolver.purge_agent_tree_credentials)
+    except Exception:
+        logger.exception("agent-tree credentials sweep failed (continuing)")
+    # Offboarding: a person's live sessions close with their access, their
+    # automations follow the admin who took it away, and the service
+    # bindings they lent follow their standing.
+    from services.agents import offboarding_bindings, offboarding_sessions, offboarding_transfer
+    offboarding_sessions.register()
+    offboarding_transfer.register()
+    offboarding_bindings.register()
+    from services.apps import app_lifecycle as _app_lifecycle
+    _app_lifecycle.register()
     # Credential-key canary: one loud ERROR when stored secrets can't be
     # decrypted (JWT_SECRET changed / config.env recreated) instead of
     # scattered use-time 500s and silently-empty credential reads.
@@ -200,6 +303,41 @@ async def lifespan(app: FastAPI):
     migrated = await asyncio.to_thread(agent_store.migrate_persona_filenames)
     if migrated:
         logger.info("Persona filename migration: %d agent(s) converged", migrated)
+    # App releases: a row whose release copy is gone falls back to the
+    # working file; a release directory with no row is removed.
+    try:
+        from services.apps import releases as _releases
+        await asyncio.to_thread(_releases.reconcile)
+    except Exception:
+        logger.exception("App release reconcile failed (continuing)")
+    # The platform catalog: remembers the loop for deltas raised off it and
+    # listens for finished task runs.
+    try:
+        from api.apps import catalog as _catalog
+        _catalog.install()
+    except Exception:
+        logger.exception("Platform catalog install failed (continuing)")
+    # Checks (CHECKS.md): the one turn_end handler that judges a session's
+    # work; nothing runs until a check is attached to an agent or a chat.
+    try:
+        from services.checks import evaluator as _checks
+        _checks.install()
+    except Exception:
+        logger.exception("Checks install failed (continuing)")
+    # Template apps seeded per member (COMMUNITY-AGENTS-REGISTRY.md): the
+    # attach hook queues, this worker deploys.
+    try:
+        from services.community import template_app_seeder as _seeder
+        _seeder.install()
+    except Exception:
+        logger.exception("Template app seeder install failed (continuing)")
+    # App handlers (APPS.md "Handlers"): deliveries left in flight at the
+    # crash go back to the queue, and due rows wake their apps.
+    try:
+        from services.apps import app_handlers as _handlers
+        _bg_tasks.append(asyncio.create_task(_handlers.boot()))
+    except Exception:
+        logger.exception("App handlers boot failed (continuing)")
     # Managed/cloud installs: seed the bootstrap license key ONCE (when the DB
     # has none). The license_check_worker then owns updates via the relay
     # re-issue (adopt-on-check) — a worker-adopted key is never overwritten.
@@ -305,13 +443,16 @@ async def lifespan(app: FastAPI):
     # without them a pinned agent's NEW chats would silently fall back to the
     # layer's first enabled model because the retired builtin row no longer
     # passes the model-allowed check. Registry-driven: a new retirement is one
-    # MODEL_SUCCESSORS entry, no code here. Idempotent; must never kill boot.
-    for _old_id, _new_id in config.MODEL_SUCCESSORS.items():
-        try:
-            subscription_store.remap_retired_model(_old_id, _new_id)
-        except Exception:
-            logger.exception("retired-model remap %s → %s failed (non-fatal)",
-                             _old_id, _new_id)
+    # MODEL_SUCCESSORS entry, no code here. The walk (remap_retired_models)
+    # lands each retired id on the END of its chain, so the dict's order
+    # cannot strand a pin on an intermediate retired id, and leaves alone an
+    # id an admin has re-added as a custom row (the admin chose to keep it —
+    # the walk runs on every boot and would otherwise rewrite those pins at
+    # each restart). Idempotent; must never kill boot.
+    try:
+        subscription_store.remap_retired_models(config.MODEL_SUCCESSORS)
+    except Exception:
+        logger.exception("retired-model remaps failed (non-fatal)")
     logger.info(f"Synced builtin models for {len(_caps)} execution layer(s)")
     # Initialize concurrency control (reads limits from DB)
     from core import concurrency
@@ -356,6 +497,10 @@ async def lifespan(app: FastAPI):
     from services.knowledge import library_projector
     _bg_tasks.append(asyncio.create_task(library_projector.reconcile_loop()))
     logger.info("Knowledge-library reconcile sweep started (300s interval)")
+    # App servers (APPS.md): idle stop, backoff bookkeeping, rows gone.
+    from services.apps import app_supervisor
+    _bg_tasks.append(asyncio.create_task(app_supervisor.sweep_loop()))
+    logger.info("App supervisor sweep started (30s interval)")
     # Start satellite heartbeat monitor
     from core.remote.satellite_connection import get_connection_manager
     _sat_cm = get_connection_manager()
@@ -515,9 +660,19 @@ async def lifespan(app: FastAPI):
                 await _mcp_autoupdate.maybe_run_weekly()
             except Exception:
                 logger.exception("mcp auto-update sweep failed")
+            try:
+                # Community agent templates: once a day, the managers of an
+                # agent whose template has a newer catalog version hear it,
+                # once per version (the update itself is theirs to press).
+                from services.community import community_agent_updater as _agent_updater
+                await _agent_updater.maybe_notify_updates()
+            except Exception:
+                logger.exception("agent template update sweep failed")
 
     _bg_tasks.append(asyncio.create_task(_registry_sweep_loop()))
     logger.info("Warmup + install registry sweeper started (60s interval)")
+    from api.media import uploads as _uploads
+    _bg_tasks.append(asyncio.create_task(_uploads.staging_sweep_loop()))
 
     # Hosted turn-classifier token refresh. When the Groq turn classifier runs
     # through the hosted relay, the minted token baked into the pushed phone
@@ -578,23 +733,39 @@ async def lifespan(app: FastAPI):
     from services.engines import token_fanout
     token_fanout.start_worker()
 
+    # The first request that falls through every route would otherwise pay
+    # FastAPI's lazy route-state build on the loop; pay it now.
+    try:
+        warm_routes(app)
+    except Exception:
+        logger.exception("route warm-up failed (non-fatal)")
+
+    # From here on, store calls made ON the loop thread use its private pool
+    # (storage/pg.py LoopPool): a Postgres restart or freeze then costs the
+    # loop one short wait, not the pool's timeout per call. Every boot step
+    # above used the shared pool with its normal wait.
+    pg_pool.arm_loop_pool()
+
     # Event-loop stall watchdog — deliberately the LAST boot step: every
     # synchronous boot step above (schema init, preflight, manifest scan,
     # concurrency init) has run, so a long boot can never read as a stall.
     # Stopped in _shutdown_cleanup right before the pool closes.
     from core import loop_watchdog
-    if loop_watchdog.start(config.LOOP_WATCHDOG_THRESHOLD_S):
+    loop_watchdog.watch_executor("default", default_executor)
+    for _lane in (pg_pool.LANE_FAST, pg_pool.LANE_BULK):
+        loop_watchdog.watch_executor(f"run_db-{_lane}", pg_pool.db_executor(_lane))
+    if loop_watchdog.start(config.LOOP_WATCHDOG_THRESHOLD_S, config.LOOP_WATCHDOG_REPORT_S):
         logger.info(
-            "Event-loop watchdog started (threshold %.1fs)",
-            config.LOOP_WATCHDOG_THRESHOLD_S,
+            "Event-loop watchdog started (threshold %.1fs, slow-loop reports from %.2fs)",
+            config.LOOP_WATCHDOG_THRESHOLD_S, config.LOOP_WATCHDOG_REPORT_S,
         )
 
     yield
     # ── Graceful Shutdown ──
     logger.info("Proxy shutdown starting...")
 
-    # Cancel the refresh worker BEFORE _shutdown_sessions so it doesn't
-    # fight credential_writeback for per-account locks during drain.
+    # Cancel the refresh worker BEFORE _shutdown_sessions so a refresh
+    # never lands mid-drain.
     try:
         await oauth_refresh_worker.stop_worker()
     except Exception:
@@ -624,6 +795,14 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(_shutdown_sessions(logger), timeout=30)
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning("Shutdown timed out after 30s — force-closing remaining resources")
+
+    # App servers: a TERM each (they die with the proxy anyway; this lets
+    # them flush).
+    try:
+        from services.apps import app_supervisor as _apps
+        await asyncio.wait_for(_apps.stop_all(), timeout=15)
+    except Exception:
+        logger.exception("App supervisor shutdown failed (continuing)")
 
     # Close the HTTP tunnel dispatcher (httpx client + sweeper task).
     try:
@@ -749,6 +928,13 @@ async def _shutdown_cleanup(logger) -> None:
             logger.warning("Shutdown: chat writer jobs still pending after 3s")
     except Exception:
         logger.exception("Shutdown: chat writer drain failed (continuing)")
+    # The session index is written behind; its last changes land now, on
+    # this thread (a write must not depend on a free executor thread here).
+    try:
+        from core.session import session_state
+        session_state.flush_session_index()
+    except Exception:
+        logger.exception("Shutdown: session index flush failed (continuing)")
     # The watchdog reported stalls through the DB work above; stop it now
     # (flag first, then the tick task — never a fake stall at shutdown).
     from core import loop_watchdog
@@ -771,57 +957,32 @@ async def _shutdown_sessions(logger):
     from services.meetings.meeting_orchestrator import shutdown_meetings
     await shutdown_meetings()
 
-    # 2. Close all sessions
-    from core.layers.cli.session import _persistent_sessions, _persistent_sessions_lock
-    from core.layers.direct.session import _direct_sessions, _direct_sessions_lock
-    from core.layers.codex.session import _codex_sessions, _codex_sessions_lock
-    from core.session.session_manager import get_execution_layer
-    from core.session.session_state import _sessions
+    # 2. Close all sessions.
+    # Every local engine, layer by layer, straight from the registry: the
+    # layer that HOLDS a session is the one that closes it, so shutdown needs
+    # neither the three private pool dicts nor the agent row (which it only
+    # ever read to work out which layer to ask — and which is gone for an
+    # agent deleted while its session ran, silently skipping the close).
+    from core.session.session_manager import get_all_layers
 
-    # CLI sessions
-    async with _persistent_sessions_lock:
-        cli_sids = list(_persistent_sessions.keys())
-    for sid in cli_sids:
-        try:
-            agent = _sessions.get(sid, {}).get("agent", "")
-            if agent:
-                await get_execution_layer(agent).close_session(sid)
-        except Exception as e:
-            logger.warning(f"Shutdown: CLI {sid[:8]} error: {e}")
-
-    # Direct LLM sessions
-    async with _direct_sessions_lock:
-        direct_sids = list(_direct_sessions.keys())
-    for sid in direct_sids:
-        try:
-            agent = _sessions.get(sid, {}).get("agent", "")
-            if agent:
-                await get_execution_layer(agent, execution_path="direct-llm").close_session(sid)
-        except Exception as e:
-            logger.warning(f"Shutdown: Direct {sid[:8]} error: {e}")
-
-    # Codex sessions
-    async with _codex_sessions_lock:
-        codex_sids = list(_codex_sessions.keys())
-    for sid in codex_sids:
-        try:
-            agent = _sessions.get(sid, {}).get("agent", "")
-            if agent:
-                await get_execution_layer(agent, execution_path="codex-cli").close_session(sid)
-        except Exception as e:
-            logger.warning(f"Shutdown: Codex {sid[:8]} error: {e}")
+    for path, layer in get_all_layers().items():
+        for sid in layer.local_session_ids():
+            try:
+                await layer.close_session(sid)
+            except Exception as e:
+                logger.warning(f"Shutdown: {path} {sid[:8]} error: {e}")
 
     # Remote sessions. A remote CLI session with an in-flight turn is LEFT
     # OPEN so the satellite keeps its CLI alive for Mode C re-adopt after the
     # restart — closing it would send close_session → kill the CLI → nothing
     # to recover. Idle/Codex/direct remote sessions close normally.
-    from core.session.session_manager import _remote_layer
+    from core.session.session_manager import _remote_layer, get_layer_capabilities
     if _remote_layer:
-        remote_sids = list(_remote_layer._sessions.keys())
-        for sid in remote_sids:
+        for sid in _remote_layer.local_session_ids():
             _info = _remote_layer._sessions.get(sid)
-            if (_info is not None
-                    and _info.execution_path == "claude-code-cli"
+            _rc = get_layer_capabilities(getattr(_info, "execution_path", "") or "") if _info else None
+            if (_rc is not None
+                    and _rc.runtime.supports_reattach_after_restart
                     and getattr(_info, "turn_active", False)):
                 logger.info(
                     f"Shutdown: leaving in-flight remote CLI {sid[:8]} open "

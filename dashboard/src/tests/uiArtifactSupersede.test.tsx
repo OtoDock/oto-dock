@@ -115,9 +115,9 @@ describe('display_ui building placeholder', () => {
     expect(screen.getByText('Working on an interactive artifact…')).toBeTruthy()
   })
 
-  it('running pin_app renders the mini-app variant', () => {
+  it('running pin_app renders the app variant', () => {
     renderBlock(tool('mcp__display__pin_app', 'running'))
-    expect(screen.getByText('Working on a mini-app…')).toBeTruthy()
+    expect(screen.getByText('Working on an app…')).toBeTruthy()
   })
 
   it('completed display_ui and other running tools keep the normal pill', () => {

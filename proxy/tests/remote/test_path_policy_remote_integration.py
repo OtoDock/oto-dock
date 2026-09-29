@@ -17,6 +17,7 @@ if str(_PROXY_DIR) not in sys.path:
 
 from auth.path_policy import SecurityContext, check_tool_access  # noqa: E402
 from services.path_policy_v2 import check_target_still_valid  # noqa: E402
+from core import placement
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +38,8 @@ def _user_remote_ctx(
         username="dave",
         agent=agent,
         is_admin_agent=False,
-        target_kind="user_remote",
-        target_label="MacBook Pro",
-        target_agents_dir=target_agents_dir,
-        target_machine_id=machine_id,
-        target_home_dir=home_dir,
-        target_allow_full_fs=allow_full_fs,
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="MacBook Pro", agents_dir=target_agents_dir, machine_id=machine_id, home_dir=home_dir, allow_full_fs=allow_full_fs),
+        )
 
 
 def _user_remote_ctx_windows(
@@ -60,13 +56,8 @@ def _user_remote_ctx_windows(
         username="dave",
         agent=agent,
         is_admin_agent=False,
-        target_kind="user_remote",
-        target_label="Windows laptop",
-        target_agents_dir="C:/Users/frank/OtoDock/agents",
-        target_machine_id="machine-win",
-        target_home_dir="C:/Users/frank",
-        target_allow_full_fs=allow_full_fs,
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="Windows laptop", agents_dir="C:/Users/frank/OtoDock/agents", machine_id="machine-win", home_dir="C:/Users/frank", allow_full_fs=allow_full_fs),
+        )
 
 
 def _admin_remote_ctx(
@@ -79,13 +70,8 @@ def _admin_remote_ctx(
         username="dave",
         agent="ops-bot",
         is_admin_agent=True,
-        target_kind="admin_remote",
-        target_label="ops-vm",
-        target_agents_dir="/home/svc/.oto-dock/agents",
-        target_machine_id="machine-xyz",
-        target_home_dir="/home/svc",
-        target_allow_full_fs=allow_full_fs,
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="ops-vm", agents_dir="/home/svc/.oto-dock/agents", machine_id="machine-xyz", home_dir="/home/svc", allow_full_fs=allow_full_fs),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -409,9 +395,8 @@ class TestCheckTargetStillValid:
         # (transition state). Treat as valid to avoid false positives.
         ctx = SecurityContext(
             role="manager", username="a", agent="b", is_admin_agent=False,
-            target_kind="user_remote",
-            target_machine_id="",
-        )
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id=""),
+            )
         assert check_target_still_valid(ctx) == ""
 
     def test_remote_machine_exists_valid(self):
@@ -499,11 +484,117 @@ class TestLiveAllowFullFsRefresh:
         try:
             n = session_state.refresh_target_allow_full_fs("m-live", True)
             assert n == 1
-            assert session_state.get_session_security("sess-live").target_allow_full_fs is True
+            assert session_state.get_session_security("sess-live").placement.allow_full_fs is True
             # Untouched: different machine.
-            assert session_state.get_session_security("sess-other").target_allow_full_fs is False
+            assert session_state.get_session_security("sess-other").placement.allow_full_fs is False
             # Idempotent: re-applying the same value updates nothing.
             assert session_state.refresh_target_allow_full_fs("m-live", True) == 0
         finally:
             session_state._session_security.pop("sess-live", None)
             session_state._session_security.pop("sess-other", None)
+
+
+# ---------------------------------------------------------------------------
+# Codex apply_patch on a satellite: the paths resolve like Write/Edit's
+# ---------------------------------------------------------------------------
+
+TREE = "/home/dave/.oto-dock/agents/my-agent"
+
+
+def _patch(*files: tuple[str, str]) -> str:
+    lines = ["*** Begin Patch"]
+    for kind, path in files:
+        lines.append(f"*** {kind}: {path}")
+        lines.append("+x" if kind == "Add File" else "@@\n-x\n+y")
+    lines.append("*** End Patch")
+    return "\n".join(lines)
+
+
+class TestRemoteApplyPatch:
+    def _d(self, ctx, text):
+        return check_tool_access("apply_patch", {"command": text}, ctx)[0]
+
+    def test_satellite_host_path_in_tree_takes_rbac(self):
+        # The reported case: an absolute host path inside the agent's own
+        # workspace was denied because the local resolver never matched it.
+        ctx = _user_remote_ctx()
+        assert self._d(ctx, _patch(("Add File", f"{TREE}/users/dave/workspace/x.md"))).allowed
+        assert self._d(ctx, _patch(("Add File", f"{TREE}/workspace/x.md"))).allowed
+        viewer = _user_remote_ctx(role="viewer")
+        d = self._d(viewer, _patch(("Add File", f"{TREE}/knowledge/x.md")))
+        assert not d.allowed
+        assert "knowledge/x.md" in d.reason and "OS user's home" in d.reason
+
+    def test_home_band_and_full_fs(self):
+        home_only = _user_remote_ctx(allow_full_fs=False)
+        assert self._d(home_only, _patch(("Add File", "/home/dave/notes/x.md"))).allowed
+        d = self._d(home_only, _patch(("Add File", "/etc/x.md")))
+        assert not d.allowed and "/etc/x.md" in d.reason and "home" in d.reason
+        assert self._d(_user_remote_ctx(allow_full_fs=True),
+                       _patch(("Add File", "/etc/x.md"))).allowed
+
+    def test_virtual_and_tilde_forms_are_denied_with_the_host_path(self):
+        # The patch text cannot be rewritten, so the deny names the path
+        # Codex must use instead.
+        ctx = _user_remote_ctx()
+        d = self._d(ctx, _patch(("Add File", "/workspace/x.md")))
+        assert not d.allowed and f"state the path as {TREE}/workspace/x.md" in d.reason
+        d = self._d(ctx, _patch(("Add File", "~/x.md")))
+        assert not d.allowed and "state the path as /home/dave/x.md" in d.reason
+
+    def test_relative_paths_anchor_at_the_session_root(self):
+        ctx = _user_remote_ctx()
+        assert self._d(ctx, _patch(("Add File", "workspace/x.md"))).allowed
+        d = self._d(ctx, _patch(("Add File", "../bob/x.md")))
+        assert not d.allowed and "absolute path" in d.reason
+
+    def test_update_needs_read_and_write(self):
+        ctx = _user_remote_ctx()
+        d = self._d(ctx, _patch(("Update File", f"{TREE}/users/dave/.codex/config.toml")))
+        assert not d.allowed and "protected" in d.reason
+        assert self._d(ctx, _patch(("Update File", f"{TREE}/users/dave/workspace/x.md"))).allowed
+
+    def test_every_file_of_the_patch_is_checked(self):
+        ctx = _user_remote_ctx()
+        d = self._d(ctx, _patch(("Add File", f"{TREE}/users/dave/workspace/a.md"),
+                                ("Add File", "/etc/b.md")))
+        assert not d.allowed and "/etc/b.md" in d.reason
+
+    def test_admin_on_admin_agent_keeps_its_reach_but_not_the_protected_set(self):
+        ctx = _admin_remote_ctx(allow_full_fs=False)
+        assert self._d(ctx, _patch(("Add File", "/etc/x.md"))).allowed
+        d = self._d(ctx, _patch(("Add File", "/home/svc/.oto-dock/agents/ops-bot/users/dave/.codex/auth.json")))
+        assert not d.allowed and "protected" in d.reason
+
+    def test_bridge_extra_paths_take_the_remote_policy(self):
+        # The approval bridge sends one Write for a multi-file change; every
+        # listed path is gated, not only the first.
+        ctx = _user_remote_ctx(allow_full_fs=False)
+        d, _ = check_tool_access("Write", {
+            "file_path": "/home/dave/notes/a.md",
+            "_codex_paths": ["/home/dave/notes/a.md", "/etc/b.md"],
+        }, ctx)
+        assert not d.allowed and "/etc/b.md" in d.reason
+        d, _ = check_tool_access("Write", {
+            "file_path": "/home/dave/notes/a.md",
+            "_codex_paths": ["/home/dave/notes/a.md", "/home/dave/notes/b.md"],
+        }, ctx)
+        assert d.allowed
+
+
+class TestRemoteApplyPatchIsRefusedTheMachinesOwnState:
+    """The machine's own OtoDock folder and agents root are refused to a
+    patch as to a file tool, on every pairing."""
+
+    def _d(self, ctx, text):
+        return check_tool_access("apply_patch", {"command": text}, ctx)[0]
+
+    def test_home_only_and_full_fs_and_the_admin_floor(self):
+        for ctx in (_user_remote_ctx(), _user_remote_ctx(allow_full_fs=True),
+                    _admin_remote_ctx(allow_full_fs=True)):
+            home = ctx.placement.home_dir
+            d = self._d(ctx, _patch(("Update File", f"{home}/.oto-dock/satellite.conf")))
+            assert not d.allowed and "OtoDock folder" in d.reason
+            d = self._d(ctx, _patch(("Add File", f"{home}/.oto-dock/agents/other/workspace/x.md")))
+            assert not d.allowed and "OtoDock folder" in d.reason
+        assert self._d(_user_remote_ctx(), _patch(("Add File", f"{TREE}/workspace/x.md"))).allowed

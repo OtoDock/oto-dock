@@ -5,7 +5,6 @@ Enhanced reader with shape inventory, chart data, speaker notes.
 formatting, transitions, connectors, hyperlinks, and slide management.
 """
 
-import contextlib
 import copy
 import os
 from pathlib import Path
@@ -21,9 +20,10 @@ from shared import (
     _push_preview,
     _resolve_path,
     _to_agents_relative,
-    _WORKER_TMP_SUFFIX,
     _WRITE_OP_ADVICE,
     logger,
+    cleanup_partials,
+    safe_open_write,
 )
 
 # ---------------------------------------------------------------------------
@@ -255,8 +255,7 @@ async def handle_write_pptx(args: dict) -> str:
             _advice=_WRITE_OP_ADVICE,
         )
     except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(path + _WORKER_TMP_SUFFIX)
+        cleanup_partials(path)
         raise
     await _push_preview(path)
     return msg
@@ -274,7 +273,6 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     if Path(path).exists() and not create_new:
         prs = Presentation(path)
     else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
         prs = Presentation()
 
     layout_map = {
@@ -997,11 +995,11 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
             errors.append(f"Op #{idx} {ot}: {exc}")
             logger.warning(f"write_pptx op #{idx} '{ot}' failed: {exc}")
 
-    # Save even with partial success. Atomic: a killed worker must never
-    # leave the user's presentation truncated.
-    tmp = path + _WORKER_TMP_SUFFIX
-    prs.save(tmp)
-    os.replace(tmp, path)
+    # Save even with partial success. Atomic and beneath the mount: a killed
+    # worker never leaves the user's presentation truncated, and a link at
+    # the name or on the way never redirects the save.
+    with safe_open_write(path) as fh:
+        prs.save(fh)
 
     msg = f"Presentation saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)

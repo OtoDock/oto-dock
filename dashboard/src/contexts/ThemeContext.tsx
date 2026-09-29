@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react'
+import { callNative } from '../lib/nativeBridge'
 
 type Theme = 'system' | 'light' | 'dark'
 
@@ -31,12 +32,7 @@ async function applyNativeTheme(resolved: 'light' | 'dark') {
   const bg = NATIVE_BG[resolved]
 
   // Update Android WebView container background (safe-area behind status/nav bars)
-  try {
-    const android = (window as any).Android
-    if (android?.setContainerColor) {
-      android.setContainerColor(bg)
-    }
-  } catch { /* not on Android */ }
+  callNative('setContainerColor', bg)
 
   // Update Android status bar color and icon style
   // Style.Dark = light text (for dark bg), Style.Light = dark text (for light bg)

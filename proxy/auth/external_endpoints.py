@@ -32,6 +32,7 @@ Contributor contract — when do you add an entry here?
 import re
 
 import config
+from auth.request_path import has_traversal
 
 # (pattern, allowed-methods) — anchored, method-scoped.
 _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
@@ -56,13 +57,6 @@ EXTERNAL_BLOCKED_DETAIL = "This endpoint is not available to external sessions"
 SESSION_DEAD_DETAIL = "Session is no longer active"
 
 
-def _has_traversal(path: str) -> bool:
-    low = path.lower()
-    if "%2e" in low or "%2f" in low or "%5c" in low or "\\" in path:
-        return True
-    return any(seg in (".", "..") for seg in path.split("/"))
-
-
 def session_token_claims(request) -> dict | None:
     """The validated payload of a SESSION JWT presented as the bearer, else
     None (no bearer, the master key, a cookie-only request, or a token that
@@ -81,7 +75,7 @@ def session_token_claims(request) -> dict | None:
 def is_external_endpoint_allowed(method: str, path: str) -> bool:
     """True if an external principal may call ``method path``."""
     base = path.split("?", 1)[0]
-    if _has_traversal(base):
+    if has_traversal(base):
         return False
     for pattern, methods in _ALLOWLIST:
         if pattern.match(base) and method.upper() in methods:

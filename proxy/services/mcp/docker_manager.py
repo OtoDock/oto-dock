@@ -14,8 +14,32 @@ import time
 
 import config
 from core.config import deployment
+from services.mcp import mcp_manifest_types as _mt
 
 logger = logging.getLogger("claude-proxy.docker-manager")
+
+# The container status vocabulary, named once (core-seams phase 8; the
+# dashboard mirror is ``lib/status/docker.ts``): the six words
+# ``get_container_status`` returns, plus the two the admin list route
+# stamps on a manifest it did not probe (``not_checked`` — the MCP is not
+# enabled; ``unknown`` — the probe raised). The enable route's own
+# ``docker_status`` answer (``started`` / ``failed``) is beside them.
+RUNNING = "running"
+UNHEALTHY = "unhealthy"
+STARTING = "starting"
+STOPPED = "stopped"
+NOT_FOUND = "not_found"
+ERROR = "error"
+NOT_CHECKED = "not_checked"
+UNKNOWN = "unknown"
+STATUSES: frozenset[str] = frozenset({RUNNING, UNHEALTHY, STARTING, STOPPED, NOT_FOUND, ERROR,
+                                      NOT_CHECKED, UNKNOWN})
+#: A container process exists (healthy or not): a recreate reaches it.
+PRESENT: frozenset[str] = frozenset({RUNNING, STARTING, UNHEALTHY})
+#: Running or coming up: no start is needed.
+STARTED: frozenset[str] = frozenset({RUNNING, STARTING})
+ENABLE_STARTED = "started"
+ENABLE_FAILED = "failed"
 
 # First boot pulls multi-GB images (e.g. Collabora for file-tools) — surface
 # that instead of sitting silent for minutes. Lines matching this get logged
@@ -162,13 +186,14 @@ def get_container_status(manifest) -> str:
                 _log_docker_perm_denied(
                     f"Docker status check for {manifest.name} failed"
                 )
-            return "not_found"
+            return NOT_FOUND
 
         output = result.stdout.strip()
         if not output:
-            return "not_found"
+            return NOT_FOUND
 
         # docker compose ps --format json outputs one JSON object per line
+        # (the State / Health words are Docker's, not ours).
         import json
         for line in output.splitlines():
             if not line.strip():
@@ -180,22 +205,22 @@ def get_container_status(manifest) -> str:
                     # `Health` is "" when the image declares no healthcheck.
                     health = (container.get("Health") or "").lower()
                     if health == "unhealthy":
-                        return "unhealthy"
+                        return UNHEALTHY
                     if health == "starting":
-                        return "starting"
-                    return "running"
+                        return STARTING
+                    return RUNNING
                 elif state in ("exited", "dead", "created"):
-                    return "stopped"
+                    return STOPPED
             except json.JSONDecodeError:
                 continue
 
-        return "not_found"
+        return NOT_FOUND
     except subprocess.TimeoutExpired:
         logger.warning("Timeout checking Docker status for %s", manifest.name)
-        return "error"
+        return ERROR
     except Exception as e:
         logger.warning("Error checking Docker status for %s: %s", manifest.name, e)
-        return "error"
+        return ERROR
 
 
 def _inject_mcp_env(manifest) -> bool:
@@ -770,7 +795,7 @@ def startup_docker_mcps() -> None:
     manifests = mcp_registry.get_all_manifests()
 
     for name, manifest in manifests.items():
-        if manifest.server.runtime != "docker":
+        if not _mt.is_container(manifest.server):
             continue
         if not states.get(name, False):
             continue  # not enabled
@@ -782,7 +807,7 @@ def startup_docker_mcps() -> None:
             logger.warning("Failed to refresh .env for %s: %s", name, e)
 
         status = get_container_status(manifest)
-        if status == "running":
+        if status == RUNNING:
             # Compose-config drift check: the skip path historically ran
             # NOTHING, so base-compose/override changes (a new mem_limit
             # default, an image retag) never reached a running container

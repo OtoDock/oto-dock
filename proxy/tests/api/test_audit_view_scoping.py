@@ -156,6 +156,51 @@ class TestNotificationsEndpointScoping:
         assert self._titles(_viewer(), agent=AG, audit=True) == {"n-ag", "n-v"}
 
 
+class TestNotificationDefinitionsOffLoop:
+    """The definitions view is one executor job, and the target
+    names of its user-scoped rows come from one batched read."""
+
+    def _seed(self):
+        agent_store.create_agent(AG, "Shared", created_by="user-admin")
+        agent_store.create_agent(OTHER, "Other", created_by="user-admin")
+        agent_store.set_delegation_targets(AG, [OTHER])
+        notification_store.create_notification("n-ag", "b", scope="agent", target=AG, created_by="user-admin")
+        notification_store.create_notification("n-other", "b", scope="agent", target=OTHER, created_by="user-admin")
+        notification_store.create_notification("n-m", "b", scope="user", target=M, created_by=M)
+        notification_store.create_notification("n-v", "b", scope="user", target=V, created_by=V)
+        notification_store.create_notification("n-gone", "b", scope="user",
+                                               target="user-gone-4f9c2e1a", created_by="user-admin")
+
+    def _view(self, ctx, *, agent=None, audit=False):
+        from api.notifications.notifications import list_notifications
+        return asyncio.run(list_notifications(
+            scope=None, source=None, agent=agent, audit=audit,
+            view="definitions", user=ctx, x_agent_name=None,
+        ))["notifications"]
+
+    def test_the_view_runs_off_the_loop_for_a_person_and_a_no_user_session(self, temp_db, loop_db_guard):
+        self._seed()
+        with loop_db_guard.active():
+            person = {n["title"] for n in self._view(_viewer(), agent=AG)}
+            session = {n["title"] for n in self._view(_nouser_session())}
+        assert person == {"n-ag", "n-v"}
+        # The delegation edge AG -> OTHER adds OTHER's agent-scope rows.
+        assert session == {"n-ag", "n-other"}
+
+    def test_target_names_come_from_one_batched_read(self, temp_db, monkeypatch):
+        self._seed()
+
+        def boom(sub):
+            raise AssertionError("resolved one sub per row")
+
+        monkeypatch.setattr(notification_store, "resolve_sub_to_display_name", boom)
+        names = {n["title"]: n["target_name"] for n in self._view(_admin(), audit=True)}
+        assert names["n-m"] == "Manager User"
+        assert names["n-v"] == "Viewer User"
+        assert names["n-gone"] == "user-gone-4f9c2e1a"[:12]
+        assert names["n-ag"] == AG
+
+
 class TestSessionJwtTaskScoping:
     """H1/H2 (2026-08-11): session JWTs are api-key-shaped but carry a real
     identity — they must get the user-view scope filter AND the
@@ -600,11 +645,11 @@ class TestNoUserEdgeReads:
             agent=None, status=None, task_id=None, session_id=None,
             created_by=None, audit=False, include_delegates=False,
             limit=50, offset=0, user=_nouser_session()))
-        # Own agent: BOTH scopes (deliberate — the agent filter is a
-        # no-user session's only scope on ITS OWN agent). Edge target:
-        # agent-scope only. total counts the same way.
-        assert {r["id"] for r in res["runs"]} == {"r-own-a", "r-own-u", "r-obs-a"}
-        assert res["total"] == 3
+        # Agent-scope runs only, on its own agent as on an edge target: a
+        # no-user session owns no person's run (the same rows are refused
+        # by id and hidden from list_tasks). total counts the same way.
+        assert {r["id"] for r in res["runs"]} == {"r-own-a", "r-obs-a"}
+        assert res["total"] == 2
 
     def test_single_run_access_scope_clamped(self, temp_db):
         from api.tasks.tasks import _check_run_access

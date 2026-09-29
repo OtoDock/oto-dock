@@ -12,6 +12,7 @@ import pytest
 from services.mcp import mcp_registry as reg
 
 from tests._paths import REPO_ROOT as _ROOT
+from core import placement
 _MANIFEST = _ROOT / "mcps" / "custom" / "browser-mcp" / "manifest.json"
 
 
@@ -61,9 +62,10 @@ def test_manifest_node_stdio_source(manifest):
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, r=False, d=None, g=None):
-    return reg._device_placement_reason(
-        m, is_remote=r, target_has_display=d, target_device_grants=g or set()
-    )
+    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+        kind=placement.KIND_ADMIN_REMOTE if r else placement.KIND_LOCAL,
+        machine_id="m" if r else "", has_display=d, device_grants=g or set(),
+    ))
 
 
 def test_gate_local_excluded(manifest):
@@ -205,7 +207,8 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
         }},
     )
     path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
-        "agent", None, is_remote=True, task_mode=True, target_browser=_own("V" * 43),
+        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
+        task_mode=True, target_browser=_own("V" * 43),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
     assert local["env"] == {
@@ -216,7 +219,7 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
     # No target_browser (local builders never pass one): the entry keeps only
     # what the framework allows, and no bundle is created.
     path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
-        "agent", None, is_remote=True,
+        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
     assert local["env"] == {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*"}

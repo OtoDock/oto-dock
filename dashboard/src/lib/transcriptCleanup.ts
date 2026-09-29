@@ -20,8 +20,10 @@
 // never hidden.
 
 // `[Current time: Friday, March 21, 2026 09:30 (9:30 AM) Europe/Athens
-// (UTC+03:00)]` followed by blank line(s). Repeats fold (stacked re-warm stamps).
-const TIME_PRELUDE_RE = /^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)/
+// (UTC+03:00)]` followed by blank line(s), and the viewer focus line
+// `[The user is looking at the app "Title" (slug) right now.]` that rides
+// interactive sends the same way. Repeats fold (stacked re-warm stamps).
+const TIME_PRELUDE_RE = /^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)/
 
 // One wrapped slash-command segment (opening tag first, matching close tag).
 const COMMAND_TAG_RE =

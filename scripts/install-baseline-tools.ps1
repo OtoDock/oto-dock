@@ -77,7 +77,8 @@ function Invoke-Native {
 }
 
 function Get-RealPythonExe {
-    # Absolute path to a REAL Python >=3.10, or $null.
+    # Absolute path to a REAL Python >=3.10 (the host floor: PYTHON_MIN_VERSION
+    # in VERSIONS.md, pinned by satellite/tests/test_python_floor.py), or $null.
     #
     # Do NOT trust a bare `Get-Command python`: on a fresh Windows it resolves
     # to the Microsoft Store "App execution alias" stubs (python.exe /
@@ -322,8 +323,8 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.263' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.153.4' }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.281' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.156.1' }
 
     function Test-ResolvedCli {
         # After an install/upgrade, verify what the shell NOW resolves for the

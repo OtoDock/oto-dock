@@ -306,7 +306,7 @@ def test_viewer_agent_scope_readonly(client):
         old_str="# S", new_str="# hacked",
     )
     assert r.json()["is_error"] is True
-    assert "read-only for viewers" in r.json()["output"]
+    assert "read-only for your role" in r.json()["output"]
 
 
 def test_editor_can_write_agent_scope(client):

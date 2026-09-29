@@ -9,7 +9,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render } from '@testing-library/react'
 
-import ImageLightbox from '@/components/chat/media/ImageLightbox'
+import ImageLightbox, { triggerDownload } from '@/components/chat/media/ImageLightbox'
+import { installFakeNativeChannel } from './fixtures/nativeChannel'
 
 describe('ImageLightbox stability under host re-renders', () => {
   it('unstable onClose identity cannot self-close it (one history entry, ever)', async () => {
@@ -39,5 +40,25 @@ describe('ImageLightbox stability under host re-renders', () => {
     unmount()
     pushSpy.mockRestore()
     backSpy.mockRestore()
+  })
+})
+
+// In the Android app an inline image is saved through the app's channel
+// (blob: URLs cannot reach the DownloadManager): the header names the file and
+// its type, the base64 rides as the body.
+describe('ImageLightbox download in the Android app', () => {
+  it('posts the image on the channel instead of a blob download', async () => {
+    const ch = installFakeNativeChannel()
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    try {
+      await triggerDownload({ imageData: 'iVBORw0KGgo=', mimeType: 'image/png', caption: 'Site plan' }, 0)
+      expect(ch.posted).toEqual([
+        { m: 'saveImageFromBase64', a: ['Site_plan.png', 'image/png'], body: 'iVBORw0KGgo=' },
+      ])
+      expect(click).not.toHaveBeenCalled()
+    } finally {
+      click.mockRestore()
+      ch.uninstall()
+    }
   })
 })

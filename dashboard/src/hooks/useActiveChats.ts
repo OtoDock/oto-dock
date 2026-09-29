@@ -1,20 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { fetchActiveChats, type ActiveChat, type Chat } from '../api/chats'
-import { useChatStore, NEW_CHAT_PREFIX, type ChatStreamPhase } from '../store/chatStore'
+import { useChatStore, NEW_CHAT_PREFIX } from '../store/chatStore'
+import { chatKind, isTaskChatId, SOURCE_TYPE, type SourceType } from '../lib/session/kind'
+import {
+  CHAT_PHASE, isLiveChatPhase, type ActiveRowPhase, type LiveChatPhase,
+} from '../lib/status/chat'
 
 // One row of the cross-agent "Active now" widget (sidebar + agent home).
 export interface ActiveChatRow {
   id: string
   agent: string
   title: string
-  phase: 'streaming' | 'warming' | 'finished'
+  phase: ActiveRowPhase
   /** 'task' rows render purple and click through to the run view instead of
-      the chat page. Derived from the durable `task-run-` id prefix first,
-      the seed's source_type second — so a live task classifies correctly
-      before its seed row exists. Undefined (store-only, non-task rows) is
-      treated as a plain chat. */
-  sourceType?: string
+      the chat page. The row's kind (`chatKind`): the seed's source_type
+      when it says so, else the durable `task-` id prefix — so a live task
+      classifies correctly before its seed row exists, and a run minted
+      before the proxy wrote the column still reads as a task. */
+  sourceType?: SourceType
   /** Backend `owner_is_shared`: legacy `agent::`-owned rows a visibility flip
       left behind. Undefined until the seed row supplies it. */
   ownerIsShared?: boolean
@@ -74,11 +78,11 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
   // (id, phase) pairs the store says are live right now. New-chat draft
   // slices (no real chat id yet) are skipped.
   const storeActive = useMemo(() => {
-    const out: { id: string; phase: 'streaming' | 'warming' }[] = []
+    const out: { id: string; phase: LiveChatPhase }[] = []
     for (const [cid, slice] of Object.entries(byChat)) {
       if (cid.startsWith(NEW_CHAT_PREFIX)) continue
-      const st: ChatStreamPhase = slice.status
-      if (st === 'streaming' || st === 'warming') out.push({ id: cid, phase: st })
+      const st = slice.status
+      if (isLiveChatPhase(st)) out.push({ id: cid, phase: st })
     }
     return out
   }, [byChat])
@@ -99,11 +103,11 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
   // that lingers after a failed warmup. Their title/agent still feed
   // metaById, which is what the initiating tab's placeholder row needs.
   const activePairs = useMemo(() => {
-    const pairs = new Map<string, 'streaming' | 'warming'>()
+    const pairs = new Map<string, LiveChatPhase>()
     for (const { id, phase } of storeActive) pairs.set(id, phase)
     for (const row of seed.data || []) {
-      if (row.status !== 'streaming') continue
-      if (!pairs.has(row.id) && !byChat[row.id]) pairs.set(row.id, 'streaming')
+      if (row.status !== CHAT_PHASE.STREAMING) continue
+      if (!pairs.has(row.id) && !byChat[row.id]) pairs.set(row.id, CHAT_PHASE.STREAMING)
     }
     return pairs
   }, [storeActive, seed.data, byChat])
@@ -200,27 +204,29 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
       shown.add(id)
       rows.push({
         id, agent, title: meta?.title || cachedTitles.get(id) || 'New chat', phase,
-        // The id prefix is the durable task marker (scheduler chats are
-        // `task-run-…`), so classification never waits on the seed — a live
-        // task with no seed row yet must not render (or filter) as a chat.
-        sourceType: id.startsWith('task-run-') ? 'task' : meta?.source_type,
+        // The kind never waits on the seed — a live task with no seed row
+        // yet must not render (or filter) as a chat.
+        sourceType: meta ? chatKind({ id, source_type: meta.source_type })
+          : (isTaskChatId(id) ? SOURCE_TYPE.TASK : undefined),
         ownerIsShared: meta?.owner_is_shared,
       })
     }
     for (const [id, phase] of activePairs) add(id, phase)
     for (const [id, at] of finished) {
       if (activePairs.has(id)) continue
-      if (at > now || byChat[id]?.unread) add(id, 'finished')
+      if (at > now || byChat[id]?.unread) add(id, CHAT_PHASE.FINISHED)
     }
     // Reload backfill: seed rows that arrived already finished-unread (the
     // in-session leaver path above never saw them stream). A store read echo
     // (unread === false) retires them before the next seed refetch.
     for (const row of seed.data || []) {
-      if (row.status !== 'finished' || shown.has(row.id) || activePairs.has(row.id)) continue
+      if (row.status !== CHAT_PHASE.FINISHED || shown.has(row.id) || activePairs.has(row.id)) continue
       if (byChat[row.id]?.unread === false || !row.unread) continue
-      add(row.id, 'finished')
+      add(row.id, CHAT_PHASE.FINISHED)
     }
-    const order = { streaming: 0, warming: 1, finished: 2 } as const
+    const order: Record<ActiveRowPhase, number> = {
+      [CHAT_PHASE.STREAMING]: 0, [CHAT_PHASE.WARMING]: 1, [CHAT_PHASE.FINISHED]: 2,
+    }
     rows.sort(
       (a, b) => order[a.phase] - order[b.phase] || a.agent.localeCompare(b.agent),
     )

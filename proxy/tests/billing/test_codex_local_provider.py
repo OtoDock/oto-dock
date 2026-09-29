@@ -79,3 +79,22 @@ def test_gpt_model_acquires_the_chatgpt_account(store):
     assert "_CODEX_ENDPOINT_URL" not in env
     assert "_CODEX_LOCAL_API_KEY" not in env
     assert "_CODEX_ENDPOINT_PROVIDER" not in env
+
+
+def test_a_single_provider_engine_never_filters_by_a_guessed_provider(store, monkeypatch):
+    # Claude declares one provider (engine-contract phase 5e); the pool's
+    # model filter is for engines whose rows come from SEVERAL. A model id the
+    # registry and the rows do not know is guessed by prefix — "gpt-…" reads
+    # as openai — and that guess must not exclude every Claude account.
+    from services.engines import subscription_pool
+    claude_key = {"id": "key-anthropic", "layer": "claude-code-cli", "provider": "anthropic",
+                  "auth_type": "api_key", "status": "active", "active_sessions": 0}
+    store.list_platform_pool.side_effect = (
+        lambda layer=None, provider=None: [claude_key] if not provider or provider == "anthropic" else []
+    )
+    store.get_credential_data.side_effect = lambda sid: {"key-anthropic": {"api_key": "sk-ant"}}[sid]
+    monkeypatch.setattr("config.get_model_provider", lambda model, layer="": "openai")
+    sub_id, _env = subscription_pool.resolve_subscription_env(
+        "claude-code-cli", None, "gpt-mystery-1",
+    )
+    assert sub_id == "key-anthropic"

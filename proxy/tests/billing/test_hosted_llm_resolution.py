@@ -136,10 +136,10 @@ def test_acquire_returns_relay_when_only_option(store):
 def test_relay_credentials_none_when_relay_base_unset(store, monkeypatch):
     from services.engines import subscription_pool
     monkeypatch.setattr("config.OTODOCK_RELAY_BASE", "")
-    assert subscription_pool.relay_llm_credentials("anthropic", "u") is None
+    assert subscription_pool.relay_llm_credentials("direct-llm", "anthropic", "u") is None
 
 
 def test_relay_credentials_none_for_local_provider(store):
     from services.engines import subscription_pool
     # Ollama / LiteLLM are local — never relay-backed.
-    assert subscription_pool.relay_llm_credentials("ollama", "u") is None
+    assert subscription_pool.relay_llm_credentials("direct-llm", "ollama", "u") is None

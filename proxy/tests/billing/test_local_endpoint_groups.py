@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -74,7 +74,7 @@ class TestLocalEndpointApi:
         groups = [[], [self._group({"direct-llm": "active", "codex-cli": "active"})]]
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool") as pool, \
-             patch.object(api_mod, "notify_phone_config_changed") as notify, \
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock) as notify, \
              patch.object(api_mod.config, "OTODOCK_CLOUD", False):
             store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
             store.local_endpoint_group_key.side_effect = store_mod.local_endpoint_group_key
@@ -88,7 +88,9 @@ class TestLocalEndpointApi:
         assert set(out["engines"]) == {"direct-llm", "codex-cli"}
         assert out["engines"]["codex-cli"]["is_mine"] is True
         pool.schedule_rebind.assert_called_once()
-        notify.assert_awaited_once()
+        # Each engine the endpoint was added to hears about it (Direct LLM
+        # pushes the phone config; Codex has nothing to do).
+        notify.assert_awaited_once_with("direct-llm", "codex-cli")
 
     def test_add_stores_ollama_as_its_openai_compatible_base(self):
         import api.admin.execution_layers as api_mod
@@ -99,7 +101,7 @@ class TestLocalEndpointApi:
         groups = [[], [self._group({"codex-cli": "active"}, provider="ollama", url=url)]]
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool"), \
-             patch.object(api_mod, "notify_phone_config_changed"), \
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock), \
              patch.object(api_mod.config, "OTODOCK_CLOUD", False):
             store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
             store.local_endpoint_group_key.side_effect = store_mod.local_endpoint_group_key
@@ -141,7 +143,7 @@ class TestLocalEndpointApi:
         g = self._group({"direct-llm": "active"}, has_key=True)
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool"), \
-             patch.object(api_mod, "notify_phone_config_changed"):
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock):
             store.list_local_endpoint_groups.return_value = [g]
             store.get_credential_data.return_value = {"endpoint_url": "http://h:8080/v1", "api_key": "k"}
             self._run(api_mod.admin_set_local_endpoint_engine(
@@ -157,13 +159,13 @@ class TestLocalEndpointApi:
         g = self._group({"direct-llm": "active", "codex-cli": "disabled"})
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool"), \
-             patch.object(api_mod, "notify_phone_config_changed") as notify:
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock) as notify:
             store.list_local_endpoint_groups.return_value = [g]
             self._run(api_mod.admin_set_local_endpoint_engine(
                 g["group"], api_mod.SetLocalEndpointEngineRequest(layer="direct-llm", enabled=False),
                 user=self._admin()))
             store.update_subscription.assert_called_once_with("direct-llm-id", status="disabled")
-            notify.assert_awaited_once()
+            notify.assert_awaited_once_with("direct-llm")
             store.update_subscription.reset_mock()
             self._run(api_mod.admin_set_local_endpoint_engine(
                 g["group"], api_mod.SetLocalEndpointEngineRequest(layer="codex-cli", enabled=True),
@@ -198,7 +200,7 @@ class TestLocalEndpointApi:
         live = {"codex-cli-id": 0, "direct-llm-id": 0}
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool") as pool, \
-             patch.object(api_mod, "notify_phone_config_changed"):
+             patch.object(api_mod, "_subscriptions_changed", new_callable=AsyncMock):
             store.list_local_endpoint_groups.return_value = [g]
             pool.reconcile_active_sessions.side_effect = lambda sid: (live[sid], live[sid])
             self._run(api_mod.admin_delete_local_endpoint(g["group"], user=self._admin()))

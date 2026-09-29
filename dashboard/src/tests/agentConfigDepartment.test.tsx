@@ -29,7 +29,7 @@ const h = vi.hoisted(() => ({
       id: 'd1',
       name: 'Engineering',
       created_by_sub: 'u1',
-      auto_delegation: true,
+      mode: 'down' as const,
       reach: 'adjacent' as const,
       position_hint: '',
       // Deliberately OUT of rank order — selecting the department must pick
@@ -144,6 +144,15 @@ describe('AgentConfig — department row', () => {
       department_id: 'd1',
       department_level_id: 'lvl-staff',
     })
+  })
+
+  it('names the selected department\'s mode and reach', () => {
+    h.agentInfo.department_id = 'd1'
+    h.agentInfo.department_level_id = 'lvl-lead'
+    renderConfig()
+    expect(
+      screen.getByText('Auto-wires delegation within the department: down only, one level up or down.'),
+    ).toBeTruthy()
   })
 
   it('selecting "None" clears both ids together', () => {

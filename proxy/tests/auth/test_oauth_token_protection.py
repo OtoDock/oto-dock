@@ -350,3 +350,24 @@ def test_build_tree_does_not_strip_lookalikes(tmp_path, _protected_set):
     tree = _build_tree(tmp_path, tmp_path, depth=1, max_depth=20)
     names = {n["name"] for n in tree}
     assert "my-design-tokens" in names
+
+
+# ---------------------------------------------------------------------------
+# The session's delivered copy: a launcher writes the
+# token file under the registered subpath inside the session's temp space,
+# so the gate refuses it by segment name where a bare temp file would pass
+# the local-tmp admission.
+# ---------------------------------------------------------------------------
+
+
+def test_delivered_copy_under_the_subpath_is_refused_in_temp_space(_protected_set):
+    from auth.path_policy import check_tool_access
+    protected = "/tmp/oto-cred-a1b2/google-tokens/a@b.json"
+    for ctx in (_manager_ctx(), _admin_ctx()):
+        d, _ = check_tool_access("Read", {"file_path": protected}, ctx)
+        assert d.allowed is False and "OAuth credentials" in d.reason
+        d, _ = check_tool_access("Bash", {"command": f"cat {protected}"}, ctx)
+        assert d.allowed is False and "OAuth credentials" in d.reason
+    # The refusal is the segment's: a sibling temp file is judged as before.
+    d, _ = check_tool_access("Read", {"file_path": "/tmp/oto-cred-a1b2/notes.json"}, _manager_ctx())
+    assert d.allowed is True

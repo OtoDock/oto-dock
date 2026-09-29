@@ -6,6 +6,7 @@ from fastapi import HTTPException
 
 import config
 from storage.agents import agent_store
+from core.execution_layer import DEFAULT_EXECUTION_PATH
 
 
 def _get_agent_dir(name: str) -> Path:
@@ -16,7 +17,8 @@ def _get_agent_dir(name: str) -> Path:
 
 def _get_execution_paths(agent_data: dict | None) -> list[str]:
     """Compute the full list of execution paths for an agent."""
-    primary = (agent_data or {}).get("execution_path", "claude-code-cli")
+    primary = ((agent_data or {}).get("execution_path")
+               or DEFAULT_EXECUTION_PATH)
     extra_json = (agent_data or {}).get("execution_paths", "")
     extra = []
     if extra_json:

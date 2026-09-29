@@ -102,13 +102,17 @@ async def create_subscription(
     selected_events: list[str],
     selected_subevents: dict[str, list[str]] | None = None,
     caller_is_admin: bool = False,
+    target_kind: str = "",
 ) -> dict:
     """End-to-end subscription create.
 
     Flow:
-      1. Load manifest, validate ``selected_events`` are in event_catalog.
-      2. Cross-check ``required_scopes`` against bound OAuth account's
-         granted scopes → raise ``SubscriptionScopeError`` if missing.
+      1. Load manifest, validate ``selected_events`` are in event_catalog,
+         resolve the target kind (``vendor_target_spec.target_kinds``; the
+         flat spec when the manifest declares none).
+      2. Cross-check ``required_scopes`` — the events' plus the kind's —
+         against bound OAuth account's granted scopes → raise
+         ``SubscriptionScopeError`` if missing.
       3. Insert DB row with status='creating' + freshly-minted signing secret.
       4. Resolve OAuth token; render registration.create template.
       5. POST to vendor with 30s timeout.
@@ -140,11 +144,23 @@ async def create_subscription(
                 "service-scope subscription requires an agent", status=400,
             )
         from services.oauth import credential_resolver
-        if credential_resolver.pick_account(mcp_name, agent) is None:
+        ref = credential_resolver.pick_account(mcp_name, agent)
+        if ref is None:
             raise SubscriptionError(
                 f"no account bound to agent {agent!r} for {mcp_name} — a "
                 f"manager must bind one in Agent Settings first",
                 status=400,
+            )
+        # Every later step opens the bound owner's token dir at the request's
+        # label (scopes, extra, target tokens, effective mode): a label other
+        # than the binding's would read another of that user's accounts.
+        if account_label != ref.label:
+            raise SubscriptionError(
+                f"account {account_label!r} is not the service account bound "
+                f"to agent {agent!r} for {mcp_name}: subscribe with the bound "
+                f"account {ref.label!r}",
+                status=400,
+                detail={"bound_account_label": ref.label},
             )
 
     # 1. Validate selected_events are in catalog.
@@ -199,7 +215,11 @@ async def create_subscription(
     # for PATs (granted_scopes returns None — we trust the user's PAT
     # scope selection; the vendor surfaces the real permission problem
     # via 403 on the subscribe call if scopes are insufficient).
+    kind_entry = resolve_target_kind(webhooks_block, target_kind)
     required_scopes = _gather_required_scopes(selected_events, catalog)
+    required_scopes |= {
+        s for s in kind_entry.get("required_scopes") or [] if isinstance(s, str) and s
+    }
     granted_scopes = _read_granted_scopes(
         scope=scope, owner=user_sub, agent=agent,
         provider_id=provider_id, mcp_name=mcp_name, account_label=account_label,
@@ -244,6 +264,19 @@ async def create_subscription(
             # the resulting invalid path as a proper error.
             return ""
         vendor_target = _TOKEN_RE.sub(_vt_repl, vendor_target)
+
+    # With target kinds the API is the check that must refuse a repository
+    # string sent as an organization (the modal's regex is advisory). A
+    # manifest without kinds keeps the client-side check alone: MS Graph's
+    # `${account.extra.*}` targets never matched a pattern here.
+    if (webhooks_block.get("vendor_target_spec") or {}).get("target_kinds"):
+        pattern = kind_entry.get("validation_regex") or ""
+        if pattern and not re.search(pattern, vendor_target):
+            raise SubscriptionError(
+                f"{kind_entry.get('label') or 'target'}: {vendor_target!r} does not "
+                f"look like {kind_entry.get('placeholder') or 'the expected form'}",
+                status=400,
+            )
 
     # Effective registration mode: hosted installs with a relay-capable
     # manifest + a relay-exchanged account deliver events VIA the relay
@@ -317,6 +350,7 @@ async def create_subscription(
         created_by=user_sub,
         expires_at=expires_at,
         delivery_mode=delivery_mode,
+        target_kind=target_kind,
     )
 
     if effective_mode == "relay":
@@ -324,7 +358,7 @@ async def create_subscription(
         # account's (workspace, user) binding as soon as they arrive; the row
         # is ready to receive immediately.
         webhook_subscription_store.update_subscription_status(
-            row["id"], "active", clear_last_error=True,
+            row["id"], webhook_subscription_store.ACTIVE, clear_last_error=True,
         )
     elif effective_mode == "auto":
         try:
@@ -341,13 +375,22 @@ async def create_subscription(
             )
         except VendorAPIError as e:
             webhook_subscription_store.update_subscription_status(
-                row["id"], "failed",
+                row["id"], webhook_subscription_store.FAILED,
                 last_error=f"vendor {e.vendor_status}: {e.vendor_body[:200]}",
             )
+            # GitHub answers 404, not 403, when the token lacks the org
+            # permission or the account is not an owner: bare, the message
+            # reads like a typo in the name. The kind's help text is the
+            # manifest author's own explanation of what the target needs.
+            hint = str(kind_entry.get("help_text") or "").strip()
+            if e.vendor_status in (403, 404) and hint:
+                raise VendorAPIError(
+                    f"{e} ({hint})", vendor_status=e.vendor_status, vendor_body=e.vendor_body,
+                ) from e
             raise
         except Exception as e:
             webhook_subscription_store.update_subscription_status(
-                row["id"], "failed", last_error=f"{type(e).__name__}: {e}",
+                row["id"], webhook_subscription_store.FAILED, last_error=f"{type(e).__name__}: {e}",
             )
             # 500, not 502 — edge proxies (Cloudflare) replace origin 502
             # bodies with their own HTML page, hiding the message.
@@ -357,7 +400,7 @@ async def create_subscription(
             ) from e
 
         webhook_subscription_store.update_subscription_status(
-            row["id"], "active",
+            row["id"], webhook_subscription_store.ACTIVE,
             vendor_subscription_id=vendor_id,
             clear_last_error=True,
         )
@@ -371,7 +414,7 @@ async def create_subscription(
         # confirmed". The dashboard SubscriptionsPanel surfaces the URL
         # (and the per-subscription secret if applicable) for paste.
         webhook_subscription_store.update_subscription_status(
-            row["id"], "active", clear_last_error=True,
+            row["id"], webhook_subscription_store.ACTIVE, clear_last_error=True,
         )
 
     return webhook_subscription_store.get_subscription(row["id"]) or row
@@ -480,34 +523,38 @@ async def _maybe_disable_relay_events(provider_id: str) -> None:
         logger.info("relay events disable skipped (%s): %s", provider_id, e)
 
 
-async def delete_subscription(*, subscription_id: str) -> bool:
+async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
     """Delete a subscription. Best-effort vendor DELETE first.
 
     Authorization happens at the API layer (_can_manage_subscription) —
     this function performs no actor checks.
-    Returns True if the row was deleted. Vendor failures are logged but
-    don't block the DB delete (orphan-tolerant by design).
+    Returns ``(deleted, vendor_detached)``: whether the row went, and
+    whether nothing is left registered at the vendor. A vendor failure is
+    logged and does not block the DB delete (orphan-tolerant by design),
+    but it is reported — a hook left behind keeps posting to a dead URL
+    until a human removes it in the vendor's settings.
     Relay-delivered rows have no vendor-side registration; deleting the
     LAST relay row for a provider best-effort disables relay forwarding
     (the forward secret is kept for cheap re-enable).
     """
     row = webhook_subscription_store.get_subscription(subscription_id)
     if not row:
-        return False
+        return False, True
     if row.get("delivery_mode") == "relay":
         deleted = webhook_subscription_store.delete_subscription(subscription_id)
         if deleted:
             await _maybe_disable_relay_events(row.get("provider_id", ""))
-        return deleted
+        return deleted, True
     try:
-        await _vendor_delete(row)
+        detached = await _vendor_delete(row) is not False
     except Exception as e:
+        detached = False
         logger.warning(
             "vendor delete failed for subscription %s (provider=%s): %s. "
             "Proceeding with DB delete (orphan-tolerant).",
             subscription_id, row.get("provider_id"), e,
         )
-    return webhook_subscription_store.delete_subscription(subscription_id)
+    return webhook_subscription_store.delete_subscription(subscription_id), detached
 
 
 async def renew_subscription(subscription_id: str) -> dict | None:
@@ -525,7 +572,7 @@ async def renew_subscription(subscription_id: str) -> dict | None:
         return row
     webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
     reg_block = webhooks_block.get("registration", {})
-    renew_block = reg_block.get("renew")
+    renew_block = registration_call(webhooks_block, row.get("target_kind") or "", "renew")
     lifetime = reg_block.get("lifetime_seconds")
     if not renew_block or not lifetime:
         # Vendor doesn't support renewal — no-op.
@@ -561,19 +608,19 @@ async def renew_subscription(subscription_id: str) -> dict | None:
         )
     except VendorAPIError as e:
         webhook_subscription_store.update_subscription_status(
-            subscription_id, "renew_failed",
+            subscription_id, webhook_subscription_store.RENEW_FAILED,
             last_error=f"vendor {e.vendor_status}: {e.vendor_body[:200]}",
         )
         raise
     except Exception as e:
         webhook_subscription_store.update_subscription_status(
-            subscription_id, "renew_failed",
+            subscription_id, webhook_subscription_store.RENEW_FAILED,
             last_error=f"{type(e).__name__}: {e}",
         )
         raise SubscriptionError(f"renew failed: {e}", status=502) from e
 
     webhook_subscription_store.update_subscription_status(
-        subscription_id, "active",
+        subscription_id, webhook_subscription_store.ACTIVE,
         expires_at=new_expires, clear_last_error=True,
     )
     return webhook_subscription_store.get_subscription(subscription_id)
@@ -596,21 +643,25 @@ async def cleanup_agent_subscriptions(agent: str) -> int:
 
 async def cleanup_account_subscriptions(
     *, scope: str, owner: str, mcp_name: str, account_label: str,
-    agent: str | None = None,
+    agent: str | None = None, token_owner_sub: str = "",
 ) -> int:
+    """``token_owner_sub`` names the lender of a service binding that no
+    longer stands (the offboarding subscriber): the vendor delete then reads
+    the account's token through that person directly, where the binding
+    lookup would answer nothing."""
     rows = webhook_subscription_store.cleanup_account_subscriptions(
         scope=scope, owner=owner, mcp_name=mcp_name, account_label=account_label,
         agent=agent,
     )
-    return await _cleanup_rows(rows)
+    return await _cleanup_rows(rows, token_owner_sub=token_owner_sub)
 
 
-async def _cleanup_rows(rows: list[dict]) -> int:
+async def _cleanup_rows(rows: list[dict], *, token_owner_sub: str = "") -> int:
     """Best-effort vendor DELETE + DB DELETE for each row."""
     count = 0
     for row in rows:
         try:
-            await _vendor_delete(row)
+            await _vendor_delete(row, token_owner_sub=token_owner_sub)
         except Exception as e:
             logger.warning(
                 "cleanup: vendor delete failed for subscription %s (provider=%s): %s",
@@ -646,7 +697,7 @@ async def _vendor_create(
       * manifest declares ``response_id_path`` and the path resolves to
         empty (we'd silently store a row that can't be deleted later)
     """
-    create_block = webhooks_block.get("registration", {}).get("create", {})
+    create_block = registration_call(webhooks_block, row.get("target_kind") or "", "create")
     if not create_block:
         raise SubscriptionError(
             "manifest declares registration.mode=auto but no registration.create block",
@@ -726,25 +777,31 @@ async def _vendor_create(
     return str(captured)
 
 
-async def _vendor_delete(row: dict) -> None:
-    """Call vendor's delete-webhook API. Caller wraps in best-effort try/except."""
+async def _vendor_delete(row: dict, *, token_owner_sub: str = "") -> bool:
+    """Call vendor's delete-webhook API. Caller wraps in best-effort try/except.
+
+    Returns whether nothing is left registered at the vendor: True after a
+    successful call or when there was nothing to delete, False when the
+    manifest is gone (the MCP was uninstalled) and the vendor still holds a
+    registration nobody can address any more.
+    """
     if row.get("delivery_mode") == "relay":
         # Relay-delivered rows registered nothing at the vendor — covers the
         # cleanup_* sweeps too.
-        return
+        return True
     manifest = mcp_registry.get_manifest(row["mcp_name"])
     if manifest is None:
-        return
+        return not row.get("vendor_subscription_id")
     webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
-    delete_block = webhooks_block.get("registration", {}).get("delete")
+    delete_block = registration_call(webhooks_block, row.get("target_kind") or "", "delete")
     if not delete_block:
         # Manifest declares no delete endpoint (vendor doesn't support it
         # OR uses manual mode). Nothing to do.
-        return
+        return True
     if not row.get("vendor_subscription_id"):
         # Row was never confirmed by the vendor (status='creating' that
         # never flipped). No vendor-side state to delete.
-        return
+        return True
     token = _resolve_token_or_raise(
         provider_id=row["provider_id"],
         scope=row["scope"],
@@ -752,6 +809,7 @@ async def _vendor_delete(row: dict) -> None:
         agent=row.get("agent"),
         mcp_name=row["mcp_name"],
         account_label=row["account_label"],
+        token_owner_sub=token_owner_sub,
     )
     account_extra = _resolve_account_extra(
         provider_id=row["provider_id"],
@@ -760,6 +818,7 @@ async def _vendor_delete(row: dict) -> None:
         agent=row.get("agent"),
         mcp_name=row["mcp_name"],
         account_label=row["account_label"],
+        token_owner_sub=token_owner_sub,
     )
     await _call_vendor(
         call_block=delete_block,
@@ -768,6 +827,7 @@ async def _vendor_delete(row: dict) -> None:
         extra_subs={},
         account_extra=account_extra,
     )
+    return True
 
 
 async def _call_vendor(
@@ -857,14 +917,18 @@ def _username_for(owner_sub: str) -> str:
 
 def _owner_username_for(
     *, scope: str, owner: str, agent: str | None, mcp_name: str,
+    token_owner_sub: str = "",
 ) -> str:
     """Filesystem username whose token dir holds the bound account.
 
     User scope → the subscription owner. Service scope → the agent's binding
     points at a user's OWN account (no platform tier); return that user's
-    username. Raises when a service-scope subscription has no resolvable
-    binding.
+    username, or the named lender's when the caller knows the binding no
+    longer stands. Raises when a service-scope subscription has no
+    resolvable binding.
     """
+    if scope == "service" and token_owner_sub:
+        return _username_for(token_owner_sub)
     if scope == "service":
         from services.oauth import credential_resolver
         ref = credential_resolver.pick_account(mcp_name, agent or "")
@@ -880,11 +944,12 @@ def _owner_username_for(
 
 def _resolve_token_or_raise(
     *, provider_id: str, scope: str, owner: str, agent: str | None,
-    mcp_name: str, account_label: str,
+    mcp_name: str, account_label: str, token_owner_sub: str = "",
 ) -> str:
     """Resolve the bound OAuth account's access_token. Raises on miss."""
     username = _owner_username_for(
         scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
+        token_owner_sub=token_owner_sub,
     )
     token_dir = get_token_dir(username=username, provider_id=provider_id)
     path = account_token_path(token_dir, account_label)
@@ -911,7 +976,7 @@ def _resolve_token_or_raise(
 
 def _resolve_account_extra(
     *, provider_id: str, scope: str, owner: str, agent: str | None,
-    mcp_name: str, account_label: str,
+    mcp_name: str, account_label: str, token_owner_sub: str = "",
 ) -> dict:
     """Read the bound account's token-file ``extra`` block.
 
@@ -927,6 +992,7 @@ def _resolve_account_extra(
     try:
         username = _owner_username_for(
             scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
+            token_owner_sub=token_owner_sub,
         )
         token_dir = get_token_dir(username=username, provider_id=provider_id)
         path = account_token_path(token_dir, account_label)
@@ -989,6 +1055,41 @@ def _read_granted_scopes(
         logger.warning("could not read granted scopes for %s/%s: %s",
                        provider_id, account_label, e)
         return set()
+
+
+def resolve_target_kind(webhooks_block: dict, key: str) -> dict:
+    """The target-kind entry a subscription uses.
+
+    A manifest without ``vendor_target_spec.target_kinds`` has one kind: the
+    flat spec itself (and only the empty key names it). With kinds, the
+    empty key is the first entry — every row created before kinds existed
+    stores ``''`` and was registered the way the first kind registers.
+    """
+    spec = webhooks_block.get("vendor_target_spec") or {}
+    kinds = [k for k in spec.get("target_kinds") or [] if isinstance(k, dict)]
+    if not kinds:
+        if key:
+            raise SubscriptionError(f"unknown target kind: {key!r}", status=400)
+        return spec
+    if not key:
+        return kinds[0]
+    for entry in kinds:
+        if entry.get("key") == key:
+            return entry
+    raise SubscriptionError(f"unknown target kind: {key!r}", status=400)
+
+
+def registration_call(webhooks_block: dict, target_kind: str, call: str) -> dict:
+    """The ``registration.<call>`` block a target kind runs: the top-level
+    block with the kind's own keys laid over it. A kind restates only what
+    differs (GitHub's organization kind: the URL) and inherits the rest."""
+    base = (webhooks_block.get("registration") or {}).get(call) or {}
+    if not (webhooks_block.get("vendor_target_spec") or {}).get("target_kinds"):
+        return base
+    override = (resolve_target_kind(webhooks_block, target_kind).get("registration") or {}).get(call)
+    if not isinstance(override, dict) or not override:
+        return base
+    return {**base, **override}
 
 
 def _gather_required_scopes(

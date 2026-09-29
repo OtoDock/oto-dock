@@ -35,14 +35,21 @@ from auth.providers import (
     get_current_user,
     require_auth,
     require_creator_interactive,
+    session_bound_to,
 )
-from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
 from storage.agents import agent_store
 from storage.knowledge import db_knowledge_libraries
 
 from api.agents._router import router
+from core import layout
 
 logger = logging.getLogger("claude-proxy.knowledge-libraries")
+
+# A session token changes an agent's libraries only for the agent it was
+# started for, the consumer ``{name}``; ``{source}`` is another agent by
+# design (``auth.providers.session_bound_to``).
+_BOUND = [Depends(session_bound_to("name"))]
 
 
 def _require_agent_exists(name: str) -> None:
@@ -52,7 +59,7 @@ def _require_agent_exists(name: str) -> None:
 
 def _require_library_authority(u: UserContext, agent: str) -> None:
     """Admin, or a creator who manages the agent being wired."""
-    if u.role == "admin":
+    if u.is_admin:
         return
     if not u.can_manage_agent(agent):
         raise HTTPException(
@@ -73,7 +80,7 @@ _WINDOWS_RESERVED = frozenset(
 # The source-root dirs a library subtree may never start in: agent memory,
 # the mirror namespace itself, and OAuth service tokens. First-SEGMENT
 # check — exact-string-only would let ``memory/private`` through.
-_RESERVED_FIRST_SEGMENTS = frozenset({"memory", "shared", ".credentials"})
+_RESERVED_FIRST_SEGMENTS = frozenset({"memory", "shared", layout.CREDENTIALS_DIR})
 
 
 def _bad(detail: str) -> HTTPException:
@@ -119,11 +126,13 @@ def normalize_subdir(subdir: str) -> str:
         raise _bad("Library folder must use forward slashes.")
     if any(ord(c) < 32 for c in sub):
         raise _bad("Library folder may not contain control characters.")
+    try:
+        sub = normalize_rel_path(sub)
+    except PathOutsideRoot:
+        raise _bad("Library folder must be a clean relative path "
+                   "(no empty, '.' or '..' segments).")
     segs = sub.split("/")
     for seg in segs:
-        if not seg or seg in (".", ".."):
-            raise _bad("Library folder must be a clean relative path "
-                       "(no empty, '.' or '..' segments).")
         if seg.startswith("."):
             raise _bad("Library folder segments may not start with a dot.")
     if segs[0] in _RESERVED_FIRST_SEGMENTS:
@@ -139,7 +148,7 @@ def _validate_subdir_on_disk(agent: str, sub: str) -> None:
     knowledge subtrees would leak content past the disjointness rule."""
     if not sub:
         return
-    knowledge_root = (config.get_agent_dir(agent) / "knowledge").resolve()
+    knowledge_root = (config.get_agent_dir(agent) / layout.KNOWLEDGE).resolve()
     cur = knowledge_root
     for seg in sub.split("/"):
         cur = cur / seg
@@ -171,7 +180,7 @@ def _bulletin_file(agent: str, subdir: str, name: str) -> Path | None:
     rel = db_knowledge_libraries.bulletin_rel(subdir, name)
     if not rel:
         return None
-    knowledge = config.get_agent_dir(agent) / "knowledge"
+    knowledge = config.get_agent_dir(agent) / layout.KNOWLEDGE
     try:
         return resolve_under(knowledge / rel, knowledge)
     except PathOutsideRoot:
@@ -186,7 +195,7 @@ def _has_bulletin(agent: str, subdir: str, name: str) -> bool:
 def _wopi_locked(agent: str, knowledge_rel: str) -> bool:
     """Is an active Collabora edit lock held on this knowledge file?"""
     from api.media import wopi as _wopi
-    file_id = _wopi.encode_file_id(f"{agent}/knowledge/{knowledge_rel}")
+    file_id = _wopi.encode_file_id(f"{agent}/{layout.KNOWLEDGE}/{knowledge_rel}")
     return _wopi._get_lock(file_id) is not None
 
 
@@ -272,7 +281,7 @@ async def list_knowledge_libraries(
     return {"libraries": libraries}
 
 
-@router.get("/v1/agents/{name}/knowledge-attachments")
+@router.get("/v1/agents/{name}/knowledge-attachments", dependencies=_BOUND)
 async def get_knowledge_attachments(
     name: str, user: UserContext = Depends(get_current_user),
 ):
@@ -315,7 +324,7 @@ async def get_knowledge_attachments(
     }
 
 
-@router.put("/v1/agents/{name}/knowledge-library")
+@router.put("/v1/agents/{name}/knowledge-library", dependencies=_BOUND)
 async def set_knowledge_library(
     name: str, req: LibraryToggleRequest,
     user: UserContext = Depends(get_current_user),
@@ -358,10 +367,10 @@ async def set_knowledge_library(
                 from services.infra import file_bookkeeping
                 old_rel, new_rel = moved
                 asyncio.create_task(
-                    file_bookkeeping.tombstone_path(name, f"knowledge/{old_rel}"))
+                    file_bookkeeping.tombstone_path(name, f"{layout.KNOWLEDGE}/{old_rel}"))
                 asyncio.create_task(
                     file_bookkeeping.record_platform_write(
-                        name, f"knowledge/{new_rel}", None))
+                        name, f"{layout.KNOWLEDGE}/{new_rel}", None))
         # `name` here is the AGENT slug (the path param); `label` is the
         # library's display name. Spelled out so the two never blur.
         created = await asyncio.to_thread(
@@ -386,7 +395,7 @@ async def set_knowledge_library(
             "detached_consumers": consumers}
 
 
-@router.put("/v1/agents/{name}/knowledge-attachments")
+@router.put("/v1/agents/{name}/knowledge-attachments", dependencies=_BOUND)
 async def attach_knowledge_library(
     name: str, req: AttachRequest,
     user: UserContext = Depends(get_current_user),
@@ -406,7 +415,7 @@ async def attach_knowledge_library(
     subdir = normalize_subdir(req.subdir)
     _require_agent_exists(name)
     _require_agent_exists(source)
-    if u.role != "admin" and not u.can_access_agent(source):
+    if not u.is_admin and not u.can_access_agent(source):
         raise HTTPException(
             status_code=403, detail="No access to the source agent")
     # A WRITABLE attach is a write channel INTO the source's knowledge tree
@@ -414,7 +423,7 @@ async def attach_knowledge_library(
     # consumer, bulletin included) — read-level access to the source must
     # not grant that. Editor tier on the SOURCE is the same bar as writing
     # its knowledge folder directly.
-    if req.writable and u.role != "admin" and not u.can_edit_agent(source):
+    if req.writable and not u.is_admin and not u.can_edit_agent(source):
         raise HTTPException(
             status_code=403,
             detail="Writable attachment requires editor, manager, or admin "
@@ -438,15 +447,15 @@ async def attach_knowledge_library(
     logger.info(
         "knowledge-library attach: %s/%s→%s writable=%s by=%s created=%s",
         source, subdir or "<root>", name, req.writable, u.acting_sub, created)
-    mount = (f"/knowledge/shared/{source}/{subdir}" if subdir
-             else f"/knowledge/shared/{source}")
+    mount = (f"{layout.V_KNOWLEDGE}/shared/{source}/{subdir}" if subdir
+             else f"{layout.V_KNOWLEDGE}/shared/{source}")
     return {"status": "attached", "source_agent": source, "subdir": subdir,
             "writable": req.writable, "created": created,
             "note": f"Mirror content materializes now at {mount}; sessions "
                     "mount it at their next start."}
 
 
-@router.delete("/v1/agents/{name}/knowledge-attachments/{source}")
+@router.delete("/v1/agents/{name}/knowledge-attachments/{source}", dependencies=_BOUND)
 async def detach_knowledge_library(
     name: str, source: str,
     subdir: str = "",

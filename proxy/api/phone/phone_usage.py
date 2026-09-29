@@ -27,6 +27,8 @@ from services.phone.phone_identity import pop_call_identity
 from storage import database as task_store
 from storage.phone import phone_call_log_store
 from storage.phone import phone_route_store
+from core.session import session_kind
+from core.session.visibility import PHONE_CHAT_OWNER
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -65,7 +67,7 @@ def _record(agent: str, model: str, in_tok: int, out_tok: int, session_id: str |
     cost = get_adapter("groq").calculate_cost(
         model, ProviderUsage(input_tokens=in_tok, output_tokens=out_tok))
     row_id = usage_service.record_usage(
-        user_sub="phone",
+        user_sub=PHONE_CHAT_OWNER,
         agent=agent,
         scope="agent",
         source_type="turn-classifier",
@@ -135,7 +137,7 @@ def _audit_trail(session_id: str, agent: str) -> tuple[str, str, list[str]]:
         return "", "", []
     identity = pop_call_identity(sid)
     chat = task_store.get_chat_by_session(sid)
-    if (not chat or chat.get("source_type") != "phone"
+    if (not chat or session_kind.of_chat(chat) is not session_kind.PHONE
             or (agent and chat.get("agent") != agent)):
         return sid, identity, []
     return sid, identity, task_store.list_tool_names(chat["id"])

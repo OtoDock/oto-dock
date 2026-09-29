@@ -7,7 +7,7 @@
 import { useState, useCallback } from 'react'
 import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
-  useSetRoutePin, useDeleteRoutePin,
+  useDeleteRoutePin,
   usePhoneServers, useCreatePhoneServer,
   usePhoneSettings, useSavePhoneSettings, useRouteMcpPreview,
   useExternalData, useSaveExternalData, useForgetExternalData,
@@ -150,10 +150,17 @@ function ModeToggle({ value, onChange }: { value: RouteMode; onChange: (v: Route
   return <Toggle checked={value !== 'off'} onChange={v => onChange(v ? 'on' : 'off')} />
 }
 
-// The modal's PIN intent, applied by the parent AFTER the route saves (the
-// PIN travels only through its dedicated write-only endpoints, never in the
-// route payload).
+// The modal's PIN intent: a value being set rides the route save as `pin`
+// (the server stores it before any write); a removal goes to the write-only
+// DELETE endpoint after the route saves. The value never enters `form`.
 export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
+
+// Whether a saved form ends as a user-mode inbound route with no PIN: the
+// state the server refuses without an explicit acknowledgement.
+function endsWithoutPin(form: { identity_mode: string; direction: string }, pin: PinIntent, hasPin: boolean) {
+  return form.identity_mode === 'user' && form.direction === 'inbound'
+    && !(pin.enabled && (pin.value !== '' || hasPin))
+}
 
 // Who the caller IS on a route (docs/PHONE-CONFIG.md "Route identity and
 // role"). `caller` never reaches a user's session (on a Shared-only agent it
@@ -203,7 +210,7 @@ function RouteModal({
   languages: string[]
   servers: { id: number; name: string; adapter_type?: string }[]
   providers: AudioProvider[]
-  onSave: (data: PhoneRouteCreate & { id?: string }, pin: PinIntent) => void
+  onSave: (data: PhoneRouteCreate & { id?: string }, pin: PinIntent, acknowledged: boolean) => void
   onClose: () => void
   saving: boolean
 }) {
@@ -218,8 +225,9 @@ function RouteModal({
   if (form.identity_user_sub && !userChoices.some(u => u.sub === form.identity_user_sub)) {
     userChoices.push({ sub: form.identity_user_sub, name: form.identity_user_sub, email: '', role: '' })
   }
-  // PIN state lives OUTSIDE `form`: the value must never ride the route
-  // payload, and extra keys would false-positive the dirty-close guard.
+  // PIN state lives OUTSIDE `form`: the value is added to the save request
+  // at the last moment, and extra keys would false-positive the dirty-close
+  // guard (it compares `form` with the row).
   const hasPin = !!route.pin_configured
   const [pinEnabled, setPinEnabled] = useState(hasPin)
   const [pinValue, setPinValue] = useState('')
@@ -255,6 +263,24 @@ function RouteModal({
   const dirty = JSON.stringify(form) !== JSON.stringify(route) || pinDirty
   const requestClose = () => {
     if (!dirty || window.confirm('Discard unsaved changes?')) onClose()
+  }
+
+  // A user-mode inbound route saved without a PIN is an explicit choice: the
+  // admin confirms it in words and the request carries the acknowledgement
+  // (the server refuses the save without it).
+  const save = () => {
+    const pin: PinIntent = { dirty: pinDirty, enabled: pinEnabled, value: pinValue }
+    const noPin = endsWithoutPin(form, pin, hasPin)
+    if (noPin) {
+      const picked = userChoices.find(u => u.sub === form.identity_user_sub)
+      const who = picked && picked.sub !== picked.name
+        ? (picked.name || picked.email || picked.sub)
+        : `the tied user (${form.identity_user_sub})`
+      if (!window.confirm(
+        `Anyone who calls this route will act as ${who}, with all their tools and credentials. Save without a PIN?`,
+      )) return
+    }
+    onSave(form, pin, noPin)
   }
 
   return (
@@ -535,7 +561,7 @@ function RouteModal({
           <div className="flex justify-end gap-2 pt-2 border-t border-p-border-light">
             <button onClick={onClose} className="px-4 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800">Cancel</button>
             <button
-              onClick={() => onSave(form, { dirty: pinDirty, enabled: pinEnabled, value: pinValue })}
+              onClick={save}
               disabled={!canSave}
               className="px-4 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
               {saving ? 'Saving...' : 'Save'}
@@ -557,7 +583,6 @@ function RoutesSection() {
   const updateMut = useUpdatePhoneRoute()
   const deleteMut = useDeletePhoneRoute()
   const toggleMut = useUpdatePhoneRoute()
-  const setPinMut = useSetRoutePin()
   const delPinMut = useDeleteRoutePin()
   const [editRoute, setEditRoute] = useState<(PhoneRouteCreate & { id?: string; pin_configured?: boolean }) | null>(null)
   const [logRoute, setLogRoute] = useState<PhoneRoute | null>(null)
@@ -570,55 +595,56 @@ function RoutesSection() {
 
   const openNew = () => setEditRoute({ ...EMPTY_ROUTE, agent: agentSlugs[0] || '', phone_server_id: defaultServerId })
 
-  // The PIN rides its own write-only endpoints AFTER the route saves (on
-  // create the id only exists then). A PIN failure is loud — the route
-  // itself saved fine, but the admin must know the gate isn't armed.
-  // Server-computed identity advisories (a user-tied line without a PIN, a
-  // Codex agent on an external route, …) ride the save / PIN responses —
-  // shown once, loudly; the routes table keeps the marker.
-  const showWarnings = (res: { warnings?: string[] } | undefined, prefix: string) => {
-    const w = res?.warnings ?? []
+  // A PIN being set rides the route save itself (the server stores it before
+  // any write); a removal goes to the write-only DELETE AFTER the route
+  // saves, and its failure is loud: the route saved fine, but the admin must
+  // know the gate is still armed. Server-computed identity advisories (a
+  // user-tied line without a PIN, a tied user that lost access, …) ride the
+  // save / removal responses, shown once, loudly; the routes table keeps the
+  // marker. The "no PIN" note is dropped when the admin just confirmed that
+  // exact risk: repeating it teaches people to dismiss alerts.
+  const showWarnings = (
+    res: { warnings?: string[] } | undefined, prefix: string, acknowledged: boolean,
+  ) => {
+    const w = (res?.warnings ?? []).filter(x => !acknowledged || !x.includes('no PIN'))
     if (w.length) alert(`${prefix}\n\n${w.map(x => `• ${x}`).join('\n')}`)
   }
 
-  const applyPin = (routeId: string, pin: PinIntent, hadPin: boolean) => {
-    if (!pin.dirty) return
-    if (pin.enabled && pin.value) {
-      setPinMut.mutate({ id: routeId, value: pin.value }, {
-        onError: (e) => alert(`Route saved, but setting the PIN failed: ${(e as Error).message}`),
-      })
-    } else if (!pin.enabled && hadPin) {
-      delPinMut.mutate(routeId, {
-        onSuccess: (res) => showWarnings(res, 'PIN removed. Please note:'),
-        onError: (e) => alert(`Route saved, but removing the PIN failed: ${(e as Error).message}`),
-      })
-    }
+  const removePin = (routeId: string, acknowledged: boolean) => {
+    delPinMut.mutate({ id: routeId, acknowledgeNoPin: acknowledged }, {
+      onSuccess: (res) => showWarnings(res, 'PIN removed. Please note:', acknowledged),
+      onError: (e) => alert(`Route saved, but removing the PIN failed: ${(e as Error).message}`),
+    })
   }
 
-  const handleSave = (data: PhoneRouteCreate & { id?: string; pin_configured?: boolean }, pin: PinIntent) => {
+  const handleSave = (
+    data: PhoneRouteCreate & { id?: string; pin_configured?: boolean }, pin: PinIntent, acknowledged: boolean,
+  ) => {
     // pin_configured + warnings are server-computed — never send them back.
     const { id, pin_configured, ...rest } = data
     delete (rest as { warnings?: string[] }).warnings
     const hadPin = !!pin_configured
-    // A PIN being set in the same save answers the "no PIN" advisory.
-    const settingPin = pin.dirty && pin.enabled && !!pin.value
-    const filterPinNote = (res: { warnings?: string[] } | undefined) =>
-      settingPin ? { warnings: (res?.warnings ?? []).filter(w => !w.includes('no PIN')) } : res
+    // The PIN card hides on an outbound form but keeps its state: a value
+    // rides the save only for an inbound route, and only a valid one.
+    const settingPin = rest.direction === 'inbound' && pin.dirty && pin.enabled && /^\d{4,6}$/.test(pin.value)
+    if (settingPin) rest.pin = pin.value
+    if (acknowledged) rest.acknowledge_no_pin = true
+    const removingPin = pin.dirty && !pin.enabled && hadPin
     if (id) {
       updateMut.mutate({ id, data: rest }, {
         onSuccess: (res) => {
-          applyPin(id, pin, hadPin); setEditRoute(null)
-          showWarnings(filterPinNote(res), 'Route saved. Please note:')
+          if (removingPin) removePin(id, acknowledged)
+          setEditRoute(null)
+          showWarnings(res, 'Route saved. Please note:', acknowledged)
         },
         onError: (e) => alert((e as Error).message),
       })
     } else {
       createMut.mutate(rest as PhoneRouteCreate, {
         onSuccess: (created) => {
-          if (created?.id) applyPin(created.id, pin, false)
           setEditRoute(null)
           if (created?.provisioning_instructions) alert(created.provisioning_instructions)
-          showWarnings(filterPinNote(created), 'Route created. Please note:')
+          showWarnings(created, 'Route created. Please note:', acknowledged)
         },
         onError: (e) => alert((e as Error).message),
       })

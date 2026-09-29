@@ -25,12 +25,15 @@ import sys
 import threading
 from pathlib import Path
 
+from . import config as satconfig  # the module: ``_main`` binds ``config`` to the loaded SatelliteConfig
 from .config import (
     SATELLITE_VERSION,
     SHARED_APP_SERVER_CLIENT_HASH,
     SHARED_CODEX_APPROVALS_HASH,
+    SHARED_LAYOUT_HASH,
     SHARED_MCP_INSTALLER_HASH,
     SHARED_STDIO_INTERCEPTOR_HASH,
+    SHARED_TERMINAL_QUERIES_HASH,
     atomic_replace,
     force_rmtree,
     load_config,
@@ -56,6 +59,8 @@ def _verify_installer_drift() -> None:
         ("app_server_client", SHARED_APP_SERVER_CLIENT_HASH),
         ("codex_approvals", SHARED_CODEX_APPROVALS_HASH),
         ("stdio_path_interceptor", SHARED_STDIO_INTERCEPTOR_HASH),
+        ("terminal_queries", SHARED_TERMINAL_QUERIES_HASH),
+        ("layout", SHARED_LAYOUT_HASH),
     ):
         try:
             mod = __import__(f"satellite._vendored.{mod_name}", fromlist=[mod_name])
@@ -149,7 +154,7 @@ def _check_post_update_state() -> None:
             "Update crash-loop detected (attempts=%d) — rolling back to %s",
             attempts, body[0] if body else "?",
         )
-        if sys.platform == "win32":
+        if satconfig.HOST.locks_running_files:
             # Can't swap in-process: the running venv (OtoDockSatellite.exe
             # + loaded .pyd) lives inside satellite\, so deleting it hits a
             # locked file. Hand the swap-back to runner.ps1 (pre-import, no
@@ -402,7 +407,7 @@ def _ensure_otodock_on_path() -> None:
     clobbers a real file the user placed there). Windows: copy
     ``bin/otodock.cmd`` into ``<otodock_dir>\\bin`` and add that dir to the user
     PATH (see :func:`_ensure_otodock_on_path_windows`)."""
-    if sys.platform == "win32":
+    if not satconfig.HOST.posix:
         _ensure_otodock_on_path_windows()
         return
     log = logging.getLogger("satellite")
@@ -644,7 +649,7 @@ async def _main(config_path: Path | None = None) -> None:
     # any real problem. Install a handler that filters these specific
     # close-time errors but lets every other exception through to the
     # default reporter.
-    if sys.platform == "win32":
+    if not satconfig.HOST.posix:
         def _benign_close_filter(loop_, context):
             exc = context.get("exception")
             msg = context.get("message", "")
@@ -664,7 +669,7 @@ async def _main(config_path: Path | None = None) -> None:
     # of `asyncio.run`, the tray Quit setting `shutdown_event`, and the
     # Scheduled-Task stop terminating the process from outside — each lands in
     # clean shutdown or the `except KeyboardInterrupt` block in `main()`.
-    if sys.platform != "win32":
+    if satconfig.HOST.posix:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, _signal_handler)
 
@@ -793,7 +798,7 @@ def main() -> None:
     # the default "python" title rather than crashing startup.
     # No-op on Windows (process name there comes from the executable
     # filename — handled by runner.ps1 copying python.exe → OtoDockSatellite.exe).
-    if sys.platform != "win32":
+    if satconfig.HOST.posix:
         try:
             import setproctitle  # type: ignore[import-not-found]
             setproctitle.setproctitle("oto-dock-satellite")

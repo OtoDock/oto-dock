@@ -21,7 +21,13 @@ export function useSavePlatformSettings() {
         method: 'PUT',
         body: JSON.stringify(data),
       })
-      if (!res.ok) throw new Error('Failed to save')
+      if (!res.ok) {
+        // A refused setting carries its reason (a 409 when turning the
+        // second-factor requirement on would lock the admin out).
+        let detail = ''
+        try { detail = String((await res.json())?.detail || '') } catch { /* no body */ }
+        throw new Error(detail || 'Failed to save')
+      }
       return res.json()
     },
     onSuccess: () => {

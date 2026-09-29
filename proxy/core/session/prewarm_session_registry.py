@@ -96,16 +96,23 @@ async def reap_stale(ttl: float = PREWARM_TTL_S) -> int:
     reaped = 0
     for sid, e in stale:  # close OUTSIDE the lock (async, and these are ours alone)
         try:
-            from core.session.session_manager import get_execution_layer
-            from storage.pg import run_db
-            # get_execution_layer reads the agent row + (for remote targets)
-            # the machine row and platform settings — a 30 s periodic loop
-            # must not do that on the event loop.
-            layer = await run_db(
-                get_execution_layer,
-                e.agent, execution_path=e.exec_path or None,
-                user_sub=e.user_sub or None, role=e.role or "manager",
-            )
+            from core.session.session_manager import find_layer_for_session
+            # The entry is already popped under the lock above, so the only
+            # thing left is the close — and the registry knows which layer
+            # holds the session. No agent row, no machine row, no platform
+            # settings: the old path resolved all three off the event loop
+            # just to arrive at the layer that was already holding it, and
+            # would strand the slot + subscription seat if that resolution
+            # ever failed (a deleted agent, a retired engine id).
+            layer = find_layer_for_session(sid)
+            if layer is None:
+                # Spawn failed or something already closed it — nothing to
+                # release, and the entry is gone either way.
+                logger.info(
+                    "prewarm: %s (agent=%s) is in no layer registry — "
+                    "nothing to close", sid[:8], e.agent,
+                )
+                continue
             await layer.close_session(sid)
             reaped += 1
             logger.info("prewarm: reaped unused pre-warm %s (agent=%s, idle>%.0fs)",

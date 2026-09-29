@@ -1,8 +1,16 @@
 import { useState, useMemo, useEffect } from 'react'
 import { Trigger, useCreateTrigger, useEditTrigger, useFireTrigger } from '../../api/triggers'
 import { useTasks } from '../../api/tasks'
+import { useApps } from '../../api/apps'
 import { useAgentInfo } from '../../api/agents'
+import { useSubscriptions } from '../../api/subscriptions'
+import { useAuth } from '../../contexts/AuthContext'
 import { availableScopes, modeOfAgent } from '../../lib/visibility'
+import { appKind } from '../../lib/kinds/app'
+import { TASK_KIND } from '../../lib/kinds/task'
+
+/** The "paste an id" choice of the subscription picker. */
+const PASTE_ID = '__paste__'
 
 
 // =====================================================================
@@ -42,15 +50,47 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
   // webhook URL (otok_-authed). Non-empty = trigger fires from a
   // vendor subscription that matches event_filter.
   const [sourceType, setSourceType] = useState<'generic' | 'vendor'>('generic')
-  const [subscriptionId, setSubscriptionId] = useState('')
+  const [subscriptionChoice, setSubscriptionChoice] = useState('')
+  const [pastedSubscriptionId, setPastedSubscriptionId] = useState('')
+  const subscriptionId = subscriptionChoice === PASTE_ID ? pastedSubscriptionId : subscriptionChoice
   const [eventFilterText, setEventFilterText] = useState('{}')
+  // A trigger links only to a subscription of its own scope: personal rows
+  // for a user trigger, the agent's rows for an agent trigger. Offering just
+  // those makes the cross-scope refusal unreachable from here.
+  const { user } = useAuth()
+  const subsQuery = useSubscriptions(
+    scope === 'agent' ? { scope: 'service', agent } : { scope: 'user' },
+  )
+  const linkableSubs = useMemo(
+    () => (subsQuery.data ?? []).filter((s) =>
+      scope === 'agent' ? s.agent === agent : s.owner === user?.sub),
+    [subsQuery.data, scope, agent, user?.sub],
+  )
 
   const createM = useCreateTrigger()
   const { data: tasks = [] } = useTasks(agent)
   // Trigger-only tasks for this scope
   const eligibleTasks = useMemo(
-    () => tasks.filter((t: any) => t.task_type === 'trigger' && t.scope === scope),
+    () => tasks.filter((t: any) => t.task_type === TASK_KIND.TRIGGER && t.scope === scope),
     [tasks, scope],
+  )
+  // Apps with a server that declared on_trigger handlers, in this scope
+  // (APPS.md "Handlers"): the fire wakes the handler instead of a task.
+  const [appTarget, setAppTarget] = useState('')   // "<slug>|<handler>"
+  // A subscription, an app handler and a task each belong to one scope:
+  // a scope change drops the picks made for the other, which the select no
+  // longer shows but the create would still send (and the server refuse).
+  useEffect(() => {
+    setSubscriptionChoice('')
+    setPastedSubscriptionId('')
+    setAppTarget('')
+    setTaskId('')
+  }, [scope])
+  const { data: apps = [] } = useApps(agent)
+  const eligibleApps = useMemo(
+    () => apps.filter((a) => appKind(a).mayServe && (a.handlers?.on_trigger?.length ?? 0) > 0
+      && (scope === 'agent' ? a.scope === 'shared' : a.scope === 'personal')),
+    [apps, scope],
   )
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -59,8 +99,8 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
       alert('Name required')
       return
     }
-    if (!taskId && !notifyEnabled) {
-      alert('Pick a task or enable notification (at least one action required).')
+    if (!taskId && !appTarget && !notifyEnabled) {
+      alert('Pick a task or an app handler, or enable notification (at least one action required).')
       return
     }
     if (notifyEnabled && (!notifyTitle.trim() || !notifyBody.trim())) {
@@ -70,7 +110,9 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
     let parsedFilter: Record<string, unknown> | undefined
     if (sourceType === 'vendor') {
       if (!subscriptionId.trim()) {
-        alert('Vendor source requires a subscription_id. Create the subscription from Connected Accounts first.')
+        alert(scope === 'agent'
+          ? "Vendor source needs one of this agent's subscriptions. Create one in Agent Settings → MCPs → Subscribe to events for this agent."
+          : 'Vendor source needs one of your subscriptions. Create one from Connected Accounts first.')
         return
       }
       try {
@@ -87,6 +129,8 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
         agent,
         slug: slug.trim() || undefined,
         task_id: taskId || undefined,
+        app_slug: appTarget ? appTarget.split('|')[0] : undefined,
+        handler: appTarget ? appTarget.split('|')[1] : undefined,
         notify: notifyEnabled
           ? {
               enabled: true,
@@ -151,13 +195,41 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
         </Field>
         {sourceType === 'vendor' && (
           <>
-            <Field label="Subscription ID" hint="An active subscription's ID from one of your connected accounts (User Settings → Integrations → Connected Accounts → expand the account → Active subscriptions).">
-              <input
-                value={subscriptionId}
-                onChange={(e) => setSubscriptionId(e.target.value)}
-                placeholder="e.g. 8f3a-...-uuid"
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
-              />
+            <Field
+              label="Subscription"
+              hint={scope === 'agent'
+                ? "One of this agent's subscriptions (Agent Settings → MCPs → the MCP → Subscribe to events for this agent)."
+                : 'One of your personal subscriptions (User Settings → Integrations → Connected Accounts → expand the account → Subscribe to events).'}
+            >
+              <select
+                value={subscriptionChoice}
+                onChange={(e) => setSubscriptionChoice(e.target.value)}
+                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+                data-testid="trigger-subscription"
+              >
+                <option value="">— Choose —</option>
+                {linkableSubs.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
+                  </option>
+                ))}
+                <option value={PASTE_ID}>Paste a subscription id…</option>
+              </select>
+              {subscriptionChoice === PASTE_ID && (
+                <input
+                  value={pastedSubscriptionId}
+                  onChange={(e) => setPastedSubscriptionId(e.target.value)}
+                  placeholder="e.g. 8f3a-...-uuid"
+                  className="mt-1 w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
+                />
+              )}
+              {!subsQuery.isLoading && linkableSubs.length === 0 && (
+                <p className="text-xs text-amber-600 mt-1">
+                  {scope === 'agent'
+                    ? 'No agent subscriptions yet: Agent Settings → MCPs → the MCP → Subscribe to events for this agent.'
+                    : 'No personal subscriptions yet: User Settings → Integrations → Connected Accounts → Subscribe to events.'}
+                </p>
+              )}
             </Field>
             <Field label="Event filter (JSON, empty = match all)" hint='Match a specific event by its catalog key, e.g. {"event_type": "pull_request"}. Leave empty ({}) to fire on every event from this subscription.'>
               <textarea
@@ -169,10 +241,25 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
             </Field>
           </>
         )}
+        <Field label="App handler to wake (optional)" hint="An app with a server declares handlers.on_trigger in its app.json; the fire wakes that handler instead of running a task. Approve the app first.">
+          <select
+            value={appTarget}
+            onChange={(e) => { setAppTarget(e.target.value); if (e.target.value) setTaskId('') }}
+            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+            data-testid="trigger-app-handler"
+          >
+            <option value="">— None —</option>
+            {eligibleApps.flatMap((a) => (a.handlers?.on_trigger ?? []).map((h) => (
+              <option key={`${a.slug}|${h}`} value={`${a.slug}|${h}`} disabled={!a.actions_approved}>
+                {a.title || a.slug} → {h}{a.actions_approved ? '' : ' (approve the app first)'}
+              </option>
+            )))}
+          </select>
+        </Field>
         <Field label="Task to run (optional)">
           <select
             value={taskId}
-            onChange={(e) => setTaskId(e.target.value)}
+            onChange={(e) => { setTaskId(e.target.value); if (e.target.value) setAppTarget('') }}
             className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           >
             <option value="">— None —</option>
@@ -270,6 +357,21 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
   const [notifyBody, setNotifyBody] = useState(trigger.notify_body ?? '')
   const [notifySeverity, setNotifySeverity] = useState(trigger.notify_severity)
   const [debounce, setDebounce] = useState(trigger.debounce_seconds)
+  // The vendor source can be bound after creation — an app's trigger is
+  // usually made before the agent's subscription exists, and a trigger
+  // with no subscription never hears a vendor event. Same scope rule as
+  // the create modal: the agent's rows for an agent trigger, personal rows
+  // for a user trigger.
+  const [subscriptionId, setSubscriptionId] = useState(trigger.subscription_id ?? '')
+  const { user } = useAuth()
+  const subsQuery = useSubscriptions(
+    trigger.scope === 'agent' ? { scope: 'service', agent: trigger.agent } : { scope: 'user' },
+  )
+  const linkableSubs = useMemo(
+    () => (subsQuery.data ?? []).filter((s) =>
+      trigger.scope === 'agent' ? s.agent === trigger.agent : s.owner === user?.sub),
+    [subsQuery.data, trigger.scope, trigger.agent, user?.sub],
+  )
   const editM = useEditTrigger()
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -284,6 +386,7 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
           notify_title: notifyTitle || null,
           notify_body: notifyBody || null,
           debounce_seconds: debounce,
+          ...(subscriptionId !== (trigger.subscription_id ?? '') ? { subscription_id: subscriptionId } : {}),
         },
       })
       onClose()
@@ -301,6 +404,29 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
             onChange={(e) => setName(e.target.value)}
             className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           />
+        </Field>
+        <Field
+          label="Vendor subscription"
+          hint={trigger.scope === 'agent'
+            ? "The agent's subscription this trigger fires from (Agent Settings → MCPs → the MCP → Subscribe to events for this agent). None = only the generic webhook URL fires it."
+            : 'The personal subscription this trigger fires from (User Settings → Integrations → Connected Accounts → Subscribe to events). None = only the generic webhook URL fires it.'}
+        >
+          <select
+            value={subscriptionId}
+            onChange={(e) => setSubscriptionId(e.target.value)}
+            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+            data-testid="edit-trigger-subscription"
+          >
+            <option value="">— None —</option>
+            {linkableSubs.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
+              </option>
+            ))}
+            {subscriptionId && !linkableSubs.some((s) => s.id === subscriptionId) && (
+              <option value={subscriptionId}>{subscriptionId} (current)</option>
+            )}
+          </select>
         </Field>
         <label className="flex items-center gap-2 text-sm">
           <input

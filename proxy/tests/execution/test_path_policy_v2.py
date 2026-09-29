@@ -25,6 +25,7 @@ from services.path_policy_v2 import (  # noqa: E402
     resolve_path_batch,
     resolve_path_for_session,
 )
+from core import placement
 
 
 # ---------------------------------------------------------------------------
@@ -33,9 +34,9 @@ from services.path_policy_v2 import (  # noqa: E402
 
 def _local_ctx() -> PathPolicyContext:
     return PathPolicyContext(
-        target_kind="local",
         agent_slug="my-agent",
         role="manager",
+        placement=placement.PlacementCapabilities(kind=placement.KIND_LOCAL),
     )
 
 
@@ -43,34 +44,20 @@ def _user_remote_ctx(*, allow_full_fs: bool = False,
                       home_dir: str = "/home/dave",
                       target_os: str = "linux") -> PathPolicyContext:
     return PathPolicyContext(
-        target_kind="user_remote",
-        machine_id="machine-abc",
-        home_dir=home_dir,
-        os_user="dave",
-        user_dirs={
-            "desktop":   f"{home_dir}/Desktop",
-            "downloads": f"{home_dir}/Downloads",
-        },
-        allow_full_fs=allow_full_fs,
-        target_agents_dir=f"{home_dir}/.oto-dock/agents",
-        target_os=target_os,
         agent_slug="my-agent",
         role="manager",
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="machine-abc", home_dir=home_dir, os_user="dave", user_dirs={
+            "desktop":   f"{home_dir}/Desktop",
+            "downloads": f"{home_dir}/Downloads",
+        }, allow_full_fs=allow_full_fs, agents_dir=f"{home_dir}/.oto-dock/agents", os=target_os),
     )
 
 
 def _admin_remote_ctx(*, allow_full_fs: bool = True) -> PathPolicyContext:
     return PathPolicyContext(
-        target_kind="admin_remote",
-        machine_id="machine-xyz",
-        home_dir="/home/svcuser",
-        os_user="svcuser",
-        user_dirs={"desktop": "/home/svcuser/Desktop"},
-        allow_full_fs=allow_full_fs,
-        target_agents_dir="/home/svcuser/.oto-dock/agents",
-        target_os="linux",
         agent_slug="ops-bot",
         role="admin",
+        placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="machine-xyz", home_dir="/home/svcuser", os_user="svcuser", user_dirs={"desktop": "/home/svcuser/Desktop"}, allow_full_fs=allow_full_fs, agents_dir="/home/svcuser/.oto-dock/agents", os="linux"),
     )
 
 
@@ -330,12 +317,10 @@ class TestRelativeWorkCwdAnchor:
     def test_context_from_security_threads_work_cwd(self):
         from types import SimpleNamespace
         sec = SimpleNamespace(
-            target_kind="user_remote", target_machine_id="m1",
-            target_agents_dir="/home/dave/.oto-dock/agents",
-            target_home_dir="/home/dave", target_allow_full_fs=False,
             role="manager", agent="my-agent",
             session_allowed_roots=("/srv/proj",),
             work_cwd="/srv/proj",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1", agents_dir="/home/dave/.oto-dock/agents", home_dir="/home/dave", allow_full_fs=False),
         )
         built = context_from_security(sec)
         assert built.work_cwd == "/srv/proj"
@@ -431,14 +416,10 @@ class TestResolveUserRemoteHomeOnly:
 
     def test_no_home_fail_closed(self):
         ctx = PathPolicyContext(
-            target_kind="user_remote",
-            machine_id="m",
-            home_dir="",  # missing
-            allow_full_fs=False,
-            target_agents_dir="/home/x/.oto-dock/agents",
+            # missing
             agent_slug="a",
-            target_os="linux",
-        )
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m", home_dir="", allow_full_fs=False, agents_dir="/home/x/.oto-dock/agents", os="linux"),
+            )
         r = resolve_path_for_session(ctx, "/some/path")
         assert not r.allowed
         assert "home directory unknown" in r.error
@@ -496,13 +477,8 @@ class TestResolveAdminRemote:
 class TestWindowsPaths:
     def test_windows_drive_lowercase(self):
         ctx = PathPolicyContext(
-            target_kind="user_remote",
-            machine_id="winbox",
-            home_dir="c:/Users/dave",
-            allow_full_fs=False,
-            target_agents_dir="c:/Users/dave/OtoDock/agents",
-            target_os="windows",
             agent_slug="my-agent",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="winbox", home_dir="c:/Users/dave", allow_full_fs=False, agents_dir="c:/Users/dave/OtoDock/agents", os="windows"),
         )
         # Backslash form should normalize and admit.
         r = resolve_path_for_session(
@@ -513,13 +489,8 @@ class TestWindowsPaths:
 
     def test_windows_other_user_rejected(self):
         ctx = PathPolicyContext(
-            target_kind="user_remote",
-            machine_id="winbox",
-            home_dir="c:/Users/dave",
-            allow_full_fs=False,
-            target_agents_dir="c:/Users/dave/OtoDock/agents",
-            target_os="windows",
             agent_slug="my-agent",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="winbox", home_dir="c:/Users/dave", allow_full_fs=False, agents_dir="c:/Users/dave/OtoDock/agents", os="windows"),
         )
         r = resolve_path_for_session(
             ctx, "C:/Users/admin/Documents/secret.txt",
@@ -530,13 +501,8 @@ class TestWindowsPaths:
 class TestMacOSPaths:
     def test_macos_home_with_users_prefix(self):
         ctx = PathPolicyContext(
-            target_kind="user_remote",
-            machine_id="mac",
-            home_dir="/Users/dave",
-            allow_full_fs=False,
-            target_agents_dir="/Users/dave/.oto-dock/agents",
-            target_os="darwin",
             agent_slug="my-agent",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mac", home_dir="/Users/dave", allow_full_fs=False, agents_dir="/Users/dave/.oto-dock/agents", os="darwin"),
         )
         r = resolve_path_for_session(
             ctx, "/Users/dave/Desktop/foo.png",
@@ -545,13 +511,8 @@ class TestMacOSPaths:
 
     def test_macos_other_user_rejected(self):
         ctx = PathPolicyContext(
-            target_kind="user_remote",
-            machine_id="mac",
-            home_dir="/Users/dave",
-            allow_full_fs=False,
-            target_agents_dir="/Users/dave/.oto-dock/agents",
-            target_os="darwin",
             agent_slug="my-agent",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="mac", home_dir="/Users/dave", allow_full_fs=False, agents_dir="/Users/dave/.oto-dock/agents", os="darwin"),
         )
         r = resolve_path_for_session(ctx, "/Users/admin/secret.txt")
         assert not r.allowed
@@ -661,6 +622,20 @@ class TestCredentialDenylist:
             ctx, "/users/dave/.credentials/google-tokens/acct.json",
         )
         assert not r.allowed
+
+    def test_protected_flag_marks_the_universal_denials(self, _protected_tokens):
+        """``protected`` is what the admin fast path honours: the credential
+        and agent-config sets, not the home band or the .ssh rule."""
+        ctx = _user_remote_ctx()
+        r = resolve_path_for_session(ctx, "/users/dave/.credentials/google-tokens/acct.json")
+        assert not r.allowed and r.protected
+        r = resolve_path_for_session(ctx, "/users/dave/.claude/permission_gate.py", writing=True)
+        assert not r.allowed and r.protected
+        assert resolve_path_for_session(ctx, "/users/dave/.claude/permission_gate.py").allowed
+        r = resolve_path_for_session(ctx, "/home/dave/.ssh/id_rsa")
+        assert not r.allowed and not r.protected
+        r = resolve_path_for_session(ctx, "/etc/hosts")
+        assert not r.allowed and not r.protected
 
     def test_ssh_denied_satellite_host(self):
         ctx = _user_remote_ctx()
@@ -810,3 +785,96 @@ class TestRelativeSessionAnchor:
         r = resolve_path_for_session(ctx, "../bob/workspace/secret.png")
         assert not r.allowed
         assert "absolute path" in r.error
+
+
+# ---------------------------------------------------------------------------
+# The machine's own state is refused to every remote session: its OtoDock
+# folder (the configuration, the browser profiles, the
+# installed MCPs, the daemon) and the other agents' trees, after the
+# session's own tree was translated and before every admission band.
+# ---------------------------------------------------------------------------
+
+class TestRemoteSessionsAreRefusedTheMachinesOwnState:
+    OWN = "/home/dave/.oto-dock/agents/my-agent"
+
+    @staticmethod
+    def _refused(ctx, path, *, writing=False):
+        r = resolve_path_for_session(ctx, path, writing=writing)
+        assert not r.allowed and r.protected is True, (path, r)
+        assert "OtoDock folder" in r.error
+
+    @staticmethod
+    def _allowed(ctx, path, *, writing=False):
+        r = resolve_path_for_session(ctx, path, writing=writing)
+        assert r.allowed, (path, r)
+        return r
+
+    @pytest.mark.parametrize("path", [
+        "~/.oto-dock/satellite.conf",
+        "/home/dave/.oto-dock/satellite.conf",
+        "~/.oto-dock/browser-profiles/other-agent/Default/Cookies",
+        "~/.oto-dock/mcps/workspace-mcp/run.sh",
+        "~/.oto-dock/satellite/transport/ws_client.py",
+        "~/.oto-dock/agents/other-agent/workspace/board.xlsx",
+        "~/.oto-dock",
+    ])
+    def test_home_only_refuses_the_state_read_and_write(self, path):
+        ctx = _user_remote_ctx()
+        self._refused(ctx, path)
+        self._refused(ctx, path, writing=True)
+
+    def test_full_filesystem_and_admin_pairings_refuse_it_too(self):
+        for ctx in (_user_remote_ctx(allow_full_fs=True), _admin_remote_ctx(allow_full_fs=True),
+                    _admin_remote_ctx(allow_full_fs=False)):
+            home = ctx.placement.home_dir
+            self._refused(ctx, f"{home}/.oto-dock/satellite.conf")
+            self._refused(ctx, f"{home}/.oto-dock/agents/other-agent/workspace/x.md", writing=True)
+
+    def test_the_sessions_own_tree_and_the_home_band_still_work(self):
+        ctx = _user_remote_ctx()
+        r = self._allowed(ctx, f"{self.OWN}/workspace/report.md")
+        assert r.path_ref.kind == "agent_tree" and r.access_path == f"{self.OWN}/workspace/report.md"
+        r = self._allowed(ctx, f"{self.OWN}/knowledge/notes.md", writing=True)
+        assert r.path_ref.kind == "agent_tree"
+        self._allowed(ctx, "~/Desktop/notes.txt")
+        self._allowed(ctx, "~/.oto-dock-notes/x.txt")   # a sibling, not the folder
+
+    def test_the_agents_root_is_refused_wherever_it_lives(self):
+        ctx = PathPolicyContext(
+            agent_slug="my-agent", role="manager",
+            placement=placement.PlacementCapabilities(
+                kind=placement.KIND_ADMIN_REMOTE, machine_id="m", home_dir="/home/dave",
+                os_user="dave", agents_dir="/srv/oto/agents", os="linux", allow_full_fs=True),
+        )
+        self._refused(ctx, "/srv/oto/agents/other-agent/workspace/x.md")
+        self._refused(ctx, "/srv/oto/agents/my-agent/stray.txt")      # no known subtree
+        r = self._allowed(ctx, "/srv/oto/agents/my-agent/workspace/x.md")
+        assert r.path_ref.kind == "agent_tree"
+
+    def test_windows_refuses_both_folder_names_in_either_slash_form(self):
+        ctx = PathPolicyContext(
+            agent_slug="my-agent", role="manager",
+            placement=placement.PlacementCapabilities(
+                kind=placement.KIND_USER_REMOTE, machine_id="m", home_dir="C:/Users/eve",
+                os_user="eve", agents_dir="C:/Users/eve/OtoDock/agents", os="windows"),
+        )
+        self._refused(ctx, "C:/Users/eve/OtoDock/satellite.conf")
+        self._refused(ctx, "c:\\users\\eve\\otodock\\satellite.conf")
+        self._refused(ctx, "C:/Users/eve/.oto-dock/browser-profiles/a/Default/Cookies")
+        self._refused(ctx, "C:\\Users\\eve\\OtoDock\\agents\\other\\workspace\\x.md", writing=True)
+        r = self._allowed(ctx, "C:/Users/eve/OtoDock/agents/my-agent/workspace/x.md")
+        assert r.path_ref.kind == "agent_tree"
+        self._allowed(ctx, "C:/Users/eve/Documents/plan.docx")
+
+    def test_macos_refuses_the_folder(self):
+        ctx = _user_remote_ctx(home_dir="/Users/dave", target_os="darwin")
+        self._refused(ctx, "/Users/dave/.oto-dock/satellite.conf")
+        self._allowed(ctx, "/Users/dave/Documents/plan.md")
+
+    def test_a_session_root_under_the_folder_admits_nothing(self):
+        ctx = _user_remote_ctx()
+        ctx = PathPolicyContext(
+            agent_slug=ctx.agent_slug, role=ctx.role, placement=ctx.placement,
+            session_allowed_roots=("/home/dave/.oto-dock/mcps",),
+        )
+        self._refused(ctx, "/home/dave/.oto-dock/mcps/x/server.py")

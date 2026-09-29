@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 
 from auth.providers import UserContext, get_current_user, require_auth
 from services.community import community_icons
+from auth import roles
 
 router = APIRouter()
 
@@ -38,7 +39,7 @@ async def mcp_icon(
     # Every surface that shows an MCP row asks for a creator, an admin or an
     # agent's manager (api/mcp/mcps.py); anyone else would only learn which
     # MCPs are installed from the answer.
-    if user.role not in ("admin", "creator") and "manager" not in user.agent_roles.values():
+    if not roles.is_creator_or_above(user.role) and roles.MANAGER not in user.agent_roles.values():
         raise HTTPException(403, "MCP managers only")
     if not community_icons.valid_name(name):
         raise HTTPException(404, "No such MCP", headers=_MISS_HEADERS)
@@ -48,7 +49,7 @@ async def mcp_icon(
         return FileResponse(path, media_type="image/png", headers=_CACHE_HEADERS)
 
     body = None
-    if user.role in ("admin", "creator"):
+    if roles.is_creator_or_above(user.role):
         body = await community_icons.catalog_icon(name)
     if body is None:
         raise HTTPException(404, "No icon", headers=_MISS_HEADERS)

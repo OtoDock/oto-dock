@@ -443,11 +443,14 @@ async def update_my_ui_prefs(
             status_code=413, detail=f"ui-prefs payload too large (max {_UI_PREFS_MAX_BYTES} bytes)"
         )
     try:
-        return await asyncio.to_thread(
+        out = await asyncio.to_thread(
             user_ui_prefs_store.upsert_prefs, user.sub, req,
         )
     except ValueError as e:  # merged-bag ceiling (see user_ui_prefs_store)
         raise HTTPException(status_code=413, detail=str(e))
+    from services.apps import focus_context
+    focus_context.invalidate_prefs(user.sub)
+    return out
 
 
 # ---------------------------------------------------------------------------

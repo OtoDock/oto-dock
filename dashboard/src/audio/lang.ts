@@ -16,6 +16,17 @@ export function baseLang(tag: string): string {
   return (tag || '').split('-')[0].toLowerCase()
 }
 
+// Default STT language from the browser/OS when the user hasn't picked one — the
+// closest the web exposes to "keyboard language" (no API gives the active layout).
+// A base code, not a tag: the recognizers accept it and the mic menu maps it to
+// its first matching row.
+export function browserSttLang(): string {
+  try {
+    const base = (navigator.language || 'en').slice(0, 2).toLowerCase()
+    return ['en', 'el', 'de', 'es', 'fr', 'it'].includes(base) ? base : 'en'
+  } catch { return 'en' }
+}
+
 // High-frequency function words per Latin language. A match-count scorer is enough
 // to PICK A VOICE — never has to be perfect; a multilingual TTS voice pronounces
 // the text either way. Greek is handled by script, above.

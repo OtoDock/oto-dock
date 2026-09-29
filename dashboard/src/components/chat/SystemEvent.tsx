@@ -1,75 +1,36 @@
 import { Link } from 'react-router-dom'
+import { SYSTEM_SUBTYPE } from '../../api/wireEvents'
 
 interface Props {
   subtype: string
   agentName?: string
   agentColor?: string
-  // Optional structured payload for progress-style events.
-  mcpName?: string
-  progressPct?: number
-  phase?: string
   message?: string
 }
 
+// The centered-divider subtypes: the two the history renderer synthesises
+// from the nudge rows, the self-wake marker, and three meeting outcomes.
 const LABELS: Record<string, string> = {
-  bg_monitoring: 'Monitoring background agents...',
-  bg_agents_complete: 'Background agents completed',
-  delegate_completed: 'Delegated task completed',
-  bg_agents_completed: 'Background agents completed',
-  bg_commands_completed: 'Background commands completed',
+  [SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED]: 'Background agents completed',
+  [SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED]: 'Background commands completed',
   // Provenance marker before an unprompted self-wake review turn (the
   // engine wakes itself when background work finishes — 1.5).
-  bg_wake: 'Background work finished — the agent reviews it',
-  meeting_concluded: 'Meeting concluded',
-  meeting_agent_failed: 'Agent disconnected from meeting',
-  meeting_agent_left: 'Agent left the meeting',
+  [SYSTEM_SUBTYPE.BG_WAKE]: 'Background work finished — the agent reviews it',
+  [SYSTEM_SUBTYPE.MEETING_CONCLUDED]: 'Meeting concluded',
+  [SYSTEM_SUBTYPE.MEETING_AGENT_FAILED]: 'Agent disconnected from meeting',
+  [SYSTEM_SUBTYPE.MEETING_AGENT_LEFT]: 'Agent left the meeting',
 }
 
-export default function SystemEvent({
-  subtype,
-  mcpName, progressPct, phase, message,
-}: Props) {
+export default function SystemEvent({ subtype, message }: Props) {
   // Meeting turn start/end: no inline separators (indicator bar handles speaker identity)
-  if (subtype === 'meeting_turn_start') return null
-  if (subtype === 'meeting_turn_end') return null
-
-  // MCP install progress — amber banner with pct bar, auto-replaced when
-  // the first assistant message arrives. The proxy emits these during the
-  // sync_mcps pass before a remote session starts.
-  if (subtype === 'mcp_installation_progress') {
-    const pct = Math.max(0, Math.min(100, progressPct ?? 0))
-    return (
-      <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40">
-        <div className="flex items-center justify-between text-xs text-amber-800 dark:text-amber-300 mb-1">
-          <span>Installing MCP{mcpName ? `: ${mcpName}` : '...'}</span>
-          <span className="text-amber-600 dark:text-amber-400">{phase || ''} {pct}%</span>
-        </div>
-        <div className="h-1 rounded-full bg-amber-200 dark:bg-amber-900/40 overflow-hidden">
-          <div className="h-1 bg-amber-500" style={{ width: `${pct}%` }} />
-        </div>
-        {message && (
-          <div className="text-xs text-amber-700 dark:text-amber-400 mt-1 truncate">{message}</div>
-        )}
-      </div>
-    )
-  }
-
-  // MCP install failed — red warning card, session continues without MCP.
-  if (subtype === 'mcp_install_failed') {
-    return (
-      <div className="my-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/40 text-xs text-red-800 dark:text-red-300">
-        <div className="font-medium">MCP install failed{mcpName ? `: ${mcpName}` : ''}</div>
-        {message && <div className="mt-1 opacity-80 truncate">{message}</div>}
-        <div className="mt-1 opacity-70">Session will run without this MCP.</div>
-      </div>
-    )
-  }
+  if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) return null
+  if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_END) return null
 
   // Auto-continued with a fresh session: the chat's pinned
   // machine was deleted (or its session files aged out), so the proxy
   // spawned a new session seeded from DB history. Persisted — renders on
   // live push and on every reload at the discontinuity point.
-  if (subtype === 'session_reseeded') {
+  if (subtype === SYSTEM_SUBTYPE.SESSION_RESEEDED) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-900/40 text-sm text-blue-800 dark:text-blue-300">
         <div className="font-medium">Continued with a fresh session</div>
@@ -80,7 +41,7 @@ export default function SystemEvent({
 
   // No usable subscription for this execution layer (user-scoped warmup blocked).
   // A setup prompt, not a crash — amber, points the user at their settings.
-  if (subtype === 'no_subscription') {
+  if (subtype === SYSTEM_SUBTYPE.NO_SUBSCRIPTION) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
         <div className="font-medium">Subscription required</div>
@@ -92,7 +53,7 @@ export default function SystemEvent({
   // The pool's subscription cap refused the spawn (the proxy's wording says
   // which cap and where it is set). Amber: a limit the user or an admin
   // chose, not a crash.
-  if (subtype === 'pool_cap') {
+  if (subtype === SYSTEM_SUBTYPE.POOL_CAP) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
         <div className="font-medium">Subscription cap reached</div>
@@ -107,7 +68,7 @@ export default function SystemEvent({
   // Remote target unreachable — session refused to start. Shown in place
   // of the assistant placeholder bubble so the user gets clear feedback
   // instead of a silently-vanishing message.
-  if (subtype === 'target_unavailable') {
+  if (subtype === SYSTEM_SUBTYPE.TARGET_UNAVAILABLE) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/40 text-sm text-red-800 dark:text-red-300">
         <div className="font-medium">Remote machine unavailable</div>
@@ -119,7 +80,7 @@ export default function SystemEvent({
   // Session failed to START on a reachable machine (config/spawn error — e.g.
   // a bad config.toml). NOT an availability problem, so a distinct title from
   // 'target_unavailable'; carries the backend's error for diagnosis.
-  if (subtype === 'session_error') {
+  if (subtype === SYSTEM_SUBTYPE.SESSION_ERROR) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/40 text-sm text-red-800 dark:text-red-300">
         <div className="font-medium">Couldn’t start the session</div>
@@ -130,7 +91,7 @@ export default function SystemEvent({
 
   // Meeting never started (admission denial, spawn failure) — red card with
   // the orchestrator's reason; the meeting pill is cleared by the handler.
-  if (subtype === 'meeting_failed') {
+  if (subtype === SYSTEM_SUBTYPE.MEETING_FAILED) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/40 text-sm text-red-800 dark:text-red-300">
         <div className="font-medium">Meeting could not start</div>
@@ -140,7 +101,7 @@ export default function SystemEvent({
   }
 
   // Meeting started: branded banner
-  if (subtype === 'meeting_started') {
+  if (subtype === SYSTEM_SUBTYPE.MEETING_STARTED) {
     return (
       <div className="flex items-center justify-center gap-2 py-3 my-2 text-xs">
         <span className="h-px flex-1 bg-[#0891b2]/30" />
@@ -153,7 +114,7 @@ export default function SystemEvent({
   // Undelivered input: the server buffered text for a starting terminal and
   // could not confirm it became a turn (a TUI dialog may have swallowed it).
   // Full text shown un-truncated so the user can copy their prompt back.
-  if (subtype === 'undelivered_input') {
+  if (subtype === SYSTEM_SUBTYPE.UNDELIVERED_INPUT) {
     return (
       <div className="my-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-sm text-amber-800 dark:text-amber-300">
         <div className="font-medium">This message may not have reached the agent</div>
@@ -168,7 +129,7 @@ export default function SystemEvent({
   }
 
   // Context compressed: amber separator
-  if (subtype === 'context_compressed') {
+  if (subtype === SYSTEM_SUBTYPE.CONTEXT_COMPRESSED) {
     return (
       <div className="flex items-center justify-center gap-2 py-3 my-2 text-xs">
         <span className="h-px flex-1 bg-[#b8860b]/30" />
@@ -179,7 +140,7 @@ export default function SystemEvent({
   }
 
   // Meeting concluded: branded banner
-  if (subtype === 'meeting_concluded') {
+  if (subtype === SYSTEM_SUBTYPE.MEETING_CONCLUDED) {
     return (
       <div className="flex items-center justify-center gap-2 py-3 my-2 text-xs">
         <span className="h-px flex-1 bg-brand/30" />
@@ -190,10 +151,10 @@ export default function SystemEvent({
   }
 
   const label = LABELS[subtype]
-  // Unknown subtypes (e.g. CLI "status" heartbeats, "api_retry", etc.) are
-  // suppressed — rendering raw subtype strings as separators is confusing.
-  // The proxy's translator filters these on the server too; this is the
-  // defense-in-depth layer for any subtypes that slip through.
+  // Unknown subtypes (the CLI's raw pass-through such as "api_retry", a
+  // subtype a newer proxy mints) are suppressed — rendering raw subtype
+  // strings as separators is confusing. The proxy's translator filters the
+  // heartbeats on the server too; this is the defense-in-depth layer.
   if (!label) return null
 
   return (

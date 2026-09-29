@@ -1,7 +1,7 @@
 """Auth provider abstraction — base class and result types."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -20,6 +20,9 @@ class AuthResult:
     requires_2fa: bool = False
     totp_session_token: str = ""  # short-lived JWT for 2FA step
     must_change_password: bool = False
+    # The ID token's claims when the provider returned one (OIDC): the
+    # confirm flow reads ``auth_time``, ``aud`` and ``sub`` from them.
+    id_claims: dict = field(default_factory=dict)
 
 
 class AuthProvider(ABC):

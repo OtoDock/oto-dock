@@ -129,3 +129,53 @@ async def test_reconcile_node_absent_marker_records_only(tmp_path):
 @pytest.mark.asyncio
 async def test_reconcile_empty_when_nothing_present(tmp_path):
     assert await mis.reconcile_mcp_runtimes(tmp_path / "nope", None) == {}
+
+
+@pytest.mark.asyncio
+async def test_uv_venv_pinned_runs_under_the_installers_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("OTO_SATELLITE_PRIVATE", "1")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    fake = AsyncMock()
+    fake.communicate = AsyncMock(return_value=(b"", None))
+    fake.returncode = 0
+    with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=fake) as spawn:
+        await mis._uv_venv_pinned("/usr/bin/uv", tmp_path / "m" / "venv", (3, 12), tmp_path / "m")
+    env = spawn.await_args.kwargs["env"]
+    assert "OTO_SATELLITE_PRIVATE" not in env
+    assert env["UV_NO_CONFIG"] == "1" and env["UV_LINK_MODE"] == "copy"
+    assert env["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_rebuilds_a_community_node_mcp(tmp_path):
+    mcps = tmp_path / "mcps"
+    (mcps / "community").mkdir(parents=True)
+    mcp = _make_mcp(mcps, "community", "node-mcp", {"name": "node-mcp", "server": {"runtime": "node"}})
+    (mcp / "node_modules").mkdir()
+    (mcp / mis._RUNTIME_MARKER).write_text(json.dumps({"node_major": 22}))
+    with patch.object(mis, "_node_major", return_value=24), \
+         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn:
+        results = await mis.reconcile_mcp_runtimes(mcps, None)
+    assert results == {"node-mcp": "skipped-bundled-node"}
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_builds_a_catalog_python_folder(tmp_path):
+    """A requirements build runs the file's own sources as this account; a
+    community folder is reported and left alone, a custom one is rebuilt."""
+    mcps = tmp_path / "mcps"
+    for cat in ("custom", "community"):
+        (mcps / cat).mkdir(parents=True)
+        mcp = _make_mcp(mcps, cat, f"{cat}-py", {"name": f"{cat}-py", "server": {"runtime": "python"}})
+        (mcp / "requirements.txt").write_text("requests==2.31\n")
+        _write_pyvenv(mcp / "venv", sys.version_info[0], sys.version_info[1] - 1)
+
+    with patch.object(mis, "_uv_venv_pinned", new_callable=AsyncMock), \
+         patch("satellite._vendored.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
+        results = await mis.reconcile_mcp_runtimes(mcps, "/fake/uv")
+
+    assert results == {"custom-py": "ok-py-reconcile", "community-py": "skipped-community-python"}
+    inst.assert_awaited_once()
+    assert (mcps / "community" / "community-py" / "venv").exists()

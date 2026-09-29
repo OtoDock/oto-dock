@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type JSX } from 'react'
+import { modeOffered } from '../../lib/engines/modes'
 import IconDropdown, { type IconDropdownOption, type IconDropdownGroup } from '../ui/IconDropdown'
 
 export interface ActiveAgent {
@@ -37,10 +38,10 @@ interface Props {
   contextMax: number
   cacheStats?: CacheStats
   meetingActive?: boolean
-  /** Whether the active execution layer supports plan mode (Claude Code CLI
-   * only — Codex and Direct LLM do not). When false, the "Plan" permission
-   * option is hidden. Undefined keeps it shown (back-compat / unknown layer). */
-  supportsPlanMode?: boolean
+  /** The permission modes the active engine declares (`permission_modes` on
+   * its descriptor — Codex and Direct LLM declare no Plan). Undefined (the
+   * catalog has not loaded) offers every mode this bar knows. */
+  permissionModes?: string[]
   modelOptions?: { value: string; label: string }[]
   modelGroups?: ModelGroup[]
   /** Interactive CLI toggle. When `interactiveAvailable`
@@ -124,29 +125,18 @@ const MODE_CONFIG: Record<string, { label: string; bg: string; text: string; bor
 
 const MODE_OPTIONS = Object.entries(MODE_CONFIG).map(([value, c]) => ({ value, label: c.label }))
 
-// --- Model config (fallback for known models) ---
-const MODEL_LETTERS: Record<string, string> = {
-  'claude-fable-5-1': 'F',
-  'claude-fable-5': 'F',  // retired builtin — grandfathered history keeps its 'F'
-  'claude-opus-5': 'O',
-  'claude-opus-4-8[1m]': 'O',  // retired builtin — grandfathered history keeps its 'O'
-  'claude-sonnet-5': 'S',
-  'claude-haiku-4-5': 'H',
-  'gpt-5': 'G',
-  'o3': '3',
-  'o4-mini': '4',
-}
-
-function getModelLetter(model: string): string {
-  if (MODEL_LETTERS[model]) return MODEL_LETTERS[model]
-  // First letter of model name, uppercased
-  return (model[0] || '?').toUpperCase()
+/** The model chip's letter: the initial of the model's display name (the
+ *  descriptor's row — "Fable 5.1" → F, "Opus 5" → O), else of its id (a chat
+ *  pinned to a retired id the catalog no longer serves). */
+function getModelLetter(model: string, label?: string): string {
+  const source = (label || model).trim()
+  return (source[0] || '?').toUpperCase()
 }
 
 // Default fallback options (used when modelOptions prop not provided)
 const DEFAULT_MODEL_OPTIONS = [
   { value: 'claude-fable-5-1', label: 'Fable 5.1 (1M)' },
-  { value: 'claude-opus-5', label: 'Opus 5 (1M)' },
+  { value: 'claude-opus-5-5', label: 'Opus 5.5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5 (1M)' },
 ]
 
@@ -180,7 +170,7 @@ function InteractiveToggle({ on, disabled, onToggle }: {
     >
       <span className="flex flex-col min-w-0">
         <span className="text-xs font-medium text-p-text">Interactive terminal</span>
-        <span className="text-[10px] text-p-text-light leading-tight truncate">Claude or Codex runs as a live TUI</span>
+        <span className="text-[10px] text-p-text-light leading-tight truncate">The native CLI runs as a live TUI</span>
       </span>
       <span className={`relative inline-block w-9 h-5 rounded-full shrink-0 transition-colors ${on ? 'bg-brand' : 'bg-p-border'}`}>
         <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${on ? 'translate-x-4' : ''}`} />
@@ -204,7 +194,7 @@ export default function ChatStatusBar({
   contextMax,
   cacheStats,
   meetingActive,
-  supportsPlanMode,
+  permissionModes: permissionModesProp,
   modelOptions: modelOptionsProp,
   modelGroups,
   modelValue: modelValueProp,
@@ -470,9 +460,10 @@ export default function ChatStatusBar({
             permission mode; our baseline + path enforcement still apply). */}
         {!hidePermissions && (() => {
           const mc = MODE_CONFIG[mode] || MODE_CONFIG.default
+          const offered = permissionModesProp ?? Object.keys(MODE_CONFIG)
           const modeOptions = modeLocked
             ? [{ value: mode, label: mc.label }]
-            : (meetingActive || supportsPlanMode === false) ? MODE_OPTIONS.filter(o => o.value !== 'plan') : MODE_OPTIONS
+            : MODE_OPTIONS.filter(o => modeOffered(offered, o.value, { meeting: meetingActive }))
           return (
             <IconDropdown
               label="Permissions"
@@ -495,7 +486,10 @@ export default function ChatStatusBar({
         {(() => {
           const matchedModel = resolvedModelOptions.find(m => m.value === model)
           const modelLabel = matchedModel?.label || model || 'Unknown'
-          const modelLetter = getModelLetter(model)
+          // The tier word lives in the trigger's tooltip only; the rows show
+          // the four-dot mark.
+          const modelTier = modelGroups?.flatMap(g => g.models).find(m => m.value === (modelValueProp || model))?.tierLabel
+          const modelLetter = getModelLetter(model, matchedModel?.label)
           // A live interactive PTY's model can't be changed from here (use /model
           // in the TUI), so show only the active model read-only — the popup still
           // opens for the interactive switch.
@@ -517,7 +511,7 @@ export default function ChatStatusBar({
               trigger={
                 <span
                   className="flex items-center justify-center w-7 h-7 rounded-lg border bg-p-surface border-p-border-light/60 dark:border-gray-700 text-p-text-secondary hover:bg-white dark:hover:bg-p-surface-hover hover:border-p-border transition-colors cursor-pointer text-xs font-semibold"
-                  title={`Model: ${modelLabel}`}
+                  title={`Model: ${modelLabel}${modelTier ? ` · ${modelTier}` : ''}`}
                 >
                   {modelLetter}
                 </span>

@@ -1,5 +1,5 @@
 """Display artifacts pushed from inside a session: images, image generation
-progress, urls, files, media and mini-app UI.
+progress, urls, files, media and app UI.
 
 One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 (its docstring holds the path-form contract). Routes register on this module's
@@ -19,12 +19,14 @@ from storage import database as task_store
 from auth.path_policy import (
     check_host_path_access,
 )
-from api.sessions.sessions import verify_session_match
+from api.sessions.sessions import verify_session_match_async
 from core.session.session_state import (
     get_permission_queue,
     get_session_security,
 )
 from api.hooks import paths, routing
+from core.session import session_kind
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -59,7 +61,7 @@ async def hook_images(req: HookImagesRequest, authorization: str | None = Header
     horizontal scroll-snap carousel — that decision lives in the renderer,
     not here.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     if not req.images:
         raise HTTPException(status_code=400, detail="images list cannot be empty")
     for idx, item in enumerate(req.images):
@@ -73,7 +75,7 @@ async def hook_images(req: HookImagesRequest, authorization: str | None = Header
             )
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "images",
+        "event_type": wire.IMAGES,
         "images": [item.model_dump() for item in req.images],
     })
     logger.info(
@@ -92,10 +94,10 @@ class HookImageGeneratingRequest(BaseModel):
 @router.post("/v1/hooks/image-generating")
 async def hook_image_generating(req: HookImageGeneratingRequest, authorization: str | None = Header(None)):
     """Called by image-gen-mcp before starting generation. Shows skeleton placeholder."""
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "image_generating",
+        "event_type": wire.IMAGE_GENERATING,
         "prompt_preview": req.prompt_preview,
         "model": req.model,
     })
@@ -109,9 +111,9 @@ class HookImageGenFailedRequest(BaseModel):
 @router.post("/v1/hooks/image-gen-failed")
 async def hook_image_gen_failed(req: HookImageGenFailedRequest, authorization: str | None = Header(None)):
     """Called by image-gen-mcp when generation fails. Removes skeleton placeholder."""
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
-    await queue.put({"event_type": "image_gen_failed"})
+    await queue.put({"event_type": wire.IMAGE_GEN_FAILED})
     return {"status": "ok"}
 
 
@@ -125,10 +127,10 @@ class HookUrlRequest(BaseModel):
 @router.post("/v1/hooks/url")
 async def hook_url(req: HookUrlRequest, authorization: str | None = Header(None)):
     """Called by display-mcp to push a clickable link to the chat."""
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "url",
+        "event_type": wire.URL,
         "url": req.url,
         "title": req.title,
         "description": req.description,
@@ -153,7 +155,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
     lazily pulled from the satellite into the platform-side cache first so
     the adapter can serve it directly.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     file_path, resolution = await paths._classify_and_pull(req.session_id, req.path)
     if file_path is None:
@@ -172,7 +174,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
     from adapters import get_adapter, get_session_adapter
     route = routing.resolve_hook_route(req.session_id)
     if route.is_meeting:
-        adapter = get_adapter("dashboard")
+        adapter = get_adapter(session_kind.DASHBOARD.name)
     else:
         adapter = get_session_adapter(req.session_id)
     if adapter is None:
@@ -238,7 +240,7 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
     satellite-host case is lazily pulled ≤50MB), made browser-playable, and
     minted a durable ``media_tokens`` row.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     kind = req.media_kind.strip().lower()
     if kind not in ("video", "audio"):
@@ -288,7 +290,7 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
     codecs = await media_pipeline.probe(local_path)
     if media_pipeline.needs_transcode(local_path, codecs) and media_pipeline.ffmpeg_available():
         await queue.put({
-            "event_type": "media_processing",
+            "event_type": wire.MEDIA_PROCESSING,
             "media_kind": kind,
             "caption": req.caption,
         })
@@ -380,7 +382,7 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     minted a durable ``media_tokens`` row (``media_kind="ui"``) that only the
     sandboxed ``/v1/ui`` route will serve.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     if not req.html.strip():
         raise HTTPException(status_code=400, detail="html is required")
@@ -474,7 +476,7 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
 
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "ui",
+        "event_type": wire.UI,
         "token": token,
         "ui_url": f"/v1/ui/{token}",
         "title": title,

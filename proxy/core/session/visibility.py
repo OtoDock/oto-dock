@@ -33,8 +33,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Owner-tier roles — the only roles that mount /config and curate knowledge.
-_OWNER_TIER = ("manager", "admin")
+from auth import roles
+from auth.roles import OWNER_TIER
+
+# The two scopes a session mounts and an automation is stored in
+# (``agents.default_scope``, ``tasks.scope`` and its siblings): the person's
+# own tree, or the agent's shared one.
+SCOPE_USER = "user"
+SCOPE_AGENT = "agent"
+SCOPES = (SCOPE_USER, SCOPE_AGENT)
 
 # Stable mode keys (UI labels live in the dashboard; agent-config-mcp maps these).
 MODE_PERSONAL_SHARED = "personal_shared"   # collaborative + user default
@@ -79,12 +86,12 @@ def _read_agent_mode(agent_name: str) -> tuple[bool, str]:
         from storage.agents import agent_store
         row = agent_store.get_agent(agent_name) or {}
         collaborative = bool(row.get("collaborative", True))
-        default_scope = row.get("default_scope") or "user"
-        if default_scope not in ("user", "agent"):
-            default_scope = "user"
+        default_scope = row.get("default_scope") or SCOPE_USER
+        if default_scope not in SCOPES:
+            default_scope = SCOPE_USER
         return collaborative, default_scope
     except Exception:
-        return True, "user"
+        return True, SCOPE_USER
 
 
 def _read_memory_toggles(agent_name: str) -> tuple[bool, bool]:
@@ -109,29 +116,63 @@ def _read_memory_toggles(agent_name: str) -> tuple[bool, bool]:
 def available_scopes_for(collaborative: bool, default_scope: str) -> tuple[str, ...]:
     """Agent-level scopes a mode offers (independent of any session)."""
     if collaborative:
-        return ("user", "agent")
-    if default_scope == "agent":
-        return ("agent",)   # Shared only
-    return ("user",)        # Personal only
+        return SCOPES
+    if default_scope == SCOPE_AGENT:
+        return (SCOPE_AGENT,)   # Shared only
+    return (SCOPE_USER,)        # Personal only
 
 
 def mode_for(collaborative: bool, default_scope: str) -> str:
     """Map the two columns to a stable mode key."""
     if collaborative:
-        return MODE_PERSONAL_SHARED if default_scope == "user" else MODE_SHARED_PERSONAL
-    return MODE_SHARED_ONLY if default_scope == "agent" else MODE_PERSONAL_ONLY
+        return MODE_PERSONAL_SHARED if default_scope == SCOPE_USER else MODE_SHARED_PERSONAL
+    return MODE_SHARED_ONLY if default_scope == SCOPE_AGENT else MODE_PERSONAL_ONLY
 
 
-# Synthetic chat-row owner prefix for Shared-only agents. Every assigned user's
-# dashboard chats collapse into ONE shared list per agent under this owner (the
-# same pattern as ``ws/phone.py``'s ``"phone"`` sentinel). Attribution of who
-# sent each message lives on ``chat_messages.author_sub`` instead.
+# The synthetic chat-row owners — the three ``chats.user_sub`` values that name
+# no users row (retention keys on that: ``services/infra/retention.py``), each
+# spelled HERE and asked of through the predicates below (core-seams phase 4):
+#
+# * ``agent::<slug>`` — a Shared-only agent's one shared history: every assigned
+#   user's dashboard chats collapse into ONE list per agent under this owner;
+#   attribution of who sent each message lives on ``chat_messages.author_sub``.
+# * ``task::<slug>`` — the scheduler's agent-scope task-run chats (a user-scope
+#   run's chat carries the CREATOR's sub instead — the row's kind, not its
+#   owner, says it is a task: ``core/session/session_kind.of_chat``).
+# * ``phone`` — a phone call's chat (a caller has no user).
 SHARED_CHAT_OWNER_PREFIX = "agent::"
+TASK_CHAT_OWNER_PREFIX = "task::"
+PHONE_CHAT_OWNER = "phone"
 
 
-def is_shared_chat_owner(owner: str) -> bool:
+def shared_chat_owner(agent_name: str) -> str:
+    """The synthetic owner of a Shared-only agent's chats — the one mint."""
+    return f"{SHARED_CHAT_OWNER_PREFIX}{agent_name}"
+
+
+def task_chat_owner(agent_name: str) -> str:
+    """The synthetic owner of an agent-scope task run's chat — the one mint."""
+    return f"{TASK_CHAT_OWNER_PREFIX}{agent_name}"
+
+
+def is_shared_chat_owner(owner: str | None) -> bool:
     """True if a chat row's ``user_sub`` is a Shared-only synthetic owner."""
     return bool(owner) and owner.startswith(SHARED_CHAT_OWNER_PREFIX)
+
+
+def is_task_chat_owner(owner: str | None) -> bool:
+    """True if a chat row's ``user_sub`` is the scheduler's agent-scope owner."""
+    return bool(owner) and owner.startswith(TASK_CHAT_OWNER_PREFIX)
+
+
+def is_phone_chat_owner(owner: str | None) -> bool:
+    """True if a chat row's ``user_sub`` is the phone sentinel."""
+    return owner == PHONE_CHAT_OWNER
+
+
+def is_synthetic_owner(owner: str | None) -> bool:
+    """True for any of the three synthetic owners — a row no real user owns."""
+    return is_shared_chat_owner(owner) or is_task_chat_owner(owner) or is_phone_chat_owner(owner)
 
 
 def is_shared_only(agent_name: str) -> bool:
@@ -140,7 +181,7 @@ def is_shared_only(agent_name: str) -> bool:
     not a per-user dir). The single signal upload/scope/access sites branch on to
     answer "is this an agent-scoped chat?" (e.g. the phone ``caller`` agent)."""
     collaborative, default_scope = _read_agent_mode(agent_name)
-    return not collaborative and default_scope == "agent"
+    return not collaborative and default_scope == SCOPE_AGENT
 
 
 def nouser_read_targets(user) -> set[str]:
@@ -175,8 +216,8 @@ def chat_history_owner(agent_name: str, user_sub: str) -> str:
     not call this. Best-effort: an unknown agent falls back to per-user.
     """
     collaborative, default_scope = _read_agent_mode(agent_name)
-    if not collaborative and default_scope == "agent":   # Shared-only
-        return f"{SHARED_CHAT_OWNER_PREFIX}{agent_name}"
+    if not collaborative and default_scope == SCOPE_AGENT:   # Shared-only
+        return shared_chat_owner(agent_name)
     return user_sub
 
 
@@ -212,49 +253,50 @@ def resolve_visibility(
     master_user, master_agent = _read_memory_toggles(agent_name)
 
     available = available_scopes_for(collaborative, default_scope)
-    mount_shared = "agent" in available
-    shared_only = (not collaborative and default_scope == "agent")
+    mount_shared = SCOPE_AGENT in available
+    shared_only = (not collaborative and default_scope == SCOPE_AGENT)
 
     # --- mount scope (which bwrap mount-set + CWD this session uses) ---
     if not username:
         # No human owner at all (phone / agent-task / trigger / meeting).
-        mount_scope = "agent"
+        mount_scope = SCOPE_AGENT
     elif scope_override is not None:
         # Task re-warm: honor the run's stored scope, clamped to the mode.
         mount_scope = scope_override if scope_override in available else available[0]
     else:
         # Human chat: shared-only mounts the agent scope; every other mode the
         # user scope. Both are guaranteed present in ``available`` by construction.
-        mount_scope = "agent" if shared_only else "user"
-    mount_username = username if mount_scope == "user" else ""
+        mount_scope = SCOPE_AGENT if shared_only else SCOPE_USER
+    mount_username = username if mount_scope == SCOPE_USER else ""
 
     # --- /config + knowledge-RW: owner-tier human only ---
     # Uses the REAL username (present for shared-only human chats even though the
     # mount is agent-scope). Agent-scope service sessions (username="") never
     # mount /config — this is the admin-only-task regression guard.
-    config_visible = bool(username) and user_role in _OWNER_TIER
+    config_visible = bool(username) and user_role in OWNER_TIER
 
     # --- effective default scope for scope-aware MCPs (memory/tasks/...) ---
     if not username:
         # No user owner → agent scope is the only sensible default. This clause
         # WINS over the viewer clamp: an agent-scope session has no user dir, so
         # a viewer-role agent-scope session still defaults to agent.
-        eff_default = "agent"
-    elif user_role == "viewer" and "user" in available:
-        # Viewers can never create agent-scope artifacts (API role-gate 403s);
-        # default their tools to user scope so the schema matches the gate.
-        eff_default = "user"
+        eff_default = SCOPE_AGENT
+    elif not roles.can_edit(user_role) and SCOPE_USER in available:
+        # Below the editor tier (a viewer, a contributor) nobody creates
+        # agent-scope artifacts (the API role-gate 403s); default their
+        # tools to user scope so the schema matches the gate.
+        eff_default = SCOPE_USER
     else:
         eff_default = default_scope
     if eff_default not in available:
         eff_default = available[0]
 
     # --- memory availability (toggle AND the mode offers the scope) ---
-    memory_user = master_user and ("user" in available)
-    memory_agent = master_agent and ("agent" in available)
+    memory_user = master_user and (SCOPE_USER in available)
+    memory_agent = master_agent and (SCOPE_AGENT in available)
 
     # --- chat-history owner ---
-    history_owner = f"agent::{agent_name}" if shared_only else user_sub
+    history_owner = shared_chat_owner(agent_name) if shared_only else user_sub
 
     return VisibilityResolution(
         mode=mode_for(collaborative, default_scope),

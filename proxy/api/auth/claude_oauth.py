@@ -15,17 +15,28 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_auth, UserContext
-from auth import claude_oauth
+from auth.providers import get_current_user, require_human, UserContext
+from api.auth.openai_oauth import limit_connect_start
+from core.layers.cli import oauth as claude_oauth
 from services.engines import subscription_pool
-from storage.billing import subscription_store
+from storage.billing import subscription_status, subscription_store
+from auth import roles
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+#: The vendor this login route belongs to — the engine's ``identity.vendor_id``
+#: and the provider its OAuth rows carry, named once.
+_VENDOR = "anthropic"
+
 # In-memory PKCE state store (state → {code_verifier, user_sub, owner_type, expiry})
 _STATE_TTL = 300  # 5 minutes
 _oauth_states: dict[str, dict] = {}
+
+# Starts per person and window (``config.RATE_LIMIT_RULES``). Its own
+# bucket: a Codex install that cannot spawn must not spend the Claude
+# connect's budget.
+_START_BUCKET = "oauth_start_claude"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +92,18 @@ def _consume_state(state: str) -> dict | None:
     return meta
 
 
+def _require_claude_login_engine(layer: str) -> None:
+    """The engine a Claude login is stored on must be one that takes an
+    Anthropic OAuth login (``identity.vendor_id`` + ``oauth`` among its auth
+    types) — a request naming another engine used to store an Anthropic
+    OAuth row under it, which the pool then handed to the wrong CLI."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(layer)
+    if (caps is None or "oauth" not in caps.auth.auth_types
+            or caps.identity.vendor_id != _VENDOR):
+        raise HTTPException(400, f"{layer} does not take a Claude login")
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -91,10 +114,11 @@ async def oauth_start(
     user: UserContext = Depends(get_current_user),
 ):
     """Start the Claude OAuth PKCE flow. Returns auth URL for popup."""
-    user = require_auth(user)
+    user = require_human(user)
     # Admin required for platform subscriptions
-    if req.owner_type == "platform" and user.role != "admin":
+    if req.owner_type == "platform" and not roles.is_admin(user.role):
         raise HTTPException(403, "Admin required for platform subscriptions")
+    limit_connect_start(_START_BUCKET, user.sub)
 
     state = _create_state(
         user_sub=user.sub,
@@ -112,7 +136,8 @@ async def oauth_exchange(
     user: UserContext = Depends(get_current_user),
 ):
     """Exchange authorization code for tokens and create subscription."""
-    user = require_auth(user)
+    user = require_human(user)
+    _require_claude_login_engine(req.layer)
     code = req.code.strip()
     # Strip URL fragment if user copied from browser address bar
     if '#' in code:
@@ -127,7 +152,7 @@ async def oauth_exchange(
         raise HTTPException(403, "OAuth state mismatch")
 
     # Admin required for platform subscriptions
-    if meta["owner_type"] == "platform" and user.role != "admin":
+    if meta["owner_type"] == "platform" and not roles.is_admin(user.role):
         raise HTTPException(403, "Admin required for platform subscriptions")
 
     # Exchange code for tokens (pass state to match CLI behavior). The
@@ -149,12 +174,21 @@ async def oauth_exchange(
     scopes = token_data.get("scope", "").split() if token_data.get("scope") else []
     subscription_type = token_data.get("subscriptionType", "")
     rate_limit_tier = token_data.get("rateLimitTier", "")
-    if not subscription_type:
-        # The token response doesn't carry the plan tier, but the Claude Code
-        # TUI gates plan-included models on it — resolve it from the profile
-        # endpoint so the credential (and the auto-label below) start correct.
-        from services.engines.subscription_pool import fetch_anthropic_subscription_fields
-        fetched_type, fetched_tier = fetch_anthropic_subscription_fields(access_token)
+    account = token_data.get("account") or {}
+    token_email = str(account.get("email_address") or "").strip()
+    token_uuid = str(account.get("uuid") or "").strip()
+
+    # One profile read per exchange, off the event loop, only when the token
+    # response left a gap: the plan tier (the Claude Code TUI gates
+    # plan-included models on it) or the account identity (the match key
+    # below, never guessed from the row list).
+    profile: dict | None = None
+    profile_read = False
+    if not subscription_type or not (token_email or token_uuid):
+        profile = await asyncio.to_thread(claude_oauth.fetch_profile, access_token)
+        profile_read = True
+    if not subscription_type and profile:
+        fetched_type, fetched_tier = claude_oauth.derive_subscription_fields(profile)
         subscription_type = fetched_type
         rate_limit_tier = rate_limit_tier or fetched_tier
 
@@ -165,13 +199,17 @@ async def oauth_exchange(
     # issue #3. The 400 detail is what both connect forms display.
     refusal = claude_oauth.grant_refusal(scopes, subscription_type)
     if refusal:
-        account = token_data.get("account") or {}
         logger.warning(
             "Claude OAuth exchange refused for %s: scopes=%s subscriptionType=%s",
-            account.get("email_address") or account.get("uuid") or "<no identity>",
+            token_email or token_uuid or "<no identity>",
             scopes, subscription_type or "-",
         )
         raise HTTPException(400, refusal)
+
+    identity, account_uuid = _resolve_identity(
+        token_email=token_email, token_uuid=token_uuid,
+        profile=profile, profile_read=profile_read,
+    )
 
     # Build credential data in the same format as .credentials.json
     oauth_token = {
@@ -187,6 +225,10 @@ async def oauth_exchange(
     rt_expires_in = token_data.get("refresh_token_expires_in")
     if rt_expires_in:
         oauth_token["refreshTokenExpiresAt"] = int((time.time() + rt_expires_in) * 1000)
+    # The account uuid rides in the blob as a second match key, so an
+    # exchange that yields only the uuid still finds the row.
+    if account_uuid:
+        oauth_token["accountUuid"] = account_uuid
     credential_data = {"oauth_token": oauth_token}
 
     # Build label from subscription type if not provided
@@ -213,8 +255,6 @@ async def oauth_exchange(
     # leaving whatever the owner later set via the scope checkboxes.
     is_platform = meta["owner_type"] == "platform"
     owner_sub = user.sub
-    account = token_data.get("account") or {}
-    identity = account.get("email_address") or account.get("uuid") or ""
     # include_disabled: a reconnect on an admin-disabled row must MATCH it
     # (and keep it disabled, below) — excluding it here would fork a second
     # ACTIVE row for the same account, silently routing around the admin.
@@ -223,29 +263,11 @@ async def oauth_exchange(
         owner_sub=owner_sub,
         include_disabled=True,
     )
-    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == "anthropic"]
+    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
+    match = _match_existing(existing_oauth, identity=identity, account_uuid=account_uuid)
 
-    if identity:
-        # Only a row PROVEN to be the same account is refreshed. Pre-identity
-        # legacy rows (oauth_email == "") are never adopted — we can't tell
-        # which account they hold, and guessing is exactly the clobber bug;
-        # a same-account legacy reconnect just yields a fresh stamped row and
-        # the stale pill is deleted by hand once.
-        match = next(
-            (s for s in existing_oauth if s.get("oauth_email") == identity),
-            None,
-        )
-    else:
-        # Provider returned no account identity (unexpected for Anthropic) —
-        # fall back to the historic single-row refresh so a reconnect after
-        # revocation still works.
-        match = existing_oauth[0] if existing_oauth else None
-        if match:
-            logger.warning(
-                "Claude OAuth exchange returned no account identity — "
-                "refreshing the first existing subscription %s", match["id"][:8],
-            )
-
+    created = match is None
+    previous_status = match.get("status") if match else None
     if match:
         # Update the same account's subscription with fresh tokens. Under the
         # sub's refresh lock: an in-flight refresh of the OLD (possibly dead)
@@ -253,15 +275,17 @@ async def oauth_exchange(
         # just-written fresh grant. Same lock discipline as every rotation.
         # An admin-DISABLED row keeps its status (credential refresh must not
         # override the admin decision); anything else revives to active.
+        # The label and the stored identity spelling are kept: a renamed
+        # pill keeps its name, and a case-variant identity must not trip the
+        # case-sensitive unique index.
         sub_id = match["id"]
-        new_status = "disabled" if match.get("status") == "disabled" else "active"
+        new_status = (subscription_status.DISABLED if match.get("status") == subscription_status.DISABLED
+                      else subscription_status.ACTIVE)
 
         def _apply_reconnect() -> None:
             with subscription_pool._refresh_lock(sub_id):
                 subscription_store.update_credential_data(sub_id, credential_data)
-                subscription_store.update_subscription(
-                    sub_id, status=new_status, label=label, oauth_email=identity or None,
-                )
+                subscription_store.update_subscription(sub_id, status=new_status)
                 subscription_pool.clear_refresh_backoff(sub_id)
 
         await asyncio.to_thread(_apply_reconnect)
@@ -273,20 +297,33 @@ async def oauth_exchange(
         # 401-recovery re-reads the same stale file forever without this.
         await asyncio.to_thread(subscription_pool.fan_out_current_token, sub_id)
     else:
-        sub = subscription_store.add_subscription(
-            layer=req.layer,
-            provider="anthropic",
-            auth_type="oauth",
-            owner_sub=owner_sub,
-            use_personal=True,
-            # Admins' personal connects ALSO contribute to the shared agent pool
-            # by default (so agent-scoped tasks work without the admin knowing to
-            # tick it). Non-admins can never contribute (the admin gate above).
-            contribute_platform=is_platform or user.role == "admin",
-            label=label,
-            credential_data=credential_data,
-            oauth_email=identity,
-        )
+        try:
+            sub = subscription_store.add_subscription(
+                layer=req.layer,
+                provider=_VENDOR,
+                auth_type="oauth",
+                owner_sub=owner_sub,
+                use_personal=True,
+                # Admins' personal connects ALSO contribute to the shared agent pool
+                # by default (so agent-scoped tasks work without the admin knowing to
+                # tick it). Non-admins can never contribute (the admin gate above).
+                contribute_platform=is_platform or roles.is_admin(user.role),
+                label=label,
+                credential_data=credential_data,
+                oauth_email=identity,
+            )
+        except subscription_store.SubscriptionExists:
+            # A parallel connect of the same account won the insert: name the
+            # row it holds instead of a bare 500.
+            rows = subscription_store.list_subscriptions(
+                layer=req.layer, owner_sub=owner_sub, include_disabled=True,
+            )
+            held = _match_existing(
+                [s for s in rows if s["auth_type"] == "oauth" and s["provider"] == _VENDOR],
+                identity=identity, account_uuid=account_uuid,
+            )
+            shown = (held or {}).get("oauth_email") or identity
+            raise HTTPException(409, f"That account ({shown}) is already connected.")
         logger.info(f"Created new OAuth subscription {sub['id'][:8]}")
 
     # A freshly (re)connected account may be the replacement that sessions
@@ -299,4 +336,75 @@ async def oauth_exchange(
         "subscription": sub,
         "subscription_type": subscription_type,
         "rate_limit_tier": rate_limit_tier,
+        "created": created,
+        "previous_status": previous_status,
     }
+
+
+def _resolve_identity(
+    *, token_email: str, token_uuid: str, profile: dict | None, profile_read: bool,
+) -> tuple[str, str]:
+    """The account identity an exchange stores and matches on, plus the
+    account uuid for the credential blob.
+
+    Token ``email_address`` first, then the profile's ``email``, then the
+    uuid; an email is lower-cased for storage. No identity is a refusal, not
+    a guess: refreshing "the first row" put a second account's tokens under
+    the first account's name. The two causes get distinct messages, since the
+    profile host differs from the token host and an egress rule can pass one
+    and not the other.
+    """
+    prof_account = (profile.get("account") or {}) if isinstance(profile, dict) else {}
+    email = token_email or str(prof_account.get("email") or "").strip()
+    uuid = token_uuid or str(prof_account.get("uuid") or "").strip()
+    identity = email.lower() if email else uuid
+    if identity:
+        return identity, uuid
+    if profile_read and profile is None:
+        logger.warning(
+            "Claude OAuth exchange: the token carried no account identity and "
+            "the profile endpoint could not be reached to confirm it",
+        )
+        raise HTTPException(
+            400,
+            "Could not reach Claude to confirm which account this is. Try again "
+            "in a moment; if it keeps failing, the install cannot reach "
+            "api.anthropic.com.",
+        )
+    logger.warning(
+        "Claude OAuth exchange: neither the token nor the profile returned an "
+        "account identity",
+    )
+    raise HTTPException(
+        400,
+        "Claude did not return the account identity, so this login cannot be "
+        "told apart from your other accounts. Try again.",
+    )
+
+
+def _match_existing(
+    rows: list[dict], *, identity: str, account_uuid: str,
+) -> dict | None:
+    """The existing row that holds this account: the exact identity first,
+    then a case-variant of it (the stored spelling is kept), then the uuid
+    stored in the credential blob (an exchange that yielded only the uuid,
+    or an install whose earlier connect stamped the email). Pre-identity
+    rows (empty ``oauth_email``) are never adopted: they could hold any
+    account, and guessing is the clobber bug."""
+    for s in rows:
+        if s.get("oauth_email") and s.get("oauth_email") == identity:
+            return s
+    folded = identity.lower()
+    for s in rows:
+        stored = s.get("oauth_email") or ""
+        if stored and stored.lower() == folded:
+            return s
+    if account_uuid:
+        for s in rows:
+            if s.get("oauth_email") == account_uuid:
+                return s
+            blob = subscription_store.get_credential_data(s["id"])
+            token = blob.get("oauth_token") if isinstance(blob, dict) else None
+            if isinstance(token, dict) and token.get("accountUuid") == account_uuid:
+                return s
+    return None

@@ -25,17 +25,30 @@ from typing import Any
 from storage.pg import get_conn
 
 
-# Status transitions allowed in the engine. Any transition not listed here
-# is rejected by ``update_status``. Frontend should ideally match.
+# The status vocabulary (``mcp_assignment_requests.status``, named once —
+# core-seams phase 8; the dashboard mirror is ``lib/status/mcpRequest.ts``,
+# bound to this set by a lock-step test) and the transitions allowed in
+# the engine. Any transition not listed here is rejected by ``update_status``.
+PENDING = "pending"
+APPROVED = "approved"
+INSTALLING = "installing"
+INSTALLED = "installed"
+INSTALL_FAILED = "install_failed"
+REJECTED = "rejected"
+CANCELLED = "cancelled"
+
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "pending":        {"approved", "rejected", "cancelled"},
-    "approved":       {"installing"},
-    "installing":     {"installed", "install_failed"},
-    "install_failed": {"installing"},  # retry
+    PENDING:        {APPROVED, REJECTED, CANCELLED},
+    APPROVED:       {INSTALLING},
+    INSTALLING:     {INSTALLED, INSTALL_FAILED},
+    INSTALL_FAILED: {INSTALLING},  # retry
 }
 
-OPEN_STATES = ("pending", "approved", "installing", "install_failed")
-TERMINAL_STATES = ("installed", "rejected", "cancelled")
+OPEN_STATES = (PENDING, APPROVED, INSTALLING, INSTALL_FAILED)
+TERMINAL_STATES = (INSTALLED, REJECTED, CANCELLED)
+STATUSES: frozenset[str] = frozenset(OPEN_STATES + TERMINAL_STATES)
+#: An admin may approve (or retry) a request in these states.
+APPROVABLE = (PENDING, INSTALL_FAILED)
 
 
 def _now() -> str:
@@ -100,7 +113,7 @@ def create_request(
                     INSERT INTO mcp_assignment_requests
                     (mcp_name, agent_slug, requested_by, reason, batch_id,
                      kind, status, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                 )
                 SELECT i.*,
@@ -111,7 +124,7 @@ def create_request(
                 FROM inserted i
                 LEFT JOIN users ru ON ru.sub = i.requested_by""",
                 (mcp_name, agent_slug, requested_by, reason or "", batch_id,
-                 kind, now, now),
+                 kind, PENDING, now, now),
             ).fetchone()
             return dict(row)
         except Exception as exc:
@@ -205,9 +218,9 @@ def list_install_failed_for_mcp(mcp_name: str) -> list[dict]:
     """
     with get_conn() as conn:
         rows = conn.execute(
-            f"{_REQUEST_SELECT} WHERE r.mcp_name=%s AND r.status='install_failed' "
+            f"{_REQUEST_SELECT} WHERE r.mcp_name=%s AND r.status=%s "
             f"ORDER BY r.created_at DESC",
-            (mcp_name,),
+            (mcp_name, INSTALL_FAILED),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -239,7 +252,8 @@ def count_pending() -> int:
     """Pending requests only — used for the admin nav badge."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM mcp_assignment_requests WHERE status='pending'",
+            "SELECT COUNT(*) AS cnt FROM mcp_assignment_requests WHERE status=%s",
+            (PENDING,),
         ).fetchone()
         return int(row["cnt"]) if row else 0
 

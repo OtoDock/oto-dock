@@ -16,6 +16,8 @@ or  ./venv/bin/python -m pytest tests/session/test_bg_command_tracking.py -q
 
 from __future__ import annotations
 
+import pytest
+
 from core.layers.cli.layer import cli_chunk_to_events
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 from core.events.bg_command_state import get_bg_command_registry
@@ -368,3 +370,124 @@ def test_registry_reset_keeps_pending_labels():
     bgreg.reset()
     assert bgreg.label_for("p1") == "p1 — keep"
     assert bgreg.label_for("d1") == ""
+
+
+# ---------------------------------------------------------------------------
+# The post-turn monitor nudges only for a completion the model never saw
+# ---------------------------------------------------------------------------
+
+class _MonitorLayer:
+    """An idle session the bg-command monitor polls; ``on_drain`` stands in
+    for whatever resolves the command meanwhile."""
+
+    def __init__(self, on_drain):
+        self._on_drain = on_drain
+
+    async def is_session_alive(self, session_id: str) -> bool:
+        return True
+
+    async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:
+        return self._on_drain()
+
+
+async def _run_monitor(monkeypatch, sid: str, on_drain) -> list[dict]:
+    import asyncio
+    from core.events import pump_bg_monitors
+    from core.session.session_state import _dashboard_notify_queues
+    monkeypatch.setattr(pump_bg_monitors.task_store, "get_chat", lambda cid: {})
+    queue: asyncio.Queue = asyncio.Queue()
+    _dashboard_notify_queues[sid] = queue
+    try:
+        await pump_bg_monitors._bg_command_monitor(_MonitorLayer(on_drain), sid, "c-" + sid, 1)
+    finally:
+        _dashboard_notify_queues.pop(sid, None)
+    return [queue.get_nowait() for _ in range(queue.qsize())]
+
+
+@pytest.mark.asyncio
+async def test_monitor_skips_the_nudge_for_a_completion_a_later_turn_surfaced(monkeypatch):
+    # The command outlives its turn; the person's next turn starts (the
+    # registry reset keeps it pending) and the CLI hands its completion to
+    # the model inside that turn. The monitor must not start a review turn.
+    from core.events.bg_command_state import reset_bg_command_registry
+    sid = "s-mon-surfaced"
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("bM1", "tuM1", label="bM1 — make test")
+
+    def later_turn():
+        reset_bg_command_registry(sid)
+        t = ClaudeCLIEventTranslator(sid)
+        _events(t, [_sys("task_updated", task_id="bM1", patch={"status": "completed"})])
+        return False
+
+    assert await _run_monitor(monkeypatch, sid, later_turn) == []
+    assert bgreg.pending_count == 0 and bgreg.unsurfaced_count == 0
+
+
+@pytest.mark.asyncio
+async def test_monitor_nudges_for_a_completion_the_model_never_saw(monkeypatch):
+    from core.session.session_state import resolve_bg_command_frame
+    sid = "s-mon-unseen"
+    get_bg_command_registry(sid).register_spawn("bM2", "tuM2", label="bM2 — make test")
+
+    def idle_drain():
+        return resolve_bg_command_frame(sid, {
+            "type": "system", "subtype": "task_updated",
+            "task_id": "bM2", "patch": {"status": "completed"}})
+
+    nudge, = await _run_monitor(monkeypatch, sid, idle_drain)
+    assert nudge["type"] == "bg_command_nudge"
+    assert nudge["labels"] == ["bM2 — make test"]
+
+
+@pytest.mark.asyncio
+async def test_a_nudge_queued_on_a_running_pump_writes_its_row_off_the_loop(
+        monkeypatch, temp_db, loop_db_guard):
+    """The monitor's nudge event row rides the chat writer, not
+    a synchronous store call on the loop."""
+    from core.events import chat_writer, pump_bg_monitors
+    from core.session.session_state import resolve_bg_command_frame
+    from storage import database as task_store
+    sid = "s-mon-offloop"
+    chat_id = "c-" + sid
+    task_store.create_chat(chat_id, "user-admin", "agent-x")
+    get_bg_command_registry(sid).register_spawn("bM3", "tuM3", label="bM3 — build")
+    monkeypatch.setattr(pump_bg_monitors, "queue_pump_prompt", lambda *a, **k: True)
+    monkeypatch.setattr(pump_bg_monitors.task_store, "get_chat", lambda cid: {})
+
+    def idle_drain():
+        return resolve_bg_command_frame(sid, {
+            "type": "system", "subtype": "task_updated",
+            "task_id": "bM3", "patch": {"status": "completed"}})
+
+    with loop_db_guard.active():
+        await pump_bg_monitors._bg_command_monitor(_MonitorLayer(idle_drain), sid, chat_id, 1)
+        await chat_writer.drain(chat_id)
+    rows = task_store.get_chat_messages(chat_id)
+    assert [r["event_type"] for r in rows] == ["bg_command_nudge"]
+
+
+@pytest.mark.asyncio
+async def test_the_abort_check_reads_the_chat_off_the_loop(monkeypatch, temp_db, loop_db_guard):
+    """A cohort that completes after the person stopped the chat's last turn
+    earns no nudge, and the read of that flag runs on the DB executor."""
+    from core.events import pump_bg_monitors
+    from core.session.session_state import resolve_bg_command_frame
+    from storage import database as task_store
+    sid = "s-mon-aborted"
+    chat_id = "c-" + sid
+    task_store.create_chat(chat_id, "user-admin", "agent-x")
+    task_store.update_chat(chat_id, last_turn_aborted=True)
+    get_bg_command_registry(sid).register_spawn("bM4", "tuM4", label="bM4: build")
+    queued: list = []
+    monkeypatch.setattr(pump_bg_monitors, "queue_pump_prompt",
+                        lambda *a, **k: queued.append(a) or True)
+
+    def idle_drain():
+        return resolve_bg_command_frame(sid, {
+            "type": "system", "subtype": "task_updated",
+            "task_id": "bM4", "patch": {"status": "completed"}})
+
+    with loop_db_guard.active():
+        await pump_bg_monitors._bg_command_monitor(_MonitorLayer(idle_drain), sid, chat_id, 1)
+    assert queued == []

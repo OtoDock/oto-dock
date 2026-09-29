@@ -9,12 +9,22 @@ unguessable token alone is no longer sufficient. `media_kind="file"` rows are
 send_file / document-preview downloads (always attachment-forced by the
 inline allowlist).
 
+The row's ``abs_path`` was checked at mint, on the file that existed then;
+the agent that owns the file keeps writing under that name afterwards. Serve
+therefore never re-opens the name: the path is placed under one of three
+proxy-owned roots, opened through ``safe_fs`` (no symlink anywhere below the
+root), and the response streams the descriptor the check produced
+(``FdFileResponse``). A file swapped for a link after the mint is "not
+found", whatever it points to.
+
 `POST /v1/media/token` mints a token for a workspace file (authenticated: agent
 access + role check), used by the workspace audio/video previews. Chat playback
 tokens are minted server-side by the `/v1/hooks/media` hook.
 """
 
+import asyncio
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +36,7 @@ from pydantic import BaseModel
 
 from api.media.access import can_serve_token
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from services.infra import safe_fs
 from services.media import media_pipeline
 from storage.agents import agent_store
 from storage import database as task_store
@@ -36,6 +47,93 @@ router = APIRouter()
 # Workspace-minted tokens self-expire (reaped by the TTL sweep). Chat-display
 # tokens minted by the hook pass expires_at="" (durable until chat delete).
 _WORKSPACE_TOKEN_TTL = 24 * 3600
+
+# The lazy-pull cache for satellite-host files sits inside the agents tree
+# (``core/remote/remote_file_flow._host_cache_root``), one folder per session.
+HOST_CACHE_SEGMENT = ".remote-host-cache"
+
+
+class MediaUnserveable(Exception):
+    """The row's path is under no serving root or fails its binding; the
+    client gets the same 404 as for a missing file."""
+
+
+class FdFileResponse(FileResponse):
+    """A ``FileResponse`` over a descriptor the caller already checked.
+
+    The path handed to Starlette is ``/proc/self/fd/N``, which re-opens the
+    very inode ``fd`` refers to, so Range/206, If-Range, HEAD, Content-Length
+    and ETag all work as for a named file while no later rename or symlink can
+    redirect the bytes. The response OWNS ``fd``: it is closed when the
+    response has been sent, on a client disconnect and on an exception alike
+    (a ``BackgroundTask`` would be skipped on disconnect). A caller that
+    holds a file object hands over ``os.dup(f.fileno())``.
+    """
+
+    def __init__(self, fd: int, stat_result: os.stat_result, **kwargs) -> None:
+        self._fd = fd
+        super().__init__(safe_fs.fd_path(fd), stat_result=stat_result, **kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        # A server that implemented pathsend would receive the magic link and
+        # open it after the close below; uvicorn does not, but never offer it.
+        extensions = scope.get("extensions")
+        if extensions and "http.response.pathsend" in extensions:
+            scope = {**scope, "extensions": {k: v for k, v in extensions.items()
+                                             if k != "http.response.pathsend"}}
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+
+def _serve_roots() -> tuple[str, str, str]:
+    """``(agents, media cache, host media cache)`` as absolute paths."""
+    return (
+        os.path.abspath(os.fspath(config.AGENTS_DIR)),
+        os.path.abspath(os.fspath(media_pipeline._CACHE_DIR)),
+        os.path.abspath(os.fspath(media_pipeline._HOST_CACHE_DIR)),
+    )
+
+
+def locate_media_row(info: dict) -> tuple[str, str]:
+    """``(root, rel)`` for a ``media_tokens`` row: the closest of the three
+    roots holding its ``abs_path`` and the path below it. Under the agents
+    root the first segment is bound to the row's agent (a legacy row with
+    ``agent=''`` is bound to the slug the path names) or, for a lazy-pull
+    cache path, to the row's session. Raises ``MediaUnserveable``."""
+    abs_path = (info.get("abs_path") or "").strip()
+    roots = _serve_roots()
+    try:
+        root, rel = safe_fs.split_under(abs_path, roots)
+    except OSError as exc:
+        raise MediaUnserveable(f"path outside every serving root: {exc}") from None
+    if root == roots[0]:
+        first, _, rest = rel.partition("/")
+        if first == HOST_CACHE_SEGMENT:
+            session = rest.partition("/")[0]
+            if not session or session != (info.get("session_id") or ""):
+                raise MediaUnserveable("host-cache path bound to another session")
+        else:
+            agent = (info.get("agent") or "").strip()
+            if not config.is_safe_agent_name(first) or (agent and first != agent):
+                raise MediaUnserveable("agent segment does not match the row")
+    return root, rel
+
+
+def open_media_row(info: dict) -> tuple[int, os.stat_result, str]:
+    """``(fd, stat, rel)`` of the regular file a row names, opened without
+    following any symlink. Blocking: run it in a thread. ``FileNotFoundError``
+    for a missing file (the caller's re-pull / 404), ``SafeFsError`` for a
+    link, a FIFO or an escape, ``MediaUnserveable`` for a bad row."""
+    root, rel = locate_media_row(info)
+    fd, st = safe_fs.open_regular_for_read(root, rel)
+    return fd, st, rel
 
 
 async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | None:
@@ -65,6 +163,43 @@ async def _repull_satellite_media(token: str, info: dict) -> tuple[Path, str] | 
     return served, mime
 
 
+async def _open_or_repull(token: str, info: dict) -> tuple[int, os.stat_result, str, dict]:
+    """The checked descriptor for a row, re-pulling satellite-host media that
+    aged out of its cache. Every refusal is the client's 404 (or the 503 for
+    an offline machine): a holder learns nothing about what a path points at."""
+    try:
+        fd, st, rel = await asyncio.to_thread(open_media_row, info)
+        return fd, st, rel, info
+    except FileNotFoundError:
+        pass
+    except MediaUnserveable as exc:
+        logger.warning("media token %s (%s) refused: %s", token[:8],
+                       info.get("media_kind") or "?", exc)
+        raise HTTPException(status_code=404, detail="media not found or expired")
+    except (safe_fs.SafeFsError, OSError) as exc:
+        logger.warning("media token %s (%s) refused: %s", token[:8],
+                       info.get("media_kind") or "?", type(exc).__name__)
+        raise HTTPException(status_code=404, detail="media not found or expired")
+    # Satellite-host (Desktop/Downloads) media isn't retained on the
+    # platform: re-pull it from the laptop on demand if it's connected.
+    result = await _repull_satellite_media(token, info)
+    if result is None:
+        if (info.get("origin_path") or "").strip():
+            raise HTTPException(
+                status_code=503,
+                detail="This clip lives on the remote machine, which is "
+                       "offline. Reconnect it and try again.",
+            )
+        raise HTTPException(status_code=404, detail="media file no longer exists")
+    served, repulled_mime = result
+    info = {**info, "abs_path": str(served), "mime": repulled_mime}
+    try:
+        fd, st, rel = await asyncio.to_thread(open_media_row, info)
+    except (OSError, MediaUnserveable):
+        raise HTTPException(status_code=404, detail="media file no longer exists")
+    return fd, st, rel, info
+
+
 @router.get("/v1/media/{token}")
 async def serve_media(
     token: str,
@@ -90,46 +225,39 @@ async def serve_media(
     # inline from THIS route would be same-origin stored XSS.
     if (info.get("media_kind") or "") == "ui":
         raise HTTPException(status_code=404, detail="media not found or expired")
-    path = Path(info["abs_path"])
-    if not path.is_file():
-        # Satellite-host (Desktop/Downloads) media isn't retained on the
-        # platform — re-pull it from the laptop on demand if it's connected.
-        result = await _repull_satellite_media(token, info)
-        if result is None:
-            if (info.get("origin_path") or "").strip():
-                raise HTTPException(
-                    status_code=503,
-                    detail="This clip lives on the remote machine, which is "
-                           "offline — reconnect it and try again.",
-                )
-            raise HTTPException(status_code=404, detail="media file no longer exists")
-        path, repulled_mime = result
-        info = {**info, "mime": repulled_mime}
-    mime = info.get("mime") or media_pipeline.guess_media_mime(path)
-    # nosniff on every media response so the browser honours our declared type
-    # instead of sniffing an attacker-shaped body into something executable.
-    headers = {"X-Content-Type-Options": "nosniff"}
-    if download:
-        # Attachment download. The client `fn` is often a caption/title with no
-        # extension (e.g. a track name), so keep the saved file's type by
-        # falling back to the served file's real suffix or the mime.
-        name = fn or path.name
-        if not Path(name).suffix:
-            name += path.suffix or media_pipeline.guess_media_ext(mime)
-        return FileResponse(path, media_type=mime, filename=name, headers=headers)
-    # Inline disposition is an ALLOWLIST of known-inert types. Everything
-    # else — text/html, XHTML, SVG, XML/XSLT, anything scriptable as a
-    # top-level document — is forced to an attachment (an <img>/<video> still
-    # renders a downloaded-disposition source; only direct navigation changes).
-    inline_ok = (
-        mime.startswith(("audio/", "video/"))
-        or (mime.startswith("image/") and mime != "image/svg+xml")
-        or mime == "application/pdf"
-    )
-    if not inline_ok:
-        return FileResponse(path, media_type=mime, filename=path.name, headers=headers)
-    # No filename → inline; FileResponse adds Accept-Ranges + 206 handling.
-    return FileResponse(path, media_type=mime, headers=headers)
+    fd, st, rel, info = await _open_or_repull(token, info)
+    try:
+        leaf = rel.rsplit("/", 1)[-1]
+        mime = info.get("mime") or media_pipeline.guess_media_mime(leaf)
+        # nosniff on every media response so the browser honours our declared
+        # type instead of sniffing an attacker-shaped body into something
+        # executable.
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if download:
+            # Attachment download. The client `fn` is often a caption/title
+            # with no extension (e.g. a track name), so keep the saved file's
+            # type by falling back to the served file's real suffix or the mime.
+            name = fn or leaf
+            if not Path(name).suffix:
+                name += Path(leaf).suffix or media_pipeline.guess_media_ext(mime)
+            return FdFileResponse(fd, st, media_type=mime, filename=name, headers=headers)
+        # Inline disposition is an ALLOWLIST of known-inert types. Everything
+        # else (text/html, XHTML, SVG, XML/XSLT, anything scriptable as a
+        # top-level document) is forced to an attachment (an <img>/<video>
+        # still renders a downloaded-disposition source; only direct
+        # navigation changes).
+        inline_ok = (
+            mime.startswith(("audio/", "video/"))
+            or (mime.startswith("image/") and mime != "image/svg+xml")
+            or mime == "application/pdf"
+        )
+        if not inline_ok:
+            return FdFileResponse(fd, st, media_type=mime, filename=leaf, headers=headers)
+        # No filename → inline; FileResponse adds Accept-Ranges + 206 handling.
+        return FdFileResponse(fd, st, media_type=mime, headers=headers)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class MintMediaTokenRequest(BaseModel):

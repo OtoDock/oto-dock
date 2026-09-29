@@ -21,6 +21,7 @@ import time
 
 from services.infra import storage_quota
 from storage.pg import get_conn
+from auth import roles
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,11 @@ async def _measure(scope: "storage_quota.QuotaScope") -> tuple[int, int]:
         b, i = await asyncio.to_thread(storage_quota.dir_usage, d)
         total_b += b
         total_i += i
+    if scope.scope_type == "user" and scope.owner_sub:
+        # A chunked upload in flight is the user's disk too; it lives in the
+        # staging area, outside the bucket's directories, until it completes.
+        from api.media import uploads
+        total_b += await asyncio.to_thread(uploads.staged_bytes_for, scope.owner_sub)
     return (total_b, total_i)
 
 
@@ -157,14 +163,15 @@ async def _fire(scope: "storage_quota.QuotaScope", metric: str, threshold: int,
 
 
 def _targets_for(scope: "storage_quota.QuotaScope") -> list[str]:
-    """Subs to notify: the owner for a user scope; managers + editors for shared."""
+    """Subs to notify: the owner for a user scope; the workspace tier (those
+    who write the shared workspace) for shared."""
     if scope.scope_type == "user":
         return [scope.owner_sub] if scope.owner_sub else []
     from storage import database
     return [
         u["sub"]
         for u in database.get_agent_users_with_profile(scope.agent_slug)
-        if u.get("agent_role") in ("manager", "editor") and u.get("sub")
+        if roles.can_write_workspace(u.get("agent_role")) and u.get("sub")
     ]
 
 

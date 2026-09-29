@@ -9,6 +9,8 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { AgentRole } from '../lib/permissions'
+import type { DepartmentMode, DepartmentReach } from '../lib/kinds/department'
 
 export interface DepartmentLevel {
   id: string
@@ -30,8 +32,11 @@ export interface Department {
   id: string
   name: string
   created_by_sub: string
-  auto_delegation: boolean
-  reach: 'adjacent' | 'subtree'
+  /** Which links the department wires (lib/departments MODE_*); new
+   * departments default to 'down'. */
+  mode: DepartmentMode
+  /** How many levels a wired link spans; independent of the mode. */
+  reach: DepartmentReach
   position_hint: string
   levels: DepartmentLevel[]
   members: DepartmentMember[]
@@ -104,8 +109,8 @@ export function useCreateDepartment() {
   return useMutation({
     mutationFn: async (data: {
       name: string
-      auto_delegation?: boolean
-      reach?: 'adjacent' | 'subtree'
+      mode?: DepartmentMode
+      reach?: DepartmentReach
       levels?: string[]
     }) => {
       const res = await apiFetch('/v1/departments', {
@@ -128,8 +133,8 @@ export function useUpdateDepartment() {
     mutationFn: async ({ id, ...fields }: {
       id: string
       name?: string
-      auto_delegation?: boolean
-      reach?: 'adjacent' | 'subtree'
+      mode?: DepartmentMode
+      reach?: DepartmentReach
       position_hint?: string
     }) => {
       const res = await apiFetch(`/v1/departments/${id}`, {
@@ -194,7 +199,7 @@ export function useAdminAddUserAgent() {
     mutationFn: async ({ sub, agent, role = 'viewer' }: {
       sub: string
       agent: string
-      role?: 'manager' | 'editor' | 'viewer'
+      role?: AgentRole
     }) => {
       const res = await apiFetch(`/v1/admin/users/${sub}/agents/${agent}`, {
         method: 'POST',

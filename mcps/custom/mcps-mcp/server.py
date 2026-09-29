@@ -22,7 +22,7 @@ avoids the two-step admin chain that breaks down on ``explicit``-mode
 MCPs needing instance config the tool layer can't provide.
 
 Permission gating is resolved ONCE at module load using the auto-injected
-``OTO_*`` env var set (``OTO_ROLE``, ``OTO_SCOPE``). Disallowed sessions
+``OTO_*`` env var set (``OTO_CAN_MANAGE_AGENT``, ``OTO_SCOPE``). Disallowed sessions
 (viewers) end up with an empty tool list — the MCP starts cleanly but exposes
 nothing, which is friendlier to the MCP launcher than ``sys.exit(0)`` would be
 (no spurious failure logs).
@@ -44,7 +44,10 @@ that — the platform is still the authoritative gate.
 
 Env vars (auto-injected by ``core/oto_env.py`` + ``env_builder.py``):
   OTO_AGENT_NAME       — agent slug (used for ``/v1/agents/{slug}/...``)
-  OTO_ROLE             — ``viewer``/``manager``/``admin``/``""`` (agent-scope)
+  OTO_CAN_MANAGE_AGENT — ``true`` when the session's person holds the owner
+                         tier on the agent (a manager or an admin; the
+                         manifest excludes task, meeting and external
+                         sessions, so no fire or caller loads this MCP)
   OTO_SCOPE            — ``user`` or ``agent``
   OTO_SESSION_ID       — session id (currently unused; future correlation)
   PROXY_URL            — proxy base URL
@@ -68,7 +71,10 @@ from mcp.types import TextContent, Tool
 # ---------------------------------------------------------------------------
 
 AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
-ROLE = os.environ.get("OTO_ROLE", "")
+# The owner-tier question, answered by the proxy in the env
+# (core/sandbox/oto_env.py): a separate process cannot import the proxy and
+# carries no role vocabulary of its own.
+CAN_MANAGE = os.environ.get("OTO_CAN_MANAGE_AGENT", "") == "true"
 SCOPE = os.environ.get("OTO_SCOPE", "")
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -80,15 +86,16 @@ def _resolve_tool_set() -> set[str]:
 
     The matrix:
 
-    - ``scope=user`` × ``role=viewer`` → empty (viewers don't manage MCPs).
-    - ``scope=user`` × ``role=manager`` → read + request tools.
-    - ``scope=user`` × ``role=admin`` → all tools (read + request + admin).
-    - ``scope=agent`` (task / phone / trigger / Shared-only agent) →
-      read-only (no requests — agent-scope can't act on behalf of a user).
+    - ``scope=user`` × below the owner tier (a viewer, a contributor, an
+      editor) → empty (only the owner tier manages MCPs; the others
+      collaborate on the workspace).
+    - ``scope=user`` × a manager → read + request tools.
+    - ``scope=user`` × an admin → the same set as a manager.
+    - ``scope=agent`` (a Shared-only agent's chat, or a user-tied phone
+      route on one) → read-only (no requests — agent-scope can't act on
+      behalf of a user). Task, trigger, meeting and external-caller
+      sessions never load this MCP (the manifest's ``exclude_from``).
     """
-    if SCOPE == "user" and ROLE == "viewer":
-        return set()
-
     read = {"list_enabled_mcps", "list_available_mcps", "list_community_mcps",
             "list_community_skills"}
     if SCOPE == "agent":
@@ -106,7 +113,7 @@ def _resolve_tool_set() -> set[str]:
         "get_request_status",
         "cancel_my_request",
     }
-    if SCOPE == "user" and ROLE in ("manager", "admin"):
+    if SCOPE == "user" and CAN_MANAGE:
         return manager
     return set()
 

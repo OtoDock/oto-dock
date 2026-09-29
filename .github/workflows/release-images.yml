@@ -64,7 +64,9 @@ jobs:
             context: .
             dockerfile: phone/Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Sanitise the platform for use in file/tag names
         run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
@@ -88,18 +90,18 @@ jobs:
           echo "::notice::building ${{ matrix.image }} (${{ matrix.platform }}) -> ghcr.io/otodock/${{ matrix.image }}:$version"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -107,7 +109,7 @@ jobs:
           # No `tags` here: each leg pushes an untagged, digest-addressed image
           # and the merge job below tags the assembled manifest list.
           outputs: type=image,name=ghcr.io/otodock/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
-          # file-tools has no version ARGs — the extra build-args are inert there.
+          # file-tools takes PYTHON_IMAGE only; NODE_IMAGE is inert there.
           build-args: |
             PYTHON_IMAGE=${{ steps.meta.outputs.python_image }}
             NODE_IMAGE=${{ steps.meta.outputs.node_image }}
@@ -124,7 +126,7 @@ jobs:
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload the digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: digests-${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -143,10 +145,12 @@ jobs:
       matrix:
         image: [otodock-proxy, otodock-file-tools, otodock-phone]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Download this image's digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-${{ matrix.image }}-*
@@ -188,14 +192,14 @@ jobs:
           echo "::notice::${{ matrix.image }} → $tags"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Create the manifest list and tag it
         working-directory: ${{ runner.temp }}/digests

@@ -1,11 +1,13 @@
 """OpenAI OAuth REST API — device code flow via `codex login --device-auth`.
 
 Flow:
-1. POST /v1/oauth/openai/start → spawns `codex login --device-auth` on server,
-   returns {url, user_code, login_id}
+1. POST /v1/oauth/openai/start → spawns `codex login --device-auth` on server
+   in a private Codex home of its own, returns {url, user_code, login_id}
 2. User opens the verification URL on any device and enters the code
-3. GET /v1/oauth/openai/status → polls until codex login writes ~/.codex/auth.json
-4. POST /v1/oauth/openai/finish → reads auth.json, stores as encrypted subscription
+3. GET /v1/oauth/openai/status → polls until codex login writes that home's
+   auth.json
+4. POST /v1/oauth/openai/finish → reads that auth.json, stores as encrypted
+   subscription, removes the home
 
 Works from everywhere (Android, desktop, remote) — no localhost redirect needed.
 For per-user subscriptions: same flow but stored with owner_type="user".
@@ -14,35 +16,74 @@ For per-user subscriptions: same flow but stored with owner_type="user".
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import signal
 import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_auth, UserContext
+from auth.providers import get_current_user, require_human, UserContext
 from services.engines import subscription_pool
-from storage.billing import subscription_store
+from storage.billing import subscription_status, subscription_store
 import config as app_config
 import contextlib
+from auth import rate_limiter, roles
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Active login sessions: login_id → {proc, user_sub, owner_type, layer, started_at, ...}
+#: The vendor this login route belongs to — the engine's ``identity.vendor_id``
+#: and the provider its OAuth rows carry, named once.
+_VENDOR = "openai"
+
+# Active login sessions: login_id → {proc, home, user_sub, owner_type, layer, started_at}.
+# A login is registered BEFORE its process is spawned (``proc`` is None until
+# the spawn returns), so no running login ever exists outside this registry.
 _active_logins: dict[str, dict] = {}
 
-# Path to Codex auth.json (written by `codex login`)
-_AUTH_JSON_PATH = Path.home() / ".codex" / "auth.json"
+# Every device login runs with its own ``CODEX_HOME`` under here (one
+# directory per login id), so a login's ``auth.json`` can only ever hold the
+# account that login produced. Never the host's own ``~/.codex``: the CLI
+# refuses helper binaries under a temporary directory, so this sits beside it.
+_LOGIN_HOME_BASE = Path.home() / ".codex-logins"
+
+# Device codes expire after 15 minutes; a login is swept at 20.
+_DEVICE_CODE_TTL_S = 900
+_LOGIN_MAX_AGE_S = 1200
+_SWEEP_EVERY_S = 60
+# How long ``finish`` lets the CLI exit on its own after writing its file,
+# and how long each signal gets before the next when a login is ended.
+_FINISH_EXIT_GRACE_S = 2.0
+_END_GRACE_S = 1.0
+
+_last_sweep = 0.0
+
+# Starts per person and window (``config.RATE_LIMIT_RULES``). Each start
+# spawns a host process, so the cap is small; the poll and the finish are
+# not limited.
+_START_BUCKET = "oauth_start_openai"
 
 # Strip ANSI escape codes from codex output
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _require_chatgpt_login_engine(layer: str) -> None:
+    """The engine a ChatGPT login is stored on must be one that takes an
+    OpenAI OAuth login (``identity.vendor_id`` + ``oauth`` among its auth
+    types) — the layer used to be stored verbatim from the request."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(layer)
+    if (caps is None or "oauth" not in caps.auth.auth_types
+            or caps.identity.vendor_id != _VENDOR):
+        raise HTTPException(400, f"{layer} does not take a ChatGPT login")
 
 
 # ---------------------------------------------------------------------------
@@ -74,26 +115,29 @@ async def oauth_start(
     Spawns `codex login --device-auth` on the server, parses the one-time
     code and verification URL from stdout.
     """
-    user = require_auth(user)
-    if req.owner_type == "platform" and user.role != "admin":
+    user = require_human(user)
+    if req.owner_type == "platform" and not roles.is_admin(user.role):
         raise HTTPException(403, "Admin required for platform subscriptions")
+    _require_chatgpt_login_engine(req.layer)
+    limit_connect_start(_START_BUCKET, user.sub)
 
-    # Clean up any stale login sessions
-    _cleanup_stale_logins()
+    await _sweep_logins()
+    # The caller's own earlier login gives way to this one; every other
+    # person's login stays registered, running, with its home intact.
+    for lid, meta in [(lid, m) for lid, m in _active_logins.items() if m["user_sub"] == user.sub]:
+        await _end_login(lid, meta)
 
-    # Kill any active login process
-    for lid, meta in _active_logins.items():
-        if meta["proc"].returncode is None:
-            with contextlib.suppress(Exception):
-                meta["proc"].terminate()
-                await asyncio.sleep(0.5)
-                if meta["proc"].returncode is None:
-                    meta["proc"].kill()
-    _active_logins.clear()
-
-    # Remove existing auth.json so we can detect when a new one is written
-    if _AUTH_JSON_PATH.exists():
-        _AUTH_JSON_PATH.unlink()
+    login_id = secrets.token_urlsafe(16)
+    home = _new_login_home(login_id)
+    meta = {
+        "proc": None,
+        "home": home,
+        "user_sub": user.sub,
+        "owner_type": req.owner_type,
+        "layer": req.layer,
+        "started_at": time.monotonic(),
+    }
+    _active_logins[login_id] = meta
 
     # Spawn codex login --device-auth via node directly (the codex binary
     # is a Node.js script and systemd services have minimal PATH)
@@ -107,13 +151,24 @@ async def oauth_start(
         f"codex device-auth: binary={codex_bin}, resolved={codex_resolved}, "
         f"node={node_bin}"
     )
-    spawn_env = {**os.environ, "BROWSER": "echo"}
-    proc = await asyncio.create_subprocess_exec(
-        node_bin, codex_resolved, "login", "--device-auth",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=spawn_env,
-    )
+    spawn_env = {**os.environ, "BROWSER": "echo", "CODEX_HOME": str(home)}
+    try:
+        # Its own session, so the node wrapper and the native codex child
+        # share a process group that one signal reaches (see _end_process).
+        proc = await asyncio.create_subprocess_exec(
+            node_bin, codex_resolved, "login", "--device-auth",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=spawn_env,
+            start_new_session=True,
+        )
+    except Exception:
+        await _end_login(login_id, meta)
+        raise
+    meta["proc"] = proc
+    if _active_logins.get(login_id) is not meta:
+        await _end_login(login_id, meta)
+        raise HTTPException(409, "Replaced by a newer login")
 
     # Read stdout to extract verification URL and user code
     verification_url = ""
@@ -157,28 +212,21 @@ async def oauth_start(
     except Exception as e:
         logger.error(f"Error reading codex device-auth output: {e}")
 
+    if _active_logins.get(login_id) is not meta:
+        await _end_login(login_id, meta)
+        raise HTTPException(409, "Replaced by a newer login")
     if not verification_url or not user_code:
         clean_output = [_ANSI_RE.sub("", l) for l in all_output]
         logger.error(
             f"codex device-auth: missing url={bool(verification_url)} "
             f"code={bool(user_code)}. Output: {clean_output[:10]}"
         )
-        with contextlib.suppress(Exception):
-            proc.terminate()
+        await _end_login(login_id, meta)
         raise HTTPException(
             500,
             "Failed to start device code auth — could not extract code. "
             "Make sure device code login is enabled in your ChatGPT Security Settings.",
         )
-
-    login_id = secrets.token_urlsafe(16)
-    _active_logins[login_id] = {
-        "proc": proc,
-        "user_sub": user.sub,
-        "owner_type": req.owner_type,
-        "layer": req.layer,
-        "started_at": time.monotonic(),
-    }
 
     logger.info(f"OpenAI device-auth started (id={login_id[:8]}, code_received={bool(user_code)})")
     return {"url": verification_url, "user_code": user_code, "login_id": login_id}
@@ -190,28 +238,27 @@ async def oauth_status(
     user: UserContext = Depends(get_current_user),
 ):
     """Poll whether the codex login process has completed."""
-    user = require_auth(user)
+    user = require_human(user)
+    if time.monotonic() - _last_sweep > _SWEEP_EVERY_S:
+        await _sweep_logins()
     meta = _active_logins.get(login_id)
     if not meta:
         raise HTTPException(404, "Login session not found")
     if meta["user_sub"] != user.sub:
         raise HTTPException(403, "Not your login session")
 
-    proc = meta["proc"]
-    if proc.returncode is not None:
-        # Process exited — check if auth.json was written
-        if _AUTH_JSON_PATH.exists():
-            return {"status": "completed"}
-        return {"status": "failed", "message": "Login process exited without writing credentials"}
-
-    # Still running — check if auth.json appeared (process might still be cleaning up)
-    if _AUTH_JSON_PATH.exists():
+    # Only this login's own file counts, and only once it is whole: the CLI
+    # writes it, then exits.
+    if _whole_login_file(meta["home"]) is not None:
         return {"status": "completed"}
 
-    # Device codes expire after 15 minutes
-    if time.monotonic() - meta["started_at"] > 900:
-        with contextlib.suppress(Exception):
-            proc.terminate()
+    proc = meta["proc"]
+    if proc is not None and proc.returncode is not None:
+        await _end_login(login_id, meta)
+        return {"status": "failed", "message": "Login process exited without writing credentials"}
+
+    if time.monotonic() - meta["started_at"] > _DEVICE_CODE_TTL_S:
+        await _end_login(login_id, meta)
         return {"status": "failed", "message": "Device code expired (15 minutes). Please try again."}
 
     return {"status": "pending"}
@@ -223,50 +270,52 @@ async def oauth_finish(
     user: UserContext = Depends(get_current_user),
 ):
     """Read auth.json and store as subscription. Call after status=completed."""
-    user = require_auth(user)
-    meta = _active_logins.pop(req.login_id, None)
+    user = require_human(user)
+    meta = _active_logins.get(req.login_id)
     if not meta:
         raise HTTPException(404, "Login session not found or already finished")
     if meta["user_sub"] != user.sub:
-        _active_logins[req.login_id] = meta  # put it back
         raise HTTPException(403, "Not your login session")
-    if meta["owner_type"] == "platform" and user.role != "admin":
+    # From here the login is the caller's own and ends on every path: its
+    # process is settled first, its home removed last.
+    _active_logins.pop(req.login_id, None)
+    try:
+        await _settle_process(meta["proc"])
+        return await _store_login(req, meta, user)
+    finally:
+        shutil.rmtree(meta["home"], ignore_errors=True)
+
+
+async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -> dict:
+    if meta["owner_type"] == "platform" and not roles.is_admin(user.role):
         raise HTTPException(403, "Admin required for platform subscriptions")
+    _require_chatgpt_login_engine(meta["layer"])
 
-    # Kill the process if still running
-    proc = meta["proc"]
-    if proc.returncode is None:
-        with contextlib.suppress(Exception):
-            proc.terminate()
-            await asyncio.sleep(1)
-            if proc.returncode is None:
-                proc.kill()
-
-    # Read auth.json
-    if not _AUTH_JSON_PATH.exists():
+    auth_path = Path(meta["home"]) / "auth.json"
+    if not auth_path.exists():
         raise HTTPException(400, "No credentials found — login may have failed")
 
     try:
-        auth_data = json.loads(_AUTH_JSON_PATH.read_text())
+        auth_data = json.loads(auth_path.read_text())
     except Exception as e:
         raise HTTPException(400, f"Failed to read credentials: {e}")
+    if not isinstance(auth_data, dict):
+        raise HTTPException(400, "Failed to read credentials: not a JSON object")
 
-    # Extract tokens — auth.json format may vary:
-    # Could be {"access_token": "...", "refresh_token": "..."} directly
-    # or nested under a "tokens" key
-    access_token = (
-        auth_data.get("access_token")
-        or auth_data.get("tokens", {}).get("access_token")
-        or ""
-    )
-    refresh_token = (
-        auth_data.get("refresh_token")
-        or auth_data.get("tokens", {}).get("refresh_token")
-        or ""
-    )
-
+    access_token = _token_field(auth_data, "access_token")
+    refresh_token = _token_field(auth_data, "refresh_token")
     if not access_token:
         raise HTTPException(400, "No access token found in credentials file")
+
+    # The account this login produced. A blob that names none is refused,
+    # never stored under a guessed row: the stored identity is what a
+    # reconnect matches on.
+    identity = _login_identity(auth_data)
+    if not identity:
+        logger.warning("Codex auth blob carried no account identity: login not stored")
+        raise HTTPException(
+            400, "This login did not identify a ChatGPT account, so it was not stored.",
+        )
 
     # Build credential data in our standard format
     credential_data = {
@@ -290,7 +339,7 @@ async def oauth_finish(
     # Admins' personal connects ALSO contribute to the shared agent pool by
     # default (so agent-scoped tasks work without the admin knowing to tick it).
     from storage import database as _db
-    _connector_is_admin = (_db.get_user(owner_sub) or {}).get("role") == "admin"
+    _connector_is_admin = roles.is_admin((_db.get_user(owner_sub) or {}).get("role"))
 
     # Reconnecting the SAME account (matched by the auth blob's identity)
     # refreshes tokens on the existing row; a DIFFERENT account creates a
@@ -298,11 +347,6 @@ async def oauth_finish(
     # (owner, layer, provider) silently clobbered the first account's
     # credential when a second one was connected — see the Anthropic twin
     # in claude_oauth.py.
-    identity = (
-        auth_data.get("email")
-        or (auth_data.get("tokens") or {}).get("account_id")
-        or ""
-    )
     # include_disabled: a reconnect on an admin-disabled row must MATCH it
     # (and keep it disabled, below) — excluding it would fork a second ACTIVE
     # row for the same account, silently routing around the admin.
@@ -311,35 +355,24 @@ async def oauth_finish(
         owner_sub=owner_sub,
         include_disabled=True,
     )
-    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == "openai"]
-
-    if identity:
-        # Only a row proven to be the same account is refreshed; legacy
-        # rows (oauth_email == "") are never adopted by guesswork.
-        match = next(
-            (s for s in existing_oauth if s.get("oauth_email") == identity),
-            None,
-        )
-    else:
-        match = existing_oauth[0] if existing_oauth else None
-        if match:
-            logger.warning(
-                "Codex auth blob carried no account identity — refreshing "
-                "the first existing subscription %s", match["id"][:8],
-            )
+    existing_oauth = [s for s in existing if s["auth_type"] == "oauth" and s["provider"] == _VENDOR]
+    # Only a row proven to be the same account is refreshed; legacy rows
+    # (oauth_email == "") are never adopted by guesswork.
+    match = next((s for s in existing_oauth if s.get("oauth_email") == identity), None)
 
     if match:
         # Under the sub's refresh lock — an in-flight refresh of the old
         # token must not land its failure verdict on the fresh grant. An
         # admin-DISABLED row keeps its status (see the Anthropic twin).
         sub_id = match["id"]
-        new_status = "disabled" if match.get("status") == "disabled" else "active"
+        new_status = (subscription_status.DISABLED if match.get("status") == subscription_status.DISABLED
+                      else subscription_status.ACTIVE)
 
         def _apply_reconnect() -> None:
             with subscription_pool._refresh_lock(sub_id):
                 subscription_store.update_credential_data(sub_id, credential_data)
                 subscription_store.update_subscription(
-                    sub_id, status=new_status, label=label, oauth_email=identity or None,
+                    sub_id, status=new_status, label=label, oauth_email=identity,
                 )
                 subscription_pool.clear_refresh_backoff(sub_id)
 
@@ -353,7 +386,7 @@ async def oauth_finish(
     else:
         sub = subscription_store.add_subscription(
             layer=meta["layer"],
-            provider="openai",
+            provider=_VENDOR,
             auth_type="oauth",
             owner_sub=owner_sub,
             use_personal=True,
@@ -377,12 +410,144 @@ async def oauth_finish(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _cleanup_stale_logins():
-    """Remove login sessions older than 20 minutes."""
+def limit_connect_start(bucket: str, user_sub: str) -> None:
+    """Refuse a start past the person's cap for the window (429 with
+    ``Retry-After``). Taken after the role and engine checks and before any
+    state is created, so a refused bearer never counts against its owner."""
+    allowed, retry_after = rate_limiter.hit(bucket, user_sub)
+    if not allowed:
+        wait = max(1, retry_after)
+        raise HTTPException(
+            429, f"Too many connect attempts: try again in {wait} s",
+            headers={"Retry-After": str(wait)},
+        )
+
+
+def _new_login_home(login_id: str) -> Path:
+    """A private ``CODEX_HOME`` for one login, owner-only like the files the
+    CLI writes into it. A pre-existing base gets its mode corrected too."""
+    _LOGIN_HOME_BASE.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(_LOGIN_HOME_BASE, 0o700)
+    home = _LOGIN_HOME_BASE / login_id
+    home.mkdir(mode=0o700)
+    return home
+
+
+def _token_field(auth_data: dict, name: str) -> str:
+    """``access_token`` / ``refresh_token`` at the top level or under
+    ``tokens`` (the layout Codex writes)."""
+    tokens = auth_data.get("tokens")
+    nested = tokens.get(name) if isinstance(tokens, dict) else None
+    return str(auth_data.get(name) or nested or "")
+
+
+def _whole_login_file(home: Path) -> dict | None:
+    """The login's ``auth.json`` once it is whole (parses, carries an access
+    token); None while it is absent or still being written."""
+    try:
+        data = json.loads((Path(home) / "auth.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not _token_field(data, "access_token"):
+        return None
+    return data
+
+
+def _login_identity(auth_data: dict) -> str:
+    """The account a blob belongs to, the key a reconnect matches rows on:
+    the top-level ``email`` (never written by Codex, kept first for rows
+    stored before the id-token fallback), then ``tokens.account_id`` (what
+    Codex writes), then the ``email`` or ``chatgpt_account_id`` claim of
+    the id token."""
+    tokens = auth_data.get("tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    identity = auth_data.get("email") or tokens.get("account_id")
+    if identity:
+        return str(identity)
+    claims = _jwt_claims(tokens.get("id_token"))
+    auth_claims = claims.get("https://api.openai.com/auth")
+    auth_claims = auth_claims if isinstance(auth_claims, dict) else {}
+    return str(claims.get("email") or auth_claims.get("chatgpt_account_id") or "")
+
+
+def _jwt_claims(token: object) -> dict:
+    """A JWT's payload, decoded without verification: the token came from
+    the login this proxy ran, and the value is a label to match rows on,
+    never a credential."""
+    if not isinstance(token, str) or token.count(".") != 2:
+        return {}
+    payload = token.split(".")[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _signal_login(proc, sig: int) -> None:
+    """Signal the login's whole process group (the spawn made the wrapper a
+    session leader). SIGTERM to the node wrapper alone is forwarded to the
+    native codex child; SIGKILL alone orphans it, so both go to the group.
+    A process without a group of its own gets the signal directly."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (OSError, TypeError):
+        with contextlib.suppress(Exception):
+            proc.send_signal(sig)
+
+
+async def _end_process(proc) -> None:
+    """SIGTERM, a bounded wait, then SIGKILL; returns once the process is
+    reaped or the second wait lapsed."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.returncode is not None:
+            return
+        _signal_login(proc, sig)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), _END_GRACE_S)
+
+
+async def _settle_process(proc) -> None:
+    """Let the CLI exit on its own after writing its file; end it if it
+    does not."""
+    if proc is None or proc.returncode is not None:
+        return
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(proc.wait(), _FINISH_EXIT_GRACE_S)
+    if proc.returncode is None:
+        await _end_process(proc)
+
+
+async def _end_login(login_id: str, meta: dict) -> None:
+    """Drop the login's registry entry (when it is still this one), end its
+    process, and remove its home once the process has been waited for."""
+    if _active_logins.get(login_id) is meta:
+        del _active_logins[login_id]
+    proc = meta.get("proc")
+    if proc is not None and proc.returncode is None:
+        await _end_process(proc)
+    shutil.rmtree(meta["home"], ignore_errors=True)
+
+
+async def _sweep_logins() -> None:
+    """End registered logins older than 20 minutes, and remove homes of that
+    age that belong to no registered login (left by a restart or a crash).
+    A young unregistered home is never touched."""
+    global _last_sweep
+    _last_sweep = time.monotonic()
     now = time.monotonic()
-    stale = [lid for lid, m in _active_logins.items() if now - m["started_at"] > 1200]
-    for lid in stale:
-        meta = _active_logins.pop(lid, None)
-        if meta and meta["proc"].returncode is None:
-            with contextlib.suppress(Exception):
-                meta["proc"].terminate()
+    for lid, meta in [(lid, m) for lid, m in _active_logins.items() if now - m["started_at"] > _LOGIN_MAX_AGE_S]:
+        await _end_login(lid, meta)
+    try:
+        entries = list(os.scandir(_LOGIN_HOME_BASE))
+    except OSError:
+        return
+    cutoff = time.time() - _LOGIN_MAX_AGE_S
+    for entry in entries:
+        if entry.name in _active_logins:
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue

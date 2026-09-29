@@ -1,6 +1,6 @@
 ---
 name: otodock-platform
-description: "How the OtoDock platform itself works and where every setting lives — installing and first-run setup, agents, AI engines, sessions, departments, shared knowledge libraries, tasks/triggers/notifications, remote machines, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
+description: "How the OtoDock platform itself works and where every setting lives — installing and first-run setup, agents, AI engines, sessions, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks/triggers/notifications, remote machines, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
 ---
 
 # OtoDock Platform Guide
@@ -21,6 +21,12 @@ deeper than this file, read the matching reference in `references/`.
   engine for low-latency work like phone calls. No model ships with the platform.
 - **Sessions** are live running instances of an agent (a chat, a task run, a call).
   The platform warms, resumes, and idles them automatically.
+- **Apps** are pages an agent builds and keeps running (buttons that put it to work,
+  live data, a server and database when needed): **shared** with the agent's team or
+  **personal**, shareable by link. The first opens as the agent's home; a person
+  approves what each may do.
+- **Checks** judge an agent's work at the end of a turn and send it back to fix what
+  they find.
 - **Tools (MCPs)** give agents abilities; **skills** (like this one) give technique.
 - Agents run inside a strict **sandbox** on the server — or with full access on a
   paired **remote machine** the user owns.
@@ -36,14 +42,20 @@ engines, users, MCP installs); **creator** → additionally creates/installs age
 manages their own departments; **member** → uses the agents they've been given.
 
 **Per-agent roles** (each agent separately): **manager** → configures the agent
-(persona, tools, skills, settings); **editor** → works in the shared workspace;
-**viewer** → chats, with a private personal space. A person can be manager of one agent
-and viewer of another. Platform admins override per-agent roles.
+(persona, tools, skills, settings); **editor** → works in the shared workspace and
+automates as the agent (agent-scope tasks, triggers, delegation, shared apps, shared
+memory); **contributor** → adds files to the shared workspace and nothing else — for an
+outside collaborator on a project who must never act as the agent; **viewer** → chats,
+with a private personal space. A person can be manager of one agent and viewer of
+another. Platform admins override per-agent roles. On a **Shared only** agent every chat
+runs as the agent itself, so chatting there takes **editor+**: viewers and contributors
+can read its shared history but get a message instead of a chat.
 
 Common surprises worth pre-empting: department assignment and shared-knowledge wiring
-need platform **admin/creator** (agent managers alone can't); agent-scope schedules need
-per-agent **editor+**; installing anything (tools, skills, agents from the community
-catalog) is **admin** — managers and agents file requests admins approve.
+need platform **admin/creator** (agent managers alone can't); agent-scope schedules and
+triggers, and pinning, approving or sharing a shared app, need per-agent **editor+**;
+installing tools and skills is **admin**, installing an agent from the community catalog
+**admin/creator** — managers and agents file requests admins approve.
 
 ## Where things live (summary — full map in references/settings-map.md)
 
@@ -52,10 +64,13 @@ catalog) is **admin** — managers and agents file requests admins approve.
   Engines (personal subscriptions) · Audio · Usage.
 - **Agent Settings** (per agent): Overview · MCPs · Skills · Configuration (persona
   file, engines/model, visibility mode, department, delegation targets, shared
-  knowledge, memory) · Monitoring (scheduled tasks, triggers, notifications, meetings).
+  knowledge, memory) · Checks · Monitoring (scheduled tasks, triggers, notifications,
+  meetings).
+- **Apps**: the apps button beside the chat composer and each app's ⋯ menu; a chat is
+  shared from its row in the chat history.
 - **Admin** (admins only): Users · Usage · MCP Servers · Skills · MCP Requests · Remote
-  Machines · Monitoring · **Setup** (tabs: General · AI Engines · OtoDock · Audio ·
-  Phone · Security · System Settings).
+  Machines · Shares · Monitoring · **Setup** (tabs: General · AI Engines · OtoDock ·
+  Audio · Phone · Security · System Settings).
 - The **Agents page** (agent pill in the top bar) is the company view: a 3D map of
   departments and agents, a grid, and the community-agent browser.
 
@@ -64,12 +79,14 @@ catalog) is **admin** — managers and agents file requests admins approve.
 You (an agent) can, with the right session role: create and manage tasks, triggers, and
 notifications; browse the tool/skill catalogs and enable or request them; update your
 own persona; manage knowledge libraries and department assignment via your
-self-configuration tools (each change confirmed in chat); build dashboards; delegate to
-wired agents; and read other agents' activity your user could see.
+self-configuration tools (each change confirmed in chat); build, check, deploy and pin
+apps, push to them, open them on the user's screen and roll them back; attach and run
+checks; delegate to wired agents; and read other agents' activity your user could see.
 
-You cannot: install catalog packages (admin approves your request), pair machines,
-manage users, change platform settings, or connect engines/accounts — for those, give
-the user the exact page, tab, and role from `references/settings-map.md`.
+You cannot: approve an app, share an app or a chat, set an app's secret, install
+catalog packages (admin approves your request), pair machines, manage users, change
+platform settings, or connect engines/accounts — for those, give the user the exact
+page, tab, and role from `references/settings-map.md`.
 
 ## Routing — read the reference that matches
 
@@ -77,8 +94,9 @@ the user the exact page, tab, and role from `references/settings-map.md`.
 | --- | --- |
 | Installing, first run, connecting Claude/ChatGPT/keys, voice & phone add-on, pairing remote machines | `references/setup.md` |
 | What an agent is, folders/workspaces, visibility modes, engines & models per agent, tools, skills, creating agents | `references/agents.md` |
-| Departments, the company map, delegation, meetings, shared knowledge libraries, bulletins, memory — running a company on OtoDock | `references/company-management.md` |
-| Schedules, one-time and trigger-fired tasks, model pinning, webhooks, event subscriptions, notifications | `references/automation.md` |
+| Apps (shared, personal, the agent's home), the approval card, releases and rollback, secrets, templates and `.otoapp`, sharing apps and chats by link | `references/apps.md` |
+| Departments, delegation modes and targets, the company map, meetings, shared knowledge libraries, bulletins, memory — running a company on OtoDock | `references/company-management.md` |
+| Schedules, one-time and trigger-fired tasks, model pinning, webhooks, event subscriptions, checks, notifications | `references/automation.md` |
 | "Where is the setting for X?" / "who can do X?" | `references/settings-map.md` |
 
 ## House rules for platform help

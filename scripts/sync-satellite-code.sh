@@ -12,6 +12,16 @@
 #   - proxy/core/layers/codex/app_server_client.py → satellite/_vendored/app_server_client.py
 #   - proxy/core/layers/codex/codex_approvals.py   → satellite/_vendored/codex_approvals.py
 #   - proxy/core/stdio_path_interceptor.py         → satellite/_vendored/stdio_path_interceptor.py
+#   - proxy/core/terminal_queries.py               → satellite/_vendored/terminal_queries.py
+#   - proxy/core/layout.py                         → satellite/_vendored/layout.py
+#
+# NOT vendored: the host OS table (proxy/core/host_os.py). satellite/config.py is
+# the boot guard's leaf — __main__ imports it before the rollback runs, so it may
+# import nothing but the standard library and the stdlib-only sibling leaf
+# engines.py, and a broken vendored copy would raise first. The table is defined
+# in both files as a TWIN (the gate's twin rule pins
+# _table / family_of / of; proxy/tests/core/test_host_os.py compares every row).
+# Edit the proxy module first, then copy the block into satellite/config.py verbatim.
 #
 # Usage: ./scripts/sync-satellite-code.sh
 
@@ -26,6 +36,8 @@ ENTRIES=(
     "proxy/core/layers/codex/app_server_client.py|satellite/_vendored/app_server_client.py|SHARED_APP_SERVER_CLIENT_HASH"
     "proxy/core/layers/codex/codex_approvals.py|satellite/_vendored/codex_approvals.py|SHARED_CODEX_APPROVALS_HASH"
     "proxy/core/stdio_path_interceptor.py|satellite/_vendored/stdio_path_interceptor.py|SHARED_STDIO_INTERCEPTOR_HASH"
+    "proxy/core/terminal_queries.py|satellite/_vendored/terminal_queries.py|SHARED_TERMINAL_QUERIES_HASH"
+    "proxy/core/layout.py|satellite/_vendored/layout.py|SHARED_LAYOUT_HASH"
 )
 
 for entry in "${ENTRIES[@]}"; do

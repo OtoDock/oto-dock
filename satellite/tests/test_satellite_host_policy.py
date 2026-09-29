@@ -88,3 +88,79 @@ def test_runtime_tree_world_writable_root_rejected(runtime_root):
 def test_paths_outside_runtime_root_unaffected(runtime_root):
     with pytest.raises(ValueError, match="outside the OS user's home"):
         sm._check_satellite_host_policy("/tmp/claude-99999/other/f.txt")
+
+
+# ---------------------------------------------------------------------------
+# The machine's own state is refused on every pairing, before the home band
+# and before the runtime-tree admission
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def state(tmp_path, monkeypatch):
+    from satellite import config
+    root = tmp_path / "home" / ".oto-dock"
+    (root / "agents" / "a1" / "workspace").mkdir(parents=True)
+    (root / "agents" / "a2" / "workspace").mkdir(parents=True)
+    (root / "mcps" / "community" / "foo").mkdir(parents=True)
+    (root / "satellite.conf").write_text("x")
+    monkeypatch.setattr(config, "otodock_dir", lambda: root)
+    return root
+
+
+def _check(state, raw, *, own="a1"):
+    return sm._check_satellite_host_policy(
+        raw, own_agent=own, agents_dir=state / "agents", mcps_dir=state / "mcps",
+    )
+
+
+def test_the_state_root_is_refused_even_with_full_fs_on(state, monkeypatch):
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    for raw in (str(state / "satellite.conf"), str(state), str(state / "browser-profiles" / "x")):
+        with pytest.raises(ValueError, match="own OtoDock state"):
+            _check(state, raw)
+
+
+def test_another_agents_tree_and_the_mcps_folder_are_refused(state, monkeypatch):
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        _check(state, str(state / "agents" / "a2" / "workspace" / "x.md"))
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        _check(state, str(state / "agents"))
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        _check(state, str(state / "mcps" / "community" / "foo" / "server.py"))
+
+
+def test_the_sessions_own_subtree_is_admitted_and_only_for_a_safe_slug(state, monkeypatch):
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    _check(state, str(state / "agents" / "a1" / "workspace" / "x.md"))  # no raise
+    with pytest.raises(ValueError):
+        _check(state, str(state / "agents" / "a2" / "workspace" / "x.md"), own="..")
+    with pytest.raises(ValueError):
+        _check(state, str(state / "agents" / "a1" / "workspace" / "x.md"), own="")
+
+
+def test_a_link_into_the_state_is_judged_by_its_target(state, tmp_path, monkeypatch):
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    (tmp_path / "home" / "Desktop").mkdir(parents=True)
+    os.symlink(state / "agents" / "a2", tmp_path / "home" / "Desktop" / "lnk")
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        _check(state, str(tmp_path / "home" / "Desktop" / "lnk" / "workspace" / "x.md"))
+
+
+def test_the_state_refusal_runs_before_the_runtime_admission(state, monkeypatch):
+    root = state / f"claude-{os.getuid()}"
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(sm, "_claude_runtime_root", lambda: str(root))
+    with pytest.raises(ValueError, match="own OtoDock state"):
+        _check(state, str(root / "task.out"))
+
+
+def test_a_sibling_of_the_state_root_stays_a_home_band_question(state, monkeypatch):
+    from satellite.host import satellite_policy
+    monkeypatch.setattr(satellite_policy, "is_full_fs_allowed", lambda: True)
+    _check(state, str(state.parent / ".oto-dock-notes" / "a.md"))  # no raise

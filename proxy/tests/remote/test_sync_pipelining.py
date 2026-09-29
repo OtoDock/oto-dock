@@ -55,7 +55,8 @@ def _make_cm(push_delays: dict):
     return cm, state
 
 
-async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None):
+async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None,
+                    manifest_fn=None, diff_fn=None, **sync_kw):
     import config as _cfg
     from core.remote import file_sync
     from core.session import visibility
@@ -72,19 +73,19 @@ async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None):
     monkeypatch.setattr(_cfg, "AGENTS_DIR", tmp_path, raising=False)
     monkeypatch.setattr(visibility, "is_shared_only", lambda slug: False)
     monkeypatch.setattr(file_sync, "compute_manifest",
-                        lambda *a, **kw: [])
+                        manifest_fn or (lambda *a, **kw: []))
     monkeypatch.setattr(sync_state_store, "load_for_machine_agent",
                         lambda *a: {})
     monkeypatch.setattr(file_tombstones_store, "load_for_agent", lambda *a: {})
     monkeypatch.setattr(
         file_sync, "diff_manifests",
-        lambda *a, **kw: SimpleNamespace(actions=actions, to_scrub=[]),
+        diff_fn or (lambda *a, **kw: SimpleNamespace(actions=actions, to_scrub=[])),
     )
 
     layer = RemoteExecutionLayer(cm)
     await layer._initial_workspace_sync(
         "machine-1", "test-agent", target_username=None, target_role="admin",
-        progress_cb=progress_cb,
+        progress_cb=progress_cb, **sync_kw,
     )
 
 
@@ -257,3 +258,55 @@ async def test_no_deadlock_sync_plus_live_fanout_share_gate(tmp_path, monkeypatc
         assert combined["max_active"] == 1
     finally:
         transfer_gate.reset_for_tests()
+
+
+# --- the manifest work runs on its own small pool -------------------
+
+
+@pytest.mark.asyncio
+async def test_manifest_work_runs_on_the_sync_cpu_executor(tmp_path, monkeypatch):
+    import threading
+    from core import loop_watchdog
+
+    seen = []
+
+    def _manifest(*a, **kw):
+        seen.append(threading.current_thread().name)
+        return []
+
+    def _diff(*a, **kw):
+        seen.append(threading.current_thread().name)
+        return SimpleNamespace(actions=[], to_scrub=[])
+
+    cm, _ = _make_cm({})
+    await _run_sync(tmp_path, monkeypatch, [], cm, manifest_fn=_manifest, diff_fn=_diff)
+    assert len(seen) == 2 and all(n.startswith("sync-cpu") for n in seen), seen
+    assert loop_watchdog.stats()["executors"]["sync-cpu"]["workers"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_background_merge_holds_one_worker_and_a_person_gets_the_other(
+        tmp_path, monkeypatch):
+    """Background manifest work (a reconnect walk, the idle sweep) takes a
+    one-slot gate before the pool; a person's merge takes none, so it never
+    queues behind a wave of walks."""
+    from core.remote import remote_workspace_sync as rws
+
+    gate = rws._background_manifest_gate()
+    await gate.acquire()
+    seen = []
+
+    def _manifest(*a, **kw):
+        seen.append("manifest")
+        return []
+
+    cm, _ = _make_cm({})
+    parked = asyncio.create_task(_run_sync(
+        tmp_path, monkeypatch, [], cm, manifest_fn=_manifest, background=True))
+    await asyncio.sleep(0.05)
+    assert seen == []                       # waits on the background gate
+    await _run_sync(tmp_path, monkeypatch, [], cm, manifest_fn=_manifest)
+    assert seen == ["manifest"]             # the person's merge ran through
+    gate.release()
+    await parked
+    assert seen == ["manifest", "manifest"]

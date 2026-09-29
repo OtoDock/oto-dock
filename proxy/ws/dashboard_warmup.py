@@ -1,6 +1,7 @@
 """Session warmup + spawn: pre-warm, warmup (inline reuse or backgrounded spawn
 tail), deferred mode/model re-apply, and the single create/resume funnel every
-spawn path goes through.
+spawn path goes through. The DETACHED pre-warm (no connection), its rollback
+and the model-foreign check live in ws/dashboard_prewarm.py.
 
 WarmupController is a mixin of ``DashboardConnection`` (ws/dashboard.py) — methods run
 with the connection's full attribute state; nothing here is standalone.
@@ -13,30 +14,31 @@ import logging
 import time
 import uuid
 import config
+from core import placement
 from storage import database as task_store
 from storage.agents import agent_store
 from storage import remote_store
 from core.session.session_state import (
     set_session_mode,
     get_session_mode,
-    get_session_user_tz,
     get_user_tz,
     set_session_user_tz,
     clear_session_liveness,
 )
 from core.execution_layer import ExecutionLayer
-from core.session.session_manager import get_execution_layer, resolve_execution_path
+from core.session.session_manager import (
+    get_execution_layer, get_layer_by_path, get_layer_capabilities,
+    resolve_execution_path,
+)
 from core.config.config_builder import (
     build_agent_config,
     release_config_seat,
-    is_hard_fail_target,
-    extract_offline_machine,
 )
 from services.engines import subscription_pool
 from services.engines.subscription_pool import NoSubscriptionError
 from core.session.history_seed import consume_pending_seed_digest
 from core.config.task_config_builder import (
-    resolve_task_identity, task_allows_knowledge_rw,
+    resolve_task_identity, run_allows_knowledge_rw,
 )
 from core.session import warmup_registry, visibility as _vis
 from core import execution_mode
@@ -48,12 +50,20 @@ from core.events import chat_writer
 # safe intra-unit circularity (see the class assembly there).
 from ws.dashboard import (
     _SpawnResult,
-    _effective_agent_role,
     _model_allowed_for_path,
     _resolve_session_interactive,
     _resume_username_for_chat,
     _rewarm_chat_allowed,
 )
+from ws.dashboard_prewarm import (
+    _model_foreign_to_engine,
+    _pre_warmup_rollback,
+    _schedule_pre_warmup_rollback,
+)
+from core.session import session_kind
+from auth import roles
+from auth.providers import acting_role_of
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -83,19 +93,21 @@ class WarmupController:
             # pins it local whatever the agent's target says), so there is
             # nothing to move it to — no banner, even when the agent's own
             # layer default resolves to a machine.
-            if resolve_execution_path(agent, chat.get("execution_path") or "") == "direct-llm":
+            _wc = get_layer_capabilities(
+                resolve_execution_path(agent, chat.get("execution_path") or ""))
+            if _wc is not None and not _wc.runtime.supports_remote_execution:
                 return {}
-            role = _effective_agent_role(self.user_sub, agent)
-            if chat.get("user_sub") != self.user_sub and role != "admin":
+            role = acting_role_of(self.user_sub, agent)
+            if chat.get("user_sub") != self.user_sub and not roles.is_admin(role):
                 return {}
             resolved, _ = remote_store.resolve_execution_target(
                 agent, self.user_sub, role,
             )
-            if not resolved or resolved == pin or resolved.startswith("__offline__:"):
+            if not resolved or resolved == pin or placement.is_offline_sentinel(resolved):
                 return {}
 
             def _label(target: str) -> str:
-                if target == "local":
+                if placement.is_local(target):
                     return "local sandbox"
                 m = remote_store.get_remote_machine(target) or {}
                 return str(m.get("name") or "") or target[:8]
@@ -141,7 +153,7 @@ class WarmupController:
         # reassignments (e.g. user demoted from editor to viewer) invalidate
         # the pre-warm and force a fresh session with the right role.
         pw_effective_role = await run_db(
-            _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+            acting_role_of, self.user_sub, agent, fallback_user=self.user,
         )
 
         # Already pre-warmed for same agent+model+role and alive -> reuse.
@@ -158,7 +170,7 @@ class WarmupController:
                     f"WS dashboard pre_warmup: reusing existing "
                     f"session={self._pre_warmed_sid[:8]}, agent={agent}, model={self._pre_warmed_model}, role={self._pre_warmed_role}"
                 )
-                await self._send({"type": "pre_warmup_ready", "session_id": self._pre_warmed_sid})
+                await self._send({"type": wire.PRE_WARMUP_READY, "session_id": self._pre_warmed_sid})
                 return
 
         # Pre-warmed for different agent/model/role (or dead) -> close old
@@ -199,6 +211,13 @@ class WarmupController:
                     f"is not a {resolved_exec_path} model) agent={agent}"
                 )
                 return
+            # A pre-warm needs room for itself and one more session, nobody
+            # waiting for a slot, and the person below their cap; otherwise it
+            # is skipped without a word (nothing was asked for yet).
+            from core import concurrency
+            if not concurrency.prewarm_allowed(resolved_exec_path, user_sub=self.user_sub):
+                logger.info(f"WS dashboard pre_warmup: skipped (no room for two) agent={agent}")
+                return
 
             # Build the config FIRST so the resolved execution target + the
             # interactive decision are known BEFORE we acquire a slot or spawn.
@@ -211,7 +230,7 @@ class WarmupController:
             build = asyncio.ensure_future(build_agent_config(
                 agent_name=agent, user=self.user, user_sub=self.user_sub,
                 user_role=pw_effective_role, permission_mode=permission_mode,
-                client_type="dashboard", resume=False,
+                client_type=session_kind.DASHBOARD.name, resume=False,
                 model=requested_model,
                 execution_path=resolved_exec_path,
                 session_id=new_sid,
@@ -220,7 +239,7 @@ class WarmupController:
             # Skip pre-warm for a REMOTE target: it would spawn a real session on
             # the satellite (counting against THAT satellite's budget) for a chat
             # the user may never send. The first real send warms it on demand.
-            if (agent_cfg.execution_target or "local") != "local":
+            if not placement.is_local(agent_cfg.execution_target):
                 logger.info(f"WS dashboard pre_warmup: skipped (remote target) agent={agent}")
                 release_config_seat(new_sid, agent_cfg)
                 return
@@ -233,12 +252,16 @@ class WarmupController:
                 logger.info(f"WS dashboard pre_warmup: skipped (interactive) agent={agent}")
                 release_config_seat(new_sid, agent_cfg)
                 return
-            # Local target → acquire a unit of the local ceiling G before spawning.
+            # Local target → acquire a unit of the local ceiling G before
+            # spawning. Speculative: a refusal for lack of room is silent.
             from core.concurrency import acquire_chat_slot
             adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
-                                          user_sub=self.user_sub)
+                                          user_sub=self.user_sub, speculative=True)
             if not adm:
                 release_config_seat(new_sid, agent_cfg)
+                if adm.reason == "speculative":
+                    logger.info(f"WS dashboard pre_warmup: skipped (no room) agent={agent}")
+                    return
                 await self._send_error(adm.user_message)
                 return
             # pw_effective_role (resolved at the top) → the spawned session's
@@ -276,7 +299,7 @@ class WarmupController:
                                     role=pw_effective_role, exec_path=self._pre_warmed_exec_path,
                                     model=agent_cfg.model)
 
-            await self._send({"type": "pre_warmup_ready", "session_id": new_sid})
+            await self._send({"type": wire.PRE_WARMUP_READY, "session_id": new_sid})
             logger.info(
                 f"WS dashboard pre_warmup: created session={new_sid[:8]}, "
                 f"agent={agent}, exec_path={self._pre_warmed_exec_path}, model={agent_cfg.model}"
@@ -323,6 +346,19 @@ class WarmupController:
         if not await run_db(agent_store.agent_exists, agent):
             await self._send_error(f"Agent '{agent}' no longer exists")
             return
+
+        # The app on this screen at SEND time (APPS.md "Live apps"): the
+        # first prompt runs as a server kick seconds later, after the overlay
+        # closed on send, so the kick carries the line captured now.
+        if msg.get("text") and "_focus_line" not in msg:
+            try:
+                from services.apps.focus_context import focus_line
+                msg["_focus_line"] = await run_db(
+                    focus_line, self.user_sub,
+                    connection_id=getattr(self, "notify_connection_id", "") or None,
+                )
+            except Exception:
+                msg["_focus_line"] = ""
 
         # For an EXISTING chat the chat row is the agent of record — the frame's
         # agent can be stale (observed 2026-07-09: a post-restart redirect opened
@@ -394,6 +430,7 @@ class WarmupController:
                 "files": msg.get("files", []),
                 "chat_id": self.chat_id,
                 "_server_kick": True,
+                "_focus_line": msg.get("_focus_line", ""),
             })
 
     async def _do_warmup(self, agent: str, msg: dict) -> str:
@@ -410,7 +447,7 @@ class WarmupController:
         def _warm_role_layer():
             # Role + layer in ONE executor job (the layer reads remote_store
             # for a remote target).
-            role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+            role = acting_role_of(self.user_sub, agent, fallback_user=self.user)
             return role, get_execution_layer(
                 agent, execution_path=requested_exec_path, user_sub=self.user_sub, role=role,
             )
@@ -493,14 +530,19 @@ class WarmupController:
                         # A LIVE session is already tracked, so this is the
                         # idempotent path today — but check the Admission
                         # anyway: silently attaching an unadmitted session is
-                        # the failure mode a future reordering would hit.
-                        adm = await acquire_chat_slot(old_session_id, target=isess.target)
+                        # the failure mode a future reordering would hit. The
+                        # owner is recorded only for a connection that drives
+                        # the chat; a re-attach is never capped.
+                        adm = await acquire_chat_slot(
+                            old_session_id, target=isess.target,
+                            user_sub=None if self._view_only else self.user_sub,
+                            per_user_cap=False)
                         if not adm:
                             await self._send_error(adm.user_message)
                             return "inline"
                         self.session_id = old_session_id
                         await self._send({
-                            "type": "warmup_ready",
+                            "type": wire.WARMUP_READY,
                             "session_id": self.session_id,
                             "chat_id": self.chat_id,
                             "mode": get_session_mode(old_session_id),
@@ -517,18 +559,23 @@ class WarmupController:
                         # Client attaches via pty_attach (see _dispatch).
                         return "inline"
                     if self.layer and await self.layer.is_session_alive(old_session_id):
-                        # Re-acquire concurrency slot (released on WS disconnect),
-                        # using the chat's pinned target so a REMOTE session is a
-                        # no-op (and a local-full proxy doesn't reject reconnecting
-                        # to a remote chat).
+                        # Confirm the concurrency slot (idempotent for a tracked
+                        # session), using the chat's pinned target so a REMOTE
+                        # session is a no-op (and a local-full proxy doesn't
+                        # reject reconnecting to a remote chat).
                         from core.concurrency import acquire_chat_slot
-                        adm = await acquire_chat_slot(old_session_id, target=chat.get("execution_target") or "local", execution_path=chat.get("execution_path"))
+                        adm = await acquire_chat_slot(
+                            old_session_id, target=chat.get("execution_target") or placement.LOCAL,
+                            execution_path=chat.get("execution_path"),
+                            user_sub=None if self._view_only else self.user_sub,
+                            per_user_cap=False,
+                        )
                         if not adm:
                             await self._send_error(adm.user_message)
                             return "skip"
                         self.session_id = old_session_id
                         await self._send({
-                            "type": "warmup_ready",
+                            "type": wire.WARMUP_READY,
                             "session_id": self.session_id,
                             "chat_id": self.chat_id,
                             "mode": get_session_mode(old_session_id),
@@ -552,6 +599,12 @@ class WarmupController:
             self.chat_id = None
             self.session_id = None
 
+        # Whether THIS warmup minted the chat row: the dashboard moves the
+        # new-chat page's draft onto a chat id only when the frame says so
+        # (a resumed chat's frame must never take it). Derived from the mint
+        # branch, not the request: a denied or vanished chat_id falls through
+        # to a mint too.
+        minted = False
         if not self.chat_id:
             # Resolve the model + role that form the pre-warm match key (the tail
             # checks them after awaiting the eager pre-warm). Model precedence:
@@ -580,7 +633,7 @@ class WarmupController:
             # pre-warm's SecurityContext is stale → the tail's match fails and it
             # spawns a fresh session with the right role baked into its mounts/policy.
             consume_effective_role = await run_db(
-                _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+                acting_role_of, self.user_sub, agent, fallback_user=self.user,
             )
 
             # The pre-warmed-reuse-vs-fresh decision moved into _spawn_tail: it must
@@ -588,6 +641,7 @@ class WarmupController:
             # chat below is allocated + announced immediately and the reuse happens in
             # the background.
             self.chat_id = str(uuid.uuid4())
+            minted = True
             chat_model = target_model
             chat_exec_mode = requested_exec_mode
             self.deferred_model = ""  # consumed
@@ -595,13 +649,18 @@ class WarmupController:
                 permission_mode = self.deferred_mode
                 self.deferred_mode = ""
             # The chat row first, then the prompt — both on the chat's lane.
+            chat_owner = await run_db(_vis.chat_history_owner, self.agent_name, self.user_sub)
+            row_mode, row_model, row_exec_mode = permission_mode, chat_model, chat_exec_mode
+            if _vis.is_shared_chat_owner(chat_owner) and not roles.can_edit(warmup_role):
+                # A Shared-only chat runs as the agent (editor tier and up):
+                # a caller below it never leaves its picks on the shared row.
+                row_mode, row_model, row_exec_mode = "default", "", ""
             await chat_writer.submit(
                 self.chat_id,
                 functools.partial(
-                    task_store.create_chat, self.chat_id,
-                    _vis.chat_history_owner(self.agent_name, self.user_sub),
-                    self.agent_name, permission_mode, model=chat_model,
-                    execution_path=effective_exec_path, execution_mode=chat_exec_mode,
+                    task_store.create_chat, self.chat_id, chat_owner,
+                    self.agent_name, row_mode, model=row_model,
+                    execution_path=effective_exec_path, execution_mode=row_exec_mode,
                 ),
                 label="create_chat",
             )
@@ -622,11 +681,12 @@ class WarmupController:
         await warmup_registry.attach_listener(self.chat_id, self._send)
         self._attached_warmups.add(self.chat_id)
         await warmup_registry.emit(self.chat_id, {
-            "type": "warmup_started",
+            "type": wire.WARMUP_STARTED,
             "chat_id": self.chat_id,
             "agent": self.agent_name,
             "execution_path": effective_exec_path,
             "execution_target": self.session_execution_target,
+            "new_chat": minted,
         })
 
         # Snapshot everything the backgrounded spawn needs as LOCALS — the
@@ -663,7 +723,7 @@ class WarmupController:
                             return
                         if time.monotonic() - rec.last_emit_ts >= 15:
                             await warmup_registry.emit(wcid, {
-                                "type": "warmup_heartbeat",
+                                "type": wire.WARMUP_HEARTBEAT,
                                 "chat_id": wcid,
                             })
             except Exception:
@@ -763,7 +823,7 @@ class WarmupController:
                         res = await self._create_or_resume_session(
                             old_session_id, w_agent, permission_mode, resume=True,
                             model=chat_model, exec_path=effective_exec_path,
-                            codex_thread_id=w_thread, chat_id=wcid,
+                            resume_handle=w_thread, chat_id=wcid,
                             pinned_target=w_pinned, adopt=False,
                             chat_exec_mode=w_exec_mode, chat_theme=w_theme,
                         )
@@ -781,10 +841,11 @@ class WarmupController:
                         res = await self._create_or_resume_session(
                             new_sid, w_agent, permission_mode, resume=False,
                             model=chat_model, exec_path=effective_exec_path,
-                            codex_thread_id=w_thread, chat_id=wcid,
+                            resume_handle=w_thread, chat_id=wcid,
                             pinned_target=w_pinned, adopt=False,
                             chat_exec_mode=w_exec_mode, chat_theme=w_theme,
                             first_prompt=argv_first_prompt,
+                            focus_line=msg.get("_focus_line", ""),
                         )
                         # The resume gate legitimately refused (missing JSONL,
                         # RPC timeout, satellite mid-reconnect) — this fresh
@@ -872,17 +933,20 @@ class WarmupController:
                                     await w_layer.close_session(c_sid)
                     if reuse_sid is not None:
                         # Fresh-resolve the target for the badge + pin (new
-                        # chat → no existing pin); fall back to local on any error.
+                        # chat → no existing pin); fall back to local on any
+                        # error. The reason rides along: a session below
+                        # manager on an admin-targeted agent runs locally,
+                        # and the badge says so only when the frame carries it.
                         try:
-                            reuse_target, _ = remote_store.resolve_execution_target(
+                            reuse_target, reuse_reason = remote_store.resolve_execution_target(
                                 w_agent, self.user_sub, w_role,
                             )
                         except Exception:
-                            reuse_target = "local"
-                        reuse_target = reuse_target or "local"
+                            reuse_target, reuse_reason = placement.LOCAL, None
+                        reuse_target = reuse_target or placement.LOCAL
                         res = _SpawnResult(
                             session_id=reuse_sid, layer=w_layer,
-                            execution_target=reuse_target, fallback_reason=None,
+                            execution_target=reuse_target, fallback_reason=reuse_reason,
                         )
                         task_store.update_chat(
                             wcid, session_id=reuse_sid, execution_target=reuse_target,
@@ -900,6 +964,7 @@ class WarmupController:
                             chat_id=wcid, adopt=False,
                             chat_exec_mode=w_exec_mode, chat_theme=w_theme,
                             first_prompt=argv_first_prompt,
+                            focus_line=msg.get("_focus_line", ""),
                         )
                         await chat_writer.submit(
                             wcid,
@@ -981,7 +1046,7 @@ class WarmupController:
                         offline_machine_name = str(om.get("name") or "")
                 _mismatch = await run_db(self._target_mismatch_fields, wcid)
                 await warmup_registry.emit(wcid, {
-                    "type": "warmup_ready",
+                    "type": wire.WARMUP_READY,
                     "session_id": res.session_id,
                     "chat_id": wcid,
                     "mode": eff_mode,
@@ -997,8 +1062,8 @@ class WarmupController:
                 # to chat_messages by the digest claim, so it renders on reload).
                 if seed_notice and still_viewing:
                     await self._send({
-                        "type": "system",
-                        "subtype": "session_reseeded",
+                        "type": wire.SYSTEM,
+                        "subtype": wire.SUBTYPE_SESSION_RESEEDED,
                         "message": seed_notice,
                         "chat_id": wcid,
                     })
@@ -1018,7 +1083,7 @@ class WarmupController:
                     task_store.update_chat(
                         wcid, pending_history_seed=seed_reason_claimed)
                 await warmup_registry.emit(wcid, {
-                    "type": "warmup_failed",
+                    "type": wire.WARMUP_FAILED,
                     "chat_id": wcid,
                     "error": str(e),
                     "reason": e.reason,
@@ -1048,7 +1113,7 @@ class WarmupController:
                     else "session_error"
                 )
                 await warmup_registry.emit(wcid, {
-                    "type": "warmup_failed",
+                    "type": wire.WARMUP_FAILED,
                     "chat_id": wcid,
                     "error": emsg,
                     "reason": fail_reason,
@@ -1082,22 +1147,20 @@ class WarmupController:
                 if first_text and not res.first_prompt_in_argv:
                     isess = interactive_session.get(res.session_id)
                     if isess is not None and isess.alive:
-                        # Stamp browser time/zone at delivery (parity with the
-                        # -p pump's injection; the client sends the text RAW so
-                        # a declined-to-headless kick can't double-stamp).
-                        user_tz = (get_session_user_tz(res.session_id)
-                                   or get_user_tz(self.user_sub))
-                        stamped = (
-                            f"[Current time: "
-                            f"{config.format_current_time(user_tz)}]"
-                            f"\n\n{first_text}"
+                        # Stamp the time and the viewer-focus line at delivery
+                        # (parity with the -p pump's injection; the client
+                        # sends the text RAW so a declined-to-headless kick
+                        # can't double-stamp).
+                        stamped = self._interactive_prelude(
+                            first_text, session_id=res.session_id,
+                            focus_line=msg.get("_focus_line", ""),
                         )
                         # Re-note the STAMPED bytes (replaces the raw note from
                         # _persist_first_prompt): the tailer's duplicate-skip
-                        # matches the journaled user line byte-for-byte and the
-                        # CLI journals what the PTY received — without this the
-                        # first user row lands twice. Any reseed digest rides
-                        # the session's stashed seed (set_pending_seed above),
+                        # matches the journaled user line and the CLI journals
+                        # what the PTY received — without this the first user
+                        # row lands twice. Any reseed digest rides the
+                        # session's stashed seed (set_pending_seed above),
                         # prepended at the first submission — NOT here.
                         from core.session.transcript_tool_events import (
                             note_sent_prompt,
@@ -1139,12 +1202,13 @@ class WarmupController:
                         f"WS dashboard: server kick enqueued for chat={wcid[:8]}"
                     )
                     self.notify_queue.put_nowait({
-                        "type": "_server_kick",
+                        "type": wire.NOTIFY_SERVER_KICK,
                         "session_id": res.session_id,
                         "chat_id": wcid,
                         "text": kick_text,
                         "images": msg.get("images", []),
                         "files": msg.get("files", []),
+                        "focus_line": msg.get("_focus_line", ""),
                     })
 
         self._warmup_task = asyncio.create_task(_spawn_tail())
@@ -1169,7 +1233,7 @@ class WarmupController:
                 await self.layer.change_mode(self.session_id, pending)
             except Exception as e:
                 logger.warning(f"Post-warmup mode re-apply failed: {e}")
-            await self._send({"type": "mode_changed", "mode": pending})
+            await self._send({"type": wire.MODE_CHANGED, "mode": pending})
             logger.info(
                 f"WS dashboard post-warmup re-applied deferred mode={pending} "
                 f"to session={self.session_id[:8]}"
@@ -1193,7 +1257,7 @@ class WarmupController:
                 await self.layer.change_model(self.session_id, pending)
             except Exception as e:
                 logger.warning(f"Post-warmup model re-apply failed: {e}")
-            await self._send({"type": "model_changed", "model": pending})
+            await self._send({"type": wire.MODEL_CHANGED, "model": pending})
             logger.info(
                 f"WS dashboard post-warmup re-applied deferred model={pending} "
                 f"to session={self.session_id[:8]}"
@@ -1201,14 +1265,20 @@ class WarmupController:
 
     async def _create_or_resume_session(self,
         sid: str, agent: str, perm_mode: str, *, resume: bool = False,
-        model: str = "", exec_path: str = "", codex_thread_id: str = "",
+        model: str = "", exec_path: str = "", resume_handle: str = "",
         chat_id: str = "", pinned_target: str = "", adopt: bool = True,
         chat_exec_mode: str = "", chat_theme: str = "", first_prompt: str = "",
+        focus_line: str = "",
     ) -> _SpawnResult:
         """Create a session via the execution layer.
 
         When resume=True, reuses the old session_id with --resume so CLI
         loads conversation history from disk.
+
+        ``first_prompt`` is a cold interactive send's RAW text; an engine
+        whose TUI takes it as a launch argument gets it stamped here (time
+        and ``focus_line``, the viewer-focus line captured at send time),
+        the others get it stamped at the PTY submit after spawn.
 
         ``adopt`` (default True): write the resolved session into the
         connection's VIEWED attributes (``session_id``/``layer``/
@@ -1231,7 +1301,7 @@ class WarmupController:
         # sessions must see the current state so editor/viewer demotions
         # take effect without forcing the user to reconnect.
         effective_role = await run_db(
-            _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+            acting_role_of, self.user_sub, agent, fallback_user=self.user,
         )
 
         # Spawn-collision guard (incident 2026-08-06): a LIVE interactive
@@ -1268,38 +1338,37 @@ class WarmupController:
         # The continue-gate (_deny_task_continue) is enforced separately at the
         # warmup / chat entry points.
         task_identity = None
-        if chat_id.startswith("task-"):
-            run = task_store.get_run(chat_id.removeprefix("task-"))
+        if session_kind.is_task_chat_id(chat_id):
+            run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
             if run:
                 # The re-warm rebuilds the SAME task fire, so the
-                # knowledge-RW opt-in follows the run's stored task shape
-                # (scheduled/one-time/trigger; delegate stays False).
+                # knowledge-RW opt-in follows the run row's kind
+                # (task_kinds.RUN_KINDS: scheduled and delegate opt in).
                 task_identity = resolve_task_identity(
                     agent, run.get("scope") or "agent", run.get("created_by"),
-                    allow_knowledge_rw=task_allows_knowledge_rw(
-                        run.get("task_type")),
+                    allow_knowledge_rw=run_allows_knowledge_rw(run.get("task_type")),
                 )
         agent_cfg = await build_agent_config(
             agent_name=agent, user=self.user, user_sub=self.user_sub,
             user_role=effective_role, permission_mode=perm_mode,
-            client_type="dashboard", resume=resume, model=model,
+            client_type=session_kind.DASHBOARD.name, resume=resume, model=model,
             execution_path=exec_path,
-            codex_thread_id=codex_thread_id,
+            resume_handle=resume_handle,
             chat_id=chat_id,
             session_id=sid,
             task_identity=task_identity,
             pinned_target=pinned_target,
         )
         # Hard-fail if the resolved target is offline and fallback is disabled.
-        # The resolver encoded this as a "__offline__:<machine_id>" sentinel.
+        # The resolver encoded this as the offline sentinel (core/placement.py).
         # Checked BEFORE get_execution_layer so the user gets the tailored
         # message below instead of the resolver's generic offline RuntimeError.
-        if is_hard_fail_target(agent_cfg.execution_target):
+        if placement.is_offline_sentinel(agent_cfg.execution_target):
             # No slot acquired yet (acquire happens after this check); the
             # pool seat the build took IS, and every raise below abandons
             # the spawn.
             release_config_seat(sid, agent_cfg)
-            offline_machine_id = extract_offline_machine(agent_cfg.execution_target)
+            offline_machine_id = placement.offline_machine_of(agent_cfg.execution_target)
             machine = remote_store.get_remote_machine(offline_machine_id)
             if not machine:
                 # Deleted mid-flight: this warmup read the pin before the
@@ -1312,7 +1381,7 @@ class WarmupController:
                     "current target."
                 )
             machine_label = machine.get("name") or offline_machine_id[:8]
-            is_admin_target = (machine.get("pairing_scope") or "") == "admin"
+            is_admin_target = placement.machine_is_admin_paired(machine)
             if is_admin_target:
                 # Admin remote target — blocks everyone using this agent.
                 msg = (
@@ -1333,11 +1402,15 @@ class WarmupController:
         # "too many sessions" while the admin page shows zero. A REMOTE session
         # is budgeted on its satellite, so this short-circuits to admitted (no
         # local slot). Idempotent for a reused pre-warm (already tracked) and
-        # for an interactive task (already "task").
+        # for an interactive task (already "task"). A denied new chat waits
+        # its turn in the admission queue; a Direct-LLM session reserves for
+        # its stdio MCPs.
         from core.concurrency import acquire_chat_slot
         adm = await acquire_chat_slot(sid, target=agent_cfg.execution_target,
                                       execution_path=agent_cfg.execution_path,
-                                      user_sub=self.user_sub)
+                                      user_sub=self.user_sub,
+                                      queue_wait_s=config.ADMISSION_QUEUE_WAIT_S,
+                                      mcp_config_path=agent_cfg.mcp_config_path or "")
         if not adm:
             release_config_seat(sid, agent_cfg)
             raise RuntimeError(adm.user_message)
@@ -1365,40 +1438,38 @@ class WarmupController:
         if not chat_theme and chat_id:
             chat_baked_theme = (task_store.get_chat(chat_id) or {}).get("tui_theme") or ""
         agent_cfg.interactive_theme = chat_theme or chat_baked_theme or "dark"
-        # Codex interactive resumes by THREAD id (chats.codex_thread_id), whose
-        # rollout persists on disk independently of the in-memory app-server
-        # session AND the warmup's `resume` flag (which is keyed on the just-closed
-        # -p session, so it's False right after a -p→terminal switch). Re-derive
-        # here: resume iff the thread's rollout is still on disk — otherwise a
-        # switch back to the terminal (or a reopen) starts a FRESH codex with no
-        # context. Claude resumes by session_id via --resume → unaffected; this
-        # only touches codex interactive.
-        if agent_cfg.interactive and (agent_cfg.execution_path or "") == "codex-cli":
-            _tid = (agent_cfg.codex_thread_id or "").strip()
-            if (agent_cfg.execution_target or "local") != "local":
-                # Remote: the rollout lives on the satellite, not on local
-                # disk, so rollout_exists (a local glob) can't see it. Trust the
-                # thread id — the satellite's CodexPtySession locates
-                # rollout-*-<tid>.jsonl and `codex resume <tid>` continues it. A
-                # genuinely-missing remote rollout is the DB-fallback case, not
-                # handled here (codex would just start a fresh thread).
-                agent_cfg.resume = bool(_tid)
-            else:
-                from core.session import codex_rollout_tailer
-                agent_cfg.resume = bool(_tid) and codex_rollout_tailer.rollout_exists(
-                    agent_cfg.sandbox_host_claude_dir, _tid,
-                )
+        # Whether an interactive spawn resumes is the ENGINE's answer: the
+        # warmup's `resume` flag is keyed on the just-closed -p session (False
+        # right after a -p→terminal switch), which is right for an engine that
+        # resumes its session id (Claude, --resume) and wrong for one that
+        # resumes by a handle whose state outlives the session (Codex: the
+        # thread id and its rollout). The engine's local layer answers for a
+        # remote placement too — the answer is a function of the config.
+        agent_cfg.resume = get_layer_by_path(
+            agent_cfg.execution_path or exec_path,
+        ).resumes_interactive(agent_cfg)
         # Codex interactive cold first prompt: a FRESH spawn delivers it as the
         # `codex` launch arg → the TUI auto-runs it after MCP warm (deterministic
         # first-turn submit; the PTY type-then-Enter race is unreliable during
         # Codex's warm). On RESUME the prompt instead rides the server-side
         # submit in `_spawn_tail` (so `codex resume <tid>` continues the thread
-        # and any new turn still runs). Claude — fresh and resume — always uses
-        # that server-side submit too.
+        # and any new turn still runs). An engine whose TUI takes no launch
+        # argument — and every resume — uses that server-side submit too.
         _first_prompt_in_argv = False
+        _fc = get_layer_capabilities(agent_cfg.execution_path or "")
         if (agent_cfg.interactive and first_prompt and not agent_cfg.resume
-                and (agent_cfg.execution_path or "") == "codex-cli"):
-            agent_cfg.interactive_first_prompt = first_prompt
+                and _fc is not None and _fc.runtime.interactive_first_prompt_via_argv):
+            # Stamped here, the one place the argv delivery is decided (the
+            # remote start path reads the same field). No session exists
+            # yet, so the user's last-known zone is the one — the same value
+            # the spawn stamps onto the session below. Re-noted STAMPED so
+            # the rollout tailer's duplicate-skip meets what the TUI journals
+            # (the send-time note holds the raw text).
+            agent_cfg.interactive_first_prompt = self._interactive_prelude(
+                first_prompt, focus_line=focus_line,
+            )
+            from core.session.transcript_tool_events import note_sent_prompt
+            note_sent_prompt(chat_id, agent_cfg.interactive_first_prompt)
             _first_prompt_in_argv = True
         # Resolve the layer from the config's already-resolved target so the
         # layer can never disagree with the config. LOCAL,
@@ -1434,7 +1505,7 @@ class WarmupController:
         # this site covers them too when their session is re-warmed here.
         # Keyed by the chat PARAM (not the viewed attribute) so it's correct even
         # for a backgrounded spawn on a non-viewed chat.
-        if chat_id and not pinned_target and not is_hard_fail_target(agent_cfg.execution_target):
+        if chat_id and not pinned_target and not placement.is_offline_sentinel(agent_cfg.execution_target):
             task_store.update_chat(chat_id, execution_target=agent_cfg.execution_target)
         # Remember the baked TUI theme for future server-side re-warms (see the
         # resolution above). Only when a REAL dashboard snapshot arrived — a
@@ -1530,135 +1601,3 @@ class WarmupController:
                 label="resume_failed_flag",
             )
         return res
-
-
-_ROLLBACK_TASKS: set[asyncio.Task] = set()
-
-
-async def _pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer) -> None:
-    """Give back what an abandoned pre-warm holds: the chat slot, and either
-    the session (spawned and bound — closing it releases the seat) or the
-    seat its config acquired that nothing bound. ``build`` is the shielded
-    config build a cancel interrupted: awaited first, the seat lives in its
-    result. A cancel inside ``start_session`` can land after the bind and
-    before ``started`` is set, so the binding decides, not the flag."""
-    if agent_cfg is None and build is not None:
-        with contextlib.suppress(Exception):
-            agent_cfg = await build
-    from core.concurrency import release_chat_slot
-    release_chat_slot(sid)
-    if started or subscription_pool.session_bound(sid):
-        if layer is not None:
-            with contextlib.suppress(Exception):
-                await layer.close_session(sid)
-    elif agent_cfg is not None:
-        release_config_seat(sid, agent_cfg)
-
-
-def _schedule_pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, layer) -> None:
-    task = asyncio.create_task(_pre_warmup_rollback(sid, build, agent_cfg, started, layer))
-    _ROLLBACK_TASKS.add(task)
-    task.add_done_callback(_ROLLBACK_TASKS.discard)
-
-
-async def spawn_detached_prewarm(
-    *, agent: str, user: dict, user_sub: str,
-    requested_model: str = "", permission_mode: str = "default",
-) -> str | None:
-    """Pre-warm a session OUTSIDE any WS connection (wake-word detection fires
-    this over HTTP before the dashboard navigates to the chat).
-
-    Mirrors ``_handle_pre_warmup``'s spawn path minus the connection-scoped
-    bookkeeping: the session is registered in the global pre-warm registry
-    (with its model), and the next dashboard warmup for the same
-    (user, agent, model, role, exec_path) claims it via ``claim_by_key`` in
-    ``_spawn_tail``; unclaimed → the TTL reaper frees it. Returns the
-    session_id, or None when skipped (remote/interactive) or not spawnable.
-    """
-    role = await run_db(_effective_agent_role, user_sub, agent, fallback_user=user)
-    new_sid = str(uuid.uuid4())
-    agent_cfg = None
-    layer = None
-    try:
-        exec_path = resolve_execution_path(agent, "")
-        if _model_foreign_to_engine(requested_model, exec_path):
-            logger.info(
-                f"detached pre-warm: skipped (model {requested_model} is not a "
-                f"{exec_path} model) agent={agent}"
-            )
-            return None
-        agent_cfg = await build_agent_config(
-            agent_name=agent, user=user, user_sub=user_sub,
-            user_role=role, permission_mode=permission_mode,
-            client_type="dashboard", resume=False,
-            model=requested_model,
-            execution_path=exec_path,
-            session_id=new_sid,
-        )
-        # Same skips as the WS pre-warm: a remote pre-warm spends the
-        # satellite's budget for a chat that may never come; an interactive
-        # cold-start never reuses a -p pre-warm. Each skip returns the seat
-        # the build acquired.
-        if (agent_cfg.execution_target or "local") != "local":
-            logger.info(f"detached pre-warm: skipped (remote target) agent={agent}")
-            release_config_seat(new_sid, agent_cfg)
-            return None
-        if _resolve_session_interactive(agent_cfg):
-            logger.info(f"detached pre-warm: skipped (interactive) agent={agent}")
-            release_config_seat(new_sid, agent_cfg)
-            return None
-        from core.concurrency import acquire_chat_slot
-        adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
-                                      user_sub=user_sub)
-        if not adm:
-            logger.info(f"detached pre-warm: no slot ({adm.user_message})")
-            release_config_seat(new_sid, agent_cfg)
-            return None
-        # The layer must match the target the build resolved (local here):
-        # resolving again without it could hand back the remote layer for an
-        # agent whose machine the build had already fallen back from.
-        layer = get_execution_layer(
-            agent, execution_path=exec_path, user_sub=user_sub, role=role,
-            execution_target=agent_cfg.execution_target,
-        )
-        await layer.start_session(new_sid, agent_cfg)
-        _tz = get_user_tz(user_sub)
-        if _tz:
-            set_session_user_tz(new_sid, _tz)
-        from core.session import prewarm_session_registry as _prewarm
-        await _prewarm.register(new_sid, agent=agent, user_sub=user_sub,
-                                role=role,
-                                exec_path=resolve_execution_path(agent, ""),
-                                model=agent_cfg.model)
-        logger.info(
-            f"detached pre-warm: created session={new_sid[:8]}, agent={agent}, "
-            f"model={agent_cfg.model}, role={role}"
-        )
-        return new_sid
-    except Exception as e:
-        logger.error(f"detached pre-warm failed: {e}", exc_info=True)
-        from core.concurrency import release_chat_slot
-        release_chat_slot(new_sid)
-        if layer is not None and await layer.is_session_alive(new_sid):
-            # Spawned and bound, then the registration after it failed: the
-            # session owns the seat — close it, which releases it.
-            with contextlib.suppress(Exception):
-                await layer.close_session(new_sid)
-        elif agent_cfg is not None:
-            release_config_seat(new_sid, agent_cfg)
-        return None
-
-
-def _model_foreign_to_engine(model: str, execution_path: str) -> bool:
-    """True when ``model`` is KNOWN to run on other engines only — a
-    pre-warm frame can pair the page's model with an engine the resolver
-    then overrides (seen on T1: a Claude model on a Codex pre-warm, which
-    filtered the Codex candidates by the wrong provider and refused). An
-    unknown model (custom row, local endpoint) is trusted."""
-    if not model or not execution_path:
-        return False
-    try:
-        layers = config.get_model_layers(model)
-    except Exception:
-        return False
-    return bool(layers) and execution_path not in layers

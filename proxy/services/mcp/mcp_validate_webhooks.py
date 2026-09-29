@@ -11,6 +11,7 @@ point `_parse_manifest` and the tests call); the ``_WEBHOOK_*`` enums and
 ``_validate_webhook_registration_call`` are internal to this module.
 """
 
+import re
 from typing import Any
 
 
@@ -513,6 +514,68 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                     raise ValueError(
                         f"credentials.webhooks.vendor_target_spec.static_options[{oidx}]"
                         f".{fname} must be a non-empty string"
+                    )
+
+    # --- target_kinds (optional): the choices a subscriber picks between ---
+    # Each kind carries its own field hints and scope, and may restate any
+    # registration call (a shallow override of the top-level block: GitHub's
+    # organization kind changes the URL and nothing else). What is validated
+    # is the merged block, the one that will run.
+    kinds = vts.get("target_kinds")
+    if kinds is not None:
+        if not isinstance(kinds, list) or not kinds:
+            raise ValueError(
+                "credentials.webhooks.vendor_target_spec.target_kinds must be a "
+                "non-empty list when declared"
+            )
+        seen_keys: set[str] = set()
+        for kidx, kind in enumerate(kinds):
+            where = f"credentials.webhooks.vendor_target_spec.target_kinds[{kidx}]"
+            if not isinstance(kind, dict):
+                raise ValueError(f"{where} must be an object")
+            for fname in ("key", "label"):
+                v = kind.get(fname, "")
+                if not isinstance(v, str) or not v.strip():
+                    raise ValueError(f"{where}.{fname} must be a non-empty string")
+            if kind["key"] in seen_keys:
+                raise ValueError(f"{where}.key={kind['key']!r} repeats an earlier kind")
+            seen_keys.add(kind["key"])
+            for fname in ("placeholder", "validation_regex", "help_text"):
+                v = kind.get(fname)
+                if v is not None and not isinstance(v, str):
+                    raise ValueError(f"{where}.{fname} must be a string when declared")
+            if kind.get("validation_regex"):
+                try:
+                    re.compile(kind["validation_regex"])
+                except re.error as e:
+                    raise ValueError(f"{where}.validation_regex does not compile: {e}") from e
+            rs = kind.get("required_scopes")
+            if rs is not None and (
+                not isinstance(rs, list) or not all(isinstance(x, str) and x for x in rs)
+            ):
+                raise ValueError(f"{where}.required_scopes must be a list of non-empty strings")
+            kreg = kind.get("registration")
+            if kreg is not None:
+                if not isinstance(kreg, dict) or not kreg:
+                    raise ValueError(f"{where}.registration must be a non-empty object")
+                unknown = set(kreg) - {"create", "delete", "renew"}
+                if unknown:
+                    raise ValueError(
+                        f"{where}.registration may only restate create/delete/renew, "
+                        f"not {sorted(unknown)}"
+                    )
+                for call, override in kreg.items():
+                    if not isinstance(override, dict) or not override:
+                        raise ValueError(f"{where}.registration.{call} must be a non-empty object")
+                    base = (raw.get("registration") or {}).get(call)
+                    if not isinstance(base, dict):
+                        raise ValueError(
+                            f"{where}.registration.{call} restates a call the top-level "
+                            f"registration block does not declare"
+                        )
+                    _validate_webhook_registration_call(
+                        {**base, **override}, mcp_name,
+                        f"{call} (target kind {kind['key']!r})", required=True,
                     )
 
     # --- event_id_field (optional but recommended for dedup) ---

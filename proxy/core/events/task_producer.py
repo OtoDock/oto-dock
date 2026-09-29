@@ -6,7 +6,9 @@ All events go through the pump → saved as chat_messages → rich structured ou
 Also broadcasts a simplified per-event SSE stream consumed by the schedules-mcp's
 ``run_task(wait=true)`` (``GET /v1/tasks/runs/{run_id}/stream``), so MCPs that
 spawn tasks can stream live output back to the calling agent without
-re-implementing chat-message decoding.
+re-implementing chat-message decoding. The stream's terminal ``done`` is not
+the producer's to send: the runner sends it once the run row is stamped, so
+the frame carries the row's verdict (``services/scheduler/runner.py``).
 """
 
 import asyncio
@@ -59,7 +61,8 @@ def _event_to_sse(event: CommonEvent) -> dict | None:
         }
 
     elif event.type == DONE:
-        # Don't emit SSE done here — the producer sends it explicitly at the end
+        # A turn's end is not the run's: the runner sends the stream's
+        # ``done`` after the row is stamped.
         return None
 
     return None
@@ -378,24 +381,9 @@ async def task_produce(
                     + bgreg.unsurfaced_count
                 )
 
-        # Broadcast SSE done
-        if broadcast_fn:
-            with contextlib.suppress(Exception):
-                await broadcast_fn(run_id, {"type": "done", "status": "completed"})
-
-    except asyncio.CancelledError:
-        # Task was cancelled
-        if broadcast_fn:
-            with contextlib.suppress(Exception):
-                await broadcast_fn(run_id, {"type": "done", "status": "cancelled"})
-        raise
-
     except Exception as e:
         logger.error(f"Task producer error: {e}", exc_info=True)
         await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
-        if broadcast_fn:
-            with contextlib.suppress(Exception):
-                await broadcast_fn(run_id, {"type": "done", "status": "failed"})
 
     finally:
         await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))

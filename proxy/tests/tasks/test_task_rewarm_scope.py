@@ -24,8 +24,12 @@ import asyncio
 
 import pytest
 
+from core import placement
+
+from types import SimpleNamespace
+
 from core.config.task_config_builder import (
-    TaskIdentity, resolve_task_identity, task_allows_knowledge_rw,
+    TaskIdentity, resolve_task_identity, run_allows_knowledge_rw, task_allows_knowledge_rw,
 )
 from ws.dashboard import _rewarm_chat_allowed, _task_continue_allowed
 from storage.agents import agent_store
@@ -105,6 +109,28 @@ class TestResolveTaskIdentity:
         assert ident.username == ""
         assert ident.creds_user_sub is None
 
+    def test_shared_only_personal_task_never_runs_above_its_creator(self, temp_db):
+        # A viewer's or contributor's personal task (made while the agent
+        # offered a personal scope, or since) runs agent-scoped on a
+        # Shared-only agent with the creator's own role, as their chat there
+        # does; an editor may automate as the agent, so theirs stays manager.
+        agent_store.create_agent("voicebot", "VoiceBot",
+                                 default_scope="agent", collaborative=False)
+        for sub, role in (("sub-v", "viewer"), ("sub-c", "contributor"), ("sub-e", "editor")):
+            _mk_user(sub, sub, role="member")
+            task_store.add_user_agent(sub, "voicebot", role, "admin")
+        assert resolve_task_identity("voicebot", "user", "sub-v") == TaskIdentity(
+            username="", role="viewer", scope="agent", creds_user_sub=None)
+        assert resolve_task_identity("voicebot", "user", "sub-c").role == "contributor"
+        ident = resolve_task_identity("voicebot", "user", "sub-e", allow_knowledge_rw=True)
+        assert (ident.role, ident.scope, ident.knowledge_rw) == ("manager", "agent", False)
+        # A creator who lost the agent runs with no more than a viewer.
+        _mk_user("sub-gone", "Gone", role="member")
+        assert resolve_task_identity("voicebot", "user", "sub-gone").role == "viewer"
+        # A creator that is not a platform user (an agent slug) keeps the
+        # agent-scope identity.
+        assert resolve_task_identity("voicebot", "user", "other-agent").role == "manager"
+
     def test_user_scope_without_created_by_falls_to_agent(self, temp_db):
         # Defensive: a "user" run with no created_by can't resolve a creator.
         agent_store.create_agent("ops", "Ops")
@@ -181,6 +207,20 @@ class TestKnowledgeRwProvenance:
         assert self._ident(created_by="sub-a", allow=False).knowledge_rw is False
         assert resolve_task_identity("ops", "agent", "sub-a").knowledge_rw is False
 
+    def test_a_transferred_row_never_carries_it_until_adopted(self, temp_db):
+        """The transfer hands a row to the manager who removed its creator;
+        the prompt is still the creator's, so the definition opts OUT of
+        the grant until the new owner adopts it (transferred_from cleared)."""
+        from services.scheduler.shared import TaskDefinition
+        agent_store.create_agent("ops", "Ops")
+        _mk_user("sub-m", "Max", role="member")
+        task_store.add_user_agent("sub-m", "ops", "manager", "admin")
+        moved = TaskDefinition(id="t", name="n", agent="ops", prompt="p", scope="agent",
+                               task_type="scheduled", created_by="sub-m",
+                               transferred_from="sub-gone")
+        assert task_allows_knowledge_rw(moved) is False
+        assert task_allows_knowledge_rw(moved.model_copy(update={"transferred_from": ""})) is True
+
     def test_user_scope_identity_never_carries_it(self, temp_db):
         agent_store.create_agent("pa", "PA")
         _mk_user("sub-m", "Max", role="member")
@@ -214,13 +254,26 @@ class TestKnowledgeRwProvenance:
         # way — no-user delegations record the agent slug, which the
         # provenance check fails closed on). Continuations / unknowns stay
         # out.
-        assert task_allows_knowledge_rw("scheduled") is True
-        assert task_allows_knowledge_rw("one_time") is True
-        assert task_allows_knowledge_rw("trigger") is True
-        assert task_allows_knowledge_rw("delegate") is True
-        assert task_allows_knowledge_rw("continuation") is False
-        assert task_allows_knowledge_rw("") is False
-        assert task_allows_knowledge_rw(None) is False
+        def _task(word):
+            return SimpleNamespace(task_type=word, schedule="", interval_seconds=None)
+        assert task_allows_knowledge_rw(_task("scheduled")) is True
+        assert task_allows_knowledge_rw(_task("one_time")) is True
+        assert task_allows_knowledge_rw(_task("trigger")) is True
+        assert task_allows_knowledge_rw(_task("delegate")) is True
+        assert task_allows_knowledge_rw(_task("continuation")) is False
+        assert task_allows_knowledge_rw(_task("")) is False
+        assert task_allows_knowledge_rw(_task(None)) is False
+        # The re-warm asks the RUN row's kind (core-seams phase 9): today's
+        # answers — the run column's ``one-time`` never matched the old
+        # word-set and a trigger task's run row read ``one-time`` too.
+        assert run_allows_knowledge_rw("scheduled") is True
+        assert run_allows_knowledge_rw("delegate") is True
+        assert run_allows_knowledge_rw("one-time") is False
+        assert run_allows_knowledge_rw("trigger") is False
+        assert run_allows_knowledge_rw("app") is False
+        assert run_allows_knowledge_rw("check") is False
+        assert run_allows_knowledge_rw("") is False
+        assert run_allows_knowledge_rw(None) is False
 
     def test_delegate_provenance_matrix(self, temp_db):
         # Manager-delegated agent-scope worker gets knowledge RW on the
@@ -429,7 +482,7 @@ def _stub_heavy(monkeypatch, tmp_path):
         cb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None),
     )
     monkeypatch.setattr(
-        cb.remote_store, "get_target_metadata", lambda *a, **k: ("local", "Local"),
+        cb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT,
     )
     monkeypatch.setattr(cb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
     monkeypatch.setattr(cb.config, "get_cli_model", lambda *a, **k: "m")
@@ -438,17 +491,19 @@ def _stub_heavy(monkeypatch, tmp_path):
     # session was built with — the sandbox scope is derived from these.
     calls: dict = {}
 
-    def _spy_dir(agent_name, *, username="", scope="user"):
+    def _spy_dir(agent_name, *, username="", scope="user", **kw):
         calls["username"] = username
         calls["scope"] = scope
         return tmp_dir
     tmp_dir = tmp_path
-    # config_builder calls ensure_persistent_agent_dir, which dispatches to these
-    # — patch both at their definition site (core.sandbox.session_config_dir) so the
-    # in-module dispatch hits the spy regardless of the agent's execution layer.
-    import core.sandbox.session_config_dir as _scd
-    monkeypatch.setattr(_scd, "ensure_persistent_claude_dir", _spy_dir)
-    monkeypatch.setattr(_scd, "ensure_persistent_codex_dir", _spy_dir)
+    # config_builder calls ensure_persistent_agent_dir, which dispatches to the
+    # engines' builders — patch both at their definition sites (the engine
+    # packages' config_dir modules) so the layers' call-time reads hit the spy
+    # regardless of the agent's execution layer.
+    import core.layers.cli.config_dir as _cli_cd
+    import core.layers.codex.config_dir as _codex_cd
+    monkeypatch.setattr(_cli_cd, "ensure_persistent_claude_dir", _spy_dir)
+    monkeypatch.setattr(_codex_cd, "ensure_persistent_codex_dir", _spy_dir)
     # Dashboard adapter appends UI context — neutralize so the prompt is stable.
     import adapters.dashboard as dash
     monkeypatch.setattr(dash.DashboardAdapter, "build_client_context", lambda self, mc: "")
@@ -516,3 +571,78 @@ class TestBuildAgentConfigTaskIdentity:
         assert sc.username == "ada"
         assert calls["scope"] == "user"
         assert calls["username"] == "ada"
+
+
+# ---------------------------------------------------------------------------
+# Below the editor tier nobody runs from the agent's own CLI state: a
+# Shared-only chat, a task re-warm, a scheduled fire — refused at config
+# time, before a pool seat, with the person's message.
+# ---------------------------------------------------------------------------
+
+class TestSharedOnlyBelowEditorRefused:
+    def _shared_only(self):
+        agent_store.create_agent("voicebot", "VoiceBot", default_scope="agent", collaborative=False)
+        for sub, role in (("sub-v", "viewer"), ("sub-c", "contributor"), ("sub-e", "editor")):
+            _mk_user(sub, sub, role="member")
+            task_store.add_user_agent(sub, "voicebot", role, "admin")
+
+    def test_a_chat_below_the_editor_tier_is_refused_before_a_seat(self, temp_db, monkeypatch, tmp_path):
+        from core.config.config_builder import build_agent_config
+        from core.config import config_builder as cb
+        from core.sandbox.session_config_dir import AgentStateRefused
+        self._shared_only()
+        _stub_heavy(monkeypatch, tmp_path)
+        seats: list = []
+        monkeypatch.setattr(cb.subscription_pool, "resolve_subscription_env",
+                            lambda *a, **k: seats.append(1) or ("test-sub", {}))
+        for sub, role in (("sub-v", "viewer"), ("sub-c", "contributor")):
+            user = {"username": sub, "display_name": sub, "email": "", "role": "member"}
+            with pytest.raises(AgentStateRefused, match="editor role") as err:
+                asyncio.run(build_agent_config(
+                    agent_name="voicebot", user=user, user_sub=sub, user_role=role,
+                    client_type="dashboard", chat_id="agent::voicebot",
+                ))
+            assert f"run as {role}" in str(err.value)
+        assert seats == []
+        # An editor acts as the agent: built in the agent scope.
+        editor = {"username": "sub-e", "display_name": "E", "email": "", "role": "member"}
+        cfg = asyncio.run(build_agent_config(
+            agent_name="voicebot", user=editor, user_sub="sub-e", user_role="editor",
+            client_type="dashboard", chat_id="agent::voicebot",
+        ))
+        assert cfg.security_context.session_scope == "agent" and seats == [1]
+
+    def test_a_task_rewarm_below_the_editor_tier_is_refused(self, temp_db, monkeypatch, tmp_path):
+        from core.config.config_builder import build_agent_config
+        from core.sandbox.session_config_dir import AgentStateRefused
+        self._shared_only()
+        _stub_heavy(monkeypatch, tmp_path)
+        admin = {"username": "ada", "display_name": "Ada", "email": "a@x", "role": "admin"}
+        ident = resolve_task_identity("voicebot", "user", "sub-v")
+        with pytest.raises(AgentStateRefused):
+            asyncio.run(build_agent_config(
+                agent_name="voicebot", user=admin, user_sub="sub-ada", user_role="admin",
+                client_type="dashboard", chat_id="task-run-v", task_identity=ident,
+            ))
+
+    def test_a_scheduled_fire_below_the_editor_tier_is_refused_before_a_seat(self, temp_db, monkeypatch):
+        from types import SimpleNamespace
+        from core.config import task_config_builder as tcb
+        from core.sandbox.session_config_dir import AgentStateRefused
+        self._shared_only()
+        monkeypatch.setattr(tcb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+        monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
+        monkeypatch.setattr(tcb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
+        monkeypatch.setattr(tcb.mcp_registry, "build_session_mcp_config",
+                            lambda *a, **k: (None, {}, {}, {}, set()))
+        seats: list = []
+        monkeypatch.setattr(tcb.subscription_pool, "resolve_subscription_env",
+                            lambda *a, **k: seats.append(1) or ("s", {}))
+        task = SimpleNamespace(scope="user", created_by="sub-c", task_type="scheduled",
+                               notification_mode="none", override_model=None,
+                               override_execution_path=None, override_execution_mode=None,
+                               judge=None, execution_target_override="", agent="voicebot",
+                               id="t1", name="t", prompt="p", timeout_seconds=60, extra_context=[])
+        with pytest.raises(AgentStateRefused, match="run as contributor"):
+            asyncio.run(tcb.build_task_agent_config("voicebot", task, "sess-t"))
+        assert seats == []

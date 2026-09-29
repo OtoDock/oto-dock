@@ -202,6 +202,7 @@ class TestSteerRung:
     class _Pump:
         session_id = "sid-st1"
         is_done = False
+        source_type = "chat"
 
     class _Layer:
         def __init__(self, accept):
@@ -214,13 +215,15 @@ class TestSteerRung:
 
     def _arm(self, monkeypatch, accept):
         from core.events import stream_pump
-        from core.session import session_manager
+        from core.session import session_delivery
         layer = self._Layer(accept)
         stream_pump._active_pumps["chat-st1"] = self._Pump()
-        monkeypatch.setattr(
-            session_manager, "resolve_execution_path", lambda a, p="": "codex-cli",
-        )
-        monkeypatch.setattr(session_manager, "get_layer_by_path", lambda p: layer)
+
+        # The chat's OWN layer (remote-aware); the rows here carry no target,
+        # so the resolver's answer is scripted.
+        async def _chat_layer(chat):
+            return layer
+        monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
         return layer
 
     def _disarm(self):
@@ -293,6 +296,85 @@ class TestSteerRung:
         finally:
             self._Pump.is_done = False
             self._disarm()
+
+    def test_meeting_pump_keeps_the_queue(self, temp_db, monkeypatch):
+        # Only a chat's own turn or a task lane takes a steer — a meeting
+        # turn's pump keeps the post-turn queue, like the dashboard branch.
+        try:
+            task_store.create_chat("chat-st1", "user-1", "pa")
+            layer = self._arm(monkeypatch, accept=True)
+            from core.events import stream_pump
+            stream_pump._active_pumps["chat-st1"].source_type = "meeting"
+            pumped = []
+            set_pump_callbacks(
+                lambda cid, ev: True,
+                lambda cid, text, system: pumped.append((cid, text)) or True,
+            )
+            outcome = asyncio.run(deliver_prompt(
+                "chat-st1", "steer me", source="delegate_result",
+                session_id="sid-st1", agent="pa",
+            ))
+            assert layer.calls == []
+            assert outcome.path == "pump"
+            assert pumped == [("chat-st1", "steer me")]
+        finally:
+            self._Pump.source_type = "chat"
+            self._disarm()
+
+    def test_unresolvable_layer_falls_back_to_pump_queue(self, temp_db,
+                                                         monkeypatch):
+        # A chat whose layer cannot be resolved (its target machine is gone)
+        # is queued, never dropped.
+        try:
+            task_store.create_chat("chat-st1", "user-1", "pa")
+            from core.events import stream_pump
+            from core.session import session_delivery
+            stream_pump._active_pumps["chat-st1"] = self._Pump()
+
+            async def _none(chat):
+                return None
+            monkeypatch.setattr(session_delivery, "chat_layer", _none)
+            pumped = []
+            set_pump_callbacks(
+                lambda cid, ev: True,
+                lambda cid, text, system: pumped.append((cid, text)) or True,
+            )
+            outcome = asyncio.run(deliver_prompt(
+                "chat-st1", "steer me", source="delegate_result",
+                session_id="sid-st1", agent="pa",
+            ))
+            assert outcome.path == "pump"
+            assert pumped == [("chat-st1", "steer me")]
+        finally:
+            self._disarm()
+
+    def test_chat_layer_resolves_the_pinned_target(self, temp_db, monkeypatch):
+        # A chat pinned to a satellite is steered through its REMOTE layer:
+        # the resolver receives the row's path and target with the owner's
+        # role (the local engine layer never owns a remote session).
+        from core.session import session_delivery, session_manager
+        seen = {}
+
+        def _get_execution_layer(agent, execution_path="", user_sub=None,
+                                 role="manager", execution_target=""):
+            seen.update(agent=agent, execution_path=execution_path,
+                        user_sub=user_sub, role=role,
+                        execution_target=execution_target)
+            return "the-remote-layer"
+        monkeypatch.setattr(session_manager, "get_execution_layer",
+                            _get_execution_layer)
+        from auth import providers as _providers
+        monkeypatch.setattr(_providers, "acting_role_of",
+                            lambda sub, agent, **k: "editor")
+        layer = asyncio.run(session_delivery.chat_layer({
+            "id": "chat-r1", "agent": "pa", "user_sub": "user-1",
+            "execution_path": "codex-cli", "execution_target": "machine-7",
+        }))
+        assert layer == "the-remote-layer"
+        assert seen == {
+            "agent": "pa", "execution_path": "codex-cli", "user_sub": "user-1",
+            "role": "editor", "execution_target": "machine-7",
+        }
 
 
 class TestOneshotGuard:
@@ -449,7 +531,7 @@ def test_register_notify_queue_replaces_superseded_sid(temp_db):
 
     q_mine: asyncio.Queue = asyncio.Queue()
     q_other: asyncio.Queue = asyncio.Queue()
-    conn = SimpleNamespace(session_id="sid-new", notify_queue=q_mine)
+    conn = SimpleNamespace(session_id="sid-new", notify_queue=q_mine, _view_only=False)
     reg = DashboardConnection._register_notify_queue
     try:
         _dashboard_notify_queues["sid-old"] = q_mine   # superseded

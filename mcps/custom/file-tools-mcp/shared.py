@@ -5,14 +5,20 @@ Config, path mapping, LibreOffice lock, preview push helpers.
 
 import asyncio
 import base64
+import contextlib
+import hashlib
+import tempfile
 import contextvars
 import json
 import logging
 import os
+import re
 import unicodedata
 from pathlib import Path
 
 import httpx
+
+import safe_fs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -23,6 +29,10 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 # in docker-compose.yml). Hardcoded — no longer a config knob; the env var
 # `MOUNT_AGENTS_DIR` is gone in v2.
 MOUNT_AGENTS_DIR = "/agents"
+# The pseudo-agent under the mount where the proxy caches a remote machine's
+# files per session (``<mount>/.remote-host-cache/<session id>/...``).
+HOST_CACHE_SEGMENT = ".remote-host-cache"
+_SAFE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$", re.IGNORECASE)
 MCP_PORT = int(os.environ.get("MCP_PORT", "8932"))
 
 logging.basicConfig(
@@ -111,14 +121,15 @@ def _to_agents_relative(container_path: str) -> str:
     return container_path  # already agents-relative or out-of-tree
 
 
-async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, str]:
+async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | None, str, str]:
     """Ask the proxy to translate a path to an agents-relative path.
 
-    Returns ``(agents_relative, "")`` on success (the agents-relative path is
-    usable directly as a container path under MOUNT_AGENTS_DIR). On failure
-    returns ``(None, reason)`` where ``reason`` carries the proxy's REAL
-    verdict — a 403 policy reject (e.g. "outside the OS user's home directory;
-    enable full filesystem access") or a 404 not-reachable — so the caller can
+    Returns ``(agents_relative, agent, "")`` on success (the agents-relative
+    path is usable directly as a container path under MOUNT_AGENTS_DIR;
+    ``agent`` is the slug the proxy echoes for the session, ``""`` from a
+    proxy that does not send it). On failure returns ``(None, "", reason)``
+    where ``reason`` carries the proxy's REAL verdict: a 403 policy reject (e.g. "outside the OS user's home directory;
+    enable full filesystem access") or a 404 not-reachable, so the caller can
     surface it instead of a generic "within the agents directory" error that
     masked every cause (Issue C).
 
@@ -134,7 +145,7 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
     logger.info(f"_resolve_via_proxy: path={path}, session_id={session_id[:12] if session_id else '(empty)'}, PROXY_URL={PROXY_URL}")
     if not session_id or not PROXY_URL or not auth:
         logger.warning(f"_resolve_via_proxy: skipping — session_id={'empty' if not session_id else 'set'}, PROXY_URL={'empty' if not PROXY_URL else 'set'}, auth={'empty' if not auth else 'set'}")
-        return None, "file-tools is not session-bound (missing session_id/PROXY_URL/auth)"
+        return None, "", "file-tools is not session-bound (missing session_id/PROXY_URL/auth)"
     try:
         async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
             resp = await client.post(
@@ -146,8 +157,8 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
             data = resp.json()
             agents_rel = data.get("agents_relative", "")
             if agents_rel:
-                return agents_rel, ""
-            return None, (
+                return agents_rel, str(data.get("agent") or ""), ""
+            return None, "", (
                 "proxy resolved the path but returned no agents-relative "
                 "mapping (it is outside the synced agent tree)"
             )
@@ -157,10 +168,22 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
             detail = str(resp.json().get("detail", "")).strip()
         except Exception:
             detail = (resp.text or "")[:200].strip()
-        return None, f"proxy resolve-path {resp.status_code}: {detail or '(no detail)'}"
+        return None, "", f"proxy resolve-path {resp.status_code}: {detail or '(no detail)'}"
     except Exception as e:
         logger.debug(f"resolve-path failed for '{path}': {e}")
-        return None, f"resolve-path request failed: {e}"
+        return None, "", f"resolve-path request failed: {e}"
+
+
+def _session_subtree(slug: str) -> str | None:
+    """The one container tree this request may touch: the session's own agent
+    folder under the mount, or, for a remote machine's file, the session's own
+    host-cache folder (the cache is per session). None for anything else."""
+    if slug == HOST_CACHE_SEGMENT:
+        session_id = _session_id_var.get()
+        return f"{MOUNT_AGENTS_DIR}/{HOST_CACHE_SEGMENT}/{session_id}" if session_id else None
+    if _SAFE_SLUG_RE.match(slug or ""):
+        return f"{MOUNT_AGENTS_DIR}/{slug}"
+    return None
 
 
 def _unicode_match_on_disk(path: str) -> str:
@@ -215,6 +238,14 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     After prefix translation, falls back to a Unicode-normalized lookup in
     the parent dir if the exact path doesn't exist on disk (see
     ``_unicode_match_on_disk``).
+
+    The answer is confined to the CALLER'S tree: the slug the proxy echoes
+    names the agent folder, or the session's own host-cache folder, and the
+    resolved path must stay inside it (an answer that names no agent is
+    refused: a slug read off the path would confine to whatever the answer
+    says). The mount holds every agent's tree, so a prefix check on the
+    mount alone would admit another agent's files; the write helpers then
+    open the answer without following a link.
     """
     # A container-absolute path goes through the proxy like every other
     # form: the mount holds EVERY agent's tree, so the prefix alone says
@@ -226,12 +257,18 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     elif path.startswith(MOUNT_AGENTS_DIR + "/"):
         path = path[len(MOUNT_AGENTS_DIR) + 1:]
 
-    agents_rel, reason = await _resolve_via_proxy(path, writing=writing)
-    if agents_rel:
-        cp = MOUNT_AGENTS_DIR + ("/" + agents_rel.lstrip("/"))
-        resolved = str(Path(cp).resolve())
-        if resolved.startswith(MOUNT_AGENTS_DIR):
+    agents_rel, agent, reason = await _resolve_via_proxy(path, writing=writing)
+    if agents_rel and not agent:
+        reason = "the proxy answered without the session's agent"
+    elif agents_rel:
+        rel = agents_rel.lstrip("/")
+        allowed = _session_subtree(agent)
+        resolved = str(Path(MOUNT_AGENTS_DIR + "/" + rel).resolve())
+        # The separator matters: a bare prefix test admits a sibling such as
+        # /agents/proj-a-evil/x.
+        if allowed and (resolved == allowed or resolved.startswith(allowed + "/")):
             return _unicode_match_on_disk(resolved)
+        reason = "the path leaves this session's agent tree"
 
     # Surface the proxy's real verdict (policy reject / not reachable / out of
     # tree) instead of a generic message that masked the actual cause.
@@ -301,14 +338,92 @@ def _dropped_note(dropped: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Writing an output: beneath the mount, no link followed
+# ---------------------------------------------------------------------------
+#
+# A resolved output path was judged by the proxy and confined above, but the
+# name can be swapped for a link before the write lands. Every write sink
+# therefore hands its bytes to ``safe_open_write``: a temp created beside the
+# name inside the parent's own handle and renamed onto it there (``safe_fs``,
+# the proxy helper's copy), so a link at the name is replaced, never written
+# through, and a link at any component refuses the write. The cores run in
+# spawn children with no session state; the root is read at call time.
+
+def _write_root() -> str:
+    """The root every output opens beneath: the mount. ``FILETOOLS_WRITE_ROOT``
+    points the suite at a temporary tree (a spawn child inherits it)."""
+    return os.environ.get("FILETOOLS_WRITE_ROOT") or MOUNT_AGENTS_DIR
+
+
+def _rel_beneath_root(container_path: str) -> tuple[str, str]:
+    root = _write_root()
+    try:
+        return root, safe_fs.rel_under(container_path, root)
+    except OSError:
+        raise PermissionError(
+            f"Cannot write '{_to_agents_relative(container_path)}': outside the writable tree"
+        ) from None
+
+
+@contextlib.contextmanager
+def safe_open_write(container_path: str):
+    """A binary file to write the output at ``container_path`` into; on a
+    clean exit the bytes replace the name atomically beneath the mount with
+    no component followed (a failure leaves no temp behind)."""
+    root, rel = _rel_beneath_root(container_path)
+    try:
+        with safe_fs.atomic_writer(root, rel, mkdirs=True) as fh:
+            yield fh
+    except safe_fs.SafeFsError as exc:
+        raise PermissionError(
+            f"Cannot write '{_to_agents_relative(container_path)}': {exc.strerror}"
+        ) from None
+
+
+def safe_mkdirs(container_dir: str) -> None:
+    """Create ``container_dir`` and its missing parents beneath the mount, none
+    of them reached through a link."""
+    root, rel = _rel_beneath_root(container_dir)
+    if not rel:
+        return
+    try:
+        safe_fs.mkdirs_beneath(root, rel)
+    except safe_fs.SafeFsError as exc:
+        raise PermissionError(
+            f"Cannot create '{_to_agents_relative(container_dir)}': {exc.strerror}"
+        ) from None
+
+
+def worker_temp_path(container_path: str, suffix: str) -> str:
+    """The one temp in the system temp dir a worker writing ``container_path``
+    may use for a library that writes by name outside the tree: named after
+    the output, so the parent's ``cleanup_partials`` finds it after a kill
+    the worker's own ``finally`` never saw. Two workers on one output share
+    the name, as they share the output."""
+    digest = hashlib.sha256(container_path.encode("utf-8")).hexdigest()[:24]
+    return os.path.join(tempfile.gettempdir(), f"file-tools-{digest}{suffix}")
+
+
+def cleanup_partials(container_path: str) -> None:
+    """Remove the temps a killed or failed worker left beside
+    ``container_path`` (``.<name>.<hex>.partial``) and its temp in the system
+    temp dir; best-effort."""
+    with contextlib.suppress(OSError):
+        os.unlink(worker_temp_path(container_path, ".pdf"))
+    parent, name = os.path.split(container_path)
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return
+    for entry in entries:
+        if entry.startswith(f".{name}.") and entry.endswith(".partial"):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(parent, entry))
+
+
+# ---------------------------------------------------------------------------
 # Worker-core plumbing (see isolation.py)
 # ---------------------------------------------------------------------------
-
-# Deterministic same-directory temp target for atomic worker saves: children
-# are routinely killed (RLIMIT_AS, deadline, daemon teardown), and a
-# deterministic name lets the PARENT clean the orphan up after a kill —
-# something a random mkstemp name can't offer once the child is gone.
-_WORKER_TMP_SUFFIX = ".otodock-tmp"
 
 # Parent-side path pre-resolution failures travel into sync worker cores as
 # marker strings, so the cores' per-op error containment (errors.append +
@@ -353,16 +468,53 @@ _WRITE_OP_ADVICE = (
 
 _libreoffice_lock = asyncio.Lock()
 
+# The profile the headless conversions run under: formulas are never
+# recalculated on load, links are never updated, macros never run (the
+# document under conversion is untrusted input; LibreOffice 7.4 is already
+# inert on these by default and the profile pins it).
+_LO_PROFILE_DIR = os.environ.get("FILETOOLS_LO_PROFILE", "/tmp/file-tools-lo-profile")
+_LO_REGISTRY = """<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="ODFRecalcMode" oor:op="fuse"><value>1</value></prop></item>
+<item oor:path="/org.openoffice.Office.Calc/Formula/Load"><prop oor:name="OOXMLRecalcMode" oor:op="fuse"><value>1</value></prop></item>
+<item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1</value></prop></item>
+<item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+</oor:items>
+"""
+
+
+def _libreoffice_profile() -> str:
+    """The user-installation directory the conversions run under, its
+    registry seeded with the pins above (written once, rewritten on drift)."""
+    user = os.path.join(_LO_PROFILE_DIR, "user")
+    os.makedirs(user, exist_ok=True)
+    xcu = os.path.join(user, "registrymodifications.xcu")
+    try:
+        current = open(xcu, encoding="utf-8").read()
+    except OSError:
+        current = ""
+    if current != _LO_REGISTRY:
+        with open(xcu, "w", encoding="utf-8") as fh:
+            fh.write(_LO_REGISTRY)
+    return _LO_PROFILE_DIR
+
 
 async def _libreoffice_convert(
     input_path: str, output_format: str, output_dir: str | None = None
 ) -> str:
-    """Convert a file with LibreOffice headless. Returns output path."""
+    """Convert a file with LibreOffice headless. Returns output path. The
+    caller passes an ``output_dir`` outside the agent tree (a temp directory)
+    and lands the result through ``safe_open_write``: LibreOffice writes by
+    name and must never write into the tree itself."""
     if output_dir is None:
         output_dir = str(Path(input_path).parent)
+    profile = _libreoffice_profile()
     async with _libreoffice_lock:
         proc = await asyncio.create_subprocess_exec(
-            "libreoffice", "--headless", "--norestore", "--convert-to",
+            "libreoffice", f"-env:UserInstallation=file://{profile}",
+            "--headless", "--norestore", "--convert-to",
             output_format, "--outdir", output_dir, input_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

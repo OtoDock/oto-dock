@@ -52,8 +52,17 @@ def _write_template(
     context_files: dict[str, str] | None = None,
     dashboards: list[dict] | None = None,
     dashboard_files: dict[str, str] | None = None,
+    apps: dict[str, dict] | None = None,
+    user_apps: dict[str, dict] | None = None,
+    checks: dict[str, dict] | None = None,
+    agent_json_extra: dict | None = None,
 ) -> Path:
-    """Write a minimal valid template directory under tmp_path/<slug>/."""
+    """Write a minimal valid template directory under tmp_path/<slug>/.
+
+    ``apps`` / ``user_apps`` map an app slug to its ``app.json`` (an
+    optional ``_blueprint`` key becomes ``blueprint.json``, ``_files`` extra
+    files); ``checks`` map a check name to its document (an optional
+    ``_script`` key becomes the script the document names)."""
     template_dir = tmp_path / slug
     template_dir.mkdir(parents=True, exist_ok=True)
 
@@ -64,8 +73,31 @@ def _write_template(
         "description": "Test template",
         "color": "#10B981",
         "version": "1.0.0",
+        **(agent_json_extra or {}),
     }
     (template_dir / "agent.json").write_text(json.dumps(agent_json))
+    for folder, items in (("apps", apps), ("user-apps", user_apps)):
+        for app_slug, manifest in (items or {}).items():
+            manifest = dict(manifest)
+            blueprint = manifest.pop("_blueprint", None)
+            extra = manifest.pop("_files", {})
+            root = template_dir / folder / app_slug
+            (root / "client").mkdir(parents=True, exist_ok=True)
+            (root / "app.json").write_text(json.dumps(manifest))
+            (root / "client" / "index.html").write_text("<p>app</p>")
+            if blueprint is not None:
+                (root / "blueprint.json").write_text(json.dumps(blueprint))
+            for rel, content in extra.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(content)
+    for name, doc in (checks or {}).items():
+        doc = dict(doc)
+        script = doc.pop("_script", None)
+        root = template_dir / "checks" / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "check.json").write_text(json.dumps(doc))
+        if script is not None:
+            (root / doc["script"]["run"]).write_text(script)
     (template_dir / "agent.md").write_text("# Test Prompt\n")
     (template_dir / "mcps.json").write_text(
         json.dumps({"required": mcps or []})
@@ -200,6 +232,603 @@ class TestTemplateLoading:
         assert set(template.context_files.keys()) == {
             "context/methodology.md", "context/glossary.txt",
         }
+
+
+class TestTemplateAppsAndChecks:
+    """Folder apps in ``apps/`` (shared) and ``user-apps/`` (per member),
+    checks in ``checks/``: what the loader admits, what it hashes, what it
+    persists (COMMUNITY-AGENTS-REGISTRY.md "Per-template layout")."""
+
+    HOME = {"title": "Home", "egress": ["api.open-meteo.com"],
+            "actions": [{"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]}
+
+    def test_both_folders_discovered_with_their_hashes(self, tmp_path, temp_db):
+        from storage.agents import template_sig
+        from storage.agents.community_agent_template_store import load_template_from_dir
+        tdir = _write_template(
+            tmp_path, agent_json_extra={"collaborative": True},
+            apps={"board": {"title": "Board", "requires": {"mcps": ["github-mcp"]},
+                            "_blueprint": {"format": 1, "tasks": [{"slug": "r", "description": "R", "prompt": "go"}]}}},
+            user_apps={"home": {**self.HOME, "_blueprint": {"roles": ["editor"], "auto_create_for_new_users": False}}},
+        )
+        template = load_template_from_dir(tdir)
+        by_slug = {a.slug: a for a in template.apps}
+        assert set(by_slug) == {"board", "home"}
+        board, home = by_slug["board"], by_slug["home"]
+        assert board.visibility == "agent" and home.visibility == "user"
+        assert board.title == "Board" and board.requires_mcps == ["github-mcp"]
+        assert [m.name for m in template.mcps] == ["github-mcp"]
+        assert board.blueprint["tasks"][0]["slug"] == "r"
+        assert home.roles == ["editor"] and home.auto_create_for_new_users is False
+        assert board.auto_create_for_new_users is True and board.roles is None
+        # The hashes: the tree without app.json (blueprint.json stays, it
+        # travels verbatim), the manifest, the consent sig.
+        files = [("blueprint.json", tdir / "user-apps/home/blueprint.json"),
+                 ("client/index.html", tdir / "user-apps/home/client/index.html")]
+        assert home.tree_sha == template_sig.tree_sha(files)
+        assert home.app_json_sha == template_sig.sha256_text(template_sig.canonical(self.HOME))
+        assert home.sig == template_sig.template_app_sig(self.HOME, home.blueprint, home.tree_sha)
+        assert home.owner_approval is False
+        assert board.sig != home.sig
+
+    def test_signature_pins_and_ignores_formatting(self, tmp_path, temp_db):
+        from storage.agents import template_sig
+        doc = {"title": "X", "egress": ["api.open-meteo.com"]}
+        assert template_sig.template_app_sig(doc, None, "abc") == \
+            "b08d34904992bac762cdc2366e81dcbea1911fb932be03e8146ad17c6169c1a9"
+        assert template_sig.template_app_sig({"egress": ["api.open-meteo.com"], "title": "X"}, None, "abc") == \
+            template_sig.template_app_sig(doc, None, "abc")
+        assert template_sig.check_sig({"name": "lint", "judge": {"rubric": "r"}}, "s") == \
+            template_sig.sha256_text('{"doc":{"judge":{"rubric":"r"},"name":"lint"},"script_sha256":"s"}')
+        # app.json never enters the tree hash (the importer rewrites it).
+        root = tmp_path / "t"
+        (root / "client").mkdir(parents=True)
+        (root / "client" / "index.html").write_text("<p>x</p>")
+        (root / "app.json").write_text('{"title": "a"}')
+        files = [("app.json", root / "app.json"), ("client/index.html", root / "client/index.html")]
+        first = template_sig.tree_sha(files)
+        (root / "app.json").write_text('{"title": "b"}')
+        assert template_sig.tree_sha(files) == first
+        (root / "client" / "index.html").write_text("<p>y</p>")
+        assert template_sig.tree_sha(files) != first
+
+    def test_owner_approval_predicate(self, temp_db):
+        from storage.agents.template_sig import needs_owner
+        base = {"title": "H", "egress": ["a.example"], "exports": {"methods": {}},
+                "bindings": [{"name": "b", "agent": "x", "app": "y"}], "external": {"links": ["z"]},
+                "files": {"read": ["workspace/x/"]},
+                "actions": [{"id": "s", "type": "platform", "method": "setup.status", "label": "S"},
+                            {"id": "f", "type": "data_feed", "feed": "tasks", "label": "F"},
+                            {"id": "p", "type": "send_prompt", "prompt": "hi", "label": "P"}]}
+        assert needs_owner(base) is False
+        for change in (
+            {"actions": [{"id": "t", "type": "mcp_tool", "mcp": "m", "tool": "t", "label": "T"}]},
+            {"actions": [{"id": "t", "type": "fire_task", "task": "r", "label": "T"}]},
+            {"actions": [{"id": "w", "type": "platform", "method": "files.write", "label": "W"}]},
+            {"handlers": {"on_schedule": {"x": {"cron": "0 7 * * *"}}}},
+            {"steps": {"x": {"run": "x.sh"}}},
+            {"inbound": {"x": {"verify": "stripe", "secret": "S", "handler": "h"}}},
+            {"secrets": [{"name": "S"}]},
+            {"files": {"write": ["workspace/x/"]}},
+        ):
+            assert needs_owner({**base, **change}) is True, change
+
+    def test_user_app_rules_and_mode(self, tmp_path, temp_db):
+        from storage.agents.community_agent_template_store import (
+            TemplateValidationError, load_template_from_dir)
+        for slug, manifest, message in (
+            ("inb", {**self.HOME, "inbound": {"s": {"verify": "stripe", "secret": "S", "handler": "h"}}},
+             "inbound hooks"),
+            ("kn", {**self.HOME, "files": {"read": ["knowledge/docs/"]}}, "never knowledge/"),
+        ):
+            tdir = _write_template(tmp_path, slug=f"tpl-{slug}", user_apps={"home": manifest})
+            with pytest.raises(TemplateValidationError, match=message):
+                load_template_from_dir(tdir)
+        # A per-user app may wake on a trigger since 1.7: its blueprint names
+        # the triggers each copy gets, aimed at the manifest's handlers.
+        waking = {**self.HOME, "handlers": {"on_trigger": ["ping"]}}
+        tdir = _write_template(tmp_path, slug="tpl-wake", user_apps={"home": dict(
+            waking, _blueprint={"triggers": [{"slug": "ping", "handler": "ping", "description": "Ping"}]})})
+        home = load_template_from_dir(tdir).apps[0]
+        assert home.blueprint["triggers"][0]["handler"] == "ping" and home.owner_approval is True
+        for slug, blueprint, message in (
+            ("nolist", {"triggers": {"slug": "ping"}}, "must be a list"),
+            ("badslug", {"triggers": [{"slug": "Ping!", "handler": "ping"}]}, "lowercase letters"),
+            ("long", {"triggers": [{"slug": "p" * 62, "handler": "ping"}]}, "at most 64 characters"),
+            ("twice", {"triggers": [{"slug": "ping", "handler": "ping"}, {"slug": "ping", "handler": "ping"}]},
+             "listed twice"),
+            ("nohandler", {"triggers": [{"slug": "ping", "handler": "pong"}]}, "not one of the manifest's"),
+            ("many", {"triggers": [{"slug": f"t{i}", "handler": "ping"} for i in range(9)]}, "at most 8"),
+        ):
+            tdir = _write_template(tmp_path, slug=f"tpl-{slug}",
+                                   user_apps={"home": dict(waking, _blueprint=blueprint)})
+            with pytest.raises(TemplateValidationError, match=message):
+                load_template_from_dir(tdir)
+        # A per-user app on a Shared-only template, a shared app on a
+        # Personal-only one: the mode rule of the dashboards.
+        tdir = _write_template(tmp_path, slug="shared-only", user_apps={"home": self.HOME},
+                               agent_json_extra={"collaborative": False, "default_scope": "agent"})
+        with pytest.raises(TemplateValidationError, match="not offered"):
+            load_template_from_dir(tdir)
+        tdir = _write_template(tmp_path, slug="personal-only", apps={"board": {"title": "B"}},
+                               agent_json_extra={"collaborative": False, "default_scope": "user"})
+        with pytest.raises(TemplateValidationError, match="not offered"):
+            load_template_from_dir(tdir)
+        # The Personal Assistant's shape: Personal-only with a per-user app.
+        tdir = _write_template(tmp_path, slug="pa-shape", user_apps={"home": self.HOME},
+                               agent_json_extra={"collaborative": False, "default_scope": "user"})
+        assert [a.visibility for a in load_template_from_dir(tdir).apps] == ["user"]
+
+    def test_slug_clash_caps_and_missing_page(self, tmp_path, temp_db):
+        from storage.agents.community_agent_template_store import (
+            TemplateValidationError, load_template_from_dir)
+        tdir = _write_template(tmp_path, slug="clash", apps={"home": {"title": "A"}},
+                               user_apps={"home": self.HOME}, agent_json_extra={"collaborative": True})
+        with pytest.raises(TemplateValidationError, match="used by another app"):
+            load_template_from_dir(tdir)
+        tdir = _write_template(tmp_path, slug="many", agent_json_extra={"collaborative": True},
+                               apps={f"a{i}": {"title": "A"} for i in range(3)},
+                               user_apps={f"u{i}": self.HOME for i in range(2)})
+        with pytest.raises(TemplateValidationError, match="at most 4 apps"):
+            load_template_from_dir(tdir)
+        tdir = _write_template(tmp_path, slug="nopage", user_apps={"home": self.HOME})
+        (tdir / "user-apps/home/client/index.html").unlink()
+        with pytest.raises(TemplateValidationError, match="client/index.html"):
+            load_template_from_dir(tdir)
+        tdir = _write_template(tmp_path, slug="badbp", user_apps={"home": {**self.HOME, "_blueprint": [1]}})
+        with pytest.raises(TemplateValidationError, match="blueprint.json must be an object"):
+            load_template_from_dir(tdir)
+
+    CHECK = {"name": "lint", "description": "Lint the change", "mandatory": True,
+             "applies": ["chats"], "script": {"run": "lint.sh", "timeout": 60},
+             "judge": {"rubric": "Is it tidy?"}, "_script": "#!/bin/sh\nexit 0\n"}
+
+    def test_checks_discovered_validated_and_hashed(self, tmp_path, temp_db):
+        from services.checks import documents
+        from storage.agents.community_agent_template_store import (
+            TemplateValidationError, load_template_from_dir)
+        tdir = _write_template(tmp_path, checks={"lint": self.CHECK,
+                                                 "review": {"name": "review", "judge": {"rubric": "r"}}})
+        template = load_template_from_dir(tdir)
+        by_name = {c.name: c for c in template.checks}
+        assert set(by_name) == {"lint", "review"}
+        lint = by_name["lint"]
+        assert lint.mandatory is True and lint.script_name == "lint.sh"
+        assert lint.script == "#!/bin/sh\nexit 0\n"
+        assert lint.doc["applies"] == ["chats"] and lint.doc["rounds"] == documents.DEFAULT_ROUNDS
+        assert lint.doc_sha256 == documents.sha256_text(documents.canonical_json(lint.doc))
+        assert lint.script_sha256 == documents.sha256_text(b"#!/bin/sh\nexit 0\n")
+        assert by_name["review"].mandatory is False and by_name["review"].script_sha256 == ""
+        # A bad document fails the template with the validator's words; a
+        # name that is not the folder's, a missing script and the cap too.
+        for name, doc, message in (
+            ("bad", {"name": "bad", "rounds": 9, "judge": {"rubric": "r"}}, "rounds"),
+            ("other", {"name": "not-other", "judge": {"rubric": "r"}}, "folder's"),
+            ("noscript", {"name": "noscript", "script": {"run": "x.sh"}}, "not in the check's folder"),
+        ):
+            tdir = _write_template(tmp_path, slug=f"chk-{name}", checks={name: doc})
+            with pytest.raises(TemplateValidationError, match=message):
+                load_template_from_dir(tdir)
+        tdir = _write_template(tmp_path, slug="chk-many",
+                               checks={f"c{i}": {"name": f"c{i}", "judge": {"rubric": "r"}} for i in range(9)})
+        with pytest.raises(TemplateValidationError, match="at most 8 checks"):
+            load_template_from_dir(tdir)
+
+    def test_persisted_record_carries_apps_checks_and_the_baseline(self, tmp_path, temp_db):
+        import hashlib
+        from storage.agents import template_sig
+        from storage.agents.community_agent_template_store import (
+            BASELINE_FORMAT, item_projection, load_template_from_dict, load_template_from_dir,
+            template_to_persistable_dict)
+        tdir = _write_template(
+            tmp_path, agent_json_extra={"collaborative": True},
+            apps={"board": {"title": "Board"}}, user_apps={"home": self.HOME},
+            checks={"lint": self.CHECK},
+            context_files={"notes.md": "See /agents/{agent_slug}/config"},
+            user_setup_md="Welcome to {agent_slug}",
+            dashboards=[{"slug": "brief", "file": "b.html", "visibility": "user"}],
+            dashboard_files={"b.html": "<h1>{agent_slug}</h1>"},
+            tasks=[{"slug": "daily", "description": "D", "scope": "user", "prompt": "do",
+                    "schedule": {"type": "cron", "cron": "0 9 * * *"}, "default_state": "active"}],
+        )
+        template = load_template_from_dir(tdir)
+        data = template_to_persistable_dict(template, agent_slug="my-agent")
+        assert data["baseline_format"] == BASELINE_FORMAT
+        assert [a["slug"] for a in data["apps"]] == ["board"]
+        assert data["user_apps"][0]["slug"] == "home" and data["user_apps"][0]["owner_approval"] is False
+        assert data["user_apps"][0]["sig"] == template.apps[1].sig if template.apps[1].slug == "home" \
+            else data["user_apps"][0]["sig"] == template.apps[0].sig
+        assert "owner_approval" not in data["apps"][0]
+        assert data["checks"] == [{"name": "lint", "doc": template.checks[0].doc,
+                                   "doc_sha256": template.checks[0].doc_sha256,
+                                   "script_sha256": template.checks[0].script_sha256, "mandatory": True,
+                                   "sig": template.checks[0].sig}]
+        assert template.checks[0].sig == template_sig.check_sig(
+            {k: v for k, v in self.CHECK.items() if k != "_script"}, template.checks[0].script_sha256)
+        assert data["consent"] == {"apps": {}, "checks": {}}
+        sha = lambda s: hashlib.sha256(s.encode()).hexdigest()  # noqa: E731
+        base = data["baseline"]
+        assert base["persona"] == sha("# Test Prompt\n")
+        assert base["context"] == {"context/notes.md": sha("See /agents/my-agent/config")}
+        assert base["setup"] is None and base["user_setup"] == sha("Welcome to my-agent")
+        assert base["dashboards"] == {"brief": sha("<h1>my-agent</h1>")}
+        assert base["items"] == {"task:daily": sha(template_sig.canonical(
+            item_projection("task", {"prompt": "do", "schedule_kind": "cron", "cron": "0 9 * * *",
+                                     "interval_seconds": None, "run_at": None, "description": "D"})))}
+        # Without a slug there is no baseline (nothing was substituted yet).
+        assert "baseline" not in template_to_persistable_dict(template)
+        # The record round-trips into items the late-joiner path can use.
+        back = load_template_from_dict(json.loads(json.dumps(data)))
+        apps = {a.slug: a for a in back.apps}
+        assert apps["home"].visibility == "user" and apps["home"].dir is None
+        assert apps["home"].sig == data["user_apps"][0]["sig"]
+        assert apps["board"].visibility == "agent"
+        assert back.checks[0].name == "lint" and back.checks[0].mandatory is True
+        assert back.checks[0].doc_sha256 == template.checks[0].doc_sha256
+        # A record written before this format has none of it and still loads.
+        old = load_template_from_dict({"slug": "x", "version": "1", "tasks": [], "triggers": [],
+                                       "notifications": [], "dashboards": []})
+        assert old.apps == [] and old.checks == []
+
+
+class TestTemplateAppSeeding:
+    """Template apps and checks at install and on attach (COMMUNITY-AGENTS-
+    REGISTRY.md "Consent", "Per-user template apps"): the cold deploy, the
+    installer's consent and what it may not cover, late joiners, the
+    re-check, the member's own app, the opt-out, removal and re-attach."""
+
+    HOME = {"title": "Home", "egress": ["api.open-meteo.com"],
+            "actions": [{"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]}
+    BOARD = {"title": "Board",
+             "actions": [{"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]}
+    LINT = {"name": "lint", "mandatory": True, "judge": {"rubric": "Is it tidy?"}}
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from services.apps import app_supervisor
+        from services.community import template_app_seeder
+        yield
+        template_app_seeder._locks.clear()
+        template_app_seeder._healed.clear()
+        template_app_seeder._failure_told.clear()
+        app_supervisor._instances.clear()
+        from api.apps import apps as apps_api
+        apps_api._deploy_locks.clear()
+
+    def _install(self, tmp_path, *, apps=None, user_apps=None, checks=None, consent=True,
+                 slug="apptpl", target="app-agent", collaborative=True):
+        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_installer import install_from_extracted_template
+        _make_user(ADMIN_SUB, "admin@test.com", "admin")
+        tdir = _write_template(tmp_path, slug=slug, apps=apps, user_apps=user_apps, checks=checks,
+                               agent_json_extra={"collaborative": collaborative})
+        template = load_template_from_dir(tdir)
+        app_consent = {a.slug: a.sig for a in template.apps} if consent else None
+        check_consent = {c.name: c.sig for c in template.checks} if consent else None
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"mcps": []})), \
+                patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+                patch("services.notifications.notification_manager.fire_notification",
+                      new=AsyncMock()):
+            return asyncio.run(install_from_extracted_template(
+                template=template, target_slug=target, installer_user_sub=ADMIN_SUB,
+                installer_role="admin", source_label="test",
+                app_consent=app_consent, check_consent=check_consent,
+                consent_by=ADMIN_SUB if consent else ""))
+
+    @staticmethod
+    def _seed(agent, sub, slug):
+        from services.community import template_app_seeder
+        with patch("services.notifications.notification_manager.fire_notification",
+                   new=AsyncMock()):
+            return asyncio.run(template_app_seeder.seed_user_copy(agent, sub, slug))
+
+    def test_consented_install_seeds_cold_and_approved(self, tmp_path, temp_db):
+        import config as app_config
+        from services.apps import app_supervisor
+        from services.checks import documents
+        from storage import database as db
+        result = self._install(tmp_path, apps={"board": self.BOARD},
+                               user_apps={"home": self.HOME}, checks={"lint": self.LINT})
+        assert result["seeded_apps"]["seeded"] == ["board"]
+        assert result["seeded_apps"]["user"] == ["home"]
+        assert result["seeded_apps"]["pending"] == [] and result["seeded_apps"]["failed"] == []
+        assert result["seeded_checks"] == {"consented": ["lint"], "offered": [], "failed": []}
+        assert result["consent_ignored"] == []
+        shared = db.get_app_by_slug("app-agent", "", "board")
+        admin = db.get_username_by_sub(ADMIN_SUB)
+        own = db.get_app_by_slug("app-agent", admin, "home")
+        for row, ref in ((shared, "apptpl:board"), (own, "apptpl:home")):
+            assert row["kind"] == "folder" and row["deploy_state"] == "idle"
+            assert row["release_path"] and row["pending_release"] == 0
+            assert db.app_actions_approved(row) and row["approved_by"] == ADMIN_SUB
+            assert row["template_ref"] == ref and not row["hidden"]
+        # Cold: no server was started; the seed source is on disk for later
+        # members; the check landed mandatory with its provenance.
+        assert app_supervisor._instances == {}
+        agent_dir = app_config.get_agent_dir("app-agent")
+        assert (agent_dir / "config/community/user-apps/home/client/index.html").is_file()
+        assert (agent_dir / f"users/{admin}/workspace/apps/home/app.json").is_file()
+        checks = {c.name: c for c in documents.load_checks("app-agent")}
+        assert checks["lint"].mandatory is True
+        assert checks["lint"].updated_by == "template:apptpl@1.0.0"
+        assert (agent_dir / "config/checks/lint/check.json").is_file()
+
+    def test_without_consent_everything_waits(self, tmp_path, temp_db):
+        from services.checks import documents
+        from storage import database as db
+        result = self._install(tmp_path, apps={"board": self.BOARD},
+                               user_apps={"home": self.HOME}, checks={"lint": self.LINT},
+                               consent=False)
+        assert result["seeded_apps"]["seeded"] == [] and result["seeded_apps"]["user"] == []
+        assert [p["slug"] for p in result["seeded_apps"]["pending"]] == ["board", "home"]
+        assert all("no consent" in p["reason"] for p in result["seeded_apps"]["pending"])
+        assert result["seeded_checks"]["offered"] == ["lint"]
+        admin = db.get_username_by_sub(ADMIN_SUB)
+        for row in (db.get_app_by_slug("app-agent", "", "board"),
+                    db.get_app_by_slug("app-agent", admin, "home")):
+            assert row["deploy_state"] == "pending" and row["pending_release"] == 1
+            assert not db.app_actions_approved(row) and row["template_ref"]
+        assert documents.load_checks("app-agent")[0].mandatory is False
+
+    def test_a_wrong_signature_is_ignored_not_approved(self, tmp_path, temp_db):
+        from storage import database as db
+        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_installer import install_from_extracted_template
+        _make_user(ADMIN_SUB, "admin@test.com", "admin")
+        tdir = _write_template(tmp_path, slug="sigtpl", user_apps={"home": self.HOME},
+                               agent_json_extra={"collaborative": False, "default_scope": "user"})
+        template = load_template_from_dir(tdir)
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"mcps": []})), \
+                patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+                patch("services.notifications.notification_manager.fire_notification",
+                      new=AsyncMock()):
+            result = asyncio.run(install_from_extracted_template(
+                template=template, target_slug="sig-agent", installer_user_sub=ADMIN_SUB,
+                installer_role="admin", source_label="test",
+                app_consent={"home": "stale"}, consent_by=ADMIN_SUB))
+        assert result["consent_ignored"] == ["app:home"]
+        row = db.get_app_by_slug("sig-agent", db.get_username_by_sub(ADMIN_SUB), "home")
+        assert row["deploy_state"] == "pending" and not db.app_actions_approved(row)
+
+    def test_an_edited_stored_copy_is_not_approved_by_the_consent(self, tmp_path, temp_db):
+        # The per-user seed source lives under /config, which a manager's
+        # session writes: an edit after the install (here an owner-only file
+        # write and a new egress host) must wait on the late joiner's card,
+        # never ride the installer's consent.
+        import json as _json
+        import config as app_config
+        from services.community import template_app_seeder
+        from storage import database as db
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        src = app_config.get_agent_dir("app-agent") / "config/community/user-apps/home/app.json"
+        doc = _json.loads(src.read_text())
+        doc["egress"] = ["api.open-meteo.com", "evil.example.com"]
+        doc["files"] = {"read": ["workspace/"], "write": ["workspace/"]}
+        src.write_text(_json.dumps(doc))
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        status, detail = self._seed("app-agent", "bob-sub", "home")
+        row = db.get_app_by_slug("app-agent", db.get_username_by_sub("bob-sub"), "home")
+        assert status == "pending" and detail == template_app_seeder.COPY_CHANGED
+        assert not db.app_actions_approved(row) and not row.get("approved_by")
+
+    def test_a_copy_that_keeps_failing_is_told_once(self, tmp_path, temp_db):
+        # The heal retries a missing copy every minute: its failure reaches
+        # the member and the managers once, not on every retry.
+        from services.community import template_app_seeder
+        from storage import database as db
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        notes = AsyncMock()
+        with patch("services.apps.app_blueprints.import_folder",
+                   new=AsyncMock(side_effect=RuntimeError("MCP x not available"))), \
+                patch("services.notifications.notification_manager.fire_notification", new=notes):
+            for _ in range(3):
+                status, _detail = asyncio.run(template_app_seeder.seed_user_copy("app-agent", "bob-sub", "home"))
+                assert status == "failed"
+        told = {c.kwargs["target"] for c in notes.call_args_list}
+        assert "bob-sub" in told and notes.call_count == len(told)
+
+    def test_owner_only_copies_wait_for_their_owner(self, tmp_path, temp_db):
+        from storage import database as db
+        manifest = {"title": "Tasks", "actions": [
+            {"id": "go", "label": "Go", "type": "fire_task", "task": "report"}],
+            "_blueprint": {"format": 1, "tasks": [{"slug": "report", "description": "R", "prompt": "do"}]}}
+        result = self._install(tmp_path, user_apps={"home": manifest})
+        # The installer IS the owner of their own copy: approved.
+        assert result["seeded_apps"]["user"] == ["home"]
+        admin = db.get_username_by_sub(ADMIN_SUB)
+        assert db.app_actions_approved(db.get_app_by_slug("app-agent", admin, "home"))
+        # A later member's copy waits on that member's card.
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        assert self._seed("app-agent", "bob-sub", "home") == ("pending", "the owner approves this app on their own card")
+        row = db.get_app_by_slug("app-agent", db.get_username_by_sub("bob-sub"), "home")
+        assert row["deploy_state"] == "pending" and row["template_ref"] == "apptpl:home"
+        dyn = db.find_template_task("app-agent", "home__report", "bob-sub")
+        assert dyn and dyn["scope"] == "user" and dyn["created_by"] == "bob-sub"
+
+    def test_late_joiner_seeded_from_the_persisted_consent(self, tmp_path, temp_db):
+        from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        # The hook only queues (no worker runs in a test); the seed itself:
+        counts = on_user_added_to_agent("app-agent", "bob-sub", "viewer")
+        assert counts["apps"] == 0
+        status, detail = self._seed("app-agent", "bob-sub", "home")
+        assert status == "seeded", detail
+        bob = db.get_username_by_sub("bob-sub")
+        row = db.get_app_by_slug("app-agent", bob, "home")
+        assert row["owner_sub"] == "bob-sub" and db.app_actions_approved(row)
+        assert row["approved_by"] == ADMIN_SUB and row["release_path"]
+        assert self._seed("app-agent", "bob-sub", "home") == ("exists", "already seeded")
+        # The consent is re-checked: a demoted installer approves no new copy.
+        _make_user("carol-sub", "carol@test.com")
+        db.add_user_agent("carol-sub", "app-agent", "viewer", "test")
+        db.upsert_user(ADMIN_SUB, "admin@test.com", "admin", "member")
+        status, detail = self._seed("app-agent", "carol-sub", "home")
+        assert status == "pending" and "may no longer approve" in detail
+        # Bob's copy is untouched by that.
+        assert db.app_actions_approved(db.get_app_by_slug("app-agent", bob, "home"))
+
+    def test_own_app_opt_out_removal_and_reattach(self, tmp_path, temp_db):
+        import config as app_config
+        from services.apps import app_lifecycle
+        from services.community import template_app_seeder
+        from storage import database as db
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        bob = db.get_username_by_sub("bob-sub")
+        agent_dir = app_config.get_agent_dir("app-agent")
+        # A folder of the member's own under that name is never touched.
+        own = agent_dir / f"users/{bob}/workspace/apps/home"
+        own.mkdir(parents=True)
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "kept"
+        own.rmdir()
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "seeded"
+        row = db.get_app_by_slug("app-agent", bob, "home")
+        # A purge keeps the row hidden as the opt-out; no seed recreates it.
+        out = asyncio.run(app_lifecycle.purge(row))
+        assert out["opted_out"] is True
+        parked = db.get_app_by_slug("app-agent", bob, "home")
+        assert parked["hidden"] and parked["template_state"] == "opted_out"
+        assert parked["release_path"] == "" and not own.exists()
+        assert self._seed("app-agent", "bob-sub", "home") == ("exists", "opted out")
+        assert template_app_seeder.heal_missing("app-agent", "bob-sub", bob) == 0
+        # The restore brings it back from the template's copy, approved.
+        with patch("services.notifications.notification_manager.fire_notification",
+                   new=AsyncMock()):
+            res = asyncio.run(template_app_seeder.restore(parked))
+        assert res["status"] == "ok" and res["restored"]
+        back = db.get_app_by_slug("app-agent", bob, "home")
+        assert not back["hidden"] and back["template_state"] == "" and db.app_actions_approved(back)
+        # A membership removal parks it; a re-attach restores it.
+        assert asyncio.run(template_app_seeder.on_user_removed("app-agent", "bob-sub")) == 1
+        gone = db.get_app_by_slug("app-agent", bob, "home")
+        assert gone["hidden"] and gone["template_state"] == "removed"
+        assert self._seed("app-agent", "bob-sub", "home") == ("restored", "back after a membership removal")
+        assert not db.get_app_by_slug("app-agent", bob, "home")["hidden"]
+
+    def test_blueprint_triggers_seed_one_per_copy(self, tmp_path, temp_db):
+        """A template app's blueprint triggers (APPS.md "Blueprints and
+        templates"): one trigger per copy owned by its member (the agent's
+        for a shared app), aimed at the copy, waiting with a pending copy;
+        a slug the member already uses skips the trigger and tells them; a
+        membership removal pauses it and the re-attach resumes it, a pause
+        of the member's own stays; a purge detaches it and the restore
+        re-attaches it."""
+        from api.events.triggers import trigger_webhook_path
+        from services.apps import app_handlers, app_lifecycle
+        from services.community import template_app_seeder
+        from services.scheduler import trigger_manager
+        from storage import database as db
+        from storage.automation import trigger_store
+        wake = {"handlers": {"on_trigger": ["ping"]},
+                "_blueprint": {"triggers": [{"slug": "ping", "handler": "ping", "description": "Ping"}]}}
+        self._install(tmp_path, apps={"board": {**self.BOARD, **wake}}, user_apps={"home": {**self.HOME, **wake}})
+        admin = db.get_username_by_sub(ADMIN_SUB)
+        own = db.get_app_by_slug("app-agent", admin, "home")
+        shared = db.get_app_by_slug("app-agent", "", "board")
+        # The installer's own copy is theirs to approve: live, its trigger
+        # aimed at it; the shared app's trigger is the agent's.
+        assert db.app_actions_approved(own)
+        mine = trigger_store.find_template_trigger("app-agent", "home__ping", ADMIN_SUB)
+        assert mine and mine["scope"] == "user" and mine["created_by"] == ADMIN_SUB
+        assert mine["app_id"] == own["id"] and mine["handler"] == "ping" and mine["enabled"]
+        assert mine["slug"] == "home-ping" and mine["name"] == "Ping"
+        assert mine["community_template"] == "apptpl" and mine["community_template_item_slug"] == "home__ping"
+        assert trigger_webhook_path(mine) == f"/v1/webhooks/user/{admin}/home-ping"
+        theirs = trigger_store.find_template_trigger("app-agent", "board__ping")
+        assert theirs and theirs["scope"] == "agent" and theirs["app_id"] == shared["id"]
+        assert trigger_webhook_path(theirs) == "/v1/webhooks/agent/app-agent/board-ping"
+        # A member's copy carries a handler, so it waits for their approval;
+        # its trigger exists from the seed and a fire waits with it.
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        bob = db.get_username_by_sub("bob-sub")
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "pending"
+        row = db.get_app_by_slug("app-agent", bob, "home")
+        bobs = trigger_store.find_template_trigger("app-agent", "home__ping", "bob-sub")
+        assert bobs and bobs["created_by"] == "bob-sub" and bobs["app_id"] == row["id"]
+        assert app_handlers._precheck(row, {"handler": "ping", "trigger_id": bobs["id"]}) == "unapproved"
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "exists"
+        assert trigger_store.find_template_trigger("app-agent", "home__ping", "bob-sub")["id"] == bobs["id"]
+        # A slug the member already uses: the copy lands, the trigger is
+        # skipped and the member is told which.
+        _make_user("carol-sub", "carol@test.com")
+        db.add_user_agent("carol-sub", "app-agent", "viewer", "test")
+        trigger_manager.register_trigger(name="Mine", scope="user", agent="app-agent", created_by="carol-sub",
+                                         slug="home-ping", notify_enabled=True, notify_title="t", notify_body="b")
+        fired = AsyncMock()
+        with patch("services.notifications.notification_manager.fire_notification", new=fired):
+            assert asyncio.run(template_app_seeder.seed_user_copy("app-agent", "carol-sub", "home"))[0] == "pending"
+        assert trigger_store.find_template_trigger("app-agent", "home__ping", "carol-sub") is None
+        titles = [c.args[0] for c in fired.call_args_list]
+        assert any("a trigger was not created" in t for t in titles), titles
+        # Removal pauses the seeded trigger with the mark; a pause of the
+        # member's own is not touched; the re-attach resumes the marked one.
+        assert asyncio.run(template_app_seeder.on_user_removed("app-agent", "bob-sub")) == 1
+        paused = trigger_store.get_trigger(bobs["id"])
+        assert not paused["enabled"] and paused["last_error"] == template_app_seeder.REMOVED_MARK
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "restored"
+        back = trigger_store.get_trigger(bobs["id"])
+        assert back["enabled"] and back["last_error"] == ""
+        trigger_store.set_trigger_enabled(bobs["id"], False)
+        asyncio.run(template_app_seeder.on_user_removed("app-agent", "bob-sub"))
+        assert self._seed("app-agent", "bob-sub", "home")[0] == "restored"
+        assert not trigger_store.get_trigger(bobs["id"])["enabled"]
+        # A purge detaches the trigger; the restore re-attaches and enables it.
+        out = asyncio.run(app_lifecycle.purge(db.get_app_by_slug("app-agent", bob, "home")))
+        assert out["opted_out"] is True
+        gone = trigger_store.get_trigger(bobs["id"])
+        assert gone["app_id"] is None and not gone["enabled"]
+        with patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()):
+            res = asyncio.run(template_app_seeder.restore(db.get_app_by_slug("app-agent", bob, "home")))
+        assert res["triggers"] == {"ping": "reattached"}, res
+        again = trigger_store.get_trigger(bobs["id"])
+        assert again["app_id"] == db.get_app_by_slug("app-agent", bob, "home")["id"] and again["enabled"]
+        assert again["last_error"] == ""
+
+    def test_a_mode_without_personal_apps_seeds_nothing(self, tmp_path, temp_db):
+        from storage import database as db
+        from storage.pg import get_conn
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        from storage.agents import agent_store
+        with get_conn() as conn:
+            conn.execute("UPDATE agents SET collaborative=FALSE, default_scope='agent' WHERE slug=%s",
+                         ("app-agent",))
+            conn.commit()
+        agent_store._invalidate_cache()
+        assert self._seed("app-agent", "bob-sub", "home") == ("skipped", "the agent's mode offers no personal apps")
+
+    def test_the_wizard_consents_to_the_default_template(self, tmp_path, temp_db):
+        from services.community.community_agent_installer import install_from_catalog
+        from storage import database as db
+        _make_user(ADMIN_SUB, "admin@test.com", "admin")
+        tdir = _write_template(tmp_path, slug="personal-assistant", user_apps={"home": self.HOME},
+                               agent_json_extra={"collaborative": False, "default_scope": "user"})
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"mcps": [], "agents": []})), \
+                patch("services.community.community_agents_catalog.fetch_and_extract_template",
+                      new=AsyncMock(return_value=tdir)), \
+                patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+                patch("services.notifications.notification_manager.fire_notification",
+                      new=AsyncMock()), \
+                patch("shutil.rmtree"):
+            result = asyncio.run(install_from_catalog(
+                template_slug="personal-assistant", target_slug="pa", installer_user_sub=ADMIN_SUB,
+                installer_role="admin", consent_all=True))
+        assert result["seeded_apps"]["user"] == ["home"]
+        row = db.get_app_by_slug("pa", db.get_username_by_sub(ADMIN_SUB), "home")
+        assert db.app_actions_approved(row) and row["approved_by"] == ADMIN_SUB
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +1048,9 @@ class TestSeeding:
         assert tasks[0]["scope"] == "agent"
         # default_state=paused → enabled=False
         assert tasks[0]["enabled"] is False
+        # An agent-scope task follows the platform clock, never the
+        # installer's zone (a literal would stop following the setting).
+        assert tasks[0]["user_tz"] is None
 
     def test_seeds_user_scope_task_for_installer(self, tmp_path, temp_db):
         from storage import database as db
@@ -447,6 +1079,74 @@ class TestSeeding:
         assert tasks[0]["scope"] == "user"
         assert tasks[0]["created_by"] == ADMIN_SUB
         assert tasks[0]["enabled"] is True
+        # No dashboard has reported the installer's zone: platform clock.
+        assert tasks[0]["user_tz"] is None
+
+    def test_seeds_user_scope_task_in_the_installers_zone(self, tmp_path, temp_db):
+        """A user-scope task is the installer's own: it takes the zone their
+        dashboard reported, like a task they would create themselves."""
+        from core.session import session_state
+        from storage import database as db
+
+        tdir = _write_template(tmp_path, tasks=[{
+            "slug": "user-task", "description": "Per-user",
+            "scope": "user", "prompt": "echo",
+            "schedule": {"type": "cron", "cron": "0 10 * * *"},
+            "default_state": "active",
+            "auto_create_for_new_users": True,
+        }])
+        session_state.set_user_tz(ADMIN_SUB, "Europe/Athens")
+        try:
+            with patch(
+                "services.community.community_agents_catalog.fetch_registry",
+                new=AsyncMock(return_value={"mcps": []}),
+            ), patch(
+                "services.mcp.mcp_registry.get_all_manifests",
+                return_value={},
+            ), patch(
+                "services.notifications.notification_manager.fire_notification",
+                new=AsyncMock(),
+            ):
+                _install_admin(tdir)
+        finally:
+            session_state._user_tz.pop(ADMIN_SUB, None)
+
+        tasks = db.list_dynamic_tasks(agent="demo-agent")
+        assert len(tasks) == 1 and tasks[0]["scope"] == "user"
+        assert tasks[0]["user_tz"] == "Europe/Athens"
+
+    def test_seeds_agent_scope_trigger_task_on_the_platform_clock(self, tmp_path, temp_db):
+        """The paired task of an agent-scope trigger is seeded with the
+        installer's sub as created_by — the zone rule keys on the item's
+        scope, so it still lands NULL."""
+        from core.session import session_state
+        from storage import database as db
+
+        tdir = _write_template(tmp_path, triggers=[{
+            "slug": "on-push", "description": "On push",
+            "scope": "agent", "prompt": "echo trig",
+            "default_state": "active",
+        }])
+        session_state.set_user_tz(ADMIN_SUB, "Europe/Athens")
+        try:
+            with patch(
+                "services.community.community_agents_catalog.fetch_registry",
+                new=AsyncMock(return_value={"mcps": []}),
+            ), patch(
+                "services.mcp.mcp_registry.get_all_manifests",
+                return_value={},
+            ), patch(
+                "services.notifications.notification_manager.fire_notification",
+                new=AsyncMock(),
+            ):
+                _install_admin(tdir)
+        finally:
+            session_state._user_tz.pop(ADMIN_SUB, None)
+
+        task = db.find_template_task("demo-agent", "on-push__task")
+        assert task and task["task_type"] == "trigger"
+        assert task["created_by"] == ADMIN_SUB and task["scope"] == "agent"
+        assert task["user_tz"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +1316,7 @@ class TestUserJoinHook:
         db.add_user_agent("user-bob", agent_slug, "viewer", "system")
 
         counts = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
-        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "user_setup": 0}
+        assert counts == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "apps": 0, "user_setup": 0}
 
         # bob owns: the user-task itself + the trigger's paired task
         # (trigger model spawns a dynamic_tasks row with
@@ -642,8 +1342,8 @@ class TestUserJoinHook:
         second = on_user_added_to_agent(agent_slug, "user-bob", "viewer")
         # First call seeds, second call sees the unique-index conflict and
         # returns 0 across the board.
-        assert first == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "user_setup": 0}
-        assert second == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
+        assert first == {"tasks": 1, "triggers": 1, "notifications": 1, "dashboards": 0, "apps": 0, "user_setup": 0}
+        assert second == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "apps": 0, "user_setup": 0}
 
     def test_hook_respects_role_filter(self, tmp_path, temp_db):
         """Item with ``roles: ["manager"]`` is NOT seeded for a viewer."""
@@ -673,7 +1373,7 @@ class TestUserJoinHook:
         _make_user("user-viewer", "viewer@example.com")
         db.add_user_agent("user-viewer", "role-agent", "viewer", "system")
         counts = on_user_added_to_agent("role-agent", "user-viewer", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "apps": 0, "user_setup": 0}
 
         _make_user("user-mgr", "mgr@example.com")
         db.add_user_agent("user-mgr", "role-agent", "manager", "system")
@@ -688,7 +1388,7 @@ class TestUserJoinHook:
 
         agent_store.create_agent("native-agent", "Native Agent")
         counts = on_user_added_to_agent("native-agent", "user-anon", "viewer")
-        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "user_setup": 0}
+        assert counts == {"tasks": 0, "triggers": 0, "notifications": 0, "dashboards": 0, "apps": 0, "user_setup": 0}
 
     def test_hook_skips_auto_create_for_new_users_false(self, tmp_path, temp_db):
         """Items where ``auto_create_for_new_users=False`` are NOT seeded for
@@ -935,7 +1635,7 @@ class TestSkillPackages:
 # ---------------------------------------------------------------------------
 
 class TestDashboardSeeding:
-    """Template-shipped mini-app dashboards: shared pins at install, per-user
+    """Template-shipped app dashboards: shared pins at install, per-user
     pins for the installer + late joiners, idempotent by the pinned_apps
     (agent, username, slug) upsert key. HTML-only v1 (actions '[]')."""
 
@@ -1050,3 +1750,49 @@ class TestDashboardSeeding:
         )
         with _pytest.raises(TemplateValidationError, match="missing file"):
             load_template_from_dir(tdir2)
+
+
+def test_the_installer_names_the_agent_as_the_dialog_said(tmp_path, temp_db):
+    """The install dialog's display name is the agent's; empty means the
+    template's own."""
+    from storage.agents import agent_store
+    from storage.agents.community_agent_template_store import load_template_from_dir
+    from services.community.community_agent_installer import install_from_extracted_template
+    _make_user(ADMIN_SUB, "admin@test.com", "admin")
+    template = load_template_from_dir(_write_template(tmp_path, slug="named-tpl"))
+    with patch("services.community.community_agents_catalog.fetch_registry",
+               new=AsyncMock(return_value={"mcps": []})), \
+            patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+            patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()):
+        for target, name, expect in (("named-a", "  Mine  ", "Mine"), ("named-b", "", "Named Tpl")):
+            asyncio.run(install_from_extracted_template(
+                template=template, target_slug=target, installer_user_sub=ADMIN_SUB,
+                installer_role="admin", source_label="test", display_name=name))
+            assert agent_store.get_agent(target)["display_name"] == expect
+
+
+class TestInstallerManagerRow:
+    """The installer's manager row is written atomically under the person's
+    row lock (``add_user_agent``), never as a read of every row followed by
+    a rewrite of the whole set."""
+
+    def test_manager_installer_gets_an_atomic_row(self, tmp_path, temp_db, monkeypatch):
+        from storage import database as db
+        _make_user(MANAGER_SUB, "manager@example.com")
+        seen: list[tuple] = []
+        real_add = db.add_user_agent
+
+        def _add(*args, **kwargs):
+            seen.append(args)
+            return real_add(*args, **kwargs)
+
+        def _never(*args, **kwargs):
+            raise AssertionError("set_user_agents must not run for the installer row")
+
+        monkeypatch.setattr(db, "add_user_agent", _add)
+        monkeypatch.setattr(db, "set_user_agents", _never)
+        tdir = _write_template(tmp_path, slug="mgr-template")
+        _install_admin(tdir, target_slug="mgr-agent", installer_sub=MANAGER_SUB,
+                       installer_role="manager")
+        assert seen == [(MANAGER_SUB, "mgr-agent", "manager", MANAGER_SUB)]
+        assert db.get_user_agent_roles(MANAGER_SUB)["mgr-agent"] == "manager"

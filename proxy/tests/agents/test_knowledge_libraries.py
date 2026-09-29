@@ -424,6 +424,81 @@ class TestProjector:
         assert library_projector._sources_touched_by(SRC) == [SRC]     # promoted
         assert library_projector._sources_touched_by(OTHER) == []
 
+    # ── Symlinks are never followed by the copy, the hash or the capture ──
+
+    def test_single_file_propagate_refuses_symlink(self, kl_env, quiet_fanout, tmp_path):
+        """The verifier's case, inverted: ``lib/leak.md`` is a link to an
+        out-of-tree secret; the targeted projection leaves the mirror
+        without it."""
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        secret = tmp_path / "config.env"
+        secret.write_text("JWT_SECRET=proxy-host-secret\n")
+        k = config.get_agent_dir(SRC) / "knowledge"
+        (k / "lib").mkdir()
+        (k / "lib" / "leak.md").symlink_to(secret)
+        _run(library_projector.propagate_source_write(SRC, "lib/leak.md"))
+        for consumer in (CON_A, CON_B):
+            leak = _mirror(consumer) / "lib" / "leak.md"
+            assert not leak.exists() or b"JWT_SECRET" not in leak.read_bytes()
+        # The sweep skips it as well.
+        _run(library_projector.reconcile_source(SRC))
+        for consumer in (CON_A, CON_B):
+            leak = _mirror(consumer) / "lib" / "leak.md"
+            assert not leak.exists() or b"JWT_SECRET" not in leak.read_bytes()
+
+    def test_rw_mirror_symlink_is_never_adopted(self, kl_env, quiet_fanout):
+        """A link planted in an RW mirror at another agent's file is not
+        copied into the source (nor into the other mirrors)."""
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        other = config.get_agent_dir(OTHER) / "workspace" / "private.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("OTHER AGENT PRIVATE")
+        mir_file = _mirror(CON_B) / "index.md"
+        mir_file.unlink()
+        mir_file.symlink_to(other)
+        st = other.stat()
+        os.utime(other, (st.st_atime, st.st_mtime + 120))
+        _run(library_projector.reconcile_source(SRC))
+        src_file = config.get_agent_dir(SRC) / "knowledge" / "index.md"
+        assert src_file.read_text() == "index v1"
+        assert (_mirror(CON_A) / "index.md").read_text() == "index v1"
+        # The explicit single-file adoption refuses it too.
+        mir_file2 = _mirror(CON_B) / "docs" / "brand.md"
+        mir_file2.unlink()
+        mir_file2.symlink_to(other)
+        _run(library_projector.propagate_mirror_write(CON_B, SRC, "docs/brand.md"))
+        assert (config.get_agent_dir(SRC) / "knowledge" / "docs" / "brand.md").read_text() == "brand v1"
+
+    def test_reconcile_capture_never_follows(self, kl_env, quiet_fanout, tmp_path):
+        """A read-only mirror file swapped for a link is healed from the
+        source and nothing of the link's target reaches the recover-bin."""
+        from services.knowledge import library_projector
+        _run(library_projector.reconcile_source(SRC))
+        secret = tmp_path / "config.env"
+        secret.write_text("JWT_SECRET=proxy-host-secret\n")
+        mir_file = _mirror(CON_A) / "index.md"
+        mir_file.unlink()
+        mir_file.symlink_to(secret)
+        st = secret.stat()
+        os.utime(secret, (st.st_atime, st.st_mtime + 120))
+        _run(library_projector.reconcile_source(SRC))
+        assert not mir_file.is_symlink() and mir_file.read_text() == "index v1"
+        for e in recover_bin_store.list_for(CON_A, ADMIN_SUB, True, True, True):
+            data = recover_bin_store.read_bytes(recover_bin_store.get(e["entry_id"]))
+            assert data is None or b"JWT_SECRET" not in data
+
+    def test_mirror_mode_is_the_umask_default(self, kl_env, quiet_fanout):
+        from services.knowledge import library_projector
+        src = config.get_agent_dir(SRC) / "knowledge" / "index.md"
+        src.chmod(0o444)
+        _run(library_projector.reconcile_source(SRC))
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = (_mirror(CON_B) / "index.md").stat().st_mode & 0o777
+        assert mode == (0o666 & ~umask)
+
     def test_detach_and_teardown(self, kl_env, quiet_fanout):
         from services.knowledge import library_projector
         _run(library_projector.reconcile_source(SRC))

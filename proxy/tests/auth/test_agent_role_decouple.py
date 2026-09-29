@@ -64,10 +64,12 @@ def test_member_agent_role_resolves_in_session_context():
         sub=_MEMBER_SUB, email="friend@t.com", name="Friend", role="member",
         agent_roles=db.get_user_agent_roles(_MEMBER_SUB),
     )
-    assert member.get_agent_role("helper") == "manager"
+    assert member.effective_role("helper") == "manager"
+    assert member.acting_role("helper") == "manager"
     assert member.can_manage_agent("helper")
-    # Unassigned agents still default to viewer.
-    assert member.get_agent_role("other") == "viewer"
+    # An unassigned agent: no row (effective_role), a viewer when admitted (acting_role).
+    assert member.effective_role("other") == ""
+    assert member.acting_role("other") == "viewer"
 
 
 def test_member_still_cannot_create_agents():
@@ -86,3 +88,20 @@ def test_admin_only_agent_still_blocked_for_member():
 def test_invalid_agent_role_rejected():
     resp = _assign(["helper"], {"helper": "owner"})
     assert resp.status_code == 400
+
+
+def test_creating_an_agent_keeps_a_concurrent_role_change(monkeypatch):
+    # The creator becomes manager of the new agent with one additive insert:
+    # a role list read before an admin's concurrent removal is never written
+    # back over it.
+    creator = "local:creator"
+    db.upsert_user(creator, "creator@t.com", "Creator", "creator")
+    agent_store.create_agent("removed-meanwhile", "Removed")
+    db.set_user_agents(creator, ["helper"], "local:admin", agent_roles={"helper": "editor"})
+    stale = {"helper": "editor", "removed-meanwhile": "manager"}
+    monkeypatch.setattr(db, "get_user_agent_roles", lambda sub: dict(stale))
+    _login_as("creator", sub=creator)
+    resp = client.post("/v1/agents", json={"display_name": "Fresh", "slug": "fresh-agent"})
+    assert resp.status_code == 200, resp.text
+    monkeypatch.undo()
+    assert db.get_user_agent_roles(creator) == {"helper": "editor", "fresh-agent": "manager"}

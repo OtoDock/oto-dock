@@ -6,8 +6,11 @@ import StatusBadge from '../../components/StatusBadge'
 import { formatRelativeTime } from '../../lib/format'
 import MarkdownContent from '../../components/chat/MarkdownContent'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
+import { isTaskChatId, runIdOfChat } from '../../lib/session/kind'
+import { MEETING_STATUS } from '../../lib/status/meeting'
 
-const STATUSES = ['', 'active', 'concluded', 'failed', 'paused', 'concluding', 'pending']
+// The filter's options: every stored meeting status (the route accepts any).
+const STATUSES = ['', ...Object.values(MEETING_STATUS)]
 
 export default function AgentMeetings() {
   const { name } = useParams<{ name: string }>()
@@ -43,8 +46,8 @@ export default function AgentMeetings() {
 
   const handleNavigate = (m: Meeting) => {
     if (!m.parent_chat_id) return
-    if (m.parent_chat_id.startsWith('task-')) {
-      const runId = m.parent_chat_id.replace('task-', '')
+    if (isTaskChatId(m.parent_chat_id)) {
+      const runId = runIdOfChat(m.parent_chat_id)
       navigate(`/runs/${runId}`)
     } else {
       navigate(`/chat/${m.moderator}/${m.parent_chat_id}`)
@@ -160,7 +163,7 @@ export default function AgentMeetings() {
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                         </svg>
-                        {m.parent_chat_id.startsWith('task-') ? 'View task' : 'View chat'}
+                        {isTaskChatId(m.parent_chat_id) ? 'View task' : 'View chat'}
                       </button>
                     )}
                   </div>

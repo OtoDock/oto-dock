@@ -28,6 +28,25 @@ export interface Task {
   override_execution_path: string | null
   effective_model: string
   effective_execution_path: string
+  // Where the effective model came from ('pinned' | 'agent default' |
+  // 'layer default'), its capability tier (1 = frontier … 4 = fast, null =
+  // untiered) and the warnings for a pin that no longer resolves. Optional:
+  // absent on an older proxy.
+  effective_model_source?: string
+  effective_model_tier?: number | null
+  tier_label?: string
+  pin_warnings?: string[]
+  // A definition's kind — the words of TASK_KIND in lib/kinds/task.ts
+  // (scheduled, one_time, trigger, continuation, app, delegate); absent on
+  // an older proxy.
+  task_type?: string
+  // The zone the cron and a naive run_at are read in: the row's own
+  // (user_tz, null = the platform's) and the resolved one (effective_tz,
+  // server-computed); the schedule in words with that zone named when it
+  // carries a clock time (schedule_text). Optional: absent on an older proxy.
+  user_tz?: string | null
+  effective_tz?: string
+  schedule_text?: string
   can_run: boolean
   can_delete: boolean
   can_pause: boolean
@@ -88,12 +107,25 @@ export const useSchedules = () =>
     refetchInterval: 60_000,
   })
 
+// A refusal's `detail` is a sentence for the person (the task and
+// continuation caps answer 429 with one); anything else is shown as sent.
+export async function readError(res: Response): Promise<string> {
+  const text = await res.text()
+  try {
+    const d = JSON.parse(text)
+    if (typeof d?.detail === 'string') return d.detail
+  } catch {
+    // not JSON
+  }
+  return text || res.statusText
+}
+
 export const useRunTaskNow = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (taskId: string): Promise<{ run_id: string }> => {
       const res = await apiFetch(`/v1/tasks/${taskId}/run`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) throw new Error(await readError(res))
       return res.json()
     },
     onSuccess: () => {
@@ -108,7 +140,7 @@ export const useDeleteTask = () => {
   return useMutation({
     mutationFn: async (taskId: string): Promise<void> => {
       const res = await apiFetch(`/v1/tasks/${taskId}/delete`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) throw new Error(await readError(res))
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] })
@@ -122,7 +154,7 @@ export const usePauseTask = () => {
   return useMutation({
     mutationFn: async (taskId: string): Promise<void> => {
       const res = await apiFetch(`/v1/tasks/${taskId}/pause`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) throw new Error(await readError(res))
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] })
@@ -136,7 +168,7 @@ export const useResumeTask = () => {
   return useMutation({
     mutationFn: async (taskId: string): Promise<void> => {
       const res = await apiFetch(`/v1/tasks/${taskId}/resume`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) throw new Error(await readError(res))
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] })

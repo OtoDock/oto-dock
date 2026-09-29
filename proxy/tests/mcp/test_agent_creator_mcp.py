@@ -18,10 +18,11 @@ _MCP_DIR = CUSTOM_MCPS / "agent-creator-mcp"
 
 def _load_server(env: dict[str, str]):
     saved = {k: os.environ.get(k) for k in (
-        "OTO_AGENT_NAME", "OTO_PLATFORM_ROLE", "PROXY_URL", "PROXY_API_KEY",
+        "OTO_AGENT_NAME", "OTO_PLATFORM_ROLE", "OTO_CAN_CREATE_AGENTS", "PROXY_URL", "PROXY_API_KEY",
     )}
     try:
         os.environ.pop("OTO_PLATFORM_ROLE", None)
+        os.environ.pop("OTO_CAN_CREATE_AGENTS", None)
         os.environ.update(env)
         return load_mcp_server(_MCP_DIR)
     finally:
@@ -36,7 +37,7 @@ class TestPermissionMatrix:
     def test_admin_gets_all_tools(self):
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant",
-            "OTO_PLATFORM_ROLE": "admin",
+            "OTO_PLATFORM_ROLE": "admin", "OTO_CAN_CREATE_AGENTS": "true",
         })
         assert mod.ENABLED_TOOLS == {
             "list_building_blocks", "validate_agent_template", "create_agent",
@@ -45,7 +46,7 @@ class TestPermissionMatrix:
     def test_creator_gets_all_tools(self):
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant",
-            "OTO_PLATFORM_ROLE": "creator",
+            "OTO_PLATFORM_ROLE": "creator", "OTO_CAN_CREATE_AGENTS": "true",
         })
         assert "create_agent" in mod.ENABLED_TOOLS
 
@@ -54,7 +55,7 @@ class TestPermissionMatrix:
         surface that 403s on every call."""
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant",
-            "OTO_PLATFORM_ROLE": "member",
+            "OTO_PLATFORM_ROLE": "member", "OTO_CAN_CREATE_AGENTS": "false",
         })
         assert mod.ENABLED_TOOLS == set()
 
@@ -88,7 +89,7 @@ class TestManifestSanity:
 
     def test_schema_handler_coherence(self):
         mod = _load_server({
-            "OTO_AGENT_NAME": "x", "OTO_PLATFORM_ROLE": "admin",
+            "OTO_AGENT_NAME": "x", "OTO_PLATFORM_ROLE": "admin", "OTO_CAN_CREATE_AGENTS": "true",
         })
         assert set(mod._TOOL_SCHEMAS.keys()) == set(mod._TOOL_HANDLERS.keys())
         assert set(mod._TOOL_SCHEMAS.keys()) == mod._ALL_TOOLS

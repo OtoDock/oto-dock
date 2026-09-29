@@ -27,6 +27,7 @@ middleware does not wrap; they are gated inline by their own key check.
 import re
 
 import config
+from auth.request_path import has_traversal
 
 # (pattern, allowed-methods) — anchored, method-scoped.
 _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
@@ -37,13 +38,6 @@ _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"^/v1/phone/usage/turn-classifier$"), frozenset({"POST"})),
     (re.compile(r"^/v1/phone/calls/report$"), frozenset({"POST"})),  # call-log rows at teardown
 ]
-
-
-def _has_traversal(path: str) -> bool:
-    low = path.lower()
-    if "%2e" in low or "%2f" in low or "%5c" in low or "\\" in path:
-        return True
-    return any(seg in (".", "..") for seg in path.split("/"))
 
 
 def extract_master_key(request) -> str | None:
@@ -70,7 +64,7 @@ def extract_master_key(request) -> str | None:
 def is_service_endpoint_allowed(method: str, path: str) -> bool:
     """True if the master key may call ``method path``."""
     base = path.split("?", 1)[0]
-    if _has_traversal(base):
+    if has_traversal(base):
         return False
     for pattern, methods in _ALLOWLIST:
         if pattern.match(base) and method.upper() in methods:

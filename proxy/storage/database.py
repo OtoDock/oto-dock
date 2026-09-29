@@ -7,7 +7,7 @@ re-exported here so callers keep importing from ``storage.database`` unchanged:
 - :mod:`storage.db_settings` — platform settings
 - :mod:`storage.identity.db_users`    — users and user-agent membership
 - :mod:`storage.chat.db_chats`    — chats, messages, media tokens, plans
-- :mod:`storage.db_apps`     — pinned mini-apps registry
+- :mod:`storage.db_apps`     — pinned apps registry
 - :mod:`storage.files.db_file_pins` — Dock file pins
 - :mod:`storage.billing.db_usage`    — usage records and usage limits
 - :mod:`storage.chat.db_meetings` — meetings and meeting turns

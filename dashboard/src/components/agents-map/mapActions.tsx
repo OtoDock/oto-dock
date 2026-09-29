@@ -7,7 +7,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import type { useSetDefaultAgent, useUpdateAgent } from '../../api/agents'
 import type { User } from '../../api/auth'
 import type { Department, useAdminAddUserAgent } from '../../api/departments'
-import { canManageAgent } from '../../lib/permissions'
+import { canManageAgent, isAdmin } from '../../lib/permissions'
 import type { MapNode } from './layout'
 import type { MenuState, PopupState } from './mapConstants'
 import { MenuIcon, type MapMenuAction } from './MapOverlays'
@@ -99,7 +99,7 @@ export function buildAgentActions({
           })
         }
       }
-    } else if (user?.role === 'admin') {
+    } else if (user && isAdmin(user)) {
       agentActions.push({
         key: 'add-me',
         label: 'Add me to this agent',

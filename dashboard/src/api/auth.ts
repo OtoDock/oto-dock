@@ -1,4 +1,6 @@
 // Authentication API — local + OIDC
+import type { AgentRole, PlatformRole } from '../lib/permissions'
+import { callNative, hasNativeBridge, openNativeBrowser } from '../lib/nativeBridge'
 
 export interface User {
   sub: string
@@ -7,10 +9,10 @@ export interface User {
   /** Filesystem-safe slug backing `users/<username>/` in agent workspaces. */
   username?: string
   display_name?: string
-  role: 'admin' | 'creator' | 'member'
+  role: PlatformRole
   agents: string[]
   default_agent?: string
-  agent_roles: Record<string, 'manager' | 'editor' | 'viewer'>
+  agent_roles: Record<string, AgentRole>
   platform_configured?: boolean
   // Whether this user has connected their OWN AI engine (personal Claude Code
   // or Codex subscription). Drives the per-user "connect an AI engine" banner —
@@ -99,6 +101,15 @@ export async function fetchAuthConfig(): Promise<AuthConfig> {
 
 // --- OIDC flow (existing, refactored) ---
 
+/** The app's sign-in leg: persist the WebView's cookies (the start fetch has
+ * just set the state-binding cookie the callback needs), then let the app
+ * open the system browser. A declined confirm opens nothing: never fall back
+ * to a WebView navigation, which would skip the confirm. */
+async function openSignInBrowser(url: string): Promise<void> {
+  callNative('flushCookies')
+  await openNativeBrowser(url, 'auth')
+}
+
 export async function startOidcLogin(mobile?: boolean): Promise<void> {
   const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
   const url = isNative || mobile ? '/auth/oidc-url?mobile=true' : '/auth/oidc-url'
@@ -106,12 +117,9 @@ export async function startOidcLogin(mobile?: boolean): Promise<void> {
   if (!res.ok) throw new Error('OIDC not configured')
   const data = await res.json()
 
-  if (isNative) {
-    const android = (window as any).Android
-    if (android?.openAuthBrowser) {
-      android.openAuthBrowser(data.url)
-      return
-    }
+  if (isNative && hasNativeBridge()) {
+    await openSignInBrowser(data.url)
+    return
   }
   window.location.href = data.url
 }
@@ -126,33 +134,70 @@ export async function startLogin(): Promise<void> {
 
   if (data.url) {
     // Bypass mode — direct OIDC redirect
-    if (isNative) {
-      const android = (window as any).Android
-      if (android?.openAuthBrowser) {
-        android.openAuthBrowser(data.url)
-        return
-      }
+    if (isNative && hasNativeBridge()) {
+      await openSignInBrowser(data.url)
+      return
     }
     window.location.href = data.url
   }
   // If login_page: true — frontend handles showing the login page
 }
 
-export async function handleCallback(code: string, state: string): Promise<User> {
+/** What the OIDC callback did: a login (the session is set), or a confirm
+ * (SHARING.md "The confirm": no session changes hands; the one-shot
+ * token goes back to the page that started it). */
+export type CallbackResult =
+  | { kind: 'login'; user: User }
+  | { kind: 'confirm'; token: string; return_to: string }
+
+export async function handleCallback(code: string, state: string): Promise<CallbackResult> {
   const res = await fetch('/auth/callback', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
     body: JSON.stringify({ code, state }),
   })
-  if (res.status === 403) throw new Error('ACCESS_DENIED')
+  if (res.status === 403) {
+    // A login: not in any group. A confirm: the provider's answer was not
+    // this account (or not a new login, where one is required); the reason
+    // rides along for the popover.
+    const d = await res.json().catch(() => ({}))
+    const err = new Error('ACCESS_DENIED') as Error & { detail?: string }
+    err.detail = typeof d.detail === 'string' ? d.detail : undefined
+    throw err
+  }
   if (res.status === 402) throw new Error('USER_LIMIT_REACHED')
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))
     throw new Error(detail.detail || 'Callback failed')
   }
   const data = await res.json()
-  return data.user
+  if (data.purpose === 'confirm') {
+    return { kind: 'confirm', token: String(data.confirm_token || ''), return_to: String(data.return_to || '/') }
+  }
+  return { kind: 'login', user: data.user }
+}
+
+/** The identity-provider confirm (SHARING.md): a login round trip to the
+ * provider that comes back to `returnTo` as a confirm token. Leaves the
+ * page: on the web the whole tab goes to the provider, on Android the
+ * system browser opens and the deep link brings the app back. */
+export async function startOidcConfirm(returnTo: string): Promise<void> {
+  const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
+  const res = await apiFetch(
+    `/auth/confirm/oidc-url?return_to=${encodeURIComponent(returnTo)}${isNative ? '&mobile=true' : ''}`,
+  )
+  if (res.status === 404) throw new Error('This platform needs an update to confirm with your identity provider.')
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}))
+    throw new Error(typeof d.detail === 'string' ? d.detail : 'Could not start the confirmation')
+  }
+  const { url } = await res.json()
+  if (isNative && hasNativeBridge()) {
+    await openSignInBrowser(url)
+    return
+  }
+  window.location.assign(url)
 }
 
 // --- Local login ---
@@ -290,8 +335,28 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
     credentials: 'same-origin',
     headers,
   })
-  if (res.status === 401) {
+  if (res.status === 401 && !(await sessionStillValid())) {
     window.location.href = '/'
   }
+  // A forced password change or 2FA enrolment holds the session to its
+  // screen: a call refused for it sends the tab there.
+  const gate = res.status === 403 ? res.headers.get('X-Auth-Gate') : null
+  if (gate) {
+    const target = gate === 'must_change_password' ? '/change-password' : '/setup-2fa'
+    if (window.location.pathname !== target) window.location.href = target
+  }
   return res
+}
+
+// A 401 is not always a lost session: a route that confirms the person at
+// the keyboard (a share link's password, a passkey confirm) answers 401 for a
+// wrong password or an expired confirmation, and the caller shows why. Only a
+// session /auth/me no longer knows sends the tab to the sign-in page.
+async function sessionStillValid(): Promise<boolean> {
+  try {
+    const me = await fetch('/auth/me', { credentials: 'same-origin' })
+    return me.ok
+  } catch {
+    return false
+  }
 }

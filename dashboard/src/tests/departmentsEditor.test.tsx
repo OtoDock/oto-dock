@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 // Data layer + auth are fully mocked — the editor is a pure view over the
-// hooks, so the tests pin gating (role / can_edit), the structural-save
-// contract (kept ids preserved, '' for new levels) and the inline confirm
-// step for member-carrying level removals.
+// hooks, so the tests pin gating (role / can_edit), the wiring pickers (the
+// mode and reach radio cards, their defaults and autosave payloads), the
+// structural-save contract (kept ids preserved, '' for new levels) and the
+// inline confirm step for member-carrying level removals.
 const h = vi.hoisted(() => ({
   role: 'member' as string,
   departments: [] as any[],
@@ -34,7 +35,7 @@ function makeDept(overrides: Record<string, any> = {}) {
     id: 'd1',
     name: 'Engineering',
     created_by_sub: 'u1',
-    auto_delegation: true,
+    mode: 'both',
     reach: 'adjacent',
     position_hint: '',
     levels: [
@@ -60,6 +61,8 @@ function renderEditor() {
   )
 }
 
+const group = (name: string) => within(screen.getByRole('radiogroup', { name }))
+
 describe('DepartmentsEditor', () => {
   beforeEach(() => {
     h.role = 'member'
@@ -76,7 +79,7 @@ describe('DepartmentsEditor', () => {
 
     // Collapsed pill by default: summary line only, body hidden.
     expect(screen.getByText('Engineering')).toBeInTheDocument()
-    expect(screen.getByText('2 agents · 3 levels · adjacent reach')).toBeInTheDocument()
+    expect(screen.getByText('2 agents · 3 levels · all directions · one level up or down')).toBeInTheDocument()
     expect(screen.queryByText('Alice')).toBeNull()
     fireEvent.click(screen.getByText('Engineering'))
     // Level names appear in the (read-only) levels list; Head/Senior also
@@ -104,7 +107,7 @@ describe('DepartmentsEditor', () => {
     expect(screen.getByText('New department')).toBeInTheDocument()
   })
 
-  it('submits the create form with name, levels, reach and auto-delegation', () => {
+  it('submits the create form with name, levels, mode and reach', () => {
     h.role = 'creator'
     renderEditor()
     // The form hides behind the New department button (round 17).
@@ -113,11 +116,18 @@ describe('DepartmentsEditor', () => {
     fireEvent.change(screen.getByLabelText('New department name'), {
       target: { value: 'Ops' },
     })
+    // A new department delegates down only, one level away, by default.
+    const modes = group('New department delegation mode')
+    expect(modes.getByLabelText('Down only')).toBeChecked()
+    for (const other of ['Off', 'Down and across', 'All directions']) {
+      expect(modes.getByLabelText(other)).not.toBeChecked()
+    }
+    expect(group('New department reach').getByLabelText('One level up or down')).toBeChecked()
     fireEvent.click(screen.getByText('Create department'))
     expect(h.createMutate).toHaveBeenCalledWith(
       {
         name: 'Ops',
-        auto_delegation: true,
+        mode: 'down',
         reach: 'adjacent',
         levels: ['Head', 'Senior', 'Junior'],
       },
@@ -125,17 +135,58 @@ describe('DepartmentsEditor', () => {
     )
   })
 
-  it('can_edit=false renders read-only: no delete, disabled controls, no level editing', () => {
+  it('picking a mode and a reach on the create form changes the payload', () => {
+    h.role = 'creator'
+    renderEditor()
+    fireEvent.click(screen.getByText('New department'))
+    fireEvent.change(screen.getByLabelText('New department name'), {
+      target: { value: 'Ops' },
+    })
+    fireEvent.click(group('New department delegation mode').getByLabelText('Down and across'))
+    fireEvent.click(group('New department reach').getByLabelText('Whole department'))
+    expect(
+      screen.getByText('Each level delegates to the level below it, and agents on the same level delegate to each other.'),
+    ).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Create department'))
+    expect(h.createMutate.mock.calls[0][0]).toMatchObject({ mode: 'down_across', reach: 'subtree' })
+  })
+
+  it('the card shows the wiring and autosaves a mode or reach pick', () => {
+    h.departments = [makeDept({ mode: 'down' })]
+    renderEditor()
+    expect(screen.getByText('2 agents · 3 levels · down only · one level up or down')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Engineering'))
+    const modes = group('delegation mode')
+    expect(modes.getByLabelText('Down only')).toBeChecked()
+    fireEvent.click(modes.getByLabelText('All directions'))
+    expect(h.updateMutate).toHaveBeenCalledWith({ id: 'd1', mode: 'both' })
+    expect(modes.getByLabelText('All directions')).toBeChecked()
+    fireEvent.click(group('reach').getByLabelText('Whole department'))
+    expect(h.updateMutate).toHaveBeenCalledWith({ id: 'd1', reach: 'subtree' })
+  })
+
+  it('a department with delegation off says so and omits the reach from its summary', () => {
+    h.departments = [makeDept({ mode: 'off', reach: 'subtree' })]
+    renderEditor()
+    expect(screen.getByText('2 agents · 3 levels · delegation off')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Engineering'))
+    expect(group('delegation mode').getByLabelText('Off')).toBeChecked()
+    // the reach is kept and shown: it applies once a mode wires something
+    expect(group('reach').getByLabelText('Whole department')).toBeChecked()
+  })
+
+  it('can_edit=false renders read-only: no delete, disabled pickers, no level editing', () => {
     h.departments = [makeDept({ can_edit: false })]
     renderEditor()
 
-    // Collapsed by default — the body (and its switch) only exists expanded.
-    expect(screen.queryByRole('switch')).toBeNull()
+    // Collapsed by default — the body (and its pickers) only exists expanded.
+    expect(screen.queryByRole('radiogroup')).toBeNull()
     fireEvent.click(screen.getByText('Engineering'))
     expect(screen.getByText('View only')).toBeInTheDocument()
     expect(screen.queryByText('Delete department')).toBeNull()
-    expect(screen.getByRole('switch')).toBeDisabled()
-    expect(screen.getByLabelText('Delegation reach')).toBeDisabled()
+    for (const radio of screen.getAllByRole('radio')) {
+      expect(radio).toBeDisabled()
+    }
     expect(screen.queryByText('Save levels')).toBeNull()
     expect(screen.queryByText('+ Add level')).toBeNull()
     // Name is plain text, not an editable input.

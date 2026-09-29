@@ -5,32 +5,37 @@
  *
  * - useOverlayPanels: the workspace overlay state (useWorkspaceState, the
  *   viewer's manage/edit rights, the ?recover=1 deep link), the pinned
- *   mini-apps overlay (appsOpen / appsActive, toggleApps, useAppsAutoOpen),
+ *   apps overlay (appsOpen / appsActive, toggleApps, useAppsAutoOpen),
  *   the agent-home live-sessions strip, the render-time ?wake=1 arm of
  *   keepAppsOnChatEntryRef (the phone-mode keep-open, created by
  *   useAgentChatStream), the Dock (projects) overlay state + the chat-pins
  *   invalidation on file_updated, and the Ctrl/Cmd+E workspace shortcut —
  *   the shortcut must stay mounted while the workspace is CLOSED (it opens
  *   it), so it lives here and not in ChatWorkspaceSlot.
- * - useAppSendPrompt: handleAppSendPrompt, the mini-app send_prompt router.
+ * - useAppSendPrompt: handleAppSendPrompt, the app send_prompt router.
  *   Runs after handleSelectChat, which its front-page path calls.
+ * - usePendingAppAction: delivers the action a full-screen app page handed
+ *   over in router state, once the page's socket is open.
  */
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { RefObject } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { ptyPasteB64, withInteractiveTime } from '../../../hooks/useInteractiveChat'
-import type { useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, type useSearchParams } from 'react-router-dom'
 import type { useAuth } from '../../../contexts/AuthContext'
 import { useWorkspaceState } from '../../../hooks/useWorkspaceState'
-import { canManageAgent, canEditAgent } from '../../../lib/permissions'
+import { canManageAgent, canWriteWorkspace } from '../../../lib/permissions'
 import { useActiveChats } from '../../../hooks/useActiveChats'
 import { useAppsAutoOpen } from '../../../hooks/useAppsAutoOpen'
 import { useApps, useChatPins, type PinnedApp } from '../../../api/apps'
 import type { useChats, useTaskChats } from '../../../api/chats'
 import { apiFetch } from '../../../api/auth'
 import { onFileUpdate } from '../../../lib/fileUpdates'
+import { onOpenApp } from '../../../lib/appLive'
+import { setPageFocus } from '../../../lib/focus'
+import { planOpenApp } from '../../../lib/openApp'
 import { buildAppActionText, substituteArgs } from '../../../lib/artifactInteraction'
 import { pushEscHandler } from '../../../lib/escStack'
 import { onIdle as speechIdle } from '../../../audio/speechActivity'
@@ -68,16 +73,33 @@ export function useOverlayPanels({
   const workspace = useWorkspaceState(agentName ?? '', lastAssistantMessageId)
   const canManageThisAgent =
     !!user && !!agentName && canManageAgent(user, agentName)
-  const canEditThisAgent =
-    !!user && !!agentName && canEditAgent(user, agentName)
+  const canWriteThisWorkspace =
+    !!user && !!agentName && canWriteWorkspace(user, agentName)
 
-  // ---- Pinned mini-apps overlay ----
+  // ---- Pinned apps overlay ----
   // Permanent agent-level surface (standing dashboards), toggled from the
   // composer button right of the workspace toggle. Slot precedence:
   // workspace > apps > projects.
   const [appsOpen, setAppsOpen] = useState(false)
   const { data: pinnedApps } = useApps(agentName ?? '')
   const appsActive = appsOpen && !workspace.state.open && !!agentName
+  // The active tab lives here, not in the overlay, so an agent's open
+  // request can select an app before the overlay is mounted; the overlay
+  // reports taps through selectApp, which keeps `?app=` in step.
+  const [appsActiveId, setAppsActiveId] = useState<string | null>(() => searchParams.get('app'))
+  const selectApp = useCallback((id: string) => {
+    setAppsActiveId(id)
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('app', id)
+      return next
+    }, { replace: true })
+  }, [setSearchParams])
+  // Viewer focus, the page-level part: the chat on screen, or home. Mounted
+  // app frames layer on top of it (lib/focus.ts).
+  useEffect(() => {
+    setPageFocus(chatId ? { surface: 'chat', chat_id: chatId } : { surface: 'home' })
+  }, [chatId])
   // Agent HOME live-sessions strip (operator call 2026-07-11): on the front
   // page (no chat open) the cross-agent "Active now" rows show permanently
   // on top — dashboards/landing render below. Hook is enabled only there;
@@ -148,6 +170,30 @@ export function useOverlayPanels({
     }
   }), [queryClient])
 
+  // An agent asked to show one of its apps (open_app, APPS.md "Live
+  // apps"): handled here when it belongs to this page, else left to the
+  // shell's toast. A standing app opens in the overlay on its tab; a chat
+  // pin opens the Dock when the viewer is in that chat. The list refetches
+  // at once when the id is unknown (the agent may have pinned it this turn).
+  useEffect(() => onOpenApp((f) => {
+    const visible = typeof document === 'undefined' || document.visibilityState === 'visible'
+    const plan = planOpenApp(f, { agentName, chatId: chatId ?? undefined, visible })
+    if (plan === 'ignore') return
+    f.handled = true
+    if (plan === 'dock') {
+      setAppsOpen(false)
+      queryClient.invalidateQueries({ queryKey: ['chat-pins'] })
+      setProjectsOpen(true)
+      return
+    }
+    if (workspace.state.open) workspace.closeWorkspace()
+    setAppsOpen(true)
+    selectApp(f.app_id)
+    if (!pinnedApps?.some((a) => a.id === f.app_id)) {
+      queryClient.invalidateQueries({ queryKey: ['apps', agentName] })
+    }
+  }), [agentName, chatId, workspace, pinnedApps, queryClient, selectApp])
+
   // Ctrl/Cmd+E toggles the workspace overlay.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -177,8 +223,8 @@ export function useOverlayPanels({
   }, [searchParams, setSearchParams, workspace])
 
   return {
-    workspace, canManageThisAgent, canEditThisAgent, recoverRequested, setRecoverRequested,
-    appsActive, setAppsOpen, showHomeActive, toggleApps,
+    workspace, canManageThisAgent, canWriteThisWorkspace, recoverRequested, setRecoverRequested,
+    appsActive, setAppsOpen, showHomeActive, toggleApps, appsActiveId, selectApp,
     setProjectsOpen, isProjectChat, chatPins, dockAvailable, projectsActive,
   }
 }
@@ -204,7 +250,7 @@ export function useAppSendPrompt({
   keepAppsOnChatEntryRef: RefObject<boolean>
   handleSelectChat: (selectedChatId: string, searchQuery?: string) => void
 }) {
-  // Mini-app send_prompt router — the host page decides the delivery rail:
+  // App send_prompt router — the host page decides the delivery rail:
   // interactive chat → typed into the terminal (composer rail, same as the
   // artifact PiP backchannel; the manifest approval gates it client-side
   // since PTY input is the user's own channel); open headless chat → the
@@ -277,4 +323,28 @@ export function useAppSendPrompt({
   )
 
   return { handleAppSendPrompt }
+}
+
+/** A send_prompt button pressed on the full-screen app page lands on the
+ *  agent's home with the action in router state: deliver it exactly as the
+ *  same button pressed in the overlay would (a new chat), once. Only on an
+ *  open socket: the delivery sends on the socket its render saw, and the
+ *  page's first render is still connecting (the action was refused and the
+ *  new chat stayed empty). */
+export function usePendingAppAction({ chatId, agentName, connected, handleAppSendPrompt }: {
+  chatId: string | null
+  agentName: string | undefined
+  connected: boolean
+  handleAppSendPrompt: ReturnType<typeof useAppSendPrompt>['handleAppSendPrompt']
+}) {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const doneRef = useRef(false)
+  useEffect(() => {
+    const pending = (location.state as { pendingAppAction?: { app: PinnedApp; action: { id: string; label: string; prompt: string }; args: unknown } } | null)?.pendingAppAction
+    if (!pending || chatId || !agentName || !connected || doneRef.current) return
+    doneRef.current = true
+    navigate(location.pathname + location.search, { replace: true, state: null })
+    void handleAppSendPrompt(pending.app, pending.action, pending.args)
+  }, [location.state, location.pathname, location.search, chatId, agentName, connected, handleAppSendPrompt, navigate])
 }

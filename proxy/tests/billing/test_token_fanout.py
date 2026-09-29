@@ -1,42 +1,68 @@
 """Rotation fan-out mechanics (``services/engines/token_fanout``).
 
-Covers the target registry, the two credential-file writers (the single
-source for each file's on-disk shape), per-directory dedupe across a scope's
-sessions, and the remote-push grouping — the parts the pool's rotation
-chokepoint builds on.
+Covers the target registry, the one credential-file writer (the file is
+named by the ENGINE's declaration, ``LayerCapabilities.auth.credential_file``),
+per-directory dedupe across a scope's sessions, and the remote-push grouping
+— the parts the pool's rotation chokepoint builds on. The payload a fan-out
+delivers is the engine's full file content; this module never shapes it.
 """
 
 import json
 import stat
 
+import pytest
+
 from services.engines import token_fanout as tf
+
+CLAUDE_FILE = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "", "expiresAt": 5,
+                                 "scopes": [], "subscriptionType": "", "rateLimitTier": ""}}
+CODEX_FILE = {"auth_mode": "chatgpt", "tokens": {"access_token": "t", "refresh_token": ""}}
 
 
 def _clean():
     tf._targets.clear()
 
 
-class TestWriters:
-    def test_claude_credentials_file_shape_and_mode(self, tmp_path):
-        blob = {"accessToken": "at", "refreshToken": "", "expiresAt": 5,
-                "scopes": [], "subscriptionType": "", "rateLimitTier": ""}
-        tf.write_claude_credentials_file(tmp_path, blob)
+class TestWriter:
+    def test_writes_the_payload_verbatim_with_mode_0600(self, tmp_path):
+        tf.write_credential_file(tmp_path, ".credentials.json", CLAUDE_FILE)
         path = tmp_path / ".credentials.json"
-        assert json.loads(path.read_text()) == {"claudeAiOauth": blob}
+        assert json.loads(path.read_text()) == CLAUDE_FILE
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
-    def test_codex_auth_file_shape_and_mode(self, tmp_path):
-        auth = {"auth_mode": "chatgpt", "tokens": {"access_token": "t",
-                                                   "refresh_token": ""}}
-        tf.write_codex_auth_file(tmp_path, auth)
-        path = tmp_path / "auth.json"
-        assert json.loads(path.read_text()) == auth
+    def test_the_writer_never_follows_a_planted_link(self, tmp_path):
+        victim = tmp_path / "victim.env"
+        victim.write_text("KEEP=1\n")
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / ".credentials.json").symlink_to(victim)
+        tf.write_credential_file(cfg, ".credentials.json", CLAUDE_FILE)
+        assert victim.read_text() == "KEEP=1\n"
+        path = cfg / ".credentials.json"
+        assert not path.is_symlink() and json.loads(path.read_text()) == CLAUDE_FILE
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
-    def test_writers_create_missing_dirs(self, tmp_path):
-        target = tmp_path / "users" / "alice" / ".claude"
-        tf.write_claude_credentials_file(target, {"accessToken": "a"})
-        assert (target / ".credentials.json").exists()
+    def test_writer_creates_missing_dirs(self, tmp_path):
+        target = tmp_path / "users" / "alice" / ".codex"
+        tf.write_credential_file(target, "auth.json", CODEX_FILE)
+        assert json.loads((target / "auth.json").read_text()) == CODEX_FILE
+
+
+class TestCredentialFileSpec:
+    def test_each_cli_engine_declares_its_frozen_row(self):
+        claude = tf.credential_file_spec("claude-code-cli")
+        assert (claude.wire_kind, claude.dirname, claude.filename) == (
+            "claude", ".claude", ".credentials.json")
+        codex = tf.credential_file_spec("codex-cli")
+        assert (codex.wire_kind, codex.dirname, codex.filename) == (
+            "codex", ".codex", "auth.json")
+
+    def test_an_env_delivered_or_unknown_engine_fails_closed(self):
+        with pytest.raises(ValueError):
+            tf.credential_file_spec("direct-llm")
+        from core.session.session_manager import UnknownExecutionPath
+        with pytest.raises(UnknownExecutionPath):
+            tf.credential_file_spec("acme-cli")
 
 
 class TestRegistry:
@@ -44,7 +70,7 @@ class TestRegistry:
         _clean()
 
     def test_register_and_unregister(self):
-        t = tf.CredentialFileTarget(kind="claude", host_dir="/x")
+        t = tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x")
         tf.register_session_target("s1", t)
         assert tf.session_target("s1") == t
         tf.unregister_session_target("s1")
@@ -60,56 +86,53 @@ class TestFanOut:
 
     def test_local_write_dedupes_per_scope_dir(self, tmp_path):
         # Two sessions share one scope dir — one write, both callbacks.
-        shared = tf.CredentialFileTarget(kind="claude", host_dir=str(tmp_path))
+        shared = tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path))
         tf.register_session_target("s1", shared)
         tf.register_session_target("s2", shared)
         written = []
-        tf.fan_out(["s1", "s2"], claude_blob={"accessToken": "new"},
-                   codex_auth=None, on_written=written.append)
+        tf.fan_out(["s1", "s2"], layer="claude-code-cli", payload=CLAUDE_FILE,
+                   on_written=written.append)
         assert sorted(written) == ["s1", "s2"]
-        blob = json.loads((tmp_path / ".credentials.json").read_text())
-        assert blob["claudeAiOauth"]["accessToken"] == "new"
+        assert json.loads((tmp_path / ".credentials.json").read_text()) == CLAUDE_FILE
 
-    def test_kind_selects_the_right_file(self, tmp_path):
-        claude_dir = tmp_path / "c"
+    def test_the_engine_names_the_file(self, tmp_path):
         codex_dir = tmp_path / "x"
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="claude", host_dir=str(claude_dir)))
-        tf.register_session_target(
-            "s2", tf.CredentialFileTarget(kind="codex", host_dir=str(codex_dir)))
+            "s2", tf.CredentialFileTarget(layer="codex-cli", host_dir=str(codex_dir)))
         written = []
-        tf.fan_out(["s1", "s2"], claude_blob={"accessToken": "a"},
-                   codex_auth={"tokens": {"access_token": "b"}},
-                   on_written=written.append)
-        assert (claude_dir / ".credentials.json").exists()
-        assert (codex_dir / "auth.json").exists()
-        assert sorted(written) == ["s1", "s2"]
+        tf.fan_out(["s2"], layer="codex-cli", payload=CODEX_FILE, on_written=written.append)
+        assert json.loads((codex_dir / "auth.json").read_text()) == CODEX_FILE
+        assert not (codex_dir / ".credentials.json").exists()
+        assert written == ["s2"]
 
     def test_unregistered_sessions_are_skipped(self, tmp_path):
         written = []
-        tf.fan_out(["ghost"], claude_blob={"accessToken": "a"},
-                   codex_auth=None, on_written=written.append)
+        tf.fan_out(["ghost"], layer="claude-code-cli", payload=CLAUDE_FILE,
+                   on_written=written.append)
         assert written == []
 
-    def test_missing_blob_for_kind_skips_without_callback(self, tmp_path):
+    def test_a_target_of_another_engine_is_skipped_not_written(self, tmp_path):
+        # Impossible by construction (a session bound to a Claude row is a
+        # Claude session) — and a wrong-format write would be the worse failure.
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="codex", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="codex-cli", host_dir=str(tmp_path)))
         written = []
-        tf.fan_out(["s1"], claude_blob={"accessToken": "a"}, codex_auth=None,
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append)
         assert written == []
         assert not (tmp_path / "auth.json").exists()
+        assert not (tmp_path / ".credentials.json").exists()
 
     def test_remote_targets_skipped_without_loop(self):
         # No captured event loop (unit-test context) → remote push is skipped
         # with a log line, never raises, never calls back.
         tf.register_session_target("s1", tf.CredentialFileTarget(
-            kind="claude", machine_id="m1", agent_name="agent",
+            layer="claude-code-cli", machine_id="m1", agent_name="agent",
             dir_relative="users/u/.claude",
         ))
         written = []
         assert tf._loop is None
-        tf.fan_out(["s1"], claude_blob={"accessToken": "a"}, codex_auth=None,
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append)
         assert written == []
 
@@ -118,7 +141,7 @@ class TestFanOut:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         shared = tf.CredentialFileTarget(
-            kind="claude", machine_id="m1", agent_name="agent",
+            layer="claude-code-cli", machine_id="m1", agent_name="agent",
             dir_relative="users/u/.claude",
         )
         tf.register_session_target("s1", shared)
@@ -141,11 +164,39 @@ class TestFanOut:
             asyncio.run(run())
         assert sorted(written) == ["s1", "s2"]
         msg = cm.send_command.call_args.args[1]
+        # The frame a released satellite clamps on — byte for byte.
         assert msg["type"] == "credentials_update"
         assert msg["agent_slug"] == "agent"
         assert msg["dir_relative"] == "users/u/.claude"
         assert msg["kind"] == "claude"
         assert msg["content"] == {"claudeAiOauth": {"accessToken": "a"}}
+
+    def test_remote_push_carries_the_engines_wire_kind(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        tf.register_session_target("s1", tf.CredentialFileTarget(
+            layer="codex-cli", machine_id="m1", agent_name="agent",
+            dir_relative="workspace/.codex",
+        ))
+        cm = MagicMock()
+        cm.is_connected.return_value = True
+        cm.send_command = AsyncMock()
+        loop = asyncio.new_event_loop()
+        try:
+            tf._loop = loop
+            with patch("core.remote.satellite_connection.get_connection_manager",
+                       return_value=cm):
+                tf.fan_out(["s1"], layer="codex-cli", payload=CODEX_FILE,
+                           on_written=lambda sid: None)
+                loop.run_until_complete(asyncio.sleep(0))
+                loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            tf._loop = None
+            loop.close()
+        msg = cm.send_command.call_args.args[1]
+        assert msg["kind"] == "codex" and msg["dir_relative"] == "workspace/.codex"
+        assert msg["content"] == CODEX_FILE
 
     def test_remote_push_failure_skips_callbacks(self):
         import asyncio
@@ -186,11 +237,11 @@ class TestExpectedSubGuard:
     def test_drops_sessions_bound_elsewhere(self, tmp_path):
         from services.engines import subscription_pool as pool
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="claude", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)))
         with pool._session_maps_lock:
             pool._session_subscriptions["s1"] = "new-sub"  # already re-homed
         written = []
-        tf.fan_out(["s1"], claude_blob={"accessToken": "stale"}, codex_auth=None,
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append, expected_sub_id="old-sub")
         assert written == []
         assert not (tmp_path / ".credentials.json").exists()
@@ -198,21 +249,20 @@ class TestExpectedSubGuard:
     def test_passes_sessions_still_bound(self, tmp_path):
         from services.engines import subscription_pool as pool
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="claude", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)))
         with pool._session_maps_lock:
             pool._session_subscriptions["s1"] = "old-sub"
         written = []
-        tf.fan_out(["s1"], claude_blob={"accessToken": "fresh"}, codex_auth=None,
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append, expected_sub_id="old-sub")
         assert written == ["s1"]
-        blob = json.loads((tmp_path / ".credentials.json").read_text())
-        assert blob["claudeAiOauth"]["accessToken"] == "fresh"
+        assert json.loads((tmp_path / ".credentials.json").read_text()) == CLAUDE_FILE
 
     def test_no_guard_keeps_legacy_behavior(self, tmp_path):
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="claude", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)))
         written = []
-        tf.fan_out(["s1"], claude_blob={"accessToken": "x"}, codex_auth=None,
+        tf.fan_out(["s1"], layer="claude-code-cli", payload=CLAUDE_FILE,
                    on_written=written.append)
         assert written == ["s1"]
 

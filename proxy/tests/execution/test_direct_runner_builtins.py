@@ -215,6 +215,68 @@ async def test_write_denied_by_the_user_becomes_result_text(direct_session):
 
 
 @pytest.mark.asyncio
+async def test_mcp_tools_go_through_the_one_permission_authority(direct_session):
+    """The direct loop's MCP branch is ``session_events.pre_tool`` →
+    ``decide_tool_permission`` (HOOKS.md row 11): a dashboard chat in default
+    mode prompts on the session's queue for a standard-tier tool, the
+    session allow-memory covers the second call, and the record of the turn
+    lists both calls."""
+    from core.session import session_events
+    from core.session.session_state import _record_session_use
+    session, _ = direct_session
+    # The fixture reuses one session id across tests; run_direct_stream is
+    # one turn and the layer's send_message is what ends it — start clean.
+    session_events.cleanup_session(session.session_id)
+    _record_session_use(session.session_id, client_type="dashboard", agent=AGENT)
+    set_session_mode(session.session_id, "default")
+    _ADAPTER.scripts = [
+        _tool_turn([("m1", "mcp__stub-server__ping", {"op": "list"})]),
+        _tool_turn([("m2", "mcp__stub-server__ping", {"op": "list"})]),
+        _final_text("done"),
+    ]
+    prompts = []
+
+    async def _approve_once():
+        queue = get_permission_queue(session.session_id)
+        req = await asyncio.wait_for(queue.get(), timeout=5)
+        prompts.append(req)
+        assert req["event_type"] == "permission_prompt"
+        assert req["tool_name"] == "mcp__stub-server__ping"
+        resolve_permission(req["request_id"], True)
+
+    approver = asyncio.create_task(_approve_once())
+    await _collect(session)
+    await approver
+    # One prompt for two calls: the allow-memory remembered the first Allow.
+    assert len(prompts) == 1
+    assert [tc["id"] for tc in session.mcp_manager.calls] == ["m1", "m2"]
+    # The turn's record: both calls, from the direct loop, neither an error.
+    recs = session_events.tool_records(session.session_id)
+    assert [(r.tool_name, r.source, r.is_error) for r in recs] == [
+        ("mcp__stub-server__ping", "direct", False)] * 2
+    session_events.cleanup_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_a_denied_mcp_call_carries_the_authority_reason(direct_session, monkeypatch):
+    """Unattended (client_type task) + a critical-tier tool: the authority
+    denies and informs; the reason is the tool result text."""
+    from core.session.session_state import _record_session_use
+    from services.mcp import mcp_permissions
+    session, _ = direct_session
+    _record_session_use(session.session_id, client_type="task", agent=AGENT)
+    set_session_mode(session.session_id, "auto")
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda server, tool: "critical")
+    _ADAPTER.scripts = [
+        _tool_turn([("c1", "mcp__stub-server__wipe", {})]),
+        _final_text("ok"),
+    ]
+    await _collect(session)
+    assert session.mcp_manager.calls == []
+    assert "unattended" in _tool_results(session)["c1"]
+
+
+@pytest.mark.asyncio
 async def test_deferred_tool_called_by_name_is_loaded_on_first_use(direct_session, monkeypatch):
     """A weaker model skips tool_search and calls a catalog entry outright:
     the runner loads the definition and executes the call."""

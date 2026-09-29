@@ -24,6 +24,10 @@ import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Literal
+from auth import roles
+from core.placement import PlacementCapabilities
+from core import host_os
+from core import layout
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +74,11 @@ class PathResolution:
     sandbox_relative: str = ""       # Sandbox-virtual form for logs /
                                      # display. Empty when not
                                      # sandbox-translatable.
+    protected: bool = False          # The denial is the universal one:
+                                     # OAuth credentials or the agent's
+                                     # own CLI config / hook scripts —
+                                     # holds for every role, an admin on
+                                     # an admin agent included.
 
 
 @dataclass(frozen=True)
@@ -91,17 +100,14 @@ class PathPolicyContext:
     Built fresh per request by the caller (hook handler or
     ``check_tool_access``). Pure data, no DB lookups inside the resolver.
     """
-    target_kind: str             # "local" | "admin_remote" | "user_remote"
-    machine_id: str = ""         # empty for local sessions
-    home_dir: str = ""           # OS home on satellite (forward-slash)
-    os_user: str = ""            # OS user on satellite
-    user_dirs: dict = field(default_factory=dict)  # {desktop, downloads, ...}
-    allow_full_fs: bool = False
-    target_agents_dir: str = ""  # satellite's agent tree root (forward-slash)
-    target_os: str = "linux"     # "linux" | "darwin" | "windows"
+    # The session's resolved placement (``core.placement``): the kind, the
+    # machine id, the OS home / user / well-known folders, ``allow_full_fs``,
+    # the agent-tree root and the reported OS (``os_family`` is what the
+    # path normalisation keys on). The local placement for local sessions.
+    placement: PlacementCapabilities = field(default_factory=PlacementCapabilities)
     agent_slug: str = ""
     user_sub: str = ""
-    role: str = "manager"
+    role: str = roles.MANAGER
     # otodock-CLI: extra absolute satellite-host roots admitted for THIS
     # session only (the arbitrary cwd the user ran `otodock` in), realpath-
     # normalized at build time. Checked after the protected-path / .env denials
@@ -121,12 +127,11 @@ class PathPolicyContext:
     # (an RBAC-exempt satellite root) and the PTY spawn cwd — reusing it
     # would widen remote file access and break satellite session spawn.
     relative_anchor: str = ""
-    # Claude-CLI runtime-tree carve inputs: the satellite's reported
-    # ``<tempdir>/claude-<uid>`` root + THIS session's CLI session id.
-    # Both non-empty → the session's own runtime subtree
+    # Claude-CLI runtime-tree carve input: THIS session's CLI session id (the
+    # placement carries the satellite's reported ``<tempdir>/claude-<uid>``
+    # root). Both non-empty → the session's own runtime subtree
     # (``<root>/<cwd-slug>/<session-id>/...``) is admitted read+write even
     # in home-only mode. Either empty → carve disabled (fail closed).
-    claude_runtime_root: str = ""
     cli_session_id: str = ""
 
 
@@ -160,7 +165,7 @@ _WINDOWS_DRIVE_RE = re.compile(r"^([a-zA-Z]):[\\/]")
 # Sandbox-virtual prefix segments. The trailing-slash variants are
 # treated identically (handled in the classifier).
 _SANDBOX_VIRTUAL_SEGMENTS = (
-    "users", "workspace", "knowledge", "config", "screenshots",
+    *layout.HEADS, "screenshots",
     "caller",   # an external caller's tree (local sessions only — never synced)
 )
 
@@ -200,7 +205,7 @@ def is_path_string(value: str) -> bool:
     return True
 
 
-def normalize_path(raw: str, target_os: str = "linux") -> str:
+def normalize_path(raw: str) -> str:
     """Normalize a path string for comparison/resolution.
 
     Performs:
@@ -311,7 +316,8 @@ def _normalize_for_compare(value: str, target_os: str) -> str:
     only loosens admission for a case-twin path — harmless.
     """
     s = value.replace("\\", "/")
-    if target_os in ("windows", "darwin"):
+    row = host_os.of(target_os)
+    if row is not None and row.case_insensitive:
         return s.lower()
     return s
 
@@ -328,6 +334,48 @@ def _is_under(child: str, parent: str, target_os: str) -> bool:
     return c == p or c.startswith(p + "/")
 
 
+# A Windows 8.3 short name: a base ending in ``~`` and digits, with an
+# optional extension (``PROGRA~1``, ``OTO-DO~1``, ``REPORT~2.TXT``).
+_SHORT_NAME_RE = re.compile(r"~[0-9]+(\.[^.]*)?$")
+
+
+def _host_alias(normalized: str, where: PlacementCapabilities) -> str:
+    """Why a satellite-host path is refused before any root compare, or "":
+    the host resolves it to another spelling than its text. A leading
+    ``//`` on every family (on Windows a UNC or device path, which can name
+    any drive or the loopback share; on POSIX a second spelling of ``/``).
+    On Windows also a component with the 8.3 short-name shape, one ending in
+    a dot or a space (Win32 drops both) and a colon past the drive (a stream
+    name). The machine's own reported runtime root is its own spelling (the
+    temp folder often carries the profile's short name): only what follows
+    it is judged."""
+    if normalized.startswith("//"):
+        return ("network, device and double-slash paths are not available to "
+                "sessions; state the plain absolute path")
+    if where.os_family != host_os.WINDOWS:
+        return ""
+    root = (where.claude_runtime_root or "").replace("\\", "/").rstrip("/")
+    if root and _is_under(normalized, root, host_os.WINDOWS):
+        rest = normalized[len(root):]
+    elif _WINDOWS_DRIVE_RE.match(normalized):
+        rest = normalized[2:]
+    else:
+        rest = normalized
+    # The path is normalized: no dot segment is left to skip.
+    for seg in rest.split("/"):
+        if not seg:
+            continue
+        if seg[-1] in ". ":
+            return (f"the path component {seg!r} ends in a dot or a space, which "
+                    "Windows drops; state the name without it")
+        if ":" in seg:
+            return f"the path component {seg!r} names a stream; state the plain path"
+        if _SHORT_NAME_RE.search(seg):
+            return (f"the path component {seg!r} looks like a Windows short (8.3) "
+                    "name; state the full name")
+    return ""
+
+
 def _is_session_runtime_path(normalized: str, ctx: PathPolicyContext) -> bool:
     """``normalized`` lies inside THIS session's Claude-CLI runtime tree.
 
@@ -341,8 +389,8 @@ def _is_session_runtime_path(normalized: str, ctx: PathPolicyContext) -> bool:
     """
     from services import path_roles  # lazy — mirrors the other path_roles uses
     return path_roles.is_session_runtime_path(
-        normalized, ctx.claude_runtime_root, ctx.cli_session_id,
-        case_insensitive=ctx.target_os in ("windows", "darwin"),
+        normalized, ctx.placement.claude_runtime_root, ctx.cli_session_id,
+        case_insensitive=host_os.ROWS[ctx.placement.os_family].case_insensitive,
     )
 
 
@@ -357,9 +405,9 @@ def _virtual_to_satellite_host(
     Returns empty string when the context doesn't have the satellite's
     agents_dir or agent_slug (programming error — caller checks).
     """
-    if not ctx.target_agents_dir or not ctx.agent_slug:
+    if not ctx.placement.agents_dir or not ctx.agent_slug:
         return ""
-    base = ctx.target_agents_dir.rstrip("/") + "/" + ctx.agent_slug
+    base = ctx.placement.agents_dir.rstrip("/") + "/" + ctx.agent_slug
     return base + sandbox_virtual  # sandbox_virtual already starts with /
 
 
@@ -370,10 +418,10 @@ def _satellite_host_to_virtual(
     sandbox-virtual form when the absolute path sits inside the synced
     tree, or empty string otherwise.
     """
-    if not ctx.target_agents_dir or not ctx.agent_slug:
+    if not ctx.placement.agents_dir or not ctx.agent_slug:
         return ""
-    base = ctx.target_agents_dir.rstrip("/") + "/" + ctx.agent_slug
-    if not _is_under(abs_path, base, ctx.target_os):
+    base = ctx.placement.agents_dir.rstrip("/") + "/" + ctx.agent_slug
+    if not _is_under(abs_path, base, ctx.placement.os_family):
         return ""
     rel = abs_path[len(base):].lstrip("/")
     sub = _agent_tree_subroot(rel)
@@ -382,8 +430,17 @@ def _satellite_host_to_virtual(
     return "/" + rel
 
 
-def _reject(error: str) -> PathResolution:
-    return PathResolution(access_path="", allowed=False, error=error)
+def _reject(error: str, *, protected: bool = False) -> PathResolution:
+    return PathResolution(access_path="", allowed=False, error=error, protected=protected)
+
+
+def _is_secret_path(normalized: str, *, writing: bool) -> bool:
+    """The universal set: OAuth credential material and the agent's own CLI
+    config (with the hook scripts and settings on a write) — the denials
+    that hold for every role, an admin on an admin agent included."""
+    from services import path_roles
+    return (path_roles.is_protected_credentials_path(normalized)
+            or path_roles.is_protected_agent_config_path(normalized, writing=writing))
 
 
 def _protected_path_denial(normalized: str, *, writing: bool) -> str:
@@ -419,8 +476,10 @@ def _protected_path_denial(normalized: str, *, writing: bool) -> str:
     # The agent's own CLI config (.claude/*.json, .codex/config.toml|
     # auth.json at a scope root) holds this session's broker cap-token, swapped
     # HTTP bearer, session JWT + model token — deny via the MCP-arg / remote
-    # resolver too (no bwrap on satellites; this is the only software gate there).
-    if path_roles.is_protected_agent_config_path(normalized):
+    # resolver too (no bwrap on satellites; this is the only software gate
+    # there). On a write the set also covers the hook scripts and settings
+    # the permission system runs from.
+    if path_roles.is_protected_agent_config_path(normalized, writing=writing):
         return "agent CLI config files are protected"
     segs = [p for p in normalized.split("/") if p]
     if any(s.lower() == ".ssh" for s in segs):
@@ -480,15 +539,15 @@ def resolve_path_for_session(
     # OS Desktop).
     if (
         raw_path.startswith("~/") or raw_path == "~"
-    ) and not ctx.home_dir and ctx.target_kind != "local":
+    ) and not ctx.placement.home_dir and ctx.placement.needs_path_translation:
         return _reject(
             "satellite has not reported a home directory yet — cannot "
             "expand '~' prefix"
         )
     # 3. Tilde expansion.
-    expanded, _was_tilde = expand_tilde(raw_path, ctx.home_dir)
+    expanded, _was_tilde = expand_tilde(raw_path, ctx.placement.home_dir)
     # 4. Normalize.
-    normalized = normalize_path(expanded, ctx.target_os)
+    normalized = normalize_path(expanded)
     # 5. Collapse `..` segments.
     if "/" in normalized:
         normalized = os.path.normpath(normalized).replace("\\", "/")
@@ -505,7 +564,7 @@ def resolve_path_for_session(
     # loops this fn, so it's covered too.
     _denial = _protected_path_denial(normalized, writing=writing)
     if _denial:
-        return _reject(_denial)
+        return _reject(_denial, protected=_is_secret_path(normalized, writing=writing))
 
     # ----- Sandbox-virtual paths ---------------------------------------
     if kind == "sandbox_virtual":
@@ -514,7 +573,7 @@ def resolve_path_for_session(
         # For local sessions, we don't translate — the caller passes the
         # raw path to its existing local-sandbox logic. For remote
         # sessions, we translate to the satellite-host path.
-        if ctx.target_kind == "local":
+        if not ctx.placement.needs_path_translation:
             return PathResolution(
                 access_path=normalized,
                 allowed=True,
@@ -568,20 +627,27 @@ def resolve_path_for_session(
         # and the satellite PTY spawn mirrors them), so the policy judges
         # the path the tool will actually touch. The result re-enters as
         # sandbox_virtual and flows through the normal RBAC.
-        anchor = (ctx.relative_anchor or "/workspace").rstrip("/")
+        anchor = (ctx.relative_anchor or layout.V_WORKSPACE).rstrip("/")
         anchored = anchor + "/" + normalized
         return resolve_path_for_session(
             ctx, anchored, writing=writing, realpath_verify=realpath_verify,
         )
 
     # ----- Satellite-host absolute paths -------------------------------
-    if ctx.target_kind == "local":
+    if not ctx.placement.needs_path_translation:
         # Local sandbox — no satellite. Reject absolute paths that
         # aren't sandbox-virtual.
         return _reject(
             "absolute paths outside the sandbox are not allowed in "
             "local sessions"
         )
+
+    # Every root compare below is lexical; a spelling the host resolves to
+    # another path than its text would pass them all (the machine's own
+    # state included), so it is refused first, whatever the band.
+    alias = _host_alias(normalized, ctx.placement)
+    if alias:
+        return _reject(alias, protected=True)
 
     # First — maybe it's actually inside the synced tree but stated as
     # an absolute satellite-host path. Translate back to sandbox-virtual
@@ -592,6 +658,21 @@ def resolve_path_for_session(
         return resolve_path_for_session(
             ctx, virtual, writing=writing, realpath_verify=realpath_verify,
         )
+
+    # The machine's own OtoDock state, its folder (the configuration and
+    # machine secret, the browser profiles, the installed MCPs, the daemon)
+    # and the agents root, which holds the OTHER agents' synced trees, is
+    # refused to every remote session, full-filesystem pairings included.
+    # Ordered AFTER the own-tree translation above (the session's own
+    # ``agents/<slug>`` subtree never lands here; a name-only rule before it
+    # would refuse that tree too) and BEFORE every admission band below, so
+    # no band can widen it. ``protected`` closes the admin fast path as well.
+    for root in (*ctx.placement.state_dirs, ctx.placement.agents_dir):
+        if root and _is_under(normalized, root, ctx.placement.os_family):
+            return _reject(
+                "the machine's own OtoDock folder and agents root are not "
+                "available to sessions", protected=True,
+            )
 
     # Pure satellite-host path (outside the agent tree): also block READING
     # the OS user's real .env secret files. Write is already denied above; an
@@ -640,7 +721,7 @@ def resolve_path_for_session(
     # (session_state); admission here is lexical, at exact parity with the home /
     # full-fs branches below.
     for _root in ctx.session_allowed_roots:
-        if _root and _is_under(normalized, _root, ctx.target_os):
+        if _root and _is_under(normalized, _root, ctx.placement.os_family):
             return PathResolution(
                 access_path=normalized,
                 allowed=True,
@@ -650,7 +731,7 @@ def resolve_path_for_session(
             )
 
     # Pure satellite-host path. Apply the home / full-FS policy matrix.
-    if ctx.allow_full_fs:
+    if ctx.placement.allow_full_fs:
         return PathResolution(
             access_path=normalized,
             allowed=True,
@@ -660,12 +741,12 @@ def resolve_path_for_session(
         )
 
     # Home-only mode. Path must be under the owner's home dir.
-    if not ctx.home_dir:
+    if not ctx.placement.home_dir:
         return _reject(
             "home directory unknown for this satellite; ask the admin "
             "to enable full filesystem access for this machine"
         )
-    if _is_under(normalized, ctx.home_dir, ctx.target_os):
+    if _is_under(normalized, ctx.placement.home_dir, ctx.placement.os_family):
         return PathResolution(
             access_path=normalized,
             allowed=True,
@@ -708,22 +789,17 @@ def context_from_security(security_ctx: object) -> PathPolicyContext:
     ``auth.path_policy.SecurityContext`` instance.
 
     Used by ``check_tool_access`` so native tools (Read / Edit / Glob)
-    flow through the same policy as MCP tool args. Lazy import keeps
-    this module free of auth dependencies.
+    flow through the same policy as MCP tool args. The placement is the
+    context's own object, copied — no field is re-derived here. Lazy
+    import keeps this module free of auth dependencies.
     """
     # Avoid circular import — security_ctx is duck-typed.
-    target_kind = getattr(security_ctx, "target_kind", "local")
-    target_machine_id = getattr(security_ctx, "target_machine_id", "")
-    target_agents_dir = getattr(security_ctx, "target_agents_dir", "")
-    target_home_dir = getattr(security_ctx, "target_home_dir", "")
-    target_allow_full_fs = bool(
-        getattr(security_ctx, "target_allow_full_fs", False)
-    )
-    role = getattr(security_ctx, "role", "manager") or "manager"
+    target = getattr(security_ctx, "placement", None) or PlacementCapabilities()
+    role = getattr(security_ctx, "role", roles.MANAGER) or roles.MANAGER
     # NOTE: SecurityContext.username is the filesystem slug, NOT the
-    # user_sub. The policy resolver doesn't currently key on user_sub
-    # so we leave it empty here; callers that need user_sub for
-    # revocation checks fetch it separately.
+    # user_sub. The policy resolver doesn't currently key on user_sub so
+    # we leave it empty here; callers that need user_sub for revocation
+    # checks fetch it separately.
     user_sub = ""
     agent_slug = getattr(security_ctx, "agent", "") or ""
     session_allowed_roots = tuple(
@@ -731,37 +807,17 @@ def context_from_security(security_ctx: object) -> PathPolicyContext:
     )
     work_cwd = normalize_path(getattr(security_ctx, "work_cwd", "") or "")
     mount_username = getattr(security_ctx, "mount_username", "") or ""
-    relative_anchor = f"/users/{mount_username}" if mount_username else "/workspace"
+    relative_anchor = layout.virtual_user_root(mount_username) if mount_username else layout.V_WORKSPACE
     return PathPolicyContext(
-        target_kind=target_kind or "local",
-        machine_id=target_machine_id or "",
-        home_dir=target_home_dir or "",
-        target_agents_dir=target_agents_dir or "",
-        allow_full_fs=target_allow_full_fs,
-        target_os=_infer_target_os(target_agents_dir, target_home_dir),
+        placement=target,
         agent_slug=agent_slug,
         user_sub=user_sub,
         role=role,
         session_allowed_roots=session_allowed_roots,
         work_cwd=work_cwd,
         relative_anchor=relative_anchor,
-        claude_runtime_root=getattr(
-            security_ctx, "target_claude_runtime_root", "") or "",
         cli_session_id=getattr(security_ctx, "cli_session_id", "") or "",
     )
-
-
-def _infer_target_os(agents_dir: str, home_dir: str) -> str:
-    """Cheap OS inference from path shape — used when the caller
-    didn't pre-populate ``target_os``. The full
-    ``capabilities.os`` is preferred when available.
-    """
-    for s in (agents_dir, home_dir):
-        if s and _WINDOWS_DRIVE_RE.match(s.replace("\\", "/")):
-            return "windows"
-    if "/Users/" in (home_dir or ""):
-        return "darwin"
-    return "linux"
 
 
 # ---------------------------------------------------------------------------
@@ -784,15 +840,15 @@ def check_target_still_valid(security_ctx: object) -> str:
 
     Local sessions short-circuit to "valid" — there's nothing to revoke.
     """
-    target_kind = getattr(security_ctx, "target_kind", "local")
-    if target_kind not in ("admin_remote", "user_remote"):
+    target = getattr(security_ctx, "placement", None) or PlacementCapabilities()
+    if not target.is_remote:
         return ""
-    machine_id = getattr(security_ctx, "target_machine_id", "") or ""
+    machine_id = target.machine_id
     if not machine_id:
         # An older session warmed up without the machine_id field. Treat
         # as valid to avoid false positives on transition.
         return ""
-    # Late import to keep this module free of storage deps for tests.
+    # Late import to keep this module free of storage deps at import time.
     from storage import remote_store as _store
     machine = _store.get_remote_machine(machine_id)
     if not machine:

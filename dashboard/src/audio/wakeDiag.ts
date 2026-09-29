@@ -13,6 +13,8 @@
 // uploaded by this module — the privacy model of the feature holds: audio
 // leaves the device only when the operator sends the saved file.
 
+import { hasNativeBridge, saveNativeFile } from '../lib/nativeBridge'
+
 const KEY = 'otodock.wakeDiag'
 export const WAKE_DIAG_RATE = 16000
 export const WAKE_DIAG_RING_SECONDS = 30
@@ -189,7 +191,7 @@ export function exportWakeDiag(): { name: string; json: string } {
     version: 1,
     saved_at: new Date().toISOString(),
     ua: typeof navigator === 'undefined' ? '' : navigator.userAgent,
-    android_app: typeof window !== 'undefined' && !!(window as unknown as { Android?: unknown }).Android,
+    android_app: hasNativeBridge(),
     rate: WAKE_DIAG_RATE,
     wav_seconds: Math.round((pcm.length / WAKE_DIAG_RATE) * 100) / 100,
     engine_base: context.base ?? null,
@@ -212,15 +214,10 @@ export function exportWakeDiag(): { name: string; json: string } {
 export function saveWakeDiag(): string {
   if (!ensureRing()) return 'recorder is off'
   const { name, json } = exportWakeDiag()
-  const android = (window as unknown as { Android?: { saveImageFromBase64?: (b64: string, name: string, mime: string) => void } }).Android
-  if (android && typeof android.saveImageFromBase64 === 'function') {
-    try {
-      android.saveImageFromBase64(base64(new TextEncoder().encode(json)), name, 'application/json')
-      wakeDiagEvent('saved', { name })
-      return `saved ${name} to Downloads`
-    } catch {
-      return 'save failed'
-    }
+  if (hasNativeBridge()) {
+    if (!saveNativeFile(base64(new TextEncoder().encode(json)), name, 'application/json')) return 'save failed'
+    wakeDiagEvent('saved', { name })
+    return `saved ${name} to Downloads`
   }
   try {
     const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))

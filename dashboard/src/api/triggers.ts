@@ -11,6 +11,21 @@ export interface Trigger {
   created_by_name?: string | null
   task_id: string | null
   task_name?: string | null
+  // What the linked task runs on (a trigger has no model of its own): the
+  // task's pin or its agent's default, resolved server-side like the
+  // Scheduled Tasks list. Optional: absent on an older proxy.
+  task_effective_model?: string
+  task_override_model?: string
+  task_effective_execution_path?: string
+  task_effective_model_source?: string
+  task_effective_model_tier?: number | null
+  task_tier_label?: string
+  // The app action (APPS.md "Handlers"): a fire wakes this handler of the
+  // app instead of running a task.
+  app_id?: string | null
+  app_slug?: string | null
+  app_title?: string | null
+  handler?: string | null
   notify_enabled: boolean
   notify_severity: string
   notify_title: string | null
@@ -59,11 +74,17 @@ export interface CreateTriggerRequest {
   // (instead of via a generic webhook URL).
   subscription_id?: string
   event_filter?: Record<string, unknown>
+  // The app action: the app by slug in the trigger's scope and one of its
+  // on_trigger handler names (never together with task_id).
+  app_slug?: string
+  handler?: string
 }
 
 export interface EditTriggerRequest {
   name?: string
   task_id?: string | null
+  app_slug?: string | null
+  handler?: string | null
   notify_enabled?: boolean
   notify_severity?: string
   notify_title?: string | null
@@ -72,6 +93,8 @@ export interface EditTriggerRequest {
   notify_target?: string | null
   debounce_seconds?: number
   event_filter?: Record<string, unknown> | null
+  // The vendor subscription, bindable after creation ('' unbinds).
+  subscription_id?: string | null
 }
 
 // `audit` (admin-only, honored server-side) → the admin Triggers page's

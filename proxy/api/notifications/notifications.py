@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 import config
 from storage.automation import notification_store
+from storage.pg import run_db
 from services.notifications import notification_manager
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
@@ -21,6 +22,7 @@ from auth.providers import (
     get_current_user,
     require_auth,
 )
+from core.session import visibility as _vis
 
 logger = logging.getLogger("claude-proxy.notification-api")
 router = APIRouter()
@@ -103,7 +105,7 @@ def _enforce_scope(user: UserContext, scope: str, agent: str | None = None) -> N
     # Visibility-modes: reject a session scope the agent's mode doesn't offer
     # (Personal-only → no "agent"; Shared-only → no "user"). "global" is an
     # admin broadcast, not a mode scope — it passes through to its own check.
-    if scope in ("user", "agent") and agent:
+    if scope in _vis.SCOPES and agent:
         from core.session.visibility import available_scopes_for
         from storage.agents import agent_store as _as
         _row = _as.get_agent(agent) or {}
@@ -116,9 +118,9 @@ def _enforce_scope(user: UserContext, scope: str, agent: str | None = None) -> N
                 detail=f"This agent does not support {scope!r}-scoped "
                        f"notifications (mode offers: {', '.join(_avail)})",
             )
-    if scope == "user":
+    if scope == _vis.SCOPE_USER:
         return  # any authenticated user
-    elif scope == "agent":
+    elif scope == _vis.SCOPE_AGENT:
         # Writes never cross agents: an agent session (user-backed or not)
         # creates agent-scope notifications only for ITS OWN agent — notifying
         # another agent's users goes through delegation. ``agent`` here is the
@@ -169,7 +171,7 @@ async def create_notification(
     # Agent-scope recipient lives in ``target`` — thread it into the gate so
     # the per-agent editor tier + the agent-session own-agent pin actually
     # apply (calling without it left both dead on this path).
-    _enforce_scope(u, req.scope, req.target if req.scope == "agent" else None)
+    _enforce_scope(u, req.scope, req.target if req.scope == _vis.SCOPE_AGENT else None)
 
     acting = u.acting_sub
 
@@ -178,7 +180,7 @@ async def create_notification(
     # notifications. An agent acting as a real user can only notify THAT user
     # (client-supplied target ignored). The master key must name a user.
     target = req.target
-    if req.scope == "user":
+    if req.scope == _vis.SCOPE_USER:
         if u.is_no_user_session:
             raise HTTPException(
                 status_code=403,
@@ -202,7 +204,7 @@ async def create_notification(
             )
 
     # Resolve username to sub if target looks like a username (not a long hash)
-    if target and req.scope == "user" and len(target) < 30:
+    if target and req.scope == _vis.SCOPE_USER and len(target) < 30:
         resolved = await asyncio.to_thread(notification_store.resolve_username_to_sub, target)
         if not resolved:
             raise HTTPException(status_code=404, detail=f"User '{target}' not found")
@@ -281,100 +283,9 @@ async def list_notifications(
     u = require_auth(user)
 
     # Definitions view: list notification definitions (for agent settings page).
-    # enabled_only=False so paused notifications appear in the list (they
-    # can be resumed). The default has been flipped, but we pass it explicitly
-    # to make the intent clear.
     if view == "definitions" or u.is_api_key:
-        notifications = await asyncio.to_thread(
-            notification_store.list_notifications,
-            scope=scope,
-            source=source,
-            enabled_only=False,
-        )
-
-        # USER-VIEW vs ADMIN-AUDIT (consistent with /v1/tasks, /v1/triggers,
-        # /v1/tasks/runs). Agent-scoped + global notifications are shared; a
-        # user's user-scoped notifications are private to them. The admin AUDIT
-        # surface (``audit=true``, admin only — the admin Notifications page) sees
-        # every user's notifications so it can audit; every other caller —
-        # INCLUDING an admin on an agent's settings tab — gets the user-view (own
-        # user-scoped + agent-scoped + global). Keyed on is_service like
-        # /v1/tasks (H1/H2): a session JWT is api-key-shaped but must get the
-        # user-view exactly like a cookie caller. ``agent`` NARROWS the
-        # agent-scope class in every mode — it never replaces the access check
-        # (the old ternary let ``?agent=`` skip can_access_agent entirely).
-        # User/global rows are not agent-bound and ride along untouched.
-        audit_view = audit and u.is_admin
-        if not u.is_service and not audit_view:
-            # Delegation edges add the targets' agent-scope rows to a
-            # no-user caller's view (read-only — the authority helper keeps
-            # mutations/fire pinned to the caller's own agent).
-            edge_reach = nouser_read_targets(u)
-            filtered = []
-            for n in notifications:
-                if n["scope"] == "user" and n.get("target") == u.sub:
-                    filtered.append(n)
-                elif n["scope"] == "agent":
-                    n_target = n.get("target", "") or ""
-                    if agent and n_target != agent:
-                        continue
-                    if u.can_access_agent(n_target) or n_target in edge_reach:
-                        filtered.append(n)
-                elif n["scope"] == "global":
-                    filtered.append(n)
-            notifications = filtered
-        elif agent:
-            # Master key / admin audit: ``agent`` narrows agent-scope rows the
-            # same way (the store has no agent filter — target IS the slug).
-            notifications = [
-                n for n in notifications
-                if n["scope"] != "agent" or (n.get("target") or "") == agent
-            ]
-
-        # Hide one-time notifications that have already fired
-        notifications = [
-            n for n in notifications
-            if not (n["notification_type"] == "one_time" and n.get("fired_count", 0) > 0)
-        ]
-
-        # Add metadata: permissions + human-readable target names.
-        # 3-tier model:
-        #   - User-scope notif: own creator can mutate.
-        #   - Agent-scope notif: owner (manager/admin) can mutate any;
-        #     editor can mutate only their own (created_by == self).
-        for n in notifications:
-            is_own_target = n.get("target") == u.sub  # user-scope ownership
-            is_own_creator = n.get("created_by") == u.sub
-            is_static = n.get("source") == "static"
-            # Per-agent: resolve can_manage / can_edit based on the
-            # notification's agent (only relevant for agent-scope).
-            n_agent = n.get("target") if n["scope"] == "agent" else None
-            can_manage = u.is_admin or (n_agent and u.can_manage_agent(n_agent))
-            can_edit = u.is_admin or (n_agent and u.can_edit_agent(n_agent))
-            can_mutate_agent_scope = can_manage or (can_edit and is_own_creator)
-            can_mutate = (
-                is_own_target  # user-scope: own
-                or (n["scope"] == "agent" and can_mutate_agent_scope)
-                # No-user session: its own agent's agent-scope rows (mirrors
-                # _check_notification_authority).
-                or (u.is_no_user_session and n["scope"] == "agent"
-                    and n_agent == u.agent)
-            )
-            n["can_delete"] = not is_static and can_mutate and not u.is_service
-            n["can_fire"] = can_mutate or u.is_service
-            # Pause/resume share the same authority as delete (only dynamic
-            # notifications); the available action depends on enabled state.
-            is_enabled = bool(n.get("enabled", True))
-            n["can_pause"] = n["can_delete"] and is_enabled
-            n["can_resume"] = n["can_delete"] and not is_enabled
-            # Resolve target sub to username for display
-            if n.get("target") and n["scope"] == "user":
-                resolved_name = notification_store.resolve_sub_to_username(n["target"])
-                n["target_name"] = resolved_name or n["target"][:12]
-            else:
-                n["target_name"] = n.get("target")
-
-        return {"notifications": notifications}
+        return {"notifications": await run_db(
+            _definitions_view, u, scope, source, agent, audit)}
 
     # Default: list user's deliveries (inbox)
     deliveries = await asyncio.to_thread(
@@ -382,6 +293,107 @@ async def list_notifications(
         user_sub=u.sub,
     )
     return {"deliveries": deliveries}
+
+
+def _definitions_view(u: UserContext, scope: str | None, source: str | None,
+                      agent: str | None, audit: bool) -> list[dict]:
+    """The definitions view as ONE executor job: the list, the view filter
+    (its edge reach is a store read for a no-user session), the flags and
+    the target names of the user-scoped rows in one batched read.
+    enabled_only=False so paused notifications appear in the list (they can
+    be resumed). The default has been flipped, but we pass it explicitly to
+    make the intent clear."""
+    notifications = notification_store.list_notifications(
+        scope=scope,
+        source=source,
+        enabled_only=False,
+    )
+    # USER-VIEW vs ADMIN-AUDIT (consistent with /v1/tasks, /v1/triggers,
+    # /v1/tasks/runs). Agent-scoped + global notifications are shared; a
+    # user's user-scoped notifications are private to them. The admin AUDIT
+    # surface (``audit=true``, admin only: the admin Notifications page) sees
+    # every user's notifications so it can audit; every other caller,
+    # INCLUDING an admin on an agent's settings tab, gets the user-view (own
+    # user-scoped + agent-scoped + global). Keyed on is_service like
+    # /v1/tasks: a session JWT is api-key-shaped but must get the
+    # user-view exactly like a cookie caller. ``agent`` NARROWS the
+    # agent-scope class in every mode; it never replaces the access check
+    # (``?agent=`` never skips can_access_agent).
+    # User/global rows are not agent-bound and ride along untouched.
+    audit_view = audit and u.is_admin
+    if not u.is_service and not audit_view:
+        # Delegation edges add the targets' agent-scope rows to a
+        # no-user caller's view (read-only: the authority helper keeps
+        # mutations/fire pinned to the caller's own agent).
+        edge_reach = nouser_read_targets(u)
+        filtered = []
+        for n in notifications:
+            if n["scope"] == _vis.SCOPE_USER and n.get("target") == u.sub:
+                filtered.append(n)
+            elif n["scope"] == _vis.SCOPE_AGENT:
+                n_target = n.get("target", "") or ""
+                if agent and n_target != agent:
+                    continue
+                if u.can_access_agent(n_target) or n_target in edge_reach:
+                    filtered.append(n)
+            elif n["scope"] == "global":
+                filtered.append(n)
+        notifications = filtered
+    elif agent:
+        # Master key / admin audit: ``agent`` narrows agent-scope rows the
+        # same way (the store has no agent filter; target IS the slug).
+        notifications = [
+            n for n in notifications
+            if n["scope"] != _vis.SCOPE_AGENT or (n.get("target") or "") == agent
+        ]
+
+    # Hide one-time notifications that have already fired
+    notifications = [
+        n for n in notifications
+        if not (n["notification_type"] == "one_time" and n.get("fired_count", 0) > 0)
+    ]
+
+    # Add metadata: permissions + human-readable target names.
+    # 3-tier model:
+    #   - User-scope notif: own creator can mutate.
+    #   - Agent-scope notif: owner (manager/admin) can mutate any;
+    #     editor can mutate only their own (created_by == self).
+    target_names = notification_store.resolve_subs_to_display_names([
+        n.get("target") or "" for n in notifications
+        if n.get("target") and n["scope"] == _vis.SCOPE_USER
+    ])
+    for n in notifications:
+        is_own_target = n.get("target") == u.sub  # user-scope ownership
+        is_own_creator = n.get("created_by") == u.sub
+        is_static = n.get("source") == "static"
+        # Per-agent: resolve can_manage / can_edit based on the
+        # notification's agent (only relevant for agent-scope).
+        n_agent = n.get("target") if n["scope"] == _vis.SCOPE_AGENT else None
+        can_manage = u.is_admin or (n_agent and u.can_manage_agent(n_agent))
+        can_edit = u.is_admin or (n_agent and u.can_edit_agent(n_agent))
+        can_mutate_agent_scope = can_manage or (can_edit and is_own_creator)
+        can_mutate = (
+            is_own_target  # user-scope: own
+            or (n["scope"] == _vis.SCOPE_AGENT and can_mutate_agent_scope)
+            # No-user session: its own agent's agent-scope rows (mirrors
+            # _check_notification_authority).
+            or (u.is_no_user_session and n["scope"] == _vis.SCOPE_AGENT
+                and n_agent == u.agent)
+        )
+        n["can_delete"] = not is_static and can_mutate and not u.is_service
+        n["can_fire"] = can_mutate or u.is_service
+        # Pause/resume share the same authority as delete (only dynamic
+        # notifications); the available action depends on enabled state.
+        is_enabled = bool(n.get("enabled", True))
+        n["can_pause"] = n["can_delete"] and is_enabled
+        n["can_resume"] = n["can_delete"] and not is_enabled
+        # Resolve target sub to username for display
+        if n.get("target") and n["scope"] == _vis.SCOPE_USER:
+            n["target_name"] = target_names.get(n["target"]) or n["target"][:12]
+        else:
+            n["target_name"] = n.get("target")
+
+    return notifications
 
 
 @router.get("/v1/notifications/unread-count")
@@ -431,9 +443,9 @@ def _check_notification_authority(notif: dict, user: UserContext) -> None:
     """
     if user.is_service:
         return
-    n_agent = notif.get("target") if notif["scope"] == "agent" else None
+    n_agent = notif.get("target") if notif["scope"] == _vis.SCOPE_AGENT else None
     if user.is_no_user_session:
-        if notif["scope"] == "agent" and n_agent == user.agent:
+        if notif["scope"] == _vis.SCOPE_AGENT and n_agent == user.agent:
             return
         raise HTTPException(
             status_code=403,

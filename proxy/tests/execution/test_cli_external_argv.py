@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS
+from core.layers.cli.layer import CLIExecutionLayer
 from core.layers.cli.session import PersistentSession
 
 
@@ -16,7 +16,7 @@ def _cmd(**kw) -> list[str]:
 
 
 def test_external_sessions_disallow_the_shell():
-    cmd = _cmd(disallowed_tools=list(EXTERNAL_DENIED_CLI_TOOLS))
+    cmd = _cmd(disallowed_tools=CLIExecutionLayer().session_denied_tools(external=True, read_only=False))
     i = cmd.index("--disallowedTools")
     assert cmd[i + 1] == "Bash,Monitor,PowerShell"
     assert "--dangerously-skip-permissions" in cmd

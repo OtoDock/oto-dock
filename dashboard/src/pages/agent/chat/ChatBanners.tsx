@@ -10,6 +10,7 @@ import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { currentDashboardTheme } from '../../../hooks/useInteractiveChat'
 import type { LayerCapabilities } from '../../../api/agents'
+import { machineOf } from '../../../lib/placement'
 import type { TargetMismatch } from '../../../store/chatStore'
 import InstallProgressBar from '../../../components/chat/InstallProgressBar'
 import MachineUpdateBanner from '../../../components/chat/MachineUpdateBanner'
@@ -56,9 +57,7 @@ export default function ChatBanners({
   return (
     <>
       <MachineUpdateBanner
-        machineId={sessionExecutionTarget && sessionExecutionTarget !== 'local'
-          ? sessionExecutionTarget
-          : null}
+        machineId={machineOf(sessionExecutionTarget) || null}
       />
 
       <RemoteFallbackBanner
@@ -92,7 +91,7 @@ export default function ChatBanners({
 
       <InstallProgressBar
         chatId={chatId}
-        machineId={sessionExecutionTarget !== 'local' ? sessionExecutionTarget : null}
+        machineId={machineOf(sessionExecutionTarget) || null}
         agent={agentName}
         onRetry={() => {
           // Re-fire warmup with the same agent + mode + model (used by the

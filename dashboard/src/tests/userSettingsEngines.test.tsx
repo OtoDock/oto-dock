@@ -35,11 +35,15 @@ vi.mock('@/api/auth', () => ({ fetchCurrentUser: vi.fn(async () => null) }))
 vi.mock('@/lib/nativeBridge', () => ({ setNativeAuthInProgress: vi.fn() }))
 
 import { ExecutionLayersSection } from '@/pages/UserSettings.aiEngines'
+import { claudeLike } from './fixtures/engines'
 
 function layer(subs: object[], overrides: object = {}) {
   return {
     name: 'claude-code-cli',
     display_name: 'Anthropic Claude Code',
+    // The card reads the engine's descriptor (vendor, account, login flow,
+    // key provider), not its id.
+    capabilities: claudeLike({ display_name: 'Anthropic Claude Code' }),
     user_subscriptions: subs,
     platform_available: true,
     allow_platform_auth: true,

@@ -1,5 +1,6 @@
 import { liveBlockToMessageBlock } from '../../lib/messageBlocks'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
+import { LIVE_BLOCK, SYSTEM_SUBTYPE, WIRE } from '../../api/wireEvents'
 
 /**
  * Pure reconstruction of the live-state message list from ordered live_blocks.
@@ -25,7 +26,7 @@ export function buildLiveStateMessages(
 
   for (const lb of liveBlocks) {
     // Meeting turn start: finalize current message, start new one with agent identity
-    if (lb.type === 'system' && lb.subtype === 'meeting_turn_start') {
+    if (lb.type === WIRE.SYSTEM && lb.subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) {
       if (msg.blocks.length > 0) newMsgs.push(msg)
       msg = {
         id: `live-turn-${lb.agent || Date.now()}`,
@@ -40,14 +41,14 @@ export function buildLiveStateMessages(
       continue
     }
     // Meeting events that don't need blocks: skip
-    if (lb.type === 'system' && (lb.subtype === 'meeting_started' || lb.subtype === 'meeting_turn_end' || lb.subtype === 'meeting_concluded')) {
+    if (lb.type === WIRE.SYSTEM && (lb.subtype === SYSTEM_SUBTYPE.MEETING_STARTED || lb.subtype === SYSTEM_SUBTYPE.MEETING_TURN_END || lb.subtype === SYSTEM_SUBTYPE.MEETING_CONCLUDED)) {
       continue
     }
     switch (lb.type) {
-      case 'text':
+      case LIVE_BLOCK.TEXT:
         pushBlock({ type: 'text', content: lb.content || '' })
         break
-      case 'tool':
+      case LIVE_BLOCK.TOOL:
         pushBlock({
           type: 'tool',
           name: lb.name || '',
@@ -59,7 +60,7 @@ export function buildLiveStateMessages(
           resultSummary: lb.result_summary,
         })
         break
-      case 'agent':
+      case LIVE_BLOCK.AGENT:
         pushBlock({
           type: 'subagent',
           description: lb.description || 'Subagent',
@@ -71,7 +72,7 @@ export function buildLiveStateMessages(
           toolResult: lb.tool_result,
         } as MessageBlock)
         break
-      case 'delegate':
+      case LIVE_BLOCK.DELEGATE:
         pushBlock({
           type: 'delegate',
           taskName: lb.task_name || '',
@@ -82,7 +83,7 @@ export function buildLiveStateMessages(
           prompt: lb.prompt || '',     // expandable pill parity with live stream
         })
         break
-      case 'command':
+      case LIVE_BLOCK.COMMAND:
         pushBlock({
           type: 'bgcommand',
           command: lb.command || '',

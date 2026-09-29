@@ -248,6 +248,26 @@ def test_verify_bearer_for_user_rejects_unknown_username(temp_db):
     assert e.value.code == "scope"
 
 
+def test_verify_bearer_for_user_accepts_a_display_name_address(temp_db):
+    """An address written with the display name (1.6.1) keeps working when
+    another user's username is that same word: the key decides which user
+    the segment means, and it never lends one user's key to the other."""
+    from services.infra import api_key_manager as akm
+    from storage.pg import get_conn
+    _seed_user_with_username("user-alice", "alice")
+    _seed_user_with_username("user-bob", "bob")
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET name='alice' WHERE sub='user-bob'")
+        conn.commit()
+    _, bob_raw = akm.create_user_key(user_sub="user-bob", name="P", permissions=["triggers"])
+    _, alice_raw = akm.create_user_key(user_sub="user-alice", name="P", permissions=["triggers"])
+    assert akm.verify_bearer_for_user(f"Bearer {bob_raw}", username="alice")["user_sub"] == "user-bob"
+    assert akm.verify_bearer_for_user(f"Bearer {alice_raw}", username="alice")["user_sub"] == "user-alice"
+    with pytest.raises(akm.KeyMismatch) as e:
+        akm.verify_bearer_for_user(f"Bearer {alice_raw}", username="bob")
+    assert e.value.code == "scope"
+
+
 def test_agent_key_does_not_authorize_user_webhook(temp_db):
     """Cross-key-type attack: agent key on user URL must reject."""
     from services.infra import api_key_manager as akm
@@ -353,3 +373,34 @@ def test_listing_excludes_revoked_by_default(temp_db):
     all_ids = [r["id"] for r in all_keys]
     assert row1["id"] in all_ids
     assert row2["id"] in all_ids
+
+
+def test_a_webhook_address_carries_the_username_and_the_display_name_still_resolves(temp_db):
+    """The user-scoped address is ``/v1/webhooks/user/<username>/<slug>``:
+    the resolvers read ``users.username`` (minted once, never renamed),
+    and an address written with the display name — what they matched
+    until 2026-09-19 — keeps working through the fallback."""
+    from datetime import datetime, timezone
+    from services.infra import api_key_manager as akm
+    from storage.automation import notification_store
+    from storage.pg import get_conn
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (sub, email, name, role, created_at, last_login, username) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (sub) DO UPDATE SET username=%s, name=%s",
+            ("sub-dev-admin", "admin@test.com", "Dev Admin", "admin", now, now, "dev-admin", "dev-admin", "Dev Admin"))
+        conn.commit()
+    assert notification_store.resolve_username_to_sub("dev-admin") == "sub-dev-admin"
+    assert notification_store.resolve_username_to_sub("Dev Admin") == "sub-dev-admin"
+    assert notification_store.resolve_sub_to_username("sub-dev-admin") == "dev-admin"
+    assert notification_store.resolve_sub_to_display_name("sub-dev-admin") == "Dev Admin"
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET display_name=%s WHERE sub=%s", ("Dimi", "sub-dev-admin"))
+        conn.commit()
+    assert notification_store.resolve_sub_to_display_name("sub-dev-admin") == "Dimi"
+    assert notification_store.resolve_sub_to_username("sub-dev-admin") == "dev-admin"
+    _row, raw = akm.create_user_key(user_sub="sub-dev-admin", name="hook", permissions=["triggers"])
+    assert akm.verify_bearer_for_user(f"Bearer {raw}", username="dev-admin")["user_sub"] == "sub-dev-admin"
+    assert akm.verify_bearer_for_user(f"Bearer {raw}", username="Dev Admin")["user_sub"] == "sub-dev-admin"
+

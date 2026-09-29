@@ -156,7 +156,7 @@ def test_delete_relay_row_skips_vendor_and_disables_when_last(monkeypatch):
     monkeypatch.setattr(relay_client, "events_register", fake_register)
     ok = asyncio.run(subscription_manager.delete_subscription(
         subscription_id="s1"))
-    assert ok is True
+    assert ok == (True, True)
     assert reg["enabled"] is False and reg["provider_id"] == "slack"
 
 
@@ -175,7 +175,7 @@ def test_delete_relay_row_keeps_forwarding_when_others_remain(monkeypatch):
 
     monkeypatch.setattr(relay_client, "events_register", fail_register)
     assert asyncio.run(subscription_manager.delete_subscription(
-        subscription_id="s1")) is True
+        subscription_id="s1")) == (True, True)
 
 
 def test_vendor_delete_noop_for_relay_rows(monkeypatch):
@@ -484,3 +484,249 @@ async def test_vendor_create_applies_event_body_overrides(monkeypatch):
         selected_events=["calendar_events"], **common,
     )
     assert captured["overrides"] == {}
+
+
+# --- service scope: the request's label must be the binding's ---------------------
+
+_GH = {
+    "available": True,
+    "provider_id": "github",
+    "event_catalog": [{"key": "push", "label": "Push"}],
+    "registration": {"mode": "manual"},
+}
+
+
+def _service_create(monkeypatch, *, account_label: str):
+    from types import SimpleNamespace
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver
+    monkeypatch.setattr(
+        mcp_registry, "get_manifest",
+        lambda name: SimpleNamespace(credentials=SimpleNamespace(webhooks=dict(_GH))))
+    monkeypatch.setattr(
+        credential_resolver, "pick_account",
+        lambda mcp, agent, **kw: credential_resolver.AccountRef(
+            label="bound", owner_sub="local:owner"))
+    return asyncio.run(subscription_manager.create_subscription(
+        user_sub="local:co-manager", scope="service", agent="ag", mcp_name="github-mcp",
+        account_label=account_label, vendor_target="o/r", selected_events=["nope"],
+    ))
+
+
+def test_service_scope_refuses_a_label_other_than_the_bindings(monkeypatch):
+    with pytest.raises(subscription_manager.SubscriptionError) as ei:
+        _service_create(monkeypatch, account_label="other")
+    assert ei.value.status == 400
+    assert ei.value.detail == {"bound_account_label": "bound"}
+    assert "'bound'" in str(ei.value)
+
+
+def test_service_scope_bound_label_passes_the_check(monkeypatch):
+    # The next validation (unknown event key) is what stops this call — the
+    # label check itself let it through.
+    with pytest.raises(subscription_manager.SubscriptionError) as ei:
+        _service_create(monkeypatch, account_label="bound")
+    assert "unknown event keys" in str(ei.value)
+
+
+# --- target kinds: one manifest, two ways to register ------------------------------
+
+_KINDS_BLOCK = {
+    "available": True, "provider_id": "github",
+    "signature": {"algorithm": "hmac-sha256", "header": "X-Hub-Signature-256",
+                  "per_subscription_secret": True},
+    "url_verification": {"kind": "none"},
+    "registration": {
+        "mode": "auto",
+        "create": {"method": "POST",
+                   "url_template": "https://api.github.com/repos/${vendor_target}/hooks",
+                   "headers": {"Authorization": "token ${account.access_token}"},
+                   "response_id_path": "id", "expected_status": [201]},
+        "delete": {"method": "DELETE",
+                   "url_template": "https://api.github.com/repos/${vendor_target}/hooks/${vendor_subscription_id}",
+                   "expected_status": [204, 404]},
+    },
+    "event_catalog": [{"key": "push", "label": "Commits pushed", "required_scopes": ["repo"]}],
+    "payload_normalization": {"event_type_path": "headers.X-GitHub-Event"},
+    "vendor_target_spec": {
+        "kind": "free_text", "label": "Repository (owner/name)",
+        "validation_regex": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+        "target_kinds": [
+            {"key": "repository", "label": "One repository",
+             "validation_regex": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+            {"key": "organization", "label": "Every repository in an organization",
+             "validation_regex": "^[A-Za-z0-9_.-]+$",
+             "required_scopes": ["admin:org_hook"],
+             "help_text": "Needs the Organization webhooks permission and owner rights on the organization.",
+             "registration": {
+                 "create": {"url_template": "https://api.github.com/orgs/${vendor_target}/hooks"},
+                 "delete": {"url_template": "https://api.github.com/orgs/${vendor_target}/hooks/${vendor_subscription_id}"},
+             }},
+        ],
+    },
+}
+
+
+def test_resolve_target_kind_and_registration_merge():
+    """'' is the first kind; an override restates only the URL and inherits
+    the rest; a manifest without kinds is its flat spec."""
+    import copy
+    wb = copy.deepcopy(_KINDS_BLOCK)
+    assert subscription_manager.resolve_target_kind(wb, "")["key"] == "repository"
+    assert subscription_manager.resolve_target_kind(wb, "organization")["required_scopes"] == ["admin:org_hook"]
+    with pytest.raises(subscription_manager.SubscriptionError):
+        subscription_manager.resolve_target_kind(wb, "team")
+    org_create = subscription_manager.registration_call(wb, "organization", "create")
+    assert org_create["url_template"] == "https://api.github.com/orgs/${vendor_target}/hooks"
+    assert org_create["method"] == "POST" and org_create["response_id_path"] == "id"
+    assert org_create["headers"] == {"Authorization": "token ${account.access_token}"}
+    assert subscription_manager.registration_call(wb, "organization", "delete")["expected_status"] == [204, 404]
+    assert subscription_manager.registration_call(wb, "", "create")["url_template"].startswith("https://api.github.com/repos/")
+    assert subscription_manager.registration_call(wb, "repository", "renew") == {}
+    del wb["vendor_target_spec"]["target_kinds"]
+    assert subscription_manager.resolve_target_kind(wb, "")["label"] == "Repository (owner/name)"
+    assert subscription_manager.registration_call(wb, "", "create")["url_template"].startswith("https://api.github.com/repos/")
+    with pytest.raises(subscription_manager.SubscriptionError):
+        subscription_manager.resolve_target_kind(wb, "organization")
+
+
+def _create_kind(monkeypatch, *, target, kind, granted, calls, call_vendor=None):
+    """Run create_subscription on the kinds manifest in auto mode, with the
+    vendor call captured into ``calls`` and the store in memory."""
+    monkeypatch.setattr(
+        subscription_manager.mcp_registry, "get_manifest",
+        lambda n: SimpleNamespace(credentials=SimpleNamespace(webhooks=_KINDS_BLOCK, oauth=None)))
+    monkeypatch.setattr(subscription_manager, "_read_granted_scopes", lambda **kw: granted)
+    monkeypatch.setattr(subscription_manager, "_resolve_account_extra", lambda **kw: {})
+    monkeypatch.setattr(subscription_manager, "_resolve_token_or_raise", lambda **kw: "tok")
+    monkeypatch.setattr(subscription_manager, "_effective_registration_mode", lambda **kw: "auto")
+    rows: dict = {}
+
+    def fake_store_create(**kw):
+        rows["row"] = {"id": "row-1", "status": "creating", **kw}
+        return rows["row"]
+
+    monkeypatch.setattr(webhook_subscription_store, "create_subscription", fake_store_create)
+    monkeypatch.setattr(webhook_subscription_store, "update_subscription_status", lambda *a, **kw: None)
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: rows.get("row"))
+
+    async def fake_call_vendor(*, call_block, row, access_token, extra_subs,
+                               account_extra=None, body_overrides=None):
+        calls.append(call_block["url_template"])
+        return {"id": "hook-9"}
+
+    monkeypatch.setattr(subscription_manager, "_call_vendor", call_vendor or fake_call_vendor)
+    return asyncio.run(subscription_manager.create_subscription(
+        user_sub="alice", scope="user", agent=None, mcp_name="github-mcp",
+        account_label="a@x.com", vendor_target=target, selected_events=["push"],
+        target_kind=kind,
+    ))
+
+
+def test_create_org_kind_needs_its_scope_then_registers_on_the_org(monkeypatch):
+    calls: list = []
+    with pytest.raises(subscription_manager.SubscriptionScopeError) as ei:
+        _create_kind(monkeypatch, target="OtoDock", kind="organization",
+                     granted={"repo"}, calls=calls)
+    assert ei.value.required_scopes == ["admin:org_hook"]
+    assert calls == []
+    row = _create_kind(monkeypatch, target="OtoDock", kind="organization",
+                       granted={"repo", "admin:org_hook"}, calls=calls)
+    assert row["target_kind"] == "organization"
+    assert calls == ["https://api.github.com/orgs/${vendor_target}/hooks"]
+
+
+def test_create_repository_kind_is_the_default_and_the_old_path(monkeypatch):
+    calls: list = []
+    row = _create_kind(monkeypatch, target="OtoDock/oto-dock", kind="",
+                       granted={"repo"}, calls=calls)
+    assert row["target_kind"] == ""
+    assert calls == ["https://api.github.com/repos/${vendor_target}/hooks"]
+
+
+def test_create_refuses_a_target_of_the_wrong_shape(monkeypatch):
+    """A repository string sent as an organization (and the reverse) stops
+    at the API: no row, no vendor call."""
+    calls: list = []
+    for target, kind in (("OtoDock/oto-dock", "organization"), ("OtoDock", "repository")):
+        with pytest.raises(subscription_manager.SubscriptionError) as ei:
+            _create_kind(monkeypatch, target=target, kind=kind,
+                         granted={"repo", "admin:org_hook"}, calls=calls)
+        assert ei.value.status == 400
+    with pytest.raises(subscription_manager.SubscriptionError):
+        _create_kind(monkeypatch, target="OtoDock", kind="team",
+                     granted={"repo", "admin:org_hook"}, calls=calls)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_vendor_delete_renders_the_kind_it_was_created_with(monkeypatch):
+    calls: list = []
+
+    async def fake_call_vendor(*, call_block, row, access_token, extra_subs,
+                               account_extra=None, body_overrides=None):
+        calls.append(call_block["url_template"])
+        return {}
+
+    monkeypatch.setattr(subscription_manager, "_call_vendor", fake_call_vendor)
+    monkeypatch.setattr(subscription_manager, "_resolve_token_or_raise", lambda **kw: "tok")
+    monkeypatch.setattr(subscription_manager, "_resolve_account_extra", lambda **kw: {})
+    monkeypatch.setattr(
+        subscription_manager.mcp_registry, "get_manifest",
+        lambda n: SimpleNamespace(credentials=SimpleNamespace(webhooks=_KINDS_BLOCK, oauth=None)))
+    base = {"id": "s1", "provider_id": "github", "mcp_name": "github-mcp", "scope": "user",
+            "owner": "alice", "agent": None, "account_label": "a@x.com",
+            "vendor_subscription_id": "hook-9", "delivery_mode": "vendor"}
+    await subscription_manager._vendor_delete({**base, "vendor_target": "OtoDock", "target_kind": "organization"})
+    await subscription_manager._vendor_delete({**base, "vendor_target": "OtoDock/oto-dock", "target_kind": ""})
+    await subscription_manager._vendor_delete({**base, "vendor_target": "OtoDock/oto-dock"})
+    assert calls == [
+        "https://api.github.com/orgs/${vendor_target}/hooks/${vendor_subscription_id}",
+        "https://api.github.com/repos/${vendor_target}/hooks/${vendor_subscription_id}",
+        "https://api.github.com/repos/${vendor_target}/hooks/${vendor_subscription_id}",
+    ]
+
+
+def test_delete_reports_whether_the_vendor_let_go(monkeypatch):
+    """The row goes either way (orphan-tolerant); the outcome says whether a
+    registration was left behind at the vendor."""
+    row = {"id": "s1", "delivery_mode": "vendor", "provider_id": "github"}
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: row)
+    monkeypatch.setattr(webhook_subscription_store, "delete_subscription", lambda sid: True)
+
+    async def ok(r):
+        return None
+
+    async def boom(r):
+        raise subscription_manager.VendorAPIError(
+            "vendor 401: bad credentials", vendor_status=401, vendor_body="bad credentials")
+
+    monkeypatch.setattr(subscription_manager, "_vendor_delete", ok)
+    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, True)
+    monkeypatch.setattr(subscription_manager, "_vendor_delete", boom)
+    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, False)
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: None)
+    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_vendor_delete_with_the_mcp_gone_reports_the_hook_left_behind(monkeypatch):
+    monkeypatch.setattr(subscription_manager.mcp_registry, "get_manifest", lambda n: None)
+    base = {"id": "s1", "provider_id": "github", "mcp_name": "github-mcp", "delivery_mode": "vendor"}
+    assert await subscription_manager._vendor_delete({**base, "vendor_subscription_id": "hook-9"}) is False
+    assert await subscription_manager._vendor_delete({**base, "vendor_subscription_id": None}) is True
+    assert await subscription_manager._vendor_delete({**base, "delivery_mode": "relay"}) is True
+
+
+def test_create_vendor_refusal_carries_the_kinds_help_text(monkeypatch):
+    calls: list = []
+
+    async def refuse(*, call_block, row, access_token, extra_subs, account_extra=None, body_overrides=None):
+        raise subscription_manager.VendorAPIError(
+            "vendor 404: Not Found", vendor_status=404, vendor_body='{"message":"Not Found"}')
+
+    with pytest.raises(subscription_manager.VendorAPIError) as ei:
+        _create_kind(monkeypatch, target="OtoDock", kind="organization",
+                     granted={"repo", "admin:org_hook"}, calls=calls, call_vendor=refuse)
+    assert ei.value.vendor_status == 404
+    assert "owner rights" in str(ei.value)

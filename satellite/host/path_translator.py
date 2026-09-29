@@ -1,23 +1,25 @@
-"""Sandbox-style path translator for satellite-spawned MCP processes.
+"""Sandbox-style path translation for satellite-spawned processes.
 
-The proxy ships sandbox-style virtual paths to MCPs in env vars
-(``/users/{u}/workspace``, ``/workspace``, ``/config``, ``/.claude``,
-``/users/{u}/workspace/.screenshots/{session_id}``) — same convention as
-local-sandboxed agents see via bwrap. The satellite has no bwrap, so this
-module rewrites those values to real satellite filesystem paths
+The proxy ships sandbox-style virtual paths in env vars, prompt text and
+MCP configs (``/users/{u}/workspace``, ``/workspace``, ``/config``,
+``/.claude``, ``/users/{u}/workspace/.screenshots/{session_id}``) — the
+convention local-sandboxed agents see through bwrap. The satellite has no
+bwrap, so these are rewritten to real satellite filesystem paths
 (``{agent_dir}/...``) before subprocess spawn.
 
-This mirrors ``proxy/auth/path_policy._sandbox_to_host`` rules but resolves
-against the satellite's per-agent directory instead of the platform host's.
+The rule itself — which virtual roots exist and where each lands under the
+agent dir — is the agent tree's, defined once in the proxy's
+``core/layout.py`` and vendored here byte-for-byte
+(``satellite/_vendored/layout.py``, ``layout.host_of_virtual``); the state
+dirs it translates (``/.claude``, ``/.codex``) are the engines' declared
+config dirs (``engines.ENGINES``). This module applies that rule to the
+three shapes the proxy sends: an env dict (``translate_env``), prompt text
+(``translate_paths_in_text``) and a Codex ``config.toml``
+(``translate_codex_mcp_env_paths``), and folds a satellite-host path back
+to its virtual form for the tunnel (``translate_satellite_to_virtual_in_text``).
 
 Also handles the literal ``{session_id}`` token left in screenshots-style
 roles so per-session subdirs end up correctly scoped.
-
-In addition to env-var values (``translate_env``), the same translation is
-applied to ``send_message`` prompt content (``translate_paths_in_text``) so
-that platform-injected sandbox paths in attachments work uniformly across
-local-sandboxed agents (bwrap-mounted) and remote-unsandboxed agents
-(satellite filesystem).
 """
 
 from __future__ import annotations
@@ -26,84 +28,38 @@ import os
 import re
 from pathlib import Path
 
+from .._vendored import layout
+from ..engines import ENGINES
+
 # Mirror of `proxy/services/path_roles.SESSION_ID_TOKEN`.
 _SESSION_ID_TOKEN = "{session_id}"
 
-# Matches sandbox-style absolute paths anywhere in a string. Six top-level
-# prefixes — same set translated by ``translate_path``. The negative lookbehind
-# excludes embeddings inside larger tokens (e.g. URLs ``http://x/users/...``,
-# already-translated absolute paths ``/agent_dir/users/...``). The trailing
-# character class delimits where a path ends — whitespace, common punctuation,
-# and quoting characters break the match.
+#: The engines' config dirs (``.claude`` / ``.codex``) — the two virtual
+#: roots ``/.claude`` and ``/.codex`` the rule maps to a session's scope.
+STATE_DIRS: tuple = tuple(e.config_dir for e in ENGINES.values())
+
+# Matches sandbox-style absolute paths anywhere in a string: the four tree
+# roots and the state dirs — the set ``layout.host_of_virtual`` translates.
+# The negative lookbehind excludes embeddings inside larger tokens (e.g. URLs
+# ``http://x/users/...``, already-translated absolute paths
+# ``/agent_dir/users/...``). The trailing character class delimits where a
+# path ends — whitespace, common punctuation, and quoting characters break
+# the match.
 _BODY_RE = r"[^\s,;:\'\"`)(\]\[}{]+"
 _SANDBOX_PATH_RE = re.compile(
     r"(?<![\w./-])"
     r"("
-    rf"/users/{_BODY_RE}"
-    rf"|/workspace(?:/{_BODY_RE})?"
-    rf"|/knowledge(?:/{_BODY_RE})?"
-    rf"|/config(?:/{_BODY_RE})?"
-    rf"|/\.claude(?:/{_BODY_RE})?"
-    rf"|/\.codex(?:/{_BODY_RE})?"
-    r")"
+    + "|".join(
+        rf"{re.escape(root)}(?:/{_BODY_RE})?"
+        for root in (*layout.TREE_ROOTS, *(f"/{d}" for d in STATE_DIRS))
+    )
+    + r")"
 )
 
 
-def translate_path(value: str, agent_dir: Path, username: str) -> str:
-    """Translate one sandbox-style virtual path to a satellite-absolute path.
-
-    Args:
-        value: env-var value as received from the proxy. May or may not be
-            a sandbox-style path (only path-shaped values get rewritten;
-            anything else passes through unchanged).
-        agent_dir: satellite's agent dir, e.g. ``~/.oto-dock/agents/{slug}``
-            (already resolved).
-        username: session's username; "" for agent-scoped sessions
-            (tasks/meetings/voice).
-
-    Returns:
-        The translated path, or the original ``value`` if it doesn't match
-        any sandbox prefix.
-    """
-    p = value
-    base = str(agent_dir).rstrip("/")
-
-    # /.claude/x → {agent_dir}/users/{u}/.claude/x  (or workspace/.claude for agent-scoped)
-    if p == "/.claude" or p.startswith("/.claude/"):
-        suffix = p[len("/.claude") :]  # "" or "/x"
-        if username:
-            return f"{base}/users/{username}/.claude{suffix}"
-        return f"{base}/workspace/.claude{suffix}"
-
-    # /.codex/x → {agent_dir}/users/{u}/.codex/x  (parallel structure)
-    if p == "/.codex" or p.startswith("/.codex/"):
-        suffix = p[len("/.codex") :]
-        if username:
-            return f"{base}/users/{username}/.codex{suffix}"
-        return f"{base}/workspace/.codex{suffix}"
-
-    # /users/{u}/x → {agent_dir}/users/{u}/x
-    if p == "/users" or p.startswith("/users/"):
-        return f"{base}{p}"
-
-    # /workspace/x → {agent_dir}/workspace/x
-    if p == "/workspace" or p.startswith("/workspace/"):
-        return f"{base}{p}"
-
-    # /knowledge/x → {agent_dir}/knowledge/x  (universal — all roles see it;
-    # RW only for owner per bwrap mount table on the proxy side, but
-    # satellite has no bwrap so the satellite owner controls access at
-    # the unix filesystem level)
-    if p == "/knowledge" or p.startswith("/knowledge/"):
-        return f"{base}{p}"
-
-    # /config/x → {agent_dir}/config/x  (manager/admin only; if mounted)
-    if p == "/config" or p.startswith("/config/"):
-        return f"{base}{p}"
-
-    # Anything else: pass through (URLs, opaque values, already-absolute paths
-    # the MCP will use verbatim).
-    return p
+def _translate(value: str, agent_dir: Path, username: str) -> str:
+    """The vendored rule with this satellite's state dirs."""
+    return layout.host_of_virtual(value, agent_dir, username, STATE_DIRS)
 
 
 def expand_session_id(value: str, session_id: str) -> str:
@@ -116,23 +72,6 @@ def expand_session_id(value: str, session_id: str) -> str:
     if _SESSION_ID_TOKEN in value:
         return value.replace(_SESSION_ID_TOKEN, session_id)
     return value
-
-
-def derive_username_from_cwd_relative(cwd_relative: str) -> str:
-    """Recover the session's username from the proxy-supplied cwd_relative.
-
-    Mirrors the convention in ``proxy/core/remote/remote_start_payload.py`` where:
-      - user-scoped sessions: cwd_relative = "users/{username}"
-      - agent-scoped sessions: cwd_relative = "workspace"
-
-    Returns empty string for agent-scoped sessions.
-    """
-    if not cwd_relative:
-        return ""
-    parts = cwd_relative.strip("/").split("/")
-    if len(parts) >= 2 and parts[0] == "users":
-        return parts[1]
-    return ""
 
 
 def translate_env(
@@ -174,11 +113,11 @@ def translate_env(
         if sep:
             # Multi-value path-list env: split, translate each, drop empties.
             segments = [s for s in expanded.split(sep) if s]
-            translated = [translate_path(s, agent_dir, username) for s in segments]
+            translated = [_translate(s, agent_dir, username) for s in segments]
             translated = [t for t in translated if t]
             out[key] = sep.join(translated)
         else:
-            out[key] = translate_path(expanded, agent_dir, username)
+            out[key] = _translate(expanded, agent_dir, username)
     return out
 
 
@@ -240,8 +179,7 @@ def translate_satellite_to_virtual_in_text(
         if len(parts) < 2:
             return raw
         rel = parts[1]  # "users/X/foo" / "workspace/foo" / etc.
-        first = rel.split("/", 1)[0]
-        if first not in ("users", "workspace", "knowledge", "config"):
+        if not layout.head_of(rel):
             return raw  # not inside the synced subtree we care about
         return "/" + rel
 
@@ -263,7 +201,7 @@ def translate_paths_in_text(
     handles the mapping; on remote satellites we have no bwrap, so this
     function does the equivalent rewrite on the satellite side.
 
-    Same translation rules as ``translate_path`` — applied via regex on the
+    The vendored rule (``layout.host_of_virtual``) — applied via regex on the
     whole string. Sandbox-style absolute paths are unique enough that false
     positives are very unlikely; if a user types a literal ``/users/foo/...``
     in chat referring to a real platform path, translating it is the correct
@@ -281,7 +219,7 @@ def translate_paths_in_text(
         return text
 
     def _sub(match: re.Match) -> str:
-        return translate_path(match.group(1), agent_dir, username)
+        return _translate(match.group(1), agent_dir, username)
 
     return _SANDBOX_PATH_RE.sub(_sub, text)
 
@@ -309,7 +247,7 @@ def translate_codex_mcp_env_paths(
     Codex reports ``connection closed: initialize response``).
 
     Applied to the shipped MCP TOML before the interactive header / interceptor
-    wrap. The shared ``_SANDBOX_PATH_RE`` only matches the six sandbox prefixes
+    wrap. The shared ``_SANDBOX_PATH_RE`` only matches the sandbox prefixes
     (so already-real ``command``/``args`` paths, loopback URLs, and JWT/token
     values are untouched), and ``OTO_TOOL_ARG_PATHS`` carries only tool names +
     JSONPath expressions (no sandbox filesystem paths), so it is preserved.
@@ -322,15 +260,15 @@ def translate_codex_mcp_env_paths(
     # FORWARD slashes. config.toml is TOML, where a Windows backslash path inside a
     # basic ("...") string is parsed as escape sequences — ``C:\Users\…`` → ``\U``
     # → "too few unicode value digits, expected unicode hexadecimal value" → the
-    # whole config fails to load. ``translate_path`` builds ``f"{str(agent_dir)}…"``
+    # whole config fails to load. the vendored rule builds ``f"{str(agent_dir)}…"``
     # whose base is backslash-separated on Windows, so we normalise the substituted
     # value to forward slashes: TOML-safe AND a valid path for the (Python) MCP
     # subprocess on Windows — the same forward-slash convention codex_session /
     # codex_pty_session already use for ``~/.oto-dock``. No-op on Unix
-    # (``translate_path`` already returns forward-slash paths there). NOTE: this is
+    # (the rule already returns forward-slash paths there). NOTE: this is
     # TOML-specific — the plain ``translate_paths_in_text`` (used for prompt text,
     # not TOML) must NOT forward-slash, so we don't route through it here.
     def _sub(match: "re.Match") -> str:
-        return translate_path(match.group(1), agent_dir, username).replace("\\", "/")
+        return _translate(match.group(1), agent_dir, username).replace("\\", "/")
 
     return _SANDBOX_PATH_RE.sub(_sub, toml_text)

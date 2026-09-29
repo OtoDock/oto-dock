@@ -9,11 +9,12 @@ import contextlib
 from datetime import datetime, timezone
 from typing import Any
 
+from storage.chat import meeting_status
 from storage.pg import get_conn
 
 
 # ---------------------------------------------------------------------------
-# Meetings
+# Meetings — the status vocabulary is storage/chat/meeting_status.py
 # ---------------------------------------------------------------------------
 
 def create_meeting(meeting_id: str, topic: str, participants: str,
@@ -51,8 +52,8 @@ def count_active_meeting_participants(created_by: str) -> int:
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT participants FROM meetings "
-            "WHERE created_by=%s AND status IN ('active','concluding','pending')",
-            (created_by,),
+            "WHERE created_by=%s AND status = ANY(%s)",
+            (created_by, sorted(meeting_status.LIVE)),
         ).fetchall()
     total = 0
     for r in rows:
@@ -61,18 +62,78 @@ def count_active_meeting_participants(created_by: str) -> int:
     return total
 
 
-def update_meeting(meeting_id: str, **fields) -> bool:
-    allowed = {"status", "current_round", "active_participants", "summary",
-               "cost_usd", "concluded_at", "parent_session_id"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
+_UPDATABLE = frozenset({"status", "current_round", "active_participants", "summary",
+                        "cost_usd", "concluded_at", "parent_session_id"})
+
+
+def _update_sql(fields: dict) -> tuple[str, list[Any]]:
+    updates = {k: v for k, v in fields.items() if k in _UPDATABLE}
+    status = updates.get("status")
+    if status is not None and status not in meeting_status.STATUSES:
+        raise ValueError(f"invalid meeting status: {status!r}")
     if not updates:
+        return "", []
+    return ", ".join(f"{k}=%s" for k in updates), list(updates.values())
+
+
+def update_meeting(meeting_id: str, **fields) -> bool:
+    """Write the named columns; a ``status`` outside
+    ``meeting_status.STATUSES`` is refused (the writers keep their own
+    transition guards; this is membership)."""
+    set_clause, values = _update_sql(fields)
+    if not set_clause:
         return False
-    sql = f"UPDATE meetings SET {', '.join(f'{k}=%s' for k in updates)} WHERE id=%s"
-    values = list(updates.values()) + [meeting_id]
     with get_conn() as conn:
-        conn.execute(sql, values)
+        conn.execute(f"UPDATE meetings SET {set_clause} WHERE id=%s", values + [meeting_id])
         conn.commit()
         return True
+
+
+def update_meeting_if(meeting_id: str, statuses, **fields) -> bool:
+    """``update_meeting`` for a row whose status is one of ``statuses`` at
+    the moment of the write, in one statement: the orchestrator's
+    read-then-write steps (a paused meeting resumed by the moderator, an
+    end, the conclusion) run on the DB executor now, so two of them may
+    interleave; the condition keeps a later end from being overwritten by
+    an earlier resume. False when the row is elsewhere."""
+    set_clause, values = _update_sql(fields)
+    if not set_clause:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            f"UPDATE meetings SET {set_clause} WHERE id=%s AND status = ANY(%s) RETURNING id",
+            values + [meeting_id, sorted(statuses)],
+        ).fetchone()
+        conn.commit()
+        return row is not None
+
+
+def remove_active_participant(meeting_id: str, agent_slug: str, statuses) -> list[str] | None:
+    """Take ``agent_slug`` out of ``active_participants`` under the row's
+    lock (two agents leaving at once must both leave) while the status is
+    one of ``statuses``. The remaining list, or None when the row is
+    elsewhere or the agent was not active."""
+    import json as _json
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status, active_participants FROM meetings WHERE id=%s FOR UPDATE",
+            (meeting_id,),
+        ).fetchone()
+        if not row or row["status"] not in statuses:
+            conn.rollback()
+            return None
+        try:
+            active = list(_json.loads(row["active_participants"] or "[]"))
+        except (ValueError, TypeError):
+            active = []
+        if agent_slug not in active:
+            conn.rollback()
+            return None
+        active.remove(agent_slug)
+        conn.execute("UPDATE meetings SET active_participants=%s WHERE id=%s",
+                     (_json.dumps(active), meeting_id))
+        conn.commit()
+        return active
 
 
 def mark_orphaned_meetings_failed() -> int:
@@ -84,9 +145,9 @@ def mark_orphaned_meetings_failed() -> int:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE meetings SET status='failed', concluded_at=%s "
-            "WHERE status IN ('active', 'pending', 'concluding')",
-            (now,),
+            "UPDATE meetings SET status=%s, concluded_at=%s "
+            "WHERE status = ANY(%s)",
+            (meeting_status.FAILED, now, sorted(meeting_status.LIVE)),
         )
         conn.commit()
         return cur.rowcount
@@ -95,19 +156,23 @@ def mark_orphaned_meetings_failed() -> int:
 def get_active_meeting_for_chat(parent_chat_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM meetings WHERE parent_chat_id=%s AND status IN ('active','concluding','pending') "
+            "SELECT * FROM meetings WHERE parent_chat_id=%s AND status = ANY(%s) "
             "ORDER BY created_at DESC LIMIT 1",
-            (parent_chat_id,),
+            (parent_chat_id, sorted(meeting_status.LIVE)),
         ).fetchone()
         return dict(row) if row else None
 
 
-def list_meetings(limit: int = 50, offset: int = 0,
-                  agent: str | None = None,
-                  status: str | None = None,
-                  scope_user_sub: str | None = None,
-                  created_by: str | None = None) -> list[dict]:
-    """List meetings with optional filtering by agent, status, scope, and creator."""
+def _meeting_conditions(agent, status, scope_user_sub, created_by,
+                        readable_agents) -> tuple[str, list[Any]]:
+    """The WHERE the list and its count share, so a page and its total
+    agree. ``scope_user_sub`` keeps a caller to agent-scope rows and their
+    own user-scope rows; ``readable_agents`` (a person's agents, a no-user
+    session's own agent and its edge targets; None for an admin or the
+    master key) narrows the agent-scope rows to meetings whose EVERY
+    participant the caller can read: access to one participant never opens
+    a meeting with others. ``participants`` is always a JSON array written
+    by ``create_meeting``; an empty one is nobody's."""
     conditions: list[str] = []
     params: list[Any] = []
     if agent:
@@ -117,13 +182,30 @@ def list_meetings(limit: int = 50, offset: int = 0,
     if status:
         conditions.append("status=%s")
         params.append(status)
-    if scope_user_sub is not None:
+    if scope_user_sub is not None and readable_agents is not None:
+        conditions.append(
+            "((scope='user' AND created_by=%s) OR (scope='agent' AND participants <> '[]' "
+            "AND participants::jsonb <@ to_jsonb(%s::text[])))")
+        params.extend([scope_user_sub, list(readable_agents)])
+    elif scope_user_sub is not None:
         conditions.append("(scope='agent' OR (scope='user' AND created_by=%s))")
         params.append(scope_user_sub)
     if created_by:
         conditions.append("created_by=%s")
         params.append(created_by)
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    return (f"WHERE {' AND '.join(conditions)}" if conditions else ""), params
+
+
+def list_meetings(limit: int = 50, offset: int = 0,
+                  agent: str | None = None,
+                  status: str | None = None,
+                  scope_user_sub: str | None = None,
+                  created_by: str | None = None,
+                  readable_agents: list[str] | None = None) -> list[dict]:
+    """List meetings with optional filtering by agent, status, scope, creator
+    and the caller's readable agents (``_meeting_conditions``)."""
+    where, params = _meeting_conditions(agent, status, scope_user_sub, created_by,
+                                        readable_agents)
     params.extend([limit, offset])
     with get_conn() as conn:
         rows = conn.execute(
@@ -136,26 +218,24 @@ def list_meetings(limit: int = 50, offset: int = 0,
 def get_meeting_count(agent: str | None = None,
                       status: str | None = None,
                       scope_user_sub: str | None = None,
-                      created_by: str | None = None) -> int:
-    """Count meetings matching filters."""
-    conditions: list[str] = []
-    params: list[Any] = []
-    if agent:
-        conditions.append('(participants LIKE %s OR moderator=%s)')
-        params.extend([f'%"{agent}"%', agent])
-    if status:
-        conditions.append("status=%s")
-        params.append(status)
-    if scope_user_sub is not None:
-        conditions.append("(scope='agent' OR (scope='user' AND created_by=%s))")
-        params.append(scope_user_sub)
-    if created_by:
-        conditions.append("created_by=%s")
-        params.append(created_by)
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+                      created_by: str | None = None,
+                      readable_agents: list[str] | None = None) -> int:
+    """Count meetings matching the list's filters."""
+    where, params = _meeting_conditions(agent, status, scope_user_sub, created_by,
+                                        readable_agents)
     with get_conn() as conn:
         row = conn.execute(f"SELECT COUNT(*) AS cnt FROM meetings {where}", params).fetchone()
         return row["cnt"] if row else 0
+
+
+def list_live_meetings_created_by(sub: str) -> list[dict]:
+    """The person's meetings that are not over (the offboarding end)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM meetings WHERE created_by=%s AND NOT (status = ANY(%s))",
+            (sub, sorted(meeting_status.TERMINAL)),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def add_meeting_turn(meeting_id: str, round_number: int, turn_order: int,

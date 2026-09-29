@@ -386,6 +386,8 @@ def startup_key_canary() -> None:
         ("2FA/TOTP enrollments",
          "SELECT totp_secret_enc AS v FROM users "
          "WHERE totp_secret_enc IS NOT NULL AND totp_secret_enc <> '' LIMIT 5"),
+        ("app secrets",
+         "SELECT value_enc AS v FROM app_secrets WHERE value_enc <> '' LIMIT 5"),
     ]
     bad: list[str] = []
     try:
@@ -598,9 +600,40 @@ def cleanup_service_agent_bindings_for_owner(owner_sub: str) -> list[dict]:
         return snapshot
 
 
+def list_service_agent_bindings_for_owner(owner_sub: str) -> list[dict]:
+    """Every ``service_agent_bindings`` row lending this person's accounts,
+    ``{mcp_name, agent_name, account_label}``, standing or not: the
+    offboarding subscriber judges each against the person's standing on
+    that agent and clears the ones that no longer hold."""
+    if not owner_sub:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT mcp_name, agent_name, account_label "
+            "FROM service_agent_bindings WHERE account_owner_sub=%s "
+            "ORDER BY agent_name, mcp_name",
+            (owner_sub,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Per-agent service-account bindings
 # ---------------------------------------------------------------------------
+
+def _owner_manages(owner_sub: str, agent_name: str) -> bool:
+    """Whether the bound account's owner still manages ``agent_name``: a
+    platform admin, or a per-agent manager. The binding lends the manager's
+    OWN account, so it stands only while they hold that standing — the same
+    re-check a share link's creator gets at every click (SHARING.md)."""
+    from auth import roles
+    from storage.identity import db_users
+    user = db_users.get_user(owner_sub)
+    if not user:
+        return False
+    return roles.can_manage(roles.effective_role(
+        user.get("role"), db_users.get_user_agent_roles(owner_sub), agent_name))
+
 
 def get_service_agent_binding(
     mcp_name: str, agent_name: str,
@@ -610,8 +643,10 @@ def get_service_agent_binding(
     ``account_owner_sub`` is always a real ``<user_sub>`` — the binding points
     at that user's ``user_credential_accounts(<sub>, mcp, account_label)`` row
     (a manager/admin designated their connected account as the agent's service
-    identity for agent-scope sessions). ``None`` → no binding; the agent gets
-    no credential for this MCP in agent scope (no platform default).
+    identity for agent-scope sessions). ``None`` → no binding, or a binding
+    whose owner no longer manages the agent (demoted, unassigned, deleted):
+    the row stays for the next bind or clear, but the agent gets no
+    credential for this MCP in agent scope (no platform default).
     """
     with get_conn() as conn:
         row = conn.execute(
@@ -621,7 +656,11 @@ def get_service_agent_binding(
         ).fetchone()
         if not row:
             return None
-        return (row["account_label"], row["account_owner_sub"])
+    if not _owner_manages(row["account_owner_sub"], agent_name):
+        logger.debug("service binding %s/%s: owner %s no longer manages the agent",
+                     mcp_name, agent_name, row["account_owner_sub"][:8])
+        return None
+    return (row["account_label"], row["account_owner_sub"])
 
 
 def set_service_agent_binding(

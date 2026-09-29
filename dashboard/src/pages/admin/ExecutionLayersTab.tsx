@@ -22,6 +22,11 @@ import { LocalModelsSection } from './ExecutionLayersTab.local'
 import { SubscriptionRow, ModelsByProvider } from './ExecutionLayersTab.rows'
 import { SetupBanner } from './ExecutionLayersTab.sections'
 import { BalanceHint } from '../../components/engines/SubscriptionWindows'
+import {
+  acceptsLocalEndpoints, acceptsRelay, codingEngineNames, engineLabel, isCoding, isLocalProvider,
+  keyProviders, sortEngineRows, supportsOAuth, vendorBadge,
+} from '../../lib/engines'
+import { ENGINE_SUBSCRIPTION_STATUS } from '../../lib/status/engineSubscription'
 
 // ---------------------------------------------------------------------------
 // Layer Card
@@ -43,27 +48,28 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 
   const discoverMut = useDiscoverModels()
 
-  const isDirectLlm = layer.name === 'direct-llm'
-  // Vendor chip shown before the engine name (mirrors User Settings → AI Engines).
-  // Only the single-vendor coding CLIs get one; direct-llm is multi-provider.
-  const vendorBadge = layer.name === 'claude-code-cli' ? 'Anthropic'
-    : layer.name === 'codex-cli' ? 'OpenAI'
-    : null
+  // Everything the card decides about the engine comes from its descriptor
+  // (lib/engines.ts), never from the id: the relay-capable engine gets the
+  // hosted section and the "bring your own key" wording, an engine with a
+  // login gets Connect Account, the vendor chip is its vendor (none for a
+  // multi-provider engine, which mirrors User Settings → AI Engines).
+  const engine = layer.capabilities
+  const relayCapable = acceptsRelay(engine)
+  const vendor = vendorBadge(engine)
+  const label = engineLabel(engine)
   const subs = layer.subscriptions.platform
-  const activeSubs = subs.filter((s) => s.status === 'active').length
+  const activeSubs = subs.filter((s) => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE).length
   const oauthCount = subs.filter((s) => s.auth_type === 'oauth').length
   const apiKeyCount = subs.filter((s) => s.auth_type === 'api_key').length
-  const hostedCount = subs.filter((s) => s.auth_type === 'relay' && s.status === 'active').length
+  const hostedCount = subs.filter((s) => s.auth_type === 'relay' && s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE).length
   // Hosted (relay) subs render in their own toggle box; the row list shows only
   // bring-your-own credentials (keys / OAuth). Local endpoints live in the
   // shared Local models section (the server lists them once, not per layer).
-  const rowSubs = isDirectLlm ? subs.filter((s) => s.auth_type !== 'relay') : subs
-  const hasLocalModels = isDirectLlm || layer.name === 'codex-cli'
-
-  // Determine the main provider for API keys
-  const mainProvider = layer.name === 'codex-cli' ? 'openai'
-    : layer.name === 'claude-code-cli' ? 'anthropic'
-    : 'anthropic'
+  const rowSubs = relayCapable ? subs.filter((s) => s.auth_type !== 'relay') : subs
+  const hasLocalModels = acceptsLocalEndpoints(engine)
+  // The providers an admin key on this engine may belong to (its vendor,
+  // or the key-taking providers of a multi-provider engine).
+  const providers = keyProviders(engine)
 
   // Existing model IDs for the discover panel
   const existingModelIds = new Set(layer.models.map((m) => m.model_id))
@@ -87,8 +93,7 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   // was launched from: below the key rows for a key subscription, below the
   // shared Local models section for a local endpoint — a panel ABOVE the
   // section read as belonging to the key list (operator feedback 2026-09-06).
-  const isLocalDiscover = discoverState != null
-    && (discoverState.provider === 'ollama' || discoverState.provider === 'openai_compatible')
+  const isLocalDiscover = discoverState != null && isLocalProvider(engine, discoverState.provider)
   const discoverPanel = discoverState ? (
     <>
       {/* Discover models: loading state */}
@@ -140,14 +145,12 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
         className="w-full flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 text-left hover:bg-p-bg-hover/30 transition-colors"
       >
         <div className="flex flex-wrap items-center gap-2 sm:gap-3 min-w-0">
-          {vendorBadge && (
+          {vendor && (
             <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
-              {vendorBadge}
+              {vendor}
             </span>
           )}
-          <h3 className="text-sm font-semibold text-p-text">
-            {vendorBadge ? layer.display_name.replace(/^(OpenAI|Anthropic)\s+/i, '') : layer.display_name}
-          </h3>
+          <h3 className="text-sm font-semibold text-p-text">{label}</h3>
           <Badge variant={activeSubs > 0 ? 'green' : 'default'}>
             {[
               hostedCount > 0 && `${hostedCount} hosted`,
@@ -174,9 +177,9 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
           {/* Subscriptions Section — bring-your-own credentials */}
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-              <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider">{isDirectLlm ? 'Bring your own key' : 'Subscriptions'}</h4>
+              <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider">{relayCapable ? 'Bring your own key' : 'Subscriptions'}</h4>
               <div className="flex flex-wrap gap-2">
-                {(layer.name === 'claude-code-cli' || layer.name === 'codex-cli') && (
+                {supportsOAuth(engine) && (
                   <button
                     onClick={() => { setShowOAuth(!showOAuth); setShowAddApiKey(false) }}
                     className="text-xs text-brand hover:text-brand-hover transition-colors"
@@ -195,7 +198,7 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 
             {rowSubs.length === 0 && !showAddApiKey && !showOAuth && (
               <p className="text-sm text-p-text-light py-2">
-                {isDirectLlm
+                {relayCapable
                   ? 'No API keys configured.'
                   : 'No platform subscriptions configured.'}
               </p>
@@ -207,17 +210,18 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
                   key={sub.id}
                   sub={sub}
                   layer={layer.name}
+                  vendorId={engine.identity.vendor_id}
                   onDiscover={handleDiscover}
                 />
               ))}
             </div>
-            <BalanceHint oauthCount={rowSubs.filter((s) => s.auth_type === 'oauth' && s.status === 'active').length} />
+            <BalanceHint oauthCount={rowSubs.filter((s) => s.auth_type === 'oauth' && s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE).length} />
 
             {showOAuth && (
-              <ConnectOAuth layer={layer.name} ownerType="platform" provider={layer.name === 'codex-cli' ? 'openai' : 'claude'} onDone={() => setShowOAuth(false)} />
+              <ConnectOAuth engine={engine} ownerType="platform" onDone={() => setShowOAuth(false)} />
             )}
             {showAddApiKey && (
-              <AddApiKeyForm layer={layer.name} provider={mainProvider} onDone={() => setShowAddApiKey(false)} />
+              <AddApiKeyForm layer={layer.name} providers={providers} onDone={() => setShowAddApiKey(false)} />
             )}
 
             {/* Discover panel for a key subscription — under the key rows */}
@@ -247,6 +251,8 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
             <ModelsByProvider
               models={layer.models}
               layer={layer.name}
+              pricingEditable={engine.model_policy.pricing_editable}
+              providers={engine.providers}
               showAddModel={showAddModel as string | false}
               onAddCustom={(provider) => setShowAddModel(showAddModel === provider ? false : provider)}
               onAddDone={() => setShowAddModel(false)}
@@ -269,23 +275,19 @@ export default function ExecutionLayersTab() {
   if (error) return <p className="text-sm text-red-500">Failed to load execution layers.</p>
   if (!layers || layers.length === 0) return <p className="text-sm text-p-text-secondary">No execution layers found.</p>
 
-  // Direct-LLM renders last (it's the supporting layer — title gen / phone
-  // classifier — not a primary coding agent). Array.sort is stable, so the
-  // other layers keep their backend order.
-  const orderedLayers = [...layers].sort(
-    (a, b) => (a.name === 'direct-llm' ? 1 : 0) - (b.name === 'direct-llm' ? 1 : 0),
-  )
+  // The engines in their declared order (`identity.sort_order`: the coding
+  // engines first, the supporting one — title gen / phone classifier — last).
+  const orderedLayers = sortEngineRows(layers)
 
-  // The setup banner clears once a coding agent has an active platform sub.
+  // The setup banner clears once a coding engine has an active platform sub;
+  // it names the coding engines from their descriptors.
   const codingReady = layers.some(
-    (l) =>
-      (l.name === 'claude-code-cli' || l.name === 'codex-cli') &&
-      l.subscriptions.platform.some((s) => s.status === 'active'),
+    (l) => isCoding(l.capabilities) && l.subscriptions.platform.some((s) => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE),
   )
 
   return (
     <div className="space-y-4">
-      {!codingReady && <SetupBanner />}
+      {!codingReady && <SetupBanner engines={codingEngineNames(layers.map((l) => l.capabilities))} />}
       <p className="text-sm text-p-text-light">
         Configure the platform's Anthropic and OpenAI subscriptions (used for
         agent-scoped tasks and chats) plus API keys and models for each AI engine.

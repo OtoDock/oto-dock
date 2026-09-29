@@ -81,24 +81,30 @@ def test_bwrap_args_are_rendered_from_the_mount_table(tree, role, username):
 
 
 def test_role_matrix(tree):
+    # The agent's own CLI state is masked (empty, read-only) out of every
+    # session that does not run from it.
+    masked = {"/workspace/.claude": False, "/workspace/.codex": False}
     assert _rw(_cfg(tree, "manager", "alice")) == {
         "/users/alice": False, "/users/alice/workspace": True,
         "/users/alice/context": True, "/users/alice/.claude": True,
-        "/config": True, "/knowledge": True, "/workspace": True,
+        "/config": True, "/knowledge": True, "/workspace": True, **masked,
     }
     assert _rw(_cfg(tree, "editor", "alice")) == {
         "/users/alice": False, "/users/alice/workspace": True,
         "/users/alice/context": True, "/users/alice/.claude": True,
-        "/knowledge": False, "/workspace": True,
+        "/knowledge": False, "/workspace": True, **masked,
     }
     assert _rw(_cfg(tree, "viewer", "alice")) == {
         "/users/alice": False, "/users/alice/workspace": True,
         "/users/alice/context": True, "/users/alice/.claude": True,
-        "/knowledge": False, "/workspace": False,
+        "/knowledge": False, "/workspace": False, **masked,
     }
     # Agent scope (service sessions / Shared-only chats): no user dir.
     assert _rw(_cfg(tree, "manager", "")) == {"/workspace": True, "/knowledge": False}
-    assert _rw(_cfg(tree, "viewer", "")) == {"/workspace": False, "/knowledge": False}
+    # Below the editor tier a person never runs from the agent's state (the
+    # engines refuse the session); anything run as them sees it masked.
+    assert _rw(_cfg(tree, "viewer", "")) == {"/workspace": False, "/knowledge": False, **masked}
+    assert not df.has_writable_mount(df.mount_table(_cfg(tree, "viewer", "")))
     # Personal-only: no shared roots at all.
     assert "/workspace" not in _rw(_cfg(tree, "manager", "alice", mount_shared=False))
 
@@ -291,3 +297,93 @@ def test_write_edit_roundtrip_and_caps(tree):
         df.write_text(r, "x" * (df.WRITE_MAX_BYTES + 1))
     with pytest.raises(FileToolError, match="folder"):
         df.write_text(_resolve(cfg, "/workspace/new", writing=True), "x")
+
+
+# ---------------------------------------------------------------------------
+# Symlinked leaves and the strict opens
+# ---------------------------------------------------------------------------
+
+def test_dangling_leaf_symlink_write_refused(tree, tmp_path):
+    """The PoC's shape: a dangling link in /workspace to a file that does
+    not exist yet outside the mount. The write is refused and the outside
+    file is never created."""
+    agents, _ = tree
+    cfg = _cfg(tree)
+    outside = tmp_path / "OUTSIDE"
+    outside.mkdir()
+    target = outside / "planted.txt"
+    (agents / AGENT / "workspace" / "escape").symlink_to(target)
+    with pytest.raises(FileToolError, match="symlink"):
+        _resolve(cfg, "/workspace/escape", writing=True)
+    assert not target.exists()
+
+
+def test_existing_leaf_symlink_write_refused(tree):
+    agents, _ = tree
+    cfg = _cfg(tree)
+    ws = agents / AGENT / "workspace"
+    (ws / "alias.md").symlink_to(ws / "notes.md")
+    with pytest.raises(FileToolError, match="symlink"):
+        _resolve(cfg, "/workspace/alias.md", writing=True)
+    assert (ws / "notes.md").read_text() == "line one\nline two\nline three\n"
+    # A link in the middle of a write path is refused as well.
+    (ws / "sub").mkdir()
+    (ws / "alias-dir").symlink_to(ws / "sub")
+    with pytest.raises(FileToolError, match="symlink"):
+        df.write_text(_resolve(cfg, "/workspace/alias-dir/new.md", writing=True), "x")
+    assert not (ws / "sub" / "new.md").exists()
+
+
+def test_read_of_swapped_alias_is_refused(tree, tmp_path):
+    """An in-mount alias is readable; once its target is swapped out of the
+    mount after the resolve, the read is refused at the open."""
+    agents, _ = tree
+    cfg = _cfg(tree)
+    ws = agents / AGENT / "workspace"
+    (ws / "alias.md").symlink_to(ws / "notes.md")
+    r = _resolve(cfg, "/workspace/alias.md")
+    assert "line one" in df.read_numbered(r)
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=1\n")
+    (ws / "alias.md").unlink()
+    (ws / "alias.md").symlink_to(secret)
+    with pytest.raises(FileToolError):
+        df.read_numbered(r)
+    # A regular file swapped for a link after the resolve, the same.
+    r = _resolve(cfg, "/workspace/notes.md")
+    (ws / "notes.md").unlink()
+    (ws / "notes.md").symlink_to(secret)
+    with pytest.raises(FileToolError):
+        df.read_numbered(r)
+
+
+def test_edit_never_writes_through_a_link(tree, tmp_path):
+    agents, _ = tree
+    cfg = _cfg(tree)
+    ws = agents / AGENT / "workspace"
+    outside = tmp_path / "outside.md"
+    outside.write_text("keep me")
+    r = _resolve(cfg, "/workspace/notes.md", writing=True)
+    (ws / "notes.md").unlink()
+    (ws / "notes.md").symlink_to(outside)
+    with pytest.raises(FileToolError):
+        df.edit_text(r, "keep", "gone")
+    with pytest.raises(FileToolError):
+        df.write_text(r, "overwritten")
+    assert outside.read_text() == "keep me"
+
+
+def test_write_under_a_moved_mount_root_is_refused(tree):
+    """The mount table trusts its host paths by name (the builder verified
+    them when it was made); a folder swapped for a link afterwards is
+    caught at the mount root instead of followed."""
+    agents, _ = tree
+    cfg = _cfg(tree)
+    mounts = df.mount_table(cfg)
+    cwd = df.session_cwd(cfg)
+    ws = agents / AGENT / "workspace"
+    ws.rename(ws.with_name("workspace-real"))
+    ws.symlink_to("workspace-real")
+    with pytest.raises(FileToolError, match="moved"):
+        df.resolve(mounts, "/workspace/x.md", cwd=cwd, writing=True)
+    assert not (agents / AGENT / "workspace-real" / "x.md").exists()

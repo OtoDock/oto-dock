@@ -1,15 +1,5 @@
 import type { LimitPayload, PoolCapField, PoolCapStatus } from '@/api/usage'
 
-// The two engines that carry subscription accounts, and what the accounts are.
-export const ENGINE_NAMES: Record<string, string> = {
-  'claude-code-cli': 'Claude Code',
-  'codex-cli': 'Codex',
-}
-export const ACCOUNT_NAMES: Record<string, string> = {
-  'claude-code-cli': 'Claude',
-  'codex-cli': 'ChatGPT',
-}
-
 export const CAP_FIELDS: PoolCapField[] = ['week_pct', 'day_pct', 'week_usd', 'day_usd']
 
 // `short` names the reading on the Usage pages: the percentages are of the
@@ -23,8 +13,11 @@ const FIELD_TEXT: Record<PoolCapField, { period: string; short: string; unit: 'p
   day_usd: { period: 'today', short: 'API cost, 24 h', unit: 'usd' },
 }
 
-export function engineName(layer: string): string {
-  return ENGINE_NAMES[layer] || layer
+/** The engine's name in a sentence. `labels` is id → label from the catalog
+ *  (lib/engines engineLabels, built by the page that owns a catalog); an
+ *  engine the catalog does not know is named by its id. */
+export function engineName(layer: string, labels: Record<string, string> = {}): string {
+  return labels[layer] || layer
 }
 
 function num(x: number): string {
@@ -78,13 +71,15 @@ export function readingTone(s: PoolCapStatus, key: PoolCapField): 'error' | 'war
 }
 
 // The composer's red banner: which budget blocked the turn.
-export function describeLimitReached(info: LimitPayload | null): { title: string; body: string } {
+export function describeLimitReached(
+  info: LimitPayload | null, labels: Record<string, string> = {},
+): { title: string; body: string } {
   if (info?.pool) {
     const s = info.pool
     const hit = hitText(s)
     return {
       title: 'Subscription cap reached.',
-      body: `${engineName(s.layer)}${hit ? `: ${hit}` : ''}. It clears as the accounts' windows reset; `
+      body: `${engineName(s.layer, labels)}${hit ? `: ${hit}` : ''}. It clears as the accounts' windows reset; `
         + (s.scope === 'user' ? 'change the cap in User Settings → Usage.' : 'an admin can change the cap in Setup → Usage.'),
     }
   }
@@ -102,12 +97,12 @@ export function describeLimitReached(info: LimitPayload | null): { title: string
 }
 
 // The composer's amber toast text.
-export function describeLimitWarning(info: LimitPayload | null): string {
+export function describeLimitWarning(info: LimitPayload | null, labels: Record<string, string> = {}): string {
   if (info?.pool) {
     const s = info.pool
     if (s.hits.length) return `Subscription cap reached (${hitText(s)}); continuing on an API key.`
     const key = warningField(s)
-    if (key) return `Subscription cap: ${describeReading(s, key)} on ${engineName(s.layer)}.`
+    if (key) return `Subscription cap: ${describeReading(s, key)} on ${engineName(s.layer, labels)}.`
   }
   const self = info?.self
   for (const period of ['monthly', 'weekly'] as const) {

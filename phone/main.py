@@ -34,6 +34,58 @@ import config
 # Track active calls
 _active_calls: dict[str, asyncio.Task] = {}
 
+# Connections that have not yet sent their identifying UUID frame are
+# bounded before anything is read from them: at most PENDING_MAX across the
+# daemon and PENDING_PER_PEER_MAX per peer host, closed at once past either
+# ceiling, and released as soon as the frame is read (a resolved call is
+# ``_active_calls``'s from then on). Asterisk sends the frame immediately,
+# so the read waits two seconds at most. The soft descriptor limit is
+# raised at start so a burst of connections cannot exhaust it first.
+PENDING_MAX = 64
+PENDING_PER_PEER_MAX = 8
+UUID_READ_TIMEOUT_S = 2.0
+_pending_total = 0
+_pending_by_peer: dict[str, int] = {}
+
+
+class _RateLimitedLog:
+    """One line per reason per window, carrying the count it held back."""
+
+    def __init__(self, window_s: float = 5.0):
+        self._window = window_s
+        self._last: dict[str, float] = {}
+        self._held: dict[str, int] = {}
+
+    def warning(self, log: logging.Logger, reason: str, message: str) -> None:
+        now = time.monotonic()
+        last = self._last.get(reason)
+        if last is not None and now - last < self._window:
+            self._held[reason] = self._held.get(reason, 0) + 1
+            return
+        held = self._held.pop(reason, 0)
+        self._last[reason] = now
+        if held:
+            message += f" ({held} more in the last {self._window:.0f}s)"
+        log.warning(message)
+
+
+_reject_log = _RateLimitedLog()
+
+
+def _raise_nofile_limit(log: logging.Logger) -> None:
+    """Lift the soft descriptor limit to the hard one (at most 65536): the
+    daemon holds a socket per call plus its provider connections, and a
+    container's default soft limit of 1024 is what a connection burst fills."""
+    import resource
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            log.info(f"RLIMIT_NOFILE soft limit raised {soft} -> {target}")
+    except (ValueError, OSError) as e:
+        log.warning(f"RLIMIT_NOFILE soft limit not raised: {e}")
+
 # Asterisk uniqueid shape (``epoch.seq``, optional systemname prefix) — the
 # register payload's dial_event is caller-supplied JSON, so the value is
 # validated before it can key the AMI DTMF registration map.
@@ -57,13 +109,8 @@ def _resolve_route(call_uuid: str, cfg: ConfigManager):
     """
     outbound_call = _call_manager.get_call_by_uuid(call_uuid)
     if outbound_call:
-        # Look up the outbound route from config
-        route_id = getattr(outbound_call, "route_id", "")
-        if route_id:
-            route = cfg.get_outbound_route(route_id)
-        else:
-            route = cfg.get_default_outbound_route()
-        return (route, True)
+        # Every origination named its route; an unknown id resolves to None.
+        return (cfg.get_outbound_route(outbound_call.route_id), True)
 
     route = cfg.resolve_inbound_route(call_uuid)
     return (route, False)
@@ -217,6 +264,18 @@ async def _handle_connection(
     ami_manager: AmiListenerManager | None = None,
 ) -> None:
     """Handle a single AudioSocket connection from Asterisk."""
+    global _pending_total
+    peername = writer.get_extra_info("peername")
+    peer_host = str(peername[0]) if peername else "unknown"
+    if (_pending_total >= PENDING_MAX
+            or _pending_by_peer.get(peer_host, 0) >= PENDING_PER_PEER_MAX):
+        _reject_log.warning(
+            logger, "pending",
+            f"Rejecting {peer_host}: too many connections awaiting their UUID "
+            f"frame ({_pending_total} pending)",
+        )
+        writer.close()
+        return
     conn = AudioSocketConnection(reader, writer)
     if len(_active_calls) >= cfg.max_live_calls:
         logger.warning(
@@ -227,19 +286,30 @@ async def _handle_connection(
         return
     logger.info(f"New connection from {conn.peer_addr}")
 
+    _pending_total += 1
+    _pending_by_peer[peer_host] = _pending_by_peer.get(peer_host, 0) + 1
     try:
         # First frame must be UUID
-        call_uuid = await asyncio.wait_for(conn.read_uuid(), timeout=5.0)
+        call_uuid = await asyncio.wait_for(conn.read_uuid(), timeout=UUID_READ_TIMEOUT_S)
     except (AudioSocketError, asyncio.TimeoutError) as e:
-        logger.error(f"Failed to read UUID from {conn.peer_addr}: {e}")
+        _reject_log.warning(
+            logger, "uuid", f"Failed to read UUID from {conn.peer_addr}: {e}")
         await conn.close()
         return
+    finally:
+        _pending_total -= 1
+        left = _pending_by_peer.get(peer_host, 0) - 1
+        if left > 0:
+            _pending_by_peer[peer_host] = left
+        else:
+            _pending_by_peer.pop(peer_host, None)
 
     route, is_outbound = _resolve_route(call_uuid, cfg)
 
     if route is None:
-        logger.warning(
-            f"Unknown UUID {call_uuid} from {conn.peer_addr} — rejecting connection"
+        _reject_log.warning(
+            logger, "unknown-uuid",
+            f"Unknown UUID {call_uuid} from {conn.peer_addr}; rejecting connection",
         )
         await conn.close()
         return
@@ -317,6 +387,7 @@ async def _run_server() -> None:
     logging.getLogger().addHandler(_file_handler)
 
     logger = logging.getLogger("phone-server")
+    _raise_nofile_limit(logger)
 
     # Suppress harmless Deepgram SDK cancel noise
     logging.getLogger("deepgram.clients.common.v1.abstract_async_websocket").setLevel(

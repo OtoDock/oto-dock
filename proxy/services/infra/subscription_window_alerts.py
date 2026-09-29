@@ -1,13 +1,14 @@
-"""Owner notifications when an OAuth account's weekly window passes 90 % and
+"""Owner notifications when an OAuth account's quota window passes 90 % and
 100 % (``services.engines.subscription_windows`` supplies the reading).
 
 One pass of the ~60 s registry sweep (``startup.py::_registry_sweep_loop``),
 self-throttled to 5 min. For every active OAuth row with an owner who has
 not turned the alerts off (ui-prefs ``subscription_usage_alerts: false``),
-each weekly window — the overall one and every per-model one — fires at
-most twice per window instance: 90 % as ``info``, 100 % as ``warning``
-(a full week locks the account for days). The 5-hour window never
-notifies: it turns over several times a day. Dedup rows
+each quota window — the engine's declared one (weekly for both vendors
+today) and every per-model one — fires at most twice per window instance:
+90 % as ``info``, 100 % as ``warning`` (a full quota locks the account for
+days). The session window never notifies: it turns over several times a
+day. Dedup rows
 (``subscription_window_alerts``) record the window instance an alert was
 for; a reading whose reset instant lies within an hour of the stored one
 is the same window (the poll's instant jitters across the minute boundary
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from services.engines import subscription_windows as sw
-from storage.billing import subscription_store
+from storage.billing import subscription_status, subscription_store
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,6 @@ _last_run: float = 0.0
 
 # Highest first: one notification per window per pass, the higher mark wins.
 _THRESHOLDS = ((100, "warning"), (90, "info"))
-
-_LAYER_PRODUCT = {"claude-code-cli": "Claude", "codex-cli": "ChatGPT"}
 
 PREF_KEY = "subscription_usage_alerts"
 
@@ -57,13 +56,14 @@ async def check_window_alerts(*, now: datetime | None = None) -> int:
         return 0
     rows = [
         r for r in rows
-        if r.get("auth_type") == "oauth" and r.get("status") == "active" and r.get("owner_sub")
+        if r.get("auth_type") == "oauth" and r.get("status") == subscription_status.ACTIVE
+        and r.get("owner_sub")
     ]
     if not rows:
         return 0
     now = now or datetime.now(timezone.utc)
     try:
-        readings = await asyncio.to_thread(sw.latest, [r["id"] for r in rows], now)
+        readings = await asyncio.to_thread(sw.latest, rows, now)   # rows: the layer names the specs
     except Exception:
         logger.exception("window alerts: failed to read the samples")
         return 0
@@ -101,15 +101,23 @@ async def _opted_out(owner: str) -> bool:
     return prefs.get(PREF_KEY) is False
 
 
-def _weekly_windows(reading: sw.Windows):
-    """(window_key, scoped label or "", pct, resets_at) for every weekly
-    window in the reading; windows without a reset instant are skipped (no
-    instance to alert on)."""
-    if reading.seven_day is not None and reading.seven_day.resets_at is not None:
-        yield "seven_day", "", reading.seven_day.pct, reading.seven_day.resets_at
+def _quota_windows(reading: sw.Windows):
+    """(window_key, scoped label or "", pct, resets_at) for the reading's
+    quota window and every per-model window; windows without a reset instant
+    are skipped (no instance to alert on)."""
+    key = reading.quota_key
+    win = reading.windows.get(key) if key else None
+    if win is not None and win.resets_at is not None:
+        yield key, "", win.pct, win.resets_at
     for s in reading.scoped:
         if s.resets_at is not None:
             yield f"scoped:{s.key}", s.label, s.pct, s.resets_at
+
+
+def _quota_label(reading: sw.Windows) -> str:
+    """The word the owner reads for the quota window ("weekly")."""
+    spec = reading.specs.get(reading.quota_key)
+    return spec.label if spec else "quota"
 
 
 # Two reset instants this close are ONE window instance. The vendor's
@@ -135,7 +143,8 @@ def _same_instance(stored: str | None, resets_at: datetime) -> bool:
 
 async def _check_row(sub: dict, reading: sw.Windows, now: datetime, *, others: int) -> int:
     fired = 0
-    for window_key, scoped_label, pct, resets_at in _weekly_windows(reading):
+    window_label = _quota_label(reading)
+    for window_key, scoped_label, pct, resets_at in _quota_windows(reading):
         instance = resets_at.replace(second=0, microsecond=0).isoformat()
         due = [(t, sev) for t, sev in _THRESHOLDS if pct >= t]
         if not due:
@@ -145,8 +154,9 @@ async def _check_row(sub: dict, reading: sw.Windows, now: datetime, *, others: i
             subscription_store.get_window_alert, sub["id"], window_key, top_threshold)
         if already and _same_instance(already.get("resets_at"), resets_at):
             continue
-        await _notify(sub, scoped_label=scoped_label, threshold=top_threshold,
-                      severity=severity, pct=pct, resets_at=resets_at, others=others)
+        await _notify(sub, scoped_label=scoped_label, window_label=window_label,
+                      threshold=top_threshold, severity=severity, pct=pct,
+                      resets_at=resets_at, others=others)
         fired += 1
         fired_at = now.isoformat()
         for threshold, _sev in due:
@@ -181,15 +191,16 @@ def _owner_when(owner: str, instant: datetime) -> str:
     return stamp if zone is not timezone.utc else f"{stamp} UTC"
 
 
-async def _notify(sub: dict, *, scoped_label: str, threshold: int, severity: str,
-                  pct: float, resets_at: datetime, others: int) -> None:
+async def _notify(sub: dict, *, scoped_label: str, window_label: str, threshold: int,
+                  severity: str, pct: float, resets_at: datetime, others: int) -> None:
     from services.notifications import notification_manager
-    product = _LAYER_PRODUCT.get(sub.get("layer", ""), "AI engine")
+    from core.session.session_manager import account_label_for
+    product = account_label_for(sub.get("layer", ""), "AI engine")
     label = sub.get("label") or product
     email = sub.get("oauth_email") or ""
     account = f"{label} ({email})" if email and email not in label else label
     when = _owner_when(sub["owner_sub"], resets_at)
-    window = f"{scoped_label} weekly limit" if scoped_label else "weekly limit"
+    window = f"{scoped_label} {window_label} limit" if scoped_label else f"{window_label} limit"
     if threshold >= 100:
         title = f"{account}: {window} reached"
         if scoped_label:

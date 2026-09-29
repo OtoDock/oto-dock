@@ -114,7 +114,7 @@ class TestLeadingFeaturesDedupe:
     (root-caused live 2026-07-19: config.toml:13:2 duplicate key)."""
 
     def test_leading_features_block_is_stripped_and_valid(self):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         from satellite.terminal.codex_pty_session import (
             _build_codex_config_toml, _strip_leading_features_block,
         )
@@ -124,7 +124,7 @@ class TestLeadingFeaturesDedupe:
         )
         assert _strip_leading_features_block(shipped).startswith("[mcp_servers.x]")
         out = _build_codex_config_toml("/tmp/cwd", shipped)
-        data = tomllib.loads(out)  # duplicate [features] would raise
+        data = toml_loads(out)  # duplicate [features] would raise
         # The preamble's own flag survives; the MCP section is intact.
         assert data["features"]["default_mode_request_user_input"] is True
         assert data["mcp_servers"]["x"]["command"] == "node"

@@ -3,7 +3,7 @@
   "server_name": "display",
   "label": "Display",
   "description": "Display images, files, audio, video, and URLs in chat",
-  "version": "1.13.2",
+  "version": "1.20.1",
   "category": "core",
 
   "server": {
@@ -48,10 +48,10 @@
       "default_exclude_from": ["phone"]
     },
     {
-      "id": "miniapp-authoring",
+      "id": "app-authoring",
       "loading": "on_demand",
-      "file": "skills/miniapp-authoring/SKILL.md",
-      "description": "Authoring contracts for interactive artifacts, mini-app dashboards, and Dock panels: display_ui backchannel and theme events, pin_app action buttons, live data panels, feeds, scoped dashboards, file pins. Use whenever building or updating a display_ui artifact, mini-app, or dashboard.",
+      "file": "skills/app-authoring/SKILL.md",
+      "description": "Authoring contracts for interactive artifacts, app dashboards and Dock panels: display_ui backchannel and theme events, pin_app action buttons, live data panels, feeds, scoped dashboards, file pins, and apps with a server (handlers the platform wakes, bindings between apps, .otoapp bundles, the widget kit). Use whenever building or updating a display_ui artifact, app, dashboard or app server.",
       "default_exclude_from": ["phone"]
     }
   ],

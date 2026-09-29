@@ -16,6 +16,7 @@ importing test module sits.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -40,10 +41,22 @@ def load_mcp_server(mcp_dir: Path):
     location under a per-MCP key removes both the key collision and the
     path-order dependence. Each call executes a fresh module, so module-level
     constants re-read the current env (the reload-with-env test pattern).
+
+    A multi-file MCP imports its siblings by bare name (``python server.py``
+    from its folder puts the folder on ``sys.path[0]``), so the folder sits
+    on ``sys.path`` only WHILE ``server.py`` executes — then it comes off,
+    since another MCP's generic sibling names (``shared``, ``screen``) must
+    not shadow a later import from a folder left at the front. The sibling
+    stays cached in ``sys.modules`` under its own (unique) name.
     """
     name = f"{mcp_dir.name.replace('-', '_')}_server"
     spec = importlib.util.spec_from_file_location(name, mcp_dir / "server.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
-    spec.loader.exec_module(mod)
+    sys.path.insert(0, str(mcp_dir))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        with contextlib.suppress(ValueError):
+            sys.path.remove(str(mcp_dir))
     return mod

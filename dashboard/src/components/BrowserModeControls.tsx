@@ -39,7 +39,10 @@ export function BrowserModeSelect({
     if (next === 'own' && !window.confirm(
       `Use your own browser on ${machine.name}?\n\n` +
       'Agents on this machine will work inside the browser you are signed into, in ' +
-      'their own tab group — your logins, cookies and open tabs are reachable to them.\n\n' +
+      'their own tab group: your logins, cookies and open tabs are reachable to them. ' +
+      'With the extension token saved, scheduled tasks, triggers, calls and meetings on this ' +
+      'machine use this browser with nobody watching, and browser actions are not asked ' +
+      'about; only the tools the browser MCP marks high-risk still need a person.\n\n' +
       'Install the Playwright Extension in that browser first. Sessions already running ' +
       'switch when they next start.',
     )) return
@@ -94,6 +97,7 @@ export function BrowserTokenField({
           Get extension <span aria-hidden>↗</span>
         </a>
         <span>then copy the token from its page and paste it here.</span>
+        <span>Saving it lets scheduled tasks, triggers, calls and meetings use this browser unattended.</span>
       </p>
       <div className="flex items-center gap-2 flex-wrap">
         <input

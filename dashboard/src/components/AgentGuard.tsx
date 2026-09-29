@@ -1,12 +1,13 @@
 import { useEffect, useRef } from 'react'
 import { Outlet, Navigate, useParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 import { useAgents } from '../api/agents'
 
 export default function AgentGuard() {
   const { name } = useParams<{ name: string }>()
   const { user, refreshUser } = useAuth()
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   // Live agent list (admins see all; others see their assignments). The
   // session snapshot (`user.agents`, fetched once at app mount) drifts in
   // BOTH directions: a deleted agent lingers in it until the JWT refreshes,

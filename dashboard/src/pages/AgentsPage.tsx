@@ -8,12 +8,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin, isCreatorOrAbove } from '../lib/permissions'
 import { useMyUiPrefs, useUpdateMyUiPrefs } from '../api/userUiPrefs'
 import AgentGrid from './AgentGrid'
 import AgentsMap3D from '../components/agents-map/AgentsMap3D'
 import DepartmentsEditor from '../components/departments/DepartmentsEditor'
 import AgentInstallModal from '../components/AgentInstallModal'
 import CommunityAgentsBrowser from '../components/CommunityAgentsBrowser'
+import SharedWithMe from '../components/sharing/SharedWithMe'
 
 type View = 'map' | 'grid' | 'departments'
 
@@ -32,8 +34,8 @@ export default function AgentsPage() {
   const [showCreateAgent, setShowCreateAgent] = useState(false)
   const [showCommunity, setShowCommunity] = useState(false)
 
-  const isAdmin = user?.role === 'admin'
-  const canEditDepts = user?.role === 'admin' || user?.role === 'creator'
+  const isAdmin = isPlatformAdmin(user)
+  const canEditDepts = isCreatorOrAbove(user)
 
   // Roamed stickiness: agents_view ('map' | 'grid') + the admin hide toggle.
   useEffect(() => {
@@ -79,6 +81,16 @@ export default function AgentsPage() {
     // dvh, not vh: mobile URL-bar dynamics make 100vh taller than the
     // visual viewport, which let the page scroll down with no way back.
     <div className="h-dvh flex flex-col bg-p-bg overflow-hidden">
+      {/* The 3D scene is always dark. In map view the scoped `.dark` palette
+          makes the bar's dark: classes and p-* tokens resolve to the dark
+          look, painted over the wrapper's own dark background so the
+          translucent bar never mixes with the page's beige; the page root
+          stays light because the install and community modals render
+          inside it without a portal. */}
+      <div
+        data-testid="agents-top-bar"
+        className={view === 'map' ? 'dark shrink-0 bg-p-bg' : 'contents'}
+      >
       {/* Top bar — standard "Back to Chat" + view controls (workspace-buttons style) */}
       <div className="flex items-center gap-2 h-12 px-4 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-p-border-light shrink-0">
         <Link
@@ -115,6 +127,9 @@ export default function AgentsPage() {
             </button>
           )}
         </div>
+      </div>
+
+      <SharedWithMe />
       </div>
 
       <div className={`flex-1 min-h-0 ${view === 'map' ? 'overflow-hidden' : 'overflow-y-auto'}`}>

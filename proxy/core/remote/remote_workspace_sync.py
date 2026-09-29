@@ -6,9 +6,20 @@ with large conflict-free pulls deferred to the background. Mixed into
 RemoteExecutionLayer; split out of remote_execution.py.
 """
 
+import asyncio
 import contextlib
+import functools
 import logging
+import random
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+
+from auth import roles as _roles
+from core import placement
+from core import layout
+from services.infra import safe_fs
 
 logger = logging.getLogger("remote-layer")
 
@@ -38,6 +49,124 @@ def _partition_deferred_pulls(actions: list, remote_size: dict) -> tuple[list, l
     deferred_ids = {id(a) for a in deferred}
     foreground = [a for a in actions if id(a) not in deferred_ids]
     return foreground, deferred
+
+
+# The manifest walk and the diff are CPU work with a stat and a hash per
+# file. On the default executor a fleet re-authenticating after a proxy
+# restart parked every other ``to_thread`` on the box for seconds, and the
+# walks slowed each other down in the GIL. They run on a pool of their own,
+# two workers so that background walks and a person's merge never wait on
+# the same worker; the rest of a merge (short store reads and writes, the
+# transfers) stays where it was. ``diff_manifests`` still asks the author
+# store per conflicting file from this pool, as it did from the default one.
+_SYNC_CPU_WORKERS = 2
+_sync_cpu: ThreadPoolExecutor | None = None
+
+
+def _sync_cpu_executor() -> ThreadPoolExecutor:
+    global _sync_cpu
+    if _sync_cpu is None:
+        from core import loop_watchdog
+        _sync_cpu = ThreadPoolExecutor(
+            max_workers=_SYNC_CPU_WORKERS, thread_name_prefix="sync-cpu",
+        )
+        loop_watchdog.watch_executor("sync-cpu", _sync_cpu)
+    return _sync_cpu
+
+
+async def _run_sync_cpu(fn, /, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _sync_cpu_executor(), functools.partial(fn, *args, **kwargs),
+    )
+
+
+# Background merges (a reconnect walk, the idle sweep) are bounded twice.
+# The reconnect gate limits how many of them apply at once across the
+# fleet; the background manifest gate keeps their manifest and diff work
+# to one of the two sync-cpu workers, so a person's merge (a session start,
+# the enable-click presync: neither takes a gate) waits behind at most one
+# cold walk, never a wave. A reconnect walk sleeps a jitter first so a
+# fleet re-authenticating together does not walk together. The gates are
+# kept per event loop: a semaphore binds to the loop of its first waiter.
+#
+# Lock order: the reconnect gate, then the per-(machine, agent) sync lock,
+# then the background manifest gate (held only through the manifest and
+# the diff, inside the sync lock), then the per-file path lock and the
+# transfer gate. A person's merge takes the sync lock without either gate,
+# so a walk waiting on a gate never holds a person up.
+_RECONNECT_SYNC_JITTER_S = 10.0
+_RECONNECT_SYNC_CONCURRENCY = 4
+_BACKGROUND_MANIFEST_CONCURRENCY = 1
+_gates: dict[str, tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore]] = {}
+
+
+def _gate(name: str, limit: int) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    held = _gates.get(name)
+    if held is None or held[0] is not loop or held[1] != limit:
+        held = (loop, limit, asyncio.Semaphore(limit))
+        _gates[name] = held
+    return held[2]
+
+
+def _reconnect_gate() -> asyncio.Semaphore:
+    return _gate("reconnect", _RECONNECT_SYNC_CONCURRENCY)
+
+
+def _background_manifest_gate() -> asyncio.Semaphore:
+    return _gate("manifest", _BACKGROUND_MANIFEST_CONCURRENCY)
+
+
+# The page a 0.5.130 satellite is asked for (entries per frame; the
+# satellite also caps a frame's text), so a large tree's manifest never needs
+# a frame past the socket's cap.
+_MANIFEST_PAGE_SIZE = 4096
+
+
+def manifest_request(cm, machine_id: str, agent_slug: str) -> dict:
+    """The ``request_manifest`` frame for ``machine_id``: paged when the
+    satellite pages (asking an older one would be ignored, and an older
+    proxy never asks, so the wire stays compatible both ways)."""
+    msg = {"type": "request_manifest", "agent_slug": agent_slug}
+    if cm.satellite_supports_paged_manifest(machine_id):
+        msg["page_size"] = _MANIFEST_PAGE_SIZE
+    return msg
+
+
+def _platform_bytes(agent_dir, rel_path: str) -> bytes | None:
+    """The platform copy of ``rel_path`` for a loser capture, read beneath
+    the agents root with no component followed (a link at the name or on
+    the way is refused, never read through); None when there is nothing a
+    capture may copy."""
+    from core.remote.file_sync import MAX_FILE_SIZE
+    agent = Path(agent_dir)
+    try:
+        return safe_fs.read_bytes_beneath(
+            agent.parent, f"{agent.name}/{rel_path}", max_size=MAX_FILE_SIZE,
+        )
+    except OSError:
+        return None
+
+
+def _reconnect_jitter_s() -> float:
+    return random.uniform(0.0, _RECONNECT_SYNC_JITTER_S)
+
+
+@dataclass
+class _ReconnectWalk:
+    sleeping: bool = True
+    rerun: bool = False
+
+
+# One reconnect walk per machine. ``register`` kicks one on every
+# re-authentication, and a flapping or replaced machine would pile them up:
+# a kick that finds a walk still in its jitter returns (that walk runs
+# soon); one that finds a walk past it asks for one more pass.
+_reconnect_walks: dict[str, _ReconnectWalk] = {}
+# (machine, agent) pairs with an idle-sweep merge pending, so a merge that
+# waits on the gate past the next sweep is not spawned twice.
+_idle_sync_inflight: set[tuple[str, str]] = set()
 
 
 
@@ -77,13 +206,12 @@ class RemoteWorkspaceSyncMixin:
         if not machine:
             return None
         owner_sub = machine.get("registered_by", "") or ""
-        is_admin_paired = machine.get("pairing_scope", "") == "admin"
+        is_admin_paired = placement.machine_is_admin_paired(machine)
         # Platform-admin check — ONLY consulted for admin-PAIRED machines
         # (admin-shared, role "admin"). User-paired machines always resolve
         # the owner's per-agent role, platform admins included (see docstring).
-        owner_is_admin = is_admin_paired and bool(owner_sub) and (
-            (await _asyncio.to_thread(_db.get_user, owner_sub)) or {}
-        ).get("role") == "admin"
+        owner_is_admin = is_admin_paired and bool(owner_sub) and _roles.is_admin(
+            ((await _asyncio.to_thread(_db.get_user, owner_sub)) or {}).get("role"))
         # Per-user isolation: user-paired → scope to the owner; admin-paired → None.
         if is_admin_paired:
             target_username: str | None = None
@@ -130,26 +258,52 @@ class RemoteWorkspaceSyncMixin:
         pairing (``resolve_machine_sync_identity``): a user-paired machine syncs as
         its owner (with the owner's per-agent role); an admin-paired machine syncs
         admin-shared. The per-(machine, agent) lock inside ``_initial_workspace_sync``
-        serializes each agent against a concurrent session warmup. Best-effort.
+        serializes each agent against a concurrent session warmup. One walk per
+        machine (a second kick coalesces into it), a jitter before the walk,
+        the reconnect gate around each agent's merge. Best-effort.
         """
-        import asyncio as _asyncio
         from storage.files import sync_state_store
 
-        agents = await _asyncio.to_thread(sync_state_store.agents_for_machine, machine_id)
-        if not agents:
+        walk = _reconnect_walks.get(machine_id)
+        if walk is not None:
+            if not walk.sleeping:
+                walk.rerun = True
             return
+        walk = _reconnect_walks[machine_id] = _ReconnectWalk()
+        try:
+            agents = await asyncio.to_thread(
+                sync_state_store.agents_for_machine, machine_id,
+            )
+            if not agents:
+                return
+            await asyncio.sleep(_reconnect_jitter_s())
+            walk.sleeping = False
+            while True:
+                await self._reconnect_pass(machine_id, agents)
+                if not walk.rerun:
+                    return
+                walk.rerun = False
+        finally:
+            _reconnect_walks.pop(machine_id, None)
 
+    async def _reconnect_pass(self, machine_id: str, agents) -> None:
+        """One pass over a machine's tracked agents; stops when the machine
+        is no longer connected (its next re-authentication kicks a new walk)."""
         synced = 0
         for agent_slug in sorted(agents):
+            if not self._cm.is_connected(machine_id):
+                return
             ident = await self.resolve_machine_sync_identity(machine_id, agent_slug)
             if ident is None:
                 continue  # machine unpaired / vanished
             target_username, target_role = ident
             try:
-                await self._initial_workspace_sync(
-                    machine_id, agent_slug,
-                    target_username=target_username, target_role=target_role,
-                )
+                async with _reconnect_gate():
+                    await self._initial_workspace_sync(
+                        machine_id, agent_slug,
+                        target_username=target_username, target_role=target_role,
+                        background=True,
+                    )
                 synced += 1
             except Exception:
                 logger.exception(
@@ -195,9 +349,14 @@ class RemoteWorkspaceSyncMixin:
                     continue  # unchanged since the last completed sync
                 if machine_id in workspace_fanout._active_machine_ids(slug):
                     continue  # an active session covers it via the per-turn path
+                key = (machine_id, slug)
+                if key in _idle_sync_inflight:
+                    continue  # its merge is still pending (on the gate)
+                _idle_sync_inflight.add(key)
                 task = _asyncio.create_task(
                     self._idle_fingerprint_sync_one(machine_id, slug, fp)
                 )
+                task.add_done_callback(lambda t, key=key: _idle_sync_inflight.discard(key))
                 self._deferred_sync_tasks.add(task)
                 task.add_done_callback(self._deferred_sync_tasks.discard)
 
@@ -214,10 +373,12 @@ class RemoteWorkspaceSyncMixin:
             if ident is None:
                 return
             target_username, target_role = ident
-            await self._initial_workspace_sync(
-                machine_id, agent_slug,
-                target_username=target_username, target_role=target_role,
-            )
+            async with _reconnect_gate():
+                await self._initial_workspace_sync(
+                    machine_id, agent_slug,
+                    target_username=target_username, target_role=target_role,
+                    background=True,
+                )
             conn = self._cm.get_connection(machine_id)
             if conn is not None:
                 conn.synced_fingerprints[agent_slug] = fp
@@ -310,6 +471,7 @@ class RemoteWorkspaceSyncMixin:
         session_username: str = "",
         session_knowledge_rw: bool = False,
         progress_cb=None,
+        background: bool = False,
     ) -> None:
         """Versioned last-write-wins sync of the agent_dir with a satellite at
         session start.
@@ -338,6 +500,10 @@ class RemoteWorkspaceSyncMixin:
         on knowledge/ writes from agent-scope task fires (agent-scope tasks
         DO run on admin-paired satellites, where this gate is the ONLY
         boundary — no bwrap there). Machine-pairing merges pass False.
+        ``background`` marks a merge nobody is waiting on (the reconnect walk,
+        the idle sweep): its manifest and diff take the one-slot background
+        gate before the sync-cpu pool, so a person's merge never queues
+        behind a wave of walks.
         Best-effort: any error is caught by the caller and the session proceeds.
         """
         import asyncio as _asyncio
@@ -362,9 +528,11 @@ class RemoteWorkspaceSyncMixin:
 
         # One warmup per (machine, agent) at a time — concurrent warmups would
         # double-apply and race the base.
+        cpu_gate = _background_manifest_gate() if background else contextlib.nullcontext()
         async with self._cm.get_sync_lock(machine_id, agent_slug):
-            local_entries = await _asyncio.to_thread(
-                lambda: file_sync.compute_manifest(
+            async with cpu_gate:
+                local_entries = await _run_sync_cpu(
+                    file_sync.compute_manifest,
                     agent_dir,
                     target_username=target_username, target_role=target_role,
                     exclude_user_dirs=exclude_users,
@@ -376,12 +544,11 @@ class RemoteWorkspaceSyncMixin:
                     # whose satellite ACKed the table (0.5.110+): both walks
                     # must apply the same rules or the diff churns.
                     ignore_rules=self._cm.effective_ignore_rules(machine_id),
-                ),
-            )
+                )
             try:
                 ack = await self._cm.send_command(
                     machine_id,
-                    {"type": "request_manifest", "agent_slug": agent_slug},
+                    manifest_request(self._cm, machine_id, agent_slug),
                     timeout=30.0,
                 )
             except Exception as e:
@@ -429,7 +596,7 @@ class RemoteWorkspaceSyncMixin:
             )
             push_only_dirs = (
                 set()
-                if (target_role in ("manager", "admin") and _cwb_username)
+                if (_roles.can_manage(target_role) and _cwb_username)
                 else set(file_sync.DEFAULT_PUSH_ONLY_PREFIXES)
             )
             # Knowledge-library mirrors: read-only attachments are
@@ -445,8 +612,8 @@ class RemoteWorkspaceSyncMixin:
                 db_knowledge_libraries.attachments_for_consumer, agent_slug,
             )
             _lib_ro = {
-                (f"knowledge/shared/{a['source_agent']}/{a['subdir']}/"
-                 if a["subdir"] else f"knowledge/shared/{a['source_agent']}/")
+                (f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/{a['subdir']}/"
+                 if a["subdir"] else f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/")
                 for a in _attachments if not a["writable"]
             }
             writable_libraries = frozenset(
@@ -454,19 +621,20 @@ class RemoteWorkspaceSyncMixin:
                 for a in _attachments if a["writable"]
             )
             push_only_dirs |= _lib_ro
-            plan = await _asyncio.to_thread(
-                file_sync.diff_manifests,
-                local_entries, remote_entries,
-                base=base, tombstones=tombstones, clock_offset=clock_offset,
-                author_of=_author_of, satellite_user=satellite_user,
-                push_only_dirs=push_only_dirs,
-                target_username=target_username, target_role=target_role,
-                session_username=session_username,
-                exclude_user_dirs=exclude_users,
-                writable_libraries=writable_libraries,
-                scrub_dirs=_lib_ro,
-                knowledge_rw=session_knowledge_rw,
-            )
+            async with cpu_gate:
+                plan = await _run_sync_cpu(
+                    file_sync.diff_manifests,
+                    local_entries, remote_entries,
+                    base=base, tombstones=tombstones, clock_offset=clock_offset,
+                    author_of=_author_of, satellite_user=satellite_user,
+                    push_only_dirs=push_only_dirs,
+                    target_username=target_username, target_role=target_role,
+                    session_username=session_username,
+                    exclude_user_dirs=exclude_users,
+                    writable_libraries=writable_libraries,
+                    scrub_dirs=_lib_ro,
+                    knowledge_rw=session_knowledge_rw,
+                )
 
             # Sync-delta telemetry (alert-only, never blocks or filters the
             # sync): a huge planned pull of NEW satellite files usually means
@@ -553,22 +721,13 @@ class RemoteWorkspaceSyncMixin:
                     with contextlib.suppress(OSError):
                         dest.unlink()
 
-            def _read_platform_bytes(rp: str) -> bytes | None:
-                try:
-                    base_dir = agent_dir.resolve()
-                    dest = (agent_dir / rp).resolve()
-                    dest.relative_to(base_dir)
-                    return dest.read_bytes()
-                except (OSError, ValueError):
-                    return None
-
             async def _capture_loser(action) -> None:
                 """Copy the LOSING side's current bytes to the recover-bin (a
                 cross-user conflict). Best-effort — the op proceeds regardless."""
                 if action.capture_side == "satellite":
                     data = await _pull_satellite_bytes(action.rel_path)
                 elif action.capture_side == "platform":
-                    data = await _asyncio.to_thread(_read_platform_bytes, action.rel_path)
+                    data = await _asyncio.to_thread(_platform_bytes, agent_dir, action.rel_path)
                 else:
                     return
                 if data is None:

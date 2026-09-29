@@ -30,25 +30,31 @@ cleanly and historical artifacts pick up wrapper improvements automatically.
 A full document (leading ``<!doctype``/``<html``) keeps its own markup and
 head (it opts out of the tokens CSS), but the BYTE-STATIC runtime script is
 injected before its closing ``</body>`` — without it a full-document
-artifact or mini-app silently loses theme sync, auto-height, actions, feeds
+artifact or app silently loses theme sync, auto-height, actions, feeds
 AND links, the exact trap the efpolis field test hit. This is not a splice
 of agent markup: the runtime carries no per-request interpolation.
 """
 
+import asyncio
 import html as html_escape
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
 import config
 from api.media.access import can_serve_token
+from api.media.media import MediaUnserveable, locate_media_row
 from auth.providers import UserContext, get_current_user
+from services.infra import safe_fs
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy.ui")
 router = APIRouter()
+
+# The hook caps an artifact at 2 MB when it is minted; the agent may Edit the
+# file afterwards, so the serve allows some growth before it gives up.
+_UI_SERVE_MAX_BYTES = 8 * 1024 * 1024
 
 
 # The artifact runtime, injected into wrapped fragments:
@@ -78,7 +84,8 @@ UI_RUNTIME = """<script>
     if (e.data.type === 'action_ack'){
       try {
         window.dispatchEvent(new CustomEvent('otodock:action-ack', {
-          detail: {status: String(e.data.status || ''), reason: String(e.data.reason || '')}
+          detail: {status: String(e.data.status || ''), reason: String(e.data.reason || ''),
+                   call_id: String(e.data.call_id || '')}
         }));
       } catch (err) {}
     }
@@ -201,18 +208,22 @@ def request_origin(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
-def _csp(origin: str) -> str:
+def _csp(origin: str, connect: tuple[str, ...] = ()) -> str:
+    """``connect`` names the path-scoped sources a folder app with a server
+    may reach (APPS.md); every other document keeps ``'none'``."""
+    connect_src = " ".join(connect) if connect else "'none'"
     return (
         "sandbox allow-scripts; default-src 'none'; "
         f"script-src {origin} 'unsafe-inline'; style-src {origin} 'unsafe-inline'; "
         f"img-src {origin} data: blob:; font-src {origin} data:; "
-        f"media-src {origin} data: blob:; connect-src 'none'; frame-src 'none'; "
+        f"media-src {origin} data: blob:; connect-src {connect_src}; frame-src 'none'; "
         "object-src 'none'; form-action 'none'; base-uri 'none'; "
         "frame-ancestors 'self'"
     )
 
 
-def _ui_response(body: str, origin: str, status_code: int = 200) -> HTMLResponse:
+def _ui_response(body: str, origin: str, status_code: int = 200, *,
+                 connect: tuple[str, ...] = ()) -> HTMLResponse:
     """Bake the isolation headers onto EVERY branch of this route. Explicit,
     never middleware-`setdefault`: the opaque-origin sandbox and the
     top-level-open safety both live or die on these being present."""
@@ -220,7 +231,7 @@ def _ui_response(body: str, origin: str, status_code: int = 200) -> HTMLResponse
         content=body,
         status_code=status_code,
         headers={
-            "Content-Security-Policy": _csp(origin),
+            "Content-Security-Policy": _csp(origin, connect),
             "X-Frame-Options": "SAMEORIGIN",
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
@@ -245,7 +256,7 @@ def is_full_document(content: str) -> bool:
 def wrap_fragment(content: str, runtime_extra: str = "") -> str:
     """Serve-time wrapper for a body fragment: doctype + viewport + tokens
     CSS + runtime. The stored file stays the agent's raw content.
-    ``runtime_extra`` lets the mini-app route append its STATIC action
+    ``runtime_extra`` lets the app route append its STATIC action
     runtime — it must never carry per-row interpolation (script-assembly
     injection)."""
     return (
@@ -304,14 +315,24 @@ async def serve_ui(
         or not can_serve_token(info, user)
     ):
         return _ui_response(_placeholder("This artifact no longer exists."), origin, 404)
-    path = Path(info["abs_path"])
-    if not path.is_file():
-        name = html_escape.escape(path.name)
+    # The file is opened beneath its serving root with no symlink followed
+    # and read from that descriptor: the row named a file at mint, and the
+    # agent that owns the name can point it anywhere afterwards.
+    try:
+        root, rel = locate_media_row(info)
+        raw = await asyncio.to_thread(
+            safe_fs.read_bytes_beneath, root, rel, max_size=_UI_SERVE_MAX_BYTES,
+        )
+    except FileNotFoundError:
+        name = html_escape.escape((info.get("abs_path") or "").rsplit("/", 1)[-1])
         return _ui_response(
             _placeholder(f"The artifact file <code>{name}</code> was deleted from the workspace."),
             origin, 404,
         )
-    content = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, MediaUnserveable) as exc:
+        logger.warning("ui token %s refused: %s", token[:8], type(exc).__name__)
+        return _ui_response(_placeholder("This artifact cannot be shown."), origin, 404)
+    content = raw.decode("utf-8", errors="replace")
     if is_full_document(content):
         return _ui_response(inject_runtime(content), origin)
     return _ui_response(wrap_fragment(content), origin)

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isCreatorOrAbove } from '../lib/permissions'
 import { useAgents, useSetDefaultAgent, type AgentSummary } from '../api/agents'
 import { useDepartments, type Department } from '../api/departments'
 import AgentCard from '../components/AgentCard'
@@ -49,17 +50,24 @@ function DepartmentGroup({ dept, members, defaultAgent, onSetDefault }: {
       </button>
       {expanded && (
         <div className="px-4 pb-4 border-t border-p-border-light pt-4">
-          <div className={CARD_GRID}>
-            {members.map(({ agent, roleLabel }) => (
-              <AgentCard
-                key={agent.name}
-                agent={agent}
-                isDefault={defaultAgent === agent.name}
-                onSetDefault={onSetDefault}
-                roleLabel={roleLabel}
-              />
-            ))}
-          </div>
+          {members.length === 0 ? (
+            <p className="text-sm text-p-text-light">
+              No agents yet — move one here from the company map or the
+              agent's Configuration tab.
+            </p>
+          ) : (
+            <div className={CARD_GRID}>
+              {members.map(({ agent, roleLabel }) => (
+                <AgentCard
+                  key={agent.name}
+                  agent={agent}
+                  isDefault={defaultAgent === agent.name}
+                  onSetDefault={onSetDefault}
+                  roleLabel={roleLabel}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </section>
@@ -75,7 +83,7 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showBrowse, setShowBrowse] = useState(false)
 
-  const canManage = user?.role === 'admin' || user?.role === 'creator'
+  const canManage = isCreatorOrAbove(user)
 
   const handleSetDefault = (name: string) => {
     setConfirmAgent(name)
@@ -117,12 +125,15 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
     for (const dept of departments) {
       const members = byDept.get(dept.id)
       // Zero VISIBLE members renders nothing (real for admins whose
-      // checkbox set excludes a whole department they can still list).
-      if (!members?.length) continue
+      // checkbox set excludes a whole department they can still list) —
+      // unless the department is empty for everyone (the feed's own
+      // `members`, the server's truth): that one shows as a group with
+      // no cards, as the map shows its dais, so it can be filled.
+      if (!members?.length && dept.members.length > 0) continue
       const levels = [...dept.levels].sort((a, b) => a.rank - b.rank)
       const rankOf = new Map(levels.map(l => [l.id, l.rank]))
       const nameOf = new Map(levels.map(l => [l.id, l.name]))
-      const sorted = [...members].sort((a, b) =>
+      const sorted = [...(members ?? [])].sort((a, b) =>
         (rankOf.get(a.department_level_id ?? '') ?? Number.MAX_SAFE_INTEGER)
         - (rankOf.get(b.department_level_id ?? '') ?? Number.MAX_SAFE_INTEGER))
       out.push({

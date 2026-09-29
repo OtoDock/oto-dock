@@ -31,9 +31,13 @@ def test_over_limit_truncates_with_ellipsis():
     assert not out[:-1].endswith(" ")  # trailing space rstripped before …
 
 
-def test_app_runtime_reports_scroll_pos():
-    # Contract with dashboard AppFrame: the shim posts scroll_pos so the
-    # host can slide the solo-app ✕ away with the content.
+def test_app_runtime_contract_with_the_host():
+    # Contract with dashboard AppFrame: calls coalesce into one app_actions
+    # message keyed by call_id, results and open acks come back in-page as
+    # window events, and the page never navigates itself (open_target).
     from api.apps.apps import APP_RUNTIME
-    assert "scroll_pos" in APP_RUNTIME
-    assert "window.scrollY" in APP_RUNTIME
+    for token in ("type:'app_actions'", "call_id", "otodock:action-result",
+                  "window.otodock.open", "type:'open_target'",
+                  "otodock:open-ack", "content_height"):
+        assert token in APP_RUNTIME, token
+    assert "scroll_pos" not in APP_RUNTIME

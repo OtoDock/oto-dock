@@ -328,3 +328,48 @@ class TestRowToTaskHydration:
             dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         )).total_seconds())
         assert delta < 60
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# NULL in a column the task model requires
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestNullRequiredColumns:
+    def test_an_edit_cannot_null_a_required_field(self, temp_db):
+        import pytest
+        from fastapi import HTTPException
+        from api.tasks import tasks
+        from auth.providers import UserContext
+
+        _create_interval_task("task-null-edit")
+        owner = UserContext(sub="user-1", email="u@t.com", name="U", role="member",
+                            agents=["support-bot"])
+        for field in ("timeout_seconds", "notify_severity", "name", "prompt",
+                      "notification_mode"):
+            req = tasks.EditTaskRequest(**{field: None})
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(tasks._edit_task_impl("task-null-edit", req, owner, None))
+            assert exc.value.status_code == 400, field
+        row = temp_db.get_dynamic_task("task-null-edit")
+        assert row["timeout_seconds"] == 600 and row["notify_severity"] == "info"
+        # A nullable field still clears.
+        asyncio.run(tasks._edit_task_impl(
+            "task-null-edit", tasks.EditTaskRequest(user_tz=None), owner, None))
+
+    def test_a_row_already_holding_null_still_loads(self, temp_db):
+        from services.scheduler import scheduler
+        from storage.pg import get_conn
+
+        _create_interval_task("task-null-row")
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE dynamic_tasks SET timeout_seconds=NULL, notify_severity=NULL, "
+                "llm_mode=NULL, scope=NULL WHERE id=%s", ("task-null-row",))
+            conn.commit()
+        task = scheduler._row_to_task(temp_db.get_dynamic_task("task-null-row"))
+        assert task.timeout_seconds == 600
+        assert task.notify_severity == "info"
+        assert task.llm_mode == "cli"
+        assert task.scope == "user"
+        assert "task-null-row" in {t.id for t in scheduler.get_all_task_definitions()}

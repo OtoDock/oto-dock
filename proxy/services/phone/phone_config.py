@@ -154,7 +154,7 @@ def direct_llm_groq_credentials() -> tuple[str, str]:
     # Hosted: a credential-less relay sub → mint a system token + relay endpoint.
     if any(s.get("auth_type") == "relay" for s in groq_subs):
         from services.engines import subscription_pool
-        creds = subscription_pool.relay_llm_credentials("groq", "")
+        creds = subscription_pool.relay_llm_credentials("direct-llm", "groq", "")
         if creds:
             return creds  # (minted_token, "{RELAY}/v1/relay/groq/v1")
 

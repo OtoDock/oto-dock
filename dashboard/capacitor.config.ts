@@ -7,8 +7,8 @@ const config: CapacitorConfig = {
 
   // Server URL is set dynamically in MainActivity.load() from SharedPreferences.
   // On first launch (no URL saved), the local setup.html page is loaded so the
-  // user can enter their server URL. allowNavigation is also set dynamically to
-  // cover the server's domain + a wildcard for its auth subdomain.
+  // user can enter their server URL. allowNavigation is also set dynamically, to
+  // the server's exact host (no wildcard).
   server: {
     cleartext: false,
     allowNavigation: [],
@@ -19,6 +19,12 @@ const config: CapacitorConfig = {
     allowMixedContent: false,
     // Use Chrome-based WebView
     webContentsDebuggingEnabled: false,
+  },
+
+  // cap sync writes res/xml/config.xml from this; unset, it emits a wildcard
+  // <access origin="*">. No Cordova plugin reads it; keep it empty anyway.
+  cordova: {
+    accessOrigins: [],
   },
 
   plugins: {

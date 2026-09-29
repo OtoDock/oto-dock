@@ -19,6 +19,7 @@ regardless of the host the suite runs on.
 """
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -33,10 +34,13 @@ async def env(monkeypatch):
     monkeypatch.setattr(config, "SESSION_EST_HEAVY_MB", 1000)
     monkeypatch.setattr(config, "SESSION_EST_LIGHT_MB", 200)
     monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 0)
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 0)
     monkeypatch.setattr(config, "get_idle_timeout", lambda: 900)
     C._sessions.clear()
     C._session_est.clear()
     C._session_added_at.clear()
+    C._session_owner.clear()
+    C._line.clear()
     C._reserved_mb = 0
     C._parked_tasks = 0
     C._live_cache = None
@@ -50,6 +54,7 @@ async def env(monkeypatch):
     C._sessions.clear()
     C._session_est.clear()
     C._session_added_at.clear()
+    C._session_owner.clear()
     C._reserved_mb = 0
     C._parked_tasks = 0
 
@@ -81,7 +86,7 @@ async def test_gate2_veto_denies_without_eviction(env, monkeypatch):
 
     async def spy(*a, **k):
         called["n"] += 1
-        return None
+        return C._Scan(None, 0, 0)
     monkeypatch.setattr(C, "_oldest_evictable_local", spy)
 
     # Budget has room (GATE 1 fine) and tracked sessions can't account for the
@@ -127,11 +132,11 @@ async def test_gate2_session_pressure_evicts_by_accounting(env, monkeypatch):
         C._session_added_at[f"s{i}"] -= 200  # aged: no grow-in debit
     env["mb"] = 1200  # shortfall = 1000 + 300 − 1200 = 100 ≤ reserved 3000
 
-    async def fake_oldest(min_idle, *, prefer_user=None):
+    async def fake_oldest(min_idle, **_kw):
         for sid in ("s0", "s1", "s2"):
             if sid in C._sessions:
-                return (sid, "cli", False)
-        return None
+                return C._Scan((sid, "cli", False), 0, 0)
+        return C._Scan(None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -210,6 +215,39 @@ async def test_light_sessions_pack_denser():
     assert len(C._sessions) == 10
 
 
+@pytest.mark.asyncio
+async def test_direct_estimate_counts_stdio_mcps(tmp_path):
+    # A Direct session starts every stdio server of its config in the proxy:
+    # 5 typed stdio + 3 typeless (stdio by default) + 2 http = 8 → 100 + 8 × 65.
+    import json
+    servers = {f"s{i}": {"type": "stdio", "command": "x"} for i in range(5)}
+    servers.update({f"t{i}": {"command": "x"} for i in range(3)})
+    servers.update({f"h{i}": {"type": "http", "url": "http://x"} for i in range(2)})
+    cfg = tmp_path / "mcp-config.json"
+    cfg.write_text(json.dumps({"mcpServers": servers}))
+    assert await C.acquire("d", "chat", execution_path="direct-llm", mcp_config_path=str(cfg))
+    assert C._session_est["d"] == 620
+    # Never above a CLI session carrying the same servers.
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps({"mcpServers": {f"s{i}": {"command": "x"} for i in range(14)}}))
+    assert await C.acquire("d2", "chat", execution_path="direct-llm", mcp_config_path=str(big))
+    assert C._session_est["d2"] == 1000
+    # Unreadable or not JSON: the flat LIGHT floor.
+    bad = tmp_path / "config.toml"
+    bad.write_text("[mcp_servers.x]\ncommand = 'x'\n")
+    assert await C.acquire("d3", "chat", execution_path="direct-llm", mcp_config_path=str(bad))
+    assert await C.acquire("d4", "chat", execution_path="direct-llm",
+                           mcp_config_path=str(tmp_path / "missing.json"))
+    assert C._session_est["d3"] == C._session_est["d4"] == 200
+    # A subprocess engine is HEAVY whatever its config holds.
+    assert await C.acquire("c", "chat", execution_path="claude-code-cli", mcp_config_path=str(cfg))
+    assert C._session_est["c"] == 1000
+    # Meetings count the same way.
+    assert await C.acquire_meeting_slots(["m"], targets={"m": "local"},
+                                         exec_paths={"m": "direct-llm"}, mcp_paths={"m": str(cfg)})
+    assert C._session_est["m"] == 620
+
+
 # --- tasks: HEAVY headroom + blocking + sync-release wakeup ------------------
 
 @pytest.mark.asyncio
@@ -227,6 +265,109 @@ async def test_task_headroom_blocks_then_sync_release_wakes():
     C.release("c0")                                  # reserved = 3000 → task fits
     assert await asyncio.wait_for(waiter, timeout=1.0)
     assert "t" in C._sessions and C._parked_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_task_keeps_one_count_slot_under_a_cap(monkeypatch):
+    # Under a hard cap a task never takes the last slot a person needs.
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 2)
+    assert await C.acquire("c1", "chat")
+    waiter = asyncio.create_task(C.acquire("t", "task", blocking=True))
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+    assert await C.acquire("c2", "chat")            # the person still gets the slot
+    C.release("c1")
+    await asyncio.sleep(0.05)
+    assert not waiter.done()                        # one chat left: still parked
+    C.release("c2")
+    assert await asyncio.wait_for(waiter, timeout=1.0)
+    assert C._sessions == {"t": "task"}
+
+
+@pytest.mark.asyncio
+async def test_count_headroom_off_at_cap_one(monkeypatch):
+    # A cap of 1 keeps no slot back (a task would never run).
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 1)
+    assert await asyncio.wait_for(C.acquire("t", "task", blocking=True), timeout=1.0)
+
+
+# --- background wakes: reserve before the spawn -----------------------------------
+
+def _never() -> bool:
+    return False
+
+
+@pytest.mark.asyncio
+async def test_reserve_background_parks_with_task_headroom():
+    for i in range(4):
+        assert await C.acquire(f"c{i}", "chat")          # 4000 of 5000
+    wake = asyncio.create_task(C.reserve_background(
+        "wake", execution_path="claude-code-cli", timeout_s=5, superseded=_never))
+    await asyncio.sleep(0.05)
+    assert not wake.done() and C._parked_tasks == 1       # never the last HEAVY
+    assert await C.acquire("person", "chat")              # a person still gets it
+    C.release("c0")
+    C.release("c1")
+    assert await asyncio.wait_for(wake, 2.0) == "reserved"
+    assert C._sessions["wake"] == "chat" and "wake" not in C._session_owner
+    assert C._parked_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_reserve_background_supersedes_when_the_sid_is_taken(monkeypatch):
+    assert await C.acquire("sid", "chat")
+    assert await C.reserve_background("sid", timeout_s=5, superseded=_never) == "superseded"
+    for i in range(4):
+        assert await C.acquire(f"c{i}", "chat")
+    monkeypatch.setattr(C, "_WAKE_SLICE_S", 0.05)
+    wake = asyncio.create_task(C.reserve_background("sid2", timeout_s=5, superseded=_never))
+    await asyncio.sleep(0.05)
+    async with C._cond:                                   # a person's warmup takes the sid
+        C._add("sid2", "chat", 1000, "u1")
+        C._cond.notify_all()
+    assert await asyncio.wait_for(wake, 2.0) == "superseded"
+    assert C._session_owner["sid2"] == "u1"              # theirs, untouched
+
+
+@pytest.mark.asyncio
+async def test_reserve_background_supersedes_on_the_predicate(monkeypatch):
+    monkeypatch.setattr(C, "_WAKE_SLICE_S", 0.05)
+    for i in range(5):
+        assert await C.acquire(f"c{i}", "chat")
+    opened = {"now": False}
+    wake = asyncio.create_task(C.reserve_background(
+        "w", timeout_s=5, superseded=lambda: opened["now"]))
+    await asyncio.sleep(0.1)
+    assert not wake.done()
+    opened["now"] = True                                  # nobody notifies: the slice sees it
+    assert await asyncio.wait_for(wake, 1.0) == "superseded"
+    assert "w" not in C._sessions and C._parked_tasks == 0
+    assert await C.reserve_background("w2", timeout_s=5, superseded=lambda: True) == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_reserve_background_times_out():
+    for i in range(5):
+        assert await C.acquire(f"c{i}", "chat")
+    assert await C.reserve_background("w", timeout_s=0.2, superseded=_never) == "timeout"
+    assert "w" not in C._sessions and C._parked_tasks == 0
+
+
+@pytest.mark.asyncio
+async def test_reserve_background_remote_untracked():
+    assert await C.reserve_background("r", target="machine-x", timeout_s=1,
+                                      superseded=_never) == "untracked"
+    assert "r" not in C._sessions
+
+
+@pytest.mark.asyncio
+async def test_release_unless_live_keeps_a_live_session(monkeypatch):
+    monkeypatch.setattr(C, "_live_local_sids", lambda: {"live"})
+    assert await C.reserve_background("live", timeout_s=1, superseded=_never) == "reserved"
+    assert await C.reserve_background("dead", timeout_s=1, superseded=_never) == "reserved"
+    assert C.release_unless_live("live") is False and "live" in C._sessions
+    assert C.release_unless_live("dead") is True and "dead" not in C._sessions
+    assert C.release_unless_live("dead") is False
 
 
 # --- atomic-N meetings, target-aware ----------------------------------------
@@ -260,8 +401,8 @@ async def test_eviction_on_gate1_full(env, monkeypatch):
     for i in range(5):
         await C.acquire(f"s{i}", "chat")     # budget full (reserved 5000)
 
-    async def fake_oldest(min_idle, *, prefer_user=None):
-        return ("s0", "cli", False) if "s0" in C._sessions else None
+    async def fake_oldest(min_idle, **_kw):
+        return C._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -290,7 +431,262 @@ async def test_eviction_denies_when_no_candidate(monkeypatch):
 
 
 async def _async_none():
-    return None
+    return C._Scan(None, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_read_once_off_the_loop(monkeypatch):
+    # Every denied admit needs the eviction floor; the setting is read on the
+    # DB executor and cached, never once per denial on the event loop.
+    import threading
+    reads: list[bool] = []
+
+    def _read():
+        reads.append(threading.current_thread() is threading.main_thread())
+        return 900
+    monkeypatch.setattr(config, "get_idle_timeout", _read)
+    for i in range(5):
+        await C.acquire(f"s{i}", "chat")
+    monkeypatch.setattr(C, "_oldest_evictable_local", lambda *a, **k: _async_none())
+    for i in range(20):
+        assert not await C.acquire(f"denied{i}", "chat")
+    assert reads == [False]
+
+
+# --- the owner map and the per-person cap -------------------------------------
+
+@pytest.mark.asyncio
+async def test_owner_filled_on_idempotent_reacquire_never_overwritten():
+    assert await C.acquire("x", "chat")
+    assert "x" not in C._session_owner
+    assert await C.acquire("x", "chat", user_sub="u1")   # the first caller that knows
+    assert await C.acquire("x", "chat", user_sub="u2")   # never overwritten
+    assert C._session_owner["x"] == "u1"
+    C.release("x")
+    assert "x" not in C._session_owner
+
+
+@pytest.mark.asyncio
+async def test_per_user_cap_refuses_then_admits_after_release(monkeypatch):
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 2)
+    scans: list[dict] = []
+
+    async def spy(min_idle, **kw):
+        scans.append(kw)
+        return C._Scan(None, 0, 0)
+    monkeypatch.setattr(C, "_oldest_evictable_local", spy)
+    assert await C.acquire("a", "chat", user_sub="u1")
+    assert await C.acquire("b", "chat", user_sub="u1")
+    adm = await C.acquire("c", "chat", user_sub="u1")
+    assert not adm and adm.reason == "user_cap"
+    assert adm.user_message.startswith("You already have 2 sessions running on this platform.")
+    # Only this person's own sessions were considered; nobody else's.
+    assert scans and all(k.get("only_user") == "u1" for k in scans)
+    assert "c" not in C._sessions
+    # Someone else is not held by u1's cap.
+    assert await C.acquire("d", "chat", user_sub="u2")
+    C.release("a")
+    assert await C.acquire("c", "chat", user_sub="u1")
+
+
+@pytest.mark.asyncio
+async def test_two_admits_of_one_person_at_the_cap_admit_one(monkeypatch):
+    # Both start one below the cap and go through the eviction path on a full
+    # budget; the owner count is re-checked in the lock hold of the add, so
+    # the second tab cannot slip past the cap.
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 2)
+    assert await C.acquire("mine", "chat", user_sub="u1")
+    for i in range(4):
+        assert await C.acquire(f"other{i}", "chat", user_sub=f"someone{i}")
+    others = [f"other{i}" for i in range(4)]
+
+    async def fake_oldest(min_idle, **kw):
+        await asyncio.sleep(0)
+        for sid in others:
+            if sid in C._sessions:
+                others.remove(sid)
+                return C._Scan((sid, "cli", False), 0, 0)
+        return C._Scan(None, 0, 0)
+
+    async def fake_evict(sid, source, is_pw=False):
+        async with C._cond:
+            C._remove(sid)
+        return True
+    monkeypatch.setattr(C, "_oldest_evictable_local", fake_oldest)
+    monkeypatch.setattr(C, "_evict_one", fake_evict)
+    first, second = await asyncio.gather(
+        C.acquire("tab1", "chat", user_sub="u1"), C.acquire("tab2", "chat", user_sub="u1"))
+    assert sorted([bool(first), bool(second)]) == [False, True]
+    assert (first.reason or second.reason) == "user_cap"
+    assert C._owned("u1") == 2
+
+
+@pytest.mark.asyncio
+async def test_per_user_cap_skips_reattach_tasks_meetings_and_phone(monkeypatch):
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 1)
+    assert await C.acquire("a", "chat", user_sub="u1")
+    assert await C.acquire("a", "chat", user_sub="u1")               # its own session
+    assert await C.acquire("r", "chat", user_sub="u1", per_user_cap=False)
+    assert await C.acquire("p", "phone", user_sub="u1")
+    assert await C.acquire("t", "task", blocking=True, user_sub="u1")
+    assert await C.acquire_chat_slot("n", user_sub=None)             # no owner known
+    assert not await C.acquire("b", "chat", user_sub="u1")
+
+
+@pytest.mark.asyncio
+async def test_per_user_cap_off_when_zero(monkeypatch):
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 0)
+    for i in range(5):
+        assert await C.acquire(f"s{i}", "chat", user_sub="u1")
+
+
+# --- the admission queue ---------------------------------------------------------
+
+def _no_victims(monkeypatch):
+    monkeypatch.setattr(C, "_oldest_evictable_local", lambda *a, **k: _async_none())
+
+
+@pytest.mark.asyncio
+async def test_queued_admit_is_served_in_arrival_order(monkeypatch):
+    for i in range(5):
+        assert await C.acquire(f"s{i}", "chat")
+    _no_victims(monkeypatch)
+    dave = asyncio.create_task(C.acquire("dave", "chat", queue_wait_s=5))
+    await asyncio.sleep(0.02)
+    frank = asyncio.create_task(C.acquire("frank", "chat", queue_wait_s=5))
+    await asyncio.sleep(0.02)
+    assert not dave.done() and not frank.done() and len(C._line) == 2
+    assert not C.prewarm_allowed()                  # people are waiting
+    C.release("s0")
+    assert await asyncio.wait_for(dave, 1.0)        # first in line, first served
+    await asyncio.sleep(0.05)
+    assert not frank.done()
+    walk_in = await C.acquire("walk_in", "chat")    # a non-queued admit never waits
+    assert not walk_in and walk_in.reason == "busy"
+    C.release("s1")
+    assert await asyncio.wait_for(frank, 1.0)
+    assert C._line == []
+
+
+@pytest.mark.asyncio
+async def test_queued_head_retries_on_its_slice(monkeypatch):
+    # No release comes, but an idle session becomes reclaimable meanwhile.
+    monkeypatch.setattr(C, "_QUEUE_SLICE_S", 0.05)
+    for i in range(5):
+        assert await C.acquire(f"s{i}", "chat")
+    calls = {"n": 0}
+
+    async def ages_in(*a, **k):
+        calls["n"] += 1
+        return C._Scan(("s0", "cli", False) if calls["n"] >= 3 and "s0" in C._sessions
+                       else None, 0, 0)
+
+    async def fake_evict(sid, source, is_pw=False):
+        async with C._cond:
+            C._remove(sid)
+        return True
+    monkeypatch.setattr(C, "_oldest_evictable_local", ages_in)
+    monkeypatch.setattr(C, "_evict_one", fake_evict)
+    assert await asyncio.wait_for(C.acquire("q", "chat", queue_wait_s=5), 2.0)
+    assert "s0" not in C._sessions and "q" in C._sessions
+
+
+@pytest.mark.asyncio
+async def test_queued_admit_times_out_with_the_last_denial(monkeypatch):
+    for i in range(5):
+        assert await C.acquire(f"s{i}", "chat")
+    _no_victims(monkeypatch)
+    t0 = time.monotonic()
+    adm = await C.acquire("late", "chat", queue_wait_s=0.3)
+    assert not adm and adm.reason == "busy"
+    assert 0.25 <= time.monotonic() - t0 < 2.0
+    assert C._line == [] and "late" not in C._sessions
+
+
+@pytest.mark.asyncio
+async def test_queue_never_waits_on_host_memory_or_user_cap(env, monkeypatch):
+    _no_victims(monkeypatch)
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 1)
+    assert await C.acquire("mine", "chat", user_sub="u1")
+    t0 = time.monotonic()
+    adm = await C.acquire("again", "chat", user_sub="u1", queue_wait_s=5)
+    assert not adm and adm.reason == "user_cap"
+    C.release("mine")
+    assert await C.acquire("bg", "chat", execution_path="direct-llm")
+    C._session_added_at["bg"] -= 200
+    env["mb"] = 500                                   # non-session pressure
+    adm = await C.acquire("other", "chat", queue_wait_s=5)
+    assert not adm and adm.reason == "host_memory"
+    assert time.monotonic() - t0 < 1.0 and C._line == []
+
+
+@pytest.mark.asyncio
+async def test_queued_waiter_cancelled_leaves_no_ticket_and_no_slot(monkeypatch):
+    for i in range(5):
+        assert await C.acquire(f"s{i}", "chat")
+    _no_victims(monkeypatch)
+    dave = asyncio.create_task(C.acquire("dave", "chat", queue_wait_s=5))
+    await asyncio.sleep(0.02)
+    frank = asyncio.create_task(C.acquire("frank", "chat", queue_wait_s=5))
+    await asyncio.sleep(0.02)
+    dave.cancel()                                     # the socket closed
+    with pytest.raises(asyncio.CancelledError):
+        await dave
+    assert len(C._line) == 1 and "dave" not in C._sessions
+    C.release("s0")
+    assert await asyncio.wait_for(frank, 1.0)
+    assert C._line == []
+
+
+# --- pre-warms: room for two, quiet, never evict --------------------------------
+
+@pytest.mark.asyncio
+async def test_prewarm_allowed_needs_room_for_two_and_the_person_below_the_cap(
+        env, monkeypatch):
+    for i in range(3):
+        assert await C.acquire(f"s{i}", "chat")
+    assert C.prewarm_allowed()                       # 3 of 5 HEAVY: room for two
+    assert await C.acquire("s3", "chat")
+    assert not C.prewarm_allowed()                   # room for one only
+    C.release("s3")
+    env["mb"] = 300 + 1500                           # the live read fits one more
+    assert not C.prewarm_allowed()
+    env["mb"] = 100_000
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 4)
+    assert not C.prewarm_allowed()                   # 3 + 2 > 4
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 5)
+    assert C.prewarm_allowed()
+    C.release("s2")
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 1)
+    assert await C.acquire("mine", "chat", user_sub="u1")
+    assert not C.prewarm_allowed(user_sub="u1")      # u1 holds their share
+    assert C.prewarm_allowed(user_sub="u2")
+    C._parked_tasks = 1
+    assert not C.prewarm_allowed(user_sub="u2")      # a task waits for room
+
+
+@pytest.mark.asyncio
+async def test_speculative_admit_never_evicts_and_denies_quietly(monkeypatch):
+    scans: list = []
+
+    async def spy(*a, **k):
+        scans.append(k)
+        return C._Scan(None, 0, 0)
+    monkeypatch.setattr(C, "_oldest_evictable_local", spy)
+    for i in range(4):
+        assert await C.acquire(f"s{i}", "chat")
+    adm = await C.acquire_chat_slot("pw", user_sub="u1", speculative=True)
+    assert not adm and adm.reason == "speculative" and adm.user_message is None
+    assert "pw" not in C._sessions and scans == []
+    C.release("s0")
+    assert await C.acquire_chat_slot("pw", user_sub="u1", speculative=True)
+    assert C._session_owner["pw"] == "u1"
+    # A person at the cap: refused quietly, none of their sessions closed.
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 1)
+    C.release("s1")
+    C.release("s2")
+    adm = await C.acquire_chat_slot("pw2", user_sub="u1", speculative=True)
+    assert not adm and adm.reason == "speculative" and scans == []
 
 
 # --- Admission semantics ------------------------------------------------------
@@ -316,8 +712,8 @@ async def test_eviction_path_ram_veto_reports_host_memory(env, monkeypatch):
         await C.acquire(f"s{i}", "chat")
     env["mb"] = 500
 
-    async def fake_oldest(min_idle, *, prefer_user=None):
-        return ("s0", "cli", False) if "s0" in C._sessions else None
+    async def fake_oldest(min_idle, **_kw):
+        return C._Scan(("s0", "cli", False) if "s0" in C._sessions else None, 0, 0)
 
     async def fake_evict(sid, source, is_pw=False):
         async with C._cond:
@@ -406,3 +802,22 @@ class TestSwapCredit:
 
     def test_disabled_by_config(self, monkeypatch):
         assert self._credit(monkeypatch, 4096, 0) == 0
+
+
+class TestStdioMcpCount:
+    """The Direct-LLM estimate counts the stdio servers of a generated MCP
+    config; which transport is stdio is the manifest module's answer."""
+
+    def test_counts_stdio_servers_by_the_transport_authority(self, tmp_path):
+        from services.mcp.mcp_manifest_types import is_stdio_transport
+        assert is_stdio_transport(None) and is_stdio_transport("stdio")
+        assert not is_stdio_transport("http") and not is_stdio_transport("sse")
+        cfg = tmp_path / "mcp-config.json"
+        cfg.write_text(json.dumps({"mcpServers": {
+            "a": {"command": "x"},
+            "b": {"type": "stdio", "command": "y"},
+            "c": {"type": "http", "url": "http://h"},
+            "d": "not a server",
+        }}), encoding="utf-8")
+        assert C._stdio_mcp_count(str(cfg)) == 2
+        assert C._stdio_mcp_count(str(tmp_path / "missing.json")) == 0

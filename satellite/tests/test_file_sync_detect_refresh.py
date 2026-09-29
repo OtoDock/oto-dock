@@ -360,3 +360,24 @@ def test_snapshot_hash_cache_skips_rehash(tmp_path, monkeypatch):
     (agent / "workspace" / "a.txt").write_bytes(b"changed!")
     snapshot_agent_dir(agent)
     assert calls["n"] == 3  # exactly the changed file
+
+
+def test_hash_cache_keeps_the_raw_digest_and_primes_tolerantly(tmp_path):
+    from satellite.transport import file_sync as fs
+    f = tmp_path / "f.bin"
+    f.write_bytes(b"content")
+    fs._HASH_CACHE.clear()
+    fs.prime_hash_cache(f, "sha256:" + "ab" * 32)
+    entry = fs._HASH_CACHE[str(f)]
+    assert isinstance(entry[2], bytes) and len(entry[2]) == 32
+    fs.prime_hash_cache(f, "not-a-hash")  # never raises, never poisons
+    assert fs._HASH_CACHE[str(f)][2] == bytes.fromhex("ab" * 32)
+    fs._HASH_CACHE.clear()
+    import os as _os
+    import time as _time
+    old = _time.time() - 60
+    _os.utime(f, (old, old))
+    st = _os.stat(f)
+    assert fs._hash_file_cached(f, st) == fs._hash_file(f)
+    assert fs._hash_file_cached(f, st) == fs._hash_file(f)  # the hit answers the text form
+    assert fs._HASH_CACHE_MAX >= 200_000

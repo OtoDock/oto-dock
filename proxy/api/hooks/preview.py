@@ -15,13 +15,15 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from storage import database as task_store
-from api.sessions.sessions import verify_session_match
+from api.sessions.sessions import verify_session_match_async
 from core.session.session_state import (
     _sessions,
     get_permission_queue,
     get_session_security,
 )
 from api.hooks import paths, routing
+from auth import roles
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -40,7 +42,7 @@ class HookDocumentPreviewRequest(BaseModel):
 async def hook_document_preview(req: HookDocumentPreviewRequest,
                                  authorization: str | None = Header(None)):
     """Called by file-tools MCP to push a live Collabora preview to the chat."""
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     import config as cfg
     from api.media.wopi import encode_file_id, create_wopi_token
@@ -109,7 +111,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         except OSError:
             _is_host_cache = False
     if _is_host_cache:
-        if (getattr(sec, "role", "") or "") in ("editor", "manager", "admin"):
+        if roles.can_write_workspace(getattr(sec, "role", "") or ""):
             permissions = "edit"
     elif sec is not None:
         from core.remote.file_sync import library_mirror_source
@@ -196,7 +198,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # Push to permission queue → stream pump → WS
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "document_preview",
+        "event_type": wire.DOCUMENT_PREVIEW,
         "wopi_url": wopi_url_with_ts,
         "filename": filename,
         "file_id": file_id,

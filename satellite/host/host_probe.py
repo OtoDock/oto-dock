@@ -7,10 +7,9 @@ display is present, and the recommended concurrent-session ceiling from this hos
 CPU/RAM. Pure functions over os / platform / psutil; no SessionManager state.
 """
 import os
-import platform
 import re
-import sys
 from pathlib import Path
+from .. import config
 
 
 # XDG keys we surface. Linux's `XDG_DOWNLOAD_DIR` (singular) is renamed to
@@ -39,8 +38,7 @@ def _detect_os_user_and_home() -> tuple[str, str]:
     which is a different namespace).
     """
     home_dir = str(Path.home().resolve())
-    is_windows = platform.system().lower() == "windows"
-    if is_windows:
+    if not config.HOST.posix:
         home_dir = home_dir.replace("\\", "/")
         os_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         return os_user, home_dir
@@ -62,10 +60,10 @@ def _detect_user_dirs(home_dir: str) -> dict[str, str]:
     paths; existence on disk is NOT checked (a missing Desktop is
     surfaced to the agent as a hint, not an error).
     """
-    sys_name = platform.system().lower()
+    host = config.HOST
     home = Path(home_dir)
 
-    if sys_name == "linux":
+    if host.xdg_user_dirs:
         dirs: dict[str, str] = {}
         xdg_file = home / ".config" / "user-dirs.dirs"
         if xdg_file.is_file():
@@ -90,24 +88,13 @@ def _detect_user_dirs(home_dir: str) -> dict[str, str]:
             "documents": str(home / "Documents"),
             "pictures":  str(home / "Pictures"),
             "music":     str(home / "Music"),
-            "videos":    str(home / "Videos"),
+            "videos":    str(home / host.videos_folder),
         }
         for k, v in defaults.items():
             dirs.setdefault(k, v)
         return dirs
 
-    if sys_name == "darwin":
-        # macOS uses "Movies" for the videos folder.
-        return {
-            "desktop":   str(home / "Desktop"),
-            "downloads": str(home / "Downloads"),
-            "documents": str(home / "Documents"),
-            "pictures":  str(home / "Pictures"),
-            "music":     str(home / "Music"),
-            "videos":    str(home / "Movies"),
-        }
-
-    if sys_name == "windows":
+    if not host.posix:
         h = home_dir  # already forward-slash normalized
         return {
             "desktop":   f"{h}/Desktop",
@@ -118,14 +105,15 @@ def _detect_user_dirs(home_dir: str) -> dict[str, str]:
             "videos":    f"{h}/Videos",
         }
 
-    # Unknown OS — best-effort flat layout.
+    # The flat layout: macOS (``Movies`` for the videos folder) and any host
+    # outside the three families.
     return {
         "desktop":   str(home / "Desktop"),
         "downloads": str(home / "Downloads"),
         "documents": str(home / "Documents"),
         "pictures":  str(home / "Pictures"),
         "music":     str(home / "Music"),
-        "videos":    str(home / "Videos"),
+        "videos":    str(home / host.videos_folder),
     }
 
 
@@ -139,12 +127,10 @@ def _interactive_pty_supported() -> bool:
     box whose venv predates the dep advertises False (and falls back to ``-p``)
     rather than opening a PTY it can't drive.
     """
-    if os.name == "posix":
-        return True
-    if sys.platform == "win32":
+    if config.HOST.conpty:
         import importlib.util
         return importlib.util.find_spec("winpty") is not None
-    return False
+    return config.HOST.posix
 
 
 def _detect_display() -> dict:
@@ -166,28 +152,27 @@ def _detect_display() -> dict:
     error), but ``has_display`` is still True — this gate is about display
     PRESENCE, not input method.
     """
-    system = platform.system().lower()
-    server = "none"
+    host = config.HOST
+    server = config.DISPLAY_NONE
     has_display = False
     try:
-        if system == "linux":
-            # systemd --user + linger boots WITHOUT a graphical session, so a
-            # headless box has neither var set → has_display stays False. A
-            # desktop login exports one of these into the user service env.
-            if os.environ.get("WAYLAND_DISPLAY"):
-                server, has_display = "wayland", True
-            elif os.environ.get("DISPLAY"):
-                server, has_display = "x11", True
-        elif system == "darwin":
-            # The satellite runs as a per-user LaunchAgent, which loads inside
-            # the user's Aqua (GUI) login session → a desktop is present.
-            server, has_display = "quartz", True
-        elif system == "windows":
-            # The satellite runs as the per-user interactive logon task (not
-            # the session-0 service), so the user's desktop is present.
-            server, has_display = "windows", True
+        if host.display_server:
+            # The table knows: macOS runs the satellite as a per-user
+            # LaunchAgent inside the Aqua login session (quartz), Windows as
+            # the interactive logon task (windows), a host outside the three
+            # families reports none.
+            server = host.display_server
+            has_display = server != config.DISPLAY_NONE
+        elif os.environ.get("WAYLAND_DISPLAY"):
+            # Linux is probed: systemd --user + linger boots WITHOUT a
+            # graphical session, so a headless box has neither var set →
+            # has_display stays False. A desktop login exports one of these
+            # into the user service env.
+            server, has_display = config.DISPLAY_WAYLAND, True
+        elif os.environ.get("DISPLAY"):
+            server, has_display = config.DISPLAY_X11, True
     except Exception:
-        return {"has_display": False, "server": "none", "session_active_unlocked": False}
+        return {"has_display": False, "server": config.DISPLAY_NONE, "session_active_unlocked": False}
     return {
         "has_display": has_display,
         "server": server,
@@ -198,7 +183,9 @@ def _detect_display() -> dict:
     }
 
 
-# Mirror of proxy/core/sandbox/host_resources.py, computed from THIS machine's psutil.
+# The satellite's own session ceiling, computed from THIS machine's psutil (the
+# proxy admits its local sessions by a different rule — the two-gate memory budget
+# in proxy/core/concurrency.py — so nothing here mirrors it).
 # The satellite HARD-ENFORCES this ceiling (physical safety — protects the host
 # from OOM, and binds satellite-INITIATED otodock sessions the proxy never sees);
 # the proxy additionally honors an admin per-machine override
@@ -222,7 +209,7 @@ def _machine_resources() -> tuple[int, int]:
 
 def _recommended_max_sessions() -> int:
     """Conservative ceiling on concurrent local agent sessions this satellite can
-    run, from its CPU + RAM (mirror of the proxy's host_resources formula)."""
+    run, from its CPU + RAM."""
     cpus, mem_bytes = _machine_resources()
     cpu_bound = int(cpus * _SAT_SESSIONS_PER_CORE)
     if mem_bytes <= 0:

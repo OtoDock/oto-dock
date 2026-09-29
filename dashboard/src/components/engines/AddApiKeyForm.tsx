@@ -1,15 +1,12 @@
 import { useState } from 'react'
+import type { EngineProvider } from '../../api/engineDescriptor'
 
 // The API-key form both AI Engines cards use: the admin tab binds it to the
-// admin add mutation (a provider choice on the multi-provider engines), the
-// user card to the user add mutation (the engine's own vendor, and the key
-// kept out of the agent pool).
-
-export const API_KEY_PROVIDERS = [
-  { id: 'anthropic', label: 'Anthropic' },
-  { id: 'openai', label: 'OpenAI' },
-  { id: 'groq', label: 'Groq' },
-]
+// admin add mutation, the user card to the user add mutation (the key kept
+// out of the agent pool). The providers a key may belong to come from the
+// engine's descriptor (lib/engines keyProviders): one provider → no select,
+// several → a select with the first preselected. The server refuses a
+// provider the engine does not list, so the form offers only those.
 
 export interface ApiKeyVars {
   layer: string
@@ -27,17 +24,17 @@ export interface ApiKeyMutation {
   error: unknown
 }
 
-export function ApiKeyForm({ layer, provider: defaultProvider, onDone, mutation, ownerType, showProviderSelect }: {
+export function ApiKeyForm({ layer, providers, onDone, mutation, ownerType }: {
   layer: string
-  provider: string
+  providers: EngineProvider[]
   onDone: () => void
   mutation: ApiKeyMutation
   ownerType: 'platform' | 'user'
-  showProviderSelect: boolean
 }) {
   const [label, setLabel] = useState('')
   const [apiKey, setApiKey] = useState('')
-  const [provider, setProvider] = useState(defaultProvider)
+  const [provider, setProvider] = useState(providers[0]?.id ?? '')
+  const showProviderSelect = providers.length > 1
 
   const handleSubmit = () => {
     if (!apiKey.trim()) return
@@ -54,7 +51,7 @@ export function ApiKeyForm({ layer, provider: defaultProvider, onDone, mutation,
           onChange={(e) => setProvider(e.target.value)}
           className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
         >
-          {API_KEY_PROVIDERS.map((p) => (
+          {providers.map((p) => (
             <option key={p.id} value={p.id}>{p.label}</option>
           ))}
         </select>
@@ -82,11 +79,16 @@ export function ApiKeyForm({ layer, provider: defaultProvider, onDone, mutation,
         >
           {mutation.isPending ? 'Adding...' : 'Add'}
         </button>
-        <button onClick={onDone} className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
+        <button
+          onClick={onDone}
+          className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors"
+        >
           Cancel
         </button>
       </div>
-      {mutation.isError && <p className="text-xs text-red-500">{(mutation.error as Error).message}</p>}
+      {mutation.isError && (
+        <p className="text-xs text-red-500">{(mutation.error as Error).message}</p>
+      )}
     </div>
   )
 }

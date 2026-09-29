@@ -185,6 +185,11 @@ class TestGates:
     def test_clamped_shared_dest_gates_viewer(self, send_env):
         _denied(_user_session("viewer"), 403, target=TGT_SHARED)
 
+    def test_contributor_drops_into_shared_workspace(self, send_env):
+        # A drop is a file write: the workspace tier, not the editor tier.
+        authz = _authz(_user_session("contributor"), target=TGT_SHARED)
+        assert authz.dest_scope == "agent"
+
     def test_agent_scope_dest_needs_editor(self, send_env):
         _denied(_user_session("viewer"), 403, target=TGT_COLLAB, scope="agent")
 

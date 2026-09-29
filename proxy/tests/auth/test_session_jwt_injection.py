@@ -356,6 +356,62 @@ class TestDirectA2:
         )
         assert payload["sid"] == "sess-d" and payload["agent"] == "agentD"
 
+    def _start_with(self, auth: str, session_id: str) -> dict:
+        import asyncio
+        from core.layers.direct.mcp import MCPServerConnection
+
+        conn = MCPServerConnection(
+            "github-mcp",
+            {"type": "http", "url": "http://github-mcp:8935/mcp",
+             "headers": {"Authorization": auth}},
+            session_id=session_id, agent_name="agentE",
+        )
+        captured = {}
+
+        class _FakeCM:
+            async def __aenter__(self):
+                return (object(), object(), None)
+
+            async def __aexit__(self, *a):
+                return False
+
+        def _fake_streamable(url, headers=None):
+            captured["headers"] = headers
+            return _FakeCM()
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        with patch("core.layers.direct.mcp.streamablehttp_client", _fake_streamable), \
+             patch("core.layers.direct.mcp.ClientSession", lambda *a, **k: _FakeSession()):
+            asyncio.run(conn._start_remote())
+        return captured["headers"] or {}
+
+    def test_brokered_bearer_placeholder_is_swapped_for_the_bundle_token(self):
+        """A proxy-terminable HTTP MCP (github/m365) carries the broker
+        placeholder in its entry; the direct layer forwards straight to the
+        sidecar, so it swaps the placeholder for the session's real bearer
+        the way the CLI copy and the tunnel do — a headless app action used
+        to reach GitHub with the literal placeholder (401 Bad credentials)."""
+        from core.credentials import mcp_broker
+        from core.credentials.mcp_broker import SecretBundle
+
+        placeholder = f"Bearer {mcp_broker.BROKER_BEARER_PLACEHOLDER}"
+        mcp_broker.provision("appx-e1", {"github-mcp": SecretBundle(http_bearer="gho_real")})
+        try:
+            headers = self._start_with(placeholder, "appx-e1")
+            assert headers["Authorization"] == "Bearer gho_real"
+            # A store miss leaves the placeholder: the sidecar refuses, fail-closed.
+            assert self._start_with(placeholder, "appx-none")["Authorization"] == placeholder
+            # A real vendor bearer is never touched.
+            assert self._start_with("Bearer gho_vendor", "appx-e1")["Authorization"] == "Bearer gho_vendor"
+        finally:
+            mcp_broker.purge_session("appx-e1")
+
 
 # --------------------------------------------------------------------------
 # The master key is no longer a resolvable template token

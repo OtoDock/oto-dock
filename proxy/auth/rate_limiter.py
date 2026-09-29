@@ -8,20 +8,28 @@ exponential backoff once the window's attempt cap is exceeded.
 
 Two entry points:
 
-* ``hit(bucket, key)`` — **record-then-check**, done synchronously with no
+* ``hit(bucket, key)``: **check-then-record**, done synchronously with no
   ``await`` in between, so it is burst-safe: N concurrent requests each
-  increment before any of them yields, so they can't all slip under the cap.
+  check and record before any of them yields, so they can't all slip under
+  the cap; a refused attempt is recorded too.
   Use this at the TOP of a handler for surfaces with no legitimate high
   frequency (2FA, password reset, OAuth start, webhook fire).
-* ``check_rate_limit`` / ``record_attempt`` — the split check/record pair, kept
-  for the login flow which counts only *failed* attempts.
+* ``check_rate_limit`` / ``record_attempt``: the split check/record pair.
+  The login counts every attempt with ``hit`` before its first await and
+  gives back the ones that tested nothing or were right
+  (``release_attempt``), so a burst from one address cannot all slip under
+  the cap while the password hashes run.
 """
 
+import secrets
 import time
 from datetime import datetime
 
+import jwt
+
 import config
 from storage import database as db
+from storage.pg import get_conn, run_db
 
 # (bucket, key) → {count, first_at, blocked_until, block_count}
 _attempts: dict[tuple[str, str], dict] = {}
@@ -116,21 +124,29 @@ def hit(bucket: str, key: str) -> tuple[bool, int]:
     return allowed, retry_after
 
 
+def release_attempt(bucket: str, key: str) -> None:
+    """Give back one attempt ``hit`` counted (never below zero)."""
+    entry = _attempts.get((bucket, key))
+    if entry and entry["count"] > 0:
+        entry["count"] -= 1
+
+
 def clear_rate_limit(bucket: str, key: str) -> None:
     """Drop tracking for ``(bucket, key)`` (e.g. on a successful login)."""
     _attempts.pop((bucket, key), None)
 
 
 # --- Login IP limiter: thin wrappers over the "login" bucket --------------
-# Login counts only FAILED attempts (a correct password must never block the
-# legitimate user), so it keeps the split check/record pair.
+# Every attempt is counted before the login's first await (``hit``); one that
+# tested no password (the tarpit refused it) or had the right one is given
+# back, so a correct password never blocks the legitimate user.
 
-def check_ip_rate_limit(ip: str) -> tuple[bool, int]:
-    return check_rate_limit("login", ip)
+def hit_ip_login(ip: str) -> tuple[bool, int]:
+    return hit("login", ip)
 
 
-def record_ip_attempt(ip: str) -> None:
-    record_attempt("login", ip)
+def release_ip_attempt(ip: str) -> None:
+    release_attempt("login", ip)
 
 
 def clear_ip_attempts(ip: str) -> None:
@@ -176,15 +192,91 @@ def check_account_tarpit(sub: str) -> tuple[bool, float]:
         return True, 0
 
 
-def record_failed_attempt(ip: str, sub: str | None):
-    """Record a failed login attempt for both IP and account."""
-    record_ip_attempt(ip)
-    if sub:
-        db.record_failed_login(sub)
-
-
-def record_successful_login(ip: str, sub: str):
-    """Clear rate limiting on successful login."""
-    clear_ip_attempts(ip)
+def _clear_account_failures(sub: str) -> None:
     db.clear_failed_logins(sub)
     db.reset_login_attempts(sub)
+
+
+def undo_failed_login(sub: str) -> None:
+    """Give back one failure the login counted before a password check that
+    never ran (the hash gate was full): one less, and no last failure when
+    it was the only one. One statement, so a failure another attempt
+    counts meanwhile is kept. Synchronous: call it on the DB executor."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET failed_login_attempts = GREATEST(failed_login_attempts - 1, 0), "
+            "last_failed_login = CASE WHEN failed_login_attempts <= 1 THEN NULL "
+            "ELSE last_failed_login END WHERE sub=%s",
+            (sub,),
+        )
+        conn.commit()
+
+
+async def record_successful_login(ip: str, sub: str) -> None:
+    """Clear the limits after a full login: the address's bucket in memory,
+    the account's counters through the DB executor."""
+    clear_ip_attempts(ip)
+    await run_db(_clear_account_failures, sub)
+
+
+# --- Trusted devices (the OWASP device-cookie pattern) ---
+#
+# A browser that completed a full login for an account carries a signed
+# device token for it: that browser's password logins skip the account
+# tarpit (an attacker without the cookie still meets it) and count their
+# failures against the device instead (the ``login_device`` bucket).
+
+DEVICE_TOKEN_DAYS = 180
+_DEVICE_PURPOSE = "trusted_device"
+
+
+def mint_device_token(sub: str) -> str:
+    now = int(time.time())
+    return jwt.encode({
+        "purpose": _DEVICE_PURPOSE, "sub": sub, "jti": secrets.token_urlsafe(16),
+        "iat": now, "exp": now + DEVICE_TOKEN_DAYS * 86400,
+    }, config.JWT_SECRET, algorithm="HS256")
+
+
+def device_token_claims(token: str) -> dict | None:
+    """The claims of a valid device token, or None (bad signature, expired,
+    another token type)."""
+    if not token:
+        return None
+    try:
+        claims = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+    if claims.get("purpose") != _DEVICE_PURPOSE or not claims.get("sub") or not claims.get("jti"):
+        return None
+    return claims
+
+
+def trusted_device_for(claims: dict | None, user: dict) -> str:
+    """The device key (the token's ``jti``) when ``claims`` vouch for this
+    account in this browser: the same account, minted after its last password
+    change, and the device's own bucket not blocked. "" otherwise.
+
+    A vouched attempt is counted against the device at once, the check and
+    the count with no await between, so a burst presenting one cookie cannot
+    all pass the check while the hashes run; ``release_device_attempt``
+    gives it back when the password was right or none was checked."""
+    if not claims or claims.get("sub") != user.get("sub"):
+        return ""
+    changed = user.get("password_changed_at")
+    if changed:
+        try:
+            if int(claims.get("iat") or 0) < datetime.fromisoformat(changed).timestamp() - 5:
+                return ""
+        except (ValueError, TypeError):
+            return ""
+    jti = str(claims["jti"])
+    allowed, _ = check_rate_limit("login_device", jti)
+    if not allowed:
+        return ""
+    record_attempt("login_device", jti)
+    return jti
+
+
+def release_device_attempt(device_key: str) -> None:
+    release_attempt("login_device", device_key)

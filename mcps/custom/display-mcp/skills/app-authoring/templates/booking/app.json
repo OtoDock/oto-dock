@@ -1,0 +1,29 @@
+{
+  "title": "Booking",
+  "deploy_requires_approval": true,
+  "actions": [
+    {"id": "notify", "label": "Tell the owner about a booking", "type": "platform", "method": "notifications.create"}
+  ],
+  "egress": ["api.stripe.com"],
+  "secrets": [
+    {
+      "name": "STRIPE_SECRET_KEY",
+      "required": true,
+      "description": "a restricted Stripe key that may create Checkout Sessions (Developers → API keys → restricted key, write on Checkout Sessions)",
+      "sends_to": {"host": "api.stripe.com", "header": "Authorization", "prefix": "Bearer "}
+    },
+    {
+      "name": "STRIPE_WEBHOOK_SECRET",
+      "required": true,
+      "description": "the signing secret of the Stripe webhook endpoint that points at this app's inbound address (Developers → Webhooks; send checkout.session.completed and checkout.session.expired)"
+    }
+  ],
+  "inbound": {
+    "stripe": {"verify": "stripe", "secret": "STRIPE_WEBHOOK_SECRET", "handler": "payment"}
+  },
+  "external": {
+    "links": ["checkout.stripe.com"],
+    "challenge": ["/register"],
+    "session_days": 30
+  }
+}

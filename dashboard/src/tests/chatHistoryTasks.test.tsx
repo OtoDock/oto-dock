@@ -294,6 +294,32 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     expect(screen.getByText(/scheduled task itself is not deleted/)).toBeTruthy()
   })
 
+  const last = <T,>(xs: T[]): T => xs[xs.length - 1]
+
+  it('deleting the OPEN chat leaves it for a fresh one; another row stays put', () => {
+    // The server closes the open chat's terminal before its row goes, so the
+    // page must not stay on (and re-resume) a chat that no longer exists.
+    deleteMutateMock.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) => {
+      opts?.onSuccess?.()
+    })
+    const onNew = vi.fn()
+    renderHistory({ activeChatId: 'c1', onNew })
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Delete'))
+    fireEvent.click(last(screen.getAllByText('Delete')))
+    expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
+    expect(onNew).toHaveBeenCalledTimes(1)
+
+    onNew.mockClear()
+    deleteMutateMock.mockClear()
+    renderHistory({ activeChatId: 'other', onNew })
+    fireEvent.click(last(screen.getAllByTitle('Options')))
+    fireEvent.click(last(screen.getAllByText('Delete')))
+    fireEvent.click(last(screen.getAllByText('Delete')))
+    expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
+    expect(onNew).not.toHaveBeenCalled()
+  })
+
   it('chat rows without flags keep their historical kebab', () => {
     renderHistory()  // chat c1, no can_* fields → owner defaults
     fireEvent.click(screen.getByTitle('Options'))

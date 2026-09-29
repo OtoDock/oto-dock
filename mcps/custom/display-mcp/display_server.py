@@ -14,6 +14,9 @@ Tools:
     calculator/animation) in a sandboxed, theme-matched, auto-sized frame.
   - send_url: Sends a clickable link card to the chat.
   - send_file: Sends a file as a downloadable link in the chat.
+  - the app and Dock tools (pin_app, app_push, app_state, open_app,
+    rollback_app, pin_file, …) live in app_tools.py and dispatch through
+    its HANDLERS table.
 
 The proxy routes display events to the appropriate client adapter (dashboard, phone, etc.).
 """
@@ -27,7 +30,7 @@ import httpx
 from PIL import Image, ImageOps
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("display-mcp")
@@ -50,21 +53,12 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 SESSION_ID = os.environ.get("OTO_SESSION_ID", "")
 
-# visibility-modes: the agent's mode scopes filter pin_app's `visibility`
-# enum so the LLM can't pick an ownership this agent's mode lacks; the
-# default mirrors OTO_DEFAULT_SCOPE (the platform's effective default —
-# viewer-clamped server-side too). Same pattern as schedules-mcp.
-AVAILABLE_SCOPES = [
-    s for s in (os.environ.get("OTO_AVAILABLE_SCOPES", "") or "").split(":")
-    if s in ("user", "agent")
-] or ["user", "agent"]
-_DEFAULT_SCOPE = (
-    os.environ.get("OTO_DEFAULT_SCOPE")
-    or os.environ.get("PROXY_TASK_SCOPE")
-    or os.environ.get("OTO_SCOPE")
-    or "user"
+from app_tools import (  # noqa: E402 — the app and Dock tools
+    MAX_UI_HTML_BYTES,
+    _artifact_read_candidates,  # noqa: F401 — the tests reach it through this module
+    _read_artifact_file,
 )
-SCOPE_DEFAULT = _DEFAULT_SCOPE if _DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABLE_SCOPES[0]
+import app_tools  # noqa: E402
 
 
 # Max image dimension (matches Claude's limit)
@@ -80,10 +74,6 @@ MAX_PASSTHROUGH_BYTES = 10 * 1024 * 1024
 # risk OOMing the subprocess on a multi-GB file before Pillow's decompression
 # guard ever sees it.
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
-
-# UI artifact content cap (mirrors the /v1/hooks/ui limit — checked here too
-# so an oversized artifact fails with a clear message before the POST).
-MAX_UI_HTML_BYTES = 2 * 1024 * 1024
 
 server = Server("display")
 
@@ -389,7 +379,7 @@ async def list_tools() -> list[Tool]:
                 "(GLTFLoader etc. — fetch is blocked), no workers/WASM "
                 "decoders, no WebXR; use procedural geometry + data:/blob:/"
                 "canvas textures, plain WebGL works fine — recipes in the "
-                "miniapp-authoring skill). "
+                "app-authoring skill). "
                 "Inline <script> is allowed and runs sandboxed: client-side "
                 "interactivity (inputs, tabs, sliders, sorting, local "
                 "calculations) fully works, but the artifact CANNOT reach "
@@ -493,220 +483,12 @@ async def list_tools() -> list[Tool]:
                 "required": ["source"],
             },
         ),
-        Tool(
-            name="pin_app",
-            description=(
-                "Pin (or update — same slug upserts) a standing MINI-APP: an "
-                "HTML dashboard the user opens any time from the chat page's "
-                "apps button, outliving every chat. Use for recurring surfaces "
-                "(morning brief, project status, home dashboard) — for a "
-                "one-off visual in THIS conversation use display_ui instead. "
-                "Same sandboxed rendering as display_ui (kit + Tailwind "
-                "available; Tailwind + mobile-responsive layout are REQUIRED "
-                "for apps — see the skill). Buttons may invoke DECLARED "
-                "actions only, via otodock.action('<id>', args): declare them "
-                "in `actions`; the user approves the manifest before any "
-                "button works (the ack tells you the approval state — relay "
-                "it). Re-pinning with new html live-reloads open tabs: that "
-                "is how a scheduled task refreshes an app. If the user "
-                "unpinned an app from their dashboard, pin_app(slug) alone "
-                "RESTORES it — file, actions and approval intact (list_apps "
-                "marks such slugs 'unpinned'); never rebuild what still "
-                "exists. `scope` pins a Dock dashboard instead: "
-                "scope='chat' binds it to THIS chat (opened from the chat's "
-                "Dock button), scope='project' to this chat's delegation "
-                "project (shown beside the live lane cards) — one dashboard "
-                "per chat/project, and a scoped re-pin REPLACES it (see the "
-                "skill's Scoped dashboards section)."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "slug": {
-                        "type": "string",
-                        "description": (
-                            "Stable identity, 1-40 chars [a-z0-9-]. Reuse to "
-                            "update; check list_apps before inventing one."
-                        ),
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Tab title shown to the user.",
-                    },
-                    "html": {
-                        "type": "string",
-                        "description": (
-                            "HTML body fragment (markup + <style>/<script>), "
-                            "max 2MB. Required on first pin UNLESS "
-                            "apps/<slug>.html already exists in your scope "
-                            "(re-pin reuses it); omit to update only "
-                            "metadata/actions. Saved to apps/<slug>.html "
-                            "in your scope workspace."
-                        ),
-                    },
-                    "actions": {
-                        "type": "array",
-                        "description": (
-                            "Declared-actions manifest (≤16). Each: {id, "
-                            "label, type: 'fire_task'|'send_prompt'|"
-                            "'mcp_tool'|'data_feed', task_id? (fire_task — "
-                            "must be a scheduled or trigger task of this "
-                            "agent), prompt? (send_prompt — may use {{arg}} "
-                            "placeholders filled from the otodock.action "
-                            "args), mcp?/tool?/fixed_args? (mcp_tool — calls "
-                            "ONE tool on one of this agent's MCPs directly, "
-                            "no agent turn), feed? (data_feed — subscribe "
-                            "the page to a read-only live platform feed via "
-                            "otodock.feed: 'active_chats' or "
-                            "'project_lanes'), args_schema? (fire_task/"
-                            "mcp_tool — flat JSON-Schema object of scalar "
-                            "props gating page-supplied args; strings need "
-                            "maxLength or enum; see the skill). Omit to keep "
-                            "the current manifest; [] clears it. Changing it "
-                            "requires user re-approval."
-                        ),
-                        "items": {"type": "object"},
-                    },
-                    "make_default": {
-                        "type": "boolean",
-                        "description": "Make this the default (first) tab.",
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["standing", "chat", "project"],
-                        "description": (
-                            "Where the app lives. 'standing' (default): the "
-                            "apps strip, outliving every chat. 'chat': THIS "
-                            "chat's Dock dashboard (progress boards for "
-                            "plan-scale work). 'project': this chat's "
-                            "delegation project Dock (plan overview + live "
-                            "lanes; errors if the chat has no project). Ids "
-                            "resolve from your session — never passed."
-                        ),
-                    },
-                    "visibility": {
-                        "type": "string",
-                        "enum": AVAILABLE_SCOPES,
-                        "default": SCOPE_DEFAULT,
-                        "description": (
-                            f"WHO sees it (default for this agent: "
-                            f"`{SCOPE_DEFAULT}`; orthogonal to `scope`). "
-                            "'agent' = one shared dashboard for every user "
-                            "of this agent (needs editor+ when a human "
-                            "drives the session); 'user' = the current "
-                            "user's personal dashboard. Omit for the "
-                            "agent's default; override only when the "
-                            "intent is explicit (e.g. \"pin this for the "
-                            "whole team\" / \"just for me\")."
-                        ),
-                    },
-                },
-                "required": ["slug"],
-            },
-        ),
-        Tool(
-            name="unpin_app",
-            description=(
-                "Retire a pinned mini-app by slug (your scope) — removes the "
-                "registration, its actions manifest AND its approval; the "
-                "apps/<slug>.html workspace file stays. (The dashboard's X "
-                "only hides an app — pin_app(slug) restores those.) A slug "
-                "pinned both shared and personal needs `visibility` to pick "
-                "one; otherwise it auto-detects."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "slug": {"type": "string", "description": "The app's slug."},
-                    "visibility": {
-                        "type": "string",
-                        "enum": AVAILABLE_SCOPES,
-                        "description": (
-                            "Disambiguate when the slug exists both shared "
-                            "('agent') and personal ('user'). Omit to "
-                            "auto-detect."
-                        ),
-                    },
-                },
-                "required": ["slug"],
-            },
-        ),
-        Tool(
-            name="list_apps",
-            description=(
-                "List the pinned mini-apps in your scope (shared + the "
-                "session user's personal ones) with slug, title, path, "
-                "declared actions, and approval state. Entries marked "
-                "'unpinned' were removed from the user's dashboard — "
-                "pin_app(slug) restores one with approval intact. Check "
-                "before pin_app so slugs are reused deliberately."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="pin_file",
-            description=(
-                "Pin an EXISTING workspace text/markdown file to the chat or "
-                "project Dock as a read-only row: collapsed by default, the "
-                "user expands it to a rich markdown render that live-updates "
-                "as the file changes — zero upkeep from you. The right tool "
-                "for living documents (a plan file on the project Dock, a "
-                "spec, meeting notes): NEVER build a mini-app just to show a "
-                "file. Re-pinning the same path updates the title. On a "
-                "remote machine the platform mirror is what renders — edits "
-                "appear after the end-of-turn sync."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Workspace-relative path of an existing text "
-                            "file (e.g. projects/hero-video/plan.md). "
-                            "Renderable types: .md (rich), plus plain-text "
-                            "code/config types."
-                        ),
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Row title (default: the filename).",
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["chat", "project"],
-                        "description": (
-                            "'chat' (default): THIS chat's Dock. 'project': "
-                            "this chat's delegation project Dock (errors if "
-                            "the chat has no project). Ids resolve from your "
-                            "session — never passed."
-                        ),
-                    },
-                },
-                "required": ["path"],
-            },
-        ),
-        Tool(
-            name="unpin_file",
-            description=(
-                "Remove a Dock file pin by path (the file itself stays). "
-                "Omit 'path' to clear every file pin of the scope."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string",
-                             "description": "The pinned file's path."},
-                    "scope": {"type": "string", "enum": ["chat", "project"],
-                              "description": "Which Dock (default 'chat')."},
-                },
-            },
-        ),
+        *app_tools.APP_TOOLS,
     ]
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
     if name == "display_images":
         return await _handle_display_images(arguments)
     elif name == "send_file":
@@ -719,16 +501,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return await _handle_display_media(arguments, "audio")
     elif name == "display_ui":
         return await _handle_display_ui(arguments)
-    elif name == "pin_app":
-        return await _handle_pin_app(arguments)
-    elif name == "unpin_app":
-        return await _handle_app_hook("unpin", arguments)
-    elif name == "list_apps":
-        return await _handle_app_hook("list", arguments)
-    elif name == "pin_file":
-        return await _handle_file_pin_hook("pin", arguments)
-    elif name == "unpin_file":
-        return await _handle_file_pin_hook("unpin", arguments)
+    handler = app_tools.HANDLERS.get(name)
+    if handler is not None:
+        return await handler(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -989,74 +764,6 @@ async def _handle_display_media(arguments: dict, media_kind: str) -> list[TextCo
     return [TextContent(type="text", text=f"Displayed {media_kind} to user.")]
 
 
-def _artifact_read_candidates(raw: str) -> list[str]:
-    """Local filesystem candidates for an existing artifact at ``raw``.
-
-    Only used for the html-less re-display flow, and only in THIS process's
-    namespace — where the CLI's own Edit writes land (the local sandbox
-    mounts the virtual paths for real; on a remote machine the env dirs are
-    rewritten to machine-absolute paths). Two forms, tried in order:
-
-    1. Absolute (``/workspace/…``, ``/users/<u>/workspace/…``): as-is first
-       (real inside the local sandbox), then anchored to the agent root
-       derived from ``OTO_WORKSPACE_DIR`` — the same ``agent_dir + virtual``
-       rule the satellite path translator applies, so scope semantics match
-       the hook's ``_sandbox_to_host`` (a user-scope session re-displaying a
-       shared ``/workspace/…`` artifact reads the SHARED file).
-    2. Relative: joined to ``OTO_WORKSPACE_DIR`` (the hook's documented
-       workspace-relative form).
-
-    Not a security boundary: the process can only read what the session
-    itself can read (mount namespace / machine scope enforce that).
-    """
-    workspace = os.environ.get("OTO_WORKSPACE_DIR", "").rstrip("/")
-    username = os.environ.get("OTO_USERNAME", "")
-    bases: list[str] = []
-    if raw.startswith("/"):
-        bases.append(raw)
-        # Agent root = OTO_WORKSPACE_DIR minus its scope suffix.
-        agent_root = ""
-        user_suffix = f"/users/{username}/workspace" if username else ""
-        if user_suffix and workspace.endswith(user_suffix):
-            agent_root = workspace[: -len(user_suffix)]
-        elif workspace.endswith("/workspace"):
-            agent_root = workspace[: -len("/workspace")]
-        if agent_root:
-            bases.append(agent_root + raw)
-    elif workspace:
-        bases.append(os.path.join(workspace, raw))
-    # The hook forces .html on save — accept an extensionless echo of the path.
-    out: list[str] = []
-    for p in bases:
-        for cand in (p, p if p.lower().endswith(".html") else p + ".html"):
-            if cand not in out:
-                out.append(cand)
-    return out
-
-
-def _read_artifact_file(raw: str) -> tuple[str | None, str]:
-    """Read an existing artifact's current content; returns (html, error)."""
-    for candidate in _artifact_read_candidates(raw):
-        try:
-            with open(candidate, "rb") as f:
-                data = f.read(MAX_UI_HTML_BYTES + 1)
-        except OSError:
-            continue
-        if len(data) > MAX_UI_HTML_BYTES:
-            return None, (
-                f"Error: the artifact file at {raw} exceeds the 2MB cap."
-            )
-        if not data.strip():
-            return None, (
-                f"Error: the artifact file at {raw} is empty — pass 'html'."
-            )
-        return data.decode("utf-8", errors="replace"), ""
-    return None, (
-        f"Error: no artifact file found at '{raw}' — pass 'html' to create "
-        f"it, or use the exact path a previous display_ui ack returned."
-    )
-
-
 async def _handle_display_ui(arguments: dict) -> list[TextContent]:
     """Render an HTML artifact in the chat (or save it without displaying).
 
@@ -1146,159 +853,6 @@ async def _handle_display_ui(arguments: dict) -> list[TextContent]:
             f"collapses), display=false refreshes it silently in place."
         ),
     )]
-
-
-async def _post_hook(path: str, payload: dict) -> tuple[dict | None, str]:
-    """POST a hook with the session JWT; returns (json, "") or (None, error)."""
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0),
-        ) as client:
-            resp = await client.post(
-                f"{PROXY_URL}{path}",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {PROXY_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-            )
-            resp.raise_for_status()
-            return resp.json() or {}, ""
-    except httpx.HTTPStatusError as e:
-        return None, f"HTTP {e.response.status_code} — {e.response.text[:300]}"
-    except Exception as e:
-        return None, str(e)
-
-
-async def _handle_pin_app(arguments: dict) -> list[TextContent]:
-    """Pin/update a standing mini-app. Thin like display_ui: the proxy hook
-    owns scope resolution, path anchoring, manifest validation, the
-    satellite push, and the live-reload broadcast."""
-    slug = (arguments.get("slug") or "").strip()
-    if not slug:
-        return [TextContent(type="text", text="Error: 'slug' is required.")]
-    html_content = arguments.get("html") or ""
-    if not html_content.strip():
-        # Opportunistic freshness on html-less re-pin: if the app file is
-        # readable HERE (where the CLI's Edit writes land), forward its
-        # current content so a satellite-side edit goes live NOW instead of
-        # at turn-end sync. Unreadable/missing → keep the classic semantics
-        # (empty html = the hook keeps the existing platform-side file), so
-        # restore-after-unpin still works from any machine.
-        refreshed, err = _read_artifact_file(f"apps/{slug}.html")
-        if not err and refreshed:
-            html_content = refreshed
-    if html_content and len(html_content.encode("utf-8")) > MAX_UI_HTML_BYTES:
-        return [TextContent(
-            type="text",
-            text="Error: html exceeds the 2MB app cap — trim embedded assets.",
-        )]
-    payload = {
-        "session_id": SESSION_ID,
-        "slug": slug,
-        "title": (arguments.get("title") or "").strip(),
-        "html": html_content,
-        "actions": arguments.get("actions"),
-        "make_default": bool(arguments.get("make_default", False)),
-        "scope": (arguments.get("scope") or "standing").strip().lower(),
-        # Ownership (S1). Empty = the proxy resolves the session's effective
-        # default — same value SCOPE_DEFAULT advertises, kept server-side so
-        # the two can't drift.
-        "visibility": (arguments.get("visibility") or "").strip().lower(),
-    }
-    data, err = await _post_hook("/v1/hooks/apps/pin", payload)
-    if data is None:
-        return [TextContent(type="text", text=f"Error pinning app: {err}")]
-    approval = data.get("approval", "none")
-    note = {
-        "approved": "Actions are approved and live.",
-        "pending user approval": (
-            "Actions are PENDING USER APPROVAL — tell the user to open the "
-            "apps panel and approve them before the buttons work."
-        ),
-        "none": "No actions declared.",
-    }.get(approval, "")
-    restored = (data.get("replaced") or data.get("restored")
-                or data.get("reused_file") or "")
-    pin_scope = data.get("pin_scope", "standing")
-    where = {
-        "chat": "this chat's Dock",
-        "project": "the project's Dock",
-    }.get(pin_scope, "the apps strip")
-    return [TextContent(
-        type="text",
-        text=(
-            f"Pinned mini-app '{slug}' ({data.get('scope', '')}, on {where}, "
-            f"saved at {data.get('path', '')})."
-            + (f" NOTE: {restored}." if restored else "")
-            + f" {note} Re-pin with the same slug to update; open tabs "
-            f"live-reload."
-        ),
-    )]
-
-
-async def _handle_file_pin_hook(op: str, arguments: dict) -> list[TextContent]:
-    """Dock file pins — thin like the app hooks: the proxy owns scope
-    resolution, path confinement, and the pins-refresh broadcast."""
-    path = (arguments.get("path") or "").strip()
-    if op == "pin" and not path:
-        return [TextContent(type="text", text="Error: 'path' is required.")]
-    payload = {
-        "session_id": SESSION_ID,
-        "path": path,
-        "title": (arguments.get("title") or "").strip(),
-        "scope": (arguments.get("scope") or "chat").strip().lower(),
-    }
-    data, err = await _post_hook(f"/v1/hooks/files/{op}", payload)
-    if data is None:
-        return [TextContent(type="text", text=f"Error ({op} file): {err}")]
-    if op == "unpin":
-        return [TextContent(
-            type="text",
-            text=(f"Removed {data.get('removed', 0)} file pin(s) from the "
-                  f"{payload['scope']} Dock (files kept)."),
-        )]
-    return [TextContent(
-        type="text",
-        text=(
-            f"Pinned '{data.get('title', '')}' ({data.get('path', '')}) to "
-            f"{'this chat' if data.get('pin_scope') == 'chat' else 'the project'}'s "
-            f"Dock. {data.get('note', '')}"
-        ),
-    )]
-
-
-async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
-    payload = {"session_id": SESSION_ID, "slug": (arguments.get("slug") or "").strip()}
-    if arguments.get("visibility"):
-        payload["visibility"] = arguments["visibility"].strip().lower()
-    data, err = await _post_hook(f"/v1/hooks/apps/{op}", payload)
-    if data is None:
-        return [TextContent(type="text", text=f"Error ({op}): {err}")]
-    if op == "unpin":
-        return [TextContent(
-            type="text",
-            text=f"Unpinned '{payload['slug']}' (file {data.get('kept_file', '')} kept).",
-        )]
-    apps = data.get("apps", [])
-    if not apps:
-        return [TextContent(type="text", text="No pinned mini-apps in your scope.")]
-    lines = []
-    for a in apps:
-        acts = ", ".join(
-            f"{x.get('id')}({x.get('type')})" for x in a.get("actions", [])
-        ) or "none"
-        approved = "approved" if a.get("actions_approved") else "PENDING APPROVAL"
-        pin_scope = a.get("pin_scope", "standing")
-        scope_tag = (f", {pin_scope}-scoped" if pin_scope != "standing" else "")
-        lines.append(
-            f"- {a.get('slug')} [{a.get('scope')}{scope_tag}] \"{a.get('title')}\" — "
-            f"path {a.get('path')}, actions: {acts}"
-            + ("" if acts == "none" else f" ({approved})")
-            + (" — UNPINNED by the user; pin_app(slug) restores it"
-               if a.get("unpinned") else "")
-        )
-    return [TextContent(type="text", text="Pinned mini-apps:\n" + "\n".join(lines))]
 
 
 async def main():

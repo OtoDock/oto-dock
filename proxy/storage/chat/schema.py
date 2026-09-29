@@ -6,7 +6,7 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 ``docs/architecture/DATABASE-SCHEMA.md``.
 """
 
-from storage.schema_base import _index_exists
+from storage.schema_base import _drop_invalid_indexes, _index_exists
 
 
 def init_chats(conn) -> None:
@@ -88,11 +88,31 @@ def init_chats(conn) -> None:
             project_id TEXT NOT NULL DEFAULT '',
             -- '' | 'orchestrator' | 'worker' — stamped by the delegation spawn
             -- path; drives the chat-list linkage accents (session H).
-            delegate_role TEXT NOT NULL DEFAULT ''
+            delegate_role TEXT NOT NULL DEFAULT '',
+            -- the checks attached to this chat (CHECKS.md): a JSON list of
+            -- refs ('agent:<name>' | 'user:<name>'), '' = none. Attached by
+            -- the checks tool for a chat, copied from the task for a run.
+            -- Existing DBs: run_migrations adds it.
+            checks TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_user ON chats(user_sub)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_agent ON chats(agent)")
+    # The newest chats of an agent (the chat and task lists stop at their
+    # limit instead of sorting every chat), a session's chat (every hook with
+    # chat side effects), the project and worker lookups polled every 10 s,
+    # and the finished-unread backfill (partial: the query repeats the
+    # predicate, so generic plans use it too).
+    _drop_invalid_indexes(conn, "idx_chats_agent_updated", "idx_chats_session",
+                          "idx_chats_project", "idx_chats_parent", "idx_chats_last_response")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_agent_updated ON chats (agent, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_session ON chats (session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_project ON chats (project_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chats_parent ON chats (parent_chat_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chats_last_response ON chats (last_response_at) "
+        "WHERE last_response_at IS NOT NULL"
+    )
 
     # Per-(chat, owner-identity) read markers for the sidebar unread indicator.
     # user_sub stores the chat-history OWNER identity (visibility.py's
@@ -156,7 +176,9 @@ def init_chats(conn) -> None:
             -- derive access from the chats table; chatless rows fall back to
             -- agent-access via `agent`. '' = pre-stamp row → coarse fallback
             -- (any authenticated user). `owner_sub` is recorded where a real
-            -- user sub exists (workspace mints) for the sharing-era rule.
+            -- user sub exists (workspace mints) and is not read by the rule.
+            -- Share routes never read this table: a chat share serves copies
+            -- from its snapshot (SHARING.md).
             owner_sub TEXT NOT NULL DEFAULT '',
             agent TEXT NOT NULL DEFAULT '',
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE

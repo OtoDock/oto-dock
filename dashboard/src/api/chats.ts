@@ -1,5 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { type SourceType } from '../lib/session/kind'
+import type { ActiveRowPhase } from '../lib/status/chat'
 
 export interface Chat {
   id: string
@@ -9,7 +11,7 @@ export interface Chat {
   session_id: string | null
   permission_mode: string
   execution_path: string
-  source_type?: 'chat' | 'phone' | 'task'
+  source_type?: SourceType
   // otodock-CLI: how the chat was started — 'dashboard' (default) or 'otodock'
   // (an `otodock` CLI session on the remote machine). Surfaced as a badge.
   origin?: string
@@ -35,6 +37,9 @@ export interface Chat {
   // backend-side. Optional: absent on stale caches from an older proxy.
   can_rename?: boolean
   can_delete?: boolean
+  // Sharing as a snapshot (SHARING.md): the owner of a per-user chat,
+  // editor and above on a shared-only agent's chat, never a task run.
+  can_share?: boolean
 }
 
 export interface ChatMessage {
@@ -103,10 +108,12 @@ export interface ActiveChat {
   id: string
   agent: string
   title: string
-  // 'streaming' (open turn right now) or 'finished' (recent finished-unread
-  // backfill — the widget keeps it until someone opens the chat).
-  status: string
-  source_type?: string
+  // streaming (an open turn right now), warming (a session registered as
+  // warming with no turn yet — metadata for the initiating tab's row) or
+  // finished (the recent finished-unread backfill — the widget keeps it
+  // until someone opens the chat). The proxy's ws/chat_phase.py.
+  status: ActiveRowPhase
+  source_type?: SourceType
   owner_is_shared?: boolean
   last_response_at?: string | null
   unread?: boolean

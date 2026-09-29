@@ -13,8 +13,10 @@ require-2FA policy. Password(+TOTP) always remains as fallback.
 Attaches to the shared core-auth router."""
 
 import asyncio
+import hmac
 import json
 import logging
+import re
 import secrets
 import time
 from urllib.parse import urlparse
@@ -40,14 +42,12 @@ from webauthn.helpers.structs import (
 
 import config
 from auth.lan_check import check_local_auth_allowed, get_client_ip
-from auth.password import verify_password
 from auth.providers import UserContext, get_current_user, mask_email, require_auth
 from auth.rate_limiter import hit as rate_limit_hit
 from auth.totp import consume_2fa_session_token, validate_2fa_session_token
 from storage import database as task_store
 from storage.identity import webauthn_store
 
-from api.auth._common import _build_user_response
 from api.auth._router import router
 
 logger = logging.getLogger("claude-proxy")
@@ -66,9 +66,37 @@ _challenges: dict[str, tuple[bytes, str, float]] = {}  # state → (challenge, s
 # cookie, the page deep-links it back via the existing OIDC-callback rails
 # (otodock://auth/callback?code=<token>&state=passkey-handoff), and the
 # webview exchanges it for its own session cookie. Single-use, 60s.
+#
+# The handoff is bound to the WebView that started it:
+# the WebView first asks ``/auth/passkey/native/start`` for a nonce, which it
+# keeps in an HttpOnly cookie and passes to the system browser in the page
+# URL; the verify stores the nonce with the token, and the exchange answers
+# only a WebView whose cookie holds it.
 NATIVE_HANDOFF_STATE = "passkey-handoff"
 _NATIVE_TOKEN_TTL = 60
-_native_tokens: dict[str, tuple[str, float]] = {}  # token → (sub, expires)
+_native_tokens: dict[str, tuple[str, str, float]] = {}  # token → (sub, handoff, expires)
+_HANDOFF_COOKIE_TTL = 300
+_HANDOFF_RING = 4  # recent nonces one browser keeps (two sign-ins at once)
+
+
+def _handoff_cookie_name() -> str:
+    return "__Host-pk_handoff" if config.COOKIE_SECURE else "pk_handoff"
+
+
+def _handoff_ring(request: Request) -> list[str]:
+    return [n for n in (request.cookies.get(_handoff_cookie_name()) or "").split(".") if n]
+
+
+def _set_handoff_ring(response: JSONResponse, ring: list[str]) -> None:
+    if ring:
+        response.set_cookie(
+            _handoff_cookie_name(), ".".join(ring[-_HANDOFF_RING:]),
+            max_age=_HANDOFF_COOKIE_TTL, httponly=True, secure=config.COOKIE_SECURE,
+            samesite="lax", path="/",
+        )
+    else:
+        response.delete_cookie(_handoff_cookie_name(), path="/", secure=config.COOKIE_SECURE,
+                               httponly=True, samesite="lax")
 
 
 def passkeys_enabled() -> bool:
@@ -129,21 +157,21 @@ def _pop_challenge(state: str) -> tuple[bytes, str] | None:
     return entry[0], entry[1]
 
 
-def _mint_native_token(sub: str) -> str:
+def _mint_native_token(sub: str, handoff: str) -> str:
     now = time.time()
-    for tok in [t for t, (_, exp) in _native_tokens.items() if exp < now]:
+    for tok in [t for t, (_, _, exp) in _native_tokens.items() if exp < now]:
         del _native_tokens[tok]
     token = secrets.token_urlsafe(32)
-    _native_tokens[token] = (sub, now + _NATIVE_TOKEN_TTL)
+    _native_tokens[token] = (sub, handoff, now + _NATIVE_TOKEN_TTL)
     return token
 
 
-def _pop_native_token(token: str) -> str | None:
-    """Single-use: returns the sub, or None (unknown/expired/replayed)."""
+def _pop_native_token(token: str) -> tuple[str, str] | None:
+    """Single-use: returns ``(sub, handoff)``, or None (unknown/expired/replayed)."""
     entry = _native_tokens.pop(token, None)
-    if not entry or entry[1] < time.time():
+    if not entry or entry[2] < time.time():
         return None
-    return entry[0]
+    return entry[0], entry[1]
 
 
 class PasskeyRegisterOptionsRequest(BaseModel):
@@ -174,8 +202,10 @@ class PasskeyLoginOptionsRequest(BaseModel):
 class PasskeyLoginVerifyRequest(BaseModel):
     state: str
     credential: dict
-    # Native-app flow: mint a one-time handoff token instead of the cookie.
+    # Native-app flow: mint a one-time handoff token instead of the cookie,
+    # bound to the nonce the starting WebView holds (``handoff``).
     native: bool = False
+    handoff: str = ""
     # 2FA-step flow: consume this on success (single-use, same as the TOTP path).
     totp_session_token: str | None = None
 
@@ -186,20 +216,83 @@ class PasskeyNativeExchangeRequest(BaseModel):
 
 async def _confirm_password(u: UserContext, password: str) -> dict:
     """Password-confirm a passkey management action. Returns the DB user row.
+    The shared helper (``auth.confirm``) owns the bucket and the rule; the
+    message names this surface."""
+    from auth import confirm
+    try:
+        return await confirm.confirm_password(u, password)
+    except HTTPException as e:
+        if e.status_code == 400:
+            raise HTTPException(400, "Passkey management requires a password-backed local account")
+        raise
 
-    Rate-limited per user (``confirm`` bucket): this re-verifies the account
-    password on an already-authed session, so an unbounded loop would be an
-    online password oracle for a hijacked session."""
-    ok, retry_after = rate_limit_hit("confirm", u.sub)
+
+class PasskeyConfirmVerifyRequest(BaseModel):
+    state: str
+    credential: dict
+
+
+@router.post("/auth/passkey/confirm/options")
+async def passkey_confirm_options(request: Request,
+                                  user: UserContext | None = Depends(get_current_user)):
+    """Start a confirm ceremony for the signed-in user (SHARING.md): the
+    passkey stands in for the password on accounts that have none. The
+    challenge is bound to the caller, so only their own passkeys answer."""
+    from auth.providers import require_human
+    u = require_human(user)
+    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
     if not ok:
         raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
                             headers={"Retry-After": str(retry_after)})
-    db_user = await asyncio.to_thread(task_store.get_user, u.sub)
-    if not db_user or not db_user.get("password_hash"):
-        raise HTTPException(400, "Passkey management requires a password-backed local account")
-    if not verify_password(password, db_user["password_hash"]):
-        raise HTTPException(401, "Password is incorrect")
-    return db_user
+    _require_enabled()
+    creds = await asyncio.to_thread(webauthn_store.list_credentials, u.sub)
+    if not creds:
+        raise HTTPException(400, "No passkey on this account")
+    options = generate_authentication_options(
+        rp_id=_rp_id(),
+        user_verification=UserVerificationRequirement.REQUIRED,
+        allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(c["credential_id"]))
+                           for c in creds],
+    )
+    state = _put_challenge(options.challenge, u.sub)
+    return {"state": state, "options": json.loads(options_to_json(options))}
+
+
+@router.post("/auth/passkey/confirm/verify")
+async def passkey_confirm_verify(req: PasskeyConfirmVerifyRequest, request: Request,
+                                 user: UserContext | None = Depends(get_current_user)):
+    """Finish the confirm ceremony: a one-shot token the confirming route
+    consumes within five minutes. No cookie is issued or changed."""
+    from auth import confirm
+    from auth.providers import require_human
+    u = require_human(user)
+    ok, retry_after = rate_limit_hit("passkey", get_client_ip(request))
+    if not ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
+                            headers={"Retry-After": str(retry_after)})
+    _require_enabled()
+    popped = _pop_challenge(req.state)
+    if not popped or popped[1] != u.sub:
+        raise HTTPException(401, "Confirmation challenge expired — try again")
+    credential_id = req.credential.get("id") or ""
+    cred = await asyncio.to_thread(webauthn_store.get_credential, credential_id)
+    if not cred or cred["user_sub"] != u.sub:
+        raise HTTPException(401, "Unknown passkey")
+    try:
+        verification = verify_authentication_response(
+            credential=req.credential,
+            expected_challenge=popped[0],
+            expected_rp_id=_rp_id(),
+            expected_origin=_expected_origin(),
+            credential_public_key=base64url_to_bytes(cred["public_key"]),
+            credential_current_sign_count=cred["sign_count"],
+            require_user_verification=True,
+        )
+    except WebAuthnException as e:
+        logger.info(f"Passkey confirm rejected for credential {credential_id[:12]}…: {e}")
+        raise HTTPException(401, "Passkey could not be verified")
+    await asyncio.to_thread(webauthn_store.record_use, credential_id, verification.new_sign_count)
+    return {"confirm_token": confirm.mint_confirm_token(u.sub)}
 
 
 # --- Management (authed, password-confirmed mutations) ---
@@ -398,6 +491,10 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
             headers={"Retry-After": str(retry_after)},
         )
     _require_enabled()
+    if req.native and not _HANDOFF_RE.fullmatch(req.handoff or ""):
+        # A page opened without the WebView's nonce (an app page older than
+        # the handoff binding): nothing to bind the sign-in to.
+        raise HTTPException(400, "Go back to the app and start the sign-in again")
 
     # 2FA-step flow: validate (not yet consume) the step token; in
     # second_factor mode a bare passwordless verify is refused server-side —
@@ -458,17 +555,29 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
     # Native app: the SYSTEM browser ran this ceremony — don't log the browser
     # in; hand back a one-time token the app's webview exchanges for ITS cookie.
     if req.native:
-        token = _mint_native_token(user_row["sub"])
+        token = _mint_native_token(user_row["sub"], req.handoff)
         logger.info(f"Passkey native handoff minted for {mask_email(user_row['email'])}")
         return {"status": "ok", "native_token": token}
 
     # A verified passkey is multi-factor by construction — no TOTP step.
-    user_data = _build_user_response(user_row)
-    response = JSONResponse(content={"user": user_data})
-    from api.auth.identity import _issue_session_cookie
-    _issue_session_cookie(response, user_row["sub"], user_row["email"],
-                          user_row["name"], user_row["role"], auth_provider="local")
+    from api.auth.identity import _login_response
+    response = await _login_response(user_row, "local")
     logger.info(f"Passkey login: {mask_email(user_row['email'])} role={user_row['role']}")
+    return response
+
+
+_HANDOFF_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+
+
+@router.post("/auth/passkey/native/start")
+async def passkey_native_start(request: Request):
+    """Start the app's passkey sign-in: a nonce the system browser carries to
+    the verify, kept in this WebView's HttpOnly cookie for the exchange. It
+    stores nothing server-side, so it takes no rate bucket."""
+    _require_enabled()
+    nonce = secrets.token_urlsafe(24)
+    response = JSONResponse({"handoff": nonce})
+    _set_handoff_ring(response, _handoff_ring(request) + [nonce])
     return response
 
 
@@ -483,9 +592,13 @@ async def passkey_native_exchange(req: PasskeyNativeExchangeRequest, request: Re
             headers={"Retry-After": str(retry_after)},
         )
 
-    sub = _pop_native_token(req.token)
-    if not sub:
+    popped = _pop_native_token(req.token)
+    if not popped:
         raise HTTPException(401, "Sign-in expired — try again")
+    sub, handoff = popped
+    ring = _handoff_ring(request)
+    if not handoff or not any(hmac.compare_digest(n, handoff) for n in ring):
+        raise HTTPException(401, "This sign-in was not started in this app. Try again.")
 
     user_row = await asyncio.to_thread(task_store.get_user, sub)
     if not user_row:
@@ -493,10 +606,8 @@ async def passkey_native_exchange(req: PasskeyNativeExchangeRequest, request: Re
     if not check_local_auth_allowed(request, user_row):
         raise HTTPException(403, "This account can only be accessed from the local network")
 
-    user_data = _build_user_response(user_row)
-    response = JSONResponse(content={"user": user_data})
-    from api.auth.identity import _issue_session_cookie
-    _issue_session_cookie(response, user_row["sub"], user_row["email"],
-                          user_row["name"], user_row["role"], auth_provider="local")
+    from api.auth.identity import _login_response
+    response = await _login_response(user_row, "local")
+    _set_handoff_ring(response, [n for n in ring if not hmac.compare_digest(n, handoff)])
     logger.info(f"Passkey login (native): {mask_email(user_row['email'])} role={user_row['role']}")
     return response

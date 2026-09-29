@@ -73,6 +73,15 @@ function dataUrlBytes(dataUrl: string): number {
   return idx < 0 ? 0 : Math.floor(((dataUrl.length - idx - 1) * 3) / 4)
 }
 
+/** A fresh photo shows from its data URL; one handed back from a cancelled
+ * queued message (already saved in the agent's workspace) through the same
+ * agent files URL the chat history uses. */
+function pendingImageSrc(img: PendingImage, agentName?: string): string {
+  if (img.base64) return img.base64
+  if (img.path && agentName) return `/v1/agents/${agentName}/files/${encodeURI(img.path)}`
+  return ''
+}
+
 /** Encode an image for the inline (vision) path — downscaled to the server's
  * own bound when large. Returns null when this browser can't decode it (e.g.
  * HEIC outside Safari): the caller demotes it to a regular file upload. */
@@ -109,6 +118,9 @@ interface Props {
   // persisted (chatStore.draftInput) and survives chat navigation.
   value: string
   onChange: (text: string) => void
+  /** The chat's agent: a photo handed back from a cancelled queued message
+   * shows through its agent files URL. */
+  agentName?: string
   onSend: (text: string) => void
   onAbort?: () => void
   onEditQueued?: () => void
@@ -148,7 +160,7 @@ interface Props {
    * icon button appears as the leftmost element of the input pill. */
   workspaceOpen?: boolean
   onToggleWorkspace?: () => void
-  /** Pinned mini-apps overlay toggle — permanent (right of the workspace
+  /** Pinned apps overlay toggle — permanent (right of the workspace
    * button, left of the projects toggle) whenever the host page wires it. */
   appsOpen?: boolean
   onToggleApps?: () => void
@@ -160,6 +172,11 @@ interface Props {
   /** Voice mode (AgentChat only). Hands-free speak → send → hear. Omitted where
    * voice mode isn't wired → no voice UI or behaviour. */
   voice?: ChatInputVoice
+  /** The chat the draft belongs to (the chatStore key). A change is a chat
+   * switch: dictation stops, its tail is dropped, and a phrase still in
+   * flight never lands under the new key. A host without chat switching
+   * may omit it. */
+  draftKey?: string
 }
 
 /** The shape of the `voice` prop; the host page builds it
@@ -184,6 +201,7 @@ function generateId(): string {
 export default function ChatInput({
   value,
   onChange,
+  agentName,
   onSend,
   onAbort,
   onEditQueued,
@@ -213,6 +231,7 @@ export default function ChatInput({
   dockKind,
   textareaRef: externalTextareaRef,
   voice,
+  draftKey,
 }: Props) {
   const text = value
   const setText = onChange
@@ -226,6 +245,13 @@ export default function ChatInput({
   // value, making each dictated phrase REPLACE the input instead of append.
   const valueRef = useRef(value)
   valueRef.current = value
+  // Same live mirror for the draft key, plus the key the mic started under:
+  // they disagree from the render that switched chats until the discard
+  // below lands, and a phrase arriving in that window belongs to the old
+  // chat, never the new one — the check is synchronous on purpose.
+  const draftKeyRef = useRef(draftKey)
+  draftKeyRef.current = draftKey
+  const dictKeyRef = useRef(draftKey)
   const [menuOpen, setMenuOpen] = useState(false)
   const [hasCamera, setHasCamera] = useState(false)
   // External-file drag over the composer (counter: child enter/leave pairs
@@ -363,16 +389,44 @@ export default function ChatInput({
   // (live partials append onto it). Live-mode barge-in is handled in VoiceControl.
   const onMicActive = (active: boolean) => {
     dictatingRef.current = active
-    if (active) dictBaseRef.current = valueRef.current
+    if (active) {
+      dictKeyRef.current = draftKeyRef.current
+      dictBaseRef.current = valueRef.current
+    }
   }
+  // Dictation is bound to the chat it started in: after a switch the old
+  // attempt's interims and finals are dropped. This also keeps the duplex
+  // caption bridge's deactivation (an empty interim, fired once its session
+  // ends on the switch) from wiping the new chat's restored draft.
+  const dictatingHere = () => dictKeyRef.current === draftKeyRef.current
   // Live partial → show base+interim without committing (the next partial/final replaces it).
-  const showInterim = (t: string) => { setText(joinText(dictBaseRef.current, t)); nudgeResize() }
+  const showInterim = (t: string) => {
+    if (!dictatingHere()) return
+    setText(joinText(dictBaseRef.current, t))
+    nudgeResize()
+  }
   // Finalized phrase → commit it onto the base so the next utterance builds after it.
   const appendTranscript = (t: string) => {
+    if (!dictatingHere()) return
     dictBaseRef.current = joinText(dictBaseRef.current, t)
     setText(dictBaseRef.current)
     nudgeResize()
   }
+  // A chat switch ends dictation: close the mic and drop its tail. Bumped
+  // even when the mic is already off — a stopped attempt keeps delivering
+  // its tail on purpose (the mic-button stop wants the last phrase), and
+  // that tail must not follow the user into the next chat. Compared against
+  // the previous key, so the mount run and StrictMode's second run are
+  // no-ops. The minted id adopted after a send is a key change too and ends
+  // a dictation started in that window (the send already closed the mic).
+  const prevDraftKeyRef = useRef(draftKey)
+  useEffect(() => {
+    if (prevDraftKeyRef.current === draftKey) return
+    prevDraftKeyRef.current = draftKey
+    dictBaseRef.current = ''
+    dictatingRef.current = false
+    setMicDiscardSignal(n => n + 1)
+  }, [draftKey])
 
   // ONE routing helper behind every entrance — pickers, camera, drag-and-drop
   // and clipboard paste — so caps, downscaling, demotion and error chips
@@ -391,7 +445,7 @@ export default function ChatInput({
 
     if (imageFiles.length) {
       const newImages: PendingImage[] = []
-      let budget = pendingImages.reduce((a, img) => a + dataUrlBytes(img.base64), 0)
+      let budget = pendingImages.reduce((a, img) => a + (img.base64 ? dataUrlBytes(img.base64) : 0), 0)
       for (const file of imageFiles) {
         const prepared = await prepareImageForChat(file)
         if (prepared === null) {
@@ -534,7 +588,7 @@ export default function ChatInput({
                     className="block rounded-lg focus:outline-hidden focus-visible:ring-2 focus-visible:ring-brand"
                   >
                     <img
-                      src={img.base64}
+                      src={pendingImageSrc(img, agentName)}
                       alt={img.name}
                       className="w-14 h-14 rounded-lg object-cover border border-p-border-light cursor-pointer"
                     />
@@ -671,11 +725,11 @@ export default function ChatInput({
                 )}
               </button>
             )}
-            {/* Pinned mini-apps toggle — permanent, right of workspace. */}
+            {/* Pinned apps toggle — permanent, right of workspace. */}
             {onToggleApps && (
               <button
                 onClick={onToggleApps}
-                title={appsOpen ? 'Close mini-apps' : 'Open mini-apps'}
+                title={appsOpen ? 'Close apps' : 'Open apps'}
                 className={`w-9 h-9 -mr-0.5 rounded-lg flex items-center justify-center transition-colors shrink-0
                   ${appsOpen
                     ? 'bg-emerald-600 text-white hover:bg-emerald-700'
@@ -849,6 +903,7 @@ export default function ChatInput({
                 onTranscript={appendTranscript}
                 onInterim={showInterim}
                 onActive={onMicActive}
+                discardSignal={micDiscardSignal}
                 disabled={disabled}
               />
             )}
@@ -916,10 +971,10 @@ export default function ChatInput({
       {lightbox !== null && lightbox.images.length > 0 && (
         <ImageLightbox
           images={lightbox.images.map(img => {
-            const m = img.base64.match(/^data:([^;,]+);base64,(.*)$/)
+            const m = img.base64?.match(/^data:([^;,]+);base64,(.*)$/)
             return m
               ? { imageData: m[2], mimeType: m[1], caption: img.name }
-              : { url: img.base64, caption: img.name }
+              : { url: pendingImageSrc(img, agentName), caption: img.name }
           })}
           initialIndex={Math.min(lightbox.idx, lightbox.images.length - 1)}
           onClose={() => setLightbox(null)}

@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import signal
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,6 +23,8 @@ from ..config import (
     snapshot_descendants,
 )
 import contextlib
+from .. import config
+from .._vendored import layout
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -46,6 +47,7 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
     gate = hook_command(claude_dir / "permission_gate.py")
     forwarder = hook_command(claude_dir / "tool_result_forwarder.py")
     subagent = hook_command(claude_dir / "subagent_tracker.py")
+    stop = hook_command(claude_dir / "stop_tracker.py")
 
     settings = {
         "autoMemoryEnabled": False,
@@ -57,8 +59,14 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
         # Platform is the only skill source: plugin skills must not activate
         # outside install/approval (mirrors the proxy-side settings builder).
         "enabledPlugins": {},
+        # Claude Code ≥ 2.1.275 syncs the signed-in claude.ai account's skills
+        # and plugins into the session; sessions run on pool accounts, so
+        # both stay off (mirrors core/layers/cli/config_dir.build_settings).
+        "syncClaudeAiSkills": False,
+        "syncClaudeAiPlugins": False,
         # Built-in-tool deny list, shipped by the proxy (single source of truth:
-        # core.sandbox._DISALLOWED_BUILTIN_TOOLS) so a REMOTE session enforces the
+        # core/layers/cli/config_dir.DISALLOWED_BUILTIN_TOOLS, plus the session's own
+        # denials from the engine's descriptor) so a REMOTE session enforces the
         # SAME permissions.deny as the local sandbox (the claude.ai
         # Cron/Trigger/Push/integration tools; Skill is ALLOWED since 2026-07 —
         # platform-managed skills activate through it). Omitted → no deny block.
@@ -95,6 +103,20 @@ def _write_cli_hooks(claude_dir: Path, disallowed_tools: list | None = None) -> 
                     "timeout": 10,
                 }],
             }],
+            # Turn end (satellite 0.5.121; the same four events as the local
+            # sandbox — proxy docs/architecture/HOOKS.md): the interactive
+            # TUI's transcript pointer and the platform's turn_end verdict,
+            # which may hold the turn open. The week-long timeout is the
+            # gate's; the proxy bounds the wait. The script reaches
+            # /v1/hooks/stop over the loopback tunnel (allowlisted both sides).
+            "Stop": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": stop,
+                    "timeout": 604800,
+                }],
+            }],
         }
     }
     (claude_dir / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
@@ -116,7 +138,7 @@ def _write_hook_scripts(claude_dir: Path, scripts: dict[str, str]) -> None:
         # Hooks run via `"python.exe" "<path>"` on all platforms, so the
         # exec bit is only useful for Unix shebang dispatch (and a no-op
         # on Windows).
-        if sys.platform != "win32":
+        if config.HOST.posix:
             path.chmod(0o755)
 
 
@@ -160,6 +182,10 @@ class CLISession:
         # reclaims stdout — single reader).
         self._drain_bg: bool = False
         self._bg_drain_task: "asyncio.Task | None" = None
+        # True from the prompt's stdin write until the turn's read loop
+        # exits: the window a steer may write into (a user frame between
+        # turns would start a turn nobody reads).
+        self._turn_active: bool = False
 
     async def start(self) -> None:
         """Write config files and spawn CLI subprocess."""
@@ -191,7 +217,7 @@ class CLISession:
         # (``.claude/projects/{cwd}/memory/``). The platform's otodock
         # memory-mcp is the single source of memory truth; running both
         # in parallel splits the agent's view. Mirrors the proxy-side
-        # cleanup in ``ensure_persistent_claude_dir``. Session JSONLs
+        # cleanup in the proxy's ``core/layers/cli/config_dir.ensure_persistent_claude_dir``. Session JSONLs
         # in ``projects/{id}/`` (used for ``--resume``) are left
         # untouched — only the ``memory/`` subdir is removed.
         projects_dir = self._claude_dir / "projects"
@@ -253,7 +279,7 @@ class CLISession:
         # PATH — see host/cli_versions.py.
         from ..host.cli_versions import resolve_spawn_bin_async
         claude_bin = await resolve_spawn_bin_async(
-            "claude", self.sat_config.claude_bin,
+            "claude", self.sat_config.bin_hint("claude"),
         )
         cmd = [claude_bin, "-p"]
         model = self.config.get("model", "")
@@ -290,6 +316,11 @@ class CLISession:
         # resume would re-warm the session with the stock SDK prompt (no
         # agent identity). The proxy ships system_prompt on resume too.
         cmd += ["--append-system-prompt-file", str(prompt_file)]
+        # Claude Code ≥ 2.1.267 would otherwise re-send the prompt it recorded
+        # on the conversation's first request on every --resume, discarding
+        # the fresh file above (mirrors the local CLI layer; the flag exists
+        # on the previous pin 2.1.263 too).
+        cmd += ["--system-prompt-snapshot", "off"]
         cmd += ["--output-format", "stream-json"]
         cmd += ["--input-format", "stream-json"]
         cmd += ["--verbose", "--include-partial-messages"]
@@ -350,7 +381,7 @@ class CLISession:
         # from manifest path_env decls + OTO_ALLOWED_ROOTS) tells the
         # translator which env vars are separator-joined sandbox-path lists
         # so it can split-translate-rejoin them. See path_translator.py.
-        username = path_translator.derive_username_from_cwd_relative(
+        username = layout.user_of(
             self.config.get("cwd_relative", ""),
         )
         env = path_translator.translate_env(
@@ -449,7 +480,7 @@ class CLISession:
         # absolute paths. Mirrors `translate_env` for env vars; without this
         # the CLI subprocess would try to read sandbox paths literally and
         # fail (no bwrap on satellite). See proxy/ws/dashboard.py::_handle_chat.
-        username = path_translator.derive_username_from_cwd_relative(
+        username = layout.user_of(
             self.config.get("cwd_relative", "")
         )
         prompt = path_translator.translate_paths_in_text(
@@ -464,12 +495,55 @@ class CLISession:
         await self.proc.stdin.drain()
 
         # Read every line until stop_turn or EOF. No filtering.
-        async for line in self._read_stdout_until_stop():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            yield event
+        self._turn_active = True
+        try:
+            async for line in self._read_stdout_until_stop():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                yield event
+        finally:
+            self._turn_active = False
+
+    async def steer(self, text: str) -> bool:
+        """Write a user frame into the RUNNING turn's stdin — the satellite
+        half of the proxy's ``PersistentSession.steer``: the CLI takes it at
+        its next tool boundary, and a frame the turn does not consume becomes
+        the CLI's next turn, which the proxy reads through. True only when
+        the frame reached the pipe (the proxy queues the message otherwise).
+        The proxy owns the result-seen guard — it alone can tell a foreign
+        result from the driven one — so this side refuses only without a live
+        turn or a live process."""
+        if (self.proc is None or self.proc.returncode is not None
+                or self.proc.stdin is None or not self._turn_active or not text):
+            return False
+        username = layout.user_of(self.config.get("cwd_relative", ""))
+        text = path_translator.translate_paths_in_text(
+            text, agent_dir=self.agent_dir, username=username,
+        )
+        msg = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+        })
+        try:
+            self.proc.stdin.write((msg + "\n").encode())
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+            return False
+        logger.info(
+            "CLI session %s: steered the live turn (%d chars)",
+            self.session_id[:8], len(text),
+        )
+        return True
+
+    async def run_turn(self, prompt: str, *, inject_time: bool = False, forward) -> None:
+        """Drive ONE turn: write the prompt, hand every raw NDJSON event to
+        ``await forward(event)`` until the proxy's ``stop_turn`` or EOF. The
+        session manager's ``forward`` tags, retains (Mode C) and ships the
+        event; the same entry point every engine's session exposes."""
+        async for event in self.send_message(prompt, inject_time=inject_time):
+            await forward(event)
 
     async def _drain_stderr(self) -> None:
         """Continuously read stderr into a bounded buffer.
@@ -587,7 +661,7 @@ class CLISession:
             return
         pid = self.proc.pid
         try:
-            if sys.platform == "win32":
+            if not config.HOST.posix:
                 self.proc.terminate()
             else:
                 self.proc.send_signal(signal.SIGINT)

@@ -1,21 +1,25 @@
-"""Per-session config-directory setup for agent sandboxes.
+"""Per-session config-directory setup for agent sandboxes — the shared spine.
 
-Builds and populates the persistent on-disk config directories a session needs
-inside the bwrap sandbox: the ``.claude``/``.codex`` dirs (hooks, settings.json,
-the stdio interceptor), the agent config dir, and the sandbox-side MCP config.
-Split out of sandbox.py; sandbox.py re-exports the public entry points so
-existing `from core.sandbox.sandbox import ensure_persistent_*` imports keep working.
+Where a session's config dir lives under its scope root and what every
+engine installs into it (the hook scripts, the stdio interceptor), the one
+funnel the session-config builders call (``ensure_persistent_agent_dir`` →
+``ExecutionLayer.prepare_config_dir``), the sandbox-side MCP config copy
+and the SSH key materialisation. The engine-specific bodies — Claude's
+``settings.json`` and its built-in deny list, Codex's ``hooks.json`` — are
+the engines' own (``core/layers/cli/config_dir.py``,
+``core/layers/codex/config_dir.py``). ``sandbox.py`` re-exports the funnel
+and the MCP config copy for its historical importers.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
 from pathlib import Path
 
 import config as app_config
+from core import layout
 
 logger = logging.getLogger("claude-proxy.sandbox")
 
@@ -32,7 +36,7 @@ _HOOKS_DIR = app_config.BASE_DIR / "hooks"
 _INTERCEPTOR_SRC = Path(__file__).resolve().parent.parent / "stdio_path_interceptor.py"
 
 
-def _write_no_follow(path: Path, data: bytes, mode: int = 0o644) -> None:
+def write_no_follow(path: Path, data: bytes, mode: int = 0o644) -> None:
     """Write ``data`` to ``path`` refusing to follow a symlink at the leaf.
 
     The ``.claude``/``.codex`` trees sit inside agent-WRITABLE binds, so an
@@ -92,160 +96,67 @@ def _copy_hook_lf(src: Path, dst: Path) -> None:
     (``/usr/bin/env: 'python3\\r': No such file or directory``) and silently
     bypasses enforcement. Normalize defensively so an editor/git CRLF can never
     break hook execution inside the sandbox (vs ``shutil.copy2``, which copies
-    bytes + perms verbatim). Writes via ``_write_no_follow`` — the dst lives
+    bytes + perms verbatim). Writes via ``write_no_follow`` — the dst lives
     in an agent-writable tree, so a planted symlink must not be followed."""
-    _write_no_follow(dst, src.read_bytes().replace(b"\r\n", b"\n"), mode=0o755)
+    write_no_follow(dst, src.read_bytes().replace(b"\r\n", b"\n"), mode=0o755)
 
 
 # ---------------------------------------------------------------------------
-# Persistent .claude/ directory management
+# The shared spine: where a session's config dir lives, and what every
+# engine installs into it. The engine-specific bodies — Claude's
+# settings.json and its built-in deny list, Codex's hooks.json — live in the
+# engine packages (core/layers/cli/config_dir.py, core/layers/codex/
+# config_dir.py) behind ExecutionLayer.prepare_config_dir.
 # ---------------------------------------------------------------------------
 
-# Claude Code CLI built-in tools that are denied on this platform.
-#
-# These tools either:
-#   (a) reach the user's claude.ai personal account (Cron*, RemoteTrigger,
-#       PushNotification, mcp__claude_ai_*) — agents on this platform must
-#       not act on the user's claude.ai account.
-#   (b) collide with platform features (RemoteTrigger ↔ our triggers,
-#       Cron* ↔ our schedules, PushNotification ↔ our notifications).
-#   (c) are server-side context irrelevant (ScheduleWakeup is for Claude
-#       Code's local /loop dynamic mode).
-#
-# The platform's own equivalents (tasks, schedules, notifications,
-# triggers, google-workspace MCP) replace each of these with a per-user
-# permissioned, scoped version. The Task* family (TaskCreate / TaskGet /
-# TaskList / TaskUpdate / TaskOutput / TaskStop) is intentionally KEPT —
-# those are Claude Code's session-internal todo tracking, useful and
-# distinct from our persistent task system.
-_DISALLOWED_BUILTIN_TOOLS = [
-    # Claude.ai cron jobs (collides with our schedules)
-    "CronCreate",
-    "CronDelete",
-    "CronList",
-    # Claude.ai webhook triggers (collides with our triggers)
-    "RemoteTrigger",
-    # Claude.ai push notifications (collides with our notifications)
-    "PushNotification",
-    # /loop dynamic-mode helper — server-side agent context, irrelevant
-    "ScheduleWakeup",
-    # Claude.ai personal-account integrations — we have our own
-    # google-workspace MCP with per-user OAuth on the platform
-    "mcp__claude_ai_Gmail__authenticate",
-    "mcp__claude_ai_Gmail__complete_authentication",
-    "mcp__claude_ai_Google_Calendar__authenticate",
-    "mcp__claude_ai_Google_Calendar__complete_authentication",
-    "mcp__claude_ai_Google_Drive__authenticate",
-    "mcp__claude_ai_Google_Drive__complete_authentication",
-    # "Skill" was denied here until 2026-07 ("parallel memory path"). It is
-    # now ALLOWED: platform-managed on-demand skills are materialized into
-    # .claude/skills/ (skills_materializer) and the Skill tool is their
-    # activation surface. The no-parallel-memory guarantee moved from tool
-    # denial to reconciliation — agent-written skill content is reverted /
-    # quarantined at every session start. Unmanaged skill SOURCES stay
-    # closed elsewhere: bundled CLI skills via
-    # CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1 (env_builder + satellite spawn),
-    # plugin skills via "enabledPlugins": {} below.
-]
+def scope_config_dir(
+    agent_name: str, name: str, *, username: str = "", scope: str = "user",
+    external_home=None,
+) -> tuple[Path, str]:
+    """``(host dir, sandbox-internal dir)`` of a session's config dir
+    ``name`` (``.claude`` / ``.codex``) under the scope's root — created,
+    verified against planted symlinks:
 
-
-def _build_sandbox_cli_settings(
-    sandbox_claude_dir: str, *, extra_deny: tuple[str, ...] = (),
-) -> dict:
-    """Build settings.json with sandbox-internal paths.
-
-    sandbox_claude_dir is the sandbox-internal .claude/ path,
-    e.g. /users/alice/.claude, /caller/.claude or /workspace/.claude.
-    ``extra_deny`` adds session-specific tool denials (the no-shell rule of
-    external sessions) to the platform-wide list.
-
-    The "sandbox" block disables Claude Code's own bwrap layer:
-    the platform already wraps the CLI in a bwrap of its own (see
-    SandboxBuilder), so the inner sandbox is redundant and has caused
-    nested-namespace failures in 2.1.x. failIfUnavailable=False keeps
-    the CLI from refusing to start if a future build flips enabled
-    back on and the inner sandbox can't initialise.
+    - a user session: ``agents/<agent>/users/<username>/<name>`` ↔
+      ``/users/<username>/<name>``
+    - an agent-scoped session (a task, a phone call without a user):
+      ``agents/<agent>/workspace/<name>`` ↔ ``/workspace/<name>``
+    - an external caller with a private tree (``external_home``):
+      ``<external_home>/<name>`` ↔ ``<SANDBOX_HOME>/<name>``
     """
-    gate = f"{sandbox_claude_dir}/permission_gate.py"
-    forwarder = f"{sandbox_claude_dir}/tool_result_forwarder.py"
-    subagent = f"{sandbox_claude_dir}/subagent_tracker.py"
-    stop = f"{sandbox_claude_dir}/stop_tracker.py"
+    if external_home:
+        from core.session.external_identity import SANDBOX_HOME
+        return _verified_external_dir(agent_name, external_home, name), f"{SANDBOX_HOME}/{name}"
+    if username and scope == "user":
+        return (_verified_session_dir(agent_name, layout.USERS, username, name),
+                f"{layout.virtual_user_root(username)}/{name}")
+    return _verified_session_dir(agent_name, layout.WORKSPACE, name), f"{layout.V_WORKSPACE}/{name}"
 
-    return {
-        "sandbox": {
-            "enabled": False,
-            "failIfUnavailable": False,
-        },
-        # Disable Claude Code's built-in auto-memory subsystem. The platform's
-        # otodock memory (topic files under knowledge/memory/ +
-        # users/{u}/context/memory/, injected by the prompt-builder, written via
-        # memory-mcp) is the single source of memory truth — having Claude
-        # Code's ``/memory`` slash command + auto-import of
-        # ``.claude/projects/{cwd}/memory/MEMORY.md`` running in parallel would
-        # split the agent's view across two uncoordinated stores.
-        # ``autoMemoryEnabled: false`` keeps ``CLAUDE.md`` import working (we
-        # don't ship one anyway) but turns off auto-memory specifically.
-        # Belt-and-braces: ``ensure_persistent_claude_dir`` also wipes the
-        # memory subdir at session start, and ``env_builder`` injects
-        # ``CLAUDE_CODE_DISABLE_AUTO_MEMORY=1``.
-        "autoMemoryEnabled": False,
-        # Pin the CLI version fleet-wide: disable Claude Code's own
-        # auto-updater so an install can't drift off the platform pin (the
-        # satellite reconciles the pinned version). Belt-and-braces with env
-        # DISABLE_AUTOUPDATER=1 (env_builder).
-        "autoUpdates": False,
-        # The platform is the only skill SOURCE: with
-        # the Skill tool allowed, plugin skills must not activate outside
-        # install/approval/version-pinning. This settings.json is rewritten
-        # every session start, so plugin enablement is platform-owned state —
-        # an explicit empty map keeps every plugin off. Live installs carry
-        # auto-installed marketplace trees under .claude/plugins/; those stay
-        # on disk (inert). VERIFY at dogfood: no plugin skills in the CLI's
-        # skills index (pre-impl checklist item 1, plan §checklist).
-        "enabledPlugins": {},
-        "permissions": {
-            "deny": list(_DISALLOWED_BUILTIN_TOOLS) + list(extra_deny),
-        },
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": gate,
-                    "timeout": 604800,
-                }],
-            }],
-            "PostToolUse": [{
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": forwarder,
-                    "timeout": 10,
-                }],
-            }],
-            # Deterministic, idle-safe subagent completion (fg + bg). Fires
-            # when a subagent stops — drives the SubagentRegistry completion
-            # gate without polling stdout. See hooks/subagent_tracker.py.
-            "SubagentStop": [{
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": subagent,
-                    "timeout": 10,
-                }],
-            }],
-            # Turn-end signal for INTERACTIVE sessions (no pump) → transcript
-            # persistence; no-ops for headless -p. See hooks/stop_tracker.py.
-            "Stop": [{
-                "matcher": "",
-                "hooks": [{
-                    "type": "command",
-                    "command": stop,
-                    "timeout": 30,
-                }],
-            }],
-        }
-    }
+
+def install_hook_scripts(config_dir: Path) -> None:
+    """Copy the four hook scripts and the stdio interceptor into a session
+    config dir (LF-normalised, executable — a CRLF shebang silently breaks
+    hook execution). The interceptor is copied unconditionally: a missing
+    source must raise, not silently disable the wrap spawn-time config still
+    points at."""
+    for script_name in HOOK_SCRIPTS:
+        src = _HOOKS_DIR / script_name
+        if src.exists():
+            _copy_hook_lf(src, config_dir / script_name)
+    _copy_hook_lf(_INTERCEPTOR_SRC, config_dir / _INTERCEPTOR_SRC.name)
+
+
+#: Every hook script a session config dir carries, for both engines
+#: (``proxy/hooks/``; the satellite receives the same set in its start payload).
+HOOK_SCRIPTS: tuple[str, ...] = (
+    "permission_gate.py", "tool_result_forwarder.py",
+    "subagent_tracker.py", "stop_tracker.py",
+)
+
+#: The permission gate's and the Stop hook's transport ceiling: a dashboard
+#: prompt and a turn-end verdict are long polls the proxy bounds itself.
+LONG_HOOK_TIMEOUT_S = 604800
+STOP_HOOK_TIMEOUT_S = LONG_HOOK_TIMEOUT_S
 
 
 def _verified_external_dir(agent_name: str, external_home, sub: str) -> Path:
@@ -261,173 +172,6 @@ def _verified_external_dir(agent_name: str, external_home, sub: str) -> Path:
         )
     return _verified_session_dir(agent_name, *home.relative_to(root_real).parts, sub)
 
-
-def ensure_persistent_claude_dir(
-    agent_name: str,
-    *,
-    username: str = "",
-    scope: str = "user",
-    external_home=None,
-    no_shell: bool = False,
-) -> Path:
-    """Create/update the persistent .claude/ dir for a session.
-
-    Determines host path based on scope:
-    - User session: agents/{agent}/users/{username}/.claude/
-    - Agent-scoped task: agents/{agent}/workspace/.claude/
-    - External caller with a private tree (``external_home``):
-      agents/{agent}/externals/<channel>/<caller>/.claude/ (mounted at
-      /caller/.claude)
-
-    ``no_shell`` adds the external-session tool denials (Bash / Monitor /
-    PowerShell — ``auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS``) to the
-    settings.json deny list — one of the three layers of that rule (the
-    permission hook floors it and the CLI argv disallows it too).
-
-    Writes/overwrites settings.json and hook scripts. Plans and session
-    data that Claude CLI creates are left untouched (persistent).
-
-    Returns the host path to the .claude/ directory.
-    """
-    if external_home:
-        claude_dir = _verified_external_dir(agent_name, external_home, ".claude")
-    elif username and scope == "user":
-        claude_dir = _verified_session_dir(
-            agent_name, "users", username, ".claude")
-    else:
-        claude_dir = _verified_session_dir(agent_name, "workspace", ".claude")
-
-    # Defensive cleanup: Claude Code CLI's built-in auto-memory (slash
-    # ``/memory`` command + auto-imports from ``MEMORY.md``) writes to
-    # ``.claude/projects/{cwd-encoded}/memory/`` and runs PARALLEL to our
-    # otodock memory system (topic files under ``knowledge/memory/`` +
-    # ``users/{u}/context/memory/``). Two coexisting memory systems confuses
-    # the LLM (it doesn't know which is canonical) and persists facts the
-    # platform never gates. Wipe each session start so otodock-memory is
-    # the only durable memory the agent sees. Matches the Codex pattern
-    # (``.codex/memories/`` wipe in ``close_codex_session``). Session
-    # JSONLs (sibling files in ``projects/{id}/``) are left untouched —
-    # only the ``memory/`` subdir is removed.
-    projects_dir = claude_dir / "projects"
-    if projects_dir.exists():
-        for proj in projects_dir.iterdir():
-            if not proj.is_dir():
-                continue
-            mem_dir = proj / "memory"
-            if mem_dir.exists():
-                shutil.rmtree(mem_dir, ignore_errors=True)
-
-    # Write settings.json (hooks config) — always sandbox-internal paths
-    if external_home:
-        from core.session.external_identity import SANDBOX_HOME
-        sandbox_claude_dir = f"{SANDBOX_HOME}/.claude"
-    elif username and scope == "user":
-        sandbox_claude_dir = f"/users/{username}/.claude"
-    else:
-        sandbox_claude_dir = "/workspace/.claude"
-    extra_deny: tuple[str, ...] = ()
-    if no_shell:
-        from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS
-        extra_deny = EXTERNAL_DENIED_CLI_TOOLS
-    settings = _build_sandbox_cli_settings(sandbox_claude_dir, extra_deny=extra_deny)
-
-    _write_no_follow(claude_dir / "settings.json",
-                     (json.dumps(settings, indent=2) + "\n").encode())
-
-    # Copy hook scripts into .claude/ dir (LF-normalized + executable — see
-    # _copy_hook_lf; a CRLF shebang silently breaks hook execution).
-    for script_name in ("permission_gate.py", "tool_result_forwarder.py",
-                        "subagent_tracker.py", "stop_tracker.py"):
-        src = _HOOKS_DIR / script_name
-        dst = claude_dir / script_name
-        if src.exists():
-            _copy_hook_lf(src, dst)
-
-    # Copy the stdio interceptor alongside the hooks so it is reachable inside
-    # the bwrap sandbox (credential-broker fetch-at-spawn + tool-arg-path
-    # translation). Stdlib-only → runs via the sandbox `python3`. Copied
-    # unconditionally: a missing source must raise, not silently disable the
-    # interceptor wrap that spawn-time config still points at.
-    _copy_hook_lf(_INTERCEPTOR_SRC, claude_dir / _INTERCEPTOR_SRC.name)
-
-    # Reconcile the platform-managed on-demand skills dir (fail-soft — a
-    # skills problem must never block a session start). See
-    # skills_materializer for the full protocol.
-    from core.sandbox.skills_materializer import materialize_skills_for_sandbox
-    materialize_skills_for_sandbox(agent_name, claude_dir)
-
-    os.chmod(claude_dir, 0o700)
-
-    logger.debug(
-        f"Prepared .claude/ dir: {claude_dir} "
-        f"(agent={agent_name}, user={username or '(none)'})"
-    )
-    return claude_dir
-
-
-def ensure_persistent_codex_dir(
-    agent_name: str,
-    *,
-    username: str = "",
-    scope: str = "user",
-    external_home=None,
-) -> Path:
-    """Create/update the persistent .codex/ dir for a Codex CLI session.
-
-    Same scoping as ensure_persistent_claude_dir (incl. the external
-    caller's tree) but writes Codex-format hooks.json instead of
-    Claude-format settings.json.
-
-    Returns the host path to the .codex/ directory.
-    """
-    if external_home:
-        codex_dir = _verified_external_dir(agent_name, external_home, ".codex")
-    elif username and scope == "user":
-        codex_dir = _verified_session_dir(
-            agent_name, "users", username, ".codex")
-    else:
-        codex_dir = _verified_session_dir(agent_name, "workspace", ".codex")
-
-    # Write hooks.json (Codex hook format) — always sandbox-internal paths
-    if external_home:
-        from core.session.external_identity import SANDBOX_HOME
-        sandbox_codex_dir = f"{SANDBOX_HOME}/.codex"
-    elif username and scope == "user":
-        sandbox_codex_dir = f"/users/{username}/.codex"
-    else:
-        sandbox_codex_dir = "/workspace/.codex"
-    hooks = _build_codex_hooks(sandbox_codex_dir)
-
-    _write_no_follow(codex_dir / "hooks.json",
-                     (json.dumps(hooks, indent=2) + "\n").encode())
-
-    # Copy hook scripts into .codex/ dir (LF-normalized + executable — see _copy_hook_lf).
-    for script_name in ("permission_gate.py", "tool_result_forwarder.py"):
-        src = _HOOKS_DIR / script_name
-        dst = codex_dir / script_name
-        if src.exists():
-            _copy_hook_lf(src, dst)
-
-    # Copy the stdio interceptor alongside the hooks (see the claude twin) —
-    # reachable inside the bwrap sandbox for the credential-broker fetch.
-    # Unconditional so a missing source raises instead of silently skipping.
-    _copy_hook_lf(_INTERCEPTOR_SRC, codex_dir / _INTERCEPTOR_SRC.name)
-
-    # Reconcile the platform-managed on-demand skills dir ($CODEX_HOME/skills;
-    # Codex's vendored .system builtins are never touched — dot-prefixed).
-    # Fail-soft; see skills_materializer for the full protocol.
-    from core.sandbox.skills_materializer import materialize_skills_for_sandbox
-    materialize_skills_for_sandbox(agent_name, codex_dir)
-
-    os.chmod(codex_dir, 0o700)
-
-    logger.debug(
-        f"Prepared .codex/ dir: {codex_dir} "
-        f"(agent={agent_name}, user={username or '(none)'})"
-    )
-    return codex_dir
-
-
 def ensure_persistent_agent_dir(
     agent_name: str,
     *,
@@ -436,64 +180,29 @@ def ensure_persistent_agent_dir(
     scope: str = "user",
     external_home=None,
     no_shell: bool = False,
+    read_only: bool = False,
 ) -> Path:
-    """The persistent CLI config dir for a session, by execution layer:
-    ``.codex/`` for Codex, ``.claude/`` for Claude CLI (and the harmless default
-    for Direct LLM, which has no CLI config).
+    """The persistent CLI config dir for a session — the ENGINE's
+    (``ExecutionLayer.prepare_config_dir``): ``.codex/`` for Codex,
+    ``.claude/`` for Claude CLI and for Direct LLM (which has no CLI config
+    but keeps its plans dir and MCP config home in that tree).
 
-    **Single source of truth** for this branch so the four session-config builders
+    **The one entry point** for the session-config builders
     (``config_builder`` / ``task_config_builder`` / ``meeting_orchestrator`` /
-    phone) can't drift. The Codex layer reads ``config.sandbox_host_claude_dir`` AS
-    its ``CODEX_HOME``; a Codex session whose config landed in ``.claude`` ran
-    against a missing ``.codex`` config and hung / crashed at init (an
-    interactive-task bug — a builder that forgot the codex branch).
+    phone / the scheduler's one-shot resume) so they can't drift. The Codex
+    layer reads ``config.sandbox_host_claude_dir`` AS its ``CODEX_HOME``; a
+    Codex session whose config landed in ``.claude`` ran against a missing
+    ``.codex`` config and hung / crashed at init (an interactive-task bug —
+    a builder that forgot the codex branch, before this funnel existed).
+    An unregistered ``execution_path`` raises ``UnknownExecutionPath``, as
+    every builder already does one step earlier. The registry is reached
+    function-locally: the layers import this package.
     """
-    # The external kwargs are forwarded only when set — the per-layer
-    # helpers keep their historical signature for every ordinary session.
-    extra: dict = {}
-    if external_home:
-        extra["external_home"] = external_home
-    if execution_path == "codex-cli":
-        return ensure_persistent_codex_dir(agent_name, username=username, scope=scope, **extra)
-    if no_shell:
-        extra["no_shell"] = True
-    return ensure_persistent_claude_dir(agent_name, username=username, scope=scope, **extra)
-
-
-def _build_codex_hooks(config_dir: str) -> dict:
-    """Build the hooks.json content for the Codex CLI hook system.
-
-    Schema (Codex hooks, per the OpenAI Codex docs):
-        {"hooks": {"<Event>": [{"matcher": <regex>,
-                                "hooks": [{"type": "command",
-                                           "command": <cmd>, "timeout": <s>}]}]}}
-    Codex passes the SAME PreToolUse stdin shape as Claude (``tool_name`` +
-    ``tool_input``) and accepts the SAME ``hookSpecificOutput`` deny output, so
-    the provider-agnostic ``permission_gate.py`` / ``tool_result_forwarder.py``
-    scripts run unchanged — one ``decide_tool_permission`` authority for every
-    surface. Runs for INTERACTIVE Codex sessions (``[features] hooks = true``
-    + ``--dangerously-bypass-hook-trust``) and for UNATTENDED app-server
-    sessions (task / phone / meeting / trigger — trusted per thread via
-    ``thread/start.config``; ``core/layers/codex/session.py``); dashboard
-    app-server chats leave it dormant and gate via the JSON-RPC approval
-    bridge (enabling both would double-gate). Empty matcher = all tools.
-    """
-    gate = f"{config_dir}/permission_gate.py"
-    forwarder = f"{config_dir}/tool_result_forwarder.py"
-
-    return {
-        "hooks": {
-            "PreToolUse": [{
-                "matcher": "",
-                "hooks": [{"type": "command", "command": f"python3 {gate}", "timeout": 604800}],
-            }],
-            "PostToolUse": [{
-                "matcher": "",
-                "hooks": [{"type": "command", "command": f"python3 {forwarder}", "timeout": 10}],
-            }],
-        },
-    }
-
+    from core.session.session_manager import get_layer_by_path
+    return get_layer_by_path(execution_path).prepare_config_dir(
+        agent_name, username=username, scope=scope, external_home=external_home,
+        no_shell=no_shell, read_only=read_only,
+    )
 
 def prepare_mcp_config_for_sandbox(
     host_mcp_config_path: str | Path,
@@ -547,7 +256,7 @@ def prepare_mcp_config_for_sandbox(
                     ref_path = Path(arg)
                     if ref_path.exists():
                         ref_dst = Path(host_config_dir) / ref_path.name
-                        _write_no_follow(ref_dst, ref_path.read_bytes())
+                        write_no_follow(ref_dst, ref_path.read_bytes())
                         args[i] = f"{sandbox_config_dir}/{ref_path.name}"
 
         # Credential broker: inject the per-(session, mcp) capability
@@ -595,15 +304,116 @@ def prepare_mcp_config_for_sandbox(
         # broker tokens / inline bearers and the destination dir is
         # agent-writable — a planted symlink must never redirect it.
         dst = Path(host_config_dir) / src.name
-        _write_no_follow(dst, _json.dumps(config_data, indent=2).encode())
+        write_no_follow(dst, _json.dumps(config_data, indent=2).encode())
     except Exception:
         # Fallback: simple copy without rewriting (same no-follow rule —
         # falling back to a follow-prone copy would void the guard above).
         dst = Path(host_config_dir) / src.name
-        _write_no_follow(dst, src.read_bytes())
+        write_no_follow(dst, src.read_bytes())
 
     # Return sandbox-internal path
     return f"{sandbox_config_dir}/{src.name}"
+
+
+class AgentStateRefused(RuntimeError):
+    """A session that would run from the agent's own CLI state (the agent
+    scope's ``workspace/.claude`` / ``.codex``: the hooks, settings, MCP
+    config and login every task, phone call and Shared-only chat of the
+    agent runs with) for a person below the editor tier. Whoever runs from
+    that dir can rewrite what the agent's other sessions execute, so only
+    the tiers that already act as the agent may. The message is the
+    person's to read."""
+
+
+def refuse_agent_state_below_editor(scope: str, role: str, *, external: bool = False) -> None:
+    """Raise :class:`AgentStateRefused` when a session of ``scope`` (its
+    MOUNT scope) and ``role`` would run from the agent's own CLI state below
+    the editor tier: a Shared-only chat of a viewer or a contributor, or
+    their own task or meeting on a Shared-only agent. An external caller is
+    not a person on the agent (a no-shell session the gate floors), and a
+    personal session runs from its own tree."""
+    from auth import roles
+    from core.session.visibility import SCOPE_AGENT
+    if scope != SCOPE_AGENT or external or roles.can_edit(role):
+        return
+    raise AgentStateRefused(
+        "This agent is set to Shared only, so its chats and tasks run as the "
+        "agent itself, which takes the editor role or above (this one would "
+        f"run as {role or 'no role'}). Ask a manager of the agent for the "
+        "editor role, or to turn on personal chats."
+    )
+
+
+def refuse_session_on_agent_state(ctx) -> None:
+    """:func:`refuse_agent_state_below_editor` for a built session, from its
+    SecurityContext: the start-time floor every engine checks before it runs
+    a CLI from its config dir (a builder the config-time check missed, a
+    context rebuilt for a resume). The session runs from the agent's state
+    when it mounts no person (``mount_username``, the sandbox's own rule);
+    no context at all is refused as below the tier."""
+    from core.session.external_identity import is_external_ctx
+    from core.session.visibility import SCOPE_AGENT, SCOPE_USER
+    if ctx is None:
+        refuse_agent_state_below_editor(SCOPE_AGENT, "")
+        return
+    scope = SCOPE_USER if getattr(ctx, "mount_username", "") else SCOPE_AGENT
+    refuse_agent_state_below_editor(
+        scope, getattr(ctx, "role", "") or "", external=is_external_ctx(ctx),
+    )
+
+
+def session_takes_ssh_keys(ctx) -> bool:
+    """Whether a session is handed the agent's SSH keys, locally or on a
+    machine: the editor tier of its SecurityContext (the keys are the
+    agent's own credentials, so only the tiers that act as the agent),
+    never an external caller's (ssh-hosts is not attached there, and key
+    material must not land in a tree a caller's session reaches), never a
+    check's judge (it reads; its MCPs are the check's list), and never a
+    session with no context or no role. The one predicate the Claude and
+    Codex layers and the satellite session-file broker share; the role is
+    read off the context alone, never inferred from a token or a name."""
+    from auth import roles
+    from core.session.external_identity import is_external_ctx
+    if ctx is None or is_external_ctx(ctx) or getattr(ctx, "read_only", False) is True:
+        return False
+    role = getattr(ctx, "role", "")
+    return isinstance(role, str) and roles.can_edit(role)
+
+
+def clear_ssh_keys_for_sandbox(host_config_dir: str | Path) -> None:
+    """Remove ``<config_dir>/ssh``: the session does not take the agent's
+    keys, so nothing an earlier, more entitled session of the same person
+    left in that dir may survive into this one (the materializer rebuilds
+    the dir only when the keys are due)."""
+    dst = Path(host_config_dir) / "ssh"
+    if dst.is_symlink():
+        dst.unlink()
+        return
+    shutil.rmtree(dst, ignore_errors=True)
+
+
+def provision_ssh_keys_for_sandbox(
+    ctx, agent_name: str, host_config_dir: str | Path, sandbox_config_dir: str,
+) -> str:
+    """The one SSH-key rule of the local layers, at spawn: a session that
+    takes the keys (:func:`session_takes_ssh_keys`) gets them materialised
+    and the ``OTO_SSH_KEY_DIR`` value the env carries (``""`` when the agent
+    authorises none); a person below the editor tier gets the dir cleared,
+    so nothing an earlier, entitled session of theirs left survives into
+    this one; a judge and an external caller take no keys but leave the dir
+    alone, because they run from a config dir another session may hold the
+    keys in (the judged person's, the agent's own)."""
+    if session_takes_ssh_keys(ctx):
+        if materialize_ssh_keys_for_sandbox(agent_name, host_config_dir):
+            return f"{sandbox_config_dir}/ssh"
+        return ""
+    from auth import roles
+    from core.session.external_identity import is_external_ctx
+    if ctx is None or is_external_ctx(ctx) or getattr(ctx, "read_only", False) is True:
+        return ""
+    if isinstance(getattr(ctx, "role", None), str) and not roles.can_edit(ctx.role):
+        clear_ssh_keys_for_sandbox(host_config_dir)
+    return ""
 
 
 def materialize_ssh_keys_for_sandbox(
@@ -641,7 +451,7 @@ def materialize_ssh_keys_for_sandbox(
         if copied == 0:
             dst.mkdir(parents=True, exist_ok=True)
             os.chmod(dst, 0o700)
-        _write_no_follow(dst / key, src.read_bytes(), mode=0o600)
+        write_no_follow(dst / key, src.read_bytes(), mode=0o600)
         copied += 1
     return copied > 0
 

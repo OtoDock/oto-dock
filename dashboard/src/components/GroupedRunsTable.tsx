@@ -68,6 +68,14 @@ export default function GroupedRunsTable({ runs, showAgent = true, showType = fa
                 )}
                 <td className="py-2 pr-4">
                   <StatusBadge status={group.latestStatus} />
+                  {run.background_pending ? (
+                    <span
+                      title="Background work was still running when the run completed; the session was kept for it and its output is not part of this run"
+                      className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
+                    >
+                      {run.background_pending} left running
+                    </span>
+                  ) : null}
                 </td>
                 <td className="py-2 pr-4 text-p-text-secondary">
                   {run.started_at ? formatRelativeTime(run.started_at) : '—'}

@@ -111,3 +111,39 @@ def test_is_path_under_root(tmp_path):
     outside.mkdir()
     assert auth_paths.is_path_under_root(inside, root)
     assert not auth_paths.is_path_under_root(outside / "x.txt", root)
+
+
+def test_is_path_under_root_is_the_tar_and_frame_containment(tmp_path):
+    """The shapes the sync_mcps / self-update extractors and the session-files
+    writer hand it (core-seams phase 3): a ``..`` member, an absolute member
+    (pathlib lets it win the join) and a sibling whose name extends the root
+    (the separator-less ``startswith(str(root))`` admitted it) are outside;
+    a member below the root and the root itself are inside."""
+    root = tmp_path / "pkg.new"
+    root.mkdir()
+    (tmp_path / "pkg.newevil").mkdir()
+    assert auth_paths.is_path_under_root(root / "manifest.json", root)
+    assert auth_paths.is_path_under_root(root / "a" / "b.py", root)
+    assert auth_paths.is_path_under_root(root, root)
+    assert not auth_paths.is_path_under_root(root / ".." / "pkg.newevil" / "x", root)
+    assert not auth_paths.is_path_under_root(root / "/etc/passwd", root)
+    assert not auth_paths.is_path_under_root(tmp_path / "pkg.newevil" / "x", root)
+    assert not auth_paths.is_path_under_root(root / "a\x00b", root)
+
+
+def test_is_authorized_relative_path_is_the_credentials_update_rule():
+    """``credentials_update`` hands it the slash-normalised ``dir_relative``."""
+    assert auth_paths.is_authorized_relative_path("users/alice/.claude")
+    assert not auth_paths.is_authorized_relative_path("users/../.claude")
+    assert not auth_paths.is_authorized_relative_path("/users/alice/.claude")
+    assert not auth_paths.is_authorized_relative_path("users/a\x00b/.claude")
+
+
+def test_agent_rel_is_the_checked_slug_prefixed_rel():
+    from satellite.host.auth_paths import agent_rel
+    assert agent_rel("workspace/x.txt", "a1") == "a1/workspace/x.txt"
+    assert agent_rel("./workspace//x.txt", "a1") == "a1/workspace/x.txt"
+    for bad in (("../x", "a1"), ("/abs", "a1"), ("workspace/x", "../a1"), ("", "a1"),
+                ("workspace/x\x00", "a1"), (".", "a1")):
+        with pytest.raises(ValueError):
+            agent_rel(*bad)

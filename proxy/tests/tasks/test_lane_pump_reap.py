@@ -45,9 +45,9 @@ def _mk_open_pump(chat_id: str) -> ChatStreamPump:
 
 
 async def test_reap_persists_prior_rounds_blocks(temp_db):
-    # task- prefix (not task-run-) sidesteps title arming + run-status sync;
-    # the reap itself is id-shape agnostic.
-    cid = "task-lane-reap-1"
+    # A plain (non-task) id: the reap itself is id-shape agnostic, and a
+    # task-shaped id would run the run-status sync (a no-op without a run row).
+    cid = "lane-reap-1"
     task_store.create_chat(cid, "user-1", "pa")
     pump = _mk_open_pump(cid)
     _active_pumps[cid] = pump
@@ -68,14 +68,14 @@ async def test_reap_persists_prior_rounds_blocks(temp_db):
 
 
 async def test_reap_noop_without_open_pump(temp_db):
-    cid = "task-lane-reap-2"
+    cid = "lane-reap-2"
     task_store.create_chat(cid, "user-1", "pa")
     await _reap_prior_lane_pump(cid, "run-next")  # no pump — no crash
     assert cid not in _active_pumps
 
 
 async def test_reap_noop_on_finished_pump(temp_db):
-    cid = "task-lane-reap-3"
+    cid = "lane-reap-3"
     task_store.create_chat(cid, "user-1", "pa")
     pump = _mk_open_pump(cid)
     pump._done = True  # already finished — nothing to reap

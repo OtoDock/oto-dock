@@ -637,16 +637,12 @@ def test_trigger_task_survives_post_fire_cleanup(temp_db):
     from storage import database as task_store
     row = task_store.get_dynamic_task("dyn-persist-test")
     assert row is not None
+    from services.scheduler import task_kinds
     task = scheduler._row_to_task(row)
-    assert task.task_type == "trigger"
+    assert task.task_type == task_kinds.TRIGGER
 
-    # The exact cleanup condition from _execute_task's finally block:
-    should_cleanup = (
-        not task.schedule
-        and task.interval_seconds is None
-        and task.task_type != "trigger"
-    )
-    assert not should_cleanup, (
+    # The retire rule the run's frame asks (task_kinds.self_removes):
+    assert not task_kinds.self_removes(task), (
         "trigger-only task would be deleted by post-fire cleanup — "
         "would break trigger ↔ task pairing on second fire"
     )
@@ -659,12 +655,7 @@ def test_trigger_task_survives_post_fire_cleanup(temp_db):
     )
     row2 = task_store.get_dynamic_task("dyn-onetime-cleanup")
     task2 = scheduler._row_to_task(row2)
-    should_cleanup_2 = (
-        not task2.schedule
-        and task2.interval_seconds is None
-        and task2.task_type != "trigger"
-    )
-    assert should_cleanup_2
+    assert task_kinds.self_removes(task2)
 
 
 def test_cleanup_agent_triggers_removes_all_for_agent(temp_db):
@@ -688,3 +679,386 @@ def test_cleanup_agent_triggers_removes_all_for_agent(temp_db):
     assert trigger_store.get_trigger(a["id"]) is None
     assert trigger_store.get_trigger(b["id"]) is None
     assert trigger_store.get_trigger(c["id"]) is not None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Subscription linkage: the refusal says which subscription to create
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_subscription(*, scope: str, owner: str, agent: str | None) -> str:
+    from storage.automation import webhook_subscription_store
+    row = webhook_subscription_store.create_subscription(
+        scope=scope, owner=owner, agent=agent, mcp_name="github-mcp",
+        provider_id="github", account_label="acct", vendor_target="o/r",
+        selected_events=["push"], selected_subevents={}, signing_secret="",
+        created_by=owner or "user-admin",
+    )
+    return row["id"]
+
+
+def _register(*, scope: str, subscription_id: str):
+    from services.scheduler import trigger_manager
+    return trigger_manager.register_trigger(
+        name="On push", scope=scope, agent="agent-x", created_by="user-test",
+        notify_enabled=True, notify_title="t", notify_body="b",
+        subscription_id=subscription_id,
+    )
+
+
+def test_agent_trigger_on_personal_subscription_points_at_the_agent_surface(temp_db):
+    from services.scheduler.trigger_manager import TriggerValidationError
+    sid = _seed_subscription(scope="user", owner="user-test", agent=None)
+    with pytest.raises(TriggerValidationError) as ei:
+        _register(scope="agent", subscription_id=sid)
+    msg = str(ei.value)
+    assert "personal" in msg
+    assert "Agent Settings → MCPs → github-mcp → Subscribe to events for this agent" in msg
+
+
+def test_user_trigger_on_agent_subscription_points_at_connected_accounts(temp_db):
+    from services.scheduler.trigger_manager import TriggerValidationError
+    sid = _seed_subscription(scope="service", owner="", agent="agent-x")
+    with pytest.raises(TriggerValidationError) as ei:
+        _register(scope="user", subscription_id=sid)
+    msg = str(ei.value)
+    assert "belongs to agent 'agent-x'" in msg
+    assert "Subscribe as: Me" in msg
+
+
+def test_matching_scopes_link(temp_db):
+    sid = _seed_subscription(scope="service", owner="", agent="agent-x")
+    row = _register(scope="agent", subscription_id=sid)
+    assert row["subscription_id"] == sid
+
+
+def test_a_trigger_made_before_its_subscription_is_bound_later(temp_db):
+    """An app's trigger is usually created before the agent's subscription
+    exists (found on the internal install: the developer dashboard's
+    github trigger sat with no subscription while the events went nowhere).
+    An edit binds it under the creation rule; '' unbinds."""
+    from services.scheduler import trigger_manager
+    from storage.automation import trigger_store
+    row = _register(scope="agent", subscription_id=None)
+    assert row["subscription_id"] is None
+    personal = _seed_subscription(scope="user", owner="user-test", agent=None)
+    ok, err = trigger_manager.update_trigger(row["id"], {"subscription_id": personal})
+    assert not ok and "Subscribe to events for this agent" in (err or "")
+    sid = _seed_subscription(scope="service", owner="", agent="agent-x")
+    ok, err = trigger_manager.update_trigger(row["id"], {"subscription_id": sid})
+    assert ok and err is None
+    assert trigger_store.get_trigger(row["id"])["subscription_id"] == sid
+    # The dispatcher's fan-out sees it now.
+    assert [t["id"] for t in trigger_store.list_triggers(subscription_id=sid)] == [row["id"]]
+    ok, err = trigger_manager.update_trigger(row["id"], {"subscription_id": ""})
+    assert ok and trigger_store.get_trigger(row["id"])["subscription_id"] is None
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Agent-scope inline notify: who it reaches and who may aim it
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_member(sub: str, agent: str, role: str = "editor"):
+    from storage.pg import get_conn
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO user_agents (sub, agent, assigned_at, assigned_by, agent_role) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (sub, agent) DO NOTHING",
+            (sub, agent, now, "user-admin", role),
+        )
+        conn.commit()
+
+
+def test_agent_trigger_notify_without_target_reaches_its_agent(temp_db, monkeypatch):
+    """The dashboard's create modal and the phone-route button send no target:
+    the notify broadcasts to the trigger's agent (TRIGGERS.md "NULL =
+    broadcast"), it does not go to nobody."""
+    import asyncio
+    _seed_user("user-ed", "ed")
+    _seed_member("user-ed", "agent-x")
+    from services.notifications import notification_manager as nm
+    from services.scheduler import trigger_manager as tm
+    row = tm.register_trigger(
+        name="Deploy", scope="agent", agent="agent-x", created_by="user-ed",
+        notify_enabled=True, notify_title="Deployed {{ref}}", notify_body="b",
+    )
+    assert (row["notify_target_scope"], row["notify_target"]) == ("agent", None)
+    sent = []
+
+    async def _capture(**kw):
+        sent.append(kw)
+        return nm.resolve_targets(kw["scope"], kw["target"])
+    monkeypatch.setattr(nm, "fire_notification", _capture)
+    out = asyncio.run(tm.fire_trigger(row, {"ref": "v2"}))
+    assert out["actions"] == ["notify"], out
+    assert (sent[0]["scope"], sent[0]["target"]) == ("agent", "agent-x")
+    assert sent[0]["title"] == "Deployed v2"
+    assert "user-ed" in nm.resolve_targets(sent[0]["scope"], sent[0]["target"])
+
+
+def test_agent_trigger_notify_reach_follows_the_notifications_api(temp_db):
+    """An agent-scoped trigger's notify reaches its own agent's users (all of
+    them, or one member); another agent, a non-member or every user on the
+    platform needs a platform admin — the rules POST /v1/notifications keeps."""
+    _seed_user("user-ed", "ed")
+    _seed_member("user-ed", "agent-x")
+    _seed_user("user-mem", "mem")
+    _seed_member("user-mem", "agent-x", "viewer")
+    _seed_user("user-out", "outsider")
+    _seed_member("user-out", "agent-y")
+    long_sub = "oidc-" + "0" * 40
+    _seed_user(long_sub, "longsub")
+    from services.scheduler import trigger_manager as tm
+
+    def reg(slug, admin=False, **notify):
+        extra = {"caller_is_admin": True} if admin else {}
+        return tm.register_trigger(
+            name=slug, slug=slug, scope="agent", agent="agent-x", created_by="user-ed",
+            notify_enabled=True, notify_title="t", notify_body="{{msg}}", **notify, **extra)
+
+    for i, notify in enumerate((
+        {"notify_target_scope": "global"},
+        {"notify_target_scope": "agent", "notify_target": "agent-y"},
+        {"notify_target_scope": "user", "notify_target": "outsider"},
+        {"notify_target_scope": "user", "notify_target": long_sub},
+    )):
+        with pytest.raises(tm.TriggerValidationError):
+            reg(f"bad-{i}", **notify)
+    assert reg("own", notify_target_scope="agent", notify_target="agent-x")["notify_target"] == "agent-x"
+    assert reg("member", notify_target_scope="user", notify_target="mem")["notify_target"] == "user-mem"
+    assert reg("self", notify_target_scope="user", notify_target="ed")["notify_target"] == "user-ed"
+    everyone = reg("everyone", admin=True, notify_target_scope="global")
+    assert (everyone["notify_target_scope"], everyone["notify_target"]) == ("global", None)
+    assert reg("out", admin=True, notify_target_scope="user",
+               notify_target="outsider")["notify_target"] == "user-out"
+
+
+def test_user_trigger_notify_stays_with_its_creator(temp_db):
+    """A user-scoped trigger notifies its creator whatever scope is asked for."""
+    _seed_user("user-alice", "alice")
+    from services.scheduler import trigger_manager as tm
+    row = tm.register_trigger(
+        name="Mine", scope="user", agent="agent-x", created_by="user-alice",
+        notify_enabled=True, notify_title="t", notify_body="b",
+        notify_target_scope="global",
+    )
+    assert (row["notify_target_scope"], row["notify_target"]) == ("user", None)
+
+
+def test_agent_trigger_notify_reach_is_checked_on_edit(temp_db):
+    """An edit that aims the notify somewhere new meets the create rule; one
+    that leaves the target where it is (a rename, a new title) passes."""
+    _seed_user("user-ed", "ed")
+    _seed_member("user-ed", "agent-x")
+    from services.scheduler import trigger_manager as tm
+    from storage.automation import trigger_store
+    row = tm.register_trigger(
+        name="Deploy", scope="agent", agent="agent-x", created_by="user-ed",
+        notify_enabled=True, notify_title="t", notify_body="b",
+    )
+    ok, err = tm.update_trigger(row["id"], {"notify_target_scope": "global"})
+    assert not ok and "admin" in (err or ""), err
+    ok, err = tm.update_trigger(
+        row["id"], {"notify_target_scope": "agent", "notify_target": "agent-y"})
+    assert not ok and err, err
+    ok, err = tm.update_trigger(row["id"], {"notify_target_scope": "global"},
+                                caller_is_admin=True)
+    assert ok and err is None
+    ok, err = tm.update_trigger(row["id"], {
+        "name": "Deploy 2", "notify_enabled": True, "notify_title": "t2"})
+    assert ok and err is None
+    assert trigger_store.get_trigger(row["id"])["notify_target_scope"] == "global"
+
+
+def test_trigger_routes_hold_the_caller_to_the_notify_reach(temp_db):
+    """Create and edit judge the target by the caller: an editor or the
+    agent's own no-user session cannot aim a trigger's notify at every user;
+    a manager may rename an admin's global trigger but not re-aim it."""
+    import asyncio
+    from fastapi import HTTPException
+    from auth.providers import UserContext
+    from api.events import triggers as api
+    from storage.agents import agent_store
+    agent_store.create_agent("agent-x", "X", created_by="user-admin")
+    _seed_user("user-ed", "ed")
+    _seed_member("user-ed", "agent-x")
+    _seed_member("user-manager", "agent-x", "manager")
+    editor = UserContext(sub="user-ed", email="", name="ed", role="creator",
+                         agents=["agent-x"], agent_roles={"agent-x": "editor"})
+    manager = UserContext(sub="user-manager", email="", name="m", role="creator",
+                          agents=["agent-x"], agent_roles={"agent-x": "manager"})
+    no_user = UserContext(sub="session:s-1", email="", name="", role="agent",
+                          is_api_key=True, session_id="s-1", agent="agent-x")
+    admin = UserContext(sub="user-admin", email="", name="a", role="admin")
+
+    def req(slug):
+        return api.CreateTriggerRequest(
+            name=slug, slug=slug, scope="agent", agent="agent-x",
+            notify=api.NotifyConfig(enabled=True, title="t", body="{{msg}}",
+                                    target_scope="global"))
+
+    for i, ctx in enumerate((editor, no_user)):
+        with pytest.raises(HTTPException) as e:
+            asyncio.run(api.create_trigger_endpoint(req(f"g-{i}"), user=ctx))
+        assert e.value.status_code == 400, e.value.detail
+    tid = asyncio.run(api.create_trigger_endpoint(req("g-admin"), user=admin))["trigger"]["id"]
+
+    def edit(ctx, **fields):
+        return asyncio.run(api._edit_impl(tid, api.EditTriggerRequest(**fields), ctx))
+
+    assert edit(manager, name="Everyone 2", notify_enabled=True, notify_title="t2")["status"] == "updated"
+    with pytest.raises(HTTPException) as e:
+        edit(manager, notify_target_scope="agent", notify_target="agent-y")
+    assert e.value.status_code == 400
+    assert edit(manager, notify_target_scope="agent")["status"] == "updated"
+    with pytest.raises(HTTPException) as e:
+        edit(manager, notify_target_scope="global")
+    assert e.value.status_code == 400
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# By-id fire and mutations: the edit authority, sessions on their own agent
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _by_id_world():
+    from auth.providers import UserContext
+    from storage.agents import agent_store
+    from storage.automation import trigger_store
+    agent_store.create_agent("agent-x", "X", created_by="user-admin")
+    agent_store.create_agent("agent-y", "Y", created_by="user-admin")
+    for sub, role in (("user-v", "viewer"), ("user-c", "contributor"),
+                      ("user-e", "editor"), ("user-m", "manager")):
+        _seed_user(sub, sub)
+        _seed_member(sub, "agent-x", role)
+    _seed_member("user-m", "agent-y", "manager")
+    tx = trigger_store.create_trigger(
+        slug="deploy", name="Deploy", scope="agent", agent="agent-x", created_by="user-admin",
+        notify_enabled=True, notify_title="t", notify_body="b", notify_target_scope="agent")
+    ty = trigger_store.create_trigger(
+        slug="deploy", name="Deploy", scope="agent", agent="agent-y", created_by="user-admin",
+        notify_enabled=True, notify_title="t", notify_body="b", notify_target_scope="agent")
+
+    def cookie(sub, role):
+        return UserContext(sub=sub, email="", name=sub, role="creator",
+                           agents=["agent-x"], agent_roles={"agent-x": role})
+
+    def session(sub, agent, platform_role="creator"):
+        roles_ = {"agent-x": "manager", "agent-y": "manager"}
+        return UserContext(sub=sub, email="", name=sub, role=platform_role,
+                           agents=list(roles_), agent_roles=roles_,
+                           is_api_key=True, session_id="s-1", agent=agent)
+    return tx, ty, cookie, session
+
+
+class _FireReq:
+    async def json(self):
+        return {"msg": "hi"}
+
+
+def test_firing_a_trigger_by_id_needs_the_edit_authority(temp_db, monkeypatch):
+    """Firing runs the agent's task and sends its notify with the caller's
+    body: a viewer or contributor may not, an editor only on their own, a
+    manager may; a user-backed session only on its own agent. ``can_fire``
+    says the same."""
+    import asyncio
+    from fastapi import HTTPException
+    from api.events import triggers as api
+    tx, ty, cookie, session = _by_id_world()
+    fired = []
+
+    async def _fire(row, body, **kw):
+        fired.append(row["id"])
+        return {"status": "ok"}
+    monkeypatch.setattr(api.trigger_manager, "fire_trigger", _fire)
+
+    def fire(row, ctx):
+        return asyncio.run(api.fire_test_endpoint(row["id"], _FireReq(), user=ctx))
+
+    for ctx in (cookie("user-v", "viewer"), cookie("user-c", "contributor"),
+                cookie("user-e", "editor"), session("user-m", "agent-y")):
+        with pytest.raises(HTTPException) as e:
+            fire(tx, ctx)
+        assert e.value.status_code == 403
+        assert api._decorate_for_user(tx, ctx)["can_fire"] is False
+    assert fired == []
+    for ctx in (cookie("user-m", "manager"), session("user-m", "agent-x")):
+        assert fire(tx, ctx)["status"] == "ok"
+        assert api._decorate_for_user(tx, ctx)["can_fire"] is True
+    assert fire(ty, session("user-m", "agent-y"))["status"] == "ok"
+    assert fired == [tx["id"], tx["id"], ty["id"]]
+
+
+def test_a_user_backed_session_manages_only_its_own_agents_triggers(temp_db):
+    """Edit, pause, resume and delete by id pin a session to its own agent,
+    as create does — a manager's (or an admin's) session included; a no-user
+    session keeps its own agent's triggers."""
+    import asyncio
+    from fastapi import HTTPException
+    from auth.providers import UserContext
+    from api.events import triggers as api
+    from storage.automation import trigger_store
+    tx, ty, _cookie, session = _by_id_world()
+    for ctx in (session("user-m", "agent-y"), session("user-admin", "agent-y", "admin")):
+        assert api._can_manage_trigger(tx, ctx) is False
+        with pytest.raises(HTTPException) as e:
+            api._check_trigger_mutation_authority(tx, ctx)
+        assert e.value.status_code == 403
+        for call in (
+            lambda: api._edit_impl(tx["id"], api.EditTriggerRequest(name="x"), ctx),
+            lambda: api.pause_trigger_endpoint(tx["id"], user=ctx),
+            lambda: api.resume_trigger_endpoint(tx["id"], user=ctx),
+            lambda: api.delete_trigger_endpoint(tx["id"], user=ctx),
+        ):
+            with pytest.raises(HTTPException) as e:
+                asyncio.run(call())
+            assert e.value.status_code == 403
+        assert api._decorate_for_user(tx, ctx)["can_edit"] is False
+    assert trigger_store.get_trigger(tx["id"])["name"] == "Deploy"
+    own = session("user-m", "agent-y")
+    assert asyncio.run(api.pause_trigger_endpoint(ty["id"], user=own))["status"] == "paused"
+    no_user = UserContext(sub="session:s-2", email="", name="", role="agent",
+                          is_api_key=True, session_id="s-2", agent="agent-y")
+    assert asyncio.run(api.resume_trigger_endpoint(ty["id"], user=no_user))["status"] == "resumed"
+    assert asyncio.run(api._edit_impl(
+        ty["id"], api.EditTriggerRequest(name="Renamed"), no_user))["status"] == "updated"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# The webhook body read under the streamed body cap
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _request(receive):
+    from starlette.requests import Request
+    scope = {
+        "type": "http", "method": "POST", "path": "/v1/webhooks/agent/a/s",
+        "headers": [], "query_string": b"",
+    }
+    return Request(scope, receive)
+
+
+def test_safe_json_re_raises_a_client_disconnect():
+    """A body the middleware cut at its tier reaches the route as a
+    disconnect; the fire must not proceed with an empty payload."""
+    import asyncio
+    from starlette.requests import ClientDisconnect
+    from api.events import triggers
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    with pytest.raises(ClientDisconnect):
+        asyncio.run(triggers._safe_json(_request(receive)))
+
+
+def test_safe_json_tolerates_a_malformed_body():
+    import asyncio
+    from api.events import triggers
+
+    async def receive():
+        return {"type": "http.request", "body": b"not json", "more_body": False}
+
+    assert asyncio.run(triggers._safe_json(_request(receive))) == {}

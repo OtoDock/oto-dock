@@ -38,9 +38,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
           cache: pip
@@ -106,9 +108,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
           cache: pip
@@ -146,9 +150,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
           cache: pip
@@ -170,6 +176,38 @@ jobs:
       - name: pytest
         run: python -m pytest satellite/tests -q
 
+  # The same suite at the host floor (VERSIONS.md PYTHON_MIN_VERSION): what an
+  # Ubuntu 22.04 host pairs with. A separate job, not a matrix, so the
+  # `satellite` check keeps its name. tomli stands in for the 3.11+ tomllib
+  # in the tests that parse a composed config.toml.
+  satellite-floor:
+    if: github.repository == 'OtoDock/oto-dock'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: |
+            satellite/requirements.txt
+            proxy/requirements-test.txt
+
+      - name: Codex CLI at the VERSIONS.md pin
+        run: sudo npm install -g "@openai/codex@$(bash scripts/versions.sh CODEX_VERSION)"
+
+      - name: Install satellite dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r satellite/requirements.txt -r proxy/requirements-test.txt
+          python -m pip install "tomli; python_version < '3.11'"
+
+      - name: pytest
+        run: python -m pytest satellite/tests -q
+
   # The phone service's suite in the phone service's own environment: its
   # lockfile, then the audio package with the localmodels extra, in the
   # order the phone image installs them (the lockfile excludes the local
@@ -178,9 +216,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
           cache: pip
@@ -203,9 +243,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm

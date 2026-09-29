@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 import httpx
 
 import config
+from auth.request_path import has_traversal
 
 logger = logging.getLogger("claude-proxy.satellite-tunnel")
 
@@ -43,12 +44,27 @@ _ALLOWLIST_REGEXES = [
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
         r"mcp-credentials|session-files|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
-        r"document-preview|tool-result|file-written|subagent)$"
+        r"document-preview|tool-result|file-written|subagent|"
+        # The Stop hook (turn end, both engines) and the Codex question
+        # bridge (request_user_input → the dashboard card); satellite 0.5.121
+        # admits the same two.
+        r"stop|codex-question)$"
     ),
-    # display-mcp pinned mini-apps (pin/unpin/list) — session-JWT gated
+    # display-mcp pinned apps (pin/unpin/list) and the live-apps hooks
+    # (push/state/open, APPS.md "Live apps") — session-JWT gated
     # proxy-side like every hook (verify_session_match + scope from the
     # session ctx); the artifact hook itself is the `ui` entry above.
-    re.compile(r"^/v1/hooks/apps/(pin|unpin|list)$"),
+    re.compile(r"^/v1/hooks/apps/(pin|unpin|list|push|state|open|rollback|"
+               r"deploy|check|status|preview|logs|restart|purge|describe|export|import|screenshot)$"),
+    # Agents calling apps (APPS.md "Agents call apps"): an app's own API,
+    # its platform methods and the push/state twins, with the session JWT
+    # the routes judge as basis `agent`. Never the client files or the
+    # socket bridge (browser surfaces).
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/(api|platform|push|state)(/.*)?$"),
+    # An app step's script pressing one of its app's buttons (APPS.md
+    # "Steps"; satellite 0.5.122 admits the same): the route accepts only
+    # the step's own in-flight claim as the bearer; never the batch route.
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/actions/[A-Za-z0-9_-]{1,64}$"),
     # display-mcp Dock file pins — same session-JWT gating; content is read
     # dashboard-side via the files API (the platform mirror for remotes).
     re.compile(r"^/v1/hooks/files/(pin|unpin)$"),
@@ -79,6 +95,9 @@ _ALLOWLIST_REGEXES = [
     re.compile(r"^/v1/continuations(/.*)?$"),
     re.compile(r"^/v1/meetings(/.*)?$"),
     re.compile(r"^/v1/triggers(/.*)?$"),
+    # checks-mcp (CHECKS.md): what is attached to this session's chat, attach,
+    # detach, run by hand — all session-JWT gated proxy-side (0.5.123).
+    re.compile(r"^/v1/checks/(attached|attach|detach|run)$"),
     re.compile(r"^/v1/subscriptions$"),
     re.compile(r"^/v1/internal/memory(/.*)?$"),
     re.compile(r"^/v1/agents/[a-zA-Z0-9_-]+(/.*)?$"),
@@ -95,6 +114,10 @@ _HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 }
+
+# Request headers that name a client address or an edge.
+_FORWARDING_PREFIX = "x-forwarded-"
+_FORWARDING_HEADERS = {"forwarded", "x-real-ip"}
 
 # Chunk body cap on the wire (matches satellite/http_tunnel.py).
 _MAX_FRAME_BODY = 256 * 1024
@@ -119,39 +142,75 @@ _MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024
 # streamable-HTTP GET that keeps delivering is never cut (the old rule cut
 # every such stream at the 15-min clamp: "swept leaked stream" every ~15 min
 # on any machine with tunneled HTTP MCPs) — or when it is older than the
-# absolute cap regardless of activity. Reaping now CLOSES the upstream
-# response (cancels the dispatch task) instead of only forgetting the entry,
-# so a reaped stream can no longer hold one of the shared httpx client's
-# connections. A per-machine open-stream cap protects that pool (hook
-# callbacks share it) from a satellite that never sends EOF.
+# absolute cap regardless of activity. Reaping CLOSES the upstream response
+# (cancels the dispatch task) instead of only forgetting the entry, so a
+# reaped stream can no longer hold an httpx connection.
 _STREAM_MAX_AGE_S = 24 * 3600
-_MAX_OPEN_STREAMS_PER_MACHINE = 64
+
+# Two stream classes, two httpx clients, separate caps. Every remote CLI
+# holds one standing streamable-HTTP GET per tunneled HTTP MCP for the life
+# of the session (``/mcp/<name>/...``, the ``mcp`` class); every hook, MCP
+# callback and app call is a short loopback request (the ``hook`` class),
+# and a parked permission prompt or a Stop-verdict wait holds one for
+# minutes. On one shared pool the standing GETs of 50 to 100 remote
+# sessions fill it and every hook waits the pool timeout for a 502, and a
+# single per-machine count lets a machine's own GETs refuse its hooks. So
+# the classes never share a connection, and a hook is never refused
+# because MCP streams are held.
+#
+# The per-machine MCP cap is a satellite's session ceiling (64) times the
+# HTTP MCPs a session holds at most (four: file-tools, video-tools, camoufox
+# or m365, github). The fleet MCP cap bounds the descriptors a fleet of
+# leaking satellites can hold (one per stream; the soft limit is 65536
+# since the boot raise). The per-machine hook cap is 64 sessions times a
+# parked prompt, a verdict wait and an in-flight callback, rounded up; only
+# a satellite that leaks streams reaches it. There is no fleet hook cap: a
+# hook is never refused fleet-wide, and past the hook pool's size (two
+# descriptors per loopback request) the pool timeout answers with a 502.
+_MAX_MCP_STREAMS_PER_MACHINE = 256
+_MAX_MCP_STREAMS_TOTAL = 2048
+_MAX_HOOK_STREAMS_PER_MACHINE = 256
+# The pools. The MCP pool carries one machine's worth of headroom over the
+# fleet cap: the cap, not the pool, is the bound (it refuses with a protocol
+# frame before the pool could wait), and a reaped stream frees its slot at
+# once while its socket closes when the cancelled task's finally runs.
+# Keepalive equals the pool size on both: httpcore prunes every idle
+# connection whenever the total number of connections (active ones
+# included) exceeds the keepalive bound, so a smaller number would open a
+# new socket per tool-call POST and per hook while streams are held.
+_MCP_POOL_MAX = _MAX_MCP_STREAMS_TOTAL + _MAX_MCP_STREAMS_PER_MACHINE
+_HOOK_POOL_MAX = 4096
+# The Stop hook waits on the turn-end verdict, which the proxy bounds itself
+# (each check's own budget; a default judge check alone is past 15 min), so
+# its ceiling is the absolute age cap: the clamp would cut the verdict off
+# and the hook would fail open with the fix round lost. The two prompt hooks
+# wait on a person and share that ceiling.
+_VERDICT_HOOK_PATH = "/v1/hooks/stop"
+_UNCLAMPED_HOOK_PATHS = frozenset({
+    _VERDICT_HOOK_PATH, "/v1/hooks/permission", "/v1/hooks/codex-question",
+})
+
+
+def _stream_timeout_ceiling(path: str) -> int:
+    # The verdict hook waits on a check's budget and the two prompt hooks
+    # wait on a person; each holds one stream of the hook class on its own
+    # pool, so they may outlive the clamp every other stream keeps.
+    if path.split("?", 1)[0] in _UNCLAMPED_HOOK_PATHS:
+        return _STREAM_MAX_AGE_S
+    return _MAX_STREAM_TIMEOUT_S
 
 
 class _BodyTooLarge(Exception):
     """Tunneled request body exceeded _MAX_REQUEST_BODY_BYTES."""
 
 
-def _has_traversal(base: str) -> bool:
-    """True if ``base`` contains a dot-segment or an encoded separator.
-
-    httpx collapses ``../`` (RFC-3986 remove_dot_segments) when it builds the
-    upstream request, so a frame path that MATCHES an allowlisted prefix could
-    be forwarded to a DIFFERENT endpoint (``/v1/tasks/../admin/users`` matches
-    ``^/v1/tasks(/.*)?$`` but is sent to ``/admin/users``). We REJECT any
-    traversal up front so the matched path is byte-identical to the forwarded
-    path — normalization can never diverge.
-    """
-    low = base.lower()
-    if "%2e" in low or "%2f" in low or "%5c" in low or "\\" in base:
-        return True
-    return any(seg in (".", "..") for seg in base.split("/"))
-
-
 def _is_allowed_path(path: str) -> bool:
     # Strip query string for matching
+    # A dot segment or an encoded separator is refused before the regexes
+    # run, so the matched path is byte-identical to the forwarded path
+    # (httpx collapses ``../`` when it builds the upstream request).
     base = path.split("?", 1)[0]
-    if _has_traversal(base):
+    if has_traversal(base):
         return False
     return any(rx.match(base) for rx in _ALLOWLIST_REGEXES)
 
@@ -164,8 +223,9 @@ _MCP_PATH_RE = re.compile(r"^/mcp/([a-z0-9_-]+)(/.*)?$")
 def _resolve_upstream_url(path: str) -> str | None:
     """Resolve a tunneled path to the upstream URL on the platform.
 
-    - ``/v1/hooks/*`` and ``/v1/location/request`` → ``http://localhost:{PORT}{path}``
-      (call the proxy's own loopback endpoint; bypasses any reverse proxy).
+    - ``/v1/hooks/*`` and ``/v1/location/request`` → the proxy's internal
+      listener, ``http://127.0.0.1:{INTERNAL_LISTENER_PORT}{path}`` (the main
+      ``PORT`` when there is none; bypasses any reverse proxy).
     - ``/mcp/{name}/{rest}`` → ``http://localhost:{mcp_port}{rest}`` resolved
       via ``mcp_registry.get_manifest(name).server.port``.
 
@@ -205,9 +265,10 @@ def _resolve_upstream_url(path: str) -> str | None:
         url = f"http://{host}:{port}{rest}"
         return url + (f"?{query}" if query else "")
 
-    # Default: route through the proxy's own loopback (hooks, location).
-    url = f"http://localhost:{config.PORT}{path}"
-    return url
+    # Default: the proxy's internal listener (hooks, location), where
+    # forwarding headers are never read; the main port when there is none.
+    port = config.INTERNAL_LISTENER_PORT or config.PORT
+    return f"http://127.0.0.1:{port}{path}"
 
 
 def _swap_brokered_bearer(path: str, headers: dict) -> None:
@@ -241,23 +302,93 @@ def _swap_brokered_bearer(path: str, headers: dict) -> None:
             headers.pop(auth_key, None)
         headers["Authorization"] = f"Bearer {bundle.http_bearer}"
     elif bundle is None:
-        # Store miss on a valid session JWT → the sidecar 401s (fail-closed).
-        # Post-restart this is a re-adopted session whose broker bundles died
-        # with the process; log once per (session, mcp) so field reports
-        # self-identify — the recovery is a session re-warm.
+        # No bundle for this (session, mcp): a callback MCP (file-tools)
+        # never has one and its JWT is forwarded as designed; a brokered MCP
+        # has none only after a proxy restart (the store died with the
+        # process) and its sidecar 401s until the session re-warms. The
+        # tunnel cannot tell the two apart, so the line names both, once
+        # per (session, mcp).
         key = (payload.get("sid") or "", mcp_match.group(1))
-        if key not in _swap_miss_logged:
-            _swap_miss_logged.add(key)
+        if _first_swap_miss(key):
             logger.info(
-                "tunnel bearer swap miss for session %s mcp %s — empty broker "
-                "store (proxy restarted?); MCP auth fails until re-warm",
+                "tunnel: no broker bundle for session %s mcp %s (a callback MCP "
+                "carries its JWT; a brokered MCP after a proxy restart needs a re-warm)",
                 key[0][:8], key[1],
             )
 
 
 # (session_id, mcp) pairs whose bearer-swap miss was already logged — the miss
-# repeats on every request of the session, one line is enough.
+# repeats on every request of the session, one line is enough. Bounded: every
+# callback-MCP session adds a pair for the life of the process, so the set
+# starts over past the cap (a repeated line after that is harmless).
 _swap_miss_logged: set[tuple[str, str]] = set()
+_SWAP_MISS_LOG_CAP = 4096
+
+
+def _first_swap_miss(key: tuple[str, str]) -> bool:
+    if key in _swap_miss_logged:
+        return False
+    if len(_swap_miss_logged) >= _SWAP_MISS_LOG_CAP:
+        _swap_miss_logged.clear()
+    _swap_miss_logged.add(key)
+    return True
+
+
+# The holder of a tunneled session token. Every tunneled HTTP MCP carries
+# the session JWT as its bearer (the brokered ones swap it for the real
+# upstream secret above; the callback ones forward it to reach the hooks),
+# and the signature alone would honour it for its 24 h life after the person
+# was removed or changed their credentials. The judge is the session routes'
+# (``auth.providers.session_token_holder_ok``: the person still exists and
+# the token predates no credential change), its answer cached per (sub, iat)
+# for the same TTL; the cache is the tunnel's own because ``core/remote``
+# imports nothing from ``api/``. A token with no person (an agent-scope run)
+# is not judged.
+_HOLDER_TTL_S = 60.0
+_HOLDER_ANSWERS_MAX = 4096
+_holder_answers: dict[tuple[str, int], tuple[bool, float]] = {}
+
+
+class _AmbiguousAuthorization(Exception):
+    """A tunneled request carries more than one Authorization header."""
+
+
+def _session_bearer_payload(headers: dict) -> dict | None:
+    """The payload of a request's session-JWT bearer, or None when the
+    request carries no bearer or one that is not a session token. The scheme
+    is read in any case, as the routes read it. More than one Authorization
+    header (keys differing in case) raises ``_AmbiguousAuthorization``:
+    which one a server reads is its own choice, so none is judged."""
+    keys = [k for k in headers if isinstance(k, str) and k.lower() == "authorization"]
+    if len(keys) > 1:
+        raise _AmbiguousAuthorization()
+    value = headers.get(keys[0]) if keys else None
+    if not isinstance(value, str):
+        return None
+    scheme, _, token = value.strip().partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    from auth.session_token import validate_session_token
+    return validate_session_token(token.strip())
+
+
+async def _holder_current(payload: dict) -> bool:
+    sub = payload.get("user_sub") or ""
+    if not sub:
+        return True
+    iat = payload.get("iat")
+    key = (sub, iat if isinstance(iat, int) else 0)
+    now = time.monotonic()
+    hit = _holder_answers.get(key)
+    if hit is not None and hit[1] >= now:
+        return hit[0]
+    from auth import providers
+    from storage.pg import run_db_fast
+    ok = bool(await run_db_fast(providers.session_token_holder_ok, payload))
+    if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
+        _holder_answers.clear()
+    _holder_answers[key] = (ok, now + _HOLDER_TTL_S)
+    return ok
 
 
 @dataclass
@@ -282,6 +413,20 @@ class _HttpStream:
     # The dispatch task — cancelled by reap/abort so the upstream response is
     # actually closed, not merely forgotten.
     task: asyncio.Task | None = None
+    # ``mcp`` for a ``/mcp/<name>/...`` stream, ``hook`` for everything else:
+    # picks the client and the cap. ``admitted`` is set once the stream was
+    # counted, so a slot is freed exactly once and a stream a test inserts
+    # by hand frees nothing.
+    kind: str = "hook"
+    admitted: bool = False
+
+
+def _new_client(is_mcp: bool) -> httpx.AsyncClient:
+    size = _MCP_POOL_MAX if is_mcp else _HOOK_POOL_MAX
+    return httpx.AsyncClient(
+        timeout=None,
+        limits=httpx.Limits(max_connections=size, max_keepalive_connections=size),
+    )
 
 
 class SatelliteHttpTunnelDispatcher:
@@ -295,33 +440,45 @@ class SatelliteHttpTunnelDispatcher:
     def __init__(self) -> None:
         self._streams: dict[tuple[str, str], _HttpStream] = {}
         self._lock = asyncio.Lock()
-        self._client: httpx.AsyncClient | None = None
+        self._mcp_client: httpx.AsyncClient | None = None
+        self._hook_client: httpx.AsyncClient | None = None
         self._sweep_task: asyncio.Task | None = None
+        # Open streams per (machine, class) and across the fleet for the
+        # MCP class; kept by ``handle_request_frame`` and ``_forget``.
+        self._open: dict[tuple[str, str], int] = {}
+        self._open_mcp_total = 0
 
     async def start(self) -> None:
         """Start the background sweeper. Idempotent."""
         if self._sweep_task is not None:
             return
-        self._client = httpx.AsyncClient(timeout=None)
+        self._mcp_client = _new_client(True)
+        self._hook_client = _new_client(False)
         self._sweep_task = asyncio.create_task(
             self._sweep_leaked_streams(), name="http-tunnel-sweeper",
         )
 
     async def shutdown(self) -> None:
-        """Cancel the sweeper and close the httpx client."""
+        """Cancel the sweeper and close both httpx clients."""
         if self._sweep_task is not None:
             self._sweep_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._sweep_task
             self._sweep_task = None
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        for attr in ("_mcp_client", "_hook_client"):
+            client = getattr(self, attr)
+            if client is not None:
+                await client.aclose()
+                setattr(self, attr, None)
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=None)
-        return self._client
+    def _get_client(self, is_mcp: bool) -> httpx.AsyncClient:
+        if is_mcp:
+            if self._mcp_client is None:
+                self._mcp_client = _new_client(True)
+            return self._mcp_client
+        if self._hook_client is None:
+            self._hook_client = _new_client(False)
+        return self._hook_client
 
     # --- Inbound frame routing (called from SatelliteConnectionManager.handle_message) ---
 
@@ -361,10 +518,12 @@ class SatelliteHttpTunnelDispatcher:
             timeout_s = int(msg.get("timeout_s", 30))
         except (TypeError, ValueError):
             timeout_s = 30
+        is_mcp = _MCP_PATH_RE.match(str(path).split("?", 1)[0]) is not None
         stream = _HttpStream(
             stream_id=stream_id,
             machine_id=machine_id,
-            timeout_s=max(1, min(timeout_s, _MAX_STREAM_TIMEOUT_S)),
+            timeout_s=max(1, min(timeout_s, _stream_timeout_ceiling(path))),
+            kind="mcp" if is_mcp else "hook",
         )
         async with self._lock:
             if key in self._streams:
@@ -378,11 +537,11 @@ class SatelliteHttpTunnelDispatcher:
                     error="stream-id-collision", body_eof=True,
                 )
                 return
-            open_here = sum(1 for k in self._streams if k[0] == machine_id)
-            if open_here >= _MAX_OPEN_STREAMS_PER_MACHINE:
+            refused = self._cap_reached(stream)
+            if refused:
                 logger.warning(
-                    "tunnel: machine %s has %d open streams — refusing %s",
-                    machine_id[:8], open_here, stream_id[:8],
+                    "tunnel: %s; refusing %s from machine %s",
+                    refused, stream_id[:8], machine_id[:8],
                 )
                 await self._send_response(
                     manager, machine_id, stream_id,
@@ -390,7 +549,14 @@ class SatelliteHttpTunnelDispatcher:
                     error="too-many-streams", body_eof=True,
                 )
                 return
+            # Counted and inserted with no await in between, so the count a
+            # concurrent admission reads is never stale.
             self._streams[key] = stream
+            stream.admitted = True
+            per_machine = (machine_id, stream.kind)
+            self._open[per_machine] = self._open.get(per_machine, 0) + 1
+            if is_mcp:
+                self._open_mcp_total += 1
 
         # Run the dispatch in the background so the main message loop returns.
         stream.task = asyncio.create_task(
@@ -417,13 +583,49 @@ class SatelliteHttpTunnelDispatcher:
                 stream_id[:8],
             )
 
+    def _cap_reached(self, stream: _HttpStream) -> str | None:
+        """Why this stream must be refused, or None when its class has room
+        on its machine (and, for an MCP stream, across the fleet)."""
+        open_here = self._open.get((stream.machine_id, stream.kind), 0)
+        if stream.kind == "mcp":
+            if open_here >= _MAX_MCP_STREAMS_PER_MACHINE:
+                return f"machine has {open_here} open MCP streams"
+            if self._open_mcp_total >= _MAX_MCP_STREAMS_TOTAL:
+                return f"{self._open_mcp_total} open MCP streams across the fleet"
+            return None
+        if open_here >= _MAX_HOOK_STREAMS_PER_MACHINE:
+            return f"machine has {open_here} open hook streams"
+        return None
+
+    def _forget(self, stream: _HttpStream) -> None:
+        """Drop the stream's registry entry (only while it is still this
+        stream: a same-id successor is never evicted) and free its slot
+        exactly once. Synchronous on purpose: the dispatch finally runs it
+        outside ``_lock``, and a decrement with no await is atomic on the
+        loop against an admission's count-and-insert."""
+        key = (stream.machine_id, stream.stream_id)
+        if self._streams.get(key) is stream:
+            del self._streams[key]
+        if not stream.admitted:
+            return
+        stream.admitted = False
+        per_machine = (stream.machine_id, stream.kind)
+        left = self._open.get(per_machine, 0) - 1
+        if left > 0:
+            self._open[per_machine] = left
+        else:
+            self._open.pop(per_machine, None)
+        if stream.kind == "mcp":
+            self._open_mcp_total = max(0, self._open_mcp_total - 1)
+
     def _reap(self, key: tuple[str, str]) -> "_HttpStream | None":
         """Forget a stream AND close it: set the cancel flag (the chunk loop
         checks it) and cancel the dispatch task so its finally closes the
         upstream httpx response now, not whenever upstream next speaks."""
-        stream = self._streams.pop(key, None)
+        stream = self._streams.get(key)
         if stream is None:
             return None
+        self._forget(stream)
         stream.cancel_event.set()
         task = stream.task
         if task is not None and not task.done():
@@ -472,9 +674,13 @@ class SatelliteHttpTunnelDispatcher:
         try:
             method = first_msg.get("method", "GET")
             path = first_msg.get("path", "")
+            # A machine never speaks for a client address: the forwarding
+            # headers go before the platform sees the request.
             headers = {
                 k: v for (k, v) in first_msg.get("headers", {}).items()
                 if k.lower() not in _HOP_BY_HOP_HEADERS
+                and not k.lower().startswith(_FORWARDING_PREFIX)
+                and k.lower() not in _FORWARDING_HEADERS
             }
             timeout_s = stream.timeout_s
             url = _resolve_upstream_url(path)
@@ -486,6 +692,31 @@ class SatelliteHttpTunnelDispatcher:
                     error="mcp-not-found", body_eof=True,
                 )
                 return
+
+            # A tunneled MCP request is judged on its token's holder before
+            # the bearer swap: a person who is gone gets a 401 and the
+            # upstream is never contacted.
+            if stream.kind == "mcp":
+                try:
+                    payload = _session_bearer_payload(headers)
+                except _AmbiguousAuthorization:
+                    await self._send_response(
+                        manager, machine_id, stream_id,
+                        status=400, headers={}, body=b"",
+                        error="ambiguous-authorization", body_eof=True,
+                    )
+                    return
+                if payload is not None and not await _holder_current(payload):
+                    logger.warning(
+                        "tunnel: session token holder refused for %s (machine %s)",
+                        path.split("?", 1)[0], machine_id[:8],
+                    )
+                    await self._send_response(
+                        manager, machine_id, stream_id,
+                        status=401, headers={}, body=b"",
+                        error="session-holder-gone", body_eof=True,
+                    )
+                    return
 
             # HTTP bearer-swap: a proxy-terminable HTTP MCP (github/m365)
             # ships the per-session JWT as its Authorization bearer; swap it for
@@ -523,16 +754,16 @@ class SatelliteHttpTunnelDispatcher:
                         break
                 body_bytes = b"".join(body_chunks)
 
-            # Make the upstream call. Use stream=True so SSE/large responses
-            # don't buffer in memory.
-            client = self._get_client()
+            # Make the upstream call on the stream class's own client. Use
+            # stream=True so SSE/large responses don't buffer in memory.
+            is_mcp = stream.kind == "mcp"
+            client = self._get_client(is_mcp)
             # Streaming MCP calls (e.g. camoufox browser actions) can legitimately
             # run far longer than a hook callback and stream their result sparsely
             # — a fixed read-timeout would sever a slow-but-valid browser op midway
             # (the original camoufox "Issue B" failure). Drop the read-timeout for
             # /mcp/* (the connect-timeout still guards a dead upstream); keep the
             # bounded read for fast hook callbacks.
-            is_mcp = _MCP_PATH_RE.match(path.split("?", 1)[0]) is not None
             req = client.build_request(
                 method, url,
                 headers=headers,
@@ -676,7 +907,7 @@ class SatelliteHttpTunnelDispatcher:
                 error="dispatch-exception", body_eof=True,
             )
         finally:
-            self._streams.pop((machine_id, stream_id), None)
+            self._forget(stream)
 
     async def _send_response(
         self,

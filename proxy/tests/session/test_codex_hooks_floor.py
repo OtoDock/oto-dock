@@ -13,7 +13,7 @@ import pathlib
 import pytest
 
 import config as app_config
-from core.execution_layer import UNATTENDED_CLIENT_TYPES
+from core.session import session_kind
 from core.layers.codex import session as codex_session
 from core.layers.codex.session import CodexAppServerSession
 
@@ -26,9 +26,10 @@ def _session(**kw) -> CodexAppServerSession:
     )
 
 
-def test_unattended_client_types_are_the_no_human_set():
-    assert set(UNATTENDED_CLIENT_TYPES) == {"task", "phone", "meeting", "trigger", "internal"}
-    assert "dashboard" not in UNATTENDED_CLIENT_TYPES
+def test_the_unattended_kinds_are_the_no_human_set():
+    unattended = {k.name for k in session_kind.KINDS if not k.attended}
+    assert unattended == {"task", "phone", "meeting", "trigger", "internal", "app"}
+    assert session_kind.attended("dashboard") and session_kind.attended("")
 
 
 def test_thread_overrides_carry_hook_trust_only_for_the_floor():
@@ -96,12 +97,53 @@ def test_forwarder_stays_quiet_under_the_hook_floor(monkeypatch):
     assert len(calls) == 1
 
 
+def test_attended_chats_send_untrusted_and_fall_back_once_on_rejection():
+    """An attended app-server chat (no floor) asks for every command and
+    patch through the bridge (approvalPolicy "untrusted"); a daemon that
+    rejects the value drops the session to on-request once; unattended
+    sessions keep never/on-request as before (HOOKS.md "Attended Codex
+    chats")."""
+    from core.layers.codex.app_server_client import AppServerError
+    attended = CodexAppServerSession(
+        session_id="11111111-2222-4333-8444-555555555557", agent_name="support",
+        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
+        config_dir="/tmp/codex-home",
+    )
+    assert attended.approval_policy == "untrusted"
+    assert attended._thread_overrides()["approvalPolicy"] == "untrusted"
+    attended.set_sandbox_mode("read-only")
+    assert attended.approval_policy == "untrusted"
+    attended.set_sandbox_mode("danger-full-access")
+    assert attended.approval_policy == "never"
+    attended.set_sandbox_mode("workspace-write")
+    # The rejection: once, then on-request for the session.
+    assert attended._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is True
+    assert attended.approval_policy == "on-request"
+    assert attended._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is False
+    # Any other error is not the fallback trigger.
+    fresh = CodexAppServerSession(
+        session_id="11111111-2222-4333-8444-555555555558", agent_name="support",
+        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
+        config_dir="/tmp/codex-home",
+    )
+    assert fresh._note_untrusted_rejection(AppServerError("thread not found")) is False
+    assert fresh.approval_policy == "untrusted"
+    # Unattended: the floor, never untrusted.
+    floored = _session(hooks_floor=True, sandbox_mode="workspace-write") if False else CodexAppServerSession(
+        session_id="11111111-2222-4333-8444-555555555559", agent_name="support",
+        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
+        config_dir="/tmp/codex-home", hooks_floor=True,
+    )
+    assert floored.approval_policy == "on-request"
+    assert _session(hooks_floor=True).approval_policy == "never"
+
+
 def test_layer_and_remote_payload_share_the_floor_rule():
     """The local layer and the remote start payload decide the floor with the
     SAME helper (helpers.codex_hooks_floor) — the satellite never re-derives it."""
     from core.layers.codex import helpers, layer
     assert layer.codex_hooks_floor is helpers.codex_hooks_floor
-    for client_type in UNATTENDED_CLIENT_TYPES:
+    for client_type in (k.name for k in session_kind.KINDS if not k.attended):
         assert helpers.codex_hooks_floor(client_type) is True
         assert helpers.codex_hooks_floor(client_type, interactive=True) is False
     assert helpers.codex_hooks_floor("dashboard") is False

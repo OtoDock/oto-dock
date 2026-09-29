@@ -183,12 +183,12 @@ async def test_run_direct_stream_keyless_cloud_provider_clean_error(direct_sessi
 @pytest.mark.asyncio
 async def test_run_direct_stream_keyless_ok_when_adapter_has_default(direct_session, monkeypatch):
     """Keyless LOCAL providers (ollama / openai-compatible) supply their own
-    placeholder key via _get_default_api_key — the turn must proceed."""
+    placeholder key via default_api_key — the turn must proceed."""
     from core.layers.direct.session import run_direct_stream
     from core.layers.direct import session as S
 
     adapter = S.get_adapter(direct_session.provider)
-    monkeypatch.setattr(adapter.__class__, "_get_default_api_key",
+    monkeypatch.setattr(adapter.__class__, "default_api_key",
                         lambda self: "local-default", raising=False)
     direct_session.api_key = ""
     events = []

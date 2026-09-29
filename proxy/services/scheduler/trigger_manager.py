@@ -23,7 +23,10 @@ from typing import TYPE_CHECKING
 
 from storage.automation import trigger_store
 from storage import database as task_store
+from storage import db_apps
 from storage.automation import notification_store
+from services.scheduler import task_kinds
+from core.session import visibility as _vis
 
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
@@ -111,7 +114,8 @@ def _validate_notify_target(
         explicitly the creator's user_sub). Cross-user notify forbidden.
       - For agent-scoped triggers: notify_target_scope must be one of the
         valid set; target may be a username (resolved later) or agent name
-        or NULL (broadcast to scope).
+        or NULL (broadcast to scope). Who it may reach is
+        ``_check_notify_reach``.
     """
     if not notify_enabled:
         return None, None
@@ -131,7 +135,7 @@ def _validate_notify_target(
             return target_scope, created_by
         return target_scope, created_by
 
-    # scope == "agent"
+    # An agent-scoped trigger: the notify may broadcast or name a target.
     target_scope = (notify_target_scope or "agent").lower()
     if target_scope not in VALID_NOTIFY_TARGET_SCOPES:
         raise TriggerValidationError(
@@ -150,6 +154,38 @@ def _validate_notify_target(
                 )
             return target_scope, resolved
     return target_scope, notify_target
+
+
+def _check_notify_reach(
+    *,
+    agent: str,
+    created_by: str,
+    target_scope: str | None,
+    target: str | None,
+    caller_is_admin: bool,
+) -> None:
+    """Who an agent-scoped trigger's notify may reach, by the rules
+    ``POST /v1/notifications`` keeps: the trigger's own agent (``agent``
+    with no target or this agent) and one of its users or the creator
+    (``user``); another agent, a user outside the agent, or every user
+    (``global``) only for a platform admin. The caller is whoever aims the
+    notify: the creator at create, the editor at edit."""
+    if caller_is_admin:
+        return
+    if target_scope == "global":
+        raise TriggerValidationError(
+            "notifying every user (notify_target_scope 'global') needs a platform admin"
+        )
+    if target_scope == _vis.SCOPE_AGENT and target and target != agent:
+        raise TriggerValidationError(
+            f"an agent-scoped trigger notifies its own agent's users, not agent {target!r}"
+        )
+    if target_scope == _vis.SCOPE_USER and target and target != created_by:
+        from services.notifications.notification_manager import agent_audience
+        if target not in agent_audience(agent):
+            raise TriggerValidationError(
+                f"notify_target must be a user of agent {agent!r}"
+            )
 
 
 def _validate_task_linkage(
@@ -188,23 +224,81 @@ def _validate_task_linkage(
             "task creator does not match trigger creator (cross-user "
             "linkage forbidden)"
         )
-    if task.get("task_type") != "trigger":
+    if task.get("task_type") != task_kinds.TRIGGER:
         raise TriggerValidationError(
             f"task task_type must be 'trigger' (got {task.get('task_type')!r}). "
             "Create a trigger-only task with task_type='trigger'."
         )
 
 
+class TriggerConflict(TriggerValidationError):
+    """A valid target that is not ready yet (the route answers 409)."""
+
+
+def _validate_app_linkage(
+    *,
+    app_id: str | None,
+    handler: str | None,
+    trigger_scope: str,
+    trigger_owner: str,
+    trigger_agent: str,
+    debounce_seconds: int,
+    require_approval: bool = True,
+) -> None:
+    """The ``app`` action (APPS.md "Handlers"): the app is a folder app of
+    the trigger's agent; a shared app takes an agent-scoped trigger, a
+    personal app a user-scoped trigger of its owner (the creator of an
+    agent-scoped trigger already held editor+, the authority approving the
+    app needed); the handler is one of the app's signed ``on_trigger``
+    names; the app is approved — except for a template seed
+    (``require_approval=False``: the copy may still wait on its card, and
+    the handler drain holds every wake as "unapproved" until it is); no
+    debounce (a debounced fire is dropped, and a wake must not be)."""
+    if not app_id:
+        return
+    from api.apps import manifest as _mf
+    row = task_store.get_app(app_id)
+    if not row:
+        raise TriggerValidationError("app not found")
+    if (row.get("agent") or "") != trigger_agent:
+        raise TriggerValidationError("the app belongs to another agent")
+    if not db_apps.app_kind_of(row).may_serve:
+        raise TriggerValidationError("only an app with a server has handlers")
+    if row.get("hidden"):
+        raise TriggerValidationError("the app is unpinned")
+    if row.get("scope_chat_id") or row.get("scope_project_id"):
+        raise TriggerValidationError("a Dock app has no handlers")
+    if row.get("username"):
+        if trigger_scope != "user" or (row.get("owner_sub") or "") != trigger_owner:
+            raise TriggerValidationError(
+                "a personal app takes a user-scoped trigger of its owner")
+    elif trigger_scope != "agent":
+        raise TriggerValidationError("a shared app takes an agent-scoped trigger")
+    names = _mf.parse_handlers(row).get("on_trigger") or []
+    if not handler or handler not in names:
+        raise TriggerValidationError(
+            f"handler {handler!r} is not an on_trigger handler of the app "
+            f"(declared: {', '.join(names) or 'none'})")
+    if int(debounce_seconds or 0):
+        raise TriggerValidationError("debounce_seconds must be 0 for an app trigger")
+    if require_approval and not task_store.app_actions_approved(row):
+        raise TriggerConflict("approve the app first")
+
+
 def _validate_action(
     *,
     task_id: str | None,
     notify_enabled: bool,
+    app_id: str | None = None,
 ) -> None:
     """At least one action must be configured. Otherwise the trigger is a
-    no-op and we reject it so users don't ship dead-end webhooks."""
-    if not task_id and not notify_enabled:
+    no-op and we reject it so users don't ship dead-end webhooks. A task
+    and an app never share one trigger (the notify may join either)."""
+    if task_id and app_id:
+        raise TriggerValidationError("a trigger runs a task or wakes an app, not both")
+    if not task_id and not notify_enabled and not app_id:
         raise TriggerValidationError(
-            "trigger must have at least one action: task_id or notify_enabled"
+            "trigger must have at least one action: task_id, app_slug or notify_enabled"
         )
 
 
@@ -238,11 +332,13 @@ def _validate_subscription_linkage(
             f"subscription_id {subscription_id!r} not found"
         )
     sub_scope = sub.get("scope")
+    mcp = sub.get("mcp_name") or "the MCP"
     if trigger_scope == "user":
         if sub_scope != "user":
             raise TriggerValidationError(
-                f"trigger.scope='user' requires subscription.scope='user' "
-                f"(got {sub_scope!r})"
+                f"this subscription belongs to agent {sub.get('agent')!r}; a "
+                f"user trigger needs a personal subscription: Connected "
+                f"Accounts → Subscribe to events → Subscribe as: Me"
             )
         if sub.get("owner") != trigger_owner:
             raise TriggerValidationError(
@@ -251,8 +347,9 @@ def _validate_subscription_linkage(
     elif trigger_scope == "agent":
         if sub_scope != "service":
             raise TriggerValidationError(
-                f"trigger.scope='agent' requires subscription.scope='service' "
-                f"(got {sub_scope!r})"
+                f"this subscription is personal; an agent trigger needs a "
+                f"subscription created for the agent: Agent Settings → MCPs "
+                f"→ {mcp} → Subscribe to events for this agent"
             )
         if sub.get("agent") != trigger_agent:
             raise TriggerValidationError(
@@ -337,12 +434,22 @@ def register_trigger(
     enabled: bool = True,
     subscription_id: str | None = None,
     event_filter: dict | None = None,
+    app_id: str | None = None,
+    handler: str | None = None,
+    require_approval: bool = True,
+    trigger_id: str | None = None,
+    community_template: str | None = None,
+    community_template_item_slug: str | None = None,
+    caller_is_admin: bool = False,
 ) -> dict:
     """Create a trigger row after validating all business rules.
 
     Maps slug derivation, scope/severity validation, cross-scope task
     linkage, notify target rules, at-least-one-action invariant, and
-    subscription scope-bridge.
+    subscription scope-bridge. A template seed (``app_blueprints``) passes
+    its own id and provenance and ``require_approval=False``.
+    ``caller_is_admin`` (a platform admin or the master key) widens the
+    notify's reach (``_check_notify_reach``).
 
     Raises TriggerValidationError on validation failure (caller maps to
     400). Re-raises psycopg.errors.UniqueViolation on slug collision —
@@ -377,6 +484,12 @@ def register_trigger(
         notify_target_scope=notify_target_scope,
         notify_target=notify_target,
     )
+    if scope == _vis.SCOPE_AGENT:
+        _check_notify_reach(
+            agent=agent.strip(), created_by=created_by,
+            target_scope=target_scope, target=target_resolved,
+            caller_is_admin=caller_is_admin,
+        )
 
     _validate_task_linkage(
         task_id=task_id,
@@ -401,7 +514,12 @@ def register_trigger(
         subscription_id=subscription_id, event_filter=event_filter,
     )
 
-    _validate_action(task_id=task_id, notify_enabled=notify_enabled)
+    _validate_action(task_id=task_id, notify_enabled=notify_enabled, app_id=app_id)
+    _validate_app_linkage(
+        app_id=app_id, handler=handler, trigger_scope=scope, trigger_owner=created_by,
+        trigger_agent=agent, debounce_seconds=debounce_seconds,
+        require_approval=require_approval,
+    )
 
     if notify_enabled:
         if not notify_title or not notify_title.strip():
@@ -412,6 +530,9 @@ def register_trigger(
     row = trigger_store.create_trigger(
         slug=slug, name=name, scope=scope, agent=agent.strip(),
         created_by=created_by,
+        trigger_id=trigger_id,
+        community_template=community_template,
+        community_template_item_slug=community_template_item_slug,
         task_id=task_id,
         notify_enabled=notify_enabled,
         notify_severity=sev,
@@ -423,6 +544,8 @@ def register_trigger(
         enabled=enabled,
         subscription_id=subscription_id,
         event_filter=event_filter or {},
+        app_id=app_id or None,
+        handler=(handler or None) if app_id else None,
     )
     logger.info(
         f"Trigger created: id={row['id'][:8]} scope={scope} agent={agent} "
@@ -431,7 +554,9 @@ def register_trigger(
     return row
 
 
-def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
+def update_trigger(
+    trigger_id: str, fields: dict, *, caller_is_admin: bool = False,
+) -> tuple[bool, str | None]:
     """Apply a partial edit to an existing trigger.
 
     Returns ``(ok, error)``. ``error`` is non-empty for validation failures
@@ -440,6 +565,9 @@ def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
 
     Scope, slug, agent, created_by are immutable once set. Caller should
     pre-filter the payload, but we also strip these fields here defensively.
+    An edit that aims the notify somewhere new meets ``_check_notify_reach``
+    for the editor (``caller_is_admin``); one that leaves it where it is
+    does not.
     """
     existing = trigger_store.get_trigger(trigger_id)
     if not existing:
@@ -469,6 +597,14 @@ def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
                 notify_target_scope=final.get("notify_target_scope"),
                 notify_target=final.get("notify_target"),
             )
+            aimed = ((existing.get("notify_target_scope"), existing.get("notify_target"))
+                     if existing.get("notify_enabled") else None)
+            if existing["scope"] == _vis.SCOPE_AGENT and (target_scope, target_resolved) != aimed:
+                _check_notify_reach(
+                    agent=existing["agent"], created_by=existing["created_by"],
+                    target_scope=target_scope, target=target_resolved,
+                    caller_is_admin=caller_is_admin,
+                )
             payload["notify_target_scope"] = target_scope
             payload["notify_target"] = target_resolved
             final["notify_target_scope"] = target_scope
@@ -481,10 +617,46 @@ def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
                 trigger_owner=existing["created_by"],
                 trigger_agent=existing["agent"],
             )
+            # A task replaces an app target (one action of the two).
+            payload["app_id"] = None
+            payload["handler"] = None
+            final["app_id"] = None
+            final["handler"] = None
 
-        if "event_filter" in payload:
-            ef = payload["event_filter"]
-            if ef is not None and not isinstance(ef, dict):
+        if payload.get("app_id") or (
+                "handler" in payload and final.get("app_id")):
+            _validate_app_linkage(
+                app_id=final.get("app_id"),
+                handler=final.get("handler"),
+                trigger_scope=existing["scope"],
+                trigger_owner=existing["created_by"],
+                trigger_agent=existing["agent"],
+                debounce_seconds=int(final.get("debounce_seconds") or 0),
+            )
+            payload["task_id"] = None
+            final["task_id"] = None
+        elif "app_id" in payload and not payload["app_id"]:
+            payload["handler"] = None
+            final["handler"] = None
+
+        if "subscription_id" in payload:
+            # Re-binding the vendor source keeps the creation rule (a user
+            # trigger ↔ the creator's personal subscription, an agent trigger
+            # ↔ the agent's service subscription); '' unbinds.
+            sid = (payload.get("subscription_id") or "").strip() or None
+            if sid:
+                _validate_subscription_linkage(
+                    subscription_id=sid,
+                    trigger_scope=existing["scope"],
+                    trigger_owner=existing["created_by"],
+                    trigger_agent=existing["agent"],
+                )
+            payload["subscription_id"] = sid
+            final["subscription_id"] = sid
+
+        if "event_filter" in payload or "subscription_id" in payload:
+            ef = final.get("event_filter")
+            if "event_filter" in payload and ef is not None and not isinstance(ef, dict):
                 raise TriggerValidationError(
                     "event_filter must be an object when supplied"
                 )
@@ -496,6 +668,7 @@ def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
         _validate_action(
             task_id=final.get("task_id"),
             notify_enabled=bool(final.get("notify_enabled")),
+            app_id=final.get("app_id"),
         )
 
         if final.get("notify_enabled"):
@@ -512,6 +685,8 @@ def update_trigger(trigger_id: str, fields: dict) -> tuple[bool, str | None]:
             ds = payload["debounce_seconds"]
             if ds is None or ds < 0:
                 raise TriggerValidationError("debounce_seconds must be >= 0")
+            if ds and final.get("app_id"):
+                raise TriggerValidationError("debounce_seconds must be 0 for an app trigger")
 
     except TriggerValidationError as e:
         return False, str(e)
@@ -629,12 +804,39 @@ def _check_debounce(trigger_id: str, debounce_seconds: int) -> float | None:
     return None
 
 
+async def _fire_app_handler(
+    trigger_row: dict, body: dict, vendor_event: "NormalizedEvent | None", event_id: str,
+) -> dict:
+    """The ``app`` action (APPS.md "Handlers"): a durable delivery for the
+    app's handler carrying the same payload a task would see, plus the
+    trigger; ``event_id`` (the caller's ``X-OtoDock-Event-Id``) makes a
+    replay a no-op that names the first delivery."""
+    from services.apps import app_handlers
+    from storage import db_app_deliveries as deliveries
+    row = await asyncio.to_thread(task_store.get_app, trigger_row["app_id"])
+    if not row:
+        raise RuntimeError("the app is gone")
+    handler = trigger_row.get("handler") or ""
+    payload = _build_trigger_payload(trigger_row, body, vendor_event)
+    payload["trigger"] = {"id": trigger_row["id"], "slug": trigger_row.get("slug") or "",
+                          "name": trigger_row.get("name") or ""}
+    d = await app_handlers.enqueue(row, handler, f"trigger:{trigger_row.get('slug') or ''}",
+                                   payload, event_id=event_id, trigger_id=trigger_row["id"])
+    if d is None:
+        first = await asyncio.to_thread(deliveries.find_event, row["id"], handler, event_id)
+        return {"delivery_id": (first or {}).get("id"), "duplicate": True}
+    if d["status"] != deliveries.PENDING:
+        raise RuntimeError(d.get("last_error") or "not queued")
+    return {"delivery_id": d["id"], "duplicate": False}
+
+
 async def fire_trigger(
     trigger_row: dict,
     body: dict,
     *,
     trigger_source: str | None = None,
     vendor_event: "NormalizedEvent | None" = None,
+    event_id: str = "",
 ) -> dict:
     """Fire a trigger: substitute placeholders, run task and/or notification.
 
@@ -684,6 +886,19 @@ async def fire_trigger(
             errors.append(f"task: {e}")
             logger.exception(f"Trigger {trigger_id[:8]} task fire failed")
 
+    # 2b. App handler (APPS.md "Handlers"): the delivery row is the fire;
+    # its verdict lands on the row later (``trigger_store.set_last_error``).
+    delivery_id: str | None = None
+    duplicate = False
+    if trigger_row.get("app_id"):
+        try:
+            out = await _fire_app_handler(trigger_row, body, vendor_event, event_id)
+            delivery_id, duplicate = out.get("delivery_id"), bool(out.get("duplicate"))
+            actions.append("duplicate" if duplicate else "app")
+        except Exception as e:
+            errors.append(f"app: {e}")
+            logger.exception(f"Trigger {trigger_id[:8]} app fire failed")
+
     # 3. Notification
     delivery_count = 0
     if trigger_row.get("notify_enabled"):
@@ -700,6 +915,11 @@ async def fire_trigger(
     # 4. Stats
     err_text = "; ".join(errors) if errors else None
     await asyncio.to_thread(trigger_store.record_fire, trigger_id, error=err_text)
+    try:
+        from api.apps import catalog
+        catalog.trigger_fired(trigger_row, err_text)
+    except Exception:
+        logger.debug("catalog trigger_fires delta failed", exc_info=True)
 
     status = "ok" if not errors else ("partial" if actions else "failed")
     return {
@@ -708,6 +928,8 @@ async def fire_trigger(
         "actions": actions,
         "task_run_id": task_run_id,
         "delivery_count": delivery_count,
+        "delivery_id": delivery_id,
+        "duplicate": duplicate,
         "errors": errors or None,
     }
 
@@ -782,7 +1004,7 @@ async def _fire_linked_task(
     final_prompt = _substitute_placeholders(task_def.prompt, context) or task_def.prompt
     return await scheduler.trigger_task_now(
         task_def,
-        trigger_type="trigger",
+        trigger_type=task_kinds.TRIGGER_TRIGGER,
         trigger_source=trigger_source or f"trigger:{trigger_row['slug']}",
         prompt_override=final_prompt,
         trigger_payload=_build_trigger_payload(trigger_row, body, vendor_event),
@@ -814,10 +1036,13 @@ async def _fire_inline_notification(
 
     target_scope = trigger_row.get("notify_target_scope")
     target = trigger_row.get("notify_target")
-    # User-scoped trigger with NULL target → notify creator.
+    # User-scoped trigger with NULL target → notify creator; an agent notify
+    # with no target → the trigger's agent.
     if trigger_row["scope"] == "user" and target is None:
         target_scope = "user"
         target = trigger_row["created_by"]
+    elif target_scope == _vis.SCOPE_AGENT and not target:
+        target = trigger_row.get("agent")
 
     deliveries = await notification_manager.fire_notification(
         title=title,

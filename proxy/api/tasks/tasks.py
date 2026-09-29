@@ -2,8 +2,9 @@
 
 Consumed by the React dashboard and the schedules-mcp and delegation-mcp servers.
 Auth: API key (server-to-server) OR OAuth2 session cookie (dashboard users).
-POST/DELETE mutating endpoints also require X-Agent-Name header for server-to-server,
-or role-based access for dashboard users.
+Mutating endpoints gate token callers on the calling agent — the master key
+names it in ``X-Agent-Name``, a session token IS its ``agent`` claim — and
+dashboard users on their role.
 """
 
 import asyncio
@@ -18,12 +19,18 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import config
-from services.scheduler import scheduler
+from api.tasks import run_stream, task_quota
+from services.scheduler import schedule_text, scheduler, task_kinds
 from storage import database as task_store
 from storage.agents import agent_store
+from storage.automation import run_status, trigger_store
+from storage.pg import run_db
 from core.session.session_state import get_user_tz
 from core.session.visibility import nouser_read_targets
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from auth import roles
+from core.session import visibility as _vis
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.task-api")
 router = APIRouter()
@@ -32,8 +39,18 @@ router = APIRouter()
 # --- Auth helpers ---
 
 
+def _caller_agent(user: UserContext, x_agent_name: str | None) -> str | None:
+    """The agent a token caller acts as. A session token's is its own
+    ``agent`` claim — the header is not read, so a session cannot name
+    another agent (a phone or agent-scope run reaches its own agent and
+    its wired targets, like a trigger or a notification); the master key
+    names its agent in ``X-Agent-Name``."""
+    return user.agent if user.is_session else x_agent_name
+
+
 def _check_agent_access_s2s(body_agent: str, x_agent_name: str | None) -> None:
-    """Validate that the requesting agent can manage this agent's tasks (server-to-server)."""
+    """Validate that the calling agent (``_caller_agent``) can manage this
+    agent's tasks: itself, or a wired delegation target."""
     if not x_agent_name:
         raise HTTPException(status_code=403, detail="X-Agent-Name header required")
     if x_agent_name == body_agent:
@@ -77,6 +94,10 @@ class CreateScheduledTaskRequest(BaseModel):
     # guards delegate spawns. Omit both to inherit.
     model: str | None = None
     layer: str | None = None
+    # Checks (CHECKS.md): the agent's offered checks and the caller's own,
+    # by name, run at the end of each run's turn; the agent's mandatory
+    # checks run without being named.
+    checks: list[str] | None = None
 
 
 class CreateOneTimeTaskRequest(BaseModel):
@@ -109,6 +130,7 @@ class CreateOneTimeTaskRequest(BaseModel):
     # Per-task execution overrides — see CreateScheduledTaskRequest.
     model: str | None = None
     layer: str | None = None
+    checks: list[str] | None = None
 
 
 def _validate_user_tz(value: str | None) -> str | None:
@@ -182,11 +204,13 @@ def _enforce_task_scope(user: UserContext, scope: str, agent: str) -> None:
             detail=f"This agent does not support {scope!r}-scoped tasks "
                    f"(mode offers: {', '.join(_avail)})",
         )
-    if scope == "user":
+    if scope == _vis.SCOPE_USER:
         return  # any authenticated user
-    elif scope == "agent":
+    elif scope == _vis.SCOPE_AGENT:
         # No-user / service sessions create agent-scope work for their own
-        # agent; a real user (cookie or USER_SESSION) is gated by editor role.
+        # agent (the agent gate, ``_check_agent_access_s2s`` on the token's
+        # agent, keeps them to it and its wired targets); a real user (cookie
+        # or USER_SESSION) is gated by editor role.
         if not user.can_edit_agent(agent) and not (
             user.is_no_user_session or user.is_service
         ):
@@ -208,7 +232,8 @@ def _resolve_creator_identity(
     - Real user (dashboard cookie / real-user-backed session token):
       ``created_by = acting_sub = user.sub``.
     - No-user session (phone/agent service): user-scope → 403 (no identity);
-      agent-scope → ``created_by = x_agent_name or user.agent``, no acting_sub.
+      agent-scope → ``created_by = user.agent`` (``x_agent_name`` is the
+      token's agent here, ``_caller_agent``), no acting_sub.
     - Master key (s2s): user-scope → 400 (must come from a real session);
       agent-scope → ``created_by = x_agent_name or "api"``, no acting_sub.
     """
@@ -216,7 +241,7 @@ def _resolve_creator_identity(
     if acting is not None:
         return acting, acting
     # No real user identity (master key or no-user service session).
-    if scope == "user":
+    if scope == _vis.SCOPE_USER:
         if user.is_no_user_session:
             raise HTTPException(
                 status_code=403,
@@ -246,7 +271,7 @@ def _check_task_permission(task_data: dict, user: UserContext) -> None:
     acting = user.acting_sub
     if acting is None:
         # Master key OR no-user session.
-        if user.is_no_user_session and task_data.get("scope", "user") == "user":
+        if user.is_no_user_session and task_data.get("scope", _vis.SCOPE_USER) == _vis.SCOPE_USER:
             raise HTTPException(
                 403,
                 "This session has no user identity and cannot modify "
@@ -254,34 +279,33 @@ def _check_task_permission(task_data: dict, user: UserContext) -> None:
             )
         return  # master key: full s2s; no-user: agent-scope management allowed
 
-    task_scope = task_data.get("scope", "user")
-    if task_scope == "user":
+    task_scope = task_data.get("scope", _vis.SCOPE_USER)
+    if task_scope == _vis.SCOPE_USER:
         if task_data.get("created_by") != acting:
             raise HTTPException(403, "Cannot modify another user's task")
-    elif task_scope == "agent":
+    elif task_scope == _vis.SCOPE_AGENT:
         acting_user = task_store.get_user(acting)
         if not acting_user:
             raise HTTPException(403, "Unknown user")
-        if acting_user["role"] == "admin":
+        role = roles.effective_role(
+            acting_user["role"], task_store.get_user_agent_roles(acting), task_data.get("agent", ""))
+        if roles.is_admin(role):
             return  # platform admin: full mutation rights
-        agent_name = task_data.get("agent", "")
-        agent_roles = task_store.get_user_agent_roles(acting)
-        per_agent = agent_roles.get(agent_name, "viewer")
-        if per_agent == "manager":
-            return  # owner-tier: can mutate any agent-scope task
-        if per_agent == "editor":
-            # Editor can mutate only their own agent-scope tasks.
-            if task_data.get("created_by") != acting:
-                raise HTTPException(
-                    403,
-                    "Editors can mutate only their own agent-scope tasks "
-                    "(manager required to mutate another collaborator's task)",
-                )
-            return
+        if roles.may_mutate_shared(role, own=task_data.get("created_by") == acting):
+            return  # owner tier: any agent-scope task; editor: their own
+        if role == roles.EDITOR:
+            raise HTTPException(
+                403,
+                "Editors can mutate only their own agent-scope tasks "
+                "(manager required to mutate another collaborator's task)",
+            )
         # Viewer / unknown role: denied
         raise HTTPException(
             403, "Agent-scoped tasks require editor, manager, or admin role for this agent",
         )
+    else:
+        # A scope the vocabulary does not know never falls through to allow.
+        raise HTTPException(403, f"Unknown task scope {task_scope!r}")
 
 
 def _check_run_access(run: dict, user: UserContext) -> None:
@@ -301,13 +325,36 @@ def _check_run_access(run: dict, user: UserContext) -> None:
     if not user.can_access_agent(run["agent"]):
         # A delegation edge lets a NO-USER session read the target's
         # AGENT-SCOPE runs by id (user-scope stays out — rule 1).
-        if not (run.get("scope", "agent") != "user"
+        if not (run.get("scope", _vis.SCOPE_AGENT) != _vis.SCOPE_USER
                 and run["agent"] in nouser_read_targets(user)):
             raise HTTPException(403, "Not authorized to access this agent's runs")
     run_scope = run.get("scope", "agent")
-    if run_scope == "user" and run.get("created_by") != user.sub:
+    if run_scope == _vis.SCOPE_USER and run.get("created_by") != user.sub:
         if not user.is_admin:
             raise HTTPException(403, "Not authorized to access this run")
+
+
+async def _check_callback_anchor(
+    user: UserContext, agent: str | None, session_id: str | None, chat_id: str | None,
+) -> None:
+    """An on-complete callback hands the run's result to a live session as a
+    prompt, so a caller names only its own: its session (the token's
+    ``sid``), that session's chat and its agent — the anchor
+    ``spawn_delegate`` takes. A cookie has no session and names none. The
+    master key is trusted s2s. Raises 403."""
+    if user.is_service:
+        return
+    if agent and agent != user.agent:
+        raise HTTPException(403, "An on-complete callback returns only to the calling agent")
+    if session_id and session_id != user.session_id:
+        raise HTTPException(403, "An on-complete callback returns only to the calling session")
+    if chat_id:
+        own = (await asyncio.to_thread(task_store.get_chat_by_session, user.session_id)
+               if user.session_id else None)
+        if not own or own["id"] != chat_id:
+            raise HTTPException(
+                403, "An on-complete callback returns only to the calling session's chat",
+            )
 
 
 def _scope_filter_sub(user: UserContext, agent: str | None, audit: bool = False) -> str | None:
@@ -322,9 +369,10 @@ def _scope_filter_sub(user: UserContext, agent: str | None, audit: bool = False)
         return None  # master key (service-to-service) — unfiltered
     if user.is_admin and audit:
         return None  # admin audit page: show all runs
-    # Real user (cookie / USER_SESSION) → own runs; an agent-scope session has
-    # no user (acting_sub None), so the `agent` filter is its only scope.
-    return user.acting_sub
+    # Real user (cookie / USER_SESSION) → own runs. A no-user session owns no
+    # user-scope run: its synthetic ``session:<sid>`` sub matches no creator,
+    # so it reads agent-scope runs only, as list_tasks shows it.
+    return user.acting_sub if user.acting_sub is not None else user.sub
 
 
 # --- Endpoints ---
@@ -409,7 +457,11 @@ async def create_scheduled_task(
     u = require_auth(user)
     _enforce_task_scope(u, req.scope, req.agent)
     if u.is_api_key:
-        _check_agent_access_s2s(req.agent, x_agent_name)
+        _check_agent_access_s2s(req.agent, _caller_agent(u, x_agent_name))
+        if u.acting_sub is not None:
+            # A delegation edge is the agent's reach, not the person's: a
+            # session minted for a person reaches only the agents they can.
+            require_agent_access(u, req.agent)
     else:
         # No platform-level require_write(u): _enforce_task_scope already gates
         # by scope (agent-scope needs per-agent editor+; user-scope any user)
@@ -434,7 +486,8 @@ async def create_scheduled_task(
             raise HTTPException(400, err)
     await _validate_task_overrides(req.agent, req.layer, req.model)
 
-    created_by, acting_sub = _resolve_creator_identity(u, req.scope, x_agent_name)
+    created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    checks = await _validate_checks(req.agent, req.checks, u)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
     user_tz = _resolve_user_tz(req.user_tz, u, acting_sub)
     task = scheduler.TaskDefinition(
@@ -454,8 +507,11 @@ async def create_scheduled_task(
         user_tz=user_tz,
         override_model=req.model or None,
         override_execution_path=req.layer or None,
+        checks=checks,
     )
-    await scheduler.add_dynamic_task(task)
+    async with task_quota.creating():
+        await task_quota.enforce_task_caps(u, req.agent, created_by, req.scope)
+        await scheduler.add_dynamic_task(task)
     timing_desc = (
         f"schedule={req.schedule!r}" if req.schedule
         else f"interval={req.interval_seconds}s"
@@ -476,13 +532,18 @@ async def create_one_time_task(
     u = require_auth(user)
     _enforce_task_scope(u, req.scope, req.agent)
     if u.is_api_key:
-        _check_agent_access_s2s(req.agent, x_agent_name)
+        _check_agent_access_s2s(req.agent, _caller_agent(u, x_agent_name))
+        if u.acting_sub is not None:
+            require_agent_access(u, req.agent)  # see create_scheduled_task
     else:
         # No platform-level require_write(u): _enforce_task_scope already gates
         # by scope (agent-scope needs per-agent editor+; user-scope any user)
         # and require_agent_access gates agent visibility — so a platform
         # "member" who is a per-agent manager/editor can still schedule tasks.
         require_agent_access(u, req.agent)
+    await _check_callback_anchor(
+        u, req.on_complete_agent, req.on_complete_session_id, None,
+    )
 
     # Cross-agent delegation validation
     if req.source_agent and req.source_agent != req.agent:
@@ -495,18 +556,21 @@ async def create_one_time_task(
             )
     await _validate_task_overrides(req.agent, req.layer, req.model)
 
-    created_by, acting_sub = _resolve_creator_identity(u, req.scope, x_agent_name)
+    created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    checks = await _validate_checks(req.agent, req.checks, u)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
     user_tz = _resolve_user_tz(req.user_tz, u, acting_sub)
 
     # Resolve task_type: explicit value (e.g. 'trigger' for trigger-only
-    # tasks) takes precedence; default falls back to schedule auto-derivation.
-    task_type = req.task_type or "one_time"
-    if task_type not in ("one_time", "trigger"):
+    # tasks) takes precedence; this route creates the kinds that need no
+    # clock (task_kinds.unscheduled: one_time, trigger).
+    task_type = req.task_type or task_kinds.ONE_TIME
+    kind = task_kinds.of_word(task_type)
+    if kind is None or not kind.unscheduled:
         raise HTTPException(400, f"Invalid task_type: {task_type!r}")
     # Trigger-only tasks must NOT have run_at / delay_seconds — they only
     # fire when a webhook trigger fires them.
-    if task_type == "trigger" and (req.run_at or req.delay_seconds is not None):
+    if task_type == task_kinds.TRIGGER and (req.run_at or req.delay_seconds is not None):
         raise HTTPException(
             400,
             "task_type='trigger' tasks cannot have run_at or delay_seconds; "
@@ -536,8 +600,12 @@ async def create_one_time_task(
         task_type=task_type,
         override_model=req.model or None,
         override_execution_path=req.layer or None,
+        checks=checks,
     )
-    await scheduler.add_dynamic_task(task)
+    async with task_quota.creating():
+        if task_type in task_quota.COUNTED_KINDS:
+            await task_quota.enforce_task_caps(u, req.agent, created_by, req.scope)
+        await scheduler.add_dynamic_task(task)
     logger.info(
         f"Created task: {task_id} type={task_type} scope={req.scope} "
         f"by {created_by} tz={user_tz or '-'} notify={req.notification_mode}"
@@ -552,7 +620,7 @@ async def list_tasks(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    all_tasks = scheduler.get_all_task_definitions()
+    all_tasks = await run_db(scheduler.get_all_task_definitions)
     # Exclude delegate tasks (background tasks with callback, not real schedules)
     all_tasks = [t for t in all_tasks if not t.use_persistent]
     if agent:
@@ -569,7 +637,7 @@ async def list_tasks(
         all_tasks = [
             t for t in all_tasks
             if u.can_access_agent(t.agent)
-            or (t.scope == "agent" and t.agent in edge_reach)
+            or (t.scope == _vis.SCOPE_AGENT and t.agent in edge_reach)
         ]
 
     # Scope-aware filtering. Agent-scoped items are shared; a user's user-scoped
@@ -585,78 +653,153 @@ async def list_tasks(
     if not u.is_service and not audit_view:
         filtered = []
         for t in all_tasks:
-            if t.scope == "agent":
+            if t.scope == _vis.SCOPE_AGENT:
                 filtered.append(t)
-            elif (t.scope == "user" and u.acting_sub is not None
+            elif (t.scope == _vis.SCOPE_USER and u.acting_sub is not None
                     and t.created_by == u.acting_sub):
                 filtered.append(t)
         all_tasks = filtered
 
-    # Build APScheduler job index for next_run_time lookup
-    jobs_by_task_id = {j["task_id"]: j for j in scheduler.get_scheduled_jobs()}
-
-    # What each task will ACTUALLY run on — its own pin, else the agent's
-    # current default. Memoized per agent: the admin listing spans agents and
-    # resolve_agent_model hits the DB. It raises when the install has no
-    # enabled model for the agent's layer; "" then means "unresolved", which
-    # the UI renders as nothing rather than a wrong claim.
-    _default_model_cache: dict[str, str] = {}
-    _default_path_cache: dict[str, str] = {}
-
-    def _agent_default_model(agent_slug: str) -> str:
-        if agent_slug not in _default_model_cache:
-            try:
-                _default_model_cache[agent_slug] = config.resolve_agent_model(agent_slug)
-            except Exception:
-                _default_model_cache[agent_slug] = ""
-        return _default_model_cache[agent_slug]
-
-    def _agent_execution_path(agent_slug: str) -> str:
-        if agent_slug not in _default_path_cache:
-            row = agent_store.get_agent(agent_slug) or {}
-            _default_path_cache[agent_slug] = row.get("execution_path") or ""
-        return _default_path_cache[agent_slug]
-
-    result = []
+    # The next fires, one map (the in-memory jobs; standalone computes once).
+    next_fires = await run_db(scheduler.next_run_times)
+    resolve = _make_model_resolver()
+    # The run counts, one grouped query (see _run_count_for).
+    counts = await run_db(task_store.count_runs_by_task, [t.id for t in all_tasks])
+    platform_tz = config.get_platform_timezone()
+    views = []
     for t in all_tasks:
-        job = jobs_by_task_id.get(t.id)
-        d = t.model_dump()
-        d["next_run_time"] = job["next_run_time"] if job else None
-        # getattr, not attribute access: this listing also renders duck-typed
+        job = {"next_run_time": next_fires[t.id]} if t.id in next_fires else None
+        d = _task_view(t, u, resolve, job, platform_tz)
+        d["run_count"] = _run_count_for(t, counts.get(t.id, 0))
+        views.append(d)
+    return {"tasks": views}
+
+
+def _run_count_for(t, history_count: int) -> int:
+    """How many times a task ran, as the task views report it. A recurring
+    continuation keeps the row counter ``dynamic_tasks.run_count`` — its
+    ``max_runs`` bound, which also counts dead-chat skips; every other kind
+    reads the run history, because the row counter is never incremented for
+    them (it read 0 on a task with hundreds of morning runs, 2026-09-17)."""
+    if getattr(t, "task_type", "") == task_kinds.CONTINUATION:
+        return max(int(getattr(t, "run_count", 0) or 0), history_count)
+    return history_count
+
+
+def _make_model_resolver():
+    """What a task will ACTUALLY run on: its own pins, else the agent's
+    default resolved WITH the effective layer (the runner's rule: an agent
+    default the pinned engine does not serve is skipped for that engine's
+    own first choice). Memoized per (agent, layer): the admin listing spans
+    agents and every resolution hits the DB. An install with no enabled
+    model for the layer resolves to "" = unresolved, which the UI renders
+    as nothing rather than a wrong claim."""
+    from api.agents._common import _get_execution_paths
+    from storage.billing import subscription_store
+
+    agent_rows: dict[str, dict] = {}
+    defaults: dict[tuple[str, str], str] = {}
+    layer_rows: dict[str, list[dict]] = {}
+
+    def _agent(slug: str) -> dict:
+        if slug not in agent_rows:
+            agent_rows[slug] = agent_store.get_agent(slug) or {}
+        return agent_rows[slug]
+
+    def _models(layer: str) -> list[dict]:
+        if layer not in layer_rows:
+            try:
+                layer_rows[layer] = subscription_store.list_models(layer)
+            except Exception:
+                layer_rows[layer] = []
+        return layer_rows[layer]
+
+    def resolve(t) -> dict:
+        # getattr, not attribute access: the listing also renders duck-typed
         # task defs (the scoping tests' minimal stubs), and task_config_builder
         # reads the same fields the same way.
-        d["effective_model"] = (getattr(t, "override_model", None)
-                                or _agent_default_model(t.agent))
-        d["effective_execution_path"] = (
-            getattr(t, "override_execution_path", None)
-            or _agent_execution_path(t.agent)
-        )
+        override_model = getattr(t, "override_model", None) or ""
+        override_path = getattr(t, "override_execution_path", None) or ""
+        path = override_path or (_agent(t.agent).get("execution_path") or "")
+        key = (t.agent, path)
+        if key not in defaults:
+            try:
+                defaults[key] = config.resolve_agent_model(t.agent, layer=path or None)
+            except Exception:
+                defaults[key] = ""
+        model = override_model or defaults[key]
+        if override_model:
+            source = "pinned"
+        elif override_path:
+            source = "layer default"
+        else:
+            source = "agent default"
+        tier, tier_label, _good_at = config.get_model_tier(model) if model else (None, "", "")
+        warnings: list[str] = []
+        if override_path and override_path not in _get_execution_paths(_agent(t.agent)):
+            warnings.append(f"the pinned engine '{override_path}' is not enabled for this agent")
+        if override_model:
+            rows = [m for m in _models(path) if m.get("model_id") == override_model]
+            if not rows:
+                warnings.append(f"the pinned model '{override_model}' is not offered on '{path}'")
+            elif not any(m.get("enabled") for m in rows):
+                warnings.append(f"the pinned model '{override_model}' is disabled")
+        return {
+            "effective_model": model,
+            "effective_execution_path": path,
+            "effective_model_source": source,
+            "effective_model_tier": tier,
+            "tier_label": tier_label,
+            "pin_warnings": warnings,
+        }
 
-        # Permission metadata for UI (3-tier per-agent model).
-        # owner = manager + admin; can mutate any task on the agent.
-        # editor = workspace collaborator; can mutate ONLY own tasks.
-        # viewer = read-only.
-        can_manage = u.is_service or u.can_manage_agent(t.agent)
-        can_edit = u.is_service or u.can_edit_agent(t.agent)
-        is_own = t.created_by == u.sub
-        is_own_user_scope = t.scope == "user" and is_own
-        is_own_agent_scope = t.scope == "agent" and is_own
-        d["can_run"] = (
-            u.is_service or is_own_user_scope or can_manage
-            or (is_own_agent_scope and can_edit)
-        )
-        d["can_delete"] = (
-            u.is_service or is_own_user_scope
-            or (t.scope == "agent" and can_manage)
-            or (is_own_agent_scope and can_edit)
-        )
-        # Pause/resume share the same authority as delete; the available
-        # action depends on current enabled state.
-        d["can_pause"] = d["can_delete"] and t.enabled
-        d["can_resume"] = d["can_delete"] and not t.enabled
-        result.append(d)
+    return resolve
 
-    return {"tasks": result}
+
+def _task_view(t, u: UserContext, resolve, job: dict | None,
+               platform_tz: str | None = None) -> dict:
+    """One task row as both schedules pages and the schedules MCP read it:
+    the definition, what it runs on, the zone it fires in, its schedule in
+    words, and the caller's permission flags."""
+    d = t.model_dump()
+    d["next_run_time"] = job["next_run_time"] if job else None
+    # The zone the cron and a naive run_at are read in: the row's own, else
+    # the platform's — no non-admin endpoint carries the platform zone, and
+    # a tab showing "Daily at 08:00" beside a browser-zone "Next" needs it.
+    # getattr: the listing also renders duck-typed rows (the scoping tests).
+    d["effective_tz"] = getattr(t, "user_tz", None) or platform_tz or config.get_platform_timezone()
+    d["schedule_text"] = schedule_text.describe(d)
+    if getattr(t, "task_type", "") == task_kinds.APP:
+        # An app handler row runs no LLM turn: no model claim on it.
+        d.update({"effective_model": "", "effective_execution_path": "",
+                  "effective_model_source": "", "effective_model_tier": None,
+                  "tier_label": "", "pin_warnings": []})
+    else:
+        d.update(resolve(t))
+
+    # Permission metadata for UI (3-tier per-agent model).
+    # owner = manager + admin; can mutate any task on the agent.
+    # editor = workspace collaborator; can mutate ONLY own tasks.
+    # viewer = read-only.
+    can_manage = u.is_service or u.can_manage_agent(t.agent)
+    can_edit = u.is_service or u.can_edit_agent(t.agent)
+    is_own = t.created_by == u.sub
+    is_own_user_scope = t.scope == _vis.SCOPE_USER and is_own
+    is_own_agent_scope = t.scope == _vis.SCOPE_AGENT and is_own
+    d["can_run"] = (
+        u.is_service or is_own_user_scope or can_manage
+        or (is_own_agent_scope and can_edit)
+    )
+    d["can_delete"] = (
+        u.is_service or is_own_user_scope
+        or (t.scope == _vis.SCOPE_AGENT and can_manage)
+        or (is_own_agent_scope and can_edit)
+    )
+    # Pause/resume share the same authority as delete; the available
+    # action depends on current enabled state.
+    d["can_pause"] = d["can_delete"] and t.enabled
+    d["can_resume"] = d["can_delete"] and not t.enabled
+    return d
 
 
 async def _delete_task_impl(task_id: str, user: UserContext, x_agent_name: str | None):
@@ -666,16 +809,16 @@ async def _delete_task_impl(task_id: str, user: UserContext, x_agent_name: str |
         raise HTTPException(status_code=404, detail="Task not found")
 
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], x_agent_name)
+        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
         _check_task_permission(dyn, user)
     else:
         require_agent_access(user, dyn["agent"])
         # Dashboard users: check ownership.
         # Agent-scope: manager can delete any; editor can delete own.
         task_scope = dyn.get("scope", "user")
-        if task_scope == "user" and dyn.get("created_by") != user.sub:
+        if task_scope == _vis.SCOPE_USER and dyn.get("created_by") != user.sub:
             raise HTTPException(403, "Cannot delete another user's task")
-        if task_scope == "agent":
+        if task_scope == _vis.SCOPE_AGENT:
             if user.can_manage_agent(dyn["agent"]):
                 pass  # owner: any
             elif user.can_edit_agent(dyn["agent"]) and dyn.get("created_by") == user.sub:
@@ -725,7 +868,7 @@ async def _resolve_pause_resume_target(
     if not dyn:
         raise HTTPException(status_code=404, detail="Task not found")
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], x_agent_name)
+        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
     else:
         require_agent_access(user, dyn["agent"])
     _check_task_permission(dyn, user)
@@ -758,8 +901,11 @@ async def resume_task(
     button.
     """
     u = require_auth(user)
-    await _resolve_pause_resume_target(task_id, u, x_agent_name)
-    await scheduler.resume_dynamic_task(task_id)
+    dyn = await _resolve_pause_resume_target(task_id, u, x_agent_name)
+    async with task_quota.creating():
+        # A resumed row counts again: the same cap a create meets.
+        await task_quota.enforce_newly_counted(u, dyn, {**dyn, "enabled": True})
+        await scheduler.resume_dynamic_task(task_id)
     return {"status": "resumed", "task_id": task_id}
 
 
@@ -780,6 +926,51 @@ class EditTaskRequest(BaseModel):
     # field entirely to leave the current pin untouched.
     model: str | None = None
     layer: str | None = None
+    # Checks (CHECKS.md): the whole list; [] clears it. Omit to leave it.
+    checks: list[str] | None = None
+
+
+# The edit fields with no null state: omitted leaves them, null is refused.
+_EDIT_REQUIRED = ("name", "prompt", "timeout_seconds", "notification_mode", "notify_severity")
+
+
+async def _validate_checks(agent: str, names: list[str] | None, u: UserContext) -> list[str]:
+    """The refs of the named checks (CHECKS.md): each must be one of the
+    agent's checks or one of the caller's own; a mandatory one needs no
+    naming and is dropped."""
+    if not names:
+        return []
+    from services.checks import documents as _checks
+    username = ""
+    if u.acting_sub:
+        username = await asyncio.to_thread(task_store.get_username_by_sub, u.acting_sub) or ""
+    refs: list[str] = []
+    for raw in names:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        it = await asyncio.to_thread(_checks.resolve_ref, agent, raw.strip(), username)
+        if it is None:
+            raise HTTPException(400, f"No check named {raw!r} on this agent (or among your own)")
+        if it.mandatory:
+            continue
+        if it.ref not in refs:
+            refs.append(it.ref)
+    if len(refs) > 16:
+        raise HTTPException(400, "At most 16 checks on one task")
+    return refs
+
+
+def _manages_agent(user: UserContext, agent: str) -> bool:
+    """Whether the acting person holds the manager tier on ``agent``
+    (a platform admin does everywhere). Synchronous: the DB executor."""
+    acting = user.acting_sub
+    if not acting:
+        return False
+    row = task_store.get_user(acting)
+    if not row:
+        return False
+    return roles.can_manage(
+        roles.effective_role(row["role"], task_store.get_user_agent_roles(acting), agent))
 
 
 async def _edit_task_impl(
@@ -791,7 +982,7 @@ async def _edit_task_impl(
     if not dyn:
         raise HTTPException(status_code=404, detail="Task not found")
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], x_agent_name)
+        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
     else:
         require_agent_access(user, dyn["agent"])
     _check_task_permission(dyn, user)
@@ -799,6 +990,11 @@ async def _edit_task_impl(
     # exclude_unset: only fields the caller explicitly supplied flow through.
     # That's how we tell "leave field alone" apart from "explicitly set to None".
     fields = req.model_dump(exclude_unset=True)
+    # A NULL in a column the task definition requires is a row no listing,
+    # fire or scheduler start can load — refused, never written.
+    nulled = [k for k in _EDIT_REQUIRED if k in fields and fields[k] is None]
+    if nulled:
+        raise HTTPException(status_code=400, detail=f"{', '.join(nulled)} cannot be null")
     # schedule / run_at / interval_seconds can be explicitly None (mode switch
     # signal) — the service layer handles cross-field NULL-ing. But at least
     # one editable field must be present.
@@ -834,12 +1030,52 @@ async def _edit_task_impl(
             fields["override_model"] = fields.pop("model") or ""
         if "layer" in fields:
             fields["override_execution_path"] = fields.pop("layer") or ""
+    if "checks" in fields:
+        refs = await _validate_checks(dyn["agent"], fields.pop("checks") or [], user)
+        fields["checks"] = json.dumps(refs) if refs else ""
+    adopter = ""
+    if "prompt" in fields and (dyn.get("transferred_from") or ""):
+        # A manager of the agent (or an admin) who rewrites a transferred
+        # task's prompt adopts it: the row becomes theirs, so their own
+        # provenance decides the knowledge-write grant and their own loss of
+        # standing moves it on. An editor's edit keeps the record.
+        if await run_db(_manages_agent, user, dyn["agent"]):
+            adopter = user.acting_sub or ""
+            fields["transferred_from"] = ""
+            fields["created_by"] = adopter
 
-    ok, err = await scheduler.update_dynamic_task(task_id, fields)
+    timed = any(fields.get(k) for k in ("schedule", "run_at", "interval_seconds"))
+    if timed and (dyn.get("task_type") or "") not in task_quota.COUNTED_KINDS + (task_kinds.TRIGGER,):
+        # A timing field re-derives the kind: a self-continuation, a delegate
+        # worker or a judge run would silently become a scheduled task.
+        raise HTTPException(
+            status_code=400,
+            detail="This task's timing cannot be edited; schedule a new task instead",
+        )
+    kind = task_kinds.of_word(dyn.get("task_type"))
+    if timed and dyn.get("community_template") and kind is not None and not kind.clocked:
+        # A seeded row counts for nobody because its clock is the
+        # installer's decision. A clock given by an edit is the editor's:
+        # the row stops being the template's (its item slug stays, so the
+        # template updater still finds it) and counts from now on.
+        fields["community_template"] = None
+    # A timing edit can make a row count toward the caps (a trigger task
+    # given an interval): judged as a create would be, under the same lock.
+    after = {**dyn, **fields}
+    if fields.get("schedule") or fields.get("interval_seconds"):
+        after["task_type"] = task_kinds.SCHEDULED
+    elif fields.get("run_at"):
+        after["task_type"] = task_kinds.ONE_TIME
+    async with task_quota.creating():
+        await task_quota.enforce_newly_counted(user, dyn, after)
+        ok, err = await scheduler.update_dynamic_task(task_id, fields)
     if err:
         raise HTTPException(status_code=400, detail=err)
     if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
+    if adopter and (dyn.get("task_type") or "") == task_kinds.TRIGGER:
+        # A trigger and the task it fires keep one creator.
+        await run_db(trigger_store.adopt_linked, task_id, dyn.get("created_by") or "", adopter)
     if (fields.get("name") or "").strip():
         # Task-history rows AND the Active-now widget label task rows by the
         # task's NAME — re-label the chats of live (running|pending) runs
@@ -917,10 +1153,13 @@ async def update_task_on_complete(
     # gate as DELETE/edit: a token caller passes the s2s agent check, everyone
     # gets the scope-aware ownership check (user-scope → creator only).
     if u.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], x_agent_name)
+        _check_agent_access_s2s(dyn["agent"], _caller_agent(u, x_agent_name))
     else:
         require_agent_access(u, dyn["agent"])
     _check_task_permission(dyn, u)
+    await _check_callback_anchor(
+        u, req.on_complete_agent, req.on_complete_session_id, req.on_complete_chat_id,
+    )
     # Auto-populate chat_id from session_id if not provided.
     # This is the persistent anchor — works even if the browser closes,
     # the WS disconnects, or the proxy restarts.
@@ -959,7 +1198,11 @@ async def run_task_now(
     if u.is_api_key:
         # dyn is guaranteed non-None (404 raised above), so attribution is
         # token-authoritative via _check_task_permission. A no-user session
-        # is denied user-scoped runs; agent-scope runs are allowed.
+        # is denied user-scoped runs; agent-scope runs are allowed on the
+        # agents the caller reaches.
+        _check_agent_access_s2s(task_def.agent, _caller_agent(u, x_agent_name))
+        if u.acting_sub is not None:
+            require_agent_access(u, task_def.agent)  # see create_scheduled_task
         _check_task_permission(dyn, u)
     else:
         require_agent_access(u, task_def.agent)
@@ -968,8 +1211,8 @@ async def run_task_now(
         # Agent-scope: owner (manager/admin) can run any; editor can run own.
         task_scope = task_def.scope
         is_own = task_def.created_by == u.sub
-        is_own_user_scope = task_scope == "user" and is_own
-        is_own_agent_scope = task_scope == "agent" and is_own
+        is_own_user_scope = task_scope == _vis.SCOPE_USER and is_own
+        is_own_agent_scope = task_scope == _vis.SCOPE_AGENT and is_own
         if (
             not is_own_user_scope
             and not u.can_manage_agent(task_def.agent)
@@ -978,7 +1221,8 @@ async def run_task_now(
             raise HTTPException(403, "Not authorized to run this task")
 
     run_id = await scheduler.trigger_task_now(
-        task_def, trigger_type="manual", trigger_source=x_agent_name,
+        task_def, trigger_type=task_kinds.TRIGGER_MANUAL,
+        trigger_source=_caller_agent(u, x_agent_name),
     )
 
     # Delegated tasks register an on-complete callback to an originating chat.
@@ -996,7 +1240,7 @@ async def run_task_now(
             # "type" rides along so the event-row fallback below persists the
             # same shape the pump stores (the dashboard's history reload keys
             # blocks on event_data["type"], not the event_type column).
-            "type": "delegate_spawn",
+            "type": wire.DELEGATE_SPAWN,
             "task_id": task_id,
             "task_name": task_def.name,
             "agent": task_def.agent,
@@ -1010,7 +1254,7 @@ async def run_task_now(
         ):
             await asyncio.to_thread(
                 task_store.add_chat_message, on_complete_chat_id, "event", "",
-                event_type="delegate_spawn", event_data=json.dumps(spawn_data),
+                event_type=wire.DELEGATE_SPAWN, event_data=json.dumps(spawn_data),
             )
 
     return {"run_id": run_id, "task_id": task_id}
@@ -1133,11 +1377,18 @@ async def cancel_run(run_id: str, user: UserContext | None = Depends(get_current
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     _check_run_access(run, u)
+    if (not u.is_service and u.acting_sub is None
+            and run["agent"] != u.agent and run.get("created_by") != u.agent):
+        # A no-user session cancels its own agent's runs and the work it
+        # started on a wired target: the edge that let _check_run_access
+        # read the target's other runs grants no write.
+        raise HTTPException(403, "Cancelling another agent's runs is not allowed")
     # Agent-scoped runs: owner can cancel any; editor can cancel
-    # only their own runs. _check_run_access already gates on user-scope
+    # only their own runs — a session token held to its person's role like
+    # a cookie. _check_run_access already gates on user-scope
     # "created_by == self".
-    if not u.is_api_key and run.get("scope", "agent") == "agent":
-        is_own = run.get("created_by") == u.sub
+    if u.acting_sub is not None and run.get("scope") != _vis.SCOPE_USER:
+        is_own = run.get("created_by") == u.acting_sub
         if u.can_manage_agent(run["agent"]):
             pass  # owner: any
         elif u.can_edit_agent(run["agent"]) and is_own:
@@ -1155,10 +1406,74 @@ async def cancel_run(run_id: str, user: UserContext | None = Depends(get_current
 @router.get("/v1/tasks/stats")
 async def get_stats(user: UserContext | None = Depends(get_current_user)):
     require_auth(user)
-    stats = await asyncio.to_thread(task_store.get_stats)
-    stats["scheduled_tasks"] = len(scheduler.get_scheduled_jobs())
+    stats = await run_db(task_store.get_stats)
+    stats["scheduled_tasks"] = len(await run_db(scheduler.next_run_times))
     stats["running_tasks"] = len(scheduler.get_running_tasks())
     return stats
+
+
+@router.get("/v1/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    audit: bool = Query(False),
+    user: UserContext | None = Depends(get_current_user),
+):
+    """One task's full definition, prompt included, what it runs on and the
+    triggers pointing at it. Registered AFTER the static /v1/tasks/runs and
+    /v1/tasks/stats routes (Starlette matches in registration order). The
+    read gate is the listing's, applied to one row: a row outside the
+    caller's reach, another user's user-scope row and a delegate row all
+    answer 404, as the listing would simply not show them."""
+    u = require_auth(user)
+    dyn = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
+    task_def = scheduler._row_to_task(dyn) if dyn else None
+    if task_def is None or task_def.use_persistent:
+        raise HTTPException(404, "Task not found")
+    if not u.is_service:
+        edge_reach = await asyncio.to_thread(nouser_read_targets, u)
+        if not (u.can_access_agent(task_def.agent)
+                or (task_def.scope == _vis.SCOPE_AGENT and task_def.agent in edge_reach)):
+            raise HTTPException(404, "Task not found")
+        if (task_def.scope == _vis.SCOPE_USER and not (audit and u.is_admin)
+                and task_def.created_by != u.acting_sub):
+            raise HTTPException(404, "Task not found")
+
+    def _build() -> dict:
+        next_fire = scheduler.next_run_time(task_id)
+        d = _task_view(task_def, u, _make_model_resolver(),
+                       {"next_run_time": next_fire} if next_fire else None)
+        d["transferred_from"] = dyn.get("transferred_from") or ""
+        d["transferred_at"] = dyn.get("transferred_at") or ""
+        history = task_store.count_runs_by_task([task_id]).get(task_id, 0)
+        if getattr(task_def, "task_type", "") == task_kinds.CONTINUATION:
+            d["run_count"] = max(int(dyn.get("run_count", 0) or 0), history)
+        else:
+            d["run_count"] = history
+        d["fired"] = bool(dyn.get("fired", False))
+        d["on_complete_chat_id"] = dyn.get("on_complete_chat_id")
+        triggers: list[dict] = []
+        if task_def.task_type == task_kinds.TRIGGER:
+            from api.events.triggers import trigger_webhook_path
+            from storage.automation import trigger_store
+            # The linkage invariant (a trigger shares its task's scope,
+            # agent and creator) makes the task gate above cover its
+            # triggers.
+            for row in trigger_store.list_triggers(task_id=task_id):
+                triggers.append({
+                    "id": row["id"],
+                    "name": row.get("name") or row.get("slug"),
+                    "slug": row.get("slug"),
+                    "scope": row.get("scope"),
+                    "enabled": bool(row.get("enabled", True)),
+                    "subscription_id": row.get("subscription_id"),
+                    "webhook_path": trigger_webhook_path(row),
+                    "fired_count": row.get("fired_count", 0),
+                    "last_fired_at": row.get("last_fired_at"),
+                })
+        d["triggers"] = triggers
+        return d
+
+    return await run_db(_build)
 
 
 @router.get("/v1/tasks/{task_id}/session")
@@ -1167,9 +1482,13 @@ async def get_task_session(task_id: str, user: UserContext | None = Depends(get_
     u = require_auth(user)
     dyn = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
     task_def = scheduler._row_to_task(dyn) if dyn else None
+    if task_def is None and not (u.is_service or u.is_admin):
+        # A one-time or delegate row retires with its run: with no row left
+        # to check the caller against, the session is not handed out.
+        raise HTTPException(404, "Task not found")
     if task_def and not u.is_service:
         require_agent_access(u, task_def.agent)
-        if task_def.scope == "user" and task_def.created_by != u.sub:
+        if task_def.scope == _vis.SCOPE_USER and task_def.created_by != u.sub:
             raise HTTPException(403, "Not authorized to access this task")
     session_id = await asyncio.to_thread(task_store.get_task_session, task_id)
     return {"task_id": task_id, "session_id": session_id}
@@ -1178,20 +1497,20 @@ async def get_task_session(task_id: str, user: UserContext | None = Depends(get_
 @router.get("/v1/schedules")
 async def list_schedules(user: UserContext | None = Depends(get_current_user)):
     u = require_auth(user)
-    jobs = scheduler.get_scheduled_jobs()
+    jobs = await run_db(scheduler.get_scheduled_jobs)
     if u.is_service:
         return {"schedules": jobs}
     # Filter to schedules the caller may actually see: the job's task must be on
     # an accessible agent, and a user-scoped task is private to its creator.
     # Jobs with no matching task definition (system/maintenance jobs) are hidden
     # from non-service callers — they previously leaked every user's schedule.
-    defs_by_id = {t.id: t for t in scheduler.get_all_task_definitions()}
+    defs_by_id = {t.id: t for t in await run_db(scheduler.get_all_task_definitions)}
     visible = []
     for j in jobs:
         t = defs_by_id.get(j.get("task_id"))
         if t is None or not u.can_access_agent(t.agent):
             continue
-        if t.scope == "user" and t.created_by != u.sub:
+        if t.scope == _vis.SCOPE_USER and t.created_by != u.sub:
             continue
         visible.append(j)
     return {"schedules": visible}
@@ -1233,10 +1552,10 @@ async def stream_run_output(
             yield f"data: {json.dumps({'type': 'error', 'message': 'Run not found'})}\n\n"
             return
 
-        if run["status"] in ("completed", "failed", "cancelled"):
+        if run_status.is_terminal(run["status"]):
             if run.get("output_text"):
-                yield f"data: {json.dumps({'type': 'text', 'text': run['output_text']})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'status': run['status']})}\n\n"
+                yield run_stream.sse(run_stream.text_frame(run["output_text"]))
+            yield run_stream.sse(run_stream.done_frame(run["status"]))
             return
 
         # Tell the subscriber what state it is joining — a parked run
@@ -1244,18 +1563,40 @@ async def stream_run_output(
         # nothing but keep-alives for minutes with no explanation.
         yield f"data: {json.dumps({'type': 'status', 'status': run['status']})}\n\n"
 
-        # Subscribe to live updates from scheduler
+        # Subscribe to live updates from scheduler. The runner's ``done``
+        # (sent after the row is stamped) is the normal end; the row is the
+        # backstop — read once after the subscribe (the run may have ended in
+        # between, its frame already popped with its buffer) and on every
+        # keep-alive tick (a writer with no scheduler task behind it: a
+        # dashboard-resumed turn's flip, a recovery after a restart).
         q = await scheduler.subscribe_run(run_id)
+        saw_text = False
         try:
+            ended = await run_stream.row_end(run_id)
             while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                    yield f"data: {json.dumps(event)}\n\n"
-                    if event.get("type") == "done":
+                if ended is None:
+                    try:
+                        event = await asyncio.wait_for(q.get(), timeout=run_stream.KEEPALIVE_S)
+                    except asyncio.TimeoutError:
+                        # Keep-alive comment to prevent proxy timeout
+                        yield ": keep-alive\n\n"
+                        ended = await run_stream.row_end(run_id)
+                        continue
+                else:
+                    # The row has ended: hand over what the queue still holds
+                    # (the subscribe's replay), then the row's own verdict —
+                    # unless a ``done`` was queued, which is the same verdict.
+                    try:
+                        event = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        if not saw_text and ended.get("output_text"):
+                            yield run_stream.sse(run_stream.text_frame(ended["output_text"]))
+                        yield run_stream.sse(run_stream.done_frame(ended["status"]))
                         break
-                except asyncio.TimeoutError:
-                    # Keep-alive comment to prevent proxy timeout
-                    yield ": keep-alive\n\n"
+                yield run_stream.sse(event)
+                saw_text = saw_text or run_stream.is_text(event)
+                if run_stream.is_done(event):
+                    break
         finally:
             scheduler.unsubscribe_run(run_id, q)
 

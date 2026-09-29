@@ -97,6 +97,11 @@ class ServerConfig:
     # a contributor widens the bound in the catalog. Ignored for docker/git+.
     # See services/mcp/mcp_updater.resolve_latest_in_bound.
     version_constraint: str = ""
+    # For a ``pypi:`` source: the packages the installer may build from a
+    # source distribution. Everything else installs from wheels only, so no
+    # build backend runs on the host; a catalog entry names an exception here
+    # (a dependency with no wheel) and the curation review sees it.
+    source_build: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -652,11 +657,83 @@ class McpManifest:
 
 
 # ---------------------------------------------------------------------------
+# The MCP runtime (core-seams phase 9): ``server.runtime`` is ``python`` or
+# ``node`` (installed on the host that runs them — a venv, ``node_modules``
+# — with a server process), ``docker`` (a container on the platform host)
+# or ``none`` (a context-only MCP with no server process). Generic code asks
+# the three questions below; ``mcp_installer.py`` keeps its own compares
+# because the satellite runs a byte copy of it. The dashboard mirror is
+# ``dashboard/src/lib/kinds/mcpRuntime.ts`` (``tests/core/test_kinds.py``).
+# ---------------------------------------------------------------------------
+
+RUNTIME_PYTHON = "python"
+RUNTIME_NODE = "node"
+RUNTIME_DOCKER = "docker"
+RUNTIME_NONE = "none"
+
+
+@dataclass(frozen=True)
+class Runtime:
+    """One runtime and the facts generic code asks of it."""
+    name: str
+    installed: bool   # the platform / a satellite installs it (a venv, node_modules)
+    container: bool   # a container the platform host drives
+    process: bool     # a server process exists (a context-only MCP has none)
+
+
+RUNTIMES_BY_NAME: dict[str, Runtime] = {r.name: r for r in (
+    Runtime(RUNTIME_PYTHON, installed=True, container=False, process=True),
+    Runtime(RUNTIME_NODE, installed=True, container=False, process=True),
+    Runtime(RUNTIME_DOCKER, installed=False, container=True, process=True),
+    Runtime(RUNTIME_NONE, installed=False, container=False, process=False),
+)}
+RUNTIMES = frozenset(RUNTIMES_BY_NAME)
+
+
+def runtime_of(word: str | None) -> Runtime | None:
+    """The runtime for a manifest word (case-folded — the parser never
+    validates it), ``None`` for an unknown or empty word."""
+    return RUNTIMES_BY_NAME.get((word or "").strip().lower())
+
+
+def _runtime_of_server(server) -> Runtime | None:
+    return runtime_of(getattr(server, "runtime", "") if server is not None else "")
+
+
+def is_container(server) -> bool:
+    """A Docker MCP: a container the platform host drives (its status pill,
+    start / stop / restart, the compose rewrite). Total over ``None``."""
+    rt = _runtime_of_server(server)
+    return bool(rt and rt.container)
+
+
+def installs_on_host(server) -> bool:
+    """A python or node MCP: installed into a venv / ``node_modules`` on
+    the host that runs it, a satellite included; a Docker MCP lives on the
+    platform host and a context-only one nowhere."""
+    rt = _runtime_of_server(server)
+    return bool(rt and rt.installed)
+
+
+def has_process(server) -> bool:
+    """Whether the MCP has a server process at all (a context-only MCP,
+    ``runtime: none``, contributes context and skills and no process)."""
+    rt = _runtime_of_server(server)
+    return bool(rt and rt.process)
+
+
+# ---------------------------------------------------------------------------
 # Shared manifest-validation patterns (used by the parse + oauth validators)
 # ---------------------------------------------------------------------------
 
 # Streamable-HTTP transport names accepted for bearer-injection.
 _HTTP_TRANSPORTS = {"http", "sse", "streamable_http", "streamable-http"}
+
+
+def is_stdio_transport(transport: str | None) -> bool:
+    """Whether a server entry runs a child process on stdio: a generated
+    config entry with no ``type`` is stdio, as the Direct manager reads it."""
+    return not transport or transport == "stdio"
 
 # POSIX env-var name: leading letter or underscore, rest alphanumerics/underscore.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")

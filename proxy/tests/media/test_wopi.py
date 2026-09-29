@@ -388,3 +388,268 @@ def test_wopiurl_symlink_out_of_agent_is_403(temp_db, tmp_path, monkeypatch):
     ws.mkdir(parents=True)
     os.symlink(outside, ws / "link.docx")
     assert _ask_url(app, "workspace/link.docx").status_code == 403
+
+
+def test_wopiurl_contributor_workspace_gets_edit(temp_db, tmp_path, monkeypatch):
+    _seed_file(tmp_path, "workspace/x.docx")
+    app = _make_url_app(monkeypatch, tmp_path, role="contributor", username="con")
+    assert _ask_url(app, "workspace/x.docx", edit=True).json()["permissions"] == "edit"
+
+
+# ---------------------------------------------------------------------------
+# GetFile / CheckFileInfo serve the checked descriptor
+# ---------------------------------------------------------------------------
+
+
+def _serve_client():
+    from api.media import wopi
+    app = FastAPI()
+    app.include_router(wopi.router)
+    return TestClient(app)
+
+
+def test_wopi_get_file_refuses_post_mint_symlink_swap(temp_db, tmp_path, monkeypatch):
+    """A view token for the PM's own file keeps serving the PM's file only:
+    swapped for a link into another project's credentials, into another
+    user's folder of the same project, or out of the agents tree, both
+    GetFile and CheckFileInfo answer 404 and leak nothing."""
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    doc = _seed_file(tmp_path, "users/pm/workspace/r.docx", b"PK real docx")
+    rel = "test-agent/users/pm/workspace/r.docx"
+    token, _ = wopi.create_wopi_token(rel, "pm-sub", "PM", "view", "test-agent")
+    file_id = _encode_file_id(rel)
+    client = _serve_client()
+    assert client.get(f"/wopi/files/{file_id}/contents",
+                      params={"access_token": token}).content == b"PK real docx"
+
+    victim = tmp_path / "proj-b" / "knowledge" / ".credentials" / "google-tokens" / "t.json"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b'{"refresh_token":"SECRET"}')
+    bob = tmp_path / "test-agent" / "users" / "bob" / "workspace" / "private.docx"
+    bob.parent.mkdir(parents=True)
+    bob.write_bytes(b"BOB SECRET")
+    outside = tmp_path.parent / f"{tmp_path.name}-config.env"
+    outside.write_text("JWT_SECRET=SECRET\n")
+    for target in (victim, bob, outside):
+        doc.unlink()
+        doc.symlink_to(os.path.relpath(target, doc.parent))
+        r = client.get(f"/wopi/files/{file_id}/contents", params={"access_token": token})
+        assert r.status_code == 404, target
+        assert b"SECRET" not in r.content
+        info = client.get(f"/wopi/files/{file_id}", params={"access_token": token})
+        assert info.status_code == 404, target
+        assert b"SECRET" not in info.content and b"Size" not in info.content
+    outside.unlink()
+    # A directory link in the middle of the path is refused too.
+    doc.unlink()
+    doc.write_bytes(b"PK real docx")
+    ws = doc.parent
+    real_ws = ws.with_name("real-ws")
+    ws.rename(real_ws)
+    ws.symlink_to("real-ws")
+    assert client.get(f"/wopi/files/{file_id}/contents",
+                      params={"access_token": token}).status_code == 404
+
+
+def test_wopi_check_file_info_and_get_file_from_the_descriptor(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    _seed_file(tmp_path, "workspace/x.docx", b"hello world")
+    rel = "test-agent/workspace/x.docx"
+    token, _ = wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "view", "test-agent")
+    file_id = _encode_file_id(rel)
+    client = _serve_client()
+    j = client.get(f"/wopi/files/{file_id}", params={"access_token": token}).json()
+    assert j["BaseFileName"] == "x.docx" and j["Size"] == 11 and j["UserCanWrite"] is False
+    r = client.get(f"/wopi/files/{file_id}/contents", params={"access_token": token})
+    assert r.status_code == 200 and r.content == b"hello world"
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert "x-wopi-itemversion" in r.headers
+    # Range requests (Collabora fetches ranges of large documents).
+    r = client.get(f"/wopi/files/{file_id}/contents", params={"access_token": token},
+                   headers={"range": "bytes=0-4"})
+    assert r.status_code == 206 and r.content == b"hello"
+
+
+def test_wopi_agent_claim_may_differ_from_path(temp_db, tmp_path, monkeypatch):
+    """A meeting participant's preview is re-minted with the parent chat's
+    agent; the signed path is the binding, so it still serves."""
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    _seed_file(tmp_path, "workspace/p.docx", b"participant doc")
+    rel = "test-agent/workspace/p.docx"
+    token, _ = wopi.create_wopi_token(rel, "u", "U", "view", "parent-agent")
+    file_id = _encode_file_id(rel)
+    r = _serve_client().get(f"/wopi/files/{file_id}/contents", params={"access_token": token})
+    assert r.status_code == 200 and r.content == b"participant doc"
+
+
+def test_wopi_first_segment_must_be_an_agent_name(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    stray = tmp_path / ".hidden-dir" / "x.docx"
+    stray.parent.mkdir()
+    stray.write_bytes(b"stray")
+    rel = ".hidden-dir/x.docx"
+    token, _ = wopi.create_wopi_token(rel, "u", "U", "view", "test-agent")
+    file_id = _encode_file_id(rel)
+    client = _serve_client()
+    assert client.get(f"/wopi/files/{file_id}/contents",
+                      params={"access_token": token}).status_code == 404
+    assert client.get(f"/wopi/files/{file_id}", params={"access_token": token}).status_code == 404
+
+
+def test_wopi_snapshot_and_host_cache_still_serve(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    import config
+    from api.media import wopi
+    client = _serve_client()
+    # A lazy-pull host cache document (a remote-machine preview).
+    cache_file, rel = _seed_host_cache(tmp_path, content=b"desktop doc")
+    token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "view", "test-agent")
+    r = client.get(f"/wopi/files/{_encode_file_id(rel)}/contents", params={"access_token": token})
+    assert r.status_code == 200 and r.content == b"desktop doc"
+    # A version-pinned preview snapshot.
+    snap_root = tmp_path / "preview-snapshots"
+    monkeypatch.setattr(config, "PREVIEW_SNAPSHOT_DIR", snap_root, raising=False)
+    (snap_root / "chat-1").mkdir(parents=True)
+    (snap_root / "chat-1" / "abc123").write_bytes(b"pinned")
+    rel = wopi.snapshot_rel_path("chat-1", "abc123")
+    token, _ = wopi.create_wopi_token(rel, "u", "U", "view", "test-agent",
+                                      display_name="report.xlsx")
+    fid = _encode_file_id(rel)
+    assert client.get(f"/wopi/files/{fid}/contents",
+                      params={"access_token": token}).content == b"pinned"
+    j = client.get(f"/wopi/files/{fid}", params={"access_token": token}).json()
+    assert j["BaseFileName"] == "report.xlsx" and j["Size"] == 6
+    # A swapped snapshot file is refused like any other.
+    (snap_root / "chat-1" / "abc123").unlink()
+    (snap_root / "chat-1" / "abc123").symlink_to(cache_file)
+    assert client.get(f"/wopi/files/{fid}/contents",
+                      params={"access_token": token}).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# PutFile writes beneath the agents root; a malformed token path is
+# refused instead of written
+# ---------------------------------------------------------------------------
+
+
+def _swap_on_open(monkeypatch, tree, victim):
+    """``tree/workspace/sub`` becomes a link to the victim as the helper opens
+    the root, after every check: the strict open must refuse it."""
+    import contextlib
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @contextlib.contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            d = tree / "workspace" / "sub"
+            d.rmdir()
+            os.symlink(victim, d)
+        with real(root, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+
+
+@pytest.mark.asyncio
+async def test_put_file_refuses_a_component_swapped_after_the_check(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from services.notifications import notification_manager
+    monkeypatch.setattr(notification_manager, "broadcast_file_updated", AsyncMock())
+    (tmp_path / "test-agent" / "workspace" / "sub").mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "x.docx").write_bytes(b"ORIGINAL")
+    _swap_on_open(monkeypatch, tmp_path / "test-agent", victim)
+
+    rel = "test-agent/workspace/sub/x.docx"
+    token, _ = wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "edit", "test-agent")
+    app = FastAPI()
+    app.include_router(wopi.router)
+    resp = TestClient(app, raise_server_exceptions=False).post(
+        f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
+    )
+    assert resp.status_code >= 400
+    assert (victim / "x.docx").read_bytes() == b"ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["x.docx"]
+
+
+@pytest.mark.asyncio
+async def test_put_file_malformed_token_path_is_refused_not_written(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    for rel in ("loose.docx", "../escape.docx", "test-agent/../x.docx"):
+        token, _ = wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "edit", "test-agent")
+        app = FastAPI()
+        app.include_router(wopi.router)
+        resp = TestClient(app, raise_server_exceptions=False).post(
+            f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
+        )
+        assert resp.status_code == 403, rel
+    assert not (tmp_path / "loose.docx").exists()
+    assert not (tmp_path.parent / "escape.docx").exists()
+
+
+@pytest.mark.asyncio
+async def test_put_file_host_cache_refuses_a_linked_cache_file(temp_db, tmp_path, monkeypatch):
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from core.remote import remote_file_flow
+    push = AsyncMock(return_value=True)
+    monkeypatch.setattr(remote_file_flow, "push_back_host_path", push)
+    d = tmp_path / ".remote-host-cache" / "sess-1" / "abc123"
+    d.mkdir(parents=True)
+    (d / "_meta.json").write_text('{"machine_id": "m-1", "abs_path": "C:/Users/u/Desktop/x.docx"}')
+    victim = tmp_path / "victim.docx"
+    victim.write_bytes(b"ORIGINAL")
+    (d / "x.docx").symlink_to(victim)
+    rel = ".remote-host-cache/sess-1/abc123/x.docx"
+    token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "edit", "test-agent")
+    app = FastAPI()
+    app.include_router(wopi.router)
+    resp = TestClient(app, raise_server_exceptions=False).post(
+        f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
+    )
+    assert resp.status_code == 403
+    assert victim.read_bytes() == b"ORIGINAL"
+    push.assert_not_awaited()
+
+
+def test_preview_mint_stamps_the_agent_of_the_path(temp_db, tmp_path, monkeypatch):
+    """A meeting participant's preview names the participant's tree; the
+    token's agent claim follows the path, not the parent chat's agent."""
+    _wopi_config(monkeypatch, tmp_path)
+    from api.media import wopi
+    from auth.providers import UserContext, get_current_user
+    from storage import database as db
+    (tmp_path / "participant" / "workspace").mkdir(parents=True)
+    (tmp_path / "participant" / "workspace" / "r.docx").write_bytes(b"doc")
+    monkeypatch.setattr(db, "get_username_by_sub", lambda s: "alice")
+    monkeypatch.setattr(db, "get_chat", lambda cid: {"id": cid, "agent": "parent", "session_id": ""})
+    monkeypatch.setattr(db, "get_preview_event_by_file", lambda cid, fid: {"id": 1})
+    monkeypatch.setattr("api.agents.chats.can_access_chat", lambda u, c: True)
+    user = UserContext(sub="alice-sub", email="a@t.com", name="Alice", role="creator",
+                       agents=["parent", "participant"],
+                       agent_roles={"parent": "manager", "participant": "manager"})
+
+    async def _stub():
+        return user
+
+    app = FastAPI()
+    app.include_router(wopi.router)
+    app.dependency_overrides[get_current_user] = _stub
+    rel = "participant/workspace/r.docx"
+    resp = TestClient(app).get(
+        f"/v1/documents/preview-wopi-url?chat_id=c1&file_id={_encode_file_id(rel)}",
+    )
+    assert resp.status_code == 200, resp.text
+    from urllib.parse import parse_qs, urlparse
+    token = parse_qs(urlparse(resp.json()["wopi_url"]).query)["access_token"][0]
+    assert wopi.validate_wopi_token(token)["agent"] == "participant"

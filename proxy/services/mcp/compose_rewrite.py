@@ -6,35 +6,56 @@ read-restricted ``docker-socket-proxy`` that **blocks ``docker build``** (BuildK
 ``build: .`` compose (build-from-context), which therefore cannot be used as-is.
 This module rewrites that compose to **pull a pre-built image** (``server.image``)
 and run the container as a sibling on the platform's shared network, reachable by
-service-DNS — the only shape a containerised proxy can actually launch.
+service-DNS, the only shape a containerised proxy can actually launch.
 
-The rewrite (T2 only — on bare-metal T1 the build-from-context compose is left
-byte-for-byte untouched, so the live install is unaffected):
+T2 only: on bare-metal T1 the build-from-context compose is left byte-for-byte
+untouched. The compose is first judged against an allowlist, on both paths
+below:
+
+* a top-level key other than ``services``, ``volumes``, ``networks``,
+  ``version`` and the ``x-*`` extension fields is refused (``include``,
+  ``configs``, ``secrets`` and ``name`` among them); the ``x-*`` fields are
+  dropped from the written file, their anchors already resolved at load;
+* a service may not read a file, a container or the daemon beyond the MCP
+  folder (``_REFUSED_SERVICE_KEYS``), and its ``env_file`` may name only the
+  ``.env`` the platform writes into the folder;
+* a top-level volume is a plain per-MCP volume: no ``external``, ``name``,
+  ``driver_opts`` or driver other than ``local``;
+* no key or value may interpolate a variable (compose fills them from the
+  proxy's own environment), apart from the agents-tree bind below and a whole
+  size value such as ``mem_limit``;
+* no name may claim a platform service (``_RESERVED_PLATFORM_NAMES``).
+
+A build-from-context compose is then rewritten to pull form:
 
 * drop ``build:`` (and any BuildKit ``additional_contexts``);
 * set ``image:`` from the manifest's ``server.image``;
-* join the external platform network (``config.OTODOCK_NETWORK``) with a network
-  **alias = the MCP's service-DNS name** so ``http://<service>:<port>`` resolves
-  from the proxy (and from local agents that share the proxy's netns);
-* ``container_name: otodock-<install_id>-mcp-<name>`` — stable + collision-free;
-* strip published host ``ports:`` (the MCP is reached over the shared network,
-  not a host port; publishing one is needless attack surface and can collide);
-* convert host **bind-mounts → named volumes** — a relative/absolute host path
-  resolves on the *daemon host*, not inside the proxy container, so a bind-mount
-  is meaningless in T2; named volumes already declared are kept as-is. The
-  ``${HOST_AGENTS_DIR}`` agents-tree bind (the catalog contract for MCPs that
-  work on agent files, e.g. video-tools) maps to the platform's **shared
-  external agents volume** (``config.OTODOCK_AGENTS_VOLUME``) — the same volume
-  the proxy and file-tools mount — never to a fresh empty per-MCP volume;
-* inject default **memory bounds + log rotation** into services that declare
-  none of their own (``_missing_default_bounds`` — the same defaults reach T1
-  through the generated override), so a leaky community sidecar can't starve
-  session admission or fill the disk.
+* ``container_name: otodock-<install_id>-mcp-<name>``, stable and collision-free.
 
-It is **idempotent**: a compose already in pull form (no ``build:``) is left
-unchanged, so it's safe to call on every install and every start. Comments are
-not preserved — the installed compose is a generated runtime artifact; the
-pristine source lives in the community catalog repo.
+Every compose, rewritten above or shipped in pull form, is hardened the same way:
+
+* each service joins only the external platform network
+  (``config.OTODOCK_NETWORK``), the target with a network **alias = the MCP's
+  service-DNS name** so ``http://<service>:<port>`` resolves from the proxy (and
+  from local agents that share the proxy's netns);
+* published host ``ports:`` and the container-escape keys
+  (``_DANGEROUS_COMPOSE_KEYS``) are stripped from every service;
+* host **bind-mounts become named volumes**: a relative or absolute host path
+  resolves on the *daemon host*, not inside the proxy container, so a bind-mount
+  is meaningless in T2. The ``${HOST_AGENTS_DIR}`` agents-tree bind (the catalog
+  contract for MCPs that work on agent files, such as video-tools) maps to the
+  platform's **shared external agents volume** (``config.OTODOCK_AGENTS_VOLUME``),
+  the same volume the proxy and file-tools mount, never to a fresh empty per-MCP
+  volume;
+* default **memory bounds and log rotation** go into services that declare none
+  of their own (``_missing_default_bounds``; the same defaults reach T1 through
+  the generated override), so a leaky community sidecar can't starve session
+  admission or fill the disk.
+
+The result is a fixed point: a hardened file is left unchanged by every later
+call, so it is safe to call on every install and every start. Comments are not
+preserved: the installed compose is a generated runtime artifact; the pristine
+source lives in the community catalog repo.
 """
 
 from __future__ import annotations
@@ -47,11 +68,14 @@ import re
 import subprocess
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
 import config
 from core.config import deployment
+from services.mcp import mcp_manifest_parse as _mmp
+from services.mcp import mcp_manifest_types as _mt
 
 logger = logging.getLogger("claude-proxy.compose-rewrite")
 
@@ -67,6 +91,164 @@ _DANGEROUS_COMPOSE_KEYS = frozenset({
     "pid", "ipc", "uts", "userns_mode", "cgroup", "cgroup_parent",
     "network_mode", "security_opt", "sysctls", "group_add",
 })
+
+# The top-level keys a Docker MCP compose may carry besides the ``x-*``
+# extension fields (inert data); compose ignores ``version``. Anything else is
+# refused: ``include`` loads another file verbatim, ``configs`` and ``secrets``
+# bind a path of the daemon host, ``name`` renames the project, and a key a
+# later compose release adds has unknown reach.
+_TOP_LEVEL_KEYS = frozenset({"services", "volumes", "networks", "version"})
+
+# Service keys refused outright. Each reads a file, a container or the daemon
+# beyond the MCP folder when the compose loads or starts (``configs``,
+# ``secrets``, ``volumes_from``, ``extends``, ``include``, ``label_file``,
+# ``use_api_socket``), runs a plugin on the compose client (``provider``), or
+# runs a lifecycle hook that can ask for a privileged exec (``post_start``,
+# ``pre_stop``).
+_REFUSED_SERVICE_KEYS = frozenset({
+    "configs", "secrets", "volumes_from", "extends", "include", "label_file",
+    "use_api_socket", "provider", "post_start", "pre_stop",
+})
+
+# The env file ``docker_manager._inject_mcp_env`` writes into the MCP folder:
+# the one ``env_file`` a service may load. The compose client reads any other
+# path inside the proxy container, where the platform's ``config.env`` lives.
+_OWN_ENV_FILES = frozenset({".env", "./.env"})
+_ENV_FILE_ENTRY_KEYS = frozenset({"path", "required", "format"})
+
+# Labels compose sets itself; the boot network self-check identifies the
+# platform's containers by them.
+_COMPOSE_LABEL_PREFIX = "com.docker.compose."
+
+# The long-form mount types the rewrite understands.
+_MOUNT_TYPES = frozenset({"bind", "volume", "tmpfs"})
+
+# The one interpolation kept besides the agents-tree bind: a whole size value,
+# as the catalog's per-install memory knobs use
+# (``mem_limit: ${OTODOCK_CAMOUFOX_MEM_LIMIT:-3g}``). A size parses as a byte
+# count or fails the load, so no string reaches the container through it.
+_SIZE_KEYS = frozenset({"mem_limit", "memswap_limit", "mem_reservation", "shm_size"})
+_SIZE_INTERPOLATION_RE = re.compile(
+    r"^\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-[0-9]+(?:\.[0-9]+)?[kKmMgG]?[bB]?)?\}$"
+)
+
+# The platform's compose services. Their names, the names compose gives their
+# containers (``<project>-<service>-<n>``), the bare-metal stack's fixed
+# container names and the hosts the proxy is configured to dial are reserved:
+# a community MCP claiming one as a service key, container_name, service_name
+# or network alias would join Docker's round-robin for a name the proxy dials
+# (intercepting PROXY_API_KEY, the phone secret or a database login) or get a
+# platform address carved into the sandbox. Matched case-insensitively (Docker
+# DNS is case-insensitive). The carve-side refusal lives in mcp_registry.
+_PLATFORM_SERVICES = (
+    "otodock-proxy", "otodock-postgres", "docker-socket-proxy", "otodock-phone",
+    "otodock-db-init", "otodock-agents-init", "file-tools", "collabora",
+)
+_RESERVED_PLATFORM_NAMES = frozenset({
+    *_PLATFORM_SERVICES, "file-tools-mcp", "collabora-agent",
+})
+_PLATFORM_CONTAINER_RE = re.compile(
+    r"^otodock[-_](?:"
+    + "|".join(re.escape(s) for s in _PLATFORM_SERVICES)
+    + r")[-_]\d+$"
+)
+
+
+def _configured_platform_hosts() -> set[str]:
+    """The hosts the proxy dials by configuration, lower-cased."""
+    hosts = {config.DOCKER_SOCKET_PROXY_HOST, config.PROXY_SERVICE_NAME}
+    for url in (config.DATABASE_URL, config.PHONE_SERVER_URL, config.COLLABORA_BACKEND_URL):
+        try:
+            host = urlsplit(url or "").hostname
+        except ValueError:
+            host = None
+        if host:
+            hosts.add(host)
+    return {h.strip().lower() for h in hosts if isinstance(h, str) and h.strip()}
+
+
+def _is_reserved_name(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    name = value.strip().lower().rstrip(".")
+    return (
+        name in _RESERVED_PLATFORM_NAMES
+        or _PLATFORM_CONTAINER_RE.match(name) is not None
+        or name in _configured_platform_hosts()
+    )
+
+
+def _reject_reserved_name(kind: str, value: object, mcp_name: str) -> None:
+    """Raise ValueError if ``value`` is a reserved platform name (case-insensitive)."""
+    if _is_reserved_name(value):
+        raise ValueError(
+            f"{mcp_name}: MCP compose {kind} {value!r} collides with a reserved "
+            f"platform service name, refusing (it would join the service-DNS of a "
+            f"name the proxy dials, or get a platform address carved into the "
+            f"sandbox)"
+        )
+
+
+# Named volumes the platform compose owns that no community MCP may mount:
+# attaching one hands the sidecar the Postgres unix socket (which the image
+# trusts: an instant superuser), the raw heap files, the SSH keys or the session
+# state. The agents volume is the one legitimate reach (the ``${HOST_AGENTS_DIR}``
+# contract maps onto it, and a healed pull-form file names it directly), so it
+# is not listed. Case-insensitive, like the service names.
+_PLATFORM_VOLUMES = frozenset({
+    "otodock-pgdata", "otodock-pgsock", "otodock-mcps", "otodock-skills",
+    "otodock-ssh-keys", "otodock-sessions",
+})
+
+
+def _reject_platform_volume(kind: str, value, mcp_name: str) -> None:
+    """Raise ValueError if ``value`` names a platform-owned volume."""
+    if isinstance(value, str) and value.strip().lower() in _PLATFORM_VOLUMES:
+        raise ValueError(
+            f"{mcp_name}: MCP compose {kind} {value!r} names a platform volume; "
+            f"refusing (a community MCP may only declare per-MCP volumes; the "
+            f"agents tree is reached through the ${{HOST_AGENTS_DIR}} bind)"
+        )
+
+
+def _reject_manifest_volume_declarations(data: dict, mcp_name: str) -> None:
+    """Refuse a top-level ``volumes:`` entry that is not a plain per-MCP volume.
+
+    ``external`` or ``name`` binds the service to a volume the manifest did not
+    create, and ``driver_opts`` or a driver other than ``local`` can make the
+    volume a bind of a daemon-host path, so each is refused whatever the name.
+    The single exception is the agents mapping the rewrite declares itself
+    (``_declare_volumes``), which a healed pull-form file carries on re-entry.
+    """
+    vols = data.get("volumes")
+    if vols is None:
+        return
+    if not isinstance(vols, dict):
+        raise ValueError(
+            f"{mcp_name}: MCP compose top-level volumes is not a mapping, refusing"
+        )
+    agents_vol = config.OTODOCK_AGENTS_VOLUME
+    for key, spec in vols.items():
+        if spec is None:
+            continue
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"{mcp_name}: MCP compose volume {key!r} is not a mapping, refusing"
+            )
+        if key == agents_vol and spec == {"external": True, "name": agents_vol}:
+            continue
+        if spec.get("external") or spec.get("name"):
+            raise ValueError(
+                f"{mcp_name}: MCP compose volume {key!r} attaches an external or "
+                f"named volume; refusing (a community MCP may only declare "
+                f"per-MCP volumes)"
+            )
+        if set(spec) - {"driver", "labels"} or spec.get("driver", "local") != "local":
+            raise ValueError(
+                f"{mcp_name}: MCP compose volume {key!r} declares driver options "
+                f"or a driver other than local, refusing (either can bind a path "
+                f"of the daemon host)"
+            )
 
 # Container-log rotation injected into services that set no `logging:` of their
 # own — catalog composes rarely do, and an uncapped json-file log grows without
@@ -109,40 +291,115 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")
 
 
+def _interpolates(value: str) -> bool:
+    """True when compose would substitute into ``value``: ``$$`` is a literal
+    ``$``, and any other ``$`` starts a substitution or fails the load."""
+    return "$" in value.replace("$$", "")
+
+
+def _service_aliases(svc: dict) -> list[str]:
+    """The network aliases a service declares, on any of its networks."""
+    out: list[str] = []
+    nets = svc.get("networks")
+    if isinstance(nets, dict):
+        for cfg in nets.values():
+            if not isinstance(cfg, dict):
+                continue
+            aliases = cfg.get("aliases")
+            if isinstance(aliases, str):
+                out.append(aliases)
+            elif isinstance(aliases, list):
+                out.extend(a for a in aliases if isinstance(a, str))
+    return out
+
+
+def _is_own_env_file(entry: object) -> bool:
+    if isinstance(entry, dict):
+        path = entry.get("path")
+        return (
+            isinstance(path, str) and path in _OWN_ENV_FILES
+            and not set(entry) - _ENV_FILE_ENTRY_KEYS
+        )
+    return isinstance(entry, str) and entry in _OWN_ENV_FILES
+
+
+def _reject_foreign_env_file(key: str, value: object, mcp_name: str) -> None:
+    """Refuse an ``env_file`` other than the MCP's own ``.env``: a string, or a
+    list of strings and ``{path, required, format}`` entries."""
+    if isinstance(value, str):
+        own = _is_own_env_file(value)
+    elif isinstance(value, list):
+        own = all(_is_own_env_file(entry) for entry in value)
+    else:
+        own = False
+    if not own:
+        raise ValueError(
+            f"{mcp_name}: MCP compose service {key!r} env_file {value!r} is not "
+            f"the MCP's own .env, refusing (the compose client would read it "
+            f"inside the proxy container)"
+        )
+
+
+def _reject_compose_labels(key: str, labels: object, mcp_name: str) -> None:
+    """Refuse a service label in the namespace compose sets itself."""
+    if isinstance(labels, dict):
+        names = [str(k) for k in labels]
+    elif isinstance(labels, list):
+        names = [str(item).split("=", 1)[0] for item in labels]
+    else:
+        return
+    owned = sorted(n for n in names if n.strip().lower().startswith(_COMPOSE_LABEL_PREFIX))
+    if owned:
+        raise ValueError(
+            f"{mcp_name}: MCP compose service {key!r} sets the compose-owned "
+            f"label {owned}, refusing (the platform identifies its own containers "
+            f"by them)"
+        )
+
+
 def _harden_service(
     key: str, svc: dict, mcp_name: str,
     declared_volumes: set[str], external_volumes: set[str],
-) -> list[str]:
-    """Apply the T2 sandbox hardening to ONE service dict, in place.
+) -> None:
+    """Apply the T2 sandbox rules to ONE service dict, in place.
 
-    Runs for EVERY service of EVERY compose the T2 path touches — target or
-    sibling, build-form or already-pull-form. A compose shipped pull-form
-    (or a sibling service) must get the exact same treatment as the rewritten
-    target, or a hijacked catalog entry sidesteps the strip by simply not
-    declaring ``build:``. Returns human-readable change notes (empty = the
-    service was already clean).
+    Runs for EVERY service of EVERY compose the T2 path touches, target or
+    sibling, build-form or already-pull-form: a compose shipped pull-form (or a
+    sibling service) gets the exact same treatment as the rewritten target, or
+    a hijacked catalog entry sidesteps it by simply not declaring ``build:``.
+    Refusals raise ValueError; the escape keys, published ports and host binds
+    are stripped or converted.
     """
-    changes: list[str] = []
+    _reject_reserved_name("service key", key, mcp_name)
+    _reject_reserved_name("container_name", svc.get("container_name"), mcp_name)
+    for alias in _service_aliases(svc):
+        _reject_reserved_name("network alias", alias, mcp_name)
+    refused = sorted(k for k in svc if k in _REFUSED_SERVICE_KEYS)
+    if refused:
+        raise ValueError(
+            f"{mcp_name}: MCP compose service {key!r} sets {refused}, refusing "
+            f"(each reads a file, a container or the daemon beyond the MCP folder)"
+        )
+    if "env_file" in svc:
+        _reject_foreign_env_file(key, svc["env_file"], mcp_name)
+    _reject_compose_labels(key, svc.get("labels"), mcp_name)
     dropped = [k for k in _DANGEROUS_COMPOSE_KEYS if k in svc]
     for k in dropped:
         svc.pop(k, None)
     if dropped:
-        changes.append(f"stripped unsafe keys {sorted(dropped)}")
         logger.warning(
             "compose_rewrite: stripped unsafe keys %s from service %r (%s)",
             sorted(dropped), key, mcp_name,
         )
-    if "ports" in svc:
-        svc.pop("ports", None)
-        changes.append("removed published ports")
-    if isinstance(svc.get("volumes"), list):
-        healed = _rewrite_volumes(
+    svc.pop("ports", None)
+    if "volumes" in svc:
+        if not isinstance(svc["volumes"], list):
+            raise ValueError(
+                f"{mcp_name}: MCP compose service {key!r} volumes is not a list, refusing"
+            )
+        svc["volumes"] = _rewrite_volumes(
             svc["volumes"], mcp_name, declared_volumes, external_volumes,
         )
-        if healed != svc["volumes"]:
-            svc["volumes"] = healed
-            changes.append("host binds → named volumes")
-    return changes
 
 
 def _is_host_bind_source(src: str) -> bool:
@@ -170,7 +427,7 @@ _AGENTS_SHORT_RE = re.compile(
 
 
 def _rewrite_volumes(
-    volumes, mcp_name: str, declared: set[str], external: set[str],
+    volumes: list, mcp_name: str, declared: set[str], external: set[str],
 ) -> list:
     """Convert host bind-mounts to per-MCP named volumes; keep named volumes.
 
@@ -178,7 +435,8 @@ def _rewrite_volumes(
     when an agents-tree mount is mapped onto the shared platform volume (the
     caller declares both at the compose top level). Handles both short-form
     (``"src:dst[:mode]"``) and long-form (``{type: bind, source, target}``)
-    entries.
+    entries; a source compose would interpolate, other than the whole
+    agents-tree form, is refused (it resolves as a daemon-host bind).
     """
     agents_vol = config.OTODOCK_AGENTS_VOLUME
     out: list = []
@@ -194,6 +452,12 @@ def _rewrite_volumes(
                 continue
             parts = v.split(":")
             src = parts[0]
+            if _interpolates(src):
+                raise ValueError(
+                    f"{mcp_name}: MCP compose volume {v!r} interpolates its source, "
+                    f"refusing (it would resolve as a bind of the daemon host; only "
+                    f"the whole ${{HOST_AGENTS_DIR}} form maps onto the agents volume)"
+                )
             if _is_host_bind_source(src):
                 dst = parts[1] if len(parts) > 1 else src
                 mode = parts[2] if len(parts) > 2 else ""
@@ -201,29 +465,32 @@ def _rewrite_volumes(
                 declared.add(name)
                 out.append(f"{name}:{dst}" + (f":{mode}" if mode else ""))
             else:
-                if "${" in src:
-                    logger.warning(
-                        "compose_rewrite: %s volume %r has an interpolated source "
-                        "this rewrite doesn't understand — left as-is (it will "
-                        "resolve as a host bind on the daemon host)",
-                        mcp_name, v,
-                    )
+                _reject_platform_volume("volume source", src, mcp_name)
                 out.append(v)  # already a named volume
         elif isinstance(v, dict):
+            mount_type = v.get("type")
+            if mount_type not in _MOUNT_TYPES:
+                raise ValueError(
+                    f"{mcp_name}: MCP compose mount {v!r} has type {mount_type!r}, "
+                    f"refusing (only bind, volume and tmpfs mounts are understood)"
+                )
             src = str(v.get("source", ""))
-            if v.get("type") == "bind" and _AGENTS_SRC_RE.match(src):
+            if mount_type == "bind" and _AGENTS_SRC_RE.match(src):
                 external.add(agents_vol)
                 ro = ":ro" if v.get("read_only") else ""
                 out.append(f"{agents_vol}:{v.get('target', '')}{ro}")
-            elif v.get("type") == "bind":
+            elif mount_type == "bind":
                 dst = v.get("target", "")
                 name = f"otodock-{config.INSTALL_ID}-mcp-{_slug(mcp_name)}-{_slug(dst)}"
                 declared.add(name)
                 out.append(f"{name}:{dst}")
             else:
-                out.append(v)  # named-volume long-form or tmpfs — leave as-is
+                _reject_platform_volume("volume source", v.get("source"), mcp_name)
+                out.append(v)  # named-volume long form or tmpfs
         else:
-            out.append(v)
+            raise ValueError(
+                f"{mcp_name}: MCP compose volume entry {v!r} is not a mount, refusing"
+            )
     return out
 
 
@@ -243,6 +510,69 @@ def _declare_volumes(data: dict, declared: set[str], external: set[str]) -> None
     for name in sorted(external):
         vols[name] = {"external": True, "name": name}
     data["volumes"] = vols
+
+
+def _reject_interpolation(data: dict, mcp_name: str) -> None:
+    """Refuse any key or value of the finished compose that compose would
+    interpolate.
+
+    The variables come from the compose client's environment, which is the
+    proxy's own (``DATABASE_URL`` carries the application password), and from
+    the MCP's ``.env``. Runs after the agents-tree bind is mapped onto the named
+    volume; a whole size value (``_SIZE_INTERPOLATION_RE``) is the one form
+    kept. The walk visits a node shared through a YAML alias once.
+    """
+    stack: list[tuple[tuple[str, ...], object]] = [((), data)]
+    seen: set[int] = set()
+    while stack:
+        path, node = stack.pop()
+        if isinstance(node, (dict, list)):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            items = node.items() if isinstance(node, dict) else enumerate(node)
+            for k, v in items:
+                if isinstance(k, str) and _interpolates(k):
+                    raise ValueError(
+                        f"{mcp_name}: MCP compose key {k!r} interpolates a variable, "
+                        f"refusing"
+                    )
+                stack.append(((*path, str(k)), v))
+        elif isinstance(node, str) and _interpolates(node):
+            if (
+                len(path) == 3 and path[0] == "services" and path[2] in _SIZE_KEYS
+                and _SIZE_INTERPOLATION_RE.match(node)
+            ):
+                continue
+            raise ValueError(
+                f"{mcp_name}: MCP compose value {'.'.join(path)} {node!r} "
+                f"interpolates a variable, refusing (compose would fill it from the "
+                f"proxy's own environment; write a literal $ as $$)"
+            )
+
+
+def _checked_services(data: object, mcp_name: str) -> dict:
+    """The compose's ``services`` mapping, once the top level has passed the
+    allowlist. Raises ValueError on any other shape."""
+    if not isinstance(data, dict):
+        raise ValueError("compose is not a mapping")
+    unknown = sorted(
+        str(k) for k in data
+        if not (isinstance(k, str) and (k in _TOP_LEVEL_KEYS or k.startswith("x-")))
+    )
+    if unknown:
+        raise ValueError(
+            f"{mcp_name}: MCP compose top-level keys {unknown} are not allowed, "
+            f"refusing (a Docker MCP compose carries only services, volumes, "
+            f"networks, version and x-* fields)"
+        )
+    services = data.get("services")
+    if not isinstance(services, dict) or not services:
+        raise ValueError("compose has no `services` mapping")
+    for key, svc in services.items():
+        if not isinstance(svc, dict):
+            raise ValueError(f"service {key!r} is not a mapping")
+    return services
 
 
 def _pick_target_service(services: dict, service_name: str) -> str:
@@ -265,6 +595,55 @@ def _pick_target_service(services: dict, service_name: str) -> str:
     )
 
 
+def _pick_pull_target(services: dict, service_name: str) -> str:
+    """The service a pull-form compose serves the MCP from: the key matching
+    ``service_name``, else the sole service, else the one service whose network
+    aliases carry ``service_name`` (the rewrite's own output). Raises when none
+    or several qualify."""
+    if service_name in services:
+        return service_name
+    if len(services) == 1:
+        return next(iter(services))
+    aliased = [k for k, s in services.items() if service_name in _service_aliases(s)]
+    if len(aliased) == 1:
+        return aliased[0]
+    raise ValueError(
+        f"cannot determine which service serves {service_name!r} among "
+        f"{sorted(services)} (declare server.service_name to disambiguate)"
+    )
+
+
+def _harden_compose(
+    data: dict, *, target: str, service_name: str, network_name: str, mcp_name: str,
+) -> dict:
+    """The hardening both paths share, on a deep copy of ``data``.
+
+    Every service is judged and stripped (``_harden_service``), joins only the
+    shared network (the target with the service-DNS alias, the siblings to
+    reach it) and gets the default bounds; the top-level networks are replaced
+    and the volumes the rewrite maps are declared. The ``x-*`` extension
+    fields are dropped: compose reads them only as YAML anchor sources, which
+    the load has already resolved into the services.
+    """
+    _reject_reserved_name("service_name", service_name, mcp_name)
+    out = copy.deepcopy(data)
+    for key in [k for k in out if isinstance(k, str) and k.startswith("x-")]:
+        del out[key]
+    _reject_manifest_volume_declarations(out, mcp_name)
+    declared: set[str] = set()
+    external: set[str] = set()
+    for key, svc in out["services"].items():
+        _harden_service(key, svc, mcp_name, declared, external)
+    for key, svc in out["services"].items():
+        svc["networks"] = (
+            {_NET_KEY: {"aliases": [service_name]}} if key == target else {_NET_KEY: {}}
+        )
+        svc.update(_missing_default_bounds(svc))
+    out["networks"] = {_NET_KEY: {"external": True, "name": network_name}}
+    _declare_volumes(out, declared, external)
+    return out
+
+
 def transform_compose_dict(
     data: dict,
     *,
@@ -277,15 +656,12 @@ def transform_compose_dict(
     """Pure transform: build-from-context compose dict → pull-form compose dict.
 
     Returns a NEW dict (the input is not mutated). Raises ``ValueError`` on a
-    shape that can't be safely rewritten for T2 (no services, a non-mapping
-    service, or a multi-service compose where a *non-target* service also needs
-    to be built — we can't pull an image we don't know).
+    shape the allowlist refuses or that can't be safely rewritten for T2 (no
+    services, a non-mapping service, or a multi-service compose where a
+    *non-target* service also needs to be built: we can't pull an image we
+    don't know).
     """
-    data = copy.deepcopy(data)
-    services = data.get("services")
-    if not isinstance(services, dict) or not services:
-        raise ValueError("compose has no `services` mapping")
-
+    services = _checked_services(data, mcp_name)
     target = _pick_target_service(services, service_name)
     others_built = [
         k for k, s in services.items()
@@ -296,32 +672,16 @@ def transform_compose_dict(
             f"compose has additional build-from-context services {others_built} "
             f"with no pre-built image — unsupported in Docker-Compose mode"
         )
-
-    declared_volumes: set[str] = set()
-    external_volumes: set[str] = set()
-    for key, svc in services.items():
-        if not isinstance(svc, dict):
-            raise ValueError(f"service {key!r} is not a mapping")
-        # Strip container-escape / host-access keys, published ports, and host
-        # binds from EVERY service — sibling services included (a malicious
-        # compose could otherwise carry its escape on a second, image-based
-        # service the target-only rewrite never touched).
-        _harden_service(key, svc, mcp_name, declared_volumes, external_volumes)
-        if key == target:
-            svc.pop("build", None)
-            svc["image"] = image
-            svc["container_name"] = container_name
-            svc["networks"] = {_NET_KEY: {"aliases": [service_name]}}
-        else:
-            # Sibling services (already image-based) join the same network so
-            # they can still talk to the target; no alias (only the target is
-            # addressed by the proxy via service-DNS).
-            svc["networks"] = {_NET_KEY: {}}
-        svc.update(_missing_default_bounds(svc))
-
-    data["networks"] = {_NET_KEY: {"external": True, "name": network_name}}
-    _declare_volumes(data, declared_volumes, external_volumes)
-    return data
+    out = _harden_compose(
+        data, target=target, service_name=service_name,
+        network_name=network_name, mcp_name=mcp_name,
+    )
+    svc = out["services"][target]
+    svc.pop("build", None)
+    svc["image"] = image
+    svc["container_name"] = container_name
+    _reject_interpolation(out, mcp_name)
+    return out
 
 
 _HEADER = (
@@ -333,110 +693,104 @@ _HEADER = (
 )
 
 
-def ensure_pull_compose(manifest) -> bool:
-    """Idempotently rewrite a Docker MCP's compose to pull form — **T2 only**.
+def _plan_pull_compose(manifest) -> tuple[Path, object, dict] | None:
+    """The compose file, its current content and the content T2 runs.
 
-    Returns ``True`` if the file was rewritten, ``False`` when no change is
-    needed (bare-metal T1, a non-docker MCP, or a compose already in pull form).
-    Raises ``ValueError`` with an actionable message when the MCP genuinely
-    cannot run in T2 — no ``server.image`` (can't pull, can't build), a missing
-    compose file, or an un-rewritable shape.
+    ``None`` where the rewrite does not apply (bare-metal T1, a non-docker
+    MCP). Raises ``ValueError`` with an actionable message when the MCP cannot
+    run in T2: a compose file missing or outside the MCP folder, no
+    ``server.image`` for a build-form compose, or a shape the allowlist
+    refuses.
     """
     if not deployment.in_docker_compose():
-        return False  # T1 / T3 — build-from-context compose stays untouched
+        return None  # T1 / T3: the build-from-context compose stays untouched
     srv = getattr(manifest, "server", None)
-    if srv is None or getattr(srv, "runtime", "") != "docker":
-        return False
-
-    compose_path = manifest.mcp_dir / srv.docker_compose
-    if not compose_path.is_file():
+    if not _mt.is_container(srv):
+        return None
+    compose_path = _mmp.resolve_skill_file(manifest.mcp_dir, srv.docker_compose)
+    if compose_path is None:
         raise ValueError(
-            f"{manifest.name}: compose file {srv.docker_compose!r} not found "
-            f"in {manifest.mcp_dir}"
+            f"{manifest.name}: compose file {srv.docker_compose!r} not found in "
+            f"{manifest.mcp_dir} (it must be a regular file inside the MCP folder)"
         )
-
-    data = yaml.safe_load(compose_path.read_text()) or {}
-    services = data.get("services") or {}
-    has_build = any(isinstance(s, dict) and "build" in s for s in services.values())
-    if not has_build:
-        # Already pull-form — heal what a stale generated artifact can carry:
-        # (a) a container_name stamped by a PREVIOUS install identity. The
-        #     install-id lives in config.env, so a recreated config.env
-        #     (install moved to a new folder) rotates it and a stale stamp
-        #     makes every `up` collide with the previous generation's
-        #     container ("name already in use" → opaque 500 on start, forever).
-        # (b) an agents-tree bind (`${HOST_AGENTS_DIR}` source) left in place
-        #     by a rewrite that predates the shared-volume mapping — on T2 it
-        #     binds an empty host dir, so the MCP sees no agent files.
-        expected = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}"
-        try:
-            target = _pick_target_service(
-                services, deployment.mcp_service_name(manifest),
-            )
-        except ValueError:
-            return False  # unrecognizable shape — leave it alone
-        svc = services.get(target)
-        if not isinstance(svc, dict):
-            return False
-        changes: list[str] = []
-        current = svc.get("container_name")
-        if (
-            isinstance(current, str)
-            and current.startswith("otodock-")
-            and "-mcp-" in current
-            and current != expected
-        ):
-            svc["container_name"] = expected
-            changes.append(
-                f"container_name {current} → {expected} (install identity changed)"
-            )
-        # (c) the sandbox hardening — a compose shipped ALREADY pull-form
-        #     never went through transform_compose_dict, so dangerous keys,
-        #     published ports, and host binds on ANY of its services (target
-        #     or sibling) would otherwise survive verbatim on T2.
-        declared: set[str] = set()
-        external: set[str] = set()
-        for skey, ssvc in services.items():
-            if not isinstance(ssvc, dict):
-                continue
-            for note in _harden_service(
-                skey, ssvc, manifest.name, declared, external,
-            ):
-                changes.append(f"{skey}: {note}")
-        if declared or external:
-            _declare_volumes(data, declared, external)
-        if not changes:
-            return False  # already pull-form and healthy — idempotent
-        compose_path.write_text(
-            _HEADER + yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-        )
-        logger.info(
-            "Healed %s pull-form compose: %s", manifest.name, "; ".join(changes),
-        )
-        return True
-
-    if not srv.image:
+    try:
+        data = yaml.safe_load(compose_path.read_text())
+    except yaml.YAMLError as e:
         raise ValueError(
-            f"{manifest.name}: this Docker MCP has no pre-built image "
-            f"(server.image is unset) — it cannot be installed in Docker-Compose "
-            f"mode because the docker-socket-proxy blocks `docker build`. Add "
-            f"server.image to its manifest, or run it on a bare-metal proxy."
-        )
+            f"{manifest.name}: compose file {srv.docker_compose!r} is not valid YAML: {e}"
+        ) from e
+    services = _checked_services(data, manifest.name)
+    service_name = deployment.mcp_service_name(manifest)
+    expected = f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}"
 
-    new_data = transform_compose_dict(
-        data,
-        image=srv.image,
-        service_name=deployment.mcp_service_name(manifest),
-        container_name=f"otodock-{config.INSTALL_ID}-mcp-{manifest.name}",
-        network_name=config.OTODOCK_NETWORK,
-        mcp_name=manifest.name,
+    if any("build" in s for s in services.values()):
+        if not srv.image:
+            raise ValueError(
+                f"{manifest.name}: this Docker MCP has no pre-built image "
+                f"(server.image is unset): it cannot be installed in Docker-Compose "
+                f"mode because the docker-socket-proxy blocks `docker build`. Add "
+                f"server.image to its manifest, or run it on a bare-metal proxy."
+            )
+        planned = transform_compose_dict(
+            data,
+            image=srv.image,
+            service_name=service_name,
+            container_name=expected,
+            network_name=config.OTODOCK_NETWORK,
+            mcp_name=manifest.name,
+        )
+        return compose_path, data, planned
+
+    target = _pick_pull_target(services, service_name)
+    planned = _harden_compose(
+        data, target=target, service_name=service_name,
+        network_name=config.OTODOCK_NETWORK, mcp_name=manifest.name,
     )
+    # A container_name stamped by a PREVIOUS install identity is re-stamped.
+    # The install-id lives in config.env, so a recreated config.env (install
+    # moved to a new folder) rotates it, and a stale stamp would make every
+    # `up` collide with the previous generation's container ("name already in
+    # use", an opaque 500 on start, forever). A name that is not otodock-shaped
+    # is the catalog's own and stays.
+    svc = planned["services"][target]
+    current = svc.get("container_name")
+    if (
+        isinstance(current, str)
+        and current.startswith("otodock-")
+        and "-mcp-" in current
+        and current != expected
+    ):
+        svc["container_name"] = expected
+    _reject_interpolation(planned, manifest.name)
+    return compose_path, data, planned
+
+
+def check_pull_compose(manifest) -> None:
+    """Run every refusal of ``ensure_pull_compose`` and write nothing: the
+    install gate runs it on the incoming folder before any file moves."""
+    _plan_pull_compose(manifest)
+
+
+def ensure_pull_compose(manifest) -> bool:
+    """Idempotently bring a Docker MCP's compose to its hardened pull form, **T2 only**.
+
+    Returns ``True`` if the file was rewritten, ``False`` when no change is
+    needed (bare-metal T1, a non-docker MCP, or a compose already in its
+    hardened pull form). Raises ``ValueError`` with an actionable message when
+    the MCP cannot run in T2 (see ``_plan_pull_compose``).
+    """
+    plan = _plan_pull_compose(manifest)
+    if plan is None:
+        return False
+    compose_path, current, planned = plan
+    if planned == current:
+        return False
     compose_path.write_text(
-        _HEADER + yaml.safe_dump(new_data, sort_keys=False, default_flow_style=False)
+        _HEADER + yaml.safe_dump(planned, sort_keys=False, default_flow_style=False)
     )
     logger.info(
-        "Rewrote %s compose → pull form (image=%s, net=%s)",
-        manifest.name, srv.image, config.OTODOCK_NETWORK,
+        "Rewrote %s compose for Docker-Compose mode (image=%s, net=%s)",
+        manifest.name, manifest.server.image or "(as shipped)", config.OTODOCK_NETWORK,
     )
     return True
 
@@ -605,7 +959,7 @@ def ensure_t1_override(manifest, *, force_realloc: bool = False) -> Path | None:
     if deployment.current_mode() != deployment.MANAGED_LOCAL:
         return None
     srv = getattr(manifest, "server", None)
-    if srv is None or getattr(srv, "runtime", "") != "docker":
+    if not _mt.is_container(srv):
         return None
 
     base_path = manifest.mcp_dir / srv.docker_compose

@@ -25,10 +25,13 @@ from .._vendored.app_server_client import (
     AppServerClient, AppServerError, mcp_server_names_from_toml, wait_for_mcp_startup,
 )
 from .._vendored.codex_approvals import (
-    approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
+    UNTRUSTED_POLICY, approval_for_sandbox, build_sandbox_policy,
+    is_untrusted_policy_rejection, make_server_request_handler,
 )
 from ..config import codex_hook_command, otodock_dir, reap_descendants, snapshot_descendants
 import contextlib
+from .. import config
+from .._vendored import layout
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -57,7 +60,7 @@ def _format_time() -> str:
 def _write_codex_hooks(codex_dir: Path) -> None:
     """Write hooks.json for the Codex hook system.
 
-    MUST match the schema the proxy's ``core/sandbox._build_codex_hooks`` emits
+    MUST match the schema the proxy's ``core/layers/codex/config_dir.build_hooks`` emits
     (per the Codex docs): an OBJECT
     ``{"hooks": {"<Event>": [{"matcher": "", "hooks":
     [{"type": "command", "command": <cmd>, "timeout": <s>}]}]}}``. The OLD shape
@@ -81,10 +84,18 @@ def _write_codex_hooks(codex_dir: Path) -> None:
                 "timeout": timeout,
             }],
         }
+    # The same four events as the proxy's core/layers/codex/config_dir.build_hooks (satellite
+    # 0.5.121; proxy docs/architecture/HOOKS.md): SubagentStop feeds the
+    # proxy's SubagentRegistry over the tunnel, Stop carries the turn-end
+    # verdict that may hold the turn open (the legacy {"decision":"block"}
+    # shape, the one Codex accepts on Stop). Both stay quiet where the
+    # scripts self-gate (the interactive TUI's OTO_INTERACTIVE).
     hooks = {
         "hooks": {
             "PreToolUse": [_hook("permission_gate.py", 604800)],
             "PostToolUse": [_hook("tool_result_forwarder.py", 10)],
+            "SubagentStop": [_hook("subagent_tracker.py", 10)],
+            "Stop": [_hook("stop_tracker.py", 604800)],
         },
     }
     (codex_dir / "hooks.json").write_text(json.dumps(hooks, indent=2) + "\n")
@@ -300,7 +311,7 @@ def chmod_private(path: Path) -> None:
     """Owner-only for a config file that carries per-session bearers (MCP
     cap-tokens, the session JWT, a local endpoint's URL) — the proxy locks its
     own config.toml 0600 the same way. No-op on Windows (no POSIX bits)."""
-    if sys.platform == "win32":
+    if not config.HOST.posix:
         return
     with contextlib.suppress(OSError):
         path.chmod(0o600)
@@ -315,7 +326,7 @@ def _write_codex_hook_scripts(codex_dir: Path, scripts: dict[str, str]) -> None:
             continue
         path = codex_dir / filename
         path.write_text(content)
-        if sys.platform != "win32":
+        if config.HOST.posix:
             path.chmod(0o755)
 
 
@@ -391,6 +402,37 @@ class CodexSession:
         # user-layer hook only when trusted — the operative switch on a shared
         # CODEX_HOME), and the deny-only / no-forward hook env below.
         self._hooks_floor: bool = bool(config.get("codex_hooks_floor"))
+        # An ATTENDED chat (no floor — a person answers the bridge) sends the
+        # "untrusted" approval policy so every command and patch reaches the
+        # proxy's decide_tool_permission, like Claude's hook (proxy HOOKS.md
+        # "Attended Codex chats"); a daemon that rejects it drops the session
+        # to on-request once, logged. Twin of the proxy session's
+        # _note_untrusted_rejection.
+        self._untrusted_rejected = False
+
+    def _plan_mode(self, sandbox_mode: str) -> bool:
+        """The plan collaboration mode follows the platform's ``permission_mode``
+        (0.5.123): plan iff plan. A proxy that ships no mode (older) keeps the
+        former rule, read-only ⟺ plan."""
+        mode = self.config.get("permission_mode")
+        if mode:
+            return mode == "plan"
+        return sandbox_mode == "read-only"
+
+    def _approval_policy(self) -> str:
+        sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
+        attended = not self._hooks_floor and not self._untrusted_rejected
+        return approval_for_sandbox(sandbox_mode, attended=attended)
+
+    def _note_untrusted_rejection(self, error: Exception) -> bool:
+        if self._approval_policy() != UNTRUSTED_POLICY or not is_untrusted_policy_rejection(error):
+            return False
+        self._untrusted_rejected = True
+        logger.warning(
+            f"Codex [{self.session_id[:8]}] rejected approvalPolicy 'untrusted' ({error}); "
+            f"this attended chat falls back to '{self._approval_policy()}'"
+        )
+        return True
 
     async def start(self) -> None:
         """Write config files, spawn the app-server daemon, open/resume thread."""
@@ -436,7 +478,7 @@ class CodexSession:
             toml_content = path_translator.translate_codex_mcp_env_paths(
                 toml_content,
                 agent_dir=self.agent_dir,
-                username=path_translator.derive_username_from_cwd_relative(
+                username=layout.user_of(
                     self.config.get("cwd_relative", ""),
                 ),
                 session_id=self.session_id,
@@ -480,7 +522,7 @@ class CodexSession:
         )
 
         # --- spawn the persistent daemon ---
-        self._username = path_translator.derive_username_from_cwd_relative(
+        self._username = layout.user_of(
             self.config.get("cwd_relative", ""),
         )
         # Curate the operator's ambient secrets BEFORE the platform config["env"]
@@ -529,10 +571,19 @@ class CodexSession:
             try:
                 await self._client.request("thread/resume", {"threadId": self.thread_id, **overrides})
             except AppServerError as e:
-                logger.warning(f"Codex resume failed ({e}); starting new thread")
-                self.thread_id = None
+                if self._note_untrusted_rejection(e):
+                    overrides = self._thread_overrides()
+                    await self._client.request("thread/resume", {"threadId": self.thread_id, **overrides})
+                else:
+                    logger.warning(f"Codex resume failed ({e}); starting new thread")
+                    self.thread_id = None
         if not self.thread_id:
-            res = await self._client.request("thread/start", overrides)
+            try:
+                res = await self._client.request("thread/start", overrides)
+            except AppServerError as e:
+                if not self._note_untrusted_rejection(e):
+                    raise
+                res = await self._client.request("thread/start", self._thread_overrides())
             self.thread_id = (res.get("thread") or {}).get("id") or ""
 
         await self._warm_mcps()
@@ -682,8 +733,17 @@ class CodexSession:
         data = res.get("data") if isinstance(res, dict) else None
         return data if isinstance(data, list) else []
 
-    async def run_turn(self, prompt: str, *, inject_time: bool = False) -> None:
+    async def run_turn(
+        self, prompt: str, *, inject_time: bool = False, forward=None,
+    ) -> None:
         """Drive ONE turn, serialized per session so turns can never overlap.
+
+        ``forward`` (the session manager's per-turn event shipper) becomes the
+        persistent forwarder's callback: EVERY app-server notification —
+        including a background sub-agent's after the main turn ends — rides
+        it, so the proxy (which holds the translator) supervises bg work
+        centrally while this side stays a dumb pipe. None keeps the current
+        forwarder (tests drive turns without one).
 
         Why the lock matters: the satellite runs every WS command as its own
         task and the proxy releases its per-session lock the moment a turn is
@@ -697,6 +757,8 @@ class CodexSession:
         active turn X but found Y``). ``abort()`` deliberately does NOT acquire
         this lock — it interrupts the in-flight turn, which lets the holder
         unwind and release so the next turn proceeds cleanly."""
+        if forward is not None:
+            self.set_event_forwarder(forward)
         async with self._turn_lock:
             await self._run_turn_locked(prompt, inject_time=inject_time)
 
@@ -731,14 +793,15 @@ class CodexSession:
             "input": [{"type": "text", "text": prompt, "text_elements": []}],
             # Per-turn permission knobs — authoritative for the session's
             # current mode so a propagated set_permission_mode takes effect.
-            "approvalPolicy": approval_for_sandbox(sandbox_mode),
+            "approvalPolicy": self._approval_policy(),
             "approvalsReviewer": "user",
             "sandboxPolicy": build_sandbox_policy(sandbox_mode, str(self._cwd or "")),
             # Plan collaboration mode, re-asserted per turn (mirror of the local
-            # layer). read-only ⟺ the platform `plan` mode; minimal {mode:...} so
-            # the user's effort isn't overridden by a preset.
+            # layer): plan iff the platform mode is `plan` (0.5.123 — a check's
+            # judge runs the read-only sandbox WITHOUT planning); minimal
+            # {mode:...} so the user's effort isn't overridden by a preset.
             "settings": {"collaborationMode": {
-                "mode": "plan" if sandbox_mode == "read-only" else "default"}},
+                "mode": "plan" if self._plan_mode(sandbox_mode) else "default"}},
         }
         model = self.config.get("model", "")
         effort = self.config.get("effort", "")
@@ -749,7 +812,13 @@ class CodexSession:
 
         self._main_turn_done.clear()
         self._stop_requested = False
-        res = await self._client.request("turn/start", turn_params)
+        try:
+            res = await self._client.request("turn/start", turn_params)
+        except AppServerError as e:
+            if not self._note_untrusted_rejection(e):
+                raise
+            turn_params["approvalPolicy"] = self._approval_policy()
+            res = await self._client.request("turn/start", turn_params)
         self._current_turn_id = (res.get("turn") or {}).get("id")
         try:
             await self._main_turn_done.wait()
@@ -885,7 +954,7 @@ class CodexSession:
         # hook posts to the same endpoint over the same tunnel.
         sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
         overrides: dict = {
-            "approvalPolicy": approval_for_sandbox(sandbox_mode),
+            "approvalPolicy": self._approval_policy(),
             "approvalsReviewer": "user",
             "sandbox": sandbox_mode,
         }
@@ -991,7 +1060,7 @@ class CodexSession:
         """
         from ..host.cli_versions import resolve_spawn_bin_async
         codex_bin = await resolve_spawn_bin_async(
-            "codex", self.sat_config.codex_bin,
+            "codex", self.sat_config.bin_hint("codex"),
         )
         last_err: Exception | None = None
         for attempt in (1, 2):

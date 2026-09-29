@@ -220,14 +220,45 @@ def build_response(method: str, params: dict, allow: bool) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def approval_for_sandbox(sandbox_mode: str) -> str:
+# The approval policy that makes Codex ask for EVERY shell command its own
+# trusted list does not cover and for every patch (``AskForApproval::
+# UnlessTrusted``). Accepted on the app-server's ``thread/start``,
+# ``thread/resume`` and ``turn/start`` (its integration tests send it at
+# 0.153.4 and 0.154.0) but retired from config files and the CLI flag in
+# 0.149 — so a session that sends it must be ready for a rejection and fall
+# back (``UNTRUSTED_FALLBACK``); the bump checklist probes it.
+UNTRUSTED_POLICY = "untrusted"
+UNTRUSTED_FALLBACK = "on-request"
+
+
+def approval_for_sandbox(sandbox_mode: str, attended: bool = False) -> str:
     """Derive the Codex ``approvalPolicy`` from the resolved ``SandboxMode``.
 
-    ``danger-full-access`` (dontAsk/auto) → ``"never"``; ``read-only`` and
-    ``workspace-write`` → ``"on-request"`` so a sandbox escape fires an approval
-    we route through ``decide_tool_permission``.
+    ``danger-full-access`` (dontAsk/auto) → ``"never"``: nothing asks.
+    ``read-only`` and ``workspace-write`` → ``"on-request"`` by default, so a
+    sandbox escape, an MCP call and Codex's own dangerous-command heuristics
+    fire an approval we route through ``decide_tool_permission``.
+
+    ``attended=True`` (a dashboard app-server chat — a person can answer) →
+    ``"untrusted"``: every shell command Codex's trusted list does not cover
+    and every patch become an approval request, so the bridge decides each
+    one exactly as Claude's PreToolUse hook is decided — the read tier runs,
+    edits run in acceptEdits and ask in default, destructive commands ask in
+    both (HOOKS.md "Attended Codex chats"). Under ``on-request`` Codex ran an
+    in-workspace ``rm`` without asking anyone. The interactive TUI keeps
+    ``on-request`` (its native prompt is the person's).
     """
-    return "never" if sandbox_mode == "danger-full-access" else "on-request"
+    if sandbox_mode == "danger-full-access":
+        return "never"
+    return UNTRUSTED_POLICY if attended else "on-request"
+
+
+def is_untrusted_policy_rejection(error: Exception | str) -> bool:
+    """Did the app-server refuse a request because of the ``untrusted``
+    approval policy? (The fallback trigger — a future Codex may retire the
+    wire value as it retired the config key.)"""
+    text = str(error).lower()
+    return "untrusted" in text or "unlesstrusted" in text or "approvalpolicy" in text
 
 
 def build_sandbox_policy(sandbox_mode: str, writable_root: str = "") -> dict:

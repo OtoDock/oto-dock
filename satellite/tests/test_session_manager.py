@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from satellite import config as satcfg
 from satellite.config import SatelliteConfig
 from satellite.sessions.session_manager import SessionManager
 
@@ -21,8 +22,6 @@ def sat_config(tmp_path):
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=tmp_path / "agents",
         mcps_dir=tmp_path / "mcps",
-        claude_bin="claude",
-        codex_bin="codex",
     )
 
 
@@ -90,8 +89,10 @@ class TestStartSessionReplacement:
         replacement = AsyncMock()
         replacement.pid = 222
         ws = AsyncMock()
+        # The ENGINES table resolves the class from its own module at
+        # dispatch, so the patch lands where the class lives.
         with patch(
-            "satellite.sessions.session_manager.CLISession",
+            "satellite.sessions.cli_session.CLISession",
             return_value=replacement,
         ):
             await sm.start_session({
@@ -105,6 +106,48 @@ class TestStartSessionReplacement:
         stale.close.assert_awaited_once()
         replacement.start.assert_awaited_once()
         assert sm.sessions["sess-1"] is replacement
+
+    @pytest.mark.asyncio
+    async def test_same_id_respawn_for_the_codex_engine(self, sat_config):
+        sm = SessionManager(sat_config)
+        stale = AsyncMock()
+        stale.pid = 111
+        sm.sessions["sess-2"] = stale
+        replacement = AsyncMock()
+        replacement.pid = 222
+        replacement.thread_id = "thread-9"
+        ws = AsyncMock()
+        with patch(
+            "satellite.sessions.codex_session.CodexSession",
+            return_value=replacement,
+        ):
+            await sm.start_session({
+                "session_id": "sess-2",
+                "execution_path": "codex-cli",
+                "config": {},
+                "command_id": "cmd-2",
+                "agent_slug": "test-agent",
+            }, ws)
+        stale.close.assert_awaited_once()
+        replacement.start.assert_awaited_once()
+        assert sm.sessions["sess-2"] is replacement
+        # A session that captured its resume handle at start reports it —
+        # under the frame type that is FROZEN wire.
+        frames = [c.args[0] for c in ws.enqueue_send.await_args_list]
+        assert {"type": "codex_thread_id", "session_id": "sess-2",
+                "thread_id": "thread-9"} in frames
+
+    @pytest.mark.asyncio
+    async def test_unknown_engine_is_an_ack_error_before_any_spawn(self, sat_config):
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        await sm.start_session({
+            "session_id": "sess-x", "execution_path": "acme-cli", "config": {},
+            "command_id": "cmd-x", "agent_slug": "test-agent",
+        }, ws)
+        ack = ws.enqueue_send.await_args_list[0].args[0]
+        assert ack["status"] == "error" and "acme-cli" in ack["error"]
+        assert "sess-x" not in sm.sessions
 
 
 class TestFileSyncHandlers:
@@ -224,6 +267,11 @@ class _FakeCLISession:
     async def send_message(self, message, inject_time=False):
         for ev in self._events:
             yield dict(ev)
+
+    async def run_turn(self, message, *, inject_time=False, forward):
+        # Mirrors CLISession.run_turn: the manager hands us its forwarder.
+        async for ev in self.send_message(message, inject_time=inject_time):
+            await forward(ev)
 
     def detect_file_changes(self):
         return []
@@ -500,7 +548,7 @@ class TestFixWindowsExePathsAfterSwap:
         return launcher_blob + shebang + zip_payload
 
     def test_rewrites_embedded_python_path(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.WINDOWS])
         from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
 
         old_root = tmp_path / "workspace-mcp.new"
@@ -530,7 +578,7 @@ class TestFixWindowsExePathsAfterSwap:
         assert b"PK\x03\x04zipped-script-bytes" in rewritten
 
     def test_noop_on_non_windows(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.LINUX])
         from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
 
         old_root = tmp_path / "workspace-mcp.new"
@@ -546,7 +594,7 @@ class TestFixWindowsExePathsAfterSwap:
         assert old_python.encode("utf-8") in wrapper.read_bytes()
 
     def test_noop_when_no_scripts_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.WINDOWS])
         from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
 
         old_root = tmp_path / "workspace-mcp.new"
@@ -888,3 +936,282 @@ class TestSyncMcpsCategoryGate:
                 continue
             assert data.get("category") in MCP_CATEGORIES, mf
 
+
+
+class TestEngineTableDispatch:
+    """Every dispatch runs through the ENGINES table and fails closed on an id
+    the table lacks — on BOTH paths (the headless start and the PTY open)."""
+
+    @pytest.mark.asyncio
+    async def test_pty_open_refuses_an_unknown_or_absent_engine(self, sat_config):
+        sm = SessionManager(sat_config)
+        for msg in (
+            {"execution_path": "acme-cli"},
+            {},                                    # no key: never a default engine
+        ):
+            ws = _CapturingWS()
+            await sm.pty_open({
+                "session_id": "pty-x", "command_id": "cmd-p", "agent_slug": "test-agent",
+                "config": {}, **msg,
+            }, ws)
+            ack = ws.sent[0]
+            assert ack["status"] == "error", msg
+            assert "pty-x" not in sm.pty_sessions
+
+    def test_capabilities_advertise_the_dispatchable_engines(self, sat_config):
+        sm = SessionManager(sat_config)
+        with patch.object(shutil, "which", return_value=None):
+            caps = sm.detect_capabilities()
+        # The engines this CODE dispatches, whatever binaries are installed.
+        assert caps["engines"] == ["claude-code-cli", "codex-cli"]
+        assert caps["installed_clis"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_dead_codex_daemon_is_not_an_ack_error(self, sat_config):
+        """The Codex session re-warms its own dead daemon on the next turn
+        (thread/resume) — the dead-process ack error is the Claude CLI's,
+        whose process the PROXY must respawn."""
+        class _DeadCodex:
+            execution_path = "codex-cli"
+            is_alive = False
+            agent_slug = "agent-1"
+
+            def __init__(self):
+                self.turns = []
+
+            async def run_turn(self, message, *, inject_time=False, forward):
+                self.turns.append(message)
+
+            def detect_file_changes(self):
+                return []
+
+        sm = SessionManager(sat_config)
+        dead = _DeadCodex()
+        sm.sessions["sess-c"] = dead
+        ws = _CapturingWS()
+        await sm.send_message({"session_id": "sess-c", "command_id": "cmd-1",
+                               "message": "hi"}, ws)
+        assert ws.sent[0] == {"type": "ack", "command_id": "cmd-1", "status": "ok"}
+        assert dead.turns == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_codex_events_ride_untagged_and_unbuffered(self, sat_config):
+        """No Mode C retention for an engine without turn replay: its
+        persistent forwarder crosses turns by design, so its events carry no
+        _command_id / _seq and nothing is buffered for a replay."""
+        class _Codex:
+            execution_path = "codex-cli"
+            is_alive = True
+            agent_slug = "agent-1"
+
+            async def run_turn(self, message, *, inject_time=False, forward):
+                await forward({"method": "item/started", "params": {}})
+
+            def detect_file_changes(self):
+                return []
+
+        sm = SessionManager(sat_config)
+        sm.sessions["sess-c"] = _Codex()
+        ws = _CapturingWS()
+        await sm.send_message({"session_id": "sess-c", "command_id": "cmd-1",
+                               "message": "hi"}, ws)
+        events = [m["event"] for m in ws.sent if m["type"] == "session_event"]
+        assert events == [{"method": "item/started", "params": {}}]
+        assert "sess-c" not in sm.turn_buffers and "sess-c" not in sm.turn_state
+        assert [m["type"] for m in ws.sent][-1] == "turn_ended"
+
+    @pytest.mark.asyncio
+    async def test_resume_replay_names_the_engine_from_the_turn_state(self, sat_config):
+        sm = SessionManager(sat_config)
+        from collections import deque
+        sm.turn_state["s1"] = {"seq": 2, "active": False, "command_id": "cmd-1",
+                               "start_seq": 1, "execution_path": "claude-code-cli"}
+        sm.turn_buffers["s1"] = deque([
+            {"type": "assistant", "_seq": 1, "_command_id": "cmd-1"},
+            {"type": "_turn_sentinel", "_seq": 2, "command_id": "cmd-1"},
+        ])
+        ws = _CapturingWS()
+        await sm.resume_session_stream({"session_id": "s1"}, ws)   # session object gone
+        paths = {m["execution_path"] for m in ws.sent if m["type"] == "session_event"}
+        assert paths == {"claude-code-cli"}
+
+
+class TestStateDirectoriesReported:
+    def test_capabilities_carry_the_state_root_and_the_mcps_folder(self, sat_config):
+        from satellite import config
+        caps = SessionManager(sat_config).detect_capabilities()
+        assert caps["otodock_dir"] == str(config.otodock_dir().resolve()).replace("\\", "/")
+        assert caps["mcps_dir"] == str(sat_config.mcps_dir.resolve()).replace("\\", "/")
+        assert "/" in caps["otodock_dir"] and "\\" not in caps["otodock_dir"]
+
+    def test_capabilities_carry_the_home_and_the_root_as_the_os_names_them(
+            self, sat_config, tmp_path, monkeypatch):
+        """A home reached through a link: the resolved forms above, and the
+        unresolved ones beside them, so the proxy refuses both spellings."""
+        from pathlib import Path
+        from satellite import config
+        real = tmp_path / "data" / "home" / "bob"
+        real.mkdir(parents=True)
+        link = tmp_path / "home-bob"
+        link.symlink_to(real)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: link))
+        caps = SessionManager(sat_config).detect_capabilities()
+        assert caps["home_dir_unresolved"] == str(link).replace("\\", "/")
+        assert caps["otodock_dir_unresolved"] == (
+            str(link / config.OTODOCK_DIRNAME).replace("\\", "/"))
+        assert caps["otodock_dir"] == str(real / config.OTODOCK_DIRNAME).replace("\\", "/")
+
+
+class TestManifestPaging:
+    def _tree(self, sat_config, n):
+        d = sat_config.agents_dir / "test-agent" / "workspace"
+        d.mkdir(parents=True)
+        for i in range(n):
+            (d / f"f{i}.txt").write_text(str(i))
+
+    @pytest.mark.asyncio
+    async def test_a_request_without_page_size_answers_one_frame(self, sat_config):
+        self._tree(sat_config, 5)
+        sm = SessionManager(sat_config)
+        ws = _CapturingWS()
+        await sm.request_manifest({"agent_slug": "test-agent", "command_id": "c1"}, ws)
+        assert len(ws.sent) == 1
+        assert ws.sent[0]["type"] == "file_manifest" and "more" not in ws.sent[0]
+        assert len(ws.sent[0]["files"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_a_request_with_page_size_answers_pages_in_order(self, sat_config, monkeypatch):
+        from satellite.sessions import session_manager as smod
+        monkeypatch.setattr(smod, "_MANIFEST_PAGE_MIN", 1)
+        self._tree(sat_config, 5)
+        sm = SessionManager(sat_config)
+        ws = _CapturingWS()
+        await sm.request_manifest(
+            {"agent_slug": "test-agent", "command_id": "c1", "page_size": 2}, ws)
+        assert [(m["page"], m["more"], len(m["files"])) for m in ws.sent] == [
+            (0, True, 2), (1, True, 2), (2, False, 1)]
+        assert {m["command_id"] for m in ws.sent} == {"c1"}
+        paths = [e["path"] for m in ws.sent for e in m["files"]]
+        assert sorted(paths) == sorted(f"workspace/f{i}.txt" for i in range(5))
+
+    @pytest.mark.asyncio
+    async def test_the_pages_are_sized_off_the_loop(self, sat_config, monkeypatch):
+        """Sizing a big tree's pages is a serialization per entry: it runs
+        with the walk, off the loop that carries heartbeats and PTY frames."""
+        import threading
+        from satellite.sessions import session_manager as smod
+        real = smod._manifest_pages
+        threads: list[bool] = []
+
+        def _spy(entries, page_size):
+            threads.append(threading.current_thread() is threading.main_thread())
+            return real(entries, page_size)
+        monkeypatch.setattr(smod, "_manifest_pages", _spy)
+        self._tree(sat_config, 3)
+        ws = _CapturingWS()
+        await SessionManager(sat_config).request_manifest(
+            {"agent_slug": "test-agent", "command_id": "c1", "page_size": 4096}, ws)
+        assert threads == [False]
+        assert [len(m["files"]) for m in ws.sent] == [3]
+
+    def test_pages_are_bounded_by_entries_and_by_bytes(self):
+        from satellite.sessions.session_manager import _manifest_pages
+        assert _manifest_pages([], 4096) == [[]]
+        many = [{"path": f"p{i}", "hash": "h", "size": 1, "mtime": 1.0} for i in range(10000)]
+        pages = _manifest_pages(many, 1)          # clamped up to the floor
+        assert all(len(p) <= 256 for p in pages) and sum(len(p) for p in pages) == 10000
+        pages = _manifest_pages(many, 10 ** 9)    # clamped down to the ceiling
+        assert all(len(p) <= 8192 for p in pages) and len(pages) == 2
+        fat = [{"path": "x" * (1100 * 1024), "hash": "h", "size": 1, "mtime": 1.0} for _ in range(5)]
+        pages = _manifest_pages(fat, 4096)
+        assert len(pages) == 5 and all(len(p) == 1 for p in pages)
+
+
+class TestSourceBuildOnTheSpec:
+    def test_the_field_is_validated(self):
+        from satellite.sessions.session_manager import _source_build_of
+        assert _source_build_of({}) == []
+        assert _source_build_of({"source_build": None}) == []
+        assert _source_build_of({"source_build": "unifi-network"}) == []
+        assert _source_build_of({"source_build": ["unifi-network", "bad pkg!", 3, "a.b_c-d"]}) == [
+            "unifi-network", "a.b_c-d"]
+
+    @pytest.mark.asyncio
+    async def test_the_install_receives_it(self, sat_config):
+        from types import SimpleNamespace
+        import base64
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            data = json.dumps({"name": "unifi-mcp", "server": {"transport": "stdio"}}).encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        spec = {
+            "name": "unifi-mcp", "category": "community", "runtime": "python", "source": "",
+            "tarball_b64": base64.b64encode(buf.getvalue()).decode(), "version_hash": "h1",
+            "source_build": ["unifi-network", "not ok"],
+        }
+        sm = SessionManager(sat_config)
+        ws = AsyncMock()
+        installed = SimpleNamespace(ok=True, log="", version_hash="h1")
+        with patch("satellite._vendored.mcp_installer.install_mcp",
+                   AsyncMock(return_value=installed)) as inst, \
+             patch("satellite.sessions.session_manager._warm_one_mcp",
+                   AsyncMock(side_effect=lambda root, name, sem: (name, "ok"))):
+            await sm.sync_mcps(
+                {"command_id": "c1", "mcps_to_install": [spec], "mcps_to_remove": []}, ws)
+        assert inst.await_args.kwargs["source_build"] == ["unifi-network"]
+
+
+class TestPullAndStatOpenBeneathTheRoot:
+    def _tree(self, sat_config):
+        import os
+        agent = sat_config.agents_dir / "test-agent"
+        (agent / "workspace").mkdir(parents=True)
+        (agent / "users" / "other").mkdir(parents=True)
+        (agent / "users" / "other" / "f.txt").write_bytes(b"PRIVATE")
+        os.symlink("../users/other", agent / "workspace" / "alias")
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_pull_refuses_an_in_tree_link_component(self, sat_config):
+        self._tree(sat_config)
+        sm = SessionManager(sat_config)
+        ws = _CapturingWS()
+        await sm.file_pull({"agent_slug": "test-agent", "path": "workspace/alias/f.txt",
+                            "request_id": "r1"}, ws)
+        assert len(ws.sent) == 1
+        assert ws.sent[0]["error"].startswith("path not authorized")
+        assert "content_b64" not in ws.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_pull_streams_a_regular_file(self, sat_config):
+        agent = self._tree(sat_config)
+        (agent / "workspace" / "ok.txt").write_bytes(b"ok")
+        sm = SessionManager(sat_config)
+        ws = _CapturingWS()
+        await sm.file_pull({"agent_slug": "test-agent", "path": "workspace/ok.txt",
+                            "request_id": "r1"}, ws)
+        import base64
+        assert base64.b64decode(ws.sent[-1]["content_b64"]) == b"ok"
+        assert ws.sent[-1]["hash"].startswith("sha256:")
+
+    @pytest.mark.asyncio
+    async def test_stat_answers_from_the_name_itself(self, sat_config):
+        agent = self._tree(sat_config)
+        (agent / "workspace" / "ok.txt").write_bytes(b"ok")
+        sm = SessionManager(sat_config)
+        ws = _CapturingWS()
+        await sm.file_stat({"agent_slug": "test-agent", "path": "workspace/alias/f.txt",
+                            "command_id": "s1"}, ws)
+        assert ws.sent[0]["status"] == "error"
+        ws = _CapturingWS()
+        await sm.file_stat({"agent_slug": "test-agent", "path": "workspace/ok.txt",
+                            "command_id": "s2"}, ws)
+        assert ws.sent[0]["exists"] is True and ws.sent[0]["size"] == 2
+        ws = _CapturingWS()
+        await sm.file_stat({"agent_slug": "test-agent", "path": "workspace/none.txt",
+                            "command_id": "s3"}, ws)
+        assert ws.sent[0]["status"] == "ok" and ws.sent[0]["exists"] is False

@@ -21,13 +21,15 @@ import contextlib
 import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from psycopg import errors as pg_errors
 from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_auth
 from services.mcp import mcp_registry
 from services.webhooks import subscription_manager
-from storage.automation import webhook_subscription_store
+from storage import database as task_store
+from storage.automation import trigger_store, webhook_subscription_store
 
 logger = logging.getLogger("claude-proxy.api.subscriptions")
 router = APIRouter()
@@ -46,6 +48,8 @@ class CreateSubscriptionRequest(BaseModel):
     selected_events: list[str]
     selected_subevents: dict[str, list[str]] | None = None
     agent: str | None = None  # required when scope='service'
+    # A `vendor_target_spec.target_kinds` key; '' = the manifest's default kind.
+    vendor_target_kind: str = ""
 
 
 # =====================================================================
@@ -87,6 +91,28 @@ def _can_view_subscription(row: dict, user: UserContext) -> bool:
         agent = row.get("agent", "")
         return user.can_access_agent(agent) if agent else False
     return False
+
+
+def _ensure_bound_label(*, mcp_name: str, agent: str, account_label: str) -> None:
+    """A service-scope request may only name the account the agent's service
+    binding points at (same rule as the manager's create path)."""
+    from services.oauth import credential_resolver
+    ref = credential_resolver.pick_account(mcp_name, agent)
+    if ref is None:
+        raise HTTPException(
+            400, f"no account bound to agent {agent!r} for {mcp_name}",
+        )
+    if ref.label != account_label:
+        raise HTTPException(
+            400,
+            detail={
+                "message": (
+                    f"account {account_label!r} is not the service account "
+                    f"bound to agent {agent!r} for {mcp_name}"
+                ),
+                "bound_account_label": ref.label,
+            },
+        )
 
 
 def _enforce_create_permission(
@@ -158,6 +184,7 @@ async def create_subscription(
             # The trusted master key counts as admin; a session token (an
             # agent subprocess, incl. a phone caller's) never does.
             caller_is_admin=bool(u.is_admin or u.is_service),
+            target_kind=body.vendor_target_kind or "",
         )
     except subscription_manager.SubscriptionScopeError as e:
         raise HTTPException(
@@ -172,7 +199,34 @@ async def create_subscription(
         )
     except subscription_manager.SubscriptionError as e:
         raise HTTPException(e.status, detail={"message": str(e), **(e.detail or {})})
+    except pg_errors.UniqueViolation:
+        # Service rows fill every column of the unique index, so re-submitting
+        # a paired loop after a partial failure hits the index on the rows
+        # that already exist. A clean 409 lets the client skip them.
+        raise HTTPException(
+            409,
+            detail={
+                "error": "exists",
+                "message": "A subscription for this target already exists "
+                           "for this account in this scope",
+            },
+        )
     return row
+
+
+def _decorate_creators(rows: list[dict]) -> list[dict]:
+    """Add ``created_by_name`` so a service row can say who subscribed the
+    agent (a co-manager, not necessarily the bound account's owner)."""
+    names: dict[str, str] = {}
+    for r in rows:
+        sub = r.get("created_by") or ""
+        if sub and sub not in names:
+            u = task_store.get_user(sub) or {}
+            names[sub] = (
+                u.get("display_name") or u.get("name") or u.get("username") or ""
+            )
+        r["created_by_name"] = names.get(sub, "")
+    return rows
 
 
 @router.get("/v1/subscriptions")
@@ -214,7 +268,7 @@ async def list_subscriptions(
         # Filter service-scope rows by manageable agents (view ≠ manage; we
         # still SHOW agent-scope rows for any agent the user can access).
         rows = [r for r in rows if _can_view_subscription(r, u)]
-    return {"subscriptions": rows}
+    return {"subscriptions": _decorate_creators(rows)}
 
 
 @router.get("/v1/subscriptions/{subscription_id}")
@@ -234,9 +288,13 @@ async def get_subscription(
 @router.delete("/v1/subscriptions/{subscription_id}")
 async def delete_subscription(
     subscription_id: str,
+    force: bool = Query(default=False),
     user: UserContext | None = Depends(get_current_user),
     x_on_behalf_of: str | None = Header(default=None),
 ):
+    """Delete a subscription. Triggers still linked to it make this a 409
+    (the FK would detach them silently) unless ``force=true``; the cascades
+    (account disconnect, agent delete, binding clear) keep the FK behaviour."""
     u = require_auth(user)
     _reject_on_behalf(x_on_behalf_of)
     row = webhook_subscription_store.get_subscription(subscription_id)
@@ -244,10 +302,30 @@ async def delete_subscription(
         raise HTTPException(404, "Subscription not found")
     if not _can_manage_subscription(row, u):
         raise HTTPException(403, "Access denied")
-    deleted = await subscription_manager.delete_subscription(
+    if not force:
+        linked = trigger_store.list_triggers(subscription_id=subscription_id)
+        if linked:
+            raise HTTPException(
+                409,
+                detail={
+                    "error": "linked_triggers",
+                    "message": (
+                        f"{len(linked)} trigger(s) still fire from this "
+                        f"subscription; pass force=true to delete it and "
+                        f"leave them without a source"
+                    ),
+                    "triggers": [
+                        {"id": t["id"], "name": t["name"], "scope": t["scope"]}
+                        for t in linked
+                    ],
+                },
+            )
+    deleted, vendor_detached = await subscription_manager.delete_subscription(
         subscription_id=subscription_id,
     )
-    return {"deleted": bool(deleted)}
+    # vendor_detached=false: the row is gone but the vendor still holds the
+    # registration — the panel tells the user to remove it by hand.
+    return {"deleted": bool(deleted), "vendor_detached": bool(vendor_detached)}
 
 
 @router.post("/v1/subscriptions/{subscription_id}/renew")
@@ -293,6 +371,16 @@ async def get_event_catalog(
     webhooks = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
     if not webhooks.get("available", False):
         raise HTTPException(404, f"MCP {mcp_name!r} does not support webhooks")
+    if scope == "service":
+        # The effective mode and the prefill below read the BOUND OWNER's
+        # token file: only someone with access to the agent may ask, and
+        # only for the account the binding names.
+        if not agent:
+            raise HTTPException(400, "scope=service requires an `agent`")
+        if not u.can_access_agent(agent):
+            raise HTTPException(403, "Access denied")
+        if account_label:
+            _ensure_bound_label(mcp_name=mcp_name, agent=agent, account_label=account_label)
     catalog = webhooks.get("event_catalog", [])
     if not (u.is_admin or u.is_api_key):
         catalog = [e for e in catalog if not e.get("admin_only")]

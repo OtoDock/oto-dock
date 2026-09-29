@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from auth.path_policy import build_permission_context, SecurityContext
 from storage.agents import agent_store
+from core import placement
 
 
 def _ctx(role: str, username: str, agent: str = "pa", display_name: str = "Alice") -> SecurityContext:
@@ -415,8 +416,8 @@ def test_env_admin_remote_block(temp_db):
     ctx = SecurityContext(
         role="manager", username="alice", agent="ops", is_admin_agent=False,
         display_name="Alice", email="a@x.com",
-        target_kind="admin_remote", target_label="prod-server-01",
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="prod-server-01"),
+        )
     text = build_permission_context(
         ctx, assigned_mcp_names=(), execution_path="claude-code-cli",
     )
@@ -437,8 +438,8 @@ def test_env_user_remote_block(temp_db):
     ctx = SecurityContext(
         role="manager", username="alice", agent="pa", is_admin_agent=False,
         display_name="Alice", email="a@x.com",
-        target_kind="user_remote", target_label="alice-laptop",
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="alice-laptop"),
+        )
     text = build_permission_context(
         ctx, assigned_mcp_names=(), execution_path="claude-code-cli",
     )
@@ -452,8 +453,8 @@ def test_admin_tier_open_on_remote_for_manager(temp_db):
     from auth.path_policy import check_tool_access
     ctx = SecurityContext(
         role="manager", username="alice", agent="ops", is_admin_agent=False,
-        target_kind="admin_remote", target_label="prod-01",
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="prod-01"),
+        )
     decision, _ = check_tool_access(
         "Bash", {"command": "docker compose up -d"}, ctx,
     )
@@ -466,8 +467,8 @@ def test_admin_tier_blocked_locally_for_manager(temp_db):
     from auth.path_policy import check_tool_access
     ctx = SecurityContext(
         role="manager", username="alice", agent="ops", is_admin_agent=False,
-        target_kind="local", target_label="",
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_LOCAL, label=""),
+        )
     decision, _ = check_tool_access(
         "Bash", {"command": "docker compose up -d"}, ctx,
     )
@@ -480,8 +481,8 @@ def test_admin_tier_blocked_for_viewer_on_remote(temp_db):
     from auth.path_policy import check_tool_access
     ctx = SecurityContext(
         role="viewer", username="alice", agent="ops", is_admin_agent=False,
-        target_kind="admin_remote", target_label="prod-01",
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="prod-01"),
+        )
     decision, _ = check_tool_access(
         "Bash", {"command": "docker ps"}, ctx,
     )

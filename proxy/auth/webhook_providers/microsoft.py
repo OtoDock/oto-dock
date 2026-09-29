@@ -29,6 +29,7 @@ import hmac
 import json
 import logging
 
+import config
 from auth.webhook_providers.base import NormalizedEvent, VerifyResult
 from auth.webhook_providers.generic import GenericWebhookProvider
 from services.webhooks.event_normalizer import normalize_event
@@ -63,9 +64,14 @@ class MicrosoftWebhookProvider(GenericWebhookProvider):
         Returns ``ok=True`` only when the body is well-formed JSON with
         a non-empty ``value`` array AND every item's clientState matches.
         """
+        # The only parse before authentication on this route: bounded by the
+        # receive route's body cap, and refused past it here too.
+        cap = config.MAX_WEBHOOK_BODY_BYTES
+        if cap and len(raw_body) > cap:
+            return VerifyResult(False, reason="malformed_body")
         try:
-            body = json.loads(raw_body.decode("utf-8", errors="replace") or "{}")
-        except json.JSONDecodeError:
+            body = json.loads(raw_body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return VerifyResult(False, reason="malformed_body")
         if not isinstance(body, dict):
             return VerifyResult(False, reason="malformed_body")

@@ -19,6 +19,7 @@ if _proxy_root not in sys.path:
 from tests.mcp.test_mcp_broker_activation import (  # noqa: E402
     _FakeManifest, _stub_assembly,
 )
+from core import placement
 
 
 def _ssh_like_manifest():
@@ -40,7 +41,7 @@ def test_config_file_mcp_excluded_on_remote(monkeypatch, tmp_path):
     )
 
     _path, _env, excluded, bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True,
+        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
     )
 
     assert "ssh-server" in excluded
@@ -61,7 +62,7 @@ def test_config_file_mcp_included_locally(monkeypatch, tmp_path):
     )
 
     _path, _env, excluded, _bundles, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=False,
+        "agent", None, placement=placement.LOCAL_PLACEMENT,
     )
 
     assert "ssh-server" not in excluded

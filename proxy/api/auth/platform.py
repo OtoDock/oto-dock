@@ -10,9 +10,12 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
+from core import placement
 from auth.license import get_current_license, get_license_key, set_license_key
+from auth import lan_check
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from storage import database as task_store
+from storage.pg import run_db
 
 from api.auth._router import router
 import contextlib
@@ -65,6 +68,13 @@ class PlatformSettingsRequest(BaseModel):
     # Passkey sign-in mode: "passwordless" (primary sign-in button; UV-required
     # so always ≥2 factors) or "second_factor" (passkeys only at the 2FA step).
     passkey_login_mode: str | None = None
+    # Sharing (SHARING.md): external links at all, public (no-password)
+    # links, the longest expiry a link may have (empty = no cap) and whether
+    # members may browse the user directory when sharing internally.
+    sharing_external_enabled: bool | None = None
+    sharing_public_links_enabled: bool | None = None
+    sharing_max_expiry_days: str | None = None
+    user_directory_visible_to_members: bool | None = None
 
 
 class LicenseKeyRequest(BaseModel):
@@ -101,7 +111,7 @@ async def _enforce_user_paired_disabled() -> None:
             machine = _rs.get_remote_machine(machine_id)
             if not machine:
                 continue
-            if (machine.get("pairing_scope") or "") == "admin":
+            if placement.machine_is_admin_paired(machine):
                 continue  # admin-paired stays connected
             try:
                 _rs.clear_user_remote_targets_for_machine(machine_id)
@@ -190,6 +200,10 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         "quota_shared_folder_inodes": settings.get("quota_shared_folder_inodes", "") or str(config.QUOTA_SHARED_FOLDER_INODES_DEFAULT),
         "quota_user_folder_inodes": settings.get("quota_user_folder_inodes", "") or str(config.QUOTA_USER_FOLDER_INODES_DEFAULT),
         "storage_quotas_enforced": storage_quota.hard_enabled(),
+        # Reverse-proxy misconfigurations seen in the last hour (the address
+        # that sent forwarding headers without being a trusted proxy, or a
+        # trusted proxy that appends no X-Forwarded-For): auth/lan_check.py.
+        "forwarding_warnings": lan_check.forwarding_warnings(),
         # SMTP
         "smtp_host": settings.get("smtp_host", ""),
         "smtp_port": settings.get("smtp_port", "587"),
@@ -247,7 +261,40 @@ async def get_platform_settings(user: UserContext | None = Depends(get_current_u
         # forced enrollment after login — never a silent lockout.
         "require_2fa": settings.get("require_2fa", "") == "1",
         "passkey_login_mode": settings.get("passkey_login_mode", "") or "passwordless",
+        # Sharing (SHARING.md). Default ON for the switches (unset = "1"
+        # semantics); the expiry cap is empty when there is none.
+        "sharing_external_enabled": settings.get("sharing_external_enabled", "") != "0",
+        "sharing_public_links_enabled": settings.get("sharing_public_links_enabled", "") != "0",
+        "sharing_max_expiry_days": settings.get("sharing_max_expiry_days", ""),
+        "user_directory_visible_to_members": settings.get("user_directory_visible_to_members", "") != "0",
     }
+
+
+async def _refuse_require_2fa_that_would_hold(u: UserContext) -> None:
+    """Turning ``require_2fa`` on is refused while it would hold the admin who
+    turns it on (a password account with no second factor): 409 before any
+    setting of the request is written. Never a lockout: the
+    refusal is the way to the enrolment screen. An SSO admin is never held."""
+    from storage.identity import webauthn_store
+
+    def _job() -> bool:
+        if task_store.get_platform_setting("require_2fa") == "1":
+            return False
+        row = task_store.get_user(u.sub)
+        if not row or str(row.get("auth_provider") or "").startswith("oidc:"):
+            return False
+        if row.get("totp_enabled"):
+            return False
+        from api.auth.webauthn import passkeys_enabled
+        return not passkeys_enabled() or webauthn_store.count_credentials(u.sub) == 0
+
+    if await run_db(_job):
+        raise HTTPException(
+            status_code=409,
+            detail=("Set up two-step sign-in on your own account first (an authenticator "
+                    "app or a passkey): turning this on would hold you on the enrolment "
+                    "screen."),
+        )
 
 
 @router.put("/v1/admin/platform-settings")
@@ -257,6 +304,8 @@ async def set_platform_settings(
 ):
     """Update platform settings. Admin only."""
     u = require_admin(user)
+    if req.require_2fa:
+        await _refuse_require_2fa_that_would_hold(u)
     if req.company_name is not None:
         await asyncio.to_thread(task_store.set_platform_setting, "company_name", req.company_name)
     if req.platform_instructions is not None:
@@ -305,6 +354,17 @@ async def set_platform_settings(
             "1" if req.subscription_windows_enabled else "0",
         )
         subscription_windows.invalidate_setting_cache()
+    for key in ("sharing_external_enabled", "sharing_public_links_enabled",
+                "user_directory_visible_to_members"):
+        val = getattr(req, key)
+        if val is not None:
+            await asyncio.to_thread(task_store.set_platform_setting, key, "1" if val else "0")
+    if req.sharing_max_expiry_days is not None:
+        raw = req.sharing_max_expiry_days.strip()
+        if raw and (not raw.isdigit() or not 1 <= int(raw) <= 3650):
+            raise HTTPException(status_code=400,
+                                detail="sharing_max_expiry_days must be 1 to 3650, or empty")
+        await asyncio.to_thread(task_store.set_platform_setting, "sharing_max_expiry_days", raw)
     if req.remote_fallback_user_override is not None:
         await asyncio.to_thread(
             task_store.set_platform_setting,
@@ -391,6 +451,9 @@ async def set_platform_settings(
             task_store.set_platform_setting,
             "require_2fa", "1" if req.require_2fa else "0",
         )
+        # The gate's policy-off cache must not delay what was just turned on.
+        from auth.providers import clear_auth_gate_caches
+        clear_auth_gate_caches()
     if req.passkey_login_mode is not None:
         if req.passkey_login_mode not in ("passwordless", "second_factor"):
             raise HTTPException(status_code=400, detail="Invalid passkey_login_mode")

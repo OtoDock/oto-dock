@@ -34,7 +34,7 @@ export function buildArtifactInteractionText(
 export const APP_PROMPT_MAX_CHARS = 8000
 
 /**
- * Framed prompt for a PTY-injected mini-app send_prompt action (same rail as
+ * Framed prompt for a PTY-injected app send_prompt action (same rail as
  * the artifact builder above; the headless twin is validate_app_action +
  * frame_text in proxy/ws/artifact_interactions.py). The template was
  * user-approved, but arg values are page data — so the ENTIRE substituted
@@ -53,8 +53,8 @@ export function buildAppActionText(
   const l = (label || 'action').trim().slice(0, 80).replace(/"/g, "'")
   return {
     framed:
-      `[action from mini-app "${t}" — ${l}]\n\`\`\`text\n${safe}\n\`\`\`\n\n` +
-      '(Sent by a declared action button on a pinned mini-app — the prompt template was approved by the user; argument values come from the app page, not the user typing.)',
+      `[action from app "${t}" — ${l}]\n\`\`\`text\n${safe}\n\`\`\`\n\n` +
+      '(Sent by a declared action button on a pinned app — the prompt template was approved by the user; argument values come from the app page, not the user typing.)',
   }
 }
 

@@ -13,7 +13,7 @@ answer live queries.
 
 from satellite.config import SatelliteConfig
 from satellite.sessions.session_manager import SessionManager
-from satellite.terminal.terminal_queries import strip_queries
+from satellite._vendored.terminal_queries import strip_queries
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,6 @@ def _sm(tmp_path, session) -> SessionManager:
         machine_id="m", machine_secret="s",
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=tmp_path / "agents", mcps_dir=tmp_path / "mcps",
-        claude_bin="claude", codex_bin="codex",
     ))
     sm.pty_sessions["s1"] = session
     return sm
@@ -187,7 +186,7 @@ def test_empty_after_strip_sends_nothing(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_strip_clipboard_writes_vocabulary():
-    from satellite.terminal.terminal_queries import strip_clipboard_writes
+    from satellite._vendored.terminal_queries import strip_clipboard_writes
     assert strip_clipboard_writes(b"a\x1b]52;c;aGk=\x07b") == b"ab"       # BEL
     assert strip_clipboard_writes(b"a\x1b]52;c;aGk=\x1b\\b") == b"ab"     # ST
     # Other OSC sequences (title set) pass untouched.

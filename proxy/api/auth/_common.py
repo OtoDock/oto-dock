@@ -56,3 +56,17 @@ def _build_user_response(user_row: dict, agents: list[str] | None = None,
         "must_change_password": bool(user_row.get("must_change_password")),
         "feature_flags": build_feature_flags(),
     }
+
+
+def user_payload(user_row: dict) -> dict:
+    """The user object every login answers with: ``_build_user_response``
+    plus the forced password change and 2FA enrolment from the one gate rule
+    (``auth.providers.auth_gate``), so the login, ``/auth/me``, the server's
+    refusals and the dashboard socket can never disagree. Synchronous: call
+    it on the DB executor."""
+    from auth.providers import GATE_CHANGE_PASSWORD, GATE_ENROLL_2FA, auth_gate
+    data = _build_user_response(user_row)
+    gate = auth_gate(user_row)
+    data["must_change_password"] = gate == GATE_CHANGE_PASSWORD
+    data["must_enroll_2fa"] = gate == GATE_ENROLL_2FA
+    return data

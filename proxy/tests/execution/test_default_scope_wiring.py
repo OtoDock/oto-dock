@@ -25,8 +25,8 @@ from tests._paths import CUSTOM_MCPS as _CUSTOM_MCPS, load_mcp_server
 def test_agent_row_drives_default_scope(temp_db):
     agent_store.create_agent("pa", "PA", default_scope="user")
     agent_store.create_agent("ops", "Ops", default_scope="agent")
-    _, _, pa_scope = oto_env.resolve_memory_and_scope("pa", username="alice")
-    _, _, ops_scope = oto_env.resolve_memory_and_scope("ops", username="alice")
+    _, _, pa_scope = oto_env.resolve_memory_and_scope("pa", username="alice", user_role="manager")
+    _, _, ops_scope = oto_env.resolve_memory_and_scope("ops", username="alice", user_role="manager")
     assert pa_scope == "user"
     assert ops_scope == "agent"
 
@@ -97,7 +97,7 @@ def test_viewer_clamp_does_not_override_agent_session(temp_db):
 def test_env_carries_resolved_default_scope(temp_db):
     """End-to-end: agent_store value reaches the env dict."""
     agent_store.create_agent("ops", "Ops", default_scope="agent")
-    mu, ma, ds = oto_env.resolve_memory_and_scope("ops", username="alice")
+    mu, ma, ds = oto_env.resolve_memory_and_scope("ops", username="alice", user_role="manager")
     env = oto_env.build_oto_env(
         agent_name="ops", username="alice", user_role="manager",
         session_id="s", default_scope=ds,
@@ -194,3 +194,14 @@ def test_triggers_mcp_schema_default_follows_oto_default_scope(monkeypatch):
     tools = asyncio.run(server.list_tools())
     by_name = {t.name: t for t in tools}
     assert _scope_property(by_name["create_trigger"])["default"] == "agent"
+
+
+def test_contributor_clamped_to_user_like_a_viewer(temp_db):
+    """A contributor writes the shared workspace but creates no agent-scope
+    artifact (the editor tier's API gate 403s), so the MCP-facing default
+    clamps to 'user' exactly like a viewer's."""
+    agent_store.create_agent("ops", "Ops", default_scope="agent")
+    _, _, scope = oto_env.resolve_memory_and_scope(
+        "ops", username="alice", user_role="contributor",
+    )
+    assert scope == "user"

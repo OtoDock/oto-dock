@@ -38,7 +38,7 @@ def init_agents(conn) -> None:
                 CHECK (default_scope IN ('user', 'agent')),
             community_template_data JSONB NOT NULL DEFAULT '{}'::jsonb,
             default_for_new_users_role TEXT NOT NULL DEFAULT ''
-                CHECK (default_for_new_users_role IN ('', 'viewer', 'editor', 'manager')),
+                CHECK (default_for_new_users_role IN ('', 'viewer', 'contributor', 'editor', 'manager')),
             -- visibility-modes 2×2 (with default_scope): TRUE+user=Personal+shared,
             -- TRUE+agent=Shared+personal, FALSE+user=Personal-only, FALSE+agent=Shared-only.
             collaborative BOOLEAN NOT NULL DEFAULT TRUE,
@@ -120,9 +120,17 @@ def init_departments(conn) -> None:
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             created_by_sub TEXT NOT NULL DEFAULT '',
-            auto_delegation BOOLEAN NOT NULL DEFAULT TRUE,
             reach TEXT NOT NULL DEFAULT 'adjacent'
                 CHECK (reach IN ('adjacent', 'subtree')),
+            -- What the compiled edges wire (db_departments.MODE_WIRING):
+            -- 'off' nothing; 'down' a strict hierarchy (below only);
+            -- 'down_across' the hierarchy plus the same level mutual; 'both'
+            -- every wired pair both ways. The column default serves the
+            -- forward migration only (a department from before the column
+            -- keeps the symmetric wiring it had); every INSERT writes the
+            -- value explicitly and a NEW department defaults to 'down'.
+            mode TEXT NOT NULL DEFAULT 'both'
+                CHECK (mode IN ('off', 'down', 'down_across', 'both')),
             -- Free-form map placement hint (JSON), owned by the map UI.
             position_hint TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,

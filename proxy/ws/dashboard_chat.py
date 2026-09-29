@@ -23,7 +23,7 @@ names below are re-exported for their existing importers.
 import config  # noqa: F401  (tests patch ``dashboard_chat.config.get_model_provider``)
 from ws.dashboard_chat_text import (  # noqa: F401
     _STOP_AND_SEND_NOTE,
-    _codex_provider_switch_blocker,
+    _provider_switch_blocker,
     _queued_outgoing,
 )
 from ws.dashboard_chat_send import ChatSendMixin

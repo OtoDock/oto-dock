@@ -90,7 +90,7 @@ def test_audio_tts_generate_is_allowlisted():
 
 
 def test_artifact_and_app_hooks_are_allowlisted():
-    """display-mcp on a satellite session: display_ui + the mini-app tools
+    """display-mcp on a satellite session: display_ui + the app tools
     reach the proxy through the tunnel — the live 403 path-not-allowlisted
     on the first trusted-VM test (2026-07-10). Exact hook paths only."""
     from satellite.transport.http_tunnel import _is_allowed_path
@@ -98,8 +98,28 @@ def test_artifact_and_app_hooks_are_allowlisted():
     assert _is_allowed_path("/v1/hooks/apps/pin")
     assert _is_allowed_path("/v1/hooks/apps/unpin")
     assert _is_allowed_path("/v1/hooks/apps/list")
+    # The live-apps hooks (push/state/open) — mirrored on both sides.
+    assert _is_allowed_path("/v1/hooks/apps/push")
+    assert _is_allowed_path("/v1/hooks/apps/state")
+    assert _is_allowed_path("/v1/hooks/apps/describe")
+    assert _is_allowed_path("/v1/hooks/apps/export")
+    assert _is_allowed_path("/v1/hooks/apps/import")
+    assert _is_allowed_path("/v1/hooks/apps/open")
+    assert _is_allowed_path("/v1/hooks/apps/screenshot")
+    assert _is_allowed_path("/v1/hooks/apps/rollback")
+    for op in ("deploy", "check", "status", "preview", "logs", "restart", "purge"):
+        assert _is_allowed_path(f"/v1/hooks/apps/{op}"), op
     assert not _is_allowed_path("/v1/hooks/apps")
     assert not _is_allowed_path("/v1/hooks/apps/evil")
+    # Agents calling apps (APPS.md) — mirrored in the proxy's list.
+    app = "0f4d7c2e-1b3a-4c5d-8e6f-7a8b9c0d1e2f"
+    assert _is_allowed_path(f"/v1/apps/{app}/api/cards")
+    assert _is_allowed_path(f"/v1/apps/{app}/platform/viewer.me")
+    assert _is_allowed_path(f"/v1/apps/{app}/push")
+    assert _is_allowed_path(f"/v1/apps/{app}/state")
+    assert not _is_allowed_path(f"/v1/apps/{app}/client/abc/app.js")
+    assert not _is_allowed_path(f"/v1/apps/{app}/ws/chat")
+    assert not _is_allowed_path(f"/v1/apps/{app}/viewer-token")
 
 
 def test_phone_relay_is_allowlisted():
@@ -355,3 +375,15 @@ def test_delegation_and_continuations_are_allowlisted():
     assert _is_allowed_path("/v1/continuations")
     assert not _is_allowed_path("/v1/delegationX")
     assert not _is_allowed_path("/v1/delegation/../admin")
+
+
+def test_checks_routes_are_allowlisted():
+    # checks-mcp (CHECKS.md, 0.5.123): the session-side routes ride the tunnel
+    # (live 403 path-not-allowlisted on the first run_check from a machine);
+    # the agent-scoped listing already rides the /v1/agents wildcard.
+    from satellite.transport.http_tunnel import _is_allowed_path
+    for path in ("/v1/checks/attached", "/v1/checks/attach", "/v1/checks/detach", "/v1/checks/run"):
+        assert _is_allowed_path(path), path
+    assert _is_allowed_path("/v1/agents/dev/checks")
+    assert not _is_allowed_path("/v1/checks")
+    assert not _is_allowed_path("/v1/checks/run/../admin")

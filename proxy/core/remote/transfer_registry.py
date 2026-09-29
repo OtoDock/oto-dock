@@ -39,6 +39,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from auth.providers import acting_role_of
+from ws import wire_events as wire
 
 logger = logging.getLogger("transfer-registry")
 
@@ -119,7 +121,7 @@ def _machine_row_event(row: MachineRow) -> dict:
 def snapshot_event(item: TransferItem) -> dict:
     """The connect-replay event: full current state of one item."""
     return {
-        "type": "transfer_state",
+        "type": wire.TRANSFER_STATE,
         "transfer_id": item.transfer_id,
         "agent_slug": item.agent_slug,
         "rel_path": item.rel_path,
@@ -150,13 +152,7 @@ def _resolve_recipients(agent_slug: str, rel_path: str) -> frozenset[str]:
 
     out: set[str] = set()
     for user_sub in resolve_targets("agent", agent_slug):
-        u = task_store.get_user(user_sub) or {}
-        if u.get("role") == "admin":
-            role = "admin"
-        else:
-            role = (task_store.get_user_agent_roles(user_sub) or {}).get(
-                agent_slug, "viewer",
-            )
+        role = acting_role_of(user_sub, agent_slug)
         username = task_store.get_username_by_sub(user_sub) or ""
         if should_sync_to_target(rel_path, username, role):
             out.add(user_sub)
@@ -212,7 +208,7 @@ async def begin(
         async with _lock:
             _items[tid] = item
         await _emit({
-            "type": "transfer_started",
+            "type": wire.TRANSFER_STARTED,
             "transfer_id": tid,
             "agent_slug": agent_slug,
             "rel_path": rel_path,
@@ -233,7 +229,7 @@ async def begin(
             async with _lock:
                 item.done_at = time.monotonic()
             await _emit({
-                "type": "transfer_done",
+                "type": wire.TRANSFER_DONE,
                 "transfer_id": tid,
                 "agent_slug": agent_slug,
                 "ok": True,
@@ -275,13 +271,13 @@ async def set_state(
             ):
                 item.done_at = time.monotonic()
                 done_event = {
-                    "type": "transfer_done",
+                    "type": wire.TRANSFER_DONE,
                     "transfer_id": transfer_id,
                     "agent_slug": item.agent_slug,
                     "ok": all(r.state == "done" for r in item.machines.values()),
                 }
         await _emit({
-            "type": "transfer_machine_state",
+            "type": wire.TRANSFER_MACHINE_STATE,
             "transfer_id": transfer_id,
             "agent_slug": item.agent_slug,
             "machine_id": machine_id,
@@ -319,7 +315,7 @@ async def progress(
             row._last_progress_emit = now
             recipients = item.recipients
         await _emit({
-            "type": "transfer_progress",
+            "type": wire.TRANSFER_PROGRESS,
             "transfer_id": transfer_id,
             "agent_slug": item.agent_slug,
             "machine_id": machine_id,
@@ -364,7 +360,7 @@ async def sweep_stale() -> int:
     for item, rows in to_fail:
         for mid in rows:
             await _emit({
-                "type": "transfer_machine_state",
+                "type": wire.TRANSFER_MACHINE_STATE,
                 "transfer_id": item.transfer_id,
                 "agent_slug": item.agent_slug,
                 "machine_id": mid,
@@ -372,7 +368,7 @@ async def sweep_stale() -> int:
                 "error": "transfer stalled",
             }, item.recipients)
         await _emit({
-            "type": "transfer_done",
+            "type": wire.TRANSFER_DONE,
             "transfer_id": item.transfer_id,
             "agent_slug": item.agent_slug,
             "ok": False,

@@ -5,7 +5,10 @@ The agent authors a community-agent template folder somewhere it can write
 folder through the same pipeline that installs catalog templates, so the
 whole manifest surface — persona, required MCPs, skill packages, scheduled
 tasks/triggers/notifications, agent-wide and per-user setup guides, auto
-context — works identically for a locally authored template.
+context, folder apps and checks — works identically for a locally authored
+template. One difference: a catalog install carries a person's consent to
+the template's apps and checks; this route carries none, so apps land
+waiting for approval and checks are offered, not mandatory.
 
 Permission resolution lives in :func:`_resolve_tool_set` and runs once at
 module load using the auto-injected ``OTO_*`` env vars (mirror of
@@ -36,7 +39,10 @@ from mcp.types import TextContent, Tool
 # ---------------------------------------------------------------------------
 
 AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
-PLATFORM_ROLE = os.environ.get("OTO_PLATFORM_ROLE", "")
+# The creator-tier question, answered by the proxy in the env
+# (core/sandbox/oto_env.py): a separate process cannot import the proxy and
+# carries no role vocabulary of its own.
+CAN_CREATE = os.environ.get("OTO_CAN_CREATE_AGENTS", "") == "true"
 
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
@@ -49,7 +55,7 @@ _ALL_TOOLS = {
 
 
 def _resolve_tool_set() -> set[str]:
-    if PLATFORM_ROLE in ("admin", "creator"):
+    if CAN_CREATE:
         return set(_ALL_TOOLS)
     # Platform members and sessions with no human identity see nothing.
     return set()
@@ -155,6 +161,22 @@ async def _tool_list_building_blocks() -> str:
     else:
         lines.append("_None available._")
 
+    examples = data.get("check_examples", [])
+    if examples:
+        lines.append("\n# Check examples")
+        lines.append(
+            "A template's `checks/<name>/check.json` (plus its script) has one "
+            "of these shapes — copy the closest from the checks-mcp examples "
+            "folder and edit it.\n"
+        )
+        lines.append("| example | sections | what it judges |")
+        lines.append("|---|---|---|")
+        for ex in examples:
+            desc = (ex.get("description") or "").replace("|", "/")
+            lines.append(
+                f"| `{ex.get('name', '')}` | {', '.join(ex.get('sections') or [])} | {desc} |",
+            )
+
     taken = data.get("agent_slugs", [])
     if taken:
         lines.append(f"\n# Slugs already taken\n{', '.join(f'`{s}`' for s in taken)}")
@@ -202,6 +224,18 @@ def _format_plan(result: dict) -> list[str]:
         if seeds.get("has_user_setup"):
             bits.append("per-user onboarding")
         lines.append(f"\n**Will seed**: {', '.join(bits)}")
+        apps = seeds.get("apps") or []
+        if apps:
+            lines.append("\n**Apps** (deployed waiting for approval — an agent never "
+                         "pre-approves an app's buttons)")
+            for a in apps:
+                who = ("each member approves their own copy" if a.get("visibility") == "user"
+                       else "a manager approves the shared copy")
+                lines.append(f"- `{a.get('slug', '')}` {a.get('title') or ''}: {who}")
+        checks = seeds.get("checks") or []
+        if checks:
+            lines.append("\n**Checks** (offered, not mandatory, until a manager consents "
+                         "in the dashboard): " + ", ".join(f"`{c.get('name', '')}`" for c in checks))
     return lines
 
 
@@ -275,6 +309,34 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
             "buttons to approve); the new agent can re-pin them with "
             "actions later.",
         )
+    apps = result.get("seeded_apps") or {}
+    if any(apps.get(k) for k in ("seeded", "user", "pending", "failed")):
+        live = list(apps.get("seeded") or []) + list(apps.get("user") or [])
+        if live:
+            lines.append(f"\n**Apps live**: {', '.join(live)}")
+        pending = apps.get("pending") or []
+        if pending:
+            lines.append(
+                "\n⏳ **Apps waiting for approval** (an agent never pre-approves "
+                "an app's buttons; the person approves on the app's card): "
+                + ", ".join(p.get("slug", "") if isinstance(p, dict) else str(p) for p in pending),
+            )
+        failed = apps.get("failed") or []
+        if failed:
+            lines.append("\n⚠️ Apps that failed: " + "; ".join(
+                f"{f.get('slug', '')} ({f.get('reason', '')})" if isinstance(f, dict) else str(f)
+                for f in failed))
+    checks = result.get("seeded_checks") or {}
+    if checks.get("offered") or checks.get("consented"):
+        lines.append(
+            "\n**Checks offered**: " + ", ".join(
+                list(checks.get("consented") or []) + list(checks.get("offered") or []))
+            + " — a manager makes them mandatory from the dashboard.",
+        )
+    if checks.get("failed"):
+        lines.append("\n⚠️ Checks that failed: " + "; ".join(
+            f"{f.get('name', '')} ({f.get('reason', '')})" if isinstance(f, dict) else str(f)
+            for f in checks["failed"]))
     if result.get("setup_md_copied"):
         lines.append(
             "The agent has a setup guide in its context — open a chat with it "
@@ -294,7 +356,8 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
 _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "list_building_blocks": {
         "description": (
-            "List the MCPs and skill packages a new agent can be given, plus "
+            "List the MCPs and skill packages a new agent can be given, the "
+            "check examples a template's checks/ folder can start from, plus "
             "the agent slugs already taken. Call this BEFORE writing "
             "`mcps.json` — MCP names are canonical platform names and are not "
             "always guessable."
@@ -304,9 +367,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "validate_agent_template": {
         "description": (
             "Dry-run a template folder you have written: checks the manifest, "
-            "persona, required MCPs and skill packages, and slug availability "
-            "without creating anything. Returns the exact errors to fix. "
-            "Always validate before `create_agent`."
+            "persona, required MCPs and skill packages, every app under apps/ "
+            "and user-apps/ (the deploy's own validator and static checks), "
+            "every check under checks/, and slug availability without "
+            "creating anything. Returns the exact errors to fix. Always "
+            "validate before `create_agent`."
         ),
         "inputSchema": {
             "type": "object",
@@ -328,7 +393,10 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "Create a new agent on the platform from a validated template "
             "folder. You become its manager. Required MCPs are installed (or "
             "queued for admin approval), skill packages assigned, and any "
-            "scheduled tasks, triggers, notifications and setup guides seeded."
+            "scheduled tasks, triggers, notifications, setup guides, apps and "
+            "checks seeded. Apps deploy waiting for approval on their cards "
+            "and checks are offered, never mandatory: an agent cannot consent "
+            "on a person's behalf."
         ),
         "inputSchema": {
             "type": "object",

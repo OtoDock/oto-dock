@@ -1,0 +1,17 @@
+{
+  "name": "content-style",
+  "description": "A rendered video or a written spreadsheet is checked for the house tone and format; the marketing manager hears about a final failure",
+  "mandatory": false,
+  "applies": ["tasks"],
+  "condition": {"events": ["render", "tool:mcp__file-tools__write_xlsx"], "kinds": ["video", "spreadsheet"]},
+  "rounds": 2,
+  "inputs": ["knowledge/tone-and-style.md"],
+  "script": {"run": "probe.sh", "timeout": 300},
+  "judge": {
+    "rubric": "Judge the produced files and the answer against the tone-and-style guide in the input: the wording, the structure and the naming of what was produced. Score from 0 to 1; list every deviation with the file and the place.",
+    "threshold": 0.8,
+    "mcps": ["file-tools"],
+    "judge_on": "auto",
+    "timeout": 600
+  }
+}

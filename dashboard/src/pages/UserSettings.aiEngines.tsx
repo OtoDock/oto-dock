@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 import { fetchCurrentUser } from '../api/auth'
 import { setNativeAuthInProgress } from '../lib/nativeBridge'
 import { SubscriptionWindowBars, BalanceHint } from '../components/engines/SubscriptionWindows'
@@ -14,9 +15,18 @@ import {
   useStartOpenAIOAuth,
   useOpenAIOAuthStatus,
   useFinishOpenAIOAuth,
+  loginAlreadyFinished,
+  alreadyConnectedMessage,
+  ClaudeExchangeError,
+  CLAUDE_SECOND_ACCOUNT_HINT,
+  type ClaudeExchangeResult,
   type UserLayerInfo,
   type Subscription,
 } from '../api/executionLayers'
+import {
+  accountLabel, engineLabel, isCoding, keyProviders, oauthFlow, sortEngineRows, supportsOAuth, vendorBadge,
+} from '../lib/engines'
+import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../lib/status/engineSubscription'
 
 // ---------------------------------------------------------------------------
 // Execution Layers Section
@@ -24,7 +34,7 @@ import {
 
 // Mirrors the admin tab's STATUS_VARIANT — an expired row must never wear the
 // green pill it used to.
-const STATUS_CHIP: Record<string, string> = {
+const STATUS_CHIP: Record<EngineSubscriptionStatus, string> = {
   active: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
   expired: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
   disabled: 'bg-gray-200 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
@@ -34,8 +44,12 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const [expanded, setExpanded] = useState(false)
   const [showConnect, setShowConnect] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
-  const [oauthStep, setOauthStep] = useState<'idle' | 'code'>('idle')
+  // 'retry': a Claude paste was refused and a fresh flow is ready; the popup
+  // opens only on the Try again click (a window.open outside a gesture is
+  // blocked by browsers).
+  const [oauthStep, setOauthStep] = useState<'idle' | 'code' | 'retry'>('idle')
   const [oauthState, setOauthState] = useState('')
+  const [claudeAuthUrl, setClaudeAuthUrl] = useState('')
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -49,7 +63,14 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
     setNativeAuthInProgress(oauthStep !== 'idle')
     return () => setNativeAuthInProgress(false)
   }, [oauthStep])
-  const isOpenAI = layer.name === 'codex-cli'
+  // The card's facts come from the engine's descriptor, never its id: the
+  // login flow decides which connect box renders (a device code the page
+  // polls on, or a popup whose code the user pastes), the identity labels
+  // name the vendor and the account, keyProviders names the key's vendor.
+  const engine = layer.capabilities
+  const isDeviceCode = oauthFlow(engine) === 'device_code'
+  const vendor = engine.identity.vendor_label
+  const account = accountLabel(engine)
   const startClaude = useStartClaudeOAuth()
   const exchangeClaude = useExchangeClaudeOAuth()
   const startOpenAI = useStartOpenAIOAuth()
@@ -59,7 +80,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const updateSub = useUserUpdateSubscription()
   const addKey = useUserAddSubscription()
   const { user, setUser } = useAuth()
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   const [userCode, setUserCode] = useState('')
   const [authUrl, setAuthUrl] = useState('')
 
@@ -78,11 +99,14 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   const userSubs = layer.user_subscriptions || []
   // "Your subscription" claims key on ACTIVE rows only — an expired row still
   // lists (so it can be reconnected) but must not report a working setup.
-  const hasOwnSub = userSubs.some(s => s.status === 'active')
-  const hasOwnOAuth = userSubs.some(s => s.status === 'active' && s.auth_type !== 'api_key')
-  const hasExpiredSub = userSubs.some(s => s.status === 'expired')
-  const supportsOAuth = layer.name === 'claude-code-cli' || layer.name === 'codex-cli'
-  const keyProvider = isOpenAI ? 'openai' : 'anthropic'
+  const hasOwnSub = userSubs.some(s => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE)
+  const hasOwnOAuth = userSubs.some(s => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && s.auth_type !== 'api_key')
+  const hasExpiredSub = userSubs.some(s => s.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED)
+  const hasLogin = supportsOAuth(engine)
+  const keyProviderList = keyProviders(engine)
+  // The server's has_own_engine counts a personal subscription on a CODING
+  // engine; the refresh below mirrors that predicate.
+  const countsAsOwnEngine = isCoding(engine)
 
   // Keep the auth user's `has_own_engine` fresh so the global "connect an AI
   // engine" banner clears the instant the user connects one here. It derives
@@ -93,35 +117,62 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   useEffect(() => {
     const flipped = hasOwnSub !== prevHasOwnSub.current
     prevHasOwnSub.current = hasOwnSub
-    if (!flipped || !supportsOAuth) return
+    if (!flipped || !countsAsOwnEngine) return
     void (async () => {
       const u = await fetchCurrentUser()
       if (u) setUser(u)
     })()
-  }, [hasOwnSub, supportsOAuth, setUser])
+  }, [hasOwnSub, countsAsOwnEngine, setUser])
 
   // After a Reconnect-driven exchange, verify the revived row IS the one the
-  // user clicked — signing into a different account creates a fresh row and
-  // leaves the expired one behind, which without this reads as "nothing
-  // happened".
-  const finishReconnect = useCallback((sub?: Subscription) => {
+  // user clicked — signing into a different account creates a fresh row (or
+  // refreshes another connected one) and leaves the expired one behind,
+  // which without this reads as "nothing happened". `created` tells the two
+  // apart: undefined for the ChatGPT flow, which has no such flag.
+  const finishReconnect = useCallback((sub?: Subscription, created?: boolean) => {
     setReconnectFor(prev => {
       if (prev && sub && sub.id !== prev.id) {
+        const who = sub.oauth_email || 'a different account'
+        const dead = prev.label || prev.oauth_email || 'the expired account'
         setNotice(
-          `You signed in as ${sub.oauth_email || 'a different account'}, so a new ` +
-          `subscription was added — “${prev.label || prev.oauth_email || 'the expired account'}” ` +
-          `is still expired. Reconnect that exact account to revive it, or remove it.`,
+          created === false
+            ? `You signed in as ${who}, which is already connected — “${dead}” ` +
+              `is still expired. Reconnect that exact account to revive it, or remove it.`
+            : `You signed in as ${who}, so a new ` +
+              `subscription was added — “${dead}” ` +
+              `is still expired. Reconnect that exact account to revive it, or remove it.`,
         )
       }
       return null
     })
   }, [])
 
+  // A Connect / Add Another Account paste that matched an account already
+  // connected: say so and keep the connect box open, instead of closing as
+  // if a second account had been added.
+  const finishConnect = useCallback((result: ClaudeExchangeResult): boolean => {
+    if (result.created || result.previous_status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE) return true
+    setNotice(alreadyConnectedMessage(result.subscription?.oauth_email || ''))
+    return false
+  }, [])
+
+  const openClaudePopup = useCallback(async (url: string) => {
+    const { openOAuthWindow } = await import('../lib/oauth')
+    const opened = await openOAuthWindow(url, 'claude-oauth')
+    if (!opened) {
+      setError('The login popup was blocked. Allow popups for this site, then try again.')
+      setOauthStep('retry')
+      return
+    }
+    setTimeout(() => setOauthStep('code'), 2000)
+  }, [])
+
   const handleStartOAuth = useCallback(async () => {
     setError('')
+    setNotice('')
     try {
-      if (isOpenAI) {
-        // OpenAI device code flow
+      if (isDeviceCode) {
+        // Device-code flow: a verification URL + one-time code, polled to completion
         const result = await startOpenAI.mutateAsync({ layer: layer.name, ownerType: 'user' })
         setAuthUrl(result.url)
         setUserCode(result.user_code)
@@ -136,7 +187,13 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
               try {
                 const fin = await finishOpenAI.mutateAsync({ loginId: result.login_id, layer: layer.name })
                 finishReconnect(fin?.subscription)
-              } catch { /* finish may 404 if already consumed — subscription still saved */ }
+              } catch (err) {
+                if (!loginAlreadyFinished(err)) {
+                  setError((err as Error).message)
+                  setOauthStep('idle')
+                  return
+                }
+              }
               setShowConnect(false)
               setOauthStep('idle')
             } else if (status.status === 'failed') {
@@ -153,31 +210,46 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
         }, 2000)
         pollRef.current = poll
       } else {
-        // Claude code-paste flow
+        // Code-paste flow: a popup whose page shows a code the user pastes back
         const { url, state } = await startClaude.mutateAsync({ layer: layer.name, ownerType: 'user' })
         setOauthState(state)
-        const { openOAuthWindow } = await import('../lib/oauth')
-        await openOAuthWindow(url, 'claude-oauth')
-        setTimeout(() => setOauthStep('code'), 2000)
+        setClaudeAuthUrl(url)
+        await openClaudePopup(url)
       }
     } catch (e) {
       setError((e as Error).message)
     }
-  }, [layer.name, isOpenAI, startOpenAI, startClaude, checkStatus, finishOpenAI, stopPoll, finishReconnect])
+  }, [layer.name, isDeviceCode, startOpenAI, startClaude, checkStatus, finishOpenAI, stopPoll, finishReconnect, openClaudePopup])
 
   const handleExchange = useCallback(async () => {
     if (!code.trim() || !oauthState) return
     setError('')
     try {
       const result = await exchangeClaude.mutateAsync({ code: code.trim(), state: oauthState, layer: layer.name })
-      finishReconnect(result?.subscription)
-      setShowConnect(false)
-      setOauthStep('idle')
       setCode('')
+      setOauthStep('idle')
+      if (reconnectFor) {
+        finishReconnect(result?.subscription, result?.created)
+        setShowConnect(false)
+        return
+      }
+      if (finishConnect(result)) setShowConnect(false)
     } catch (e) {
       setError((e as Error).message)
+      // The state was consumed by the refused paste: prepare a fresh flow so
+      // one click retries, without a popup until that click.
+      if (e instanceof ClaudeExchangeError && e.status === 403) return
+      try {
+        const { url, state } = await startClaude.mutateAsync({ layer: layer.name, ownerType: 'user' })
+        setOauthState(state)
+        setClaudeAuthUrl(url)
+        setCode('')
+        setOauthStep('retry')
+      } catch (e2) {
+        setError(`${(e as Error).message} ${(e2 as Error).message}`)
+      }
     }
-  }, [code, oauthState, layer.name, exchangeClaude, finishReconnect])
+  }, [code, oauthState, layer.name, exchangeClaude, startClaude, reconnectFor, finishReconnect, finishConnect])
 
   const handleReconnect = useCallback((sub: Subscription) => {
     setReconnectFor(sub)
@@ -195,8 +267,8 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
   // The pill's name: the row's label, else what the row is on this engine.
   const subLabel = (sub: Subscription) =>
     sub.label || (sub.auth_type === 'api_key'
-      ? `${isOpenAI ? 'OpenAI' : 'Anthropic'} API key`
-      : `${isOpenAI ? 'ChatGPT' : 'Claude'} Subscription`)
+      ? `${vendor} API key`
+      : `${account} Subscription`)
 
   return (
     <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
@@ -206,12 +278,12 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
-              {isOpenAI ? 'OpenAI' : 'Anthropic'}
-            </span>
-            <span className="font-medium text-p-text">
-              {layer.display_name.replace(/^(OpenAI|Anthropic)\s+/i, '')}
-            </span>
+            {vendorBadge(engine) && (
+              <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+                {vendorBadge(engine)}
+              </span>
+            )}
+            <span className="font-medium text-p-text">{engineLabel(engine)}</span>
           </div>
           <div className="text-sm text-p-text-secondary">
             {hasOwnOAuth
@@ -265,12 +337,12 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                     </span>
                   )}
                   {sub.oauth_email && <span className="text-xs text-p-text-light truncate max-w-full">{sub.oauth_email}</span>}
-                  <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded-sm ${STATUS_CHIP[sub.status] || STATUS_CHIP.disabled}`}>
+                  <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded-sm ${STATUS_CHIP[sub.status] || STATUS_CHIP[ENGINE_SUBSCRIPTION_STATUS.DISABLED]}`}>
                     {sub.status}
                   </span>
                 </div>
                 <div className="shrink-0 flex items-center gap-2">
-                  {sub.status === 'expired' && supportsOAuth && (
+                  {sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED && hasLogin && (
                     <button
                       onClick={() => handleReconnect(sub)}
                       className="text-xs px-2 py-1 rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
@@ -286,15 +358,15 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   </button>
                 </div>
               </div>
-              {sub.status === 'active' && sub.auth_type !== 'api_key' && (
+              {sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && sub.auth_type !== 'api_key' && (
                 <SubscriptionWindowBars windows={sub.windows} />
               )}
-              {sub.status === 'expired' && (
+              {sub.status === ENGINE_SUBSCRIPTION_STATUS.EXPIRED && (
                 <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                   This account's login expired — reconnect the same account to revive it.
                 </p>
               )}
-              {sub.status === 'disabled' && (
+              {sub.status === ENGINE_SUBSCRIPTION_STATUS.DISABLED && (
                 <p className="mt-1 text-xs text-p-text-light">
                   Disabled by an administrator.
                 </p>
@@ -306,22 +378,22 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
                   admin-only, mirroring the server-side gate. */}
               {/* Scope toggles only mean something on a usable row — an
                   expired/disabled account can't serve sessions either way. */}
-              <div className={`flex items-center gap-3 mt-1.5 ${sub.status !== 'active' ? 'opacity-50' : ''}`}>
-                <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === 'active' ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Use this account for your own chats">
+              <div className={`flex items-center gap-3 mt-1.5 ${sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE ? 'opacity-50' : ''}`}>
+                <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Use this account for your own chats">
                   <input
                     type="checkbox"
                     checked={sub.use_personal}
-                    disabled={sub.status !== 'active'}
+                    disabled={sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE}
                     onChange={(e) => updateSub.mutate({ layer: layer.name, id: sub.id, use_personal: e.target.checked })}
                   />
                   Personal use
                 </label>
                 {isAdmin && (
-                  <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === 'active' ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Contribute this account to the shared agent pool">
+                  <label className={`flex items-center gap-1 text-xs text-p-text-light ${sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE ? 'cursor-pointer' : 'cursor-not-allowed'}`} title="Contribute this account to the shared agent pool">
                     <input
                       type="checkbox"
                       checked={sub.contribute_platform}
-                      disabled={sub.status !== 'active'}
+                      disabled={sub.status !== ENGINE_SUBSCRIPTION_STATUS.ACTIVE}
                       onChange={(e) => updateSub.mutate({ layer: layer.name, id: sub.id, contribute_platform: e.target.checked })}
                     />
                     Agent pool
@@ -330,12 +402,12 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
               </div>
             </div>
           ))}
-          <BalanceHint oauthCount={userSubs.filter((s) => s.status === 'active' && s.auth_type !== 'api_key').length} />
+          <BalanceHint oauthCount={userSubs.filter((s) => s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && s.auth_type !== 'api_key').length} />
 
           {/* Platform status */}
           {!hasOwnSub && hasExpiredSub && (
             <p className="text-sm text-p-text-light">
-              {isOpenAI ? 'ChatGPT' : 'Claude'} logins have a limited lifetime — reconnecting the
+              {account} logins have a limited lifetime — reconnecting the
               same account above revives it in place.
             </p>
           )}
@@ -357,13 +429,13 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           )}
 
           {/* Connect button, and the pay-as-you-go alternative */}
-          {supportsOAuth && !showConnect && !showApiKey && (
+          {hasLogin && !showConnect && !showApiKey && (
             <div className="flex flex-wrap items-center gap-3">
               <button
                 onClick={() => setShowConnect(true)}
                 className="px-4 py-2 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
               >
-                {userSubs.length > 0 ? 'Add Another Account' : `Connect Your ${isOpenAI ? 'ChatGPT' : 'Claude'} Account`}
+                {userSubs.length > 0 ? 'Add Another Account' : `Connect Your ${account} Account`}
               </button>
               <button
                 onClick={() => setShowApiKey(true)}
@@ -375,7 +447,7 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           )}
           {showApiKey && (
             <ApiKeyForm
-              layer={layer.name} provider={keyProvider} ownerType="user" showProviderSelect={false}
+              layer={layer.name} providers={keyProviderList} ownerType="user"
               mutation={addKey} onDone={() => setShowApiKey(false)}
             />
           )}
@@ -384,17 +456,20 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
           {showConnect && oauthStep === 'idle' && (
             <div className="p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
               <p className="text-sm text-p-text">
-                {isOpenAI
-                  ? 'Click below to sign in with your ChatGPT account.'
-                  : 'Click below to authenticate with your Anthropic account. A popup will open for login.'}
+                {isDeviceCode
+                  ? `Click below to sign in with your ${account} account.`
+                  : `Click below to authenticate with your ${vendor} account. A popup will open for login.`}
               </p>
+              {!isDeviceCode && (
+                <p className="text-xs text-p-text-light">{CLAUDE_SECOND_ACCOUNT_HINT}</p>
+              )}
               <div className="flex gap-2">
                 <button
                   onClick={handleStartOAuth}
-                  disabled={isOpenAI ? startOpenAI.isPending : startClaude.isPending}
+                  disabled={isDeviceCode ? startOpenAI.isPending : startClaude.isPending}
                   className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
                 >
-                  {(isOpenAI ? startOpenAI.isPending : startClaude.isPending) ? 'Starting...' : 'Connect'}
+                  {(isDeviceCode ? startOpenAI.isPending : startClaude.isPending) ? 'Starting...' : 'Connect'}
                 </button>
                 <button
                   onClick={() => { setShowConnect(false); setReconnectFor(null) }}
@@ -406,9 +481,9 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             </div>
           )}
 
-          {showConnect && oauthStep === 'code' && isOpenAI && (
+          {showConnect && oauthStep === 'code' && isDeviceCode && (
             <div className="p-3 bg-p-bg rounded-lg border border-p-border-light space-y-3">
-              <p className="text-sm font-medium text-p-text">Sign in with ChatGPT</p>
+              <p className="text-sm font-medium text-p-text">Sign in with {account}</p>
               <div className="space-y-1">
                 <p className="text-xs text-p-text-secondary">1. Open this link and sign in:</p>
                 <div className="flex items-center gap-2">
@@ -431,11 +506,34 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
             </div>
           )}
 
-          {showConnect && oauthStep === 'code' && !isOpenAI && (
+          {showConnect && oauthStep === 'retry' && !isDeviceCode && (
+            <div className="p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
+              <p className="text-xs text-p-text-light">
+                Click Try again to open the login popup once more and paste the new code.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => { setError(''); void openClaudePopup(claudeAuthUrl) }}
+                  className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
+                >
+                  Try again
+                </button>
+                <button
+                  onClick={() => { setShowConnect(false); setOauthStep('idle'); setCode(''); setReconnectFor(null); setError('') }}
+                  className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {showConnect && oauthStep === 'code' && !isDeviceCode && (
             <div className="p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
               <p className="text-sm text-p-text">
-                Copy the authorization code from the Anthropic page and paste it below.
+                Copy the authorization code from the {vendor} page and paste it below.
               </p>
+              <p className="text-xs text-p-text-light">{CLAUDE_SECOND_ACCOUNT_HINT}</p>
               <input
                 type="text"
                 placeholder="Paste authorization code here"
@@ -476,8 +574,9 @@ export function ExecutionLayersSection() {
   if (isLoading) return null
   if (!layers || layers.length === 0) return null
 
-  // Only show layers that support OAuth (claude-code-cli for now)
-  const oauthLayers = layers.filter(l => l.name === 'claude-code-cli' || l.name === 'codex-cli')
+  // The engines a user can connect an account to — those whose descriptor
+  // takes a login — in engine order.
+  const oauthLayers = sortEngineRows(layers.filter(l => supportsOAuth(l.capabilities)))
   if (oauthLayers.length === 0) return null
 
   return (

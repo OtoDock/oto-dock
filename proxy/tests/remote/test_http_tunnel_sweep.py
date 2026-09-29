@@ -139,23 +139,166 @@ async def test_cancel_machine_streams_closes_upstreams():
     await asyncio.sleep(0)
 
 
+# --- Stream classes: MCP streams and hook streams are counted apart -------
+
+def _frame(stream_id: str, path: str, method: str = "GET") -> dict:
+    return {
+        "stream_id": stream_id, "method": method, "path": path,
+        "headers": {}, "body_b64": "", "body_eof": True, "timeout_s": 30,
+    }
+
+
+class _ParkedClient:
+    """A client whose every request holds its upstream open until released,
+    so an admitted stream stays in ``_streams`` with its slot taken."""
+
+    def __init__(self):
+        self.release = asyncio.Event()
+        self.sent: list[str] = []
+
+    def build_request(self, method, url, **kw):
+        return url
+
+    async def send(self, req, stream=False):
+        self.sent.append(req)
+        await self.release.wait()
+        raise RuntimeError("released")
+
+
+async def _admitted(disp, mgr, machine_id, stream_id, path, method="GET") -> bool:
+    await disp.handle_request_frame(mgr, machine_id, _frame(stream_id, path, method))
+    await asyncio.sleep(0)   # the dispatch task reaches the parked send
+    return (machine_id, stream_id) in disp._streams
+
+
+def _refused(conn: FakeConnection) -> bool:
+    last = conn.sent[-1]
+    return (last["type"] == "http_response" and last["status"] == 503
+            and last["error"] == "too-many-streams")
+
+
+async def _drain(disp):
+    for key in list(disp._streams):
+        disp._reap(key)
+    await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
-async def test_per_machine_open_stream_cap_returns_503(monkeypatch):
+async def test_mcp_streams_and_hook_streams_are_capped_separately(monkeypatch):
+    monkeypatch.setattr(tun, "_MAX_MCP_STREAMS_PER_MACHINE", 2)
+    monkeypatch.setattr(tun, "_MAX_HOOK_STREAMS_PER_MACHINE", 2)
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
     disp = SatelliteHttpTunnelDispatcher()
     conn = FakeConnection()
     mgr = FakeManager(conn)
-    monkeypatch.setattr(tun, "_MAX_OPEN_STREAMS_PER_MACHINE", 2)
-    for sid in ("a", "b"):
-        disp._streams[("m1", sid)] = _stream(stream_id=sid)
+    client = _ParkedClient()
+    monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
+    try:
+        assert await _admitted(disp, mgr, "m1", "mcp-1", "/mcp/file-tools/mcp/")
+        # A queried MCP path is still an MCP stream.
+        assert await _admitted(disp, mgr, "m1", "mcp-2", "/mcp/file-tools/mcp/?session_id=1")
+        assert disp._open[("m1", "mcp")] == 2 and disp._open_mcp_total == 2
+        # The machine's MCP streams are at their cap: a hook is still admitted.
+        assert await _admitted(disp, mgr, "m1", "hook-1", "/v1/hooks/permission", "POST")
+        assert disp._open[("m1", "hook")] == 1
+        # A third MCP stream is refused with the protocol frame, at once.
+        assert not await _admitted(disp, mgr, "m1", "mcp-3", "/mcp/file-tools/mcp/")
+        assert _refused(conn)
+        assert disp._open[("m1", "mcp")] == 2 and disp._open_mcp_total == 2
+        # The mirror on another machine: hooks at their cap refuse a hook,
+        # never an MCP stream.
+        assert await _admitted(disp, mgr, "m2", "hook-a", "/v1/hooks/permission", "POST")
+        assert await _admitted(disp, mgr, "m2", "hook-b", "/v1/hooks/stop", "POST")
+        assert not await _admitted(disp, mgr, "m2", "hook-c", "/v1/hooks/permission", "POST")
+        assert _refused(conn)
+        assert await _admitted(disp, mgr, "m2", "mcp-a", "/mcp/file-tools/mcp/")
+        assert disp._open[("m2", "hook")] == 2 and disp._open[("m2", "mcp")] == 1
+        assert disp._open_mcp_total == 3
+    finally:
+        await _drain(disp)
 
-    await disp.handle_request_frame(mgr, "m1", {
-        "stream_id": "c", "method": "GET", "path": "/v1/hooks/permission",
-        "headers": {}, "body_b64": "", "body_eof": True, "timeout_s": 30,
-    })
-    assert ("m1", "c") not in disp._streams
-    assert conn.sent[-1]["type"] == "http_response"
-    assert conn.sent[-1]["status"] == 503
-    assert conn.sent[-1]["error"] == "too-many-streams"
+
+@pytest.mark.asyncio
+async def test_the_fleet_mcp_cap_refuses_mcp_streams_and_never_a_hook(monkeypatch):
+    monkeypatch.setattr(tun, "_MAX_MCP_STREAMS_TOTAL", 2)
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    client = _ParkedClient()
+    monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
+    try:
+        assert await _admitted(disp, mgr, "m1", "s1", "/mcp/file-tools/mcp/")
+        assert await _admitted(disp, mgr, "m2", "s2", "/mcp/file-tools/mcp/")
+        before = (dict(disp._open), disp._open_mcp_total)
+        assert not await _admitted(disp, mgr, "m3", "s3", "/mcp/file-tools/mcp/")
+        assert _refused(conn)
+        # A refusal changes no counter.
+        assert (dict(disp._open), disp._open_mcp_total) == before
+        assert await _admitted(disp, mgr, "m3", "h3", "/v1/hooks/permission", "POST")
+    finally:
+        await _drain(disp)
+
+
+@pytest.mark.asyncio
+async def test_a_forgotten_stream_frees_its_slot_exactly_once(monkeypatch):
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    client = _ParkedClient()
+    monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
+    assert await _admitted(disp, mgr, "m1", "s1", "/mcp/file-tools/mcp/")
+    assert await _admitted(disp, mgr, "m1", "h1", "/v1/hooks/permission", "POST")
+    # Reaped: the slot is freed now, and the cancelled dispatch's finally
+    # does not free it again.
+    disp._reap(("m1", "s1"))
+    assert disp._open_mcp_total == 0 and ("m1", "mcp") not in disp._open
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert disp._open_mcp_total == 0 and ("m1", "mcp") not in disp._open
+    # A finished dispatch frees its slot through the same path.
+    client.release.set()
+    for _ in range(20):
+        if ("m1", "h1") not in disp._streams:
+            break
+        await asyncio.sleep(0.01)
+    assert ("m1", "hook") not in disp._open
+    # A stream inserted by hand was never admitted: reaping it touches no
+    # counter.
+    disp._streams[("m1", "x")] = _stream(stream_id="x")
+    disp._reap(("m1", "x"))
+    assert disp._open == {} and disp._open_mcp_total == 0
+    # A machine's counters are gone with its streams.
+    client.release.clear()
+    assert await _admitted(disp, mgr, "m1", "s2", "/mcp/file-tools/mcp/")
+    assert await _admitted(disp, mgr, "m1", "h2", "/v1/hooks/stop", "POST")
+    await disp.cancel_machine_streams(mgr, "m1")
+    await asyncio.sleep(0)
+    assert disp._open == {} and disp._open_mcp_total == 0
+
+
+@pytest.mark.asyncio
+async def test_per_machine_hook_stream_cap_returns_503(monkeypatch):
+    monkeypatch.setattr(tun, "_MAX_HOOK_STREAMS_PER_MACHINE", 2)
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+    client = _ParkedClient()
+    monkeypatch.setattr(disp, "_get_client", lambda is_mcp=False: client)
+    try:
+        for sid in ("a", "b"):
+            assert await _admitted(disp, mgr, "m1", sid, "/v1/hooks/permission", "POST")
+        await disp.handle_request_frame(mgr, "m1", {
+            "stream_id": "c", "method": "GET", "path": "/v1/hooks/permission",
+            "headers": {}, "body_b64": "", "body_eof": True, "timeout_s": 30,
+        })
+        assert ("m1", "c") not in disp._streams
+        assert conn.sent[-1]["type"] == "http_response"
+        assert conn.sent[-1]["status"] == 503
+        assert conn.sent[-1]["error"] == "too-many-streams"
+    finally:
+        await _drain(disp)
 
 
 def test_request_chunk_refreshes_activity():

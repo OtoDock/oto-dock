@@ -12,8 +12,24 @@ fan-out chokepoint that keeps live sessions alive across a rotation.
 import time
 from unittest.mock import patch
 
+from core.execution_layer import OAuthRefresh
+from core.layers.cli import oauth as claude_oauth
 from services.engines import subscription_pool as pool
 from services.engines import token_fanout
+
+_REFRESH = "core.layers.cli.layer.CLIExecutionLayer.refresh_oauth"
+
+
+def _rotated(token: str = "rotated", exp: int = 0) -> OAuthRefresh:
+    """What the Claude adapter answers on a successful rotation."""
+    return OAuthRefresh(oauth_token={"accessToken": token, "refreshToken": "r2",
+                                    "expiresAt": exp or int(time.time() * 1000) + 8 * 3600 * 1000})
+
+
+def _row(sub_id: str) -> dict:
+    """A Claude subscription row — the rotation chokepoint takes the row so
+    the fan-out knows whose credential file to rewrite."""
+    return {"id": sub_id, "layer": "claude-code-cli", "provider": "anthropic"}
 
 
 def _clean():
@@ -42,7 +58,7 @@ class TestBindSnapshot:
         pool._issued_token_expiry["sub-1"] = 12345
         pool.bind_session("sess-1", "sub-1")
         token_fanout.register_session_target(
-            "sess-1", token_fanout.CredentialFileTarget(kind="claude", host_dir="/x"),
+            "sess-1", token_fanout.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"),
         )
         with patch.object(pool.subscription_store, "decrement_active_sessions"):
             pool.release_subscription("sess-1")
@@ -145,9 +161,9 @@ class TestRefreshPreservesPlanTier:
                           return_value={"oauth_token": stored_token}), \
              patch.object(pool.subscription_store, "update_credential_data",
                           side_effect=lambda _sid, cred: updates.append(cred)), \
-             patch.object(pool, "fetch_anthropic_subscription_fields",
+             patch.object(claude_oauth, "fetch_subscription_fields",
                           return_value=profile_fields) as fetch:
-            got = pool._refresh_anthropic_oauth_token("sub-tier", "r")
+            got = pool._refresh_oauth_token(_row("sub-tier"), "r")
         assert got == ("new", False)
         assert len(updates) == 1
         return updates[0]["oauth_token"], fetch
@@ -180,17 +196,17 @@ class TestRefreshPreservesPlanTier:
         assert tok["rateLimitTier"] == ""
 
     def test_derive_subscription_fields_mapping(self):
-        assert pool._derive_subscription_fields(
+        assert claude_oauth.derive_subscription_fields(
             {"account": {"has_claude_max": True},
              "organization": {"rate_limit_tier": "default_claude_max_20x"}},
         ) == ("max", "default_claude_max_20x")
-        assert pool._derive_subscription_fields(
+        assert claude_oauth.derive_subscription_fields(
             {"account": {"has_claude_pro": True}, "organization": {}},
         ) == ("pro", "")
-        assert pool._derive_subscription_fields(
+        assert claude_oauth.derive_subscription_fields(
             {"account": {}, "organization": {"organization_type": "claude_enterprise"}},
         ) == ("enterprise", "")
-        assert pool._derive_subscription_fields({}) == ("", "")
+        assert claude_oauth.derive_subscription_fields({}) == ("", "")
 
 
 class TestIssueStamping:
@@ -202,10 +218,7 @@ class TestIssueStamping:
             subscription_id="sub-9", layer="claude-code-cli", provider="anthropic",
             auth_type="oauth", api_key=None, oauth_access_token="tok",
             endpoint_url=None, oauth_expires_at_ms=exp_ms,
-            claude_creds_blob=(
-                pool._claude_file_blob({"accessToken": "tok", "expiresAt": exp_ms})
-                if exp_ms else None
-            ),
+            credential={"oauth_token": {"accessToken": "stored", "refreshToken": "SECRET"}},
         )
 
     def test_resolve_env_stamps_issued_expiry_and_emits_file_blob(self):
@@ -216,9 +229,9 @@ class TestIssueStamping:
         # OAuth never rides env — the layer writes the blob to
         # .credentials.json (env is frozen at exec + outranks the file).
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
-        blob = json.loads(env["_CLAUDE_CREDS_BLOB"])
-        assert blob["accessToken"] == "tok"
-        assert blob["refreshToken"] == ""  # pool = sole rotator
+        blob = json.loads(env["_CLAUDE_CREDS_BLOB"])["claudeAiOauth"]
+        assert blob["accessToken"] == "tok"        # the ISSUED token, not the stored one
+        assert blob["refreshToken"] == ""          # pool = sole rotator
         assert blob["expiresAt"] == 777
         assert pool._issued_token_expiry["sub-9"] == 777
 
@@ -229,21 +242,22 @@ class TestIssueStamping:
         assert "sub-9" not in pool._issued_token_expiry
 
 
-class TestClaudeFileBlob:
-    def test_blob_shape_and_neutralized_refresh(self):
-        blob = pool._claude_file_blob({
-            "accessToken": "at", "refreshToken": "SECRET", "expiresAt": 42,
+class TestClaudeCredentialsFile:
+    def test_file_shape_and_neutralized_refresh(self):
+        from core.layers.cli.oauth import credentials_file
+        stored = {"oauth_token": {
+            "accessToken": "old", "refreshToken": "SECRET", "expiresAt": 1,
             "scopes": ["user:inference"], "subscriptionType": "max",
             "rateLimitTier": "tier5",
-        })
-        assert blob == {
+        }}
+        assert credentials_file("at", 42, stored) == {"claudeAiOauth": {
             "accessToken": "at",
             "refreshToken": "",
             "expiresAt": 42,
             "scopes": ["user:inference"],
             "subscriptionType": "max",
             "rateLimitTier": "tier5",
-        }
+        }}
 
 
 class TestFanOutOnRotation:
@@ -258,7 +272,7 @@ class TestFanOutOnRotation:
         pool._session_token_expiry["sess-b"] = 1
         token_fanout.register_session_target(
             "sess-a",
-            token_fanout.CredentialFileTarget(kind="claude", host_dir=str(tmp_path)),
+            token_fanout.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)),
         )
         # sess-b has no target (e.g. spawned before the last proxy restart) —
         # its snapshot must NOT advance.
@@ -267,9 +281,9 @@ class TestFanOutOnRotation:
         }}
         with patch.object(pool.subscription_store, "get_credential_data",
                           return_value=cred), \
-             patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value=("rotated", False)):
-            assert pool._refresh_oauth_token("sub-r", "r1") == ("rotated", False)
+             patch.object(pool.subscription_store, "update_credential_data"), \
+             patch(_REFRESH, return_value=_rotated(exp=exp)):
+            assert pool._refresh_oauth_token(_row("sub-r"), "r1") == ("rotated", False)
         import json
         written = json.loads((tmp_path / ".credentials.json").read_text())
         assert written["claudeAiOauth"]["accessToken"] == "rotated"
@@ -279,18 +293,25 @@ class TestFanOutOnRotation:
 
     def test_fanout_failure_never_fails_the_refresh(self):
         pool.bind_session("sess-a", "sub-r")
+        # The refresh's own read succeeds; the FAN-OUT's read fails.
+        cred = {"oauth_token": {"accessToken": "old", "refreshToken": "r1", "expiresAt": 1}}
         with patch.object(pool.subscription_store, "get_credential_data",
-                          side_effect=RuntimeError("db down")), \
-             patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value=("rotated", False)):
-            assert pool._refresh_oauth_token("sub-r", "r1") == ("rotated", False)
+                          side_effect=[cred, RuntimeError("db down")]), \
+             patch.object(pool.subscription_store, "update_credential_data"), \
+             patch(_REFRESH, return_value=_rotated()):
+            assert pool._refresh_oauth_token(_row("sub-r"), "r1") == ("rotated", False)
 
     def test_rotation_without_bound_sessions_skips_fanout(self):
-        with patch.object(pool, "_refresh_anthropic_oauth_token",
-                          return_value=("rotated", False)), \
-             patch.object(pool.subscription_store, "get_credential_data") as read:
-            assert pool._refresh_oauth_token("sub-lonely", "r1") == ("rotated", False)
-        read.assert_not_called()
+        with patch(_REFRESH, return_value=_rotated()), \
+             patch.object(pool.subscription_store, "get_credential_data",
+                          return_value={"oauth_token": {}}) as read, \
+             patch.object(pool.subscription_store, "update_credential_data"), \
+             patch("services.engines.token_fanout.fan_out") as fan:
+            assert pool._refresh_oauth_token(_row("sub-lonely"), "r1") == ("rotated", False)
+        # One read for the refresh itself; the fan-out never runs (and never
+        # re-reads) when no session is bound.
+        assert read.call_count == 1
+        fan.assert_not_called()
 
 
 class TestEnsureFreshAndFanOut:
@@ -387,11 +408,11 @@ class TestConcurrentBindDuringFanOut:
                               return_value={"oauth_token": {
                                   "accessToken": "a", "refreshToken": "r",
                                   "expiresAt": 1}}), \
-                 patch.object(pool, "_refresh_anthropic_oauth_token",
-                              return_value=("a", False)), \
+                 patch.object(pool.subscription_store, "update_credential_data"), \
+                 patch(_REFRESH, return_value=_rotated("a")), \
                  patch("services.engines.token_fanout.fan_out"):
                 for _ in range(500):
-                    pool._refresh_oauth_token("sub-hot", "r")
+                    pool._refresh_oauth_token(_row("sub-hot"), "r")
         finally:
             stop.set()
             t.join()

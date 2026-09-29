@@ -56,7 +56,7 @@ class TestCommonEvent:
         constants = [
             ce.TEXT, ce.THINKING, ce.TOOL_USE, ce.TOOL_INPUT, ce.TOOL_RESULT,
             ce.PERMISSION_REQUEST, ce.QUESTION, ce.SUBAGENT_START,
-            ce.SUBAGENT_END, ce.DELEGATE_SPAWN, ce.DELEGATE_RESULT,
+            ce.SUBAGENT_END, ce.DELEGATE_SPAWN, ce.DELEGATE_RESULT, ce.CHECK_VERDICT,
             ce.PLAN_MODE, ce.SYSTEM, ce.METADATA, ce.DONE, ce.ERROR,
             ce.QUEUE_TURN, ce.PRODUCER_DONE,
         ]
@@ -69,7 +69,7 @@ class TestCommonEvent:
         constants = [
             ce.TEXT, ce.THINKING, ce.TOOL_USE, ce.TOOL_INPUT, ce.TOOL_RESULT,
             ce.PERMISSION_REQUEST, ce.QUESTION, ce.SUBAGENT_START,
-            ce.SUBAGENT_END, ce.DELEGATE_SPAWN, ce.DELEGATE_RESULT,
+            ce.SUBAGENT_END, ce.DELEGATE_SPAWN, ce.DELEGATE_RESULT, ce.CHECK_VERDICT,
             ce.PLAN_MODE, ce.SYSTEM, ce.METADATA, ce.DONE, ce.ERROR,
             ce.QUEUE_TURN, ce.PRODUCER_DONE,
         ]
@@ -426,7 +426,13 @@ class TestSessionManager:
             layer = get_execution_layer("caller")
             assert isinstance(layer, DirectLLMExecutionLayer)
 
-    def test_unknown_agent_defaults_to_cli(self):
+    def test_unknown_agent_falls_back_to_the_platform_default(self):
+        # An agent row that is GONE while a session of it may still be live
+        # (deleted mid-session, a shutdown sweep) must NOT raise: the caller
+        # at that point is almost always trying to CLOSE something. The
+        # platform default is the right guess — it is what the row said.
+        # Contrast test_unknown_path_fails_closed below: a KNOWN row naming
+        # an unknown engine is a configuration error and does raise.
         from core.session.session_manager import get_execution_layer
         from core.layers.cli.layer import CLIExecutionLayer
 
@@ -538,12 +544,66 @@ class TestSessionManager:
                     user_sub=None, role="manager", execution_target="machine-xyz",
                 )
 
-    def test_unknown_path_defaults_to_cli(self):
-        from core.session.session_manager import get_layer_by_path
-        from core.layers.cli.layer import CLIExecutionLayer
+    def test_unknown_path_fails_closed(self):
+        # This used to return the CLI layer, which meant a typo'd or retired
+        # engine id silently ran the agent on Claude Code: wrong binary, wrong
+        # credentials, wrong sandbox, no error anywhere. An id no layer claims
+        # is a configuration error and must surface as one.
+        import pytest
+        from core.session.session_manager import (
+            UnknownExecutionPath, get_execution_layer, get_layer_by_path,
+        )
 
-        layer = get_layer_by_path("unknown-path")
-        assert isinstance(layer, CLIExecutionLayer)
+        with pytest.raises(UnknownExecutionPath) as exc:
+            get_layer_by_path("unknown-path")
+        # The message names what IS registered, so an operator can see the typo.
+        assert "claude-code-cli" in str(exc.value)
+
+        with pytest.raises(UnknownExecutionPath):
+            get_execution_layer("test", execution_path="unknown-path",
+                                execution_target="local")
+
+    def test_unknown_path_is_not_a_runtime_error(self):
+        # scheduler/delivery.py and ws/duplex_attach.py already catch
+        # RuntimeError from this module and read it as "the remote target is
+        # offline". A misconfigured engine must not masquerade as that.
+        import pytest
+        from core.session.session_manager import (
+            UnknownExecutionPath, get_layer_by_path,
+        )
+
+        assert not issubclass(UnknownExecutionPath, RuntimeError)
+        with pytest.raises(ValueError):   # it IS a ValueError
+            get_layer_by_path("unknown-path")
+
+    def test_valid_execution_paths_is_the_registry(self):
+        from core.session.session_manager import (
+            _LAYERS, register_layer, valid_execution_paths,
+        )
+
+        assert valid_execution_paths() == set(_LAYERS)
+        assert "claude-code-cli" in valid_execution_paths()
+        # Registering a layer is the ONE step that makes its id valid
+        # everywhere — the API validators, the checks parser and the admin
+        # endpoints all read this set.
+        try:
+            register_layer("acme-cli", MagicMock())
+            assert "acme-cli" in valid_execution_paths()
+        finally:
+            _LAYERS.pop("acme-cli", None)
+        assert "acme-cli" not in valid_execution_paths()
+
+    def test_find_layer_for_session_asks_each_layer(self):
+        from core.session.session_manager import (
+            find_layer_for_session, get_all_layers,
+        )
+
+        assert find_layer_for_session("no-such-session") is None
+        assert find_layer_for_session("") is None
+        # Every registered layer answers ownership synchronously, without the
+        # caller importing its private pool dict.
+        for layer in get_all_layers().values():
+            assert layer.owns_session("no-such-session") is False
 
     def test_register_layer(self):
         from core.session.session_manager import register_layer, get_layer_by_path, _LAYERS

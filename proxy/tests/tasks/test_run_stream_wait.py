@@ -114,3 +114,39 @@ class TestQueuedRunVisibility:
         assert run["chat_id"] == f"task-{run['id']}"
         assert chat is not None
         assert chat["user_sub"] == "task::pa"
+
+
+class TestWaitBound:
+    """``run_task(wait=true)`` ends at ``timeout_seconds``: httpx's read
+    timeout is per read and the stream's keep-alives reset it, so a run that
+    outlives the wait must still hand the caller back at the bound."""
+
+    def test_keepalives_do_not_stretch_the_wait_past_timeout_seconds(self, monkeypatch):
+        import asyncio
+
+        from tests._paths import CUSTOM_MCPS, load_mcp_server
+
+        mod = load_mcp_server(CUSTOM_MCPS / "schedules-mcp")
+
+        async def _post(path, body, headers=None):
+            return {"run_id": "run-long"}
+
+        async def _keepalives():
+            yield b'data: {"type": "status", "status": "running"}\n\n'
+            while True:
+                await asyncio.sleep(0.05)
+                yield b": keep-alive\n\n"
+
+        real_client = httpx.AsyncClient
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=_keepalives()))
+        monkeypatch.setattr(mod, "_post", _post)
+        monkeypatch.setattr(mod.httpx, "AsyncClient",
+                            lambda *a, **k: real_client(transport=transport))
+
+        async def _call():
+            return await asyncio.wait_for(mod.call_tool(
+                "run_task", {"task_id": "dyn-1", "wait": True, "timeout_seconds": 1}), 10)
+
+        text = "\n".join(c.text for c in asyncio.run(_call()))
+        assert "still running after 1s" in text
+        assert "run-long" in text

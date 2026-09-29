@@ -8,6 +8,7 @@ import {
   useFireTrigger,
 } from '../api/triggers'
 import { useAgents } from '../api/agents'
+import { TaskModelChip, linkedTaskModel } from '../components/common/TaskModelChip'
 
 /**
  * Admin Triggers page — platform-wide list of every trigger across all
@@ -199,10 +200,18 @@ function AdminTriggerRow({ trigger }: { trigger: Trigger }) {
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 text-xs">
         <span><span className="text-p-text-light">Action: </span>
-          {trigger.task_id ? `Task` : ''}
-          {trigger.task_id && trigger.notify_enabled ? ' + ' : ''}
+          {trigger.task_id ? (
+            <>
+              Task: {trigger.task_name ?? trigger.task_id.slice(0, 8)}
+              {trigger.task_effective_model ? (
+                <>{' '}<TaskModelChip task={linkedTaskModel(trigger)} /></>
+              ) : null}
+            </>
+          ) : ''}
+          {trigger.app_id ? `App: ${trigger.app_title ?? trigger.app_slug} → ${trigger.handler}` : ''}
+          {(trigger.task_id || trigger.app_id) && trigger.notify_enabled ? ' + ' : ''}
           {trigger.notify_enabled ? `Notify` : ''}
-          {!trigger.task_id && !trigger.notify_enabled ? '—' : ''}
+          {!trigger.task_id && !trigger.app_id && !trigger.notify_enabled ? '—' : ''}
         </span>
         <span><span className="text-p-text-light">Source: </span>
           {trigger.subscription_id ? 'Vendor' : 'Webhook'}

@@ -19,7 +19,9 @@ Three inbound message kinds the reader demuxes (verified live vs codex 0.120.0):
 Mirrors the CLI persistent subprocess spawn (``core/layers/cli/session.py``):
 200 MB stdout limit (big MCP-result lines), ``start_new_session`` for group-kill
 on POSIX (Windows has no process groups → teardown tree-kills via taskkill),
-optional sandbox command prefix for the local bwrap.
+optional sandbox command prefix for the local bwrap. The spawn itself is
+injectable (``spawn``): the proxy starts the daemon off its event loop inside
+a spawn slot; without one the client uses ``asyncio.create_subprocess_exec``.
 """
 
 from __future__ import annotations
@@ -85,12 +87,16 @@ class AppServerClient:
         sandbox_cmd_prefix: list[str] | None = None,
         codex_bin: str | None = None,
         label: str = "",
+        spawn: Callable[..., Awaitable[Any]] | None = None,
     ):
         self._env = env
         self._cwd = cwd
         self._sandbox_cmd_prefix = sandbox_cmd_prefix or []
         self._codex_bin = codex_bin or "codex"
         self._label = label or "codex-app-server"
+        # ``spawn(argv, *, cwd, env, limit)`` → a process with the
+        # ``asyncio.subprocess.Process`` surface the client uses.
+        self._spawn = spawn
 
         self.proc: asyncio.subprocess.Process | None = None
         self._started = False
@@ -143,16 +149,20 @@ class AppServerClient:
         # 200 MB stdout buffer — matches the CLI/Codex subprocess. Default 64 KB
         # readline raises LimitOverrunError on large MCP-result lines and kills
         # the reader mid-turn (see core/layers/cli/session.py).
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self._cwd,
-            env=self._env,
-            start_new_session=True,
-            limit=200 * 1024 * 1024,
-        )
+        limit = 200 * 1024 * 1024
+        if self._spawn is not None:
+            self.proc = await self._spawn(cmd, cwd=self._cwd, env=self._env, limit=limit)
+        else:
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._cwd,
+                env=self._env,
+                start_new_session=True,
+                limit=limit,
+            )
         self._started = True
         logger.info(f"{self._label}: daemon pid={self.proc.pid}")
 

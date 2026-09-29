@@ -155,3 +155,36 @@ async def test_classify_rejects_cross_user_in_tree_file(local_session, tmp_agent
         local_session, str(bob_ws / "secret.docx")
     )
     assert host is None
+
+
+def test_sandbox_to_host_collapses_slash_runs_before_the_join(tmp_agents_dir):
+    """``/workspace//etc/passwd`` lands under the workspace, never at
+    ``/etc/passwd``: ``pathlib`` restarts a join at an absolute component and
+    the policy verdict before the map had judged the collapsed form (core-seams
+    phase 10, audit A1)."""
+    from auth.path_policy import SecurityContext
+    agent_dir = tmp_agents_dir / "personal-assistant"
+    ctx = SecurityContext(role="manager", username="alice", agent="personal-assistant",
+                          is_admin_agent=False, session_scope="user")
+    assert paths._sandbox_to_host("/workspace//etc/passwd", ctx, agent_dir) == \
+        str(agent_dir / "workspace" / "etc" / "passwd")
+    assert paths._sandbox_to_host("/config//x", ctx, agent_dir) == str(agent_dir / "config" / "x")
+    assert paths._sandbox_to_host("/users/alice//workspace/a", ctx, agent_dir) == \
+        str(agent_dir / "users" / "alice" / "workspace" / "a")
+    # the plain forms answer as they always did
+    assert paths._sandbox_to_host("/workspace/a", ctx, agent_dir) == str(agent_dir / "workspace" / "a")
+
+
+def test_workspace_redirect_follows_the_workspace_tier(tmp_agents_dir):
+    """Below the workspace tier a Docker MCP's ``/workspace`` means the
+    person's own workspace (the viewer redirect); a contributor's means the
+    shared one, exactly like an editor's."""
+    from auth.path_policy import SecurityContext
+    agent_dir = tmp_agents_dir / "personal-assistant"
+    def ctx(role):
+        return SecurityContext(role=role, username="alice", agent="personal-assistant",
+                               is_admin_agent=False, session_scope="user")
+    assert paths._sandbox_to_host("/workspace/a", ctx("viewer"), agent_dir) == \
+        str(agent_dir / "users" / "alice" / "workspace" / "a")
+    assert paths._sandbox_to_host("/workspace/a", ctx("contributor"), agent_dir) == \
+        str(agent_dir / "workspace" / "a")

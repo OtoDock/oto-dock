@@ -14,36 +14,53 @@ import {
   useStartOpenAIOAuth,
   useOpenAIOAuthStatus,
   useFinishOpenAIOAuth,
+  loginAlreadyFinished,
   useBulkAddModels,
+  alreadyConnectedMessage,
+  ClaudeExchangeError,
+  CLAUDE_SECOND_ACCOUNT_HINT,
   type DiscoveredModel,
 } from '../../api/executionLayers'
+import type { EngineDescriptor, EngineProvider } from '../../api/engineDescriptor'
+import { accountLabel, oauthFlow } from '../../lib/engines'
+import { ENGINE_SUBSCRIPTION_STATUS } from '../../lib/status/engineSubscription'
 import { Badge, PROVIDER_LABELS } from './ExecutionLayersTab.widgets'
 import { CopyButton } from '../../components/CopyButton'
 import { ApiKeyForm } from '../../components/engines/AddApiKeyForm'
 
 // ---------------------------------------------------------------------------
-// Add API Key Form — the admin binding of the shared form (a provider choice
-// on the multi-provider engines).
+// Add API Key Form — the admin binding of the shared form. `providers` are
+// the engine's key-taking providers (lib/engines keyProviders): a select
+// appears only when there is more than one.
 // ---------------------------------------------------------------------------
 
-export function AddApiKeyForm({ layer, provider, onDone }: { layer: string; provider: string; onDone: () => void }) {
+export function AddApiKeyForm({ layer, providers, onDone }: { layer: string; providers: EngineProvider[]; onDone: () => void }) {
   const addMut = useAddSubscription()
   return (
-    <ApiKeyForm
-      layer={layer} provider={provider} onDone={onDone} mutation={addMut} ownerType="platform"
-      showProviderSelect={layer === 'direct-llm' || layer === 'codex-cli'}
-    />
+    <ApiKeyForm layer={layer} providers={providers} onDone={onDone} mutation={addMut} ownerType="platform" />
   )
 }
 
 // ---------------------------------------------------------------------------
-// Connect Claude OAuth
+// Connect an OAuth account. The engine's descriptor decides the flow and the
+// words: a device-code login (a verification URL + one-time code the form
+// polls on) or a code-paste login (a popup whose page shows a code); the
+// account and vendor labels are the engine's own.
 // ---------------------------------------------------------------------------
 
-export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: { layer: string; ownerType: 'platform' | 'user'; onDone: () => void; provider?: 'claude' | 'openai' }) {
-  const [step, setStep] = useState<'idle' | 'waiting' | 'code' | 'device-code'>('idle')
+export function ConnectOAuth({ engine, ownerType, onDone }: { engine: EngineDescriptor; ownerType: 'platform' | 'user'; onDone: () => void }) {
+  const layer = engine.name
+  const deviceCode = oauthFlow(engine) === 'device_code'
+  const account = accountLabel(engine)
+  const vendor = engine.identity.vendor_label
+  // 'retry': a paste was refused and a fresh flow is ready; the popup opens
+  // only on the Try again click (a window.open outside a gesture is blocked).
+  // 'done': the paste matched an account already connected (or revived an
+  // expired one), which the form says instead of closing quietly.
+  const [step, setStep] = useState<'idle' | 'waiting' | 'code' | 'device-code' | 'retry' | 'done'>('idle')
   const [code, setCode] = useState('')
   const [oauthState, setOauthState] = useState('')
+  const [notice, setNotice] = useState('')
 
   // Block an install switch while this auth flow holds in-WebView state (the code
   // paste / device-code step would be lost on a switch).
@@ -75,33 +92,70 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
   const checkStatus = useOpenAIOAuthStatus()
   const finishOpenAI = useFinishOpenAIOAuth()
 
-  const accountLabel = provider === 'openai' ? 'ChatGPT Account' : 'Claude Account'
 
   // --- Claude flow (code-paste) ---
+  const [authUrlClaude, setAuthUrlClaude] = useState('')
+
+  const openClaudePopup = useCallback(async (url: string) => {
+    setStep('waiting')
+    const { openOAuthWindow } = await import('../../lib/oauth')
+    const opened = await openOAuthWindow(url, 'claude-oauth')
+    if (!opened) {
+      setError('The login popup was blocked. Allow popups for this site, then try again.')
+      setStep('retry')
+      return
+    }
+    setTimeout(() => setStep('code'), 2000)
+  }, [])
+
   const handleStartClaude = useCallback(async () => {
     setError('')
+    setNotice('')
     try {
       const { url, state } = await startClaude.mutateAsync({ layer, ownerType })
       setOauthState(state)
-      setStep('waiting')
-      const { openOAuthWindow } = await import('../../lib/oauth')
-      await openOAuthWindow(url, 'claude-oauth')
-      setTimeout(() => setStep('code'), 2000)
+      setAuthUrlClaude(url)
+      await openClaudePopup(url)
     } catch (e) {
       setError((e as Error).message)
     }
-  }, [layer, ownerType, startClaude])
+  }, [layer, ownerType, startClaude, openClaudePopup])
 
   const handleExchangeClaude = useCallback(async () => {
     if (!code.trim() || !oauthState) return
     setError('')
     try {
-      await exchangeClaude.mutateAsync({ code: code.trim(), state: oauthState, layer })
-      onDone()
+      const result = await exchangeClaude.mutateAsync({ code: code.trim(), state: oauthState, layer })
+      if (result.created) {
+        onDone()
+        return
+      }
+      // A match: the same account again, or an expired row revived through
+      // this same button (the Setup form has no Reconnect of its own).
+      const email = result.subscription?.oauth_email || ''
+      setCode('')
+      setNotice(
+        result.previous_status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE
+          ? alreadyConnectedMessage(email)
+          : `Reconnected ${email || 'the account'}: its login is fresh again.`,
+      )
+      setStep('done')
     } catch (e) {
       setError((e as Error).message)
+      // The state was consumed by the refused paste: prepare a fresh flow
+      // so one click retries, without a popup until that click.
+      if (e instanceof ClaudeExchangeError && e.status === 403) return
+      try {
+        const { url, state } = await startClaude.mutateAsync({ layer, ownerType })
+        setOauthState(state)
+        setAuthUrlClaude(url)
+        setCode('')
+        setStep('retry')
+      } catch (e2) {
+        setError(`${(e as Error).message} ${(e2 as Error).message}`)
+      }
     }
-  }, [code, oauthState, layer, exchangeClaude, onDone])
+  }, [code, oauthState, layer, ownerType, exchangeClaude, startClaude, onDone])
 
   // --- OpenAI flow (device code) ---
   const handleStartOpenAI = useCallback(async () => {
@@ -120,7 +174,13 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
             stopPoll()
             try {
               await finishOpenAI.mutateAsync({ loginId: result.login_id, layer })
-            } catch { /* finish may 404 if already consumed — subscription still saved */ }
+            } catch (err) {
+              if (!loginAlreadyFinished(err)) {
+                setError((err as Error).message)
+                setStep('idle')
+                return
+              }
+            }
             onDone()
           } else if (status.status === 'failed') {
             stopPoll()
@@ -140,8 +200,8 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
     }
   }, [layer, ownerType, startOpenAI, checkStatus, finishOpenAI, onDone, stopPoll])
 
-  const handleStart = provider === 'openai' ? handleStartOpenAI : handleStartClaude
-  const isStarting = provider === 'openai' ? startOpenAI.isPending : startClaude.isPending
+  const handleStart = deviceCode ? handleStartOpenAI : handleStartClaude
+  const isStarting = deviceCode ? startOpenAI.isPending : startClaude.isPending
 
   // --- Idle state ---
   if (step === 'idle') {
@@ -152,7 +212,7 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
           disabled={isStarting}
           className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
         >
-          {isStarting ? 'Starting...' : `Connect ${accountLabel}`}
+          {isStarting ? 'Starting...' : `Connect ${account} Account`}
         </button>
         <button onClick={onDone} className="ml-2 px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
           Cancel
@@ -166,7 +226,7 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
   if (step === 'device-code') {
     return (
       <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-3">
-        <p className="text-sm font-medium text-p-text">Sign in with ChatGPT</p>
+        <p className="text-sm font-medium text-p-text">Sign in with {account}</p>
         <div className="space-y-2">
           <p className="text-xs text-p-text-secondary">1. Open this link and sign in to your account:</p>
           <div className="flex items-center gap-2">
@@ -203,6 +263,50 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
     )
   }
 
+  // --- Claude: the paste matched an account already connected ---
+  if (step === 'done') {
+    return (
+      <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-3">
+        <p className="text-sm text-amber-700 dark:text-amber-400" data-testid="claude-connect-notice">{notice}</p>
+        <div className="flex gap-2">
+          <button
+            onClick={handleStartClaude}
+            disabled={startClaude.isPending}
+            className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
+          >
+            Start again
+          </button>
+          <button onClick={onDone} className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
+            Done
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // --- Claude: a paste was refused; a fresh flow waits for one click ---
+  if (step === 'retry') {
+    return (
+      <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-3">
+        <p className="text-xs text-red-500">{error}</p>
+        <p className="text-xs text-p-text-light">
+          Click Try again to open the login popup once more and paste the new code.
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={() => { setError(''); void openClaudePopup(authUrlClaude) }}
+            className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
+          >
+            Try again
+          </button>
+          <button onClick={onDone} className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
+            Cancel
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // --- Claude code-paste states ---
   return (
     <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-3">
@@ -212,8 +316,9 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
         </p>
         <p className="text-xs text-p-text-light">
           {step === 'waiting'
-            ? 'A popup window opened for Anthropic login. After you authenticate, a code will be shown on the page.'
-            : 'Copy the authorization code from the Anthropic page and paste it below.'}
+            ? `A popup window opened for ${vendor} login. After you authenticate, a code will be shown on the page.`
+            : `Copy the authorization code from the ${vendor} page and paste it below.`}
+          {' '}{CLAUDE_SECOND_ACCOUNT_HINT}
         </p>
       </div>
       <input
@@ -245,7 +350,14 @@ export function ConnectOAuth({ layer, ownerType, onDone, provider = 'claude' }: 
 // Add Custom Model Form
 // ---------------------------------------------------------------------------
 
-export function AddModelForm({ layer, provider, onDone }: { layer: string; provider: string; onDone: () => void }) {
+export function AddModelForm({ layer, provider, xhighEditable, onDone }: {
+  layer: string
+  provider: string
+  /** The provider declares xhigh per model (`effort_per_model`): its adapter
+   *  reads `supports_xhigh` and falls back to max without it. */
+  xhighEditable: boolean
+  onDone: () => void
+}) {
   const [modelId, setModelId] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [showPricing, setShowPricing] = useState(false)
@@ -308,13 +420,12 @@ export function AddModelForm({ layer, provider, onDone }: { layer: string; provi
         />
         Supports reasoning (effort/thinking parameters)
       </label>
-      {/* xhigh is a distinct effort level only on Anthropic.
-          OpenAI-family adapters (OpenAI / Codex / Ollama / LiteLLM) top their
-          reasoning scale at xhigh and collapse platform "max" onto it
-          internally — the supports_xhigh flag is never consulted there, so
-          hide the checkbox to avoid confusing admins. Flag stays false in
-          the payload, which is a no-op for non-Anthropic providers. */}
-      {provider === 'anthropic' && (
+      {/* The checkbox exists where the provider's entry declares xhigh per
+          model (Anthropic: an older model rejects it and the adapter sends
+          max instead). A provider whose ladder tops at xhigh takes it on
+          every model and never reads the flag — no checkbox, the flag stays
+          false in the payload and nothing consults it. */}
+      {xhighEditable && (
         <label className="flex items-center gap-2 text-xs text-p-text-secondary cursor-pointer">
           <input
             type="checkbox"

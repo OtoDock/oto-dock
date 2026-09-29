@@ -4,7 +4,12 @@
 
 export interface PendingImage {
   id: string
-  base64: string
+  /** A fresh photo: the data URL to send. Absent for a photo the chat's
+   * scope already holds (one handed back from a cancelled queued message),
+   * which is re-sent by `path` and shown through the agent files URL. */
+  base64?: string
+  /** Agent-relative saved path of an already-saved photo. */
+  path?: string
   name: string
 }
 
@@ -12,7 +17,9 @@ export interface PendingFile {
   id: string
   name: string
   size: number
-  file: File
+  /** The picked File while it uploads; absent for a file handed back from
+   * a cancelled queued message (already uploaded — `uploadedPath` is set). */
+  file?: File
   uploading?: boolean
   /** Waiting in the sequential upload queue. `uploading` stays true while
    * queued so the send gate still holds — a Send while a file waits in the
@@ -28,4 +35,39 @@ export interface PendingFile {
    * phase-2 remote-machine sync progress in transferStore. */
   transferId?: string
   remotePush?: boolean
+}
+
+/** A photo as the server names it after saving it (`{name, path}`). */
+export interface AttachedImageMeta {
+  name: string
+  path?: string
+}
+
+/** An uploaded file as the server validated it (`{path, name}`). */
+export interface AttachedFileMeta {
+  path: string
+  name: string
+}
+
+/** One message waiting behind a live turn (or held by a steer): the text
+ * plus the attachment meta the `queued` / `steered` / `queue_snapshot`
+ * frames carry, so the bubble shows the chips and a cancel can hand the
+ * attachments back to the composer. */
+export interface QueuedMessage {
+  text: string
+  images?: AttachedImageMeta[]
+  files?: AttachedFileMeta[]
+}
+
+/** The frames still carry only `text` for old persisted queues. */
+export function toQueuedMessage(m: unknown): QueuedMessage {
+  if (typeof m === 'string') return { text: m }
+  if (m && typeof m === 'object') {
+    const o = m as Record<string, unknown>
+    const out: QueuedMessage = { text: typeof o.text === 'string' ? o.text : '' }
+    if (Array.isArray(o.images) && o.images.length) out.images = o.images as AttachedImageMeta[]
+    if (Array.isArray(o.files) && o.files.length) out.files = o.files as AttachedFileMeta[]
+    return out
+  }
+  return { text: '' }
 }

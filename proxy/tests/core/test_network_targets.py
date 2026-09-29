@@ -2,6 +2,8 @@
 carve-out it feeds (part of the always-on sandbox-isolation work).
 """
 
+import pytest
+
 from services.mcp import mcp_registry
 from services.mcp.mcp_registry import (
     McpManifest, ServerConfig, NetworkTargetDecl,
@@ -240,3 +242,83 @@ class TestHostSelfRewrite:
         env = {"PROMETHEUS_URL": "http://192.168.0.50:9090"}
         mcp_registry._rewrite_host_self_targets_to_loopback(m, env, "pa")
         assert env["PROMETHEUS_URL"] == "http://192.168.0.50:9090"  # T2 → no rewrite
+
+
+# ---------------------------------------------------------------------------
+# The platform's own control plane is never carved or spliced
+# ---------------------------------------------------------------------------
+
+class TestPlatformRefusal:
+    """The carve never re-opens a route into the platform's control-plane
+    networks or to a platform service address, and the bare-metal splice
+    never opens a platform listener's port."""
+
+    def _homelab(self, monkeypatch, ips, *, compose, port=9090, local_ips=()):
+        import config
+        from core.config import deployment
+        monkeypatch.setattr(deployment, "in_docker_compose", lambda: compose)
+        monkeypatch.setattr(mcp_registry, "_platform_targets_cache", {})
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://u:p@dbhost:5432/x")
+        monkeypatch.setattr(config, "DOCKER_SOCKET_PROXY_HOST", "docker-socket-proxy")
+        m = _manifest("prom", [NetworkTargetDecl("config", "PROMETHEUS_URL", port_default=port)])
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [m])
+        monkeypatch.setattr(mcp_registry, "manifest_capability_available", lambda mm: True)
+        monkeypatch.setattr(mcp_registry, "network_access_enabled", lambda mm: True)
+        monkeypatch.setattr(mcp_registry, "enumerate_mcp_network_targets",
+                            lambda mm, a, **k: [("target.lan", port)])
+        monkeypatch.setattr(mcp_registry, "_resolve_to_ips", lambda h: list(ips.get(h, [])))
+        monkeypatch.setattr(mcp_registry, "_is_local_host_ip", lambda ip: ip in local_ips)
+        return mcp_registry.resolve_sandbox_egress("pa")
+
+    def test_compose_control_plane_networks_are_not_carved(self, monkeypatch):
+        forwards, allow = self._homelab(monkeypatch, {
+            "target.lan": ["10.203.0.5", "10.202.0.8", "10.204.0.7", "10.200.0.20"],
+        }, compose=True)
+        assert allow == ["10.200.0.20"]
+
+    def test_compose_service_addresses_are_not_carved(self, monkeypatch):
+        forwards, allow = self._homelab(monkeypatch, {
+            "dbhost": ["10.200.0.4"], "docker-socket-proxy": ["10.200.0.5"],
+            "target.lan": ["10.200.0.4", "10.200.0.5", "10.200.0.6"],
+        }, compose=True)
+        assert allow == ["10.200.0.6"]
+
+    def test_the_proxy_container_own_addresses_are_not_carved(self, monkeypatch):
+        forwards, allow = self._homelab(monkeypatch, {
+            "target.lan": ["10.200.0.9", "10.200.0.10"],
+        }, compose=True, local_ips=("10.200.0.9",))
+        assert allow == ["10.200.0.10"]
+
+    @pytest.mark.parametrize("compose", [True, False])
+    def test_loopback_and_mapped_forms_are_never_carved(self, monkeypatch, compose):
+        forwards, allow = self._homelab(monkeypatch, {
+            "target.lan": ["127.0.0.1", "::1", "::ffff:10.203.0.5", "::ffff:127.0.0.1"],
+        }, compose=compose)
+        # A mapped form is judged as its IPv4 address: a control-plane
+        # address in compose mode, an ordinary private one on bare metal.
+        assert allow == ([] if compose else ["::ffff:10.203.0.5"])
+
+    def test_bare_metal_does_not_apply_the_compose_networks(self, monkeypatch):
+        forwards, allow = self._homelab(monkeypatch, {
+            "target.lan": ["10.203.0.5"],
+        }, compose=False)
+        assert allow == ["10.203.0.5"]
+
+    def test_bare_metal_never_splices_a_platform_listener_port(self, monkeypatch):
+        import config
+        # A homelab target that names the proxy host itself on the database
+        # port is a splice request for the local Postgres: refused.
+        monkeypatch.setattr(config, "PHONE_SERVER_URL", "http://127.0.0.1:9093")
+        forwards, _allow = self._homelab(monkeypatch, {
+            "dbhost": ["127.0.0.1"], "target.lan": ["192.168.0.50"],
+        }, compose=False, port=5432, local_ips=("192.168.0.50",))
+        assert "5432" not in forwards
+        for port in (9093, 9092):
+            forwards, _allow = self._homelab(monkeypatch, {
+                "dbhost": ["127.0.0.1"], "target.lan": ["192.168.0.50"],
+            }, compose=False, port=port, local_ips=("192.168.0.50",))
+            assert str(port) not in forwards
+        forwards, _allow = self._homelab(monkeypatch, {
+            "dbhost": ["127.0.0.1"], "target.lan": ["192.168.0.50"],
+        }, compose=False, port=9090, local_ips=("192.168.0.50",))
+        assert "9090" in forwards

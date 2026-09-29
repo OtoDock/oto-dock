@@ -267,10 +267,9 @@ class TestInstalledVersionReadback:
         # empty readback after a successful install as a failure.
         assert mcp_installer._node_installed_version(tmp_path, "nope") == ""
 
-    @pytest.mark.asyncio
-    async def test_python_missing_venv_returns_empty(self, tmp_path: Path):
-        # No venv interpreter on disk → "" without spawning anything.
-        assert await mcp_installer._python_installed_version(tmp_path / "venv", "ha-mcp") == ""
+    def test_python_missing_venv_returns_empty(self, tmp_path: Path):
+        # No venv on disk → "" without touching anything.
+        assert mcp_installer._python_installed_version(tmp_path / "venv", "ha-mcp") == ""
 
 
 class TestCheckSystemRequirements:
@@ -341,3 +340,295 @@ class TestSelfHash:
         h = mcp_installer.self_hash()
         assert len(h) == 64  # full sha256 hex
         assert all(c in "0123456789abcdef" for c in h)
+
+
+# ---------------------------------------------------------------------------
+# The install subprocesses: scrubbed environment, binary-only pypi,
+# a clean venv, an in-process version readback, git-applied patches.
+# ---------------------------------------------------------------------------
+
+import asyncio
+import os
+import subprocess
+
+_SECRETS = {"DATABASE_URL": "postgresql://u:p@db/x", "JWT_SECRET": "s3",
+            "POSTGRES_PASSWORD": "pw", "NODE_OPTIONS": "--require /tmp/x.js",
+            "OTO_MACHINE_SECRET": "m"}
+_KEPT = {"PATH": os.environ.get("PATH", "/usr/bin"), "HTTPS_PROXY": "http://proxy:3128",
+         "UV_CACHE_DIR": "/tmp/uv-cache", "NPM_CONFIG_REGISTRY": "https://registry.example"}
+
+
+class _Proc:
+    def __init__(self, rc: int, out: bytes = b""):
+        self.returncode = rc
+        self._out = out
+
+    async def communicate(self):
+        return self._out, b""
+
+
+def _fake_uv(tmp_path: Path) -> str:
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\n")
+    return str(uv)
+
+
+def _recording_spawn(monkeypatch, script=None, *, passthrough=()):
+    """Replace ``create_subprocess_exec`` with a recorder that answers from
+    ``script`` (a list of _Proc) and lets ``passthrough`` argv[0] basenames
+    run for real."""
+    real = asyncio.create_subprocess_exec
+    calls: list[dict] = []
+
+    async def _spawn(*argv, **kw):
+        calls.append({"argv": [str(a) for a in argv], "env": kw.get("env"), "cwd": kw.get("cwd")})
+        if Path(argv[0]).name in passthrough:
+            return await real(*argv, **kw)
+        return script[len(calls) - 1] if script else _Proc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    return calls
+
+
+def _node_dir(tmp_path: Path, pkg: str = "pkg", version: str = "1.0.0") -> Path:
+    mcp_dir = tmp_path / "mcps" / "community" / "node-mcp"
+    (mcp_dir / "node_modules" / pkg).mkdir(parents=True)
+    (mcp_dir / "node_modules" / pkg / "package.json").write_text(json.dumps({"version": version}))
+    return mcp_dir
+
+
+def _python_dir(tmp_path: Path) -> Path:
+    mcp_dir = tmp_path / "mcps" / "community" / "py-mcp"
+    mcp_dir.mkdir(parents=True)
+    return mcp_dir
+
+
+class TestInstallEnvironment:
+    def test_allowlist_keeps_runtime_and_network_names_only(self, monkeypatch):
+        for k, v in {**_SECRETS, **_KEPT}.items():
+            monkeypatch.setenv(k, v)
+        env = mcp_installer._install_env()
+        for k in _SECRETS:
+            assert k not in env
+        for k in _KEPT:
+            assert env[k] == _KEPT[k]
+        assert env["UV_NO_CONFIG"] == "1"
+        assert env["PIP_CONFIG_FILE"] == os.devnull
+        assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_every_node_subprocess_gets_the_scrubbed_env(self, tmp_path, monkeypatch):
+        for k, v in {**_SECRETS, **_KEPT}.items():
+            monkeypatch.setenv(k, v)
+        mcp_dir = _node_dir(tmp_path)
+        (mcp_dir / "patches").mkdir()
+        (mcp_dir / "patches" / "pkg+1.0.0.patch").write_text("x")
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(1), _Proc(0, b"Applied patch")])
+        monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: "/usr/bin/git" if n == "git" else None)
+        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        assert r.ok, r.log
+        assert calls, "no subprocess recorded"
+        for c in calls:
+            assert c["env"] is not None, c["argv"]
+            assert not set(_SECRETS) & set(c["env"]), c["argv"]
+            assert c["env"]["PATH"] == _KEPT["PATH"]
+        assert not any(c["argv"][0].endswith("npx") for c in calls)
+        git_calls = [c for c in calls if c["argv"][0].endswith("git")]
+        assert git_calls and all(c["env"]["GIT_CEILING_DIRECTORIES"] == str(mcp_dir.parent) for c in git_calls)
+
+    @pytest.mark.asyncio
+    async def test_every_python_subprocess_gets_the_scrubbed_env(self, tmp_path, monkeypatch):
+        for k, v in {**_SECRETS, **_KEPT}.items():
+            monkeypatch.setenv(k, v)
+        mcp_dir = _python_dir(tmp_path)
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        r = await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
+        assert r.ok, r.log
+        assert len(calls) == 2  # uv venv, uv pip install: no interpreter readback
+        for c in calls:
+            assert not set(_SECRETS) & set(c["env"]), c["argv"]
+            assert c["env"]["UV_LINK_MODE"] == "copy"
+            assert c["env"]["UV_PYTHON_INSTALL_DIR"].endswith(".uv-python")
+            assert c["env"]["UV_NO_CONFIG"] == "1"
+
+
+class TestBinaryOnlyPython:
+    @pytest.mark.asyncio
+    async def test_pypi_install_is_binary_only_with_declared_exceptions(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "pypi:unifi-network-mcp@1.0.0",
+            uv_bin=_fake_uv(tmp_path), source_build=["antlr4-python3-runtime"],
+        )
+        pip = calls[1]["argv"]
+        assert "--only-binary=:all:" in pip
+        assert pip[pip.index("--no-binary") + 1] == "antlr4-python3-runtime"
+        assert pip[-1] == "unifi-network-mcp==1.0.0"
+
+    @pytest.mark.asyncio
+    async def test_pip_fallback_is_binary_only_and_isolated(self, tmp_path, monkeypatch):
+        mcp_dir = _python_dir(tmp_path)
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp", uv_bin=None)
+        pip = calls[1]["argv"]
+        assert "--only-binary=:all:" in pip and "--isolated" in pip
+
+    @pytest.mark.asyncio
+    async def test_git_and_requirements_installs_are_not_binary_only(self, tmp_path, monkeypatch):
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        await mcp_installer.install_mcp(
+            _python_dir(tmp_path), "python", "git+https://host/r.git@v1", uv_bin=_fake_uv(tmp_path),
+        )
+        assert not any("--only-binary=:all:" in c["argv"] for c in calls)
+        mcp_dir = tmp_path / "mcps" / "custom" / "bundled"
+        mcp_dir.mkdir(parents=True)
+        (mcp_dir / "requirements.txt").write_text("x\n")
+        calls[:] = []
+        await mcp_installer.install_mcp(mcp_dir, "python", "", uv_bin=_fake_uv(tmp_path))
+        assert calls and not any("--only-binary=:all:" in c["argv"] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_pypi_install_recreates_the_venv(self, tmp_path, monkeypatch):
+        mcp_dir = _python_dir(tmp_path)
+        (mcp_dir / "venv").mkdir()
+        (mcp_dir / "venv" / "stale").write_text("x")
+        calls = _recording_spawn(monkeypatch, [_Proc(0), _Proc(0)])
+        await mcp_installer.install_mcp(mcp_dir, "python", "pypi:ha-mcp@6.7.0", uv_bin=_fake_uv(tmp_path))
+        assert calls[0]["argv"][1] == "venv"
+        assert not (mcp_dir / "venv" / "stale").exists()
+
+
+class TestVersionReadback:
+    def test_reads_dist_info_in_process(self, tmp_path, monkeypatch):
+        venv = tmp_path / "venv"
+        site = venv / "lib" / "python3.13" / "site-packages"
+        (site / "ha_mcp-6.7.0.dist-info").mkdir(parents=True)
+        (site / "ha_mcp-6.7.0.dist-info" / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: ha-mcp\nVersion: 6.7.0\n")
+        spawned = []
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", lambda *a, **k: spawned.append(a))
+        assert mcp_installer._python_installed_version(venv, "ha-mcp") == "6.7.0"
+        assert mcp_installer._python_installed_version(venv, "HA_MCP") == "6.7.0"
+        assert mcp_installer._python_installed_version(venv, "other") == ""
+        assert spawned == []
+
+    def test_reads_the_windows_layout(self, tmp_path):
+        site = tmp_path / "venv" / "Lib" / "site-packages"
+        (site / "pkg-1.2.dist-info").mkdir(parents=True)
+        (site / "pkg-1.2.dist-info" / "METADATA").write_text("Name: pkg\nVersion: 1.2\n")
+        assert mcp_installer._python_installed_version(tmp_path / "venv", "pkg") == "1.2"
+
+
+_PATCH = """diff --git a/node_modules/pkg/index.js b/node_modules/pkg/index.js
+index 0000000..1111111 100644
+--- a/node_modules/pkg/index.js
++++ b/node_modules/pkg/index.js
+@@ -1 +1 @@
+-old
++new
+"""
+
+
+class TestPatches:
+    def _patched_node_dir(self, tmp_path: Path) -> Path:
+        # The MCP folder sits INSIDE a git work tree, as on a bare-metal install
+        # where mcps/ lives under the platform checkout.
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        mcp_dir = _node_dir(tmp_path)
+        (mcp_dir / "node_modules" / "pkg" / "index.js").write_text("old\n")
+        (mcp_dir / "patches").mkdir()
+        (mcp_dir / "patches" / "pkg+1.0.0.patch").write_text(_PATCH)
+        return mcp_dir
+
+    @pytest.mark.asyncio
+    async def test_patches_are_applied_by_git_inside_a_work_tree(self, tmp_path, monkeypatch):
+        mcp_dir = self._patched_node_dir(tmp_path)
+        marker = tmp_path / "bin-ran"
+        (mcp_dir / "node_modules" / ".bin").mkdir()
+        bin_ = mcp_dir / "node_modules" / ".bin" / "patch-package"
+        bin_.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        bin_.chmod(0o755)
+        calls = _recording_spawn(monkeypatch, [_Proc(0)], passthrough=("git",))
+        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        assert r.ok, r.log
+        assert (mcp_dir / "node_modules" / "pkg" / "index.js").read_text() == "new\n"
+        assert not marker.exists()
+        assert not any("npx" in c["argv"][0] for c in calls)
+        # A second install over the same node_modules is a no-op for the patch.
+        calls[:] = []
+        _recording_spawn(monkeypatch, [_Proc(0)], passthrough=("git",))
+        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        assert r.ok, r.log
+        assert (mcp_dir / "node_modules" / "pkg" / "index.js").read_text() == "new\n"
+        assert "already applied" in r.log
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_or_failed_patch_fails_the_install(self, tmp_path, monkeypatch):
+        mcp_dir = self._patched_node_dir(tmp_path)
+        _recording_spawn(monkeypatch, [_Proc(0), _Proc(1), _Proc(0, b"Skipped patch 'node_modules/pkg/index.js'.")])
+        monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: "/usr/bin/git")
+        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        assert r.ok is False
+        assert "Skipped patch" in r.log
+
+    @pytest.mark.asyncio
+    async def test_patches_need_git(self, tmp_path, monkeypatch):
+        mcp_dir = self._patched_node_dir(tmp_path)
+        _recording_spawn(monkeypatch, [_Proc(0)])
+        monkeypatch.setattr(mcp_installer.shutil, "which", lambda n: None)
+        r = await mcp_installer.install_mcp(mcp_dir, "node", "npm:pkg@1.0.0")
+        assert r.ok is False
+        assert "git" in r.log
+
+
+class TestSystemRequirementNames:
+    def test_bad_names_are_refused_before_any_command(self, monkeypatch):
+        ran = []
+        monkeypatch.setattr(mcp_installer.subprocess, "run", lambda *a, **k: ran.append(a))
+        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_installer._is_package_installed", return_value=False):
+            ok, msg = mcp_installer.install_system_requirements(
+                mcp_installer.SystemRequirementsInput(debian=["libmagic1", "--force-yes", "a b"]))
+        assert ok is False and "--force-yes" in msg and ran == []
+
+    def test_names_follow_a_double_dash(self, monkeypatch):
+        ran = []
+
+        class _R:
+            returncode = 0
+            stdout = stderr = ""
+
+        monkeypatch.setattr(mcp_installer.subprocess, "run", lambda cmd, **k: ran.append(cmd) or _R())
+        with patch("services.mcp.mcp_installer._detect_os_keys", return_value=["debian"]), \
+             patch("services.mcp.mcp_installer._is_package_installed", return_value=False):
+            ok, _ = mcp_installer.install_system_requirements(
+                mcp_installer.SystemRequirementsInput(debian=["libmagic1", "poppler-utils"]))
+        assert ok is True
+        assert ran[0][-3:] == ["--", "libmagic1", "poppler-utils"]
+
+
+class TestVenvRemovalOffTheLoop:
+    """A venv holds thousands of files; removing it on the event loop stalls
+    every other request for seconds."""
+
+    class _Stop(Exception):
+        pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["pypi:pkg", "git+https://host/r.git@v1"])
+    async def test_the_package_venv_is_removed_in_a_worker_thread(self, tmp_path, monkeypatch, source):
+        import threading
+        seen: list[bool] = []
+
+        def _rmtree(path, ignore_errors=False):
+            seen.append(threading.current_thread() is threading.main_thread())
+            raise self._Stop
+
+        monkeypatch.setattr(mcp_installer.shutil, "rmtree", _rmtree)
+        mcp_dir = tmp_path / "community" / "pkg"
+        mcp_dir.mkdir(parents=True)
+        with pytest.raises(self._Stop):
+            await mcp_installer.install_mcp(mcp_dir, "python", source)
+        assert seen == [False]

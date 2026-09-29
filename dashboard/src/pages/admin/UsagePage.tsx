@@ -779,6 +779,77 @@ export default function UsagePage() {
         </div>
       )}
 
+      {/* Judge spend per check (CHECKS.md "Spend"): the judge runs a check started. */}
+      {(overview.checks?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface overflow-hidden" data-testid="usage-checks">
+          <div className="px-4 py-3 border-b border-p-border-light">
+            <h3 className="text-sm font-medium text-p-text">Checks — Judge Runs (This Month)</h3>
+            <p className="text-xs text-p-text-light mt-0.5">Sessions a check started to judge an agent&apos;s work. A manager caps them per agent per day on the agent&apos;s Checks page.</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-p-text-secondary border-b border-p-border-light bg-p-bg/30">
+                  <th className="px-4 py-2 font-medium">Check</th>
+                  <th className="px-4 py-2 font-medium">Agent</th>
+                  <th className="px-4 py-2 font-medium text-right">Cost</th>
+                  <th className="px-4 py-2 font-medium text-right">Runs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overview.checks!.map((c) => (
+                  <tr key={`${c.agent}:${c.check_name}`} className="border-b border-p-border-light last:border-0">
+                    <td className="px-4 py-2"><a href={`/agents/${c.agent}/checks`} className="font-medium text-p-text hover:underline">{c.check_name}</a></td>
+                    <td className="px-4 py-2 text-p-text-secondary">{c.agent || '—'}</td>
+                    <td className="px-4 py-2 text-right text-p-text">${c.total_cost.toFixed(2)}</td>
+                    <td className="px-4 py-2 text-right text-p-text-secondary">{c.run_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Unattended spend per app: the runs an app's handler fired. */}
+      {(overview.apps?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface overflow-hidden" data-testid="usage-apps">
+          <div className="px-4 py-3 border-b border-p-border-light">
+            <h3 className="text-sm font-medium text-p-text">Apps — Unattended Runs (This Month)</h3>
+            <p className="text-xs text-p-text-light mt-0.5">Task runs an app started on its own — on a schedule, on a webhook, on a platform event. Button presses stay with the person who pressed.</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-p-text-secondary border-b border-p-border-light bg-p-bg/30">
+                  <th className="px-4 py-2 font-medium">App</th>
+                  <th className="px-4 py-2 font-medium">Agent</th>
+                  <th className="px-4 py-2 font-medium text-right">Cost</th>
+                  <th className="px-4 py-2 font-medium text-right">Runs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overview.apps!.map((a) => (
+                  <tr key={a.app_id} className="border-b border-p-border-light last:border-0">
+                    <td className="px-4 py-2">
+                      {a.scope === 'gone' ? (
+                        <span className="text-p-text-light">{a.app_id.slice(0, 8)} (deleted)</span>
+                      ) : (
+                        <a href={`/apps/${a.app_id}`} className="font-medium text-p-text hover:underline">{a.title}</a>
+                      )}
+                      {a.scope === 'personal' && <span className="ml-1 text-xs text-p-text-light">personal</span>}
+                    </td>
+                    <td className="px-4 py-2 text-p-text-secondary">{a.agent || '—'}</td>
+                    <td className="px-4 py-2 text-right text-p-text">${a.total_cost.toFixed(2)}</td>
+                    <td className="px-4 py-2 text-right text-p-text-secondary">{a.run_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Subscription pool: the agent pool's OAuth accounts and their cap. */}
       <PlatformPoolCapSection />
 

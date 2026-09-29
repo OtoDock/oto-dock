@@ -30,6 +30,7 @@ def app_with_router(tmp_path, monkeypatch):
 
     # Redirect AGENTS_DIR so we don't touch real workspace files
     agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()  # the root exists on every install; the code never creates it
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
     # `config.get_agent_dir` reads AGENTS_DIR at call-time (it's a function);
     # the helper used by uploads.py:133 is `config.get_agent_dir`. Confirm
@@ -198,6 +199,7 @@ def app_with_internal_agent(tmp_path, monkeypatch):
     from auth.providers import UserContext
 
     agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()  # the root exists on every install; the code never creates it
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
 
     user = UserContext(
@@ -252,7 +254,7 @@ def test_agent_scoped_upload_rejects_viewer(app_with_internal_agent, monkeypatch
     """Viewers cannot post into an internal agent's shared `/workspace/`.
     Path policy permits the write at the OS level (agent-scoped sessions
     can write `/workspace/`), but for the API caller we add a per-agent
-    manager check — defense in depth."""
+    workspace-tier check — defense in depth."""
     app, _, user = app_with_internal_agent
     # Demote: per-agent viewer + platform member (defense in depth)
     user.agent_roles["internal-bot"] = "viewer"
@@ -265,7 +267,23 @@ def test_agent_scoped_upload_rejects_viewer(app_with_internal_agent, monkeypatch
         data={"agent": "internal-bot"},
     )
     assert resp.status_code == 403, resp.text
-    assert "manager" in resp.text.lower()
+    assert "contributor" in resp.text.lower()
+
+
+@pytest.mark.parametrize("role", ["contributor", "editor"])
+def test_agent_scoped_upload_accepts_the_workspace_tier(app_with_internal_agent, role):
+    """An upload into a Shared-only chat is a shared-workspace write: the
+    workspace tier, not the owner tier (editors used to be refused here)."""
+    app, agents_dir, user = app_with_internal_agent
+    user.agent_roles["internal-bot"] = role
+    user.role = "member"
+    resp = TestClient(app).post(
+        "/v1/upload",
+        files={"file": ("site.md", BytesIO(b"# day"), "text/markdown")},
+        data={"agent": "internal-bot"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert (agents_dir / "internal-bot" / "workspace" / "uploads" / "files" / "site.md").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -443,3 +461,106 @@ def test_upload_refuses_landing_dir_symlinked_out_of_agent(app_with_router, tmp_
     )
     assert resp.status_code == 403, resp.text
     assert list(outside.rglob("*")) == []
+
+
+# ---------------------------------------------------------------------------
+# The single-shot write: off the loop, floored, never through a planted link
+# ---------------------------------------------------------------------------
+
+
+def _post_file(client, name="note.txt", data=b"hello", agent="test-agent"):
+    return client.post("/v1/upload", files={"file": (name, BytesIO(data))},
+                       data={"agent": agent})
+
+
+def test_single_shot_writes_and_fsyncs_off_the_loop(app_with_router, monkeypatch):
+    import threading
+    app, agents_dir = app_with_router
+    seen = set()
+    real_fsync = os.fsync
+
+    def _fsync(fd):
+        seen.add(threading.current_thread().name)
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", _fsync)
+    resp = _post_file(TestClient(app), data=b"x" * (3 * 1024 * 1024))
+    assert resp.status_code == 200, resp.text
+    assert seen and all(n.startswith("file-commit") for n in seen)
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    assert [p.name for p in landed.iterdir()] == ["note.txt"]
+    assert (landed / "note.txt").stat().st_size == 3 * 1024 * 1024
+
+
+def test_single_shot_refuses_below_the_free_disk_floor(app_with_router, monkeypatch):
+    import shutil
+    from collections import namedtuple
+    import config
+    app, _agents_dir = app_with_router
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 5)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_PCT", 0)
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(100 << 20, 99 << 20, 1 << 20))
+    assert _post_file(TestClient(app)).status_code == 507
+
+
+def test_single_shot_failure_leaves_no_partial(app_with_router, monkeypatch):
+    from api.media import uploads
+    app, agents_dir = app_with_router
+
+    def _boom(*a, **kw):
+        raise OSError("disk gone")
+    monkeypatch.setattr(uploads, "_flush_fsync_close", _boom)
+    assert _post_file(TestClient(app)).status_code == 500
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    assert [p.name for p in landed.iterdir()] == []
+
+
+def test_single_shot_refusals_answer_403_like_the_chunked_routes(app_with_router, monkeypatch):
+    """A confinement refusal after the destination was resolved (a component
+    swapped for a link in the window) is the caller's 403, never a 500, at
+    the temp open and at the final rename alike; no temp is left behind."""
+    from api.media import uploads
+    from services.infra import safe_fs
+    app, agents_dir = app_with_router
+    real_open, real_rename = safe_fs.open_beneath, safe_fs.rename_beneath
+
+    def _refuse_open(*a, **kw):
+        raise safe_fs.SymlinkRefused("a component is a link")
+    monkeypatch.setattr(uploads.safe_fs, "open_beneath", _refuse_open)
+    resp = _post_file(TestClient(app))
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == "Path outside agent directory"
+    assert _no_partials(agents_dir) == []
+    monkeypatch.setattr(uploads.safe_fs, "open_beneath", real_open)
+
+    def _refuse_rename(*a, **kw):
+        raise safe_fs.EscapeRefused("the path left the root")
+    monkeypatch.setattr(uploads.safe_fs, "rename_beneath", _refuse_rename)
+    resp = _post_file(TestClient(app))
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"] == "Path outside agent directory"
+    assert _no_partials(agents_dir) == []
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    assert [p.name for p in landed.iterdir()] == []
+    monkeypatch.setattr(uploads.safe_fs, "rename_beneath", real_rename)
+
+    # A plain filesystem error at the open is a logged 500, still no temp.
+    def _not_a_dir(*a, **kw):
+        raise NotADirectoryError("files is a file")
+    monkeypatch.setattr(uploads.safe_fs, "mkdirs_beneath", _not_a_dir)
+    resp = _post_file(TestClient(app))
+    assert resp.status_code == 500 and resp.json()["detail"] == "Upload failed"
+    assert _no_partials(agents_dir) == []
+
+
+def test_single_shot_never_writes_through_a_planted_link(app_with_router, tmp_path):
+    app, agents_dir = app_with_router
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    landed.mkdir(parents=True)
+    target = tmp_path / "elsewhere.txt"
+    target.write_bytes(b"untouched")
+    (landed / "note.txt").symlink_to(target)
+    resp = _post_file(TestClient(app))
+    assert resp.status_code == 200 and resp.json()["filename"] == "note_1.txt"
+    assert target.read_bytes() == b"untouched"
+    assert (landed / "note_1.txt").read_bytes() == b"hello"

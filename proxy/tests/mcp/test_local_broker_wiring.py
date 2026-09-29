@@ -127,3 +127,55 @@ def test_codex_inject_then_wrap_full_chain():
     # display untouched (no token → no wrap)
     disp_idx = out.index("[mcp_servers.display]")
     assert 'args = ["d.py"]' in out[disp_idx:]
+
+
+# --- a bundle the token-file delivery creates gets wired like any other ----
+
+def test_a_token_file_bundle_gets_the_fetch_token_in_json_and_toml(tmp_path):
+    """An OAuth stdio MCP with no other secret had no bundle; the token-file
+    delivery creates one, and the Claude JSON and the Codex TOML then carry
+    its fetch token and the interceptor wrap."""
+    from core.credentials import credential_files as cf
+    bundles: dict = {}
+    cf.merge_token_files(bundles, {"gws": {cf.CREDENTIAL_FILES_ENV: "{}"}})
+
+    cfg = {"mcpServers": {"gws": {"command": "bash", "args": ["run.sh"],
+                                  "env": {"WS_DIR": "/knowledge/x"}}}}
+    src = tmp_path / "agent.json"
+    src.write_text(json.dumps(cfg))
+    host_dir = tmp_path / ".claude"
+    host_dir.mkdir()
+    prepare_mcp_config_for_sandbox(
+        src, host_dir, sandbox_config_dir="/workspace/.claude",
+        session_id="sess-9", secret_bundles=bundles,
+    )
+    srv = json.loads((host_dir / "agent.json").read_text())["mcpServers"]["gws"]
+    assert mcp_broker.verify_token(srv["env"]["OTO_MCP_FETCH_TOKEN"]) == ("sess-9", "gws")
+    assert srv["args"][:2] == ["/workspace/.claude/stdio_path_interceptor.py", "--"]
+
+    toml = '[mcp_servers.gws]\ncommand = "bash"\nargs = ["run.sh"]\nenv = { WS_DIR = "/knowledge/x" }\n'
+    out = _inject_fetch_tokens_toml(toml, set(bundles), "sess-9")
+    tok = re.search(r'"OTO_MCP_FETCH_TOKEN" = "([^"]+)"', out).group(1)
+    assert mcp_broker.verify_token(tok) == ("sess-9", "gws")
+    wrapped = wrap_toml_text(out, interpreter="python3",
+                             interceptor_path="/workspace/.codex/stdio_path_interceptor.py")
+    assert "stdio_path_interceptor.py" in wrapped
+
+
+# --- the delivery helper the Direct-LLM and app-button builders share -------
+
+
+def test_deliver_token_files_merges_and_a_failure_delivers_nothing(monkeypatch):
+    from core.credentials import credential_files as cf
+    monkeypatch.setattr(cf, "token_file_env",
+                        lambda agent, **kw: {"gws": {cf.CREDENTIAL_FILES_ENV: "{}"}})
+    bundles: dict = {}
+    cf.deliver_token_files(bundles, "a", user_sub="", session_scope="agent")
+    assert set(bundles) == {"gws"} and bundles["gws"].env[cf.CREDENTIAL_FILES_ENV] == "{}"
+
+    def boom(agent, **kw):
+        raise RuntimeError("store down")
+    monkeypatch.setattr(cf, "token_file_env", boom)
+    other: dict = {}
+    cf.deliver_token_files(other, "a")
+    assert other == {}

@@ -87,6 +87,7 @@ import {
   useAdminAddUserAgent,
 } from '../../api/departments'
 import { useAuth } from '../../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin, isCreatorOrAbove } from '../../lib/permissions'
 import {
   computeHeat,
   computeMapLayout,
@@ -103,6 +104,7 @@ import { MapMenu, MenuIcon, ModeBanner, NewDepartmentInline } from './MapOverlay
 import { useMapRenderer } from './useMapRenderer'
 import { useStageMachine } from './useStageMachine'
 import { useMapPointers } from './useMapPointers'
+import { useSnapshotHeal } from './useSnapshotHeal'
 
 export interface AgentsMap3DProps {
   /** WebGL missing / renderer creation failed → parent falls back to grid. */
@@ -126,15 +128,17 @@ export default function AgentsMap3D({
   const navigate = useNavigate()
   const qc = useQueryClient()
   const { user, refreshUser } = useAuth()
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   // Admin "Everything" view needs ?all=true — without it the backend
   // filters the list to the admin's own checkbox agents and non-member
   // agents can never appear on the map.
   // keepPrevious: the admin scope toggle flips the query KEY after ui-prefs
   // land — without placeholder data the list drops to [] for a beat and
   // every chip is torn down and rebuilt a second time on load.
-  const { data: agents = [], isSuccess: agentsReady, isPending: agentsPending } =
-    useAgents({ all: isAdmin && !hideNonMember, keepPrevious: true })
+  const {
+    data: agents = [], isSuccess: agentsReady, isPending: agentsPending,
+    isPlaceholderData: agentsPlaceholder,
+  } = useAgents({ all: isAdmin && !hideNonMember, keepPrevious: true })
   const {
     data: departments = [], isSuccess: deptsReady, isPending: deptsPending,
   } = useDepartments()
@@ -173,11 +177,23 @@ export default function AgentsMap3D({
   const [assetsTick, setAssetsTick] = useState(0)
 
   // For admins, grayed = "not a member" (they can ACCESS everything, so the
-  // dept feed's accessible flags never gray anything for them).
+  // dept feed's accessible flags never gray anything for them). Keyed on the
+  // JOINED slugs, not the array: refreshUser() hands back a new array for an
+  // unchanged snapshot, and a new Set here would recompute the layout and
+  // rebuild every chip and the terrain for nothing.
+  const memberKey = (user?.agents ?? []).join('\0')
   const memberOf = useMemo(
-    () => (isAdmin ? new Set(user?.agents ?? []) : undefined),
-    [isAdmin, user?.agents],
+    () => (isAdmin ? new Set(memberKey ? memberKey.split('\0') : []) : undefined),
+    [isAdmin, memberKey],
   )
+  // A slug the poll lists that the snapshot lacks → refetch the snapshot
+  // once (useSnapshotHeal.ts) — the grant made from another session or by
+  // an agent through the Agent Creator would otherwise stay gray until a
+  // hard reload.
+  useSnapshotHeal({
+    agents, user, refreshUser,
+    settled: agentsReady && !agentsPlaceholder,
+  })
   const layout = useMemo(
     () => computeMapLayout(agents, departments, {
       hideNonMember: isAdmin && hideNonMember,
@@ -325,6 +341,25 @@ export default function AgentsMap3D({
     setPopup, setMenu, user, favDeptRef,
   })
 
+  // A department created from the map stays on the map: page to its dais
+  // once the departments feed carries it. Paging BEFORE that would be reset
+  // to free-roam by the stage machine (a department it cannot find in the
+  // layout means "vanished"), so the id waits in a ref for the layout that
+  // has it.
+  const pendingDeptRef = useRef<string | null>(null)
+  useEffect(() => {
+    const id = pendingDeptRef.current
+    if (!id || !layout.clusters.some((c) => c.departmentId === id)) return
+    pendingDeptRef.current = null
+    if (stage) setStage({ deptId: id })
+    else setMapDept(id)
+  }, [layout, stage])
+  const onDepartmentCreated = useCallback((id: string) => {
+    setNewDeptName(null)
+    pendingDeptRef.current = id
+    setNotice('Department created — move an agent here from its menu')
+  }, [])
+
   // --- pointer interaction (useMapPointers.ts) ----------------------------
   const {
     activePointers, gestureOwnedIds, attemptLinkRef, onDeptTapRef,
@@ -336,7 +371,7 @@ export default function AgentsMap3D({
     exitStageRef, pageDeltaRef, setMenu, setPopup,
   })
 
-  const canCreateDepartments = user?.role === 'admin' || user?.role === 'creator'
+  const canCreateDepartments = isCreatorOrAbove(user)
   const popupDept = popup
     ? departments.find((d) => d.id === popup.node.departmentId)
     : undefined
@@ -463,6 +498,15 @@ export default function AgentsMap3D({
         </div>
       )}
 
+      {/* An entered department with nobody in it is a bare dais — say so,
+          and say how to fill it (the empty department exists on the map so
+          it CAN be filled from here). */}
+      {stage && stageData && !layout.nodes.some((n) => n.departmentId === stage.deptId) && (
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 px-4 py-2 text-sm text-center rounded-xl bg-[#171b30]/80 text-slate-300 border border-white/10 backdrop-blur-md pointer-events-none max-w-[80%]">
+          No agents yet — move one here from its menu
+        </div>
+      )}
+
       {/* The pager strip (both paged levels — round 16): the XCOM
           tab-strip idiom — dept names in ring order, Independents last.
           On stage a tap dollies there; at the whole-map view it swings
@@ -568,7 +612,7 @@ export default function AgentsMap3D({
           name={newDeptName}
           onName={setNewDeptName}
           onClose={() => setNewDeptName(null)}
-          onCreated={(id) => { setNewDeptName(null); onOpenDepartments(id) }}
+          onCreated={onDepartmentCreated}
         />
       )}
     </div>

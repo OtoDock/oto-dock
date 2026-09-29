@@ -153,7 +153,7 @@ def test_external_driven_sources_policy():
     delivery path (and pre-fan-out, attach() stole the stream outright). Only externally-driven sources are view-only; 'task'/'meeting'
     pumps MUST stay attachable (the dashboard is their live viewer).
     """
-    from ws.dashboard import _EXTERNAL_DRIVEN_SOURCES
+    from core.session.session_kind import EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES
 
     assert "phone" in _EXTERNAL_DRIVEN_SOURCES
     # Regression guard — adding any of these would silently break the dashboard's
@@ -167,7 +167,7 @@ def test_external_driven_sources_policy():
 async def test_phone_pump_is_view_only_default_is_attachable(temp_db):
     """The guard keys on pump.source_type — a phone pump reports 'phone' (→ the
     dashboard views it read-only) while a default pump is 'chat' (→ attachable)."""
-    from ws.dashboard import _EXTERNAL_DRIVEN_SOURCES
+    from core.session.session_kind import EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES
 
     temp_db.create_chat("pc-phone", "phone", "a1")
     producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
@@ -219,3 +219,148 @@ async def test_done_keeps_live_blocks_and_advances_cutoff(temp_db):
     finally:
         stream_pump._chat_streaming_state.pop("pc3", None)
         pump.producer.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Coalesced deltas, bounded dashboard queues
+# ---------------------------------------------------------------------------
+
+from core.events.common_events import PRODUCER_DONE, THINKING, TOOL_USE  # noqa: E402
+
+
+def _events_of(items: list) -> list[dict]:
+    return [i["event"] for i in items if i.get("pump_type") == "ws_event"]
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_text_deltas_arrives_as_fewer_frames_in_order(temp_db):
+    pump = _mk_pump("co1")
+    _seed_live("co1", pump.session_id)
+    q = pump.attach()
+    try:
+        for i in range(20):
+            await pump._process_event(CommonEvent(type=TEXT, data={"content": f"{i},"}))
+        first = _drain(q)
+        assert _events_of(first) == [{"type": "text", "content": "0,"}]  # no added latency
+        await asyncio.sleep(stream_pump._DELTA_FLUSH_S * 2)
+        rest = _events_of(_drain(q))
+        assert len(rest) == 1
+        assert rest[0]["content"] == "".join(f"{i}," for i in range(1, 20))
+        live = stream_pump._chat_streaming_state["co1"]
+        assert live["live_blocks"][-1]["content"] == "".join(f"{i}," for i in range(20))
+    finally:
+        stream_pump._chat_streaming_state.pop("co1", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_any_other_frame_flushes_the_pending_text_first(temp_db):
+    pump = _mk_pump("co2")
+    _seed_live("co2", pump.session_id)
+    q = pump.attach()
+    try:
+        await pump._process_event(CommonEvent(type=TEXT, data={"content": "a"}))
+        await pump._process_event(CommonEvent(type=TEXT, data={"content": "b"}))
+        await pump._process_event(CommonEvent(type=TOOL_USE, data={"name": "Bash", "tool_id": "t1"}))
+        pump.push_ws_event({"type": "system", "subtype": "note"})
+        types = [(e["type"], e.get("content")) for e in _events_of(_drain(q))]
+        assert types == [("text", "a"), ("text", "b"), ("tool_start", None), ("system", None)]
+    finally:
+        stream_pump._chat_streaming_state.pop("co2", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_thinking_deltas_merge_and_progress_keeps_the_latest(temp_db):
+    pump = _mk_pump("co3")
+    _seed_live("co3", pump.session_id)
+    q = pump.attach()
+    try:
+        for data in ({"phase": "start"},
+                     {"phase": "delta", "text": "x"}, {"phase": "delta", "text": "y"},
+                     {"phase": "delta", "text": "z"},
+                     {"phase": "progress", "estimated_tokens": 10},
+                     {"phase": "progress", "estimated_tokens": 30},
+                     {"phase": "end", "text": ""}):
+            await pump._process_event(CommonEvent(type=THINKING, data=data))
+        frames = _events_of(_drain(q))
+        assert frames == [
+            {"type": "thinking", "phase": "start"},
+            {"type": "thinking", "phase": "delta", "text": "x"},
+            {"type": "thinking", "phase": "delta", "text": "yz"},
+            {"type": "thinking", "phase": "progress", "estimated_tokens": 30},
+            {"type": "thinking", "phase": "end", "text": ""},
+        ]
+    finally:
+        stream_pump._chat_streaming_state.pop("co3", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_attach_mid_burst_gives_no_duplicate_and_no_gap(temp_db):
+    """The pending delta goes to the existing viewers BEFORE the new queue
+    joins: the newcomer's live_state snapshot already holds it."""
+    pump = _mk_pump("co4")
+    live = _seed_live("co4", pump.session_id)
+    qa = pump.attach()
+    try:
+        for c in "abc":
+            await pump._process_event(CommonEvent(type=TEXT, data={"content": c}))
+        qb = pump.attach(bounded=True)
+        snapshot = live["live_blocks"][-1]["content"]
+        await pump._process_event(CommonEvent(type=TEXT, data={"content": "d"}))
+        await asyncio.sleep(stream_pump._DELTA_FLUSH_S * 2)
+        a_text = "".join(e["content"] for e in _events_of(_drain(qa)))
+        b_text = "".join(e["content"] for e in _events_of(_drain(qb)))
+        assert a_text == "abcd"
+        assert snapshot == "abc" and snapshot + b_text == "abcd"
+    finally:
+        stream_pump._chat_streaming_state.pop("co4", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_bounded_queue_past_its_cap_gets_one_resync_and_nothing_after(temp_db, monkeypatch):
+    monkeypatch.setattr(stream_pump, "_VIEWER_QUEUE_MAX", 5)
+    pump = _mk_pump("co5")
+    _seed_live("co5", pump.session_id)
+    slow = pump.attach(bounded=True)
+    other = pump.attach()
+    try:
+        for i in range(12):
+            pump.push_ws_event({"type": "system", "subtype": f"n{i}"})
+        assert _drain(slow) == [{"pump_type": stream_pump.PUMP_RESYNC}]
+        pump.push_ws_event({"type": "system", "subtype": "late"})
+        assert _drain(slow) == []
+        assert len(_drain(other)) == 13
+    finally:
+        stream_pump._chat_streaming_state.pop("co5", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_pending_text_goes_before_all_done_and_a_late_attach_gets_ended(temp_db):
+    temp_db.create_chat("co6", "user-admin", "a1")
+    eq: asyncio.Queue = asyncio.Queue()
+    producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    pump = ChatStreamPump(chat_id="co6", session_id="sess-co6", producer=producer,
+                          event_queue=eq, perm_queue=None)
+    stream_pump._active_pumps["co6"] = pump
+    q = pump.attach(bounded=True)
+    for c in "abc":
+        await eq.put(CommonEvent(type=TEXT, data={"content": c}))
+    await eq.put(CommonEvent(type=PRODUCER_DONE, data={}))
+    try:
+        await pump._run()
+        items = _drain(q)
+        kinds = [i["pump_type"] for i in items]
+        text = "".join(e["content"] for e in _events_of(items))
+        assert text == "abc"
+        assert kinds.index("all_done") > max(
+            n for n, i in enumerate(items) if i["pump_type"] == "ws_event")
+        assert kinds[-1] == "pump_ended"
+        late = pump.attach(bounded=True)
+        assert _drain(late) == [{"pump_type": "pump_ended"}]
+    finally:
+        stream_pump._active_pumps.pop("co6", None)
+        stream_pump._chat_streaming_state.pop("co6", None)

@@ -4,6 +4,7 @@ import { getTaskTypeLabel, getTaskTypeStyle, formatTrigger } from '../../lib/run
 import { formatDuration, formatRelativeTime } from '../../lib/format'
 import StatusBadge from '../StatusBadge'
 import { pushEscHandler } from '../../lib/escStack'
+import { RUN_STATUS } from '../../lib/status/run'
 
 interface Props {
   run: Run
@@ -36,10 +37,10 @@ export default function TaskMetadata({ run, costBilled }: Props) {
   }, [open])
 
   const statusColor =
-    run.status === 'completed' ? 'bg-green-500' :
-    run.status === 'running' ? 'bg-yellow-500' :
-    run.status === 'pending' ? 'bg-indigo-400' :
-    run.status === 'failed' ? 'bg-red-500' :
+    run.status === RUN_STATUS.COMPLETED ? 'bg-green-500' :
+    run.status === RUN_STATUS.RUNNING ? 'bg-yellow-500' :
+    run.status === RUN_STATUS.PENDING ? 'bg-indigo-400' :
+    run.status === RUN_STATUS.FAILED ? 'bg-red-500' :
     'bg-gray-400'
 
   return (
@@ -47,7 +48,7 @@ export default function TaskMetadata({ run, costBilled }: Props) {
       {/* Icon button */}
       <button
         onClick={() => setOpen(!open)}
-        title={run.status === 'pending'
+        title={run.status === RUN_STATUS.PENDING
           ? 'Task run: queued — waiting for a free task slot'
           : `Task run: ${run.status}`}
         className="relative w-10 h-10 rounded-xl bg-white/80 dark:bg-gray-900/80 backdrop-blur-xs border border-p-border-light shadow-xs
@@ -61,10 +62,10 @@ export default function TaskMetadata({ run, costBilled }: Props) {
         </svg>
         {/* Status badge -- bottom-right corner */}
         <span className={`absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full ${statusColor} border-2 border-white dark:border-gray-900`}>
-          {run.status === 'running' && (
+          {run.status === RUN_STATUS.RUNNING && (
             <span className="absolute inset-0 rounded-full animate-ping bg-yellow-400 opacity-50" />
           )}
-          {run.status === 'pending' && (
+          {run.status === RUN_STATUS.PENDING && (
             <span className="absolute inset-0 rounded-full animate-ping bg-indigo-400 opacity-40" />
           )}
         </span>

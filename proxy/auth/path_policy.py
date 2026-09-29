@@ -9,14 +9,19 @@ Two-pass gate:
   Pass 2 (existing):    mode-based logic (default/acceptEdits/plan/dontAsk)
 """
 
+import posixpath
 import re
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import config
+from core.events import tool_roles
+from core.placement import PlacementCapabilities
 # str-typed readers: a duck-typed / mocked context must never look external
 # (a truthy stand-in attribute would otherwise become a host path).
 from core.session.external_identity import external_home_of, is_external_ctx
+from auth import roles
+from core import layout
 
 
 # ---------------------------------------------------------------------------
@@ -28,45 +33,24 @@ from core.session.external_identity import external_home_of, is_external_ctx
 class SecurityContext:
     """Immutable security context for a session."""
 
-    role: str  # per-agent effective role: "admin" | "manager" | "editor" | "viewer"
+    role: str  # the effective per-agent role (auth/roles.EFFECTIVE_ROLES)
     username: str  # filesystem-safe slug, or "" for tasks/phone without user
     agent: str  # current agent name
     is_admin_agent: bool  # True if agent is in HIGH_CLEARANCE_AGENTS
     display_name: str = ""  # user's full display name
     email: str = ""  # user's email
-    # Execution-target metadata (environment-aware prompts + bash tier
-    # gating). target_kind drives both the prompt's
-    # ``# Execution Environment`` section AND admin-tier bash gating:
-    # remote satellites open the admin tier to manager/editor because the
-    # admin/user already trusted the agent at pairing time.
-    #   - ``"local"`` — bwrap sandbox on the platform host (default)
-    #   - ``"admin_remote"`` — admin-paired remote satellite
-    #   - ``"user_remote"`` — user-paired remote satellite (user's own
-    #     hardware; user-scope sessions only)
-    target_kind: str = "local"
-    target_label: str = ""  # human-readable machine name (empty when local)
-    # Satellite's local agent-tree root, e.g.
-    # ``C:/Users/alice/OtoDock/agents`` (Windows) or
-    # ``/home/alice/.oto-dock/agents`` (Linux/macOS). Empty for local
-    # sessions. Set by config_builder from the machine's reported
-    # capabilities so we can decide whether a satellite-absolute path
-    # is "inside the synced tree" (apply RBAC) or "elsewhere on the
-    # satellite host" (allow under the home/full-FS policy).
-    target_agents_dir: str = ""
-    # Satellite-host path-policy fields. All empty for local
-    # sessions; populated by config_builder for remote sessions.
-    #   target_machine_id    — for mid-session revocation detection
-    #   target_home_dir      — admits paths under the OS user's home dir
-    #                          when allow_full_fs is False
-    #   target_allow_full_fs — when True, the policy admits any path
-    #                          (system files, other dirs, etc.); when
-    #                          False, only sandbox-virtual + home are
-    #                          admitted on user-paired satellites
-    target_machine_id: str = ""
-    target_home_dir: str = ""
-    target_allow_full_fs: bool = False
+    # Where the session runs — the resolved placement (``core.placement``):
+    # the kind (the local sandbox, the agent's admin-paired default machine,
+    # the person's own paired machine) and the machine's facts the path
+    # policy, the prompt's ``# Execution Environment`` section, the bash
+    # tier gating and the device-tool gate ask. Built once per session by
+    # ``remote_store.placement_of``; persisted under the security index's
+    # own ``target_*`` keys by ``session_state``'s codec; ``allow_full_fs``
+    # and ``device_grants`` are live-refreshed on a machine toggle. The
+    # local placement for local sessions (every fact empty).
+    placement: PlacementCapabilities = field(default_factory=PlacementCapabilities)
     # otodock-CLI: extra absolute satellite-host roots this ONE session may
-    # read/write, beyond the home/sandbox/full-fs matrix — the session's own
+    # read/write, beyond the home/sandbox/full-FS matrix — the session's own
     # arbitrary cwd subtree (the folder the user ran `otodock` in). Per-session
     # (never a module global → no cross-session leak), realpath-normalized at
     # build time. Empty for every normal session.
@@ -79,36 +63,13 @@ class SecurityContext:
     # still passes the same roots/home/RBAC admission. Empty for every
     # normal session (dashboard-spawned sessions keep the workspace anchor).
     work_cwd: str = ""
-    # The Claude Code CLI's per-user runtime root on the satellite
-    # (``<tempdir>/claude-<uid>``), reported concretely in the capabilities
-    # probe — scratchpad + background-task outputs live under
-    # ``<root>/<cwd-slug>/<session-id>/``. Together with ``cli_session_id``
-    # it admits the session's OWN runtime tree even with allow_full_fs off.
-    # Empty for local sessions — their root is a proxy-host constant
-    # (``core.sandbox.sandbox.claude_runtime_root()``, the sandbox's private
-    # tmpfs /tmp + the proxy uid) applied by ``_is_local_session_runtime_path``
-    # — and for satellites that haven't reported the capability (fail closed).
-    target_claude_runtime_root: str = ""
     # This session's CLI session id (== chats.session_id, the value spawned
     # via --session-id/--resume). Stamped centrally by
     # ``session_state.set_session_security`` when the registration key is a
-    # UUID — empty disables the runtime-tree carve. Used ONLY to scope that
+    # UUID — empty disables the runtime-tree carve (the placement's
+    # ``claude_runtime_root`` is the other half). Used ONLY to scope that
     # carve to the session's own subtree.
     cli_session_id: str = ""
-    # OS user identity on the satellite (a different namespace from the
-    # platform ``username``). Empty for local sessions.
-    target_os_user: str = ""
-    # Well-known user folders reported in the satellite's capabilities
-    # probe (XDG on Linux, fixed layout on macOS, Known Folders on
-    # Windows). Empty dict for local sessions. Keys: desktop, downloads,
-    # documents, pictures, music, videos.
-    target_user_dirs: dict = field(default_factory=dict)
-    # Device-control consent set granted to this satellite: the capability
-    # keys (``computer`` / ``browser`` / ``app``) the
-    # owner permits. Empty for local sessions and ungranted machines. Live-
-    # refreshed by ``session_state.refresh_target_device_grants`` on a toggle,
-    # so a mid-session revoke takes effect at the next device-tool gate.
-    target_device_grants: set = field(default_factory=set)
     # --- Visibility-modes decouple (see core/session/visibility.py) ---
     # ``session_scope`` is the MOUNT scope ("user"|"agent") — distinct from
     # ``username`` (which stays the REAL human, for attribution + the identity
@@ -139,6 +100,11 @@ class SecurityContext:
     # by construction. Grants ``/knowledge`` RW (mount + hook + satellite
     # write-back); ``/config`` is deliberately untouched (human-manager-only).
     knowledge_rw: bool = False
+    # The judge profile (CHECKS.md): a check's judge session — every mount
+    # row flipped read-only (the CLI state dirs excepted), the ``judge``
+    # gate mode, the write tools off the CLI. Set by the task config builder
+    # for a ``task_type='check'`` run only; False for every other session.
+    read_only: bool = False
     # --- External routes (core/session/external_identity.py) ---
     # ``principal`` says what kind of session this is: "user" (a human, or
     # any session that is not external — the default), "agent" (reserved for
@@ -182,7 +148,7 @@ class SecurityContext:
         owner-tier role (correct for every mode, incl. Shared-only)."""
         if self.config_visible is not None:
             return self.config_visible
-        return bool(self.username) and self.role in ("manager", "admin")
+        return bool(self.username) and roles.can_manage(self.role)
 
 
 @dataclass(frozen=True)
@@ -209,26 +175,38 @@ class PathDecision:
 
 _ALLOW = PathDecision(allowed=True)
 
-#: External sessions (a phone caller who is not a platform user) never get a
-#: shell — a shell reaches what the caller cannot hear: the MCP processes'
-#: credentials (config.toml, ``/proc/*/environ``), token files, the proxy
-#: with the session token. Three layers enforce it: the permission-hook
-#: floor (``api/hooks/hooks.py``), the CLI argv ``--disallowedTools``
-#: (``core/layers/cli``) and the settings.json deny list
-#: (``core/sandbox/session_config_dir.py``). Direct LLM has no shell; an
-#: external Codex session has no shell tool at all (``[features] shell_tool
-#: = false``) and runs this gate as its PreToolUse hook — its file writes
-#: arrive as ``apply_patch`` (``_check_apply_patch``).
-#:
-#: ``WebSearch`` and ``WebFetch`` are NOT floored (2026-09-08): a caller can
-#: already hear anything the session can read (the shared space as viewer,
-#: their own tree), so a query or a URL carries nothing the phone line does
-#: not, and the direct engine already gives callers the provider's web
-#: tools. ``WebFetch`` keeps its SSRF gate (``path_shell._check_webfetch``)
-#: and the local sandbox netns still blackholes private ranges; on a remote
-#: target, where there is no netns and the gate is literal-URL only, the
-#: gate denies ``WebFetch`` to external sessions outright.
-EXTERNAL_DENIED_CLI_TOOLS: tuple[str, ...] = ("Bash", "Monitor", "PowerShell")
+# The bash command tiers a decision carries (``_BASH_COMMAND_TIER`` in
+# auth/path_shell.py); the permission hook allows or prompts by them.
+TIER_READ = "read"
+TIER_EDIT = "edit"
+TIER_EXTENDED = "extended"
+TIER_ADMIN = "admin"
+TIER_ASK = "ask"
+
+# External sessions (a phone caller who is not a platform user) never get a
+# shell — a shell reaches what the caller cannot hear: the MCP processes'
+# credentials (config.toml, ``/proc/*/environ``), token files, the proxy
+# with the session token. Three layers enforce it: the permission-hook
+# floor (``api/hooks/permission.py``: every tool whose ROLE is ``shell`` —
+# ``core/events/tool_roles``), the CLI argv ``--disallowedTools`` and the
+# settings.json deny list (the engine's own shell names, from its
+# descriptor: ``core/layers/cli``). Direct LLM has no shell; an external
+# Codex session has no shell tool at all (``[features] shell_tool = false``)
+# and runs this gate as its PreToolUse hook — its file writes arrive as
+# ``apply_patch`` (``_check_apply_patch``). A check's judge session
+# (CHECKS.md "The judge profile") never writes: the engine's write tools are
+# denied the same three ways (the ``judge`` gate mode by role, the argv, the
+# settings deny list); the shell stays for its read tier, which the gate
+# polices per command.
+#
+# ``WebSearch`` and ``WebFetch`` are NOT floored (2026-09-08): a caller can
+# already hear anything the session can read (the shared space as viewer,
+# their own tree), so a query or a URL carries nothing the phone line does
+# not, and the direct engine already gives callers the provider's web
+# tools. ``WebFetch`` keeps its SSRF gate (``path_shell._check_webfetch``)
+# and the local sandbox netns still blackholes private ranges; on a remote
+# target, where there is no netns and the gate is literal-URL only, the
+# gate denies ``WebFetch`` to external sessions outright.
 
 # ---------------------------------------------------------------------------
 # Resolved path constants (computed once at import)
@@ -273,6 +251,13 @@ def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
     """
     agent_dir = _AGENTS_DIR / ctx.agent
 
+    # ``~`` — the sandbox's HOME is /tmp for every local session (the shell
+    # expands it there; the file tools do not expand it at all). A remote
+    # session never reaches here with a tilde: path_policy_v2 expands it
+    # to the satellite's home.
+    if ctx.placement.isolates_with_bwrap and (raw_path == "~" or raw_path.startswith("~/")):
+        return "/tmp" + raw_path[1:]
+
     # /caller/ — an external caller's private tree (SecurityContext.
     # external_home). A session without one has no /caller at all: the raw
     # path is returned untranslated and resolves outside every allowed root.
@@ -283,20 +268,22 @@ def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
         return str(Path(ctx.external_home) / rest) if rest else ctx.external_home
 
     # /config/ — agent config dir (manager/admin RW; editor/viewer RO)
-    if raw_path.startswith("/config/") or raw_path == "/config":
+    if layout.under(raw_path, layout.V_CONFIG):
         return str(agent_dir / raw_path[1:])
 
     # /knowledge/ — agent reference library (manager/admin RW; everyone else RO).
     # Universal across user-scope and agent-scope sessions.
-    if raw_path.startswith("/knowledge/") or raw_path == "/knowledge":
+    if layout.under(raw_path, layout.V_KNOWLEDGE):
         return str(agent_dir / raw_path[1:])
 
     # /workspace/ — agent workspace (manager/admin/editor RW; viewer RO; agent-scoped RW)
-    if raw_path.startswith("/workspace/") or raw_path == "/workspace":
+    if layout.under(raw_path, layout.V_WORKSPACE):
         return str(agent_dir / raw_path[1:])
 
-    # /users/{username}/ — all user roles (viewer/editor/manager/admin)
-    if raw_path.startswith("/users/"):
+    # /users/{username}/ — all user roles (viewer/editor/manager/admin); a
+    # bare ``/users`` is deliberately not a root here (it resolves outside
+    # every allowed dir, as it always did)
+    if raw_path.startswith(layout.V_USERS + "/"):
         return str(agent_dir / raw_path[1:])
 
     # /screenshots/ — MCP conditional mount
@@ -313,8 +300,8 @@ def _session_cwd_anchor(ctx: SecurityContext) -> Path:
     if external_home_of(ctx):
         return Path(ctx.external_home)
     if ctx.mount_username:
-        return agent_dir / "users" / ctx.mount_username
-    return agent_dir / "workspace"
+        return layout.user_dir(agent_dir, ctx.mount_username)
+    return agent_dir / layout.WORKSPACE
 
 
 def _resolve_candidates(raw_path: str, ctx: SecurityContext) -> list[Path]:
@@ -339,6 +326,11 @@ def _resolve_candidates(raw_path: str, ctx: SecurityContext) -> list[Path]:
     cwd_anchored = (_session_cwd_anchor(ctx) / raw_path).resolve()
     if cwd_anchored == primary:
         return [primary]
+    # A ``..``-leading path is never the display form (that starts with the
+    # agent's slug): the agents-relative anchor would only climb out of the
+    # agents dir into whatever sits next to it.
+    if posixpath.normpath(raw_path).startswith(".."):
+        return [cwd_anchored]
     return [cwd_anchored, primary]
 
 
@@ -370,15 +362,13 @@ _PATCH_FILE_RE = re.compile(
 )
 
 
-def _check_apply_patch(tool_input: dict | str, ctx: SecurityContext) -> PathDecision:
-    """Role-check every path a Codex ``apply_patch`` call names.
+def _patch_files(tool_input: dict | str) -> list[tuple[str, str, tuple[bool, ...]]]:
+    """``(kind, path, checks)`` for every file a Codex ``apply_patch`` names.
 
     ``Update File`` reads the original before writing it back (a zero-chunk
     update with ``Move to`` copies the file verbatim), so it needs the read
     AND the write check; ``Add File`` / ``Delete File`` / ``Move to`` are
-    writes. Relative paths resolve the way the file tools' do (cwd-anchored
-    candidates — ``_check_path_arg``). A patch that names no file is left to
-    Codex to reject.
+    writes. A patch that names no file is left to Codex to reject.
     """
     text: object = tool_input
     if isinstance(tool_input, dict):
@@ -387,16 +377,83 @@ def _check_apply_patch(tool_input: dict | str, ctx: SecurityContext) -> PathDeci
             or tool_input.get("input") or tool_input.get("patch_text") or ""
         )
     if not isinstance(text, str) or not text:
-        return _ALLOW
+        return []
+    files = []
     for kind, raw in _PATCH_FILE_RE.findall(text):
         raw = raw.strip()
-        if not raw:
-            continue
-        checks = ((False, True) if kind == "Update File" else (True,))
+        if raw:
+            files.append((kind, raw, (False, True) if kind == "Update File" else (True,)))
+    return files
+
+
+def _check_apply_patch(tool_input: dict | str, ctx: SecurityContext) -> PathDecision:
+    """Role-check every path a Codex ``apply_patch`` call names on a LOCAL
+    sandbox. Relative paths resolve the way the file tools' do (cwd-anchored
+    candidates — ``_check_path_arg``)."""
+    for kind, raw, checks in _patch_files(tool_input):
         for writing in checks:
             decision = _check_path_arg(raw, ctx, writing=writing)
             if not decision.allowed:
                 return PathDecision(False, f"apply_patch denied for {kind} {raw}: {decision.reason}")
+    return _ALLOW
+
+
+_REMOTE_BANDS = (
+    "inside the agent tree write under workspace/ or your own folder; outside "
+    "it only under the OS user's home, unless the machine allows the full "
+    "filesystem"
+)
+
+
+def _is_virtual_form(raw_path: str, policy_ctx) -> bool:
+    """A sandbox-virtual (``/workspace/…``, ``/users/{u}/…``) or ``~`` path:
+    what the LLM writes, not what a satellite's native tools can open."""
+    from services import path_policy_v2 as _v2
+    return (
+        _v2.classify_path(_v2.normalize_path(raw_path))
+        == "sandbox_virtual"
+        or raw_path == "~" or raw_path.startswith("~/")
+    )
+
+
+def _check_apply_patch_remote(tool_input: dict | str, ctx: SecurityContext) -> PathDecision:
+    """Role-check a Codex ``apply_patch`` on a satellite the way Write/Edit
+    are checked there: every patched path goes through the remote resolver,
+    so a satellite-host path inside the synced tree translates back and takes
+    the per-role RBAC, and one outside it takes the home band and
+    ``allow_full_fs``. The patch text cannot be rewritten (the paths are
+    inside it, and Codex's deny-only hook never receives an updated input),
+    so a sandbox-virtual or ``~`` path is denied with the satellite-host
+    form named. Relative paths anchor at the session's own root; ``..``
+    takes the resolver's deterministic deny. An admin on an admin agent
+    keeps the fast path's reach (no home band) but not the protected set.
+    """
+    files = _patch_files(tool_input)
+    if not files:
+        return _ALLOW
+    from services import path_policy_v2 as _v2
+    policy_ctx = _v2.context_from_security(ctx)
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
+        policy_ctx = _dc_replace(
+            policy_ctx, placement=_dc_replace(policy_ctx.placement, allow_full_fs=True))
+    for kind, raw, checks in files:
+        for writing in checks:
+            res = _v2.resolve_path_for_session(policy_ctx, raw, writing=writing)
+            if not res.allowed:
+                return PathDecision(False, f"apply_patch denied for {kind} {raw}: {res.error}")
+            if _is_virtual_form(raw, policy_ctx):
+                return PathDecision(
+                    False,
+                    f"apply_patch denied for {kind} {raw}: Codex edits the "
+                    f"machine's own filesystem; state the path as {res.access_path}",
+                )
+            decision = enforce_agent_tree_rbac(res, ctx, writing=writing)
+            if not decision.allowed:
+                return PathDecision(
+                    False,
+                    f"apply_patch denied for {kind} {raw}: {decision.reason} "
+                    f"({_REMOTE_BANDS})",
+                )
     return _ALLOW
 
 
@@ -410,29 +467,39 @@ def _is_other_users_dir(resolved: Path, username: str) -> bool:
     """
     parts = resolved.parts
     for i, part in enumerate(parts):
-        if part == "users" and i + 1 < len(parts):
+        if part == layout.USERS and i + 1 < len(parts):
             dir_owner = parts[i + 1]
             if not username or dir_owner != username:
                 return True
     return False
 
 
-def _is_local_session_runtime_path(resolved: Path, ctx: SecurityContext) -> bool:
-    """``resolved`` is inside THIS session's Claude-CLI runtime tree on a LOCAL
-    sandbox: ``/tmp/claude-<proxy uid>/<cwd-slug>/<this session id>/…`` —
-    the scratchpad the CLI's own system prompt directs the agent to, plus its
-    background-task outputs. The sandbox's ``/tmp`` is a private tmpfs, so the
-    only thing to scope is the session id (same predicate remote uses with the
-    satellite-reported root). The rest of ``/tmp`` — ``HOME``, the CLI's own
-    state files — stays denied. Widening-only: callers run the credential /
-    agent-config / cross-user denies first."""
-    if ctx.target_kind != "local" or not ctx.cli_session_id:
+#: The sandbox's ``/tmp``: a private per-sandbox tmpfs that is also the
+#: agent's ``HOME`` (``core/sandbox/sandbox.py``), resolved once so a host
+#: whose ``/tmp`` is a symlink compares equal to a resolved candidate.
+_SANDBOX_TMP = Path("/tmp").resolve()
+
+
+def _is_local_tmp_path(resolved: Path, ctx: SecurityContext) -> bool:
+    """``resolved`` is under the sandbox's ``/tmp`` on a LOCAL target: the
+    agent's ``HOME``, the CLI's runtime tree (scratchpad, background-task
+    outputs) and any scratch file. The tmpfs is private to the sandbox, so
+    no other session's or user's data is there; the CLI state that would
+    live under it if a CLI fell back to ``$HOME`` is kept by the protected
+    set (``path_roles.is_protected_agent_config_path`` knows ``/tmp`` as a
+    scope root). Widening-only: callers run the credential / agent-config /
+    cross-user / ``.env`` denies first. A remote target never takes it — the
+    OS user's home boundary is the operator's pairing decision, and the
+    session's own runtime tree is admitted by ``path_policy_v2`` there.
+
+    The check runs on the PROXY-host resolution of the path, and the
+    sandbox's ``/tmp`` shares only its name with the host's: an install (or
+    the test suite) whose data dir sits under ``/tmp`` must keep the role
+    matrix for the agent tree, so a path inside it, or inside the proxy
+    dir, never takes this rule."""
+    if not ctx.placement.isolates_with_bwrap or not _path_under(resolved, _SANDBOX_TMP):
         return False
-    from core.sandbox.sandbox import claude_runtime_root  # lazy: auth → core
-    from services import path_roles
-    return path_roles.is_session_runtime_path(
-        resolved, claude_runtime_root(), ctx.cli_session_id,
-    )
+    return not (_path_under(resolved, _AGENTS_DIR) or _path_under(resolved, _PROXY_DIR))
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +535,7 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         )
 
     # Admin on admin agent: unrestricted
-    if ctx.is_admin_agent and ctx.role == "admin":
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
 
     # Block other users' dirs first. MOUNT identity, not attribution: a
@@ -494,11 +561,11 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     if path_roles.is_claude_bg_output_path(resolved):
         return _ALLOW
 
-    # The CLI's OWN session runtime tree on a local sandbox (scratchpad +
-    # task outputs, read side) — same slot and same reasoning as the rule
-    # above; see _is_local_session_runtime_path. Remote sessions get the
-    # equivalent from path_policy_v2 (satellite-reported root).
-    if _is_local_session_runtime_path(resolved, ctx):
+    # The sandbox's private /tmp on a local target (HOME, the CLI's runtime
+    # tree, scratch files) — same slot and same reasoning as the rule above;
+    # see _is_local_tmp_path. Remote sessions get their own runtime tree
+    # from path_policy_v2 (satellite-reported root) instead.
+    if _is_local_tmp_path(resolved, ctx):
         return _ALLOW
 
     # Helper: check access for a single agent dir based on role
@@ -509,9 +576,9 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         # (NOT config — config is human-owner curation only). An external
         # caller additionally reads their own tree.
         if not ctx.username:
-            if _path_under(resolved, (agent_dir / "workspace").resolve()):
+            if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
                 return True
-            if _path_under(resolved, (agent_dir / "knowledge").resolve()):
+            if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
                 return True
             if external_home_of(ctx) and _path_under(
                     resolved, Path(ctx.external_home).resolve()):
@@ -527,15 +594,15 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         # The write check (_check_write_path) discriminates further on
         # workspace + knowledge.
         if ctx.mount_username and _path_under(
-                resolved, (agent_dir / "users" / ctx.mount_username).resolve()):
+                resolved, layout.user_dir(agent_dir, ctx.mount_username).resolve()):
             return True
-        if _path_under(resolved, (agent_dir / "workspace").resolve()):
+        if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
             return True
-        if _path_under(resolved, (agent_dir / "knowledge").resolve()):
+        if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
             return True
-        if _path_under(resolved, (agent_dir / "config").resolve()):
+        if _path_under(resolved, (agent_dir / layout.CONFIG).resolve()):
             # OWNER tier only: manager / admin. Editor + viewer denied.
-            return ctx.role in ("manager", "admin")
+            return roles.can_manage(ctx.role)
         return False
 
     # Current agent
@@ -564,14 +631,14 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
 # above via ``is_protected_credentials_path`` (MCP processes write tokens
 # in place, but they bypass this hook entirely).
 _USER_DIR_WRITABLE_SUBDIRS: tuple[str, ...] = (
-    "workspace", "context", ".claude", ".codex",
+    *layout.USER_SUBDIRS, ".claude", ".codex",
 )
 #: An external caller (a phone caller who is not a platform user) writes
 #: only its files and context. Its CLI config dir (``/caller/.claude`` /
 #: ``/caller/.codex``) holds the permission hook itself, the settings deny
 #: list and the session's config — never a tool-write target (the CLI's
 #: own process state writes there without going through a tool).
-_EXTERNAL_WRITABLE_SUBDIRS: tuple[str, ...] = ("workspace", "context")
+_EXTERNAL_WRITABLE_SUBDIRS: tuple[str, ...] = layout.USER_SUBDIRS
 
 # Paths that are NEVER writable (even admin on admin agent).
 # Protects the permission system itself and sensitive infrastructure.
@@ -601,11 +668,11 @@ def _is_memory_file(resolved: Path) -> bool:
         if seg != "memory" or i == 0:
             continue
         prev = parts[i - 1]
-        if prev == "knowledge":
+        if prev == layout.KNOWLEDGE:
             return True
         # users/{u}/context/memory and externals/<channel>/<caller>/context/memory
-        if prev == "context" and i >= 2 and (
-                "users" in parts[:i] or "externals" in parts[:i]):
+        if prev == layout.CONTEXT and i >= 2 and (
+                layout.USERS in parts[:i] or "externals" in parts[:i]):
             return True
     return False
 
@@ -614,7 +681,7 @@ def _external_read_denial(resolved: Path, ctx: SecurityContext) -> PathDecision 
     """External-session read rules that precede every grant: no shared agent
     memory, and no other caller's tree. ``None`` = nothing to deny here."""
     agent_dir = (_AGENTS_DIR / ctx.agent).resolve()
-    if _path_under(resolved, (agent_dir / "knowledge" / "memory").resolve()):
+    if _path_under(resolved, (agent_dir / layout.KNOWLEDGE / "memory").resolve()):
         return PathDecision(
             False,
             "Read denied: shared agent memory is not available on external routes",
@@ -647,6 +714,15 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
             "Manage accounts via Settings → Integrations.",
         )
 
+    # The agent's own CLI config, and the hook scripts and settings the
+    # permission system runs from (``.claude/*.json``, the hook scripts,
+    # ``.codex/{config.toml,auth.json,hooks.json}`` at a scope root): a
+    # session that could rewrite them would remove its own gate for the
+    # rest of the session. Every role, admin on admin agent included; the
+    # platform writes them proxy-side, never through a tool.
+    if path_roles.is_protected_agent_config_path(resolved, writing=True):
+        return PathDecision(False, "Write denied: agent CLI config files are protected.")
+
     # Always-deny targets (even admin on admin agent)
     for deny_path in _ALWAYS_DENY_WRITE:
         if _path_under(resolved, deny_path):
@@ -656,7 +732,7 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         return PathDecision(False, "Write denied: .env files are protected")
 
     # Admin on admin agent: allow everything else
-    if ctx.is_admin_agent and ctx.role == "admin":
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
 
     # Block other users' dirs (MOUNT identity — see the read-path comment).
@@ -683,12 +759,12 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
                     "on this line.",
                 )
 
-    # The CLI's OWN session runtime tree on a local sandbox (the scratchpad
-    # its system prompt directs it to): admitted read + write, scoped by the
-    # session id. Ordered AFTER the memory / OAuth-credential / always-deny /
-    # .env / cross-user denies above so it can never weaken them. See
-    # _is_local_session_runtime_path; remote gets this from path_policy_v2.
-    if _is_local_session_runtime_path(resolved, ctx):
+    # The sandbox's private /tmp on a local target (HOME, the CLI's runtime
+    # tree, scratch files): admitted read + write. Ordered AFTER the memory /
+    # OAuth-credential / agent-config / always-deny / .env / cross-user
+    # denies above so it can never weaken them. See _is_local_tmp_path;
+    # remote gets its own runtime tree from path_policy_v2.
+    if _is_local_tmp_path(resolved, ctx):
         return _ALLOW
 
     # Plan files — handled by sandbox per-user isolation
@@ -699,7 +775,7 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     # RO-root + RW-subdir bwrap mount, which is what actually stops the
     # hook-bypassing writers (Codex native tools, Bash, MCP processes).
     if ctx.mount_username:
-        own_dir = (_AGENTS_DIR / ctx.agent / "users" / ctx.mount_username).resolve()
+        own_dir = layout.user_dir(_AGENTS_DIR / ctx.agent, ctx.mount_username).resolve()
         if _path_under(resolved, own_dir) and resolved != own_dir:
             for sub in _USER_DIR_WRITABLE_SUBDIRS:
                 if _path_under(resolved, own_dir / sub):
@@ -726,7 +802,7 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
             never authorizes ``marketing-extra``); a path under the slug
             but outside every attached subtree is denied.
             ``None`` = not a mirror-namespace path."""
-            shared_root = (agent_dir / "knowledge" / "shared").resolve()
+            shared_root = (agent_dir / layout.KNOWLEDGE / "shared").resolve()
             if not _path_under(resolved, shared_root):
                 return None
             try:
@@ -752,37 +828,39 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         # /config stays denied (human-manager-only), memory/ was denied
         # earlier (_is_memory_file precedes this branch).
         if not ctx.username:
-            if _path_under(resolved, (agent_dir / "workspace").resolve()):
+            if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
                 # An external caller never writes the shared workspace: the
                 # builder always makes it a viewer (phone_identity.
                 # EXTERNAL_ROUTE_ROLE); the role check stays as defence in
                 # depth should another producer ever hand out a wider role.
-                return not (is_external_ctx(ctx) and ctx.role == "viewer")
+                return not (is_external_ctx(ctx) and ctx.role == roles.VIEWER)
             if ctx.knowledge_rw:
                 mirror = _mirror_verdict()
                 if mirror is not None:
                     return mirror
-                return _path_under(resolved, (agent_dir / "knowledge").resolve())
+                return _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve())
             return False
 
-        # Viewer: only own user dir + plans (no workspace, no config, no knowledge)
-        if ctx.role == "viewer":
+        # Viewer — and any role the table does not know — only own user dir +
+        # plans (no workspace, no config, no knowledge). Closed, never open.
+        if not roles.can_write_workspace(ctx.role):
             return False
 
-        # Editor: workspace/ is writable (collaborative); config/ and knowledge/
-        # stay owner-only (they shape agent BEHAVIOR, not workspace state).
-        if ctx.role == "editor":
-            return _path_under(resolved, (agent_dir / "workspace").resolve())
+        # Editor / contributor: workspace/ is writable (collaborative);
+        # config/ and knowledge/ stay owner-only (they shape agent BEHAVIOR,
+        # not workspace state).
+        if not roles.can_manage(ctx.role):
+            return _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve())
 
         # Manager / admin (owner tier): workspace/ + config/ + knowledge/
-        if _path_under(resolved, (agent_dir / "workspace").resolve()):
+        if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
             return True
-        if _path_under(resolved, (agent_dir / "config").resolve()):
+        if _path_under(resolved, (agent_dir / layout.CONFIG).resolve()):
             return True
         mirror = _mirror_verdict()
         if mirror is not None:
             return mirror
-        if _path_under(resolved, (agent_dir / "knowledge").resolve()):
+        if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
             return True
         return False
 
@@ -790,9 +868,11 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     if _check_agent_write(ctx.agent):
         return _ALLOW
 
-    if ctx.role == "viewer":
+    if ctx.role == roles.VIEWER:
         return PathDecision(False, "Write denied: viewers can only write to personal folders and plans")
-    if ctx.role == "editor":
+    if ctx.role == roles.CONTRIBUTOR:
+        return PathDecision(False, "Write denied: contributors write the shared workspace and their personal folders only (knowledge is owner-only)")
+    if ctx.role == roles.EDITOR:
         return PathDecision(False, "Write denied: editors cannot modify agent knowledge (owner-only). Agent config is not visible to editors at all.")
     return PathDecision(False, "Write denied: path outside allowed scope for your role")
 
@@ -856,59 +936,47 @@ def _check_remote_bash_path(
     return enforce_agent_tree_rbac(res, ctx, writing=writing)
 
 
+def _check_remote_protected_path(
+    raw_path: str, ctx: SecurityContext, *, writing: bool,
+) -> PathDecision | None:
+    """The universal denials of one shell path on a REMOTE machine, for the
+    admin floor: the remote resolver's ``protected`` refusals (the machine's
+    own OtoDock state, the OAuth credentials, the agent's CLI config) and
+    nothing else: the role matrix and the home band stay skipped there."""
+    from services import path_policy_v2 as _v2
+    res = _v2.resolve_path_for_session(
+        _v2.context_from_security(ctx), raw_path, writing=writing,
+    )
+    if not res.allowed and res.protected:
+        return PathDecision(False, res.error)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-# Tools with file_path argument (Read/Write/Edit; Delete is the Direct-LLM
-# builtin — the CLIs delete via Bash — checked as a write on its file_path)
-_FILE_PATH_TOOLS = {"Read", "Write", "Edit", "NotebookEdit", "Delete"}
-# Tools with path argument (Glob/Grep — optional, defaults to cwd)
-_SEARCH_PATH_TOOLS = {"Glob", "Grep"}
-# Read-operation tools
-_READ_TOOLS = {"Read", "Glob", "Grep"}
-# Write-operation tools
-_WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "Delete"}
-
-# Shell command-execution tools, routed through the command gate.
-#   * _BASH_TOOLS → _check_bash. "Monitor" is Claude Code's background-command
-#     runner ("same permission rules as Bash", bash-flavored on all platforms);
-#     it presents tool_name="Monitor" to the hook (NOT "Bash"), so a Bash-only
-#     branch misses it.
-#   * _POWERSHELL_TOOLS → _check_powershell. Windows-native (also Lin/Mac opt-in).
-# Without routing these, every PowerShell / Monitor command would hit the _ALLOW
-# catch-all below → no dangerous-deny / cross-user / credential gate (a real hole
-# in dontAsk/auto, where tasks + phone run). tool_input.command carries the
-# command for all three.
-_BASH_TOOLS = {"Bash", "Monitor"}
-_POWERSHELL_TOOLS = {"PowerShell"}
-_SHELL_COMMAND_TOOLS = _BASH_TOOLS | _POWERSHELL_TOOLS
-
-# Tools whose payloads are structured / natural-language (NOT shell commands) —
-# exempt from the unknown-tool dangerous backstop, else a benign Agent /
-# TodoWrite / WebSearch arg mentioning a path or an `rm -rf` example would be
-# false-denied with no recourse. The backstop is a cross-platform CATASTROPHE net
-# for a FUTURE/unknown command-execution tool we don't yet route — NOT a content
-# filter over ordinary tool args.
-_KNOWN_STRUCTURED_TOOLS = (
-    _FILE_PATH_TOOLS | _SEARCH_PATH_TOOLS | _SHELL_COMMAND_TOOLS | {
-        "WebFetch", "WebSearch", "Agent", "Task", "TaskGet", "TaskList",
-        "TaskOutput", "TaskCreate", "TaskUpdate", "TaskStop", "TodoWrite",
-        "TodoRead", "ToolSearch", "AskUserQuestion", "ExitPlanMode",
-        "EnterPlanMode", "CronList", "CronCreate", "CronDelete",
-        "CodexEscalation",
-        # Direct-LLM client-side builtins (core/layers/direct/builtins.py):
-        # a skill name / search query is natural language, never a command.
-        "Skill", "tool_search",
-    }
-)
+# The tool vocabulary is ``core/events/tool_roles``: this gate dispatches on
+# a tool's ROLE (shell / read / glob / search / write / delete / web_fetch /
+# …), its PAYLOAD kind (a command, a file path, a search path, a patch, a
+# URL) and, for a shell, its DIALECT — never on a name. "Monitor" is Claude
+# Code's background-command runner ("same permission rules as Bash",
+# bash-flavored on all platforms) and presents tool_name="Monitor" to the
+# hook; PowerShell is Windows-native (also Lin/Mac opt-in): both are role
+# ``shell``, dialects posix and powershell, and route through the command
+# gate (dangerous-deny / tier / cross-user path / credential backstops) in
+# every mode. A tool the vocabulary does not know is refused outright when
+# it carries a command (``tool_roles.SHELL_PAYLOAD_KEYS`` — the fail-closed
+# rule: a future shell-like tool must be declared, never run ungated) and
+# otherwise gets the catastrophe net below.
 
 
 def _unknown_tool_dangerous_scan(tool_input: dict) -> "PathDecision":
-    """Cross-platform catastrophe net for an UNRECOGNIZED command-execution tool
-    (a future shell-like tool we don't yet route). Scans string arg values for the
-    POSIX + PowerShell dangerous patterns ONLY — never the credential / agent-config
-    regex (that would false-deny natural-language tool args). Allows otherwise."""
+    """Cross-platform catastrophe net for an UNDECLARED tool with a
+    structured payload (no command key — those are refused before this
+    runs). Scans string arg values for the POSIX + PowerShell dangerous
+    patterns ONLY — never the credential / agent-config regex (that would
+    false-deny natural-language tool args). Allows otherwise."""
     for value in tool_input.values():
         if not isinstance(value, str) or not value:
             continue
@@ -919,6 +987,42 @@ def _unknown_tool_dangerous_scan(tool_input: dict) -> "PathDecision":
             if pattern.search(value):
                 return PathDecision(False, f"Denied (dangerous command): {reason}")
     return _ALLOW
+
+
+def _protected_tool_path_denial(
+    tool_name: str, tool_input: dict, ctx: SecurityContext,
+) -> PathDecision | None:
+    """The universal denies of a file tool's path, for the caller that skips
+    the role matrix: OAuth credentials, the agent's own CLI config (read and
+    write) and, on a write, the platform's hook scripts and settings. A local
+    path is checked on its resolved candidates; a satellite path through the
+    remote resolver, whose ``protected`` flag marks exactly these denials."""
+    if tool_roles.payload_of(tool_name) not in (tool_roles.FILE_PATH, tool_roles.SEARCH_PATH):
+        return None
+    raw_path = tool_roles.payload_value(tool_name, tool_input)
+    if not raw_path:
+        return None
+    writing = tool_roles.writes(tool_name)
+    verb = "Write" if writing else "Read"
+    if ctx.placement.needs_path_translation:
+        from services import path_policy_v2 as _v2
+        res = _v2.resolve_path_for_session(
+            _v2.context_from_security(ctx), raw_path, writing=writing,
+        )
+        if not res.allowed and res.protected:
+            return PathDecision(False, f"{verb} denied: {res.error}")
+        return None
+    from services import path_roles
+    for cand in _resolve_candidates(raw_path, ctx):
+        if path_roles.is_protected_credentials_path(cand):
+            return PathDecision(
+                False,
+                f"{verb} denied: OAuth credentials are protected. "
+                "Manage accounts via Settings → Integrations.",
+            )
+        if path_roles.is_protected_agent_config_path(cand, writing=writing):
+            return PathDecision(False, f"{verb} denied: agent CLI config files are protected.")
+    return None
 
 
 def check_tool_access(
@@ -940,32 +1044,68 @@ def check_tool_access(
     if tool_name.startswith("mcp__"):
         return _ALLOW, None
 
-    # Shell command-execution tools — full command gate (dangerous-deny + tier +
-    # cross-user path + credential / agent-config backstops). Placed BEFORE the
-    # admin fast-path + remote _ALLOW so the backstops fire for every caller; the
-    # admin-on-admin fast path lives INSIDE _check_bash / _check_powershell (after
-    # the backstops), matching the pre-existing contract.
-    #   Bash / Monitor: bwrap restricts the filesystem locally; the gate restricts
-    #   command types + path args (the only cross-user gate on a satellite).
-    if tool_name in _BASH_TOOLS:
-        return _check_bash(tool_input.get("command", ""), ctx), None
-    if tool_name in _POWERSHELL_TOOLS:
-        return _check_powershell(tool_input.get("command", ""), ctx), None
+    role = tool_roles.role_of(tool_name)
+    payload = tool_roles.payload_of(tool_name)
 
-    # WebFetch: SSRF prevention
-    if tool_name == "WebFetch":
-        return _check_webfetch(tool_input.get("url", ""), ctx), None
+    # An UNDECLARED tool, ahead of everything (the admin fast path included):
+    # with a command payload it is refused — a shell-like tool the platform
+    # does not route must never run ungated, on any placement, in any mode;
+    # with a structured payload it gets the catastrophe net.
+    if not role:
+        if tool_roles.carries_command(tool_input):
+            return PathDecision(
+                False,
+                f"{tool_name} is not a tool this platform knows; a command tool "
+                "must be declared in core/events/tool_roles.py",
+            ), None
+        return _unknown_tool_dangerous_scan(tool_input or {}), None
 
-    # Codex apply_patch: the patch text names its files. Each one gets the
-    # Read/Write role check, so a patch cannot read a protected file (an
-    # "Update" with a "Move to" is a copy) or write outside the caller's
-    # writable subfolders.
-    if tool_name == "apply_patch":
+    # Shell tools — full command gate (dangerous-deny + tier + cross-user
+    # path + credential / agent-config backstops). Placed BEFORE the admin
+    # fast-path + remote _ALLOW so the backstops fire for every caller; the
+    # admin-on-admin fast path lives INSIDE _check_bash / _check_powershell
+    # (after the backstops), matching the pre-existing contract. bwrap
+    # restricts the filesystem locally; the gate restricts command types +
+    # path args (the only cross-user gate on a satellite).
+    if role == tool_roles.SHELL:
+        command = tool_roles.payload_value(tool_name, tool_input)
+        if tool_roles.dialect_of(tool_name) == tool_roles.POWERSHELL:
+            return _check_powershell(command, ctx), None
+        return _check_bash(command, ctx), None
+
+    # A URL fetch: SSRF prevention
+    if role == tool_roles.WEB_FETCH:
+        return _check_webfetch(tool_roles.payload_value(tool_name, tool_input), ctx), None
+
+    # A patch (Codex's apply_patch): the patch text names its files. Each
+    # one gets the Read/Write role check, so a patch cannot read a protected
+    # file (an "Update" with a "Move to" is a copy) or write outside the
+    # caller's writable subfolders. On a satellite the paths resolve the way
+    # Write/Edit resolve there (home band, allow_full_fs, in-tree RBAC).
+    if payload == tool_roles.PATCH:
+        if ctx.placement.needs_path_translation:
+            return _check_apply_patch_remote(tool_input, ctx), None
         return _check_apply_patch(tool_input, ctx), None
 
-    # Admin on admin agent: skip all path checks
-    if ctx.is_admin_agent and ctx.role == "admin":
-        return _ALLOW, None
+    # The Codex approval bridge gates a multi-file change as one file-path
+    # write whose ``_codex_paths`` lists every file (``file_path`` is the
+    # first). Each extra path takes the same decision as a write of its own,
+    # so no file of the change escapes the gate; the mode logic then runs
+    # once.
+    extra_paths = (tool_input.get("_codex_paths")
+                   if role == tool_roles.WRITE and payload == tool_roles.FILE_PATH else None)
+    if isinstance(extra_paths, list):
+        for extra in extra_paths[1:]:
+            if isinstance(extra, str) and extra:
+                decision, _ = check_tool_access(tool_name, {"file_path": extra}, ctx)
+                if not decision.allowed:
+                    return decision, None
+
+    # Admin on admin agent: skip the role matrix — never the universal
+    # protected set, which the read and write checks below enforce for
+    # everyone else (Bash gets it from its own raw-command backstops).
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
+        return (_protected_tool_path_denial(tool_name, tool_input, ctx) or _ALLOW), None
 
     # Remote satellites: delegate to the remote path-policy framework.
     # The satellite hosts its own filesystem the proxy has no direct
@@ -978,28 +1118,21 @@ def check_tool_access(
     #   - OUTSIDE the synced tree: admit paths under the OS user's
     #     home directory by default, plus any path when the machine's
     #     ``allow_full_fs`` policy is True. Reject everything else.
-    if ctx.target_kind in ("admin_remote", "user_remote"):
-        if tool_name not in _FILE_PATH_TOOLS and tool_name not in _SEARCH_PATH_TOOLS:
-            # Bash / Monitor / PowerShell / WebFetch / MCP already checked above.
-            # A genuinely-unknown command-execution tool gets the cross-platform
-            # dangerous-pattern backstop (catastrophe net) instead of a bare allow.
-            if tool_name not in _KNOWN_STRUCTURED_TOOLS:
-                return _unknown_tool_dangerous_scan(tool_input or {}), None
+    if ctx.placement.needs_path_translation:
+        if payload not in (tool_roles.FILE_PATH, tool_roles.SEARCH_PATH):
+            # The shells, the URL fetch, the patch and the MCP tools were
+            # checked above; every other declared tool is structured.
             return _ALLOW, None
-        # NotebookEdit carries its path as `notebook_path` — include it so
-        # notebook writes get the same remote policy as Write/Edit.
-        _path_key = next(
-            (k for k in ("file_path", "notebook_path", "path")
-             if tool_input.get(k)),
-            "",
-        )
+        # A notebook edit carries its path as `notebook_path`: the payload
+        # table names the key, so notebook writes get the same remote policy.
+        _path_key = tool_roles.payload_key(tool_name, tool_input)
         raw_path = tool_input.get(_path_key, "") if _path_key else ""
         if not raw_path:
             return _ALLOW, None
         # Late import to avoid circular dependency on services/.
         from services import path_policy_v2 as _v2
         policy_ctx = _v2.context_from_security(ctx)
-        is_write = tool_name in _WRITE_TOOLS
+        is_write = tool_roles.writes(tool_name)
         resolution = _v2.resolve_path_for_session(
             policy_ctx, raw_path, writing=is_write,
         )
@@ -1017,17 +1150,7 @@ def check_tool_access(
         # replaces the old Windows-only "use `C:/x` instead" deny-nudge —
         # translating is strictly better than denying, on every OS.
         _updated_input = None
-        if (
-            resolution.access_path
-            and _path_key
-            and (
-                _v2.classify_path(
-                    _v2.normalize_path(raw_path, policy_ctx.target_os)
-                ) == "sandbox_virtual"
-                or raw_path == "~"
-                or raw_path.startswith("~/")
-            )
-        ):
+        if resolution.access_path and _path_key and _is_virtual_form(raw_path, policy_ctx):
             _updated_input = {**tool_input, _path_key: resolution.access_path}
         # In-tree paths: defer to local RBAC against the sandbox-virtual
         # form (same admission semantics whether the LLM wrote
@@ -1070,37 +1193,33 @@ def check_tool_access(
             return PathDecision(allowed=True, updated_input=_updated_input), None
         return _ALLOW, None
 
-    # File path tools (Read, Write, Edit, NotebookEdit — the latter names
-    # its arg `notebook_path`)
-    if tool_name in _FILE_PATH_TOOLS:
-        raw_path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+    # A file-path tool (a read, a write, a delete; a notebook edit names its
+    # arg `notebook_path` — the payload table knows)
+    if payload == tool_roles.FILE_PATH:
+        raw_path = tool_roles.payload_value(tool_name, tool_input)
         if not raw_path:
             return _ALLOW, None  # no path = tool will error naturally
         # Translate sandbox-internal paths to host paths for validation
         translated = _translate_sandbox_path(raw_path, ctx)
         resolved = _resolve_path(translated)
 
-        # Plan file isolation: sandbox isolates plans per-user — allow all plan file ops
+        # Plan file isolation: sandbox isolates plans per-user — allow all
+        # plan file ops; a write there registers the plan's name.
         if _path_under(resolved, _PLANS_DIR):
-            new_plan = resolved.name if tool_name in ("Write",) else None
+            new_plan = resolved.name if tool_roles.writes(tool_name) else None
             return _ALLOW, new_plan
 
-        if tool_name in _READ_TOOLS:
-            return _check_path_arg(raw_path, ctx, writing=False), None
-        return _check_path_arg(raw_path, ctx, writing=True), None
+        return _check_path_arg(raw_path, ctx, writing=tool_roles.writes(tool_name)), None
 
-    # Search tools (Glob, Grep) — use 'path' key, optional
-    if tool_name in _SEARCH_PATH_TOOLS:
-        raw_path = tool_input.get("path", "")
+    # A search tool (a glob, a grep) — the 'path' key, optional
+    if payload == tool_roles.SEARCH_PATH:
+        raw_path = tool_roles.payload_value(tool_name, tool_input)
         if not raw_path:
             return _ALLOW, None  # defaults to cwd, within scope
         return _check_path_arg(raw_path, ctx, writing=False), None
 
-    # All other tools (Agent, TaskGet, TodoWrite, ToolSearch, etc.): allow. A
-    # genuinely-unknown command-execution tool (not in the known structured set)
-    # gets the cross-platform dangerous-pattern backstop (catastrophe net) first.
-    if tool_name not in _KNOWN_STRUCTURED_TOOLS:
-        return _unknown_tool_dangerous_scan(tool_input or {}), None
+    # Every other declared tool (a subagent, the task list, the checklist,
+    # tool discovery, …) carries a structured payload: allow.
     return _ALLOW, None
 
 

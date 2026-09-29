@@ -129,8 +129,9 @@ for cmd in python3 python; do
         version=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
         major=$(echo "$version" | cut -d. -f1)
         minor=$(echo "$version" | cut -d. -f2)
-        # Floor matches the Windows installer (3.10+) — current LTS distros
-        # (Ubuntu 22.04/24.04, Debian 12) ship 3.10–3.12 and must provision.
+        # Floor = PYTHON_MIN_VERSION in VERSIONS.md (3.10; matches the Windows
+        # installer) — current LTS distros (Ubuntu 22.04/24.04, Debian 12) ship
+        # 3.10–3.12 and must provision. tests/test_python_floor.py pins it.
         if [ "$major" -ge 3 ] && [ "$minor" -ge 10 ]; then
             PYTHON_CMD="$cmd"
             ok "Python $version found ($cmd)"

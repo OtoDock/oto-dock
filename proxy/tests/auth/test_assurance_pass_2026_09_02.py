@@ -132,10 +132,10 @@ def test_verified_literal_path_refuses_symlink(tmp_path):
     assert _verified_literal_path(real, "knowledge", ".credentials") is None
 
 
-def test_oauth_materialization_refuses_traversal_agent_name(tmp_path, monkeypatch):
-    """The destination root is ``AGENTS_DIR/<agent>``: a name that would leave
-    the agents tree materializes nothing and returns None, while a real slug
-    lands the token under the agent."""
+def test_oauth_resolve_writes_no_token_file_into_any_agent_tree(tmp_path, monkeypatch):
+    """The resolver answers the sandbox-virtual ``credentials_dir`` path and
+    writes nothing under the agents root, whatever the agent name: the file
+    travels in the session's delivery route."""
     from types import SimpleNamespace
     import config
     from services.mcp import mcp_registry
@@ -154,11 +154,46 @@ def test_oauth_materialization_refuses_traversal_agent_name(tmp_path, monkeypatc
     monkeypatch.setattr(
         cr, "_bound_token_source", lambda *a, **k: (token_dir, "acct", "alice"))
 
-    assert cr._resolve_oauth_mcp(
-        "workspace", {}, "user-1", "user", agent_name="../escape") is None
+    monkeypatch.setattr("storage.database.get_username_by_sub", lambda sub: "alice")
+    virtual = "/users/alice/.credentials/google"
+    for name in ("../escape", "pa"):
+        out = cr._resolve_oauth_mcp("workspace", {}, "user-1", "user", agent_name=name)
+        assert out == {"TOKEN_DIR": virtual}
     assert not (tmp_path / "escape").exists()
+    assert not (tmp_path / "agents").exists()
+    out = cr._resolve_oauth_mcp("workspace", {}, None, "agent", agent_name="pa")
+    assert out == {"TOKEN_DIR": "/knowledge/.credentials/google"}
 
-    dest = tmp_path / "agents" / "pa" / "users" / "alice" / ".credentials" / "google"
-    out = cr._resolve_oauth_mcp("workspace", {}, "user-1", "user", agent_name="pa")
-    assert out == {"TOKEN_DIR": str(dest)}
-    assert (dest / "acct.json").read_text() == "{}"
+
+def test_the_boot_sweep_removes_the_agent_tree_credentials_of_earlier_releases(tmp_path, monkeypatch):
+    import config
+    from services.oauth import credential_resolver as cr
+    agents = tmp_path / "agents"
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    stale = [agents / "a" / "knowledge" / ".credentials" / "google-tokens",
+             agents / "a" / "users" / "alice" / ".credentials" / "google-tokens"]
+    for d in stale:
+        d.mkdir(parents=True)
+        (d / "x@gmail.com.json").write_text("{}")
+    keep = agents / "a" / "users" / "alice" / "workspace" / ".credentials"
+    keep.mkdir(parents=True)
+    (keep / "note.txt").write_text("mine")
+    assert cr.purge_agent_tree_credentials() == 2
+    assert not any(d.parent.exists() for d in stale)
+    assert (keep / "note.txt").read_text() == "mine"
+    assert cr.purge_agent_tree_credentials() == 0
+
+
+def test_a_symlink_planted_at_a_credentials_name_is_removed_by_the_sweep(tmp_path, monkeypatch):
+    from services.oauth import credential_resolver as cr
+    agents = tmp_path / "agents"
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x").write_text("keep")
+    know = agents / "a" / "knowledge"
+    know.mkdir(parents=True)
+    (know / ".credentials").symlink_to(outside)
+    assert cr.purge_agent_tree_credentials() == 1
+    assert not (know / ".credentials").is_symlink() and not (know / ".credentials").exists()
+    assert (outside / "x").read_text() == "keep"

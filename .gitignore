@@ -19,6 +19,8 @@ agents/
 !proxy/tests/agents/
 # …and storage/agents/ is the agent-domain storage sub-package:
 !proxy/storage/agents/
+# …and services/agents/ is the agent-domain services sub-package:
+!proxy/services/agents/
 
 # ── Python ──
 __pycache__/

@@ -1,5 +1,5 @@
 """User sends: the chat turn itself, stop-and-send, delivery into a live
-interactive session, artifact interactions, mini-app actions and read receipts.
+interactive session, artifact interactions, app actions and read receipts.
 
 ``ChatSendMixin`` is one of the mixins ``ws/dashboard_chat.py`` assembles into
 ``ChatController``; methods run with the connection's full attribute state
@@ -11,16 +11,15 @@ import functools
 import json
 import logging
 import config
+from core import placement
 from storage import database as task_store
-from storage.agents import agent_store
 from storage.pg import run_db
 from core.events import chat_writer
 from services.notifications import notification_manager
 from core.session.session_state import (
     get_session_mode,
-    get_session_user_tz,
-    get_user_tz,
 )
+from core.events.common_events import TurnInput
 from core.events.stream_pump import (
     _active_pumps,
 )
@@ -31,6 +30,7 @@ from ws.dashboard import (
     _role_and_layer,
 )
 from ws.dashboard_chat_text import _REVIVAL_WAIT_S
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -54,14 +54,14 @@ class ChatSendMixin:
         cap = await run_db(pool_caps.evaluate, "user", self.user_sub, layer_path)
         if cap.allowed:
             if cap.warning:
-                await self._send({"type": "limit_warning", "pool": cap.to_public()})
+                await self._send({"type": wire.LIMIT_WARNING, "pool": cap.to_public()})
             return "ok"
         if cap.on_reached == "continue" and await run_db(
             subscription_pool.cap_continue_available, layer_path, self.user_sub,
         ):
-            await self._send({"type": "limit_warning", "pool": cap.to_public()})
+            await self._send({"type": wire.LIMIT_WARNING, "pool": cap.to_public()})
             return "continue"
-        await self._send({"type": "limit_reached", "pool": cap.to_public()})
+        await self._send({"type": wire.LIMIT_REACHED, "pool": cap.to_public()})
         return "blocked"
 
     async def _recycle_session(self, why: str) -> None:
@@ -132,11 +132,21 @@ class ChatSendMixin:
                 self.user_sub, msg_chat_id or self.chat_id or "", self.notify_connection_id,
             )
 
+        # A bound socket runs the turn on its bound chat, so a frame naming
+        # another chat is refused: the gates below judge the chat that runs,
+        # and a message meant for one chat never lands in another.
+        if self.chat_id and self.agent_name and msg_chat_id and msg_chat_id != self.chat_id:
+            await self._send_error("This message is for a chat this connection "
+                                   "is not on. Reopen the chat and send it again.")
+            await self._send({"type": wire.DONE, "chat_id": msg_chat_id})
+            return
+
         # Task continue-gate (security boundary): a turn must never be driven
         # on a task this user can't continue — agent-scoped → editor+,
         # user-scoped → creator/admin. Checks the chat being driven (the
         # message's chat_id, or the WS's current chat_id on the normal path).
         if await self._deny_task_continue(msg_chat_id or self.chat_id):
+            await self._send({"type": wire.DONE, "chat_id": msg_chat_id or self.chat_id or ""})
             return
 
         # Self-heal: if WS state is missing (post-reconnect race where `chat`
@@ -148,16 +158,11 @@ class ChatSendMixin:
         if msg_chat_id and (not self.chat_id or not self.agent_name):
             chat = await run_db(task_store.get_chat, msg_chat_id)
             if chat:
-                allowed = chat["user_sub"] == self.user_sub or self.user_role == "admin"
-                if not allowed:
-                    chat_agent = chat.get("agent", "")
-                    is_assigned = chat_agent in self.user_agents
-                    is_agent_scoped = (
-                        _vis.is_shared_only(chat_agent)
-                        or chat.get("source_type") == "phone"
-                        or _vis.is_shared_chat_owner(chat["user_sub"])
-                    )
-                    allowed = is_assigned and is_agent_scoped
+                # The rule resume_chat binds by (the chat's owner decides,
+                # never the agent's current mode). Imported here: the agents
+                # API package imports this module's assembly.
+                from api.agents.agents import can_open_chat
+                allowed = await run_db(can_open_chat, self._viewer_context(), chat)
                 if allowed:
                     # In-flight warmup re-attach: if a warmup is still running
                     # for this chat (fresh-satellite MCP install in progress),
@@ -200,11 +205,19 @@ class ChatSendMixin:
                     pump = _active_pumps.get(self.chat_id)
                     if pump and not pump.is_done:
                         from core.concurrency import acquire_chat_slot
-                        # Pinned target so a REMOTE session's recovery stays off the local ceiling.
-                        if await acquire_chat_slot(pump.session_id, target=chat.get("execution_target") or "local", execution_path=chat.get("execution_path")):
+                        # Pinned target so a REMOTE session's recovery stays off
+                        # the local ceiling; the owner is recorded only for a
+                        # connection that drives the chat, a re-attach is never
+                        # capped.
+                        if await acquire_chat_slot(
+                                pump.session_id,
+                                target=chat.get("execution_target") or placement.LOCAL,
+                                execution_path=chat.get("execution_path"),
+                                user_sub=None if self._view_only else self.user_sub,
+                                per_user_cap=False):
                             self.session_id = pump.session_id
                             await self._send({
-                                "type": "warmup_ready",
+                                "type": wire.WARMUP_READY,
                                 "session_id": self.session_id,
                                 "chat_id": self.chat_id,
                                 "mode": get_session_mode(self.session_id) or chat.get("permission_mode", "default"),
@@ -237,10 +250,10 @@ class ChatSendMixin:
                 usage_service.check_user_limit, self.user_sub, self.user_role
             )
             if not limit_status["allowed"]:
-                await self._send({"type": "limit_reached", **limit_status["periods"]})
+                await self._send({"type": wire.LIMIT_REACHED, **limit_status["periods"]})
                 return
             if limit_status["warning"]:
-                await self._send({"type": "limit_warning", **limit_status["periods"]})
+                await self._send({"type": wire.LIMIT_WARNING, **limit_status["periods"]})
         except Exception:
             pass  # Don't block messages if limit check fails
 
@@ -350,7 +363,7 @@ class ChatSendMixin:
                 # Interactive sessions never recycle implicitly: a PTY holds
                 # live TUI state, and this branch is reachable WITHOUT the other
                 # user typing anything (an idle artifact-backchannel send or a
-                # mini-app action routes here), so recycling would kill a
+                # app action routes here), so recycling would kill a
                 # colleague's terminal mid-work. Refuse and let them take it over
                 # deliberately.
                 _isess = interactive_session.get(self.session_id)
@@ -379,51 +392,19 @@ class ChatSendMixin:
             await self._send_error("No session — send warmup first")
             return
 
-        # Resolve the chat scope once. Shared-only agent dashboard chats run as
-        # agent-scoped (one shared history) — sandbox mounts only `/workspace/`,
-        # no `/users/{u}/`. All other agents' chats are user-scoped — sandbox
-        # mounts `/users/{u}/` (and `/workspace/` for managers). Mirrors the
-        # `pump_scope` derivation in `_start_new_stream` above.
-        if not self.agent_name or not await run_db(agent_store.agent_exists, self.agent_name):
-            await self._send_error("Unknown agent")
+        # The turn's input — the same derivation a busy send takes in the
+        # dispatcher's steer/queue branch (`_prepare_turn_input`).
+        turn_input = await self._prepare_turn_input(text, images, files)
+        if turn_input is None:
+            # The refusal went out as an error frame; the client armed its
+            # streaming state on the send, so end the turn it never got.
+            await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
             return
         is_agent_scoped = _vis.is_shared_only(self.agent_name)
-        agent_dir = config.get_agent_dir(self.agent_name)
-        username = self.user.get("username") or ""
-        if not is_agent_scoped and not username:
-            # User-scoped chat without a username slug indicates a user
-            # provisioning gap (every account gets a slug on first login).
-            await self._send_error("User has no username configured")
-            return
-
-        # Layer dispatch differs for chat-attached photos: CLI/Codex have a
-        # built-in Read tool that opens the saved file from disk and submits
-        # it to the API as a vision content block. Direct LLM has no built-in
-        # Read tool — we attach the image directly to the user message as a
-        # provider-native vision content block (Anthropic `image`/source.base64,
-        # OpenAI `image_url`). See proxy/core/layers/providers/base.py
-        # `format_image_content_block` and proxy/core/layers/direct/session.py
-        # `run_direct_stream(images=...)`.
-        # Use `layer.capabilities.name` rather than a local exec_path string
-        # because `effective_exec_path` is scoped to the warmup/resume
-        # handlers (not _handle_chat). Direct LLM is always local (never goes
-        # through RemoteExecutionLayer per docs), so the layer's own name is
-        # the right discriminator.
-        is_direct_llm = bool(self.layer and self.layer.capabilities.name == "direct-llm")
-
-        cli_text, attached_images, image_meta, valid_files = await self._process_attachments(
-            text, images, files,
-            agent=self.agent_name, agent_dir=agent_dir,
-            is_agent_scoped=is_agent_scoped, username=username,
-            is_direct_llm=is_direct_llm,
-        )
+        cli_text, attached_images = turn_input.cli_text, turn_input.images
 
         # Save original user text to DB (without image/file paths injection)
-        event_meta = {}
-        if image_meta:
-            event_meta["images"] = image_meta
-        if valid_files:
-            event_meta["files"] = valid_files
+        event_meta = turn_input.event_meta
         event_data = json.dumps(event_meta) if event_meta else ""
 
         # ONE chat-lane job for the send-time row work, ordered against the
@@ -447,8 +428,26 @@ class ChatSendMixin:
         _read_prev_author = is_agent_scoped and bool(_cid) and not server_kick
         _title = self._deterministic_title(text) if (_cid and not artifact_framed) else ""
 
+        _focus_conn = getattr(self, "notify_connection_id", "") or None
+        _focus_user = self.user_sub
+        # A server kick is the warmup's own first prompt: the line was
+        # captured at send time (the overlay closes on send and the kick runs
+        # seconds later), so the kick carries it instead of a live read.
+        _focus_captured = msg.get("_focus_line") if server_kick else None
+
         def _send_job() -> dict:
-            out = {"prev_author": "", "title_set": False, "rec": None, "cancelled": ""}
+            out = {"prev_author": "", "title_set": False, "rec": None, "cancelled": "",
+                   "focus": ""}
+            # The app on THIS sender's screen, if any (APPS.md "Live
+            # apps"). Best effort: a focus failure must never hold a send.
+            if _focus_captured is not None:
+                out["focus"] = str(_focus_captured or "")
+            elif _focus_conn:
+                try:
+                    from services.apps.focus_context import focus_line
+                    out["focus"] = focus_line(_focus_user, connection_id=_focus_conn)
+                except Exception:
+                    logger.debug("focus line unavailable for chat %s", _cid, exc_info=True)
             if _read_prev_author:
                 out["prev_author"] = task_store.get_last_user_message_author(_cid)
             if _persist_row:
@@ -477,7 +476,7 @@ class ChatSendMixin:
             # socket's notify queue drains only between turns — the direct
             # send is what titles the sending tab for the whole first
             # turn. The client's title_updated patch is idempotent.
-            await self._send({"type": "title_updated", "chat_id": self.chat_id, "title": _title})
+            await self._send({"type": wire.TITLE_UPDATED, "chat_id": self.chat_id, "title": _title})
             try:
                 notification_manager.broadcast_chat_title(
                     (chat_rec or {}).get("user_sub") or "", self.chat_id, _title,
@@ -489,6 +488,10 @@ class ChatSendMixin:
         if sent["cancelled"]:
             cli_text = sent["cancelled"] + "\n\n" + cli_text
             logger.info(f"WS dashboard: injected cancelled turn context ({len(sent['cancelled'])} chars) for chat={self.chat_id}")
+        # Prompt-side only, like the notes around it: the stored row is the
+        # raw text.
+        if sent.get("focus"):
+            cli_text = sent["focus"] + "\n\n" + cli_text
 
         # Speaker-transition note (Shared-only): the resumed transcript may
         # carry other teammates' turns, and the warmup's identity line names
@@ -519,27 +522,32 @@ class ChatSendMixin:
             # Process any messages queued during streaming (e.g. user clicked
             # "implement" before CLI finished). Send as a new turn.
             while self.message_queue and self.session_id:
-                combined = "\n\n".join(self.message_queue)
+                batch = TurnInput.combine(self.message_queue)
                 self.message_queue.clear()
-                await self._send({"type": "queue_sent", "text": combined})
+                await self._send({"type": wire.QUEUE_SENT, "text": batch.text,
+                                  **batch.frame_fields()})
                 # Lane-ordered after the finished turn's rows (drained at its
                 # pump end) and before the next pump's.
+                _batch_meta = batch.event_meta
                 await chat_writer.submit(
                     self.chat_id,
                     functools.partial(task_store.add_chat_message, self.chat_id,
-                                      "user", combined, author_sub=self.user_sub),
+                                      "user", batch.text,
+                                      event_data=json.dumps(_batch_meta) if _batch_meta else "",
+                                      author_sub=self.user_sub),
                     label="queue_drain",
                 )
                 pump = await self._start_new_stream(
-                    combined,
+                    batch.cli_text,
                     target_session_id=self.session_id,
                     target_chat_id=self.chat_id,
                     target_layer=self.layer,
+                    images=batch.images or None,
                 )
                 if pump:
                     await self._enter_pump_loop()
                 else:
-                    await self._send({"type": "done", "chat_id": self.chat_id or ""})
+                    await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
                     break
             # Leftover backchannel interactions (queued via the between-turns
             # dispatcher during a transient streaming state, so never adopted
@@ -570,11 +578,11 @@ class ChatSendMixin:
                 if pump:
                     await self._enter_pump_loop()
                 else:
-                    await self._send({"type": "done", "chat_id": self.chat_id or ""})
+                    await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
                     break
         else:
             # Pump creation failed (dead session, error) — reset frontend streaming state
-            await self._send({"type": "done", "chat_id": self.chat_id or ""})
+            await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
 
     def _maybe_stop_and_send(self, pump) -> None:
         """Typed message queued onto a busy turn → graceful stop-and-send.
@@ -651,25 +659,34 @@ class ChatSendMixin:
         valid_files: list = []
         if msg.get("images") or msg.get("files"):
             # Same pipeline as the pty_attachments frame: save + push the
-            # attachments, build the prompt with sandbox-virtual paths.
-            cli_text, _imgs, image_meta, valid_files = await self._process_attachments(
-                text, msg.get("images", []), msg.get("files", []),
-                agent=self.agent_name, agent_dir=config.get_agent_dir(self.agent_name),
-                is_agent_scoped=_vis.is_shared_only(self.agent_name),
-                username=self.user.get("username") or "",
-                is_direct_llm=False,
-            )
+            # attachments, build the prompt with sandbox-virtual paths. A
+            # refusal (a viewer's photo into a Shared-only chat) is handled
+            # here: the error frame answers the send, nothing is typed.
+            from ws.dashboard_chat_support import AttachmentsRefused
+            try:
+                cli_text, _imgs, image_meta, valid_files = await self._process_attachments(
+                    text, msg.get("images", []), msg.get("files", []),
+                    agent=self.agent_name, agent_dir=config.get_agent_dir(self.agent_name),
+                    is_agent_scoped=_vis.is_shared_only(self.agent_name),
+                    username=self.user.get("username") or "",
+                    is_direct_llm=False,
+                )
+            except AttachmentsRefused as e:
+                await self._send_error(str(e))
+                return True
 
         # Adopt the live session + tell the client it is interactive so it
         # attaches the terminal (same frame shape as the resume re-attach) —
         # the client sent `chat` precisely because it believed the session
         # dead.
         from core.concurrency import acquire_chat_slot
-        await acquire_chat_slot(isess.session_id, target=isess.target)
+        await acquire_chat_slot(isess.session_id, target=isess.target,
+                                user_sub=None if self._view_only else self.user_sub,
+                                per_user_cap=False)
         self.session_id = isess.session_id
         chat_rec = await run_db(task_store.get_chat, self.chat_id) or {}
         await self._send({
-            "type": "warmup_ready",
+            "type": wire.WARMUP_READY,
             "session_id": self.session_id,
             "chat_id": self.chat_id,
             "mode": get_session_mode(self.session_id) or chat_rec.get("permission_mode", "default"),
@@ -698,10 +715,19 @@ class ChatSendMixin:
                 ),
                 label="live_send",
             )
-        user_tz = get_session_user_tz(self.session_id) or get_user_tz(self.user_sub)
-        stamped = (
-            f"[Current time: {config.format_current_time(user_tz)}]\n\n{cli_text}"
-        )
+        # The focus line is a second prelude after the time stamp on the
+        # interactive rail; the tailer keeps both and the prelude matchers
+        # strip both (APPS.md "Live apps").
+        focus = ""
+        try:
+            from services.apps.focus_context import focus_line
+            focus = await run_db(
+                focus_line, self.user_sub,
+                connection_id=getattr(self, "notify_connection_id", "") or None,
+            )
+        except Exception:
+            logger.debug("focus line unavailable for chat %s", self.chat_id, exc_info=True)
+        stamped = self._interactive_prelude(cli_text, session_id=self.session_id, focus_line=focus)
         from core.session.transcript_tool_events import note_sent_prompt
         note_sent_prompt(self.chat_id, stamped)
         # Bracketed paste + CR (the composer's own framing): the question-
@@ -728,7 +754,7 @@ class ChatSendMixin:
         token = str(msg.get("token") or "")
 
         async def ack(status: str, reason: str = ""):
-            frame: dict = {"type": "artifact_ack", "token": token, "status": status}
+            frame: dict = {"type": wire.ARTIFACT_ACK, "token": token, "status": status}
             if reason:
                 frame["reason"] = reason
             await self._send(frame)
@@ -744,8 +770,8 @@ class ChatSendMixin:
         # Meeting turn flow is managed — no page-event injection mid-meeting.
         if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
-        if await self._deny_task_continue(chat_id):
-            return await ack("denied", "task chat not continuable")
+        if refusal := await self._deny_task_continue(chat_id):
+            return await ack("denied", refusal)
         if not _ai.check_rate(chat_id, token):
             return await ack("denied", "rate limited")
 
@@ -773,7 +799,7 @@ class ChatSendMixin:
             chat_id,
             functools.partial(
                 task_store.add_chat_message, chat_id, "event", "",
-                event_type="artifact_interaction",
+                event_type=wire.ARTIFACT_INTERACTION,
                 event_data=_ai.event_row_json(interaction),
             ),
             label="artifact_row",
@@ -786,7 +812,7 @@ class ChatSendMixin:
         })
 
     async def _handle_app_action(self, msg: dict):
-        """Between-turns entry for a pinned mini-app send_prompt action (the
+        """Between-turns entry for a pinned app send_prompt action (the
         in-stream twin lives in `_stream_via_pump`; fire_task actions execute
         via REST in api/apps and never reach the WS). Same delivery contract
         as `_handle_artifact_interaction` — the approved prompt TEMPLATE is
@@ -798,7 +824,7 @@ class ChatSendMixin:
         action_id = str(msg.get("action_id") or "")
 
         async def ack(status: str, reason: str = ""):
-            frame: dict = {"type": "app_action_ack", "app_id": app_id,
+            frame: dict = {"type": wire.APP_ACTION_ACK, "app_id": app_id,
                            "action_id": action_id, "status": status}
             if reason:
                 frame["reason"] = reason
@@ -815,8 +841,8 @@ class ChatSendMixin:
             return await ack("denied", err)
         if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
-        if await self._deny_task_continue(chat_id):
-            return await ack("denied", "task chat not continuable")
+        if refusal := await self._deny_task_continue(chat_id):
+            return await ack("denied", refusal)
         if not _ai.check_rate(chat_id, f"app:{app_id}"):
             return await ack("denied", "rate limited")
 
@@ -834,7 +860,7 @@ class ChatSendMixin:
             chat_id, functools.partial(task_store.set_chat_title_if_unset, chat_id, _title),
             label="app_title",
         ):
-            await self._send({"type": "title_updated", "chat_id": chat_id,
+            await self._send({"type": wire.TITLE_UPDATED, "chat_id": chat_id,
                               "title": _title})
 
         if self.streaming:
@@ -853,7 +879,7 @@ class ChatSendMixin:
             chat_id,
             functools.partial(
                 task_store.add_chat_message, chat_id, "event", "",
-                event_type="app_action", event_data=_ai.event_row_json(interaction),
+                event_type=wire.APP_ACTION, event_data=_ai.event_row_json(interaction),
             ),
             label="app_action_row",
         )
@@ -874,25 +900,18 @@ class ChatSendMixin:
         cid = msg.get("chat_id") or ""
         if not cid:
             return
-        _uid, _role, _agents = self.user_sub, self.user_role, set(self.user_agents)
+        _uid, _viewer = self.user_sub, self._viewer_context()
+        # Imported here: the agents API package imports this module's assembly.
+        from api.agents.agents import can_open_chat
 
         def _read_job() -> tuple[str, str] | None:
-            # Access gate + the read mark in ONE executor job.
+            # Access gate (the resume gate's rule) + the read mark in ONE
+            # executor job.
             chat = task_store.get_chat(cid)
-            if not chat:
+            if not chat or not can_open_chat(_viewer, chat):
                 return None
             owner = chat.get("user_sub", "")
             chat_agent = chat.get("agent", "")
-            if owner != _uid and _role != "admin":
-                # Mirror the resume gate: assigned users may read agent-scoped
-                # chats of shared-only agents (+ phone conversations).
-                is_agent_scoped = (
-                    _vis.is_shared_only(chat_agent)
-                    or chat.get("source_type") == "phone"
-                    or _vis.is_shared_chat_owner(owner)
-                )
-                if not (chat_agent in _agents and is_agent_scoped):
-                    return None
             task_store.mark_chat_read(cid, _vis.chat_history_owner(chat_agent, _uid))
             return owner, chat_agent
 

@@ -5,8 +5,10 @@ import { useAdminUsers } from '../../api/runs'
 import StatusBadge from '../../components/StatusBadge'
 import { formatRelativeTime } from '../../lib/format'
 import MarkdownContent from '../../components/chat/MarkdownContent'
+import { MEETING_STATUS } from '../../lib/status/meeting'
 
-const STATUSES = ['', 'active', 'concluded', 'failed', 'paused', 'concluding', 'pending']
+// The filter's options: every stored meeting status (the route accepts any).
+const STATUSES = ['', ...Object.values(MEETING_STATUS)]
 
 export default function MeetingsPage() {
   const [agentFilter, setAgentFilter] = useState('')

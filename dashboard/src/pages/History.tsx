@@ -5,8 +5,10 @@ import { useAgents } from '../api/agents'
 import { groupRunsBySession, getTaskTypeLabel, getTaskTypeStyle, formatTrigger, isInternalTaskType } from '../lib/runs'
 import StatusBadge from '../components/StatusBadge'
 import { formatRelativeTime, formatDuration } from '../lib/format'
+import { RUN_STATUS } from '../lib/status/run'
 
-const STATUSES = ['', 'pending', 'running', 'completed', 'failed', 'cancelled']
+// The filter's options: every stored run status (the route accepts any).
+const STATUSES = ['', ...Object.values(RUN_STATUS)]
 
 export default function History() {
   const navigate = useNavigate()

@@ -340,10 +340,8 @@ class TwilioCallAPI:
                 await ws.close()
                 return ws
             is_outbound = True
-            if outbound_call.route_id:
-                route = self.cfg.get_outbound_route(outbound_call.route_id)
-            else:
-                route = self.cfg.get_default_outbound_route()
+            # Every origination named its route; an unknown id resolves to None.
+            route = self.cfg.get_outbound_route(outbound_call.route_id)
         elif token:
             entry = self._pending.pop(token)
             if entry:

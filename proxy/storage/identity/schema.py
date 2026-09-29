@@ -104,11 +104,29 @@ def init_identity(conn) -> None:
             assigned_at TEXT NOT NULL,
             assigned_by TEXT NOT NULL,
             agent_role TEXT DEFAULT 'viewer'
-                CHECK (agent_role IN ('manager', 'editor', 'viewer')),
+                CHECK (agent_role IN ('manager', 'editor', 'contributor', 'viewer')),
             PRIMARY KEY (sub, agent),
             FOREIGN KEY (sub) REFERENCES users(sub) ON DELETE CASCADE
         )
     """)
+    # A deleted person's username never returns to the slug pool: their
+    # users/<username>/ trees are archived out of the agent folders
+    # (services/agents/offboarding_transfer.py) and a later person with the
+    # same display name must not inherit them. Written by db_users.delete_user
+    # in the deleting transaction; archived_at is stamped once no agent
+    # folder holds the tree. A username here that a live users row holds
+    # again means an older dump was restored: the row is dropped, not acted on.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS retired_usernames (
+            username TEXT PRIMARY KEY,
+            sub TEXT NOT NULL,
+            retired_at TEXT NOT NULL,
+            archived_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retired_usernames_sub ON retired_usernames(sub)"
+    )
     # WebAuthn passkeys (storage/identity/webauthn_store.py; api/auth/webauthn.py).
     # credential_id / public_key are base64url. sign_count backs the cloned-
     # authenticator check; transports (JSON list) improve later allowCredentials

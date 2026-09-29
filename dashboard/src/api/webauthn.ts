@@ -112,7 +112,7 @@ export async function deletePasskey(credentialId: string, password: string): Pro
 // match the proxy's NATIVE_HANDOFF_STATE.
 export const NATIVE_HANDOFF_STATE = 'passkey-handoff'
 
-async function runPasskeyAssertion(native: boolean, totpSessionToken?: string): Promise<any> {
+async function runPasskeyAssertion(native: boolean, totpSessionToken?: string, handoff?: string): Promise<any> {
   const optRes = await fetch('/auth/passkey/options', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -138,6 +138,7 @@ async function runPasskeyAssertion(native: boolean, totpSessionToken?: string): 
     body: JSON.stringify({
       state,
       native,
+      ...(handoff ? { handoff } : {}),
       ...(totpSessionToken ? { totp_session_token: totpSessionToken } : {}),
       credential: {
         id: cred.id,
@@ -167,10 +168,61 @@ export async function passkeySecondFactor(totpSessionToken: string): Promise<Use
   return data.user
 }
 
-/** System-browser leg of the native-app flow: returns the one-time handoff token. */
-export async function nativePasskeyLogin(): Promise<string> {
-  const data = await runPasskeyAssertion(true)
+/** App-webview leg, before the system browser opens: a nonce this webview
+ *  keeps in its own cookie; the token the system browser mints is bound to
+ *  it, and only this webview can exchange that token. */
+export async function startNativeHandoff(): Promise<string> {
+  const res = await fetch('/auth/passkey/native/start', {
+    method: 'POST',
+    credentials: 'same-origin',
+  })
+  const data = await jsonOrThrow(res, 'Could not start the passkey sign-in')
+  return data.handoff
+}
+
+/** System-browser leg of the native-app flow: returns the one-time handoff
+ *  token, bound to the ``handoff`` nonce the app's webview holds. */
+export async function nativePasskeyLogin(handoff: string): Promise<string> {
+  const data = await runPasskeyAssertion(true, undefined, handoff)
   return data.native_token
+}
+
+/** The confirm with the signed-in user's own passkey (SHARING.md): the
+ * stand-in for the password on accounts without one. Returns the one-shot
+ * token the confirming route consumes. */
+export async function passkeyConfirm(): Promise<string> {
+  const optRes = await apiFetch('/auth/passkey/confirm/options', { method: 'POST', body: '{}' })
+  const { state, options } = await jsonOrThrow(optRes, 'Failed to start the passkey confirmation')
+  const publicKey: PublicKeyCredentialRequestOptions = {
+    ...options,
+    challenge: b64urlToBuf(options.challenge),
+    allowCredentials: (options.allowCredentials || []).map((c: any) => ({
+      ...c, id: b64urlToBuf(c.id),
+    })),
+  }
+  const cred = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null
+  if (!cred) throw new Error('Passkey confirmation was cancelled')
+  const assertion = cred.response as AuthenticatorAssertionResponse
+  const verifyRes = await apiFetch('/auth/passkey/confirm/verify', {
+    method: 'POST',
+    body: JSON.stringify({
+      state,
+      credential: {
+        id: cred.id,
+        rawId: bufToB64url(cred.rawId),
+        type: cred.type,
+        response: {
+          clientDataJSON: bufToB64url(assertion.clientDataJSON),
+          authenticatorData: bufToB64url(assertion.authenticatorData),
+          signature: bufToB64url(assertion.signature),
+          userHandle: assertion.userHandle ? bufToB64url(assertion.userHandle) : null,
+        },
+        clientExtensionResults: cred.getClientExtensionResults(),
+      },
+    }),
+  })
+  const data = await jsonOrThrow(verifyRes, 'Passkey confirmation failed')
+  return data.confirm_token
 }
 
 /** App-webview leg: trade the handoff token for this webview's session cookie. */

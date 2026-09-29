@@ -1,12 +1,21 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useApps, useHideAppForMe, useReorderApps, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
+import { useSearchParams } from 'react-router-dom'
+import { rollbackNoticeText, useApps, useHideAppForMe, usePurgeApp, useReorderApps, useRollbackApp, useUnhideAppForMe, useUnpinApp, type PinnedApp } from '../../api/apps'
 import { onFileUpdate } from '../../lib/fileUpdates'
+import { onAppDeployed } from '../../lib/appLive'
+import { appKind } from '../../lib/kinds/app'
+import { DEPLOY_STATE } from '../../lib/status/appDeploy'
 import { useQueryClient } from '@tanstack/react-query'
 import AppFrame from './AppFrame'
+import AppMenu from './AppMenu'
+import SharePopover from '../sharing/SharePopover'
 import AppApprovalCard, { appNeedsApproval } from './AppApprovalCard'
+import AppDeployCard from './AppDeployCard'
+import AppLogsPanel from './AppLogsPanel'
+import AppSettingsPanel from './AppSettingsPanel'
 
 /**
- * Pinned mini-apps overlay — swaps the message-list slot like
+ * Pinned apps overlay — swaps the message-list slot like
  * ProjectsOverlay: a reorderable chip strip (shared apps first, then the
  * viewer's personal ones; order[0] is the default tab) over a sandboxed
  * AppFrame, with the declared-actions approval card when a manifest is
@@ -16,10 +25,11 @@ import AppApprovalCard, { appNeedsApproval } from './AppApprovalCard'
  * snap-x row, fade gradients, active-chip auto-scroll) and its ownership
  * colors: personal apps brand-blue, shared apps accent-purple — the same
  * scope language as the workspace view, which also answers "where is this
- * app's file?" at a glance. Unpinning is a two-step confirm on the ACTIVE
- * chip's inline X (browser-tab style, so the X visually binds to what it
- * removes) — unpin is soft server-side: file, manifest and approval all
- * survive a re-pin.
+ * app's file?" at a glance. The ACTIVE chip carries the app's three-dot
+ * menu (open full screen, share, hide for me, unpin); unpin is a two-step
+ * confirm and soft server-side: file, manifest and approval all survive a
+ * re-pin. The active tab rides `?app=<id>` so a reload or a shared link
+ * lands on the same dashboard.
  */
 
 interface Props {
@@ -28,6 +38,11 @@ interface Props {
   /** False when the host page already renders content above (the agent
       home's live-sessions strip carries the floating-TopBar clearance). */
   topPadding?: boolean
+  /** The active tab, when the page owns it (useOverlayPanels lifts it so an
+      agent's open request can select a tab before the overlay mounts);
+      absent, the overlay keeps its own from `?app=`. */
+  activeId?: string | null
+  onSelect?: (id: string) => void
 }
 
 const IS_DESKTOP = typeof window !== 'undefined'
@@ -35,24 +50,117 @@ const IS_DESKTOP = typeof window !== 'undefined'
   && !window.matchMedia('(hover: none)').matches
 const LONG_PRESS_MS = 450
 
-export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: Props) {
+/** The rollback confirm, shared by the overlay and the full-screen page:
+ * it names what moves (every viewer, and a folder app's data). */
+export function RollbackConfirm({ app, busy, onConfirm, onCancel }: {
+  app: PinnedApp; busy: boolean; onConfirm: () => void; onCancel: () => void
+}) {
+  const title = app.title || app.slug
+  return (
+    <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 text-xs" data-testid="app-rollback-confirm">
+      <span className="text-p-text">
+        Roll back “{title}” to the previous release? Everyone switches at once.
+        {appKind(app).keepsData && (
+          <> Its data goes back to before this release; newer changes are kept in a snapshot.</>
+        )}
+      </span>
+      <div className="ml-auto flex shrink-0 items-center gap-2">
+        <button
+          onClick={onConfirm}
+          disabled={busy}
+          className="rounded-md bg-amber-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-amber-700 disabled:opacity-60"
+        >
+          {busy ? 'Rolling back…' : 'Roll back'}
+        </button>
+        <button
+          onClick={onCancel}
+          className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** What a rollback did (or why it was refused), until dismissed. */
+export function RollbackNotice({ notice, onClose }: {
+  notice: { text: string; error: boolean }; onClose: () => void
+}) {
+  return (
+    <div
+      className={`mx-3 mt-2 flex items-start gap-2 rounded-xl border px-3 py-2.5 text-xs ${notice.error ? 'border-red-500/40 bg-red-500/5' : 'border-emerald-500/40 bg-emerald-500/5'}`}
+      data-testid="app-rollback-notice"
+      role="status"
+    >
+      <span className="flex-1 text-p-text">{notice.error ? `Roll back failed: ${notice.text}` : notice.text}</span>
+      <button
+        onClick={onClose}
+        aria-label="Dismiss"
+        className="shrink-0 rounded-full px-1.5 text-p-text-light transition-colors hover:bg-p-surface-hover hover:text-p-text"
+      >
+        ×
+      </button>
+    </div>
+  )
+}
+
+export default function AppsOverlay({
+  agent, onSendPrompt, topPadding = true, activeId: controlledActiveId, onSelect,
+}: Props) {
   const { data: apps, isLoading } = useApps(agent)
   const unpin = useUnpinApp(agent)
   const hideForMe = useHideAppForMe(agent)
   const unhide = useUnhideAppForMe(agent)
+  const rollback = useRollbackApp(agent)
+  const purge = usePurgeApp(agent)
   const reorder = useReorderApps(agent)
   const qc = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  const [activeId, setActiveId] = useState<string | null>(null)
+  const [localActiveId, setLocalActiveId] = useState<string | null>(() => searchParams.get('app'))
+  const activeId = controlledActiveId !== undefined ? controlledActiveId : localActiveId
+  // null = "no preference" after the active tab went away: the first tab
+  // takes over through the `?? list[0]` fallback, so a page-owned id needs
+  // no reset (a stale id falls back the same way).
+  const setActiveId = (id: string | null) => {
+    if (onSelect) {
+      if (id) onSelect(id)
+      return
+    }
+    setLocalActiveId(id)
+    if (!id) return
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev)
+      next.set('app', id)
+      return next
+    }, { replace: true })
+  }
   const [armedId, setArmedId] = useState<string | null>(null) // mobile move-arrows
-  // The app id the X was clicked on — confirm renders only while that app
-  // is STILL the active tab, so the confirm can never unpin anything else.
+  // The app id the menu's Unpin was chosen on — confirm renders only while
+  // that app is STILL the active tab, so the confirm can never unpin
+  // anything else.
   const [confirmUnpinId, setConfirmUnpinId] = useState<string | null>(null)
+  // Roll back is a two-step too: it moves every viewer and, for a folder
+  // app, its data. The result stays on the card slot until dismissed.
+  const [confirmRollbackId, setConfirmRollbackId] = useState<string | null>(null)
+  const [rollbackNotice, setRollbackNotice] = useState<{ appId: string; text: string; error: boolean } | null>(null)
+  const [shareId, setShareId] = useState<string | null>(null)
   const [showHidden, setShowHidden] = useState(false)
-  // The app document's own scroll offset (AppFrame's onScrollY bridge) —
-  // slides the solo-app ✕ away with the content instead of hovering
-  // permanently over it. Reset on tab switch; AppFrame resets on reload.
-  const [frameScrollY, setFrameScrollY] = useState(0)
+  // Folder apps (APPS.md): the logs panel and the working-copy preview are
+  // per app id, so switching tabs never carries them over.
+  const [logsId, setLogsId] = useState<string | null>(null)
+  // The settings panel (APPS.md "Secrets"), per app id like the logs.
+  const [settingsId, setSettingsId] = useState<string | null>(null)
+  const [previewIds, setPreviewIds] = useState<Set<string>>(() => new Set())
+  // "Delete app and its data": the slug typed back, on the active tab only.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [deleteTyped, setDeleteTyped] = useState('')
+  const togglePreview = (id: string) => setPreviewIds((prev) => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
   const dragIdRef = useRef<string | null>(null)
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
@@ -68,12 +176,31 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
   const active = list.find((a) => a.id === activeId) ?? list[0] ?? null
   const activeKey = active?.id ?? ''
 
+  const selectTab = (id: string) => {
+    setActiveId(id)
+    setArmedId(null)
+    setConfirmUnpinId(null)
+    setConfirmRollbackId(null)
+  }
+  const runRollback = (a: PinnedApp) => {
+    setConfirmRollbackId(null)
+    const left = a.release ?? 0
+    rollback.mutate(a.id, {
+      onSuccess: (r) => setRollbackNotice({ appId: a.id, text: rollbackNoticeText(a, left, r), error: false }),
+      onError: (e) => setRollbackNotice({ appId: a.id, text: (e as Error).message, error: true }),
+    })
+  }
+
   // A pin from the agent registers a NEW row without touching the list cache
-  // — any file_updated under an apps/ path refreshes the registry view.
+  // — any file_updated under an apps/ path refreshes the registry view. A
+  // folder app never writes one file: its deploy frame does the same.
   useEffect(() => onFileUpdate((u) => {
     if (u.agent_slug === agent && /(^|\/)apps\/[^/]+\.html$/.test(u.rel_path)) {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
     }
+  }), [agent, qc])
+  useEffect(() => onAppDeployed(() => {
+    qc.invalidateQueries({ queryKey: ['apps', agent] })
   }), [agent, qc])
 
   // Fade edges (ScopeChips): recompute on scroll/resize/list change.
@@ -107,9 +234,6 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
       chip.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
     }
   }, [activeKey])
-
-  // Tab switch shows a fresh document at scroll 0 — snap the ✕ back.
-  useEffect(() => { setFrameScrollY(0) }, [activeKey])
 
   const applyOrder = (ids: string[]) => {
     // Optimistic tab order; the server renumbers within each scope group and
@@ -159,10 +283,34 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
     if (longPressRef.current) { clearTimeout(longPressRef.current); longPressRef.current = null }
   }
 
+  // Menu actions on a row. Hide-for-me is reversible from the "+N hidden"
+  // chip, so it acts at once; unpin goes through the confirm block.
+  const hideRow = (a: PinnedApp) => {
+    setConfirmUnpinId(null)
+    setActiveId(null)
+    hideForMe.mutate(a.id)
+  }
+  const menuFor = (a: PinnedApp, onChip: boolean) => (
+    <AppMenu
+      app={a}
+      onChip={onChip}
+      onHideForMe={a.scope === 'shared' || a.granted ? () => hideRow(a) : undefined}
+      onUnpin={a.can_manage ? () => setConfirmUnpinId(a.id) : undefined}
+      onShare={a.can_manage ? () => setShareId(a.id) : undefined}
+      onRollback={a.can_manage ? () => { setConfirmUnpinId(null); setConfirmRollbackId(a.id) } : undefined}
+      onLogs={appKind(a).mayServe && a.can_manage ? () => setLogsId(a.id) : undefined}
+      onSettings={appKind(a).hasSettings && a.can_manage ? () => setSettingsId(a.id) : undefined}
+      onTogglePreview={appKind(a).hasPreviewBuild && a.can_manage ? () => togglePreview(a.id) : undefined}
+      previewing={previewIds.has(a.id)}
+      onDelete={appKind(a).deletable && a.can_manage ? () => { setDeleteTyped(''); setConfirmDeleteId(a.id) } : undefined}
+    />
+  )
+  const shareTarget = shareId ? (apps ?? []).find((a) => a.id === shareId) ?? null : null
+
   if (isLoading) {
     return (
       <div className="flex flex-1 items-center justify-center bg-p-bg pt-16 text-sm text-p-text-light">
-        Loading mini-apps…
+        Loading apps…
       </div>
     )
   }
@@ -177,7 +325,7 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
           <rect x="13.25" y="13.25" width="7" height="7" rx="1.5" />
         </svg>
         <p className="text-sm font-medium text-p-text-secondary">
-          {hiddenList.length ? 'All shared apps are hidden' : 'No mini-apps pinned yet'}
+          {hiddenList.length ? 'All shared apps are hidden' : 'No apps pinned yet'}
         </p>
         {hiddenList.length ? (
           <div className="flex flex-wrap items-center justify-center gap-1.5">
@@ -194,8 +342,8 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
           </div>
         ) : (
           <p className="max-w-sm text-xs text-p-text-light">
-            Ask the agent to pin one — e.g. “pin a morning-brief dashboard as a
-            mini-app” — and it appears here for every visit, refreshed by tasks.
+            Ask the agent to pin one — e.g. “pin a morning-brief dashboard as an
+            app” — and it appears here for every visit, refreshed by tasks.
           </p>
         )}
       </div>
@@ -204,14 +352,8 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
 
   const needsApproval = appNeedsApproval(active)
   const confirmTarget = confirmUnpinId && active?.id === confirmUnpinId ? active : null
+  const rollbackTarget = confirmRollbackId && active?.id === confirmRollbackId ? active : null
   const stripVisible = list.length > 1 || hiddenList.length > 0
-  // With the strip hidden, the lone app's removal entry point moves to a
-  // small overlay ✕ on the frame — REQUIRED for shared rows: the agent has
-  // no per-user hide path (unpin_app is personal-own or shared-for-everyone
-  // only), so without it a viewer could never park a team dashboard off
-  // their own strip (S2).
-  const soloRemovable =
-    !stripVisible && !!active && (active.can_manage || active.scope === 'shared')
 
   return (
     <div className={`flex flex-1 min-h-0 flex-col bg-p-bg ${topPadding ? 'pt-14' : 'pt-1'}`}>
@@ -219,11 +361,10 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
           Hidden with a SINGLE visible app — personal OR shared alike
           (operator call, 2026-08-15): the common shape is one agent
           dashboard, and the front-page auto-open shows it clean, no tab
-          chrome. Removal moves to the overlay ✕ (same confirm block; shared
-          rows keep the S2 hide-for-me / unpin-for-everyone split). The
-          strip returns the moment a second app is pinned — and stays
-          whenever hidden apps exist: the "+N hidden" restore chips have no
-          other home. */}
+          chrome. The menu moves to the frame's corner then. The strip
+          returns the moment a second app is pinned — and stays whenever
+          hidden apps exist: the "+N hidden" restore chips have no other
+          home. */}
       {stripVisible && (
       <div className="relative border-b border-p-border-light/60">
         <div
@@ -236,7 +377,12 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
             const armed = armedId === a.id
             const pending = a.actions.length > 0 && (!a.actions_approved || a.approval_stale)
             const purple = a.scope === 'shared'
-            const chipClass = purple
+            // Teal: another user's personal app shared with this viewer.
+            const chipClass = a.granted
+              ? isActive
+                ? 'bg-p-accent-teal text-white border-p-accent-teal'
+                : 'bg-p-accent-teal/10 text-p-accent-teal border-p-accent-teal/30 hover:bg-p-accent-teal/20'
+              : purple
               ? isActive
                 ? 'bg-p-accent-purple text-white border-p-accent-purple'
                 : 'bg-p-accent-purple/10 text-p-accent-purple border-p-accent-purple/30 hover:bg-p-accent-purple/20'
@@ -252,8 +398,8 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
                     aria-label="Move left"
                   >‹</button>
                 )}
-                {/* div+role, not <button>: the active chip nests the unpin
-                    X (interactive elements can't nest). */}
+                {/* div+role, not <button>: the active chip nests the menu
+                    button (interactive elements can't nest). */}
                 <div
                   ref={isActive ? activeChipRef : undefined}
                   role="button"
@@ -265,14 +411,14 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
                   onTouchStart={(e) => startLongPress(a.id, e)}
                   onTouchMove={(e) => cancelLongPress(e)}
                   onTouchEnd={() => cancelLongPress()}
-                  onClick={() => { setActiveId(a.id); setArmedId(null); setConfirmUnpinId(null) }}
+                  onClick={() => selectTab(a.id)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault()
-                      setActiveId(a.id); setArmedId(null); setConfirmUnpinId(null)
+                      selectTab(a.id)
                     }
                   }}
-                  title={purple ? `${a.title || a.slug} (shared)` : `${a.title || a.slug} (personal)`}
+                  title={a.granted ? `${a.title || a.slug} (shared with you)` : purple ? `${a.title || a.slug} (shared)` : `${a.title || a.slug} (personal)`}
                   className={`flex cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs font-medium transition-colors ${chipClass}`}
                 >
                   {a.title || a.slug}
@@ -280,19 +426,7 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
                     <span className={`h-1.5 w-1.5 rounded-full ${isActive ? 'bg-white' : 'bg-amber-500'}`}
                           title="Actions pending approval" />
                   )}
-                  {isActive && (a.can_manage || a.scope === 'shared') && (
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setConfirmUnpinId(a.id) }}
-                      title={a.scope === 'shared' && !a.can_manage
-                        ? 'Hide this app from my strip' : 'Remove this app'}
-                      aria-label={`Remove ${a.title || a.slug}`}
-                      className="-mr-1 rounded-full p-0.5 text-white/70 transition-colors hover:bg-white/20 hover:text-white"
-                    >
-                      <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                    </button>
-                  )}
+                  {isActive && menuFor(a, true)}
                 </div>
                 {armed && (
                   <button
@@ -335,48 +469,32 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
       </div>
       )}
 
-      {/* Removal confirmation — always names its target; the X sits on the
-          active chip (or the solo-app frame overlay when the strip is
-          hidden), and a tab switch cancels the pending confirm. Shared rows
-          split (S2): "Hide for me" parks it off THIS user's strip only (any
-          role); "Unpin for everyone" is the team-wide soft-unpin (editor+,
-          can_manage). Personal rows keep the single unpin. */}
+      {/* Unpin confirmation — always names its target; reached from the
+          menu's Unpin, and a tab switch cancels the pending confirm. The
+          team-wide soft-unpin is editor+ (can_manage); personal rows keep
+          the single unpin. */}
       {confirmTarget && (
         <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs">
           <span className="text-p-text">
             {confirmTarget.scope === 'shared'
-              ? `Remove “${confirmTarget.title || confirmTarget.slug}”? Hiding
-                 affects only your strip. Restore it anytime from the “hidden”
-                 chip, or ask your agents to pin it back later.`
+              ? `Unpin “${confirmTarget.title || confirmTarget.slug}” for everyone?
+                 The workspace file and the approved actions are kept — ask
+                 the agent to pin it back anytime.`
               : `Unpin “${confirmTarget.title || confirmTarget.slug}”? The
                  workspace file and the approved actions are kept — ask the
                  agent to pin it back anytime.`}
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            {confirmTarget.scope === 'shared' && (
-              <button
-                onClick={() => {
-                  setConfirmUnpinId(null)
-                  setActiveId(null)
-                  hideForMe.mutate(confirmTarget.id)
-                }}
-                className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
-              >
-                Hide for me
-              </button>
-            )}
-            {(confirmTarget.scope !== 'shared' || confirmTarget.can_manage) && (
-              <button
-                onClick={() => {
-                  setConfirmUnpinId(null)
-                  setActiveId(null)
-                  unpin.mutate(confirmTarget.id)
-                }}
-                className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
-              >
-                {confirmTarget.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
-              </button>
-            )}
+            <button
+              onClick={() => {
+                setConfirmUnpinId(null)
+                setActiveId(null)
+                unpin.mutate(confirmTarget.id)
+              }}
+              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
+            >
+              {confirmTarget.scope === 'shared' ? 'Unpin for everyone' : 'Unpin'}
+            </button>
             <button
               onClick={() => setConfirmUnpinId(null)}
               className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
@@ -387,51 +505,95 @@ export default function AppsOverlay({ agent, onSendPrompt, topPadding = true }: 
         </div>
       )}
 
-      {/* Declared-actions approval card (shared with the Dock) */}
+      {rollbackTarget && (
+        <RollbackConfirm
+          app={rollbackTarget}
+          busy={rollback.isPending}
+          onConfirm={() => runRollback(rollbackTarget)}
+          onCancel={() => setConfirmRollbackId(null)}
+        />
+      )}
+      {active && rollbackNotice?.appId === active.id && (
+        <RollbackNotice notice={rollbackNotice} onClose={() => setRollbackNotice(null)} />
+      )}
+
+      {active && confirmDeleteId === active.id && (
+        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/5 px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
+          <span className="text-p-text">
+            Delete “{active.title || active.slug}” with its data? The app, its releases and its
+            database are removed for good; the folder goes to the recover bin. Type <code className="font-mono">{active.slug}</code> to confirm.
+          </span>
+          <input
+            value={deleteTyped}
+            onChange={(e) => setDeleteTyped(e.target.value)}
+            placeholder={active.slug}
+            aria-label="Type the app's slug to confirm"
+            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono text-p-text"
+          />
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              disabled={deleteTyped.trim().toLowerCase() !== active.slug || purge.isPending}
+              onClick={() => { const id = active.id; setConfirmDeleteId(null); setActiveId(null); purge.mutate({ appId: id, confirm: deleteTyped.trim() }) }}
+              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+            >
+              Delete app and its data
+            </button>
+            <button
+              onClick={() => setConfirmDeleteId(null)}
+              className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Declared-actions approval card (shared with the Dock); a folder
+          app's pending release takes the slot instead. */}
+      {active?.deploy_state === DEPLOY_STATE.PENDING && (
+        <AppDeployCard key={`deploy-${active.id}`} app={active} agent={agent} />
+      )}
       {needsApproval && active && (
         <AppApprovalCard key={active.id} app={active} agent={agent} />
       )}
+      {active && logsId === active.id && (
+        <AppLogsPanel key={`logs-${active.id}`} app={active} onClose={() => setLogsId(null)} />
+      )}
+      {active && settingsId === active.id && (
+        <AppSettingsPanel key={`settings-${active.id}`} app={active} agent={agent} onClose={() => setSettingsId(null)} />
+      )}
 
-      {/* The app itself. `isolate` caps the internal z-layers (✕ over the
-          openurl chip) inside this subtree — without it the ✕'s z-20 ties
-          with the absolute TopBar's z-20 and DOM order painted it OVER the
-          notifications panel (whose z-50 lives INSIDE the TopBar's
-          context). `overflow-hidden` clips the ✕ as it slides away. */}
-      <div className="relative isolate overflow-hidden flex-1 min-h-0 p-2">
+      {/* The app itself. `isolate` caps the internal z-layers (the corner
+          menu's button over the openurl chip) inside this subtree — without
+          it that z ties with the absolute TopBar's z-20 and DOM order paints
+          it OVER the notifications panel (whose z-50 lives INSIDE the
+          TopBar's context). The menu's PANEL is portaled to the body and
+          closes on any press outside it, so it never shares a moment with
+          the notifications panel. */}
+      <div className="relative isolate flex-1 min-h-0 p-2">
+        {/* Keyed by the app: a tab switch mounts a fresh frame. A reused
+            instance kept the first tab's closures (its message handler is
+            registered once), so a folder app opened after a file app never
+            got its viewer token (found live on the internal install). */}
         {active && (
           <AppFrame
+            key={active.id}
             app={active}
             agent={agent}
             onSendPrompt={onSendPrompt}
-            onScrollY={setFrameScrollY}
+            preview={previewIds.has(active.id)}
           />
         )}
-        {/* Solo-app overlay ✕ — small, semi-transparent, INSIDE the frame's
-            top-right corner (no reserved chrome height). z-20 clears the
-            frame's own overlays (openurl consent chip is z-10). Opens the
-            same confirm block as the chip ✕. Anchored to the DOCUMENT's
-            top-right: the shim reports the app's scroll offset and the ✕
-            slides away with the content (no transition — it must track the
-            finger), going inert once mostly gone. */}
-        {soloRemovable && !confirmTarget && active && (
-          <button
-            onClick={() => setConfirmUnpinId(active.id)}
-            title={active.scope === 'shared' && !active.can_manage
-              ? 'Hide this app from my strip' : 'Remove this app'}
-            aria-label={`Remove ${active.title || active.slug}`}
-            style={{
-              transform: `translateY(${-Math.min(frameScrollY, 96)}px)`,
-              opacity: Math.max(0, 1 - frameScrollY / 56),
-              pointerEvents: frameScrollY > 40 ? 'none' : 'auto',
-            }}
-            className="absolute top-3.5 right-3.5 z-20 flex h-6 w-6 items-center justify-center rounded-full border border-p-border-light bg-p-bg/70 text-p-text-light backdrop-blur-sm transition-colors hover:bg-p-surface-hover hover:text-p-text"
-          >
-            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
+        {/* Solo app: no strip, so the menu sits in the frame's top-right
+            corner (small, translucent; z-20 clears the frame's own overlays
+            — the openurl chip is z-10). */}
+        {!stripVisible && active && (
+          <div className="absolute top-3.5 right-3.5 z-20">
+            {menuFor(active, false)}
+          </div>
         )}
       </div>
+      {shareTarget && <SharePopover app={shareTarget} onClose={() => setShareId(null)} />}
     </div>
   )
 }

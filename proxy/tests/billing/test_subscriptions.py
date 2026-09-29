@@ -26,21 +26,21 @@ import pytest
 
 class TestPKCE:
     def test_generate_pkce_returns_tuple(self):
-        from auth.claude_oauth import generate_pkce
+        from core.layers.cli.oauth import generate_pkce
 
         verifier, challenge = generate_pkce()
         assert isinstance(verifier, str)
         assert isinstance(challenge, str)
 
     def test_verifier_length(self):
-        from auth.claude_oauth import generate_pkce
+        from core.layers.cli.oauth import generate_pkce
 
         verifier, _ = generate_pkce()
         # 32 bytes base64url-encoded = 43 chars (no padding)
         assert len(verifier) == 43
 
     def test_challenge_is_s256_of_verifier(self):
-        from auth.claude_oauth import generate_pkce
+        from core.layers.cli.oauth import generate_pkce
 
         verifier, challenge = generate_pkce()
         expected_hash = hashlib.sha256(verifier.encode()).digest()
@@ -48,7 +48,7 @@ class TestPKCE:
         assert challenge == expected
 
     def test_unique_per_call(self):
-        from auth.claude_oauth import generate_pkce
+        from core.layers.cli.oauth import generate_pkce
 
         v1, c1 = generate_pkce()
         v2, c2 = generate_pkce()
@@ -56,7 +56,7 @@ class TestPKCE:
         assert c1 != c2
 
     def test_build_auth_url_contains_required_params(self):
-        from auth.claude_oauth import build_auth_url, CLIENT_ID
+        from core.layers.cli.oauth import build_auth_url, CLIENT_ID
 
         url = build_auth_url("test-challenge", "test-state")
         assert "platform.claude.com/oauth/authorize" in url
@@ -67,14 +67,14 @@ class TestPKCE:
         assert "state=test-state" in url
 
     def test_build_auth_url_encodes_redirect_uri(self):
-        from auth.claude_oauth import build_auth_url
+        from core.layers.cli.oauth import build_auth_url
 
         url = build_auth_url("c", "s")
         # redirect_uri should be URL-encoded
         assert "redirect_uri=https%3A%2F%2F" in url
 
     def test_build_auth_url_encodes_scopes(self):
-        from auth.claude_oauth import build_auth_url
+        from core.layers.cli.oauth import build_auth_url
 
         url = build_auth_url("c", "s")
         # Scopes should be encoded (spaces as +)
@@ -88,7 +88,7 @@ class TestPKCE:
 
 class TestTokenExchange:
     def test_exchange_success(self):
-        from auth.claude_oauth import exchange_code
+        from core.layers.cli.oauth import exchange_code
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -108,7 +108,7 @@ class TestTokenExchange:
             assert result["subscriptionType"] == "max"
 
     def test_exchange_failure_raises(self):
-        from auth.claude_oauth import exchange_code
+        from core.layers.cli.oauth import exchange_code
 
         mock_resp = MagicMock()
         mock_resp.status_code = 400
@@ -120,7 +120,7 @@ class TestTokenExchange:
                 exchange_code("bad-code", "verifier")
 
     def test_exchange_sends_correct_headers(self):
-        from auth.claude_oauth import exchange_code
+        from core.layers.cli.oauth import exchange_code
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -135,7 +135,7 @@ class TestTokenExchange:
             assert headers["Content-Type"] == "application/json"
 
     def test_exchange_sends_json_body(self):
-        from auth.claude_oauth import exchange_code
+        from core.layers.cli.oauth import exchange_code
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -1336,14 +1336,14 @@ class TestTokenRefresh:
         written = mock_store.update_credential_data.call_args.args[1]["oauth_token"]
         assert abs(written["refreshTokenExpiresAt"] - (time.time() + 3600) * 1000) < 5000
 
-    def test_claude_file_blob_passes_grant_expiry_when_present(self):
-        from services.engines.subscription_pool import _claude_file_blob
+    def test_credentials_file_passes_grant_expiry_when_present(self):
+        from core.layers.cli.oauth import credentials_file
 
-        with_field = _claude_file_blob({
-            "accessToken": "at", "expiresAt": 1, "refreshTokenExpiresAt": 123456,
-        })
+        with_field = credentials_file(
+            "at", 1, {"oauth_token": {"refreshTokenExpiresAt": 123456}},
+        )["claudeAiOauth"]
         assert with_field["refreshTokenExpiresAt"] == 123456
-        without = _claude_file_blob({"accessToken": "at", "expiresAt": 1})
+        without = credentials_file("at", 1, {"oauth_token": {}})["claudeAiOauth"]
         # Absent (not zero) — a 0 would read as an epoch-expired login.
         assert "refreshTokenExpiresAt" not in without
 
@@ -1532,7 +1532,7 @@ class TestSelectionRebind:
         from services.engines import token_fanout as tf
         pool.bind_session(sid, sub_id, layer="claude-code-cli", user_sub=scope_sub)
         tf.register_session_target(
-            sid, tf.CredentialFileTarget(kind="claude", host_dir=str(host_dir)))
+            sid, tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(host_dir)))
 
     def test_bind_records_ctx_and_release_pops_it(self):
         from services.engines import subscription_pool as pool
@@ -1687,7 +1687,7 @@ class TestSelectionRebind:
         store.list_personal.return_value = []
         pool.bind_session("s1", "A")  # legacy bind, no ctx
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="claude", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(tmp_path)))
 
         assert pool.rebind_delisted_sessions() == 0
         assert pool.get_session_subscription("s1") == "A"
@@ -1731,7 +1731,7 @@ class TestSelectionRebind:
         store.get_credential_data.return_value = cred
         pool.bind_session("s1", "A", layer="codex-cli", user_sub="u1")
         tf.register_session_target(
-            "s1", tf.CredentialFileTarget(kind="codex", host_dir=str(tmp_path)))
+            "s1", tf.CredentialFileTarget(layer="codex-cli", host_dir=str(tmp_path)))
 
         assert pool.rebind_delisted_sessions() == 1
         assert pool.get_session_subscription("s1") == "B"
@@ -1752,7 +1752,7 @@ class TestSelectionRebind:
         store.get_credential_data.return_value = self._fresh_oauth_cred("tok-b")
         self._bind_claude_session("s1", "A", "u1", tmp_path)
 
-        def fake_fan_out(sids, *, claude_blob, codex_auth, on_written, **kw):
+        def fake_fan_out(sids, *, layer, payload, on_written, **kw):
             with pool._session_maps_lock:  # session dies just before the write
                 pool._session_subscriptions.pop("s1")
             for sid in sids:

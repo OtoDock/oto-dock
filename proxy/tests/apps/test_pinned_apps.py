@@ -1,4 +1,4 @@
-"""Pinned mini-apps: pin/unpin/list hooks + cookie-authed serve route +
+"""Pinned apps: pin/unpin/list hooks + cookie-authed serve route +
 CRUD/approval/exec endpoints + registry cleanup.
 
 The security-load-bearing assertions live here: the fixed slug-derived save
@@ -24,6 +24,7 @@ from api.apps import manifest as _mf
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
+from auth.session_token import create_session_token
 from core.session import session_state
 from storage import database as task_store
 
@@ -32,6 +33,9 @@ client = TestClient(app)
 SID = "sess-app-1"
 SID_SHARED = "sess-app-shared"
 AGENT = "apps-agent"
+# A session token, as the MCP sidecars send: a body past 64 KB with a bearer
+# that does not verify is refused before the route runs.
+_BEARER = {"Authorization": f"Bearer {create_session_token(SID, AGENT, '')}"}
 
 
 def _user(sub: str = "alice-sub", role: str = "member",
@@ -95,16 +99,16 @@ def _set_username(sub: str, username: str) -> None:
 
 def _pin(payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.pins.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match_async"):
         return client.post("/v1/hooks/apps/pin", json=payload,
-                           headers={"Authorization": "Bearer dummy"})
+                           headers=_BEARER)
 
 
 def _hook(op: str, payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.pins.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match_async"):
         return client.post(f"/v1/hooks/apps/{op}", json=payload,
-                           headers={"Authorization": "Bearer dummy"})
+                           headers=_BEARER)
 
 
 def _mk_task(task_type: str = "trigger", scope: str = "agent",
@@ -265,6 +269,44 @@ def test_pin_cap_per_scope(agent_tree, monkeypatch):
     assert _pin({"slug": "s1", "html": "<p>s</p>"}, sid=SID_SHARED).status_code == 200
 
 
+def test_a_single_file_pin_never_lands_on_a_folder_app(agent_tree):
+    # A folder app's row serves a release tree: an html pin on its slug
+    # would cut a single-file release into that tree and break the app.
+    row = task_store.upsert_app(AGENT, "alice", "alice-sub", "board", title="Board",
+                                rel_path="users/alice/workspace/apps/board", kind="folder")
+    r = _pin({"slug": "board", "html": "<p>over</p>"})
+    assert r.status_code == 400 and "folder app" in r.json()["detail"], r.text
+    after = task_store.get_app(row["id"])
+    assert after["kind"] == "folder" and after["rel_path"] == "users/alice/workspace/apps/board"
+    assert not (agent_tree / "users/alice/workspace/apps/board.html").exists()
+
+
+def test_a_session_reaches_the_apps_of_its_own_agent_only(agent_tree):
+    # A session's bearer resolves to its user, who may belong to other
+    # agents: the app routes still answer it for its own agent alone, as
+    # the app API does (a prompt must not press another agent's buttons).
+    shared = _pin({"slug": "team", "html": "<p>t</p>"}, sid=SID_SHARED).json()["app_id"]
+    mine = _pin({"slug": "mine", "html": "<p>m</p>", "visibility": "user"}).json()["app_id"]
+
+    def session(agent: str, role: str = "member") -> UserContext:
+        return UserContext(sub="alice-sub", email="alice@test.com", name="alice", role=role,
+                           agents=[AGENT, "other-agent"],
+                           agent_roles={AGENT: "manager", "other-agent": "manager"},
+                           is_api_key=True, session_id="s-x", agent=agent)
+
+    for app_id in (shared, mine):
+        _as(session("other-agent"))
+        assert client.get(f"/v1/apps/{app_id}").status_code == 404
+        assert client.get(f"/v1/apps/{app_id}/state").status_code == 404
+        _as(session("other-agent", role="admin"))
+        assert client.get(f"/v1/apps/{app_id}").status_code == 404
+        _as(session(AGENT))
+        assert client.get(f"/v1/apps/{app_id}").status_code == 200
+    # The person at the keyboard still reaches both.
+    _as(_user())
+    assert client.get(f"/v1/apps/{shared}").status_code == 200
+
+
 def test_make_default_renumbers_within_scope_only(agent_tree):
     a = _pin({"slug": "a", "html": "<p>a</p>"}).json()["app_id"]
     b = _pin({"slug": "b", "html": "<p>b</p>"}).json()["app_id"]
@@ -316,7 +358,7 @@ def test_serve_app_wraps_with_app_runtime(agent_tree):
 
 
 def test_serve_app_full_document_gets_runtime_injected(agent_tree):
-    # Full-document mini-apps keep their own markup but the byte-static
+    # Full-document apps keep their own markup but the byte-static
     # runtime (incl. the APP action extension) lands before </body> — a
     # full-document app otherwise silently loses actions, feeds and links.
     doc = "<!doctype html><html><body>raw</body></html>"
@@ -360,9 +402,37 @@ def test_serve_shared_app_any_agent_user(agent_tree):
 def test_serve_app_missing_file(agent_tree):
     app_id = _pin({"slug": "brief", "html": "<p>x</p>"}).json()["app_id"]
     (agent_tree / "users/alice/workspace/apps/brief.html").unlink()
+    # The release copy made at pin time keeps serving without the working
+    # file (APPS.md "Releases and rollback")...
+    r = client.get(f"/v1/apps/{app_id}/html")
+    assert r.status_code == 200 and "<p>x</p>" in r.text
+    # ...and only with that gone too is the app really missing.
+    (agent_tree / task_store.get_app(app_id)["release_path"]).unlink()
     r = client.get(f"/v1/apps/{app_id}/html")
     assert r.status_code == 404 and "deleted from the workspace" in r.text
     _csp_ok(r)
+
+
+def test_a_file_apps_working_file_is_never_read_through_a_link(agent_tree, tmp_path):
+    """D2-N1: a single-file app's working copy (the owner's preview, a row
+    with no release) and its release cut are only ever read from a regular
+    file inside the agent's tree; a link there serves the placeholder and a
+    pin without html refuses to cut it."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET-CONTENT")
+    app_id = _pin({"slug": "brief", "html": "<p>x</p>"}).json()["app_id"]
+    working = agent_tree / "users/alice/workspace/apps/brief.html"
+    working.unlink()
+    working.symlink_to(secret)
+    r = client.get(f"/v1/apps/{app_id}/html", params={"preview": 1})
+    assert r.status_code == 404 and "SECRET-CONTENT" not in r.text, r.text
+    assert "not a regular file" in r.text
+    _csp_ok(r)
+    task_store.clear_app_release(app_id)
+    r = client.get(f"/v1/apps/{app_id}/html")
+    assert r.status_code == 404 and "SECRET-CONTENT" not in r.text
+    r = _pin({"slug": "brief", "html": ""})
+    assert r.status_code == 400 and "SECRET-CONTENT" not in r.text, r.text
 
 
 # ───────────────────────── CRUD: list / approve / exec ──────────────────────
@@ -431,6 +501,40 @@ def test_approve_requires_task_run_authority(agent_tree):
     _as(_user(sub="bob-sub", agent_roles={AGENT: "viewer"}))
     r = client.post(f"/v1/apps/{app_id}/approve", json={"sig": listed["actions_sig"]})
     assert r.status_code == 403
+
+
+def test_approve_is_human_only(agent_tree):
+    """The session JWT every sandbox holds resolves to its owner's real
+    role, so on the role alone an editor-owned agent session could pin a
+    manifest and approve it itself. Every bearer principal gets 403 — the
+    owner's own session token, a no-user agent session, the master key —
+    and the approval stays unset until the human cookie approves."""
+    trig = _mk_task("trigger", scope="agent", created_by="alice-sub")
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [
+        {"id": "go", "label": "Go", "type": "fire_task", "task_id": trig},
+    ]}, sid=SID_SHARED).json()["app_id"]
+    sig = client.get(f"/v1/apps?agent={AGENT}").json()["apps"][0]["actions_sig"]
+
+    bearers = [
+        # alice's own session token: same sub, same manager role, bearer.
+        UserContext(sub="alice-sub", email="alice@test.com", name="alice",
+                    role="member", agents=[AGENT], agent_roles={AGENT: "manager"},
+                    is_api_key=True, session_id=SID_SHARED, agent=AGENT),
+        UserContext(sub=f"session:{SID_SHARED}", email="session@internal",
+                    name="Session Token", role="agent", is_api_key=True,
+                    session_id=SID_SHARED, agent=AGENT),
+        UserContext(sub="api-key", email="api@internal", name="API Key",
+                    role="admin", is_api_key=True),
+    ]
+    for principal in bearers:
+        _as(principal)
+        r = client.post(f"/v1/apps/{app_id}/approve", json={"sig": sig})
+        assert r.status_code == 403, principal.sub
+        assert not task_store.app_actions_approved(task_store.get_app(app_id))
+
+    _as(_user())
+    assert client.post(f"/v1/apps/{app_id}/approve", json={"sig": sig}).status_code == 200
+    assert task_store.app_actions_approved(task_store.get_app(app_id))
 
 
 def _approve(app_id: str) -> None:
@@ -1078,3 +1182,242 @@ def test_hide_rows_cascade_on_hard_delete(agent_tree):
             (app_id,),
         ).fetchone()["c"]
     assert n == 0
+
+
+# ───────────────────────── batch / warm / single read ───────────────────────
+
+
+def _batch(app_id: str, calls: list[dict]) -> tuple[int, list[dict]]:
+    r = client.post(f"/v1/apps/{app_id}/actions/batch", json={"calls": calls})
+    if r.status_code != 200:
+        return r.status_code, []
+    return 200, [__import__("json").loads(line) for line in r.text.splitlines() if line]
+
+
+def test_batch_shape_validation(agent_tree):
+    app_id = _pin({"slug": "b", "html": "<p>x</p>"}).json()["app_id"]
+    assert _batch(app_id, [])[0] == 400
+    assert _batch(app_id, [{"call_id": str(i), "action_id": "x"}
+                           for i in range(17)])[0] == 400
+    assert _batch(app_id, [{"call_id": "a", "action_id": "x"},
+                           {"call_id": "a", "action_id": "y"}])[0] == 400
+    assert _batch(app_id, [{"call_id": "", "action_id": "x"}])[0] == 400
+    assert client.post(f"/v1/apps/{uuid.uuid4()}/actions/batch",
+                       json={"calls": [{"call_id": "a", "action_id": "x"}]}).status_code == 404
+
+
+def test_batch_streams_one_line_per_call_with_per_entry_refusals(
+        agent_tree, fake_mcps, monkeypatch):
+    """A refusal never fails the batch: each entry is its own line with the
+    single route's status and reason; one fire_task per batch; unknown ids,
+    chat-delivered prompts and stale approval are all per-entry."""
+    trig = _mk_task("trigger", scope="agent", created_by="alice-sub")
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [
+        {"id": "go", "label": "Go", "type": "fire_task", "task_id": trig},
+        {"id": "ask", "label": "Ask", "type": "send_prompt", "prompt": "hi"},
+        _mcp_action(),
+    ]}, sid=SID_SHARED).json()["app_id"]
+
+    async def fake_exec(row, action, merged):
+        return {"status": "done", "result": f"out:{merged['text']}"}
+
+    async def fake_trigger(task_def, **kw):
+        return "run-7"
+
+    monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", fake_exec)
+    from services.scheduler import scheduler
+    monkeypatch.setattr(scheduler, "trigger_task_now", fake_trigger)
+
+    # Unapproved: the batch is accepted, every entry is denied 409.
+    code, lines = _batch(app_id, [{"call_id": "c1", "action_id": "run",
+                                   "args": {"text": "a"}}])
+    assert code == 200
+    assert lines == [{"call_id": "c1", "action_id": "run", "status": "denied",
+                      "reason": "Actions not approved", "code": 409}]
+    _approve(app_id)
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+
+    code, lines = _batch(app_id, [
+        {"call_id": "t1", "action_id": "run", "args": {"text": "a"}},
+        {"call_id": "t2", "action_id": "run", "args": {"text": "b"}},
+        {"call_id": "f1", "action_id": "go"},
+        {"call_id": "f2", "action_id": "go"},
+        {"call_id": "p1", "action_id": "ask"},
+        {"call_id": "u1", "action_id": "nope"},
+    ])
+    assert code == 200
+    by_id = {line["call_id"]: line for line in lines}
+    assert set(by_id) == {"t1", "t2", "f1", "f2", "p1", "u1"}
+    assert by_id["t1"] == {"call_id": "t1", "action_id": "run",
+                           "status": "done", "result": "out:a"}
+    assert by_id["t2"]["result"] == "out:b"
+    assert by_id["f1"] == {"call_id": "f1", "action_id": "go",
+                           "status": "ok", "run_id": "run-7"}
+    assert by_id["f2"]["status"] == "denied" and by_id["f2"]["code"] == 429
+    assert "per batch" in by_id["f2"]["reason"]
+    assert by_id["p1"]["status"] == "denied" and by_id["p1"]["code"] == 400
+    assert by_id["u1"]["status"] == "denied" and by_id["u1"]["code"] == 404
+
+    # A second batch inside the window → 429 for the batch itself.
+    assert _batch(app_id, [{"call_id": "x", "action_id": "run",
+                            "args": {"text": "c"}}])[0] == 429
+
+
+def test_batch_entries_run_concurrently(agent_tree, fake_mcps, monkeypatch):
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [_mcp_action()]},
+                  sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+    import asyncio as _aio
+    gate = {"started": 0}
+
+    async def slow_exec(row, action, merged):
+        gate["started"] += 1
+        # Both entries must have started before either finishes.
+        for _ in range(50):
+            if gate["started"] >= 2:
+                break
+            await _aio.sleep(0.02)
+        return {"status": "done", "result": str(gate["started"])}
+
+    monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", slow_exec)
+    code, lines = _batch(app_id, [
+        {"call_id": "1", "action_id": "run", "args": {"text": "a"}},
+        {"call_id": "2", "action_id": "run", "args": {"text": "b"}},
+    ])
+    assert code == 200 and all(line["result"] == "2" for line in lines)
+
+
+def test_a_batch_entry_that_raises_is_its_own_line(agent_tree, fake_mcps, monkeypatch):
+    # Every call gets exactly one line: an unexpected failure in one entry
+    # answers that entry and never ends the stream on its siblings.
+    app_id = _pin({"slug": "b", "html": "<p>x</p>", "actions": [_mcp_action()]},
+                  sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+    from api.apps import apps as apps_api
+    apps_api._fire_rate.clear()
+
+    async def flaky_exec(row, action, merged):
+        if merged["text"] == "boom":
+            raise RuntimeError("tool manager fell over")
+        return {"status": "done", "result": merged["text"]}
+
+    monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", flaky_exec)
+    code, lines = _batch(app_id, [
+        {"call_id": "1", "action_id": "run", "args": {"text": "boom"}},
+        {"call_id": "2", "action_id": "run", "args": {"text": "fine"}},
+    ])
+    by_id = {line["call_id"]: line for line in lines}
+    assert code == 200 and set(by_id) == {"1", "2"}, lines
+    assert by_id["1"]["status"] == "denied" and by_id["1"]["code"] == 500
+    assert by_id["2"] == {"call_id": "2", "action_id": "run", "status": "done", "result": "fine"}
+
+
+def test_warm_endpoint(agent_tree, fake_mcps, monkeypatch):
+    warmed = []
+
+    async def fake_warm(row):
+        warmed.append(row["id"])
+        return True
+
+    monkeypatch.setattr("services.apps.headless_exec.warm", fake_warm)
+
+    # No tool buttons → nothing to build.
+    plain = _pin({"slug": "p", "html": "<p>x</p>"}).json()["app_id"]
+    assert client.post(f"/v1/apps/{plain}/warm").status_code == 204
+
+    app_id = _pin({"slug": "m", "html": "<p>x</p>", "actions": [_mcp_action()]},
+                  sid=SID_SHARED).json()["app_id"]
+    # Unapproved → nothing to build either.
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 204
+    _approve(app_id)
+    r = client.post(f"/v1/apps/{app_id}/warm")
+    assert r.status_code == 202
+    # The build is scheduled on the app's loop; give it a moment to run.
+    import time as _t
+    for _ in range(50):
+        if warmed:
+            break
+        _t.sleep(0.02)
+    assert warmed == [app_id]
+    # Asked again inside the window → 204, no second build.
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 204
+    assert warmed == [app_id]
+
+    # A viewer of the agent may warm a shared app; a stranger gets 404.
+    task_store.upsert_user("bob-sub", "bob@test.com", "Bob", "member")
+    _as(_user(sub="bob-sub", agent_roles={AGENT: "viewer"}))
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 202
+    _as(_user(sub="eve-sub", agents=(), agent_roles={}))
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 404
+
+
+def test_warm_endpoint_on_a_freshly_booted_host(agent_tree, fake_mcps, monkeypatch):
+    # The monotonic clock starts at boot: a key never seen must not read as
+    # "fired at zero", or the first warm after a reboot is refused for the
+    # whole interval (CI runners are minutes old when the suite reaches here).
+    from types import SimpleNamespace
+    from api.apps import apps as apps_api
+    monkeypatch.setattr(apps_api, "time", SimpleNamespace(monotonic=lambda: 12.0))
+
+    async def fake_warm(row):
+        return True
+
+    monkeypatch.setattr("services.apps.headless_exec.warm", fake_warm)
+    app_id = _pin({"slug": "m", "html": "<p>x</p>", "actions": [_mcp_action()]},
+                  sid=SID_SHARED).json()["app_id"]
+    _approve(app_id)
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 202
+    assert client.post(f"/v1/apps/{app_id}/warm").status_code == 204   # asked recently
+
+
+def test_read_single_app(agent_tree):
+    app_id = _pin({"slug": "mine", "html": "<p>m</p>", "title": "Mine"}).json()["app_id"]
+    r = client.get(f"/v1/apps/{app_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == app_id and body["agent"] == AGENT and body["chat_id"] == ""
+    assert body["scope"] == "personal" and body["title"] == "Mine"
+    for key in ("actions", "actions_sig", "actions_approved", "can_manage"):
+        assert key in body
+    # Another member never sees alice's personal app: same 404 as missing.
+    task_store.upsert_user("bob-sub", "bob@test.com", "Bob", "member")
+    _as(_user(sub="bob-sub", agent_roles={AGENT: "viewer"}))
+    assert client.get(f"/v1/apps/{app_id}").status_code == 404
+    assert client.get(f"/v1/apps/{uuid.uuid4()}").status_code == 404
+    _as(_user())
+    task_store.set_app_hidden(app_id, True)
+    assert client.get(f"/v1/apps/{app_id}").status_code == 404
+
+
+def test_pin_shared_contributor_human_rejected(agent_tree):
+    """A contributor writes the shared workspace, but a shared dashboard acts
+    as the agent (like an agent-scope task): the editor tier stays the bar,
+    on the shared mount and for an explicit team visibility alike."""
+    sid = "sid-contributor-shared"
+    session_state.set_session_security(sid, SecurityContext(
+        role="contributor", username="alice", agent=AGENT, is_admin_agent=False,
+        session_scope="agent"))
+    try:
+        r = _pin({"slug": "team-c", "html": "<p>t</p>"}, sid=sid)
+        assert r.status_code == 403
+        assert "editor or manager" in r.json()["detail"]
+        # An editor+ pins the team dashboard; the contributor cannot remove it.
+        assert _pin({"slug": "team", "html": "<p>t</p>"}, sid=SID_SHARED).status_code == 200
+        assert _hook("unpin", {"slug": "team"}, sid=sid).status_code == 403
+    finally:
+        session_state._session_security.pop(sid, None)
+    sid = "sid-contributor-vis"
+    session_state.set_session_security(sid, SecurityContext(
+        role="contributor", username="alice", agent=AGENT, is_admin_agent=False))
+    try:
+        r = _pin({"slug": "team-cv", "html": "<p>t</p>", "visibility": "agent"}, sid=sid)
+        assert r.status_code == 403
+        # Their pins default to themselves.
+        r = _pin({"slug": "mine-c", "html": "<p>m</p>"}, sid=sid)
+        assert r.status_code == 200
+        assert r.json()["path"] == "/users/alice/workspace/apps/mine-c.html"
+    finally:
+        session_state._session_security.pop(sid, None)

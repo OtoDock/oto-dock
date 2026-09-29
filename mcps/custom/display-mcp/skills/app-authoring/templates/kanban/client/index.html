@@ -1,0 +1,96 @@
+<script src="/ui-kit/tailwind.js"></script>
+<div class="px-1 py-2">
+  <div class="mb-3 flex flex-wrap items-center gap-2">
+    <!-- No <form>: the frame is sandboxed without allow-forms, so a form
+         submit is blocked before any script runs. Enter and the button are
+         handled in script instead. -->
+    <div id="add" class="flex flex-1 gap-2">
+      <input id="title" class="flex-1 rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="New card…" maxlength="200">
+      <button class="btn primary" type="button" id="add-btn">Add</button>
+    </div>
+    <span id="status" class="text-xs text-[var(--p-text-secondary)]">Connecting…</span>
+  </div>
+  <div id="board" class="grid grid-cols-1 gap-3 md:grid-cols-3"></div>
+</div>
+<script>
+(function () {
+  var COLUMNS = [["todo", "To do"], ["doing", "Doing"], ["done", "Done"]];
+  var board = document.getElementById("board");
+  var status = document.getElementById("status");
+  var cards = [];
+
+  function render() {
+    board.replaceChildren();
+    COLUMNS.forEach(function (c) {
+      var col = document.createElement("section");
+      col.className = "card min-h-40 p-2";
+      col.dataset.col = c[0];
+      var h = document.createElement("h3");
+      h.className = "mb-2 text-sm font-semibold";
+      h.textContent = c[1] + " (" + cards.filter(function (k) { return k.col === c[0]; }).length + ")";
+      col.appendChild(h);
+      cards.filter(function (k) { return k.col === c[0]; }).forEach(function (k) {
+        var el = document.createElement("div");
+        el.className = "mb-2 cursor-grab rounded-lg border border-[var(--p-border-light)] bg-[var(--p-bg)] p-2 text-sm";
+        el.draggable = true;
+        el.dataset.id = k.id;
+        el.innerHTML = '<div class="font-medium"></div><div class="mt-1 text-[11px] text-[var(--p-text-secondary)]"></div>';
+        el.firstChild.textContent = k.title;
+        el.lastChild.textContent = "moved by " + (k.moved_by || "—");
+        el.addEventListener("dragstart", function (e) { e.dataTransfer.setData("text/plain", String(k.id)); });
+        var del = document.createElement("button");
+        del.className = "mt-1 text-[11px] text-[var(--p-text-light)] hover:text-red-500";
+        del.textContent = "remove";
+        del.onclick = function () { api("/cards/" + k.id, { method: "DELETE" }); };
+        el.appendChild(del);
+        col.appendChild(el);
+      });
+      col.addEventListener("dragover", function (e) { e.preventDefault(); });
+      col.addEventListener("drop", function (e) {
+        e.preventDefault();
+        var id = e.dataTransfer.getData("text/plain");
+        if (!id) return;
+        var pos = cards.filter(function (k) { return k.col === c[0]; }).length + 1;
+        api("/cards/" + id + "/move", { method: "POST", body: JSON.stringify({ col: c[0], position: pos }) });
+      });
+      board.appendChild(col);
+    });
+  }
+
+  function api(path, init) {
+    init = init || {};
+    init.headers = Object.assign({ "content-type": "application/json" }, init.headers || {});
+    return otodock.fetch(path, init).then(function (r) {
+      if (!r.ok) status.textContent = "The server answered " + r.status;
+      return r;
+    }).catch(function () { status.textContent = "Could not reach the app's server"; });
+  }
+
+  function addCard() {
+    var input = document.getElementById("title");
+    var title = input.value.trim();
+    if (!title) return;
+    input.value = "";
+    api("/cards", { method: "POST", body: JSON.stringify({ title: title, col: "todo" }) });
+  }
+  document.getElementById("add-btn").addEventListener("click", addCard);
+  document.getElementById("title").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); addCard(); }
+  });
+
+  // Live: the server pushes the whole board on every change.
+  var ws = otodock.ws("/live");
+  ws.onopen = function () { status.textContent = "Live"; };
+  ws.onclose = function () { status.textContent = "Reconnecting…"; };
+  ws.onmessage = function (ev) {
+    try {
+      var msg = JSON.parse(ev.data);
+      if (msg.type === "cards") { cards = msg.cards || []; render(); }
+    } catch (err) {}
+  };
+  api("/cards").then(function (r) { return r && r.ok ? r.json() : null; }).then(function (d) {
+    if (d) { cards = d.cards || []; render(); }
+  });
+  render();
+})();
+</script>

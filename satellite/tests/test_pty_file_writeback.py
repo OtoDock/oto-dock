@@ -76,8 +76,6 @@ async def test_platform_push_never_echoes_back(tmp_path):
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=tmp_path / "agents",
         mcps_dir=tmp_path / "mcps",
-        claude_bin="claude",
-        codex_bin="codex",
     )
     sat_config.agents_dir.mkdir(parents=True)
     sm = SessionManager(sat_config)

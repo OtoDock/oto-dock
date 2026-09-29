@@ -21,7 +21,14 @@ from core.events.common_events import (
     PLAN_MODE, SYSTEM, METADATA, DONE, ERROR,
     TODO_UPDATE, CONTEXT_COMPACT,
 )
-from core.execution_layer import ExecutionLayer, AgentConfig, LayerCapabilities
+from core import placement
+from core.execution_layer import (
+    AgentConfig, AuthProfile, BehaviourProfile, CredentialFileSpec, EngineIdentity,
+    ExecutionLayer, LayerCapabilities, ModelPolicy, OAuthRefresh, RuntimeProfile,
+    SubscriptionHandle, UsageProfile, WindowSpec, Windows,
+)
+from core.layers.cli import oauth as claude_oauth
+from core.layers.cli import usage as claude_usage
 from core.layers.cli.helpers import ClaudeStreamChunk
 from core.layers.cli.session import (
     PersistentSession,
@@ -30,8 +37,8 @@ from core.layers.cli.session import (
     interrupt_persistent_session, _persistent_sessions,
 )
 import config as app_config
-from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS
 from core.session.external_identity import external_home_of, is_external_ctx
+from core import layout
 from core.session.session_state import (
     _record_session_use,
     cleanup_session_permission_state, register_session_state,
@@ -94,7 +101,6 @@ async def _interrupt_watchdog(session: PersistentSession, armed_seq: int) -> Non
 # Credential dir writeback
 # ---------------------------------------------------------------------------
 
-from core.credentials.credential_writeback import writeback_credential_dirs as _writeback_credential_dirs
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +238,95 @@ _CLI_CAPABILITIES = LayerCapabilities(
     compression_threshold_pct=83,
     mcp_delivery="external_config",
     mcp_config_format="json",
+    providers=[
+        # `claude --effort` takes the platform ladder as is (session.py
+        # _build_persistent_cmd); xhigh only on the models whose row says so,
+        # else the CLI gets max.
+        {"id": "anthropic", "label": "Anthropic", "requires_key": True,
+         "kind": "vendor", "relay_path": "", "api_path": "",
+         "effort_scale": ["low", "medium", "high", "xhigh", "max"],
+         "effort_per_model": ["xhigh"]},
+    ],
+    identity=EngineIdentity(
+        short_name="claude",
+        vendor_id="anthropic",
+        vendor_label="Anthropic",
+        account_label="Claude",
+        role="coding",
+        sort_order=10,
+    ),
+    runtime=RuntimeProfile(
+        has_os_process=True,                  # one `claude -p` process per session
+        hard_abort_kills_process=True,        # SIGTERM the process group; the session goes cli_dead
+        supports_remote_execution=True,
+        supports_interactive_pty=True,        # the native Ink TUI under a PTY
+        interactive_first_prompt_via_argv=False,   # cold prompt is a PTY write + Enter
+        supports_reattach_after_restart=True, # Mode C: a satellite keeps the in-flight turn
+        binary="claude",
+        pin_key="claude_code",                # cli_pins wire key — frozen
+        config_dir_name=".claude",            # CLAUDE_CONFIG_DIR under the session's scope root
+        self_wakes=True,                      # ≥ 2.1.243 runs a turn of its own after a bg completion
+        event_queue_depth=1000,               # a remote session's proxy-side event queue
+        interactive_submit_backstop=True,     # the Ink TUI under ConPTY swallows the first Enter
+        installed_name="claude-code",         # installed_clis wire value — frozen
+    ),
+    behaviour=BehaviourProfile(
+        rebuilds_history_from_db=False,       # the CLI owns its JSONL history (--resume)
+        attach_images_inline=False,           # photos ride as sandbox paths its Read tool opens
+        phone_http_mcps=True,
+        skills_delivery="materialized_dir",   # the Skill tool indexes .claude/skills/
+        supports_bash=True,
+        supports_plans_dir=True,              # ~/.claude/plans/ (EnterPlanMode)
+        builtin_file_tools=False,             # its own Read/Write/Edit, not the platform's
+        has_shell_on_external_route=True,     # the hook floor, the argv and the settings deny carve the shell tools off per session
+        provider_pinned_per_session=False,    # single provider
+        supports_steer=True,                  # user frame into the live turn's stdin
+        supports_compact=False,               # stream-json runs no /compact (tested on 2.1.201)
+        supports_interrupt_for_queued=True,   # control_request {interrupt}
+        # The CLI's own tool names, by role — Claude's ARE the platform's
+        # canonical names (core/events/tool_roles), so canonical_tool_name is
+        # identity here. The shell and write rows are what an external
+        # session and a judge session may not have (two layers: the hook
+        # floor by role and --disallowedTools; never the scope's shared
+        # settings.json, see config_dir.build_settings).
+        tools={
+            "shell": ("Bash", "Monitor", "PowerShell"),
+            "read": ("Read",),
+            "glob": ("Glob",),
+            "search": ("Grep",),
+            "write": ("Write", "Edit", "MultiEdit", "NotebookEdit"),
+            "web_fetch": ("WebFetch",),
+            "web_search": ("WebSearch",),
+            "subagent": ("Agent", "Task"),
+            "todo": ("TodoWrite", "TodoRead"),
+            "task_read": ("TaskGet", "TaskList", "TaskOutput"),
+            "task_write": ("TaskCreate", "TaskUpdate", "TaskStop"),
+            "discovery": ("ToolSearch",),
+            "skill": ("Skill",),
+            "workflow": ("Workflow",),
+            "plan_enter": ("EnterPlanMode",),
+            "plan_exit": ("ExitPlanMode",),
+            "question": ("AskUserQuestion",),
+        },
+        question_tool_holds_turn=False,       # headless: the platform denies AskUserQuestion, shows the card; the answer is the next message
+    ),
+    model_policy=ModelPolicy(
+        default_model="claude-opus-5-5",      # tier 2: the frontier model is a deliberate choice
+        model_filter_policy="none",           # a personal Claude account sees every builtin
+        pricing_editable=False,               # registry-priced; the vendor bills the subscription
+    ),
+    auth=AuthProfile(
+        auth_types=("oauth", "api_key"),      # a Claude login, or an Anthropic key
+        credential_file=CredentialFileSpec(   # the satellite clamp's row — frozen
+            wire_kind="claude", dirname=".claude", filename=".credentials.json",
+        ),
+        oauth_flow="code_paste",              # the popup shows a code the user pastes back
+    ),
+    usage=UsageProfile(windows=(
+        # Anthropic's consumer windows, as /api/oauth/usage names them.
+        WindowSpec(key="five_hour", length_s=5 * 3600, role="session", label="session"),
+        WindowSpec(key="seven_day", length_s=7 * 86400, role="quota", label="weekly"),
+    )),
 )
 
 
@@ -277,6 +372,10 @@ class CLIExecutionLayer(ExecutionLayer):
                 f"'{config.agent_name}' without a sandbox dir — local agents "
                 f"must run sandboxed + network-isolated."
             )
+        # Below the editor tier a session never runs from the agent's own CLI
+        # state (its sandbox masks it: the CLI would start with no hooks).
+        from core.sandbox.session_config_dir import refuse_session_on_agent_state
+        refuse_session_on_agent_state(config.security_context)
         mcp_path = Path(config.mcp_config_path) if config.mcp_config_path else None
 
         # Build sandbox (every local CLI session is sandboxed — guarded above)
@@ -296,7 +395,7 @@ class CLIExecutionLayer(ExecutionLayer):
         # LOCAL bwrap mount path, so satellite_only device MCPs must never
         # appear — they run native on the satellite.
         mcp_mounts: list[SandboxMount] = []
-        assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, is_remote=False) or []
+        assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []
         for manifest in assigned_mcps:
             for m in getattr(manifest, "sandbox_mounts", []):
                 # Resolve the ${mcp_dir} template in the host path. The host
@@ -328,12 +427,16 @@ class CLIExecutionLayer(ExecutionLayer):
             # their own tree at /caller when the route gave them one.
             external=is_external_ctx(ctx),
             external_home=external_home_of(ctx),
+            read_only=bool(getattr(ctx, "read_only", False)),
         )
         sandbox_builder = SandboxBuilder(sandbox_cfg)
         # External sessions never get a shell — the CLI argv is one of the
-        # three layers (hook floor + settings deny are the others;
-        # auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS).
-        disallowed_tools = list(EXTERNAL_DENIED_CLI_TOOLS) if is_external_ctx(ctx) else None
+        # two layers (the hook floor by role is the other; the names are
+        # this engine's ``behaviour.tools``). A judge session (CHECKS.md)
+        # gets no write tools the same two ways.
+        disallowed_tools = self.session_denied_tools(
+            external=is_external_ctx(ctx), read_only=bool(getattr(ctx, "read_only", False)),
+        ) or None
 
         # Get the sandbox-internal .claude/ path from env overrides
         sandbox_claude_dir = sandbox_builder.get_env_overrides().get(
@@ -344,13 +447,22 @@ class CLIExecutionLayer(ExecutionLayer):
         # scope config dir (CLAUDE_CONFIG_DIR). The CLI re-reads this file
         # (mtime-watch + 401-recovery), which is what lets the pool rotate the
         # token under a LIVE process — env delivery is frozen at exec and
-        # outranks the file, so the blob must never reach the child env (pop).
-        creds_blob_json = extra_env.pop("_CLAUDE_CREDS_BLOB", "")
-        if creds_blob_json:
-            from services.engines.token_fanout import write_claude_credentials_file
-            write_claude_credentials_file(
-                Path(config.sandbox_host_claude_dir), json.loads(creds_blob_json),
+        # outranks the file, so the payload must never reach the child env
+        # (credential_file_from_env pops it).
+        credentials = self.credential_file_from_env(extra_env)
+        if credentials is not None:
+            from services.engines.token_fanout import write_credential_file
+            write_credential_file(
+                Path(config.sandbox_host_claude_dir),
+                self.capabilities.auth.credential_file.filename, credentials,
             )
+
+        # OAuth token files for the stdio MCPs that read one: delivered in
+        # the MCP's secret bundle (the tree's copy is masked out of the
+        # sandbox), so this precedes the config preparation that keys the
+        # fetch tokens on the bundles.
+        from core.credentials.credential_files import attach_token_files
+        await asyncio.to_thread(attach_token_files, config)
 
         # Copy MCP config into .claude/ dir (avoids mounting proxy/sessions/)
         if mcp_path:
@@ -367,17 +479,14 @@ class CLIExecutionLayer(ExecutionLayer):
         # SSH keys into <.claude>/ssh so the prompt's ready-to-run
         # `ssh -i "$OTO_SSH_KEY_DIR/…"` lines work from bash. Independent
         # of mcp_path — ssh-hosts emits no mcpServers entry, so it may be
-        # the session's ONLY MCP with no config file at all.
-        # Never for an EXTERNAL session (a phone caller who is not a platform
-        # user): ssh-hosts is not attached there, and key material must not
-        # be materialised into a tree a caller's session can reach.
-        from core.sandbox.session_config_dir import (
-            materialize_ssh_keys_for_sandbox,
+        # the session's ONLY MCP with no config file at all. A session that
+        # takes no keys is left none from an earlier one (the helper's rule).
+        from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
+        ssh_dir = provision_ssh_keys_for_sandbox(
+            ctx, config.agent_name, config.sandbox_host_claude_dir, sandbox_claude_dir,
         )
-        if not is_external_ctx(ctx) and materialize_ssh_keys_for_sandbox(
-            config.agent_name, config.sandbox_host_claude_dir,
-        ):
-            extra_env["OTO_SSH_KEY_DIR"] = f"{sandbox_claude_dir}/ssh"
+        if ssh_dir:
+            extra_env["OTO_SSH_KEY_DIR"] = ssh_dir
 
         # If resume is requested and session was used before, set up _sessions
         # so get_or_create uses --resume
@@ -439,7 +548,8 @@ class CLIExecutionLayer(ExecutionLayer):
                 user_sub=config.user_sub,
                 role=(getattr(ctx, "role", "") or ""),
                 username=(getattr(ctx, "username", "") or ""),
-                target=config.execution_target or "local",
+                target=config.execution_target or placement.LOCAL,
+                execution_path=self.capabilities.name,
                 tui_theme=config.interactive_theme or "dark",
                 # Claude pre-fills the cold prompt but does NOT auto-submit it
                 # (verified: `claude "<prompt>"` only pre-fills); interactive_session
@@ -480,26 +590,130 @@ class CLIExecutionLayer(ExecutionLayer):
                 session_id, config.subscription_id,
                 layer="claude-code-cli", user_sub=config.subscription_user_sub,
                 scope_key=credential_scope_key(
-                    config.execution_target or "local",
+                    config.execution_target or placement.LOCAL,
                     config.sandbox_host_claude_dir,
                 ),
             )
             # Rotation fan-out target — only sessions with a credential FILE
             # register (API-key sessions have nothing to rewrite).
-            if creds_blob_json:
+            if credentials is not None:
                 from services.engines import token_fanout
                 token_fanout.register_session_target(
                     session_id,
                     token_fanout.CredentialFileTarget(
-                        kind="claude",
+                        layer=self.capabilities.name,
                         host_dir=config.sandbox_host_claude_dir,
                     ),
                 )
 
-    async def send_message(
+    def pinned_cli_version(self) -> str:
+        return app_config.PINNED_CLAUDE_CODE_VERSION
+
+    def cli_binary_path(self) -> str:
+        return app_config.CLAUDE_BIN
+
+    def session_denied_tools(self, *, external: bool, read_only: bool) -> list[str]:
+        """The CLI tools a session may not have, from the descriptor: the
+        shell tools of an external caller (a phone caller who is not a
+        platform user), the write tools of a check's judge: the argv's list
+        (the hook floor refuses the same by role)."""
+        tools = self.capabilities.behaviour.tools
+        denied: list[str] = []
+        if external:
+            denied.extend(tools.get("shell", ()))
+        if read_only:
+            denied.extend(tools.get("write", ()))
+        return list(dict.fromkeys(denied))
+
+    def prepare_config_dir(
+        self, agent_name: str, *, username: str = "", scope: str = "user",
+        external_home=None, no_shell: bool = False, read_only: bool = False,
+    ) -> Path:
+        """The ``.claude`` dir: settings.json, the hook scripts, the skills
+        dir. ``no_shell`` and ``read_only`` are not written here: the dir is
+        the scope's, shared by every session of it and reloaded live by the
+        CLI, so a session's own denials ride its argv
+        (``session_denied_tools``) and the hook floor. The builder
+        (``core/layers/cli/config_dir``) is reached through its module at
+        call time (tests patch it there)."""
+        from core.layers.cli import config_dir as _cd
+        extra: dict = {}
+        if external_home:
+            extra["external_home"] = external_home
+        return _cd.ensure_persistent_claude_dir(
+            agent_name, username=username, scope=scope, **extra)
+
+    def chat_session_files(self, home: Path, session_id: str, resume_handle: str) -> list[Path]:
+        """The session JSONL of one chat: ``<home>/.claude/projects/*/<sid>.jsonl``
+        (every project dir — the munged-cwd name varies, and
+        satellite-migrated copies sit in local homes too) plus the legacy
+        pre-sandbox location under the proxy's own home. The caller keeps
+        the id-shape and liveness guards."""
+        if not session_id:
+            return []
+        files = list((home / ".claude" / "projects").glob(f"*/{session_id}.jsonl"))
+        legacy = (Path.home() / ".claude" / "projects"
+                  / str(app_config.AGENTS_DIR).replace("/", "-") / f"{session_id}.jsonl")
+        if legacy.is_file():
+            files.append(legacy)
+        return files
+
+    def iter_session_files(self, home: Path):
+        for f in (home / ".claude" / "projects").glob("*/*.jsonl"):
+            yield f, f.stem
+
+    # --- Credentials -------------------------------------------------------
+
+    #: The env entry the pool's login payload rides in from the config builder
+    #: to ``start_session`` (popped there — it never reaches the child).
+    _CREDENTIALS_ENV = "_CLAUDE_CREDS_BLOB"
+
+    def subscription_env(self, handle: SubscriptionHandle) -> dict[str, str]:
+        env: dict[str, str] = {}
+        if handle.api_key:
+            env["ANTHROPIC_API_KEY"] = handle.api_key
+        if handle.oauth_access_token:
+            payload = self.credential_file_payload(
+                handle.oauth_access_token, handle.oauth_expires_at_ms, handle.credential,
+            )
+            if payload is not None:
+                env[self._CREDENTIALS_ENV] = json.dumps(payload)
+        return env
+
+    def credential_file_payload(
+        self, access_token: str, expires_at_ms: int, stored: dict,
+    ) -> dict | None:
+        return claude_oauth.credentials_file(access_token, expires_at_ms, stored)
+
+    def credential_file_from_env(self, env: dict) -> dict | None:
+        raw = env.pop(self._CREDENTIALS_ENV, "")
+        return json.loads(raw) if raw else None
+
+    def refresh_oauth(self, refresh_token: str, stored: dict) -> OAuthRefresh:
+        return claude_oauth.refresh(refresh_token, stored)
+
+    # --- Usage windows -----------------------------------------------------
+
+    def _window_specs(self) -> dict[str, WindowSpec]:
+        return {s.key: s for s in self.capabilities.usage.windows}
+
+    def usage_request(self, stored: dict) -> tuple[str, dict] | None:
+        return claude_usage.usage_request(stored)
+
+    def parse_usage(self, payload) -> Windows | None:
+        return claude_usage.from_usage(payload, self._window_specs())
+
+    def usage_scope_key(self, model: str) -> str:
+        return claude_usage.model_family(model)
+
+    def record_usage_event(self, session_id: str, payload) -> None:
+        claude_usage.record_event_async(session_id, payload)
+
+    async def _send_turn(
         self, session_id: str, message: str, **kwargs,
     ) -> AsyncIterator[CommonEvent]:
-        """Send message and yield CommonEvents translated from CLI chunks.
+        """One turn: send the message, yield CommonEvents translated from
+        CLI chunks (``send_message`` on the base wraps the turn-end loop).
 
         Kwargs:
             inject_time: bool — prepend current datetime to message
@@ -548,6 +762,21 @@ class CLIExecutionLayer(ExecutionLayer):
         await interrupt_persistent_session(session_id)
         return False
 
+    async def steer(self, session_id: str, text: str) -> bool:
+        """Mid-turn steering for a headless Claude session: the user frame
+        goes into the live turn's stdin (see PersistentSession.steer). Refused
+        while the turn is parked on a permission card or a question — the
+        card is the question, and a typed message keeps the auto-deny plus
+        queue path — so the caller falls back to the queue."""
+        session = _persistent_sessions.get(session_id)
+        if session is None or not session.is_alive:
+            return False
+        from core.events.stream_pump import _pending_permissions
+        from core.session.session_state import has_pending_question
+        if _pending_permissions.get(session_id) or has_pending_question(session_id):
+            return False
+        return await session.steer(text)
+
     async def interrupt_for_queued(self, session_id: str) -> bool:
         """Stop-and-send: graceful-ONLY interrupt for a queued typed message.
 
@@ -568,9 +797,6 @@ class CLIExecutionLayer(ExecutionLayer):
 
     async def close_session(self, session_id: str) -> None:
         """Close and remove the persistent session."""
-        # Best-effort: writeback any credential_dir files to central location
-        await _writeback_credential_dirs(session_id)
-
         await close_persistent_session(session_id)
         # Permission mode + security context: a closed session must not keep
         # a live context (the hook fails closed without one, and a session
@@ -634,7 +860,30 @@ class CLIExecutionLayer(ExecutionLayer):
     def capabilities(self) -> LayerCapabilities:
         return _CLI_CAPABILITIES
 
+    def transcript_tailer(self):
+        """The Ink TUI writes its session JSONL under
+        ``<CLAUDE_CONFIG_DIR>/projects/``; ``transcript_tailer`` persists it."""
+        from core.session import transcript_tailer
+        return transcript_tailer
+
+    _remote_adapter = None
+
+    def remote_adapter(self):
+        """This engine on a satellite — ``core/layers/cli/remote.py``
+        (imported here, not at module level: it needs this module's
+        ``cli_chunk_to_events``)."""
+        if self._remote_adapter is None:
+            from core.layers.cli.remote import ClaudeRemoteAdapter
+            self._remote_adapter = ClaudeRemoteAdapter(self)
+        return self._remote_adapter
+
     # --- Session access ---
+
+    def owns_session(self, session_id: str) -> bool:
+        return session_id in _persistent_sessions
+
+    def local_session_ids(self) -> list[str]:
+        return list(_persistent_sessions)
 
     async def get_session(self, session_id: str) -> PersistentSession | None:
         """Return the underlying PersistentSession."""
@@ -671,12 +920,6 @@ class CLIExecutionLayer(ExecutionLayer):
             return False
         return await session.drain_bg_commands(budget=budget)
 
-    async def session_self_wakes(self, session_id: str) -> bool:
-        """Claude ≥2.1.243 self-wakes after background completions — the bg
-        monitors give that wake a grace window before nudging (codex layers
-        have no such method → no grace)."""
-        return session_id in _persistent_sessions
-
     async def is_session_process_dead(self, session_id: str) -> bool:
         """Check if session exists in pool but its CLI process has died."""
         session = _persistent_sessions.get(session_id)
@@ -704,7 +947,7 @@ class CLIExecutionLayer(ExecutionLayer):
         Checks the session's persistent .claude/ dir first.  After a proxy
         restart the in-memory mapping is lost, so *agent_name* + *username*
         (or an external caller's *external_home*) are used to derive the
-        .claude/ path (same logic as ``ensure_persistent_claude_dir``).
+        .claude/ path (same logic as ``config_dir.ensure_persistent_claude_dir``).
         Falls back to ~/.claude/ for legacy pre-sandbox sessions.
         """
         from core.session.session_state import get_session_claude_dir
@@ -718,9 +961,9 @@ class CLIExecutionLayer(ExecutionLayer):
             if external_home:
                 candidate = Path(external_home) / ".claude"
             elif username:
-                candidate = agent_dir / "users" / username / ".claude"
+                candidate = layout.user_dir(agent_dir, username) / ".claude"
             else:
-                candidate = agent_dir / "workspace" / ".claude"
+                candidate = agent_dir / layout.WORKSPACE / ".claude"
             if candidate.is_dir():
                 claude_dir = str(candidate)
 

@@ -29,6 +29,7 @@ import contextlib
 import logging
 import threading
 from pathlib import Path
+from .. import config as satconfig  # the module: ``maybe_start_tray`` takes the loaded SatelliteConfig as ``config``
 
 logger = logging.getLogger("satellite")
 
@@ -202,9 +203,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
     consumer task in __main__ drains, ``config`` the SatelliteConfig (for the
     dashboard URL + log path).
     """
-    import sys
-
-    if sys.platform != "win32":
+    if not satconfig.HOST.tray:
         return None
 
     try:

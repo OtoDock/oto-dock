@@ -20,10 +20,10 @@ Platform (proxy)                    Satellite (remote machine)
 
 - **No bwrap on satellite** -- agents run as direct subprocesses on the host filesystem
 - **Dumb pipe** -- the satellite does not parse, filter, or interpret stdout. Every raw NDJSON/JSONL line is forwarded verbatim. All turn-end decisions (settle, JOB_DONE, bg-agent tracking) live on the proxy via `ClaudeCLIEventTranslator` + `SettleController`. The satellite exits its stdout read loop when the proxy sends `stop_turn` or the process EOFs.
-- **Hooks shipped with each session** -- `permission_gate.py` and `tool_result_forwarder.py` scripts are bundled into every `start_session` payload and written into the session's `.claude/` or `.codex/` dir before the CLI is spawned. Satellites never need hooks pre-deployed and always run the current proxy version. Claude sessions always run them; a Codex session runs them when trusted -- the interactive TUI by CLI flag, and (0.5.118) an unattended app-server session (task / phone / meeting / trigger) when the payload's `codex_hooks_floor` is set: `[features] hooks = true`, thread-level `bypass_hook_trust`, deny-only hook output. Attended Codex dashboard chats gate through the JSON-RPC approval bridge instead.
-- **Hooks call platform over the WS tunnel** -- at runtime, hook scripts (and Docker MCPs) hit the satellite's local `aiohttp` server at `http://127.0.0.1:<port>` (the `PROXY_URL` value injected on the satellite), which multiplexes each request back to the proxy over the same WebSocket as `http_request` frames. No separate network path, no inbound ports.
+- **Hooks shipped with each session** -- the four hook scripts (`permission_gate.py`, `tool_result_forwarder.py`, `subagent_tracker.py`, `stop_tracker.py`) are bundled into every `start_session` payload and written into the session's `.claude/` or `.codex/` dir before the CLI is spawned; the satellite's own writers name the same four events for both engines (0.5.121). Satellites never need hooks pre-deployed and always run the current proxy version. Claude sessions always run them; a Codex session runs them when trusted -- the interactive TUI by CLI flag, and (0.5.118) an unattended app-server session (task / phone / meeting / trigger) when the payload's `codex_hooks_floor` is set: `[features] hooks = true`, thread-level `bypass_hook_trust`, deny-only hook output. Attended Codex dashboard chats gate through the JSON-RPC approval bridge instead (asking for every command in the prompting modes). The matrix per engine and placement is the proxy's `docs/architecture/HOOKS.md`.
+- **Hooks call platform over the WS tunnel** -- at runtime, hook scripts (and Docker MCPs) hit the satellite's local `aiohttp` server at `http://127.0.0.1:<port>` (the `PROXY_URL` value injected on the satellite), which multiplexes each request back to the proxy over the same WebSocket as `http_request` frames. No separate network path, no inbound ports. A tunneled path with a dot segment, an encoded separator, a backslash or a NUL is refused before the allowlist runs (`_has_traversal`, a byte twin of the proxy's `auth/request_path.py`).
 - **File sync over WS** -- agent directories synced bidirectionally between platform and satellite. Generated/build dirs (cargo `target/`, gradle `build/`, NuGet `obj/`, CMake/Meson trees, ...) are excluded by the marker-confirmed sync-ignore rules the proxy ships in the auth handshake (0.5.110+; engine in `transport/file_sync.py`)
-- **Process-per-turn for Codex** -- each message spawns a new `codex exec` process (thread ID enables resume)
+- **Persistent `codex app-server` daemon for Codex** -- one JSON-RPC process per session: `thread/start` (or `thread/resume` for a persisted thread id) once, `turn/start` per message; the process-per-turn `codex exec` model is gone (see Session Types)
 - **Protocol-versioned** -- each satellite announces `satellite_version` on connect. The proxy rejects satellites below its `MIN_SATELLITE_VERSION` with a clear upgrade error.
 
 ### Package layout
@@ -32,14 +32,16 @@ Run with `python -m satellite`. Modules are grouped into subpackages by concern;
 
 | Path | Responsibility |
 |---|---|
-| `__main__.py`, `config.py` | entry point + boot guard; cross-platform helpers, `SATELLITE_VERSION`, vendored hashes |
+| `__main__.py`, `config.py` | entry point + boot guard; the host OS table (`HostOS`, `ROWS`, `HOST` bound once at import — the twin of `proxy/core/host_os.py`) and the cross-platform helpers that ask it, `SATELLITE_VERSION`, vendored hashes |
 | `transport/` | the wire — `ws_client`, `lifecycle_update` (auto-update), `http_tunnel`, `file_sync` |
-| `sessions/` | agent sessions — `session_manager`, `cli_session`, `codex_session`, `mcp_install_support`, `mcp_interceptor` |
+| `sessions/` | agent sessions — `session_manager`, `cli_session`, `codex_session`, `session_files`, `step_runner` (app steps), `mcp_install_support`, `mcp_interceptor` |
 | `terminal/` | interactive PTY + the local `otodock` CLI — `local_socket`, `otodock_cli`, `otodock_proto`, `pty_session`/`pty_session_base`, `codex_pty_session`, `pty_relay`/`winpty_relay` |
-| `host/` | host integration — `host_probe`, `satellite_policy`, `auth_paths`, `env_hygiene`, `path_translator`, `cli_versions`, `tray` |
-| `_vendored/` | byte-for-byte copies of proxy source (never edit — see [Vendored Shared Modules](#vendored-shared-modules)) |
+| `host/` | host integration — `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (the file sync's opens beneath the agents root with no link followed; the satellite's own twin of the proxy's `safe_fs`, not vendored, see proxy SAFE-FS.md "The satellite twin"), `env_hygiene`, `path_translator`, `cli_versions`, `tray` |
+| `_vendored/` | byte-for-byte copies of proxy source — `mcp_installer`, `stdio_path_interceptor`, `app_server_client`, `codex_approvals`, `terminal_queries` (the terminal query/reply strips + `MOUSE_RE` the PTY mirror and the local CLI use; 0.5.125), `layout` (the agent tree: the folder names, the per-user tree, the virtual-root translation `host_of_virtual`, and the questions the session modules ask of a relative path — `user_of`, and the scope's engine-config dir `state_dir`; 0.5.126) — never edit, see [Vendored Shared Modules](#vendored-shared-modules) |
 
-`__main__` imports only `config` (a stdlib-only leaf) at module top so the boot guard can roll back a broken auto-update **before** any subpackage import is attempted — a broken update self-heals instead of crash-looping.
+`__main__` imports only `config` (a leaf that reaches no further than the stdlib and `engines.py`) at module top so the boot guard can roll back a broken auto-update **before** any subpackage import is attempted — a broken update self-heals instead of crash-looping.
+
+Everything platform-specific is a FACT on one row — `config.HOST` (this machine's row of the table in `config.py`, the twin of `proxy/core/host_os.py`): `config.HOST.posix`, `.conpty`, `.locks_running_files`, `.service_manager`, `.case_insensitive`, `.name` … No module outside the table compares `sys.platform` (the two exceptions are named below); see [Vendored Shared Modules](#vendored-shared-modules) for why this one shared body is the one that is not vendored.
 
 ## Targeting Model
 
@@ -50,9 +52,11 @@ Two levels of remote execution targeting:
 
 Resolution priority: **user target > agent target > local**. If a user's machine is offline, falls back to the agent default (per the `remote_fallback_user_override` setting, default on — when off, the session fails with an offline error instead).
 
+On the proxy this vocabulary is `proxy/core/placement.py` (core-seams phase 7): the two remote kinds (`KIND_ADMIN_REMOTE` / `KIND_USER_REMOTE`), the pairing scopes (`PAIRING_ADMIN` / `PAIRING_USER`, `machine_is_admin_paired`) and the offline sentinel. `remote_store.resolve_execution_target` picks the target; `remote_store.placement_of` reads the machine row once into the `PlacementCapabilities` descriptor (the machine's `os`, `home_dir`, `agents_dir`, `os_user`, `allow_full_fs`, `user_dirs`, `device_grants`, `has_display` — the facts this satellite reports at auth) that every session builder carries as `SecurityContext.placement` and hands to the MCP set and the prompt as `placement=`.
+
 ## Prerequisites
 
-- Python 3.10+ (3.13 recommended; the installer provisions it where missing)
+- Python 3.10 or newer (`PYTHON_MIN_VERSION` in VERSIONS.md). The pairing installer provisions one where missing: the distro's `python3` on Linux, brew `python` on macOS, Python 3.12 via winget on Windows. Auto-update keeps whatever interpreter the venv was built on.
 - Network egress to the platform's public `wss://` endpoint (one outbound WebSocket — no inbound ports, no VPN)
 - Claude Code CLI and/or Codex CLI — the pairing installer installs these automatically, along with the rest of the dev toolchain
 
@@ -69,7 +73,7 @@ bash <(curl -sL -H "X-Pairing-Token: <token>" "https://<public-host>/v1/satellit
 
 The `/v1/satellite/bootstrap` endpoint returns a self-extracting script (bash for Linux/macOS, PowerShell for Windows). It calls `scripts/install-baseline-tools.sh` to install Tier 1 + Tier 2 dev tooling (git, gh, python+uv, node+npm+pnpm, jq, ripgrep, poppler-utils, sqlite3, etc.) and the Claude / Codex CLIs, exchanges the pairing token for the machine secret, writes config, and registers a **per-user** service (systemd user unit + `loginctl enable-linger` / launchd LaunchAgent / Windows logon Scheduled Task) — no root or SYSTEM.
 
-> **Windows gotcha — Python "App execution aliases".** On a fresh Windows 10/11 with no real Python, `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` / `python3.exe` are 0-byte Microsoft Store redirect stubs. They satisfy `Get-Command python` but, when run, print `Python was not found…` and exit `9009`. The installer is hardened against this: `install-baseline-tools.ps1` uses a real-interpreter probe (`Get-RealPythonExe`, not a bare name check) so winget actually installs Python 3.13, and `install.ps1`'s `Test-PythonVersion` runs the probe under a function-local `SilentlyContinue` so a stub degrades to "not found" instead of aborting the install under the bootstrap's `$ErrorActionPreference='Stop'`. If a run still can't find Python (e.g. a real install shadowed by the alias), the installer prints the fix: **Settings → Apps → Advanced app settings → App execution aliases → turn OFF `python.exe` and `python3.exe`**, then re-run.
+> **Windows gotcha — Python "App execution aliases".** On a fresh Windows 10/11 with no real Python, `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe` / `python3.exe` are 0-byte Microsoft Store redirect stubs. They satisfy `Get-Command python` but, when run, print `Python was not found…` and exit `9009`. The installer is hardened against this: `install-baseline-tools.ps1` uses a real-interpreter probe (`Get-RealPythonExe`, not a bare name check) so winget actually installs Python 3.12 (`Python.Python.3.12`) instead of skipping the step, and `install.ps1`'s `Test-PythonVersion` runs the probe under a function-local `SilentlyContinue` so a stub degrades to "not found" instead of aborting the install under the bootstrap's `$ErrorActionPreference='Stop'`. If a run still can't find Python (e.g. a real install shadowed by the alias), the installer prints the fix: **Settings → Apps → Advanced app settings → App execution aliases → turn OFF `python.exe` and `python3.exe`**, then re-run.
 
 ### Manual Install
 
@@ -140,11 +144,14 @@ Config file: `~/.oto-dock/satellite.conf` (INI format)
 | `[cli]` | `claude_bin` | Claude Code CLI *hint* (default: `claude`). When the platform ships CLI pins, runtime pin-verified resolution (`host/cli_versions.py`) decides what spawns — a hint that doesn't satisfy the pin loses to a binary that does. With no pin, the hint is authoritative. |
 | `[codex]` | `codex_bin` | Codex CLI hint (default: `codex`) — same resolution rules as `claude_bin` |
 
+The two hint rows are the `conf_section` / `conf_key` of the engine's row in `satellite/engines.py` (0.5.124: `SatelliteConfig.cli_bins`, read through `bin_hint(binary)`) — the keys are unchanged, and a new engine adds a row, not a field.
+
 ## Directory Structure
 
 ```
 ~/.oto-dock/
 ├── satellite.conf            # Daemon configuration
+├── steps/                    # App steps' scratch (0.5.122): one 0700 dir per running delivery — the script and its payload — removed with the run, wiped at start; never synced
 ├── agents/                   # Agent directories (synced from platform)
 │   └── {agent-slug}/
 │       ├── config/           # Agent config (platform-authoritative, push only)
@@ -188,7 +195,7 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 
 | Type | Purpose |
 |------|---------|
-| `auth` | Authentication (first message, 5s timeout). Includes `satellite_version`. |
+| `auth` | Authentication (first message, 5s timeout). Includes `satellite_version` and the `capabilities` object; among them `home_dir`, `otodock_dir` and `mcps_dir` resolved, and `home_dir_unresolved` and `otodock_dir_unresolved` as the OS names them (a link or a Windows short name left as it is). The proxy refuses the OtoDock folder under each spelling (`otodock_dir`, `otodock_dir_unresolved`, and the OtoDock folder name under either home) and the MCP folder to every session; the home folder itself is not refused. |
 | `heartbeat` | System load + active sessions + per-agent stat fingerprints (every 20s) |
 | `ack` | Command acknowledgment. Carries `results` / `installed_mcps` for `sync_mcps`; `mcps` for `sync_mcps_verify`. `file_push` acks when the proxy supplied a `command_id`. |
 | `session_event` | Raw CLI/Codex event (forwarded verbatim to ChatStreamPump) |
@@ -197,9 +204,10 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 | `turn_ended` | Stdout read loop for the current turn exited (stop_turn or EOF). Proxy yields `DONE` on receipt. |
 | `codex_thread_id` | Thread ID from Codex first turn |
 | `file_changed` | File modified during session |
-| `file_manifest` | Response to manifest request |
+| `file_manifest` | Response to manifest request: one frame, or, when the request carried `page_size` (0.5.130), pages in order with `page` and `more` (at most the clamped `page_size`, 256 to 8192 entries, and about 2 MiB of entry text each; the walk and the page sizing run off the loop). The proxy fails the wait on a page out of order, so a lost page never reads as a whole manifest. |
 | `file_content` | Response to file pull |
 | `mcp_install_progress` | Streaming progress during `sync_mcps`: `{command_id, mcp, phase, pct, message, error?}`. |
+| `step_output` | (0.5.122) What a running app step prints, as it prints it: `{command_id, delivery_id, text}`, coalesced per 4 KB / 300 ms; the verdict rides the ack (`sessions/step_runner.py`). |
 | `pty_output` / `pty_exit` | Interactive-PTY stdout bytes (base64) / child-exit, for the dashboard terminal mirror |
 | `pty_alive` | On reconnect: the live interactive-PTY `session_ids` so the proxy can reconcile (re-adopt / exit / orphan) |
 | `transcript_lines` | New CLI/Codex session-file (JSONL) lines from an interactive session → the dashboard chat |
@@ -214,7 +222,7 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 | Type | Purpose |
 |------|---------|
 | `auth_result` | Authentication response |
-| `start_session` | Spawn CLI or Codex session. Includes `hook_scripts`, `use_native_permissions` (CLI), `multi_value_envs` (`{env_var: separator}` map for joined sandbox-path-list env vars like `OTO_ALLOWED_ROOTS=":"` and `ALLOWED_FILE_DIRS=":"`), and the session's MCP `env` (manifest-declared `path_env` values + standard `OTO_*` set, all sandbox-style virtual paths). `path_translator.translate_env` rewrites virtual paths to satellite-absolute paths before subprocess spawn; for env vars listed in `multi_value_envs` it splits on the separator, translates each segment, drops empties, and rejoins. Mirror of bwrap on local. Codex payloads add `sandbox_mode`, already-mapped `effort`, `auth_json`, and (0.5.116+) `local_model_provider` — `{base_url, env_key}` for a local OpenAI-compatible endpoint, written into `config.toml` as `model_provider = "oto_local"` + `[model_providers.oto_local]` by both Codex writers; the key rides the payload `env` under the `env_key` name and the satellite host dials `base_url` as configured. 0.5.117+ adds `stream_idle_timeout_ms` (into the provider table) and `catalog_json` (written as `<CODEX_HOME>/models.json`, referenced by the root `model_catalog_json` key with its absolute path; removed when absent) so Codex defers its MCP tools on an Ollama model; the Codex MCP warm gate then waits for every configured server (90 s cap on a local model) before the `start_session` ack. |
+| `start_session` | Spawn CLI or Codex session. Includes `hook_scripts`, `use_native_permissions` (CLI), `multi_value_envs` (`{env_var: separator}` map for joined sandbox-path-list env vars like `OTO_ALLOWED_ROOTS=":"` and `ALLOWED_FILE_DIRS=":"`), and the session's MCP `env` (manifest-declared `path_env` values + standard `OTO_*` set, all sandbox-style virtual paths). `path_translator.translate_env` rewrites virtual paths to satellite-absolute paths before subprocess spawn; for env vars listed in `multi_value_envs` it splits on the separator, translates each segment, drops empties, and rejoins. Mirror of bwrap on local. Claude payloads add `disallowed_tools`, the platform-wide deny list the satellite writes into the scope's shared `settings.json` (a session's own denials never ride it; the permission gate refuses them over the tunnel). Codex payloads add `sandbox_mode`, already-mapped `effort`, `auth_json`, `permission_mode` (`judge` for a check's judge, `""` for every other session), and (0.5.116+) `local_model_provider` — `{base_url, env_key}` for a local OpenAI-compatible endpoint, written into `config.toml` as `model_provider = "oto_local"` + `[model_providers.oto_local]` by both Codex writers; the key rides the payload `env` under the `env_key` name and the satellite host dials `base_url` as configured. 0.5.117+ adds `stream_idle_timeout_ms` (into the provider table) and `catalog_json` (written as `<CODEX_HOME>/models.json`, referenced by the root `model_catalog_json` key with its absolute path; removed when absent) so Codex defers its MCP tools on an Ollama model; the Codex MCP warm gate then waits for every configured server (90 s cap on a local model) before the `start_session` ack. |
 | `send_message` | Send user message to session |
 | `stop_turn` | Exit the current stdout read loop — turn is over according to proxy's `SettleController`. Triggers `turn_ended` reply. |
 | `abort` | Interrupt running session: tree-kill for CLI (hard fallback since 0.5.89 — see `interrupt_turn`); Codex soft-interrupts its daemon turn (`turn/interrupt`, daemon + MCPs survive) — since 2026-07-09 the proxy treats that as its GRACEFUL codex path (producer stays alive for the terminal turn event; the `session_aborted` ack only triggers a proxy-side queue drain when a hard abort armed it). |
@@ -222,11 +230,13 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 | `close_session` | Clean shutdown |
 | `control_request` | Model/mode change — written to CLI stdin as `{"type":"control_request",...}`. |
 | `control_response` | Answer to a native `can_use_tool` permission prompt — written to CLI stdin as `{"type":"control_response",...}`. |
-| `request_manifest` | Request file manifest for sync |
-| `file_push` | Push file to satellite. Atomic `.partial` → fsync → rename (or append + rename on final chunk). When `command_id` is present, satellite replies with an `ack` so the proxy's `push_file()` helper can wait for the flush (write-barrier for the remote file flow). |
-| `file_pull` | Pull file from satellite (path-clamped to agent_dir). |
-| `sync_mcps` | Batched MCP install/update/remove. Includes per-MCP tarballs (gzipped base64), manifest data, source, version_hash, system_requirements. Satellite streams `mcp_install_progress` as it works. |
+| `credentials_update` | The platform's token-rotation fan-out: `{agent_slug, dir_relative, kind, content, command_id}` — rewrite one scope config dir's CLI credential file with a freshly rotated token. `kind` names the engine's row in `satellite/engines.py` (`claude` → `.claude/.credentials.json`, `codex` → `.codex/auth.json`); the target must be that engine's config dir inside the agent tree — relative, no traversal, nothing else — or the frame is refused with an ack error. These files are excluded from the file sync, so this push is their only delivery channel; the live CLIs pick the rewrite up on their own (Claude's mtime-watch / 401-recovery, Codex's guarded `auth.json` reload). No process is touched. |
+| `request_manifest` | Request file manifest for sync; an optional `page_size` asks for the answer in pages |
+| `file_push` | Push file to satellite, written beneath the agent's folder through `host/safe_fs.py` with no component followed: atomic temp → fsync → rename in the parent (or append to `<path>.partial` + rename on final chunk); a link on the way is an error. When `command_id` is present, satellite replies with an `ack` so the proxy's `push_file()` helper can wait for the flush (write-barrier for the remote file flow). |
+| `file_pull` | Pull file from satellite (path-clamped to agent_dir, then streamed from a descriptor opened beneath the agents root with no link followed). |
+| `sync_mcps` | Batched MCP install/update/remove. Includes per-MCP tarballs (gzipped base64), manifest data, source, `source_build` (the packages allowed to build from source, each checked against a plain distribution name), version_hash, system_requirements. Satellite streams `mcp_install_progress` as it works. |
 | `sync_mcps_verify` | Compute a fresh `version_hash` for every installed MCP and report in ack. Used on reconnect + before every `sync_mcps` diff. |
+| `step_run` | (0.5.122) An app step (proxy APPS.md "Steps"): the script's text and sha256, the folder to run in (relative to the synced agent folder), the environment, the payload, the timeout. `sessions/step_runner.py` writes the script and the payload into `~/.oto-dock/steps/<delivery id>/` (0700 — outside `agents/`, so the sync never sees it; wiped at start), checks the hash, runs the interpreter the script's first line names (no mode bit needed) in that folder with the curated environment plus `OTODOCK_PROXY_URL` (the loopback tunnel), `OTODOCK_STEP_PAYLOAD`, `OTODOCK_STEP_SCRIPT`, `OTODOCK_WORKSPACE_DIR` and `OTODOCK_KNOWLEDGE_DIR`, streams `step_output`, kills the tree at the timeout and when the link drops, removes the directory, and acks `{exit_code, output (first 32 KB), timed_out, seconds}` — or an error for a bad id, slug, hash, folder, bound or a duplicate delivery, and (0.5.129) for any failure before the script runs, so every step is answered. (0.5.129) The exit code is the script's own return code, not the pipe closing: its output drains for up to 5 s after it exits, then its process group is killed (POSIX), so a child it left behind neither holds the run to its timeout nor outlives it. The script runs as the satellite's own user, like every session here; only the script travels. (0.5.123) A check's script (proxy CHECKS.md) adds `payload_env` (up to four names set to the payload file's path — `OTODOCK_CHECK_INPUT`) and `cwd_absolute` (the judged session's working directory; it must exist and is refused if it is the filesystem root, inside `~/.oto-dock` — the synced agent tree included, that is the no-field branch — or an ancestor of the home directory). The same version admits the checks tool's routes `/v1/checks/{attached,attach,detach,run}` on the tunnel allowlist and makes Codex's plan collaboration mode follow a `permission_mode` the start payload names, so a judge's read-only sandbox is not plan mode; with no mode named (the proxy names one for a judge only) plan follows the live sandbox, read-only ⟺ plan, both at start and after a mode change, which carries the sandbox alone. |
 | `pty_open` | Spawn an interactive TUI under a PTY (the no-`-p` remote analogue of `start_session`); ack carries the satellite `pid` |
 | `pty_input` / `pty_resize` / `pty_close` | Interactive-PTY keystroke bytes / resize / close |
 | `pty_local_detach` | Dashboard took over a session — detach the local `otodock` terminal but keep the PTY (+ proxy mirror) alive |
@@ -238,7 +248,7 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 | `http_response` / `http_response_chunk` | Tunneled HTTP response back to the waiting subprocess |
 | `pong` | Heartbeat pong (no-op) |
 
-The `auth_result` also carries **`cli_pins`** (`{claude_code, codex}` versions the satellite reconciles its installed CLIs to) and the satellite advertises an **`interactive_pty`** capability so the proxy only drives a remote PTY on hosts that can spawn one (else it falls back to headless `-p`).
+The `auth_result` also carries **`cli_pins`** (`{claude_code, codex}` versions the satellite reconciles its installed CLIs to) and the satellite advertises an **`interactive_pty`** capability so the proxy only drives a remote PTY on hosts that can spawn one (else it falls back to headless `-p`), and a **`steps`** capability (0.5.122) so the proxy sends `step_run` only where it is handled. Since 0.5.124 the satellite also advertises **`engines`** — the wire ids of the engines it can run (`sorted(ENGINES)` from `satellite/engines.py`); the proxy refuses to start an engine the satellite does not advertise, and reads an absent value as `{claude-code-cli, codex-cli}` (every satellite before 0.5.124).
 
 ## Session Types
 
@@ -269,11 +279,11 @@ Persistent `codex app-server` JSON-RPC daemon (`sessions/codex_session.py`; the 
 
 No duplicate effort mapping or sandbox defaulting happens on the satellite — the proxy is the single source of truth (it also decides which sessions run the hook floor: `codex_hooks_floor`).
 
-**Execution path selection**: The proxy sends `execution_path` in the `start_session` command. The satellite dispatches to `CLISession` or `CodexSession` based on this field. The `execution_path` comes from `AgentConfig.execution_path` (set by the dashboard's layer selection), not from the agent's DB default.
+**Execution path selection**: The proxy sends `execution_path` in the `start_session` command. The satellite resolves it in the **`ENGINES` table** (`satellite/engines.py`, 0.5.124 — one row per engine: the wire id, its binary and `installed_clis` name, `cli_pins` key, config dir, `credentials_update` kind and file, `satellite.conf` hint key, the headless and PTY session classes by dotted path, and two behaviour facts — `turn_replay`, the Mode C per-turn tagging and retention buffer that is Claude's, and `revives_dead_process`, Codex's `run_turn` re-warming a dead daemon, so a dead daemon is not an ack error there) and instantiates the row's headless class. An id the table lacks is refused with an ack error before anything spawns — both here and in `pty_open` (which used to fall through to the Claude PTY). The same table drives the `credentials_update` clamp, the CLI pin reconcile (`host/cli_versions._PACKAGES`) and the `installed_clis` / `cli_status` / `engines` capabilities; the local `otodock` client (`terminal/otodock_cli.py`) keeps its own two-row subcommand → wire-id map, `_EXEC_PATHS`, because it runs standalone and cannot import the table. The proxy's `tests/remote/test_satellite_engine_table.py` checks every shared fact against its engine descriptors. The `execution_path` comes from `AgentConfig.execution_path` (set by the dashboard's layer selection), not from the agent's DB default.
 
 ### Interactive PTY (`pty_open`)
 
-Both Claude and Codex can also run as a **full interactive TUI** under a real PTY (no `-p`), driven from the dashboard's terminal or a local `otodock` command. `pty_open` spawns the CLI on a pseudo-terminal (`pty_relay` on Unix, `winpty_relay`/ConPTY on Windows; dispatched via `pty_session.py` / `codex_pty_session.py` on the shared `pty_session_base` spine). Raw stdout bytes stream back as base64 `pty_output` on a dedicated **lossless, backpressured lane** — a full lane pauses the PTY read instead of dropping bytes that would corrupt the xterm stream — and keystrokes arrive as `pty_input`. The CLI's own transcript file is tailed and forwarded as `transcript_lines` so the dashboard chat reflects the interactive work. On reconnect the satellite reports its live `session_ids` via `pty_alive` and the proxy reconciles (re-adopt survivors, exit the dead, reap orphans).
+Both Claude and Codex can also run as a **full interactive TUI** under a real PTY (no `-p`), driven from the dashboard's terminal or a local `otodock` command. `pty_open` resolves the frame's `execution_path` in the same `ENGINES` table and spawns the row's PTY class on a pseudo-terminal (`pty_relay` on Unix, `winpty_relay`/ConPTY on Windows; `pty_session.py` / `codex_pty_session.py` on the shared `pty_session_base` spine; an unknown id is refused with an ack error, 0.5.124). Raw stdout bytes stream back as base64 `pty_output` on a dedicated **lossless, backpressured lane** — a full lane pauses the PTY read instead of dropping bytes that would corrupt the xterm stream — and keystrokes arrive as `pty_input`. The CLI's own transcript file is tailed and forwarded as `transcript_lines` so the dashboard chat reflects the interactive work. On reconnect the satellite reports its live `session_ids` via `pty_alive` and the proxy reconciles (re-adopt survivors, exit the dead, reap orphans).
 
 ## The `otodock` CLI (local sessions)
 
@@ -306,7 +316,7 @@ Agent directories are synced between platform and satellite continuously, in rea
 
 **Phantom-event suppression**: Satellite's `apply_file_push` updates `_file_snapshot[rel_path]` post-write so the next end-of-turn `detect_changes` doesn't echo the same content back as a phantom event.
 
-**Path translation for stdio MCPs**: `path_translator.translate_env` mirrors bwrap's mapping rules — sandbox-style virtual paths in the proxy-supplied env (`/users/{u}/workspace`, `/workspace`, `/.claude`, etc.) get rewritten to satellite-absolute paths (`{agent_dir}/users/{u}/workspace`, etc.) before subprocess spawn. The literal `{session_id}` token (used for session-scoped roles like screenshots) is also expanded here.
+**Path translation for stdio MCPs**: `path_translator.translate_env` applies the agent tree's rule — `_vendored/layout.py::host_of_virtual`, the byte copy of `proxy/core/layout.py`, edited there and re-synced — to every value: sandbox-style virtual paths in the proxy-supplied env (`/users/{u}/workspace`, `/workspace`, `/.claude`, etc.) get rewritten to satellite-absolute paths (`{agent_dir}/users/{u}/workspace`, etc.) before subprocess spawn. The literal `{session_id}` token (used for session-scoped roles like screenshots) is also expanded here.
 
 For env vars listed in the `start_session` payload's `multi_value_envs` map (built proxy-side from manifest `path_env` decls + `OTO_ALLOWED_ROOTS`), the translator splits each value on its declared separator, translates each segment independently, drops empties, and rejoins. This is what makes `ALLOWED_FILE_DIRS=/users/alice:/workspace:/config` translate correctly to `{agent_dir}/users/alice:{agent_dir}/workspace:{agent_dir}/config`. Same convention as bwrap on local — MCPs see the same env values, no per-target branching needed.
 
@@ -329,7 +339,7 @@ Bump `SATELLITE_VERSION` for every satellite-side change (it drives auto-update)
 
 ## Vendored Shared Modules
 
-Four modules are byte-for-byte copies of proxy source, vendored into the satellite's `_vendored/` package so both sides share one implementation. `scripts/sync-satellite-code.sh` copies each verbatim and bakes its sha256 into a `SHARED_*_HASH` constant in `satellite/config.py`:
+Six modules are byte-for-byte copies of proxy source, vendored into the satellite's `_vendored/` package so both sides share one implementation. `scripts/sync-satellite-code.sh` copies each verbatim and bakes its sha256 into a `SHARED_*_HASH` constant in `satellite/config.py`:
 
 | Vendored copy (never edit) | Authoritative proxy source |
 |---|---|
@@ -337,9 +347,15 @@ Four modules are byte-for-byte copies of proxy source, vendored into the satelli
 | `_vendored/stdio_path_interceptor.py` | `proxy/core/stdio_path_interceptor.py` |
 | `_vendored/app_server_client.py` | `proxy/core/layers/codex/app_server_client.py` |
 | `_vendored/codex_approvals.py` | `proxy/core/layers/codex/codex_approvals.py` |
+| `_vendored/terminal_queries.py` | `proxy/core/terminal_queries.py` (the terminal query / reply strips and the mouse-report pattern the PTY mirror boundaries share; 0.5.125) |
+| `_vendored/layout.py` | `proxy/core/layout.py` (the agent tree: the folder names, the per-user tree, the sandbox-virtual roots and the rule that maps them under the satellite's agent dir — `host_of_virtual`, `user_of`, `state_dir`; 0.5.126, core-seams phase 10) |
+
+`mcp_installer.py` keeps its own `runtime` compares (`python` / `node` / `docker`): the satellite cannot import the proxy's runtime authority (`proxy/services/mcp/mcp_manifest_types.py`, core-seams phase 9), so the vendored copy carries the words, and the vocabulary gate lists both it and `sessions/mcp_install_support.py` as allowed sites. A change there is a satellite release.
+
+The host OS table is NOT vendored: `config.py` is the boot guard's leaf (`__main__.py` imports it before `_check_post_update_state` runs, so it may import nothing but the standard library and the stdlib-only sibling leaf `engines.py` (`proxy/tests/core/test_host_os.py::test_the_satellite_config_stays_a_leaf` pins that import set) — a broken vendored module would raise before the rollback could run). The table (`HostOS`, the words `LINUX` / `DARWIN` / `WINDOWS`, the rows `ROWS` / `OTHER`, `family_of`, `of`, `host_os`) is defined in `config.py` and again in `proxy/core/host_os.py`; the vocabulary gate's twin rule pins `_table`, `family_of` and `of`, and `proxy/tests/core/test_host_os.py` imports both and compares every row. Every satellite module asks a fact on `config.HOST` at call time (`config.HOST.posix`, `.conpty`, `.locks_running_files`, `.service_manager`, …) — never `from .config import HOST` (the tests patch the global with a row: `monkeypatch.setattr(config, "HOST", config.ROWS[config.WINDOWS])`). The one exception among the satellite's own modules is `terminal/otodock_cli.py`, the standalone terminal client, whose fallback import branch has no package to reach `config` from; the vendored `mcp_installer.py` keeps its own `sys.platform` reads for the reason it keeps its `runtime` words — one file serving two trees can import a leaf from neither. A module whose function binds its own `config` (the loaded `SatelliteConfig` — `__main__._main`, `host/tray.py`) imports the module as `satconfig`; the proxy's acceptance test refuses a shadowed read.
 
 ```bash
-# On the proxy machine, after touching any of the four proxy sources above:
+# On the proxy machine, after touching any of the six proxy sources above:
 ./scripts/sync-satellite-code.sh
 # …then redeploy/restart the satellite to pick up the new modules.
 ```
@@ -352,6 +368,8 @@ At startup (`__main__._verify_installer_drift`) the satellite computes the sha25
 cd satellite
 python -m pytest tests/ -v
 ```
+
+The suite runs on the host floor too (Python 3.10; CI's `satellite-floor` job): install `tomli` there (`pip install "tomli; python_version < '3.11'"`) — the tests that parse a composed `config.toml` go through `tests/_toml.py`, which takes `tomllib`, else `tomli`, else skips. `tests/test_python_floor.py` pins every site that states the floor (`VERSIONS.md`, the two installers, the baseline probe, this README's Prerequisites).
 
 ## Running as a Service
 
@@ -392,7 +410,7 @@ WantedBy=default.target
     <string>com.otodock.satellite</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>/Users/<your-user>/.oto-dock/satellite/venv/bin/python</string>
         <string>-m</string>
         <string>satellite</string>
     </array>

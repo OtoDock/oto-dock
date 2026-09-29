@@ -113,12 +113,16 @@ export function useChatMessages(args: {
     }))
   }, [])
 
-  // Drop the transient media_processing skeleton (transcode done/failed).
-  const removeMediaProcessing = useCallback(() => {
+  // Drop every transient placeholder of `kind` from the streaming bubble
+  // (a transcode skeleton once the player or the failure arrives, a
+  // generation placeholder once the generation fails); the kind comes from
+  // the artifact table's `evicts` (lib/kinds/artifact.ts), null = nothing.
+  const removePlaceholders = useCallback((kind: string | null) => {
+    if (!kind) return
     setMessages((prev) => {
       const last = prev[prev.length - 1]
       if (!last || last.role !== 'assistant') return prev
-      const blocks = last.blocks.filter((b) => b.type !== 'media_processing')
+      const blocks = last.blocks.filter((b) => b.type !== kind)
       if (blocks.length === last.blocks.length) return prev
       const updated = { ...last, blocks }
       currentMsgRef.current = updated
@@ -304,7 +308,7 @@ export function useChatMessages(args: {
     rawRowsRef, oldestLoadedIdRef, loadingOlderRef,
     hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder,
     seedDbHistory, loadOlder,
-    appendBlock, removeMediaProcessing, appendToLastTextBlock,
+    appendBlock, removePlaceholders, appendToLastTextBlock,
     updateToolBlock, updateToolBlockByName, resolvePermission,
     updateSubagentActive, updateCommandActive, ensureAssistantMsg,
     removePreviewBlocks,

@@ -66,14 +66,14 @@ def test_relay_sub_mints_via_shared_helper(store, monkeypatch):
     key, base = phone_config.direct_llm_groq_credentials()
     assert key == "MINTED"
     assert base == "https://api.otodock.io/v1/relay/groq/v1"
-    relay.assert_called_once_with("groq", "")   # system token (user_sub="")
+    relay.assert_called_once_with("direct-llm", "groq", "")   # system token (user_sub=""), the API engine's relay path
 
 
 def test_relay_unavailable_falls_back_to_empty(store, monkeypatch):
     # Relay down / no credit → mint returns None → no creds (dispatcher → Smart Turn).
     store.list_platform_pool.return_value = [_groq_sub(auth_type="relay")]
     monkeypatch.setattr(
-        "services.engines.subscription_pool.relay_llm_credentials", lambda provider, user_sub: None,
+        "services.engines.subscription_pool.relay_llm_credentials", lambda layer, provider, user_sub: None,
     )
     assert phone_config.direct_llm_groq_credentials() == ("", "")
     # configured() reflects configuration, not live availability → still True.

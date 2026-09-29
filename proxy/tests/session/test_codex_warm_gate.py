@@ -192,3 +192,28 @@ def test_mcp_server_names_from_toml():
     assert mcp_server_names_from_toml(toml) == ["task-mcp", "file.tools", "github"]
     assert mcp_server_names_from_toml("") == []
     assert mcp_server_names_from_toml("[memories]\nuse_memories = false\n") == []
+
+
+@pytest.mark.asyncio
+async def test_the_daemon_is_spawned_below_the_proxys_priority(monkeypatch):
+    """The Codex daemon (and every MCP it starts) runs niced; the
+    session's own sandbox prefix, which picks the cwd, is left untouched."""
+    from core.layers.codex import session as codex_session
+    from core.sandbox import pty_relay
+    seen = {}
+
+    class _Client:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        async def start(self, init):
+            return {}
+
+    monkeypatch.setattr(codex_session, "AppServerClient", _Client)
+    s = codex_session.CodexAppServerSession(
+        session_id="11111111-2222-4333-8444-555555555555", agent_name="a",
+        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
+        config_dir="/tmp/codex-home", sandbox_cmd_prefix=["bwrap", "--x"])
+    await s._connect_with_retry({}, None)
+    assert seen["sandbox_cmd_prefix"] == [*pty_relay.nice_prefix(), "bwrap", "--x"]
+    assert s.sandbox_cmd_prefix == ["bwrap", "--x"]

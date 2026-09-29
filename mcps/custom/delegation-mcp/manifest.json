@@ -2,7 +2,7 @@
   "name": "delegation-mcp",
   "label": "Delegation",
   "description": "Delegate work to parallel agent sessions and monitor them",
-  "version": "1.2.4",
+  "version": "1.2.7",
   "category": "core",
 
   "server": {

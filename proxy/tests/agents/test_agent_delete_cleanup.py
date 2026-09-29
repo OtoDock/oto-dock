@@ -123,6 +123,35 @@ class TestDeleteAgentCleanup:
         assert _count("file_author", "agent_slug", slug) == 0
         assert _count("recover_bin", "agent_slug", slug) == 0
 
+    def test_delete_agent_sets_its_timeouts_first(self, temp_db, monkeypatch):
+        """The teardown runs about 35 DELETEs in one transaction: it lifts
+        the pool's 300 s statement timeout (a large agent must never be cut
+        halfway) and bounds a lock wait, both LOCAL to the transaction."""
+        import contextlib
+        slug = "zz-delete-timeouts"
+        _seed_agent_with_everything(slug)
+        seen: list[str] = []
+        real_get_conn = agent_store.get_conn
+
+        @contextlib.contextmanager
+        def recording_conn():
+            with real_get_conn() as conn:
+                class _Conn:
+                    def execute(self, query, params=None, **kw):
+                        seen.append(query)
+                        return conn.execute(query, params, **kw)
+
+                    def __getattr__(self, name):
+                        return getattr(conn, name)
+                yield _Conn()
+
+        monkeypatch.setattr(agent_store, "get_conn", recording_conn)
+        assert agent_store.delete_agent(slug) is True
+        assert seen[0] == "SET LOCAL statement_timeout = '30min'"
+        assert seen[1] == "SET LOCAL lock_timeout = '60s'"
+        assert not agent_store.agent_exists(slug)
+        assert _count("task_runs", "agent", slug) == 0
+
     def test_reinstall_same_slug_has_no_stale_remote_target(self, temp_db):
         """The headline bug: a personal remote machine must NOT survive a
         delete + reinstall of the same slug."""

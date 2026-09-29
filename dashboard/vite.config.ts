@@ -42,11 +42,11 @@ function bundleAnimeIife(): Plugin {
 // `THREE`, with a curated addon set attached under THREE.* — camera controls
 // (Orbit/Map), the EffectComposer post-processing chain (bloom is the kit's
 // signature "wow" lever), fat lines, and RoundedBoxGeometry — everything a
-// mini-app needs for impressive scenes while staying inside the artifact
+// app needs for impressive scenes while staying inside the artifact
 // CSP (no loaders/workers/WASM). NEVER add examples/jsm/lines/webgpu/*
 // (it drags the whole WebGPU renderer in). The same package pin feeds BOTH
 // surfaces: the dashboard map imports `three` as ESM (tree-shaken into its
-// lazy chunk) and mini-apps load this global build — the Tailwind dual-path
+// lazy chunk) and apps load this global build — the Tailwind dual-path
 // precedent. Version bumps hit both at once.
 function bundleThreeIife(): Plugin {
   const entry = 'otodock-three-kit-entry'
@@ -100,10 +100,59 @@ function bundleThreeIife(): Plugin {
   }
 }
 
+// The external link's host page (SHARING.md "External links"): the proxy's
+// /s/<token> HTML loads dist/ui-kit/share-host.js by a stable, un-hashed
+// path (the /ui-kit/ prefix is already login-exempt), so it is built here
+// like the other kit scripts, from src/sharehost/main.ts.
+function bundleShareHostIife(): Plugin {
+  let outDir = path.resolve(__dirname, 'dist')
+  return {
+    name: 'otodock:bundle-share-host-iife',
+    apply: 'build',
+    configResolved(config) {
+      outDir = resolvedOutDir(config)
+    },
+    async closeBundle() {
+      const { rolldown } = await import('rolldown')
+      const bundle = await rolldown({ input: path.resolve(__dirname, 'src/sharehost/main.ts') })
+      await bundle.write({
+        format: 'iife',
+        file: path.join(outDir, 'ui-kit/share-host.js'),
+        minify: true,
+      })
+      await bundle.close()
+    },
+  }
+}
+
+// The widget kit (proxy APPS.md "The widget kit"): standard shapes for app
+// pages, bound to the catalog feeds through the runtime, built like the
+// share host from src/uikit/widgets.ts to a stable un-hashed kit path.
+function bundleWidgetsIife(): Plugin {
+  let outDir = path.resolve(__dirname, 'dist')
+  return {
+    name: 'otodock:bundle-widgets-iife',
+    apply: 'build',
+    configResolved(config) {
+      outDir = resolvedOutDir(config)
+    },
+    async closeBundle() {
+      const { rolldown } = await import('rolldown')
+      const bundle = await rolldown({ input: path.resolve(__dirname, 'src/uikit/widgets.ts') })
+      await bundle.write({
+        format: 'iife',
+        file: path.join(outDir, 'ui-kit/otodock-widgets.js'),
+        minify: true,
+      })
+      await bundle.close()
+    },
+  }
+}
+
 // Every text asset under assets/ and ui-kit/ gets .br and .gz siblings; the
 // proxy serves the one the client accepts and never compresses at request
 // time. Registered LAST: the static-copy targets land in writeBundle and the
-// two IIFE writers above run earlier in the same sequential closeBundle
+// four IIFE writers above run earlier in the same sequential closeBundle
 // pass, so the kit files exist by now.
 function precompressAssets(): Plugin {
   let outDir = path.resolve(__dirname, 'dist')
@@ -158,6 +207,8 @@ export default defineConfig({
     }),
     bundleAnimeIife(),
     bundleThreeIife(),
+    bundleShareHostIife(),
+    bundleWidgetsIife(),
     // The build id in index.html (a hash of the built page + public/): the
     // proxy reads it back and a stale page reloads once. Before the
     // precompress plugin, which must stay last.
@@ -184,9 +235,11 @@ export default defineConfig({
         target: 'http://localhost:8400',
         changeOrigin: true,
       },
+      // No changeOrigin: the proxy's dashboard socket accepts a page whose
+      // Origin names the Host it was sent to, so the browser's Host must
+      // pass through.
       '/ws': {
         target: 'http://localhost:8400',
-        changeOrigin: true,
         ws: true,
       },
       // Wake-word wasm/model bundle — served by the proxy from

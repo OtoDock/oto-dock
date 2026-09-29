@@ -14,9 +14,11 @@ import contextlib
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 from isolation import run_parse
+import safe_fs
 from shared import (
     _checked_resolved,
     _dropped_note,
@@ -25,11 +27,15 @@ from shared import (
     _op_type,
     _push_image_preview,
     _push_preview,
+    _rel_beneath_root,
     _resolve_or_mark,
     _resolve_path,
     _to_agents_relative,
-    _WORKER_TMP_SUFFIX,
     logger,
+    cleanup_partials,
+    safe_mkdirs,
+    safe_open_write,
+    worker_temp_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -375,21 +381,119 @@ _WRITE_PDF_ADVICE = (
 )
 
 
-def _render_pdf_core(full_html: str, path: str) -> None:
-    """Worker core: WeasyPrint layout/render — the memory hazard — plus an
-    atomic save (a killed child must never truncate an existing PDF)."""
+# The references a PDF's HTML and CSS may name: ``src="..."``, CSS
+# ``url(...)`` (quoted or bare) and ``@import``. Each one that is not a
+# ``data:`` URL is resolved through the proxy like a tool argument; the
+# render then fetches only what resolved (``_AllowedFilesFetcher``), so an
+# external URL or a file outside the session's tree is dropped, never read.
+_SRC_RE = re.compile(r'src="([^"]+)"')
+_CSS_URL_RE = re.compile(r"""url\(\s*(['"]?)([^'")]+)\1\s*\)""")
+_CSS_IMPORT_RE = re.compile(r"""@import\s+(?!url\()(['"])([^'"]+)\1""")
+# A referenced asset past this is not an image or a stylesheet.
+_MAX_FETCH_BYTES = 64 * 1024 * 1024
+
+
+def _file_url(container_path: str) -> str:
+    """The ``file:`` URL of a resolved path, percent-encoded once (the
+    fetcher decodes it exactly once)."""
+    from urllib.request import pathname2url
+
+    return "file://" + pathname2url(container_path)
+
+
+def _allowed_files_fetcher(allowed):
+    """WeasyPrint's fetcher restricted to ``data:`` URLs and the ``file:``
+    URLs of ``allowed`` (the paths the proxy resolved for this session);
+    anything else raises, which WeasyPrint reports as a missing resource and
+    renders without. A ``file:`` URL is decoded once, the way ``_file_url``
+    encoded it, and the bytes come from a no-follow read beneath the mount,
+    so the path that is checked is the path that is read. Built inside the
+    worker (a closure cannot cross the spawn boundary; the allowed list
+    can)."""
+    import mimetypes
+    from urllib.parse import urlsplit
+    from urllib.request import url2pathname
+
+    from weasyprint.urls import URLFetcher, URLFetcherResponse, URLFetchingError
+
+    allowed_paths = {os.path.normpath(p) for p in allowed}
+
+    class _AllowedFilesFetcher(URLFetcher):
+        def __init__(self):
+            super().__init__(allowed_protocols={"file", "data"}, allow_redirects=False)
+
+        def fetch(self, url, headers=None):
+            parts = urlsplit(url)
+            scheme = parts.scheme.lower()
+            if scheme == "data":
+                return super().fetch(url, headers)
+            if scheme == "file" and not parts.netloc:
+                path = os.path.normpath(url2pathname(parts.path))
+                if path in allowed_paths:
+                    root, rel = _rel_beneath_root(path)
+                    data = safe_fs.read_bytes_beneath(root, rel, max_size=_MAX_FETCH_BYTES)
+                    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                    return URLFetcherResponse(url, body=data, headers={"Content-Type": mime})
+            raise URLFetchingError("external resources are not fetched")
+
+    return _AllowedFilesFetcher()
+
+
+def _render_pdf_core(full_html: str, path: str, allowed=()) -> None:
+    """Worker core: WeasyPrint layout/render (the memory hazard) with the
+    fetcher limited to ``allowed`` and an atomic save beneath the mount (a
+    killed child never truncates an existing PDF; a link at the name or on
+    the way never redirects the save)."""
     from weasyprint import HTML
 
-    tmp = path + _WORKER_TMP_SUFFIX
-    HTML(string=full_html).write_pdf(tmp)
-    os.replace(tmp, path)
+    fetcher = _allowed_files_fetcher(allowed)
+    with safe_open_write(path) as fh:
+        HTML(string=full_html, url_fetcher=fetcher, base_url=None).write_pdf(fh)
+
+
+async def _resolve_references(*texts: str) -> dict[str, str]:
+    """``{reference: resolved container path}`` for every ``src``, CSS
+    ``url()`` and ``@import`` in ``texts`` that the proxy resolves for this
+    session; a ``data:`` URL is left to the fetcher, an unresolved reference
+    is left out (and so never fetched)."""
+    refs: set[str] = set()
+    for text in texts:
+        refs.update(_SRC_RE.findall(text))
+        refs.update(m[1] for m in _CSS_URL_RE.findall(text))
+        refs.update(m[1] for m in _CSS_IMPORT_RE.findall(text))
+    out: dict[str, str] = {}
+    for ref in refs:
+        if ref.lower().startswith("data:"):
+            continue
+        with contextlib.suppress(Exception):
+            out[ref] = await _resolve_path(ref)
+    return out
+
+
+def _rewrite_references(text: str, resolved: dict[str, str]) -> str:
+    """Point every resolved reference at its ``file:`` URL; the rest stay as
+    written (the fetcher refuses them)."""
+    def _src(match):
+        r = resolved.get(match.group(1))
+        return f'src="{_file_url(r)}"' if r else match.group(0)
+
+    def _url(match):
+        r = resolved.get(match.group(2))
+        return f'url("{_file_url(r)}")' if r else match.group(0)
+
+    def _imp(match):
+        r = resolved.get(match.group(2))
+        return f'@import url("{_file_url(r)}")' if r else match.group(0)
+
+    text = _SRC_RE.sub(_src, text)
+    text = _CSS_URL_RE.sub(_url, text)
+    return _CSS_IMPORT_RE.sub(_imp, text)
 
 
 async def handle_write_pdf(args: dict) -> str:
     import markdown as md
 
     path = await _resolve_path(args["path"], writing=True)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     content = args.get("content", "")
     content_type = args.get("content_type", "markdown")
@@ -408,17 +512,12 @@ async def handle_write_pdf(args: dict) -> str:
     else:
         html_body = content
 
-    # Pre-resolve img srcs — a re.sub callback can't await.
-    src_map: dict[str, str] = {}
-    for src in set(re.findall(r'src="([^"]+)"', html_body)):
-        with contextlib.suppress(Exception):
-            src_map[src] = await _resolve_path(src)
-
-    def resolve_img_src(match):
-        resolved = src_map.get(match.group(1))
-        return f'src="file://{resolved}"' if resolved else match.group(0)
-
-    html_body = re.sub(r'src="([^"]+)"', resolve_img_src, html_body)
+    # Pre-resolve every reference in the parent (the proxy hop is async);
+    # the worker's fetcher then admits exactly these files.
+    src_map = await _resolve_references(html_body, custom_css)
+    html_body = _rewrite_references(html_body, src_map)
+    custom_css = _rewrite_references(custom_css, src_map)
+    allowed = sorted(set(src_map.values()))
 
     # After the src= rewriter — injected SVG markup must never meet it
     math_errors: list[str] = []
@@ -449,10 +548,9 @@ img {{ max-width: 100%; }}
     # Assembly above is cheap and needs the async resolver; the WeasyPrint
     # render is the memory hazard and runs in a bounded worker child.
     try:
-        await run_parse(_render_pdf_core, full_html, path, _advice=_WRITE_PDF_ADVICE)
+        await run_parse(_render_pdf_core, full_html, path, allowed, _advice=_WRITE_PDF_ADVICE)
     except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(path + _WORKER_TMP_SUFFIX)
+        cleanup_partials(path)
         raise
     await _push_preview(path)
     msg = f"PDF created: {_to_agents_relative(path)}"
@@ -542,8 +640,11 @@ async def handle_edit_pdf(args: dict) -> str:
                 _edit_pdf_core, path, ops, dropped, _advice=_EDIT_PDF_ADVICE
             )
         except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path + _WORKER_TMP_SUFFIX)
+            cleanup_partials(path)
+            for op in ops:
+                out = op.get("output_path") if isinstance(op, dict) else None
+                if isinstance(out, str) and out:
+                    cleanup_partials(out)
             raise
     await _push_preview(path)
     return msg
@@ -590,16 +691,17 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
                     errors.append(f"Op #{idx} split: output_path required")
                     continue
                 out = _checked_resolved(output_path)
-                Path(out).parent.mkdir(parents=True, exist_ok=True)
                 page_indices = _parse_pages(page_spec, doc.page_count)
                 new_doc = fitz.open()
                 for pi in page_indices:
                     new_doc.insert_pdf(doc, from_page=pi, to_page=pi)
-                # Atomic: `out` may name an existing file, and a killed
-                # child must never leave it truncated.
-                new_doc.save(out + _WORKER_TMP_SUFFIX)
-                new_doc.close()
-                os.replace(out + _WORKER_TMP_SUFFIX, out)
+                # Atomic and beneath the mount: `out` may name an existing
+                # file, a killed child must never leave it truncated, and a
+                # link at the name or on the way never redirects it.
+                try:
+                    _save_pdf_beneath(new_doc, out)
+                finally:
+                    new_doc.close()
 
             elif ot == "rotate_page":
                 page_spec = op.get("pages", "all")
@@ -914,7 +1016,7 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
                 if not output_dir:
                     output_dir = str(Path(path).parent / (Path(path).stem + "_images"))
                 out_dir = _checked_resolved(output_dir)
-                Path(out_dir).mkdir(parents=True, exist_ok=True)
+                safe_mkdirs(out_dir)
 
                 extracted = []
                 for pi in _parse_pages(page_spec, doc.page_count):
@@ -927,7 +1029,8 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
                             img_bytes = base_image["image"]
                             fname = f"page{pi + 1}_img{img_idx + 1}.{ext}"
                             img_path = Path(out_dir) / fname
-                            img_path.write_bytes(img_bytes)
+                            with safe_open_write(str(img_path)) as fh:
+                                fh.write(img_bytes)
                             extracted.append(str(img_path))
                         except Exception as e:
                             logger.warning(f"Failed to extract image xref={xref}: {e}")
@@ -969,8 +1072,7 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
 
                 if output_path:
                     out = _checked_resolved(output_path)
-                    Path(out).parent.mkdir(parents=True, exist_ok=True)
-                    doc.save(out)
+                    _save_pdf_beneath(doc, out)
 
             # =============================================================
             # UNKNOWN
@@ -1005,20 +1107,15 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
     if getattr(doc, "_compress_deflate_fonts", False):
         save_kwargs["deflate_fonts"] = True
 
-    # Save — pymupdf can't overwrite the source file directly, so save to a
-    # deterministic temp then replace (deterministic so the PARENT can clean
-    # the orphan after a worker kill — see _WORKER_TMP_SUFFIX).
+    # Save (pymupdf can't overwrite the source file directly): the bytes go
+    # to the helper's temp beside the name and replace it beneath the mount
+    # (a killed child leaves the original whole and a temp the parent
+    # removes; a link at the name or on the way never redirects the save).
     size_before = os.path.getsize(path)
-    tmp_path = path + _WORKER_TMP_SUFFIX
     try:
-        doc.save(tmp_path, **save_kwargs)
+        _save_pdf_beneath(doc, path, **save_kwargs)
+    finally:
         doc.close()
-        os.replace(tmp_path, path)
-    except Exception:
-        doc.close()
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
     size_after = os.path.getsize(path)
 
     msg = f"PDF saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
@@ -1072,6 +1169,38 @@ def _pdf_to_images_core(path: str, tmp_dir: str, page_spec, dpi: int,
     return saved
 
 
+def _save_pdf_beneath(doc, container_path: str, **save_kwargs) -> None:
+    """Save a PyMuPDF document at ``container_path`` beneath the mount: the
+    library writes by name into a temp outside the tree (its file-object
+    output is not usable on the pinned build), and the bytes land through
+    the write helper. The temp's name is derived from the output so the
+    parent removes it after a kill this ``finally`` never sees."""
+    tmp = worker_temp_path(container_path, ".pdf")
+    try:
+        doc.save(tmp, **save_kwargs)
+        _copy_beneath(tmp, container_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+def _copy_beneath(src_path: str, container_path: str) -> None:
+    """Copy a file made outside the tree (a temp) to ``container_path``
+    beneath the mount through the write helper."""
+    with open(src_path, "rb") as src, safe_open_write(container_path) as fh:
+        shutil.copyfileobj(src, fh)
+
+
+def _land_files(src_dir: str, out_dir: str, names: list[str]) -> None:
+    """Copy the files ``names`` of a temp directory into ``out_dir`` beneath
+    the mount through the write helper (the folder created beneath it too)."""
+    safe_mkdirs(out_dir)
+    for name in names:
+        with open(os.path.join(src_dir, name), "rb") as src, \
+                safe_open_write(os.path.join(out_dir, name)) as fh:
+            shutil.copyfileobj(src, fh)
+
+
 async def handle_pdf_to_images(args: dict) -> str:
     path = await _resolve_path(args["path"])
     if not Path(path).exists():
@@ -1086,26 +1215,23 @@ async def handle_pdf_to_images(args: dict) -> str:
     dpi = int(args.get("dpi", 150))
     fmt = args.get("format", "png").lower()
 
-    tmp_dir = out_dir.rstrip("/") + _WORKER_TMP_SUFFIX
+    # The pages render into a temp directory outside the tree and land in
+    # the output folder beneath the mount, each through the write helper.
+    tmp_dir = tempfile.mkdtemp(prefix="file-tools-pages-")
     try:
         saved = await run_parse(
             _pdf_to_images_core, path, tmp_dir, page_spec, dpi, fmt,
             _advice=_RENDER_ADVICE,
         )
-    except Exception:
+        first = (Path(tmp_dir) / saved[0]["name"]).read_bytes() if saved else b""
+        await asyncio.to_thread(_land_files, tmp_dir, out_dir, [s["name"] for s in saved])
+    finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    for s in saved:
-        os.replace(os.path.join(tmp_dir, s["name"]), os.path.join(out_dir, s["name"]))
-    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Push first page inline for preview
     if saved:
-        img_bytes = (Path(out_dir) / saved[0]["name"]).read_bytes()
         mime = "image/png" if fmt == "png" else "image/jpeg"
-        await _push_image_preview(img_bytes, mime, f"Page 1 of {Path(path).name}")
+        await _push_image_preview(first, mime, f"Page 1 of {Path(path).name}")
 
     return (
         f"Rendered {len(saved)} pages from {_to_agents_relative(path)} at {dpi}dpi.\n"
@@ -1231,7 +1357,7 @@ async def handle_screenshot_document(args: dict) -> list:
     try:
         # For non-PDF: convert to temp PDF via LibreOffice
         if ext != ".pdf":
-            temp_dir = tempfile.mkdtemp(dir=str(Path(path).parent))
+            temp_dir = tempfile.mkdtemp(prefix="file-tools-shot-")
             convert_path = path
 
             # Excel: set fit-to-width page setup + handle sheet selection.
@@ -1421,10 +1547,10 @@ def _images_to_pdf_core(image_paths: list, out: str, page_size: str,
         page.insert_image(img_rect, filename=img_path)
 
     inserted = doc.page_count
-    tmp = out + _WORKER_TMP_SUFFIX
-    doc.save(tmp)
-    doc.close()
-    os.replace(tmp, out)
+    try:
+        _save_pdf_beneath(doc, out)
+    finally:
+        doc.close()
     return inserted
 
 
@@ -1437,7 +1563,6 @@ async def handle_images_to_pdf(args: dict) -> str:
         return "Error: images list is empty"
 
     out = await _resolve_path(output_path, writing=True)
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
 
     page_size = args.get("page_size", "a4").lower()
     fit = args.get("fit", "contain")
@@ -1462,8 +1587,7 @@ async def handle_images_to_pdf(args: dict) -> str:
             _advice=_RENDER_ADVICE,
         )
     except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(out + _WORKER_TMP_SUFFIX)
+        cleanup_partials(out)
         raise
 
     await _push_preview(out)
@@ -1485,7 +1609,6 @@ async def handle_convert_document(args: dict) -> str:
 
     if output_path:
         output_dir = str(Path(await _resolve_path(output_path, writing=True)).parent)
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
     else:
         output_dir = str(Path(input_path).parent)
 
@@ -1530,16 +1653,22 @@ async def handle_convert_document(args: dict) -> str:
     # bounds it and a cgroup OOM kill targets its RSS, not the server;
     # _libreoffice_lock serializes runs and the 120s timeout kills hangs.
     # A worker wrapper could only strip the child's RLIMIT_AS (it survives
-    # fork+exec — see isolation.py) or cap soffice confusingly.
+    # fork+exec, see isolation.py) or cap soffice confusingly. It writes by
+    # name, so it writes into a temp directory outside the tree; the result
+    # lands in the output folder beneath the mount through the write helper.
+    lo_dir = tempfile.mkdtemp(prefix="file-tools-lo-")
     try:
-        out = await _libreoffice_convert(input_path, output_format, output_dir)
-    except RuntimeError as exc:
-        return f"Conversion error: {exc}"
-
-    if output_path:
-        final = await _resolve_path(output_path, writing=True)
-        Path(out).rename(final)
-        out = final
+        try:
+            produced = await _libreoffice_convert(input_path, output_format, lo_dir)
+        except RuntimeError as exc:
+            return f"Conversion error: {exc}"
+        if output_path:
+            out = await _resolve_path(output_path, writing=True)
+        else:
+            out = await _resolve_path(str(Path(output_dir) / Path(produced).name), writing=True)
+        await asyncio.to_thread(_copy_beneath, produced, out)
+    finally:
+        shutil.rmtree(lo_dir, ignore_errors=True)
 
     await _push_preview(out)
     return f"Converted: {_to_agents_relative(out)}"

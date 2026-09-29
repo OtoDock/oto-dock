@@ -26,12 +26,19 @@ _MCP_DIR = CUSTOM_MCPS / "agent-config-mcp"
 
 def _load_server(env: dict[str, str]):
     """Reload the server.py module with a fresh env so the permission gate
-    is re-evaluated. Stash + restore real env to keep test isolation."""
+    is re-evaluated. Stash + restore real env to keep test isolation; the
+    session keys are cleared first, so a suite run from inside an agent
+    session (whose own OTO_CAN_* flags are in the environment) sees only
+    what the test sets."""
     saved = {k: os.environ.get(k) for k in (
-        "OTO_AGENT_NAME", "OTO_ROLE", "OTO_SCOPE",
+        "OTO_AGENT_NAME", "OTO_ROLE", "OTO_SCOPE", "OTO_TASK_TYPE",
+        "OTO_CAN_MANAGE_AGENT", "OTO_CAN_EDIT_AGENT",
+        "OTO_CAN_WRITE_WORKSPACE", "OTO_CAN_CREATE_AGENTS",
         "AGENT_CONFIG_MCP_PROXY_URL", "PROXY_URL", "PROXY_API_KEY",
     )}
     try:
+        for k in saved:
+            os.environ.pop(k, None)
         os.environ.update(env)
         return load_mcp_server(_MCP_DIR)
     finally:
@@ -57,7 +64,7 @@ class TestPermissionMatrix:
     def test_manager_user_scope_has_all_tools(self):
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant-lite",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
             "OTO_SCOPE": "user",
         })
         assert "update_display_name" in mod.ENABLED_TOOLS
@@ -67,10 +74,24 @@ class TestPermissionMatrix:
     def test_admin_user_scope_has_all_tools(self):
         mod = _load_server({
             "OTO_AGENT_NAME": "personal-assistant-lite",
-            "OTO_ROLE": "admin",
+            "OTO_ROLE": "admin", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
             "OTO_SCOPE": "user",
         })
         assert "update_default_model" in mod.ENABLED_TOOLS
+
+    def test_contributor_has_only_complete_setup(self):
+        """A contributor writes the shared workspace and nothing under the
+        agent's identity: the same surface as a viewer here, read off the
+        proxy's answer (OTO_CAN_EDIT_AGENT), never a role word."""
+        mod = _load_server({
+            "OTO_AGENT_NAME": "personal-assistant-lite",
+            "OTO_ROLE": "contributor",
+            "OTO_SCOPE": "user",
+            "OTO_CAN_MANAGE_AGENT": "false",
+            "OTO_CAN_EDIT_AGENT": "false",
+            "OTO_CAN_WRITE_WORKSPACE": "true",
+        })
+        assert mod.ENABLED_TOOLS == {"complete_setup"}
 
     def test_viewer_agent_scope_has_only_complete_setup(self):
         """A Shared-only agent mounts agent-scope for HUMAN chats too, so the
@@ -124,7 +145,7 @@ class TestManifestSanity:
 
     def test_schema_handler_coherence(self):
         mod = _load_server({
-            "OTO_AGENT_NAME": "x", "OTO_ROLE": "manager",
+            "OTO_AGENT_NAME": "x", "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
             "OTO_SCOPE": "user",
         })
         schemas = set(mod._TOOL_SCHEMAS.keys())
@@ -139,7 +160,7 @@ class TestSetVisibilityMode:
 
     def _load(self):
         return _load_server({
-            "OTO_AGENT_NAME": "demo", "OTO_ROLE": "manager",
+            "OTO_AGENT_NAME": "demo", "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
             "OTO_SCOPE": "user",
         })
 
@@ -212,9 +233,12 @@ class TestUpdatePersona:
     mounts agent-scope for human chats too."""
 
     def _load(self, role="manager", scope="user", task_type=""):
+        owner = role in ("manager", "admin")
         return _load_server({
             "OTO_AGENT_NAME": "demo", "OTO_ROLE": role, "OTO_SCOPE": scope,
             "OTO_TASK_TYPE": task_type,
+            "OTO_CAN_MANAGE_AGENT": "true" if owner else "false",
+            "OTO_CAN_EDIT_AGENT": "true" if owner or role == "editor" else "false",
         })
 
     def _spy(self, mod):
@@ -293,7 +317,7 @@ class TestListContextFiles:
 
     def _load(self):
         return _load_server({
-            "OTO_AGENT_NAME": "demo", "OTO_ROLE": "manager",
+            "OTO_AGENT_NAME": "demo", "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true",
             "OTO_SCOPE": "user",
         })
 
@@ -356,3 +380,119 @@ class TestListContextFiles:
         mod._request = fake_request
         out = asyncio.run(mod._tool_list_context_files())
         assert "not found" in out
+
+
+class TestEngineCatalog:
+    """The engines come from the platform — ``GET /v1/execution-layers`` —
+    never a literal (engine-contract phase 5): the two layer enums and the
+    engine-naming descriptions are filled at tools/list, the validators refuse
+    an id the catalog lacks, the interactive gate reads
+    ``runtime.supports_interactive_pty``. The engines here are invented so a
+    server that remembered the real three would fail. An unreachable catalog
+    advertises no enum and lets the proxy's own validation answer."""
+
+    CATALOG = {
+        "acme-cli": {
+            "display_name": "Acme Coder",
+            "runtime": {"supports_interactive_pty": True},
+            "models": [{"value": "acme-1", "label": "Acme 1", "tier": 2}],
+            "auto_model": "acme-1", "auto_model_label": "Acme 1",
+        },
+        "zephyr-api": {
+            "display_name": "Zephyr API",
+            "runtime": {"supports_interactive_pty": False},
+            "models": [{"value": "z-1", "label": "Z 1", "tier": 3}],
+            "auto_model": "z-1", "auto_model_label": "Z 1",
+        },
+    }
+
+    def _load(self, *, catalog_down=False, default_model="z-1"):
+        mod = _load_server({
+            "OTO_AGENT_NAME": "demo", "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true", "OTO_CAN_EDIT_AGENT": "true", "OTO_SCOPE": "user",
+        })
+        calls: list[tuple[str, str, dict | None]] = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("json")))
+            if path == "/v1/execution-layers":
+                if catalog_down:
+                    raise mod._ApiError("GET /v1/execution-layers: connection refused")
+                return json.loads(json.dumps(self.CATALOG))
+            if path.endswith("/info"):
+                return {"execution_path": "acme-cli", "execution_paths": ["acme-cli"],
+                        "default_model": default_model}
+            return {}
+
+        mod._request = fake_request
+        return mod, calls
+
+    @staticmethod
+    def _tools(mod):
+        return {t.name: t for t in asyncio.run(mod.list_tools())}
+
+    def test_static_table_names_no_engine(self):
+        mod, _ = self._load()
+        blob = json.dumps(mod._TOOL_SCHEMAS)
+        for literal in ("claude-code-cli", "codex-cli", "direct-llm"):
+            assert literal not in blob, literal
+        assert not hasattr(mod, "VALID_LAYERS")
+
+    def test_tools_list_fills_the_enums_and_descriptions_from_the_catalog(self):
+        mod, calls = self._load()
+        tools = self._tools(mod)
+        layers = tools["update_execution_layers"].inputSchema["properties"]["layers"]
+        assert layers["items"]["enum"] == ["acme-cli", "zephyr-api"]
+        assert tools["update_default_layer"].inputSchema["properties"]["layer"]["enum"] == ["acme-cli", "zephyr-api"]
+        assert "acme-cli, zephyr-api" in tools["update_execution_layers"].description
+        assert "acme-cli, zephyr-api" in tools["update_default_layer"].description
+        mode_desc = tools["update_default_execution_mode"].description
+        assert "acme-cli" in mode_desc and "zephyr-api" not in mode_desc  # only the TUI engine
+        assert "{engines}" not in mode_desc and "{interactive}" not in mode_desc
+        # Read once per process: a second tools/list does not refetch.
+        self._tools(mod)
+        assert sum(1 for c in calls if c[1] == "/v1/execution-layers") == 1
+
+    def test_unreachable_catalog_advertises_no_enum_and_defers_to_the_proxy(self):
+        mod, calls = self._load(catalog_down=True)
+        tools = self._tools(mod)
+        assert "enum" not in tools["update_execution_layers"].inputSchema["properties"]["layers"]["items"]
+        assert "enum" not in tools["update_default_layer"].inputSchema["properties"]["layer"]
+        assert "list_available_models" in tools["update_execution_layers"].description
+        assert "{engines}" not in tools["update_default_layer"].description
+        # The validators let the PATCH answer (the proxy fails closed on an unknown id).
+        out = asyncio.run(mod._tool_update_execution_layers(["whatever"]))
+        assert "✅" in out
+        assert ("PATCH", "/v1/agents/demo", {"execution_paths": ["whatever"]}) in calls
+        # A failed fetch is not cached: the next call tries again.
+        assert sum(1 for c in calls if c[1] == "/v1/execution-layers") >= 2
+
+    def test_validators_refuse_an_engine_the_catalog_lacks(self):
+        mod, calls = self._load()
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli", "nope"]))
+        assert "❌" in out and "['nope']" in out and "acme-cli" in out
+        out = asyncio.run(mod._tool_update_default_layer("nope"))
+        assert "❌" in out and "acme-cli" in out
+        assert not any(c[0] == "PATCH" for c in calls)
+        # A catalog engine passes the validator and reaches the PATCH.
+        out = asyncio.run(mod._tool_update_execution_layers(["acme-cli", "zephyr-api"]))
+        assert "✅" in out
+        assert ("PATCH", "/v1/agents/demo", {"execution_paths": ["acme-cli", "zephyr-api"]}) in calls
+
+    def test_interactive_gate_reads_supports_interactive_pty(self):
+        # The default model runs on the engine WITHOUT a TUI → refused, naming the TUI engine.
+        mod, calls = self._load(default_model="z-1")
+        out = asyncio.run(mod._tool_update_default_execution_mode("interactive"))
+        assert "❌" in out and "acme-cli" in out and "zephyr-api" in out
+        assert not any(c[0] == "PATCH" for c in calls)
+        # On the TUI engine → allowed.
+        mod, calls = self._load(default_model="acme-1")
+        out = asyncio.run(mod._tool_update_default_execution_mode("interactive"))
+        assert "✅" in out
+        assert ("PATCH", "/v1/agents/demo", {"default_execution_mode": "interactive"}) in calls
+
+    def test_list_available_models_names_what_auto_runs(self):
+        mod, _ = self._load()
+        out = asyncio.run(mod._tool_list_available_models())
+        assert "## Acme Coder (`acme-cli`)" in out
+        assert "Auto (no `default_model`) currently runs `acme-1` (Acme 1) on this engine." in out
+        assert "Auto (no `default_model`) currently runs `z-1` (Z 1) on this engine." in out

@@ -19,14 +19,14 @@ interface Props {
   taskRun: ReturnType<typeof useRunByChat>['data']
   agentName: string
   canManageThisAgent: boolean
-  canEditThisAgent: boolean
+  canWriteThisWorkspace: boolean
   workspace: ReturnType<typeof useWorkspaceState>
   recoverRequested: boolean
   setRecoverRequested: Dispatch<SetStateAction<boolean>>
 }
 
 export default function ChatWorkspaceSlot({
-  isTaskChat, currentAgent, taskRun, agentName, canManageThisAgent, canEditThisAgent,
+  isTaskChat, currentAgent, taskRun, agentName, canManageThisAgent, canWriteThisWorkspace,
   workspace, recoverRequested, setRecoverRequested,
 }: Props) {
   return isTaskChat ? (
@@ -44,7 +44,7 @@ export default function ChatWorkspaceSlot({
           <WorkspaceOverlay
             agent={agentName}
             canManage={isAgentScope ? false : canManageThisAgent}
-            canEdit={canEditThisAgent}
+            canEdit={canWriteThisWorkspace}
             state={workspace.state}
             actions={workspace}
             topPadding
@@ -69,7 +69,7 @@ export default function ChatWorkspaceSlot({
       <WorkspaceOverlay
         agent={agentName}
         canManage={canManageThisAgent}
-        canEdit={canEditThisAgent}
+        canEdit={canWriteThisWorkspace}
         state={workspace.state}
         actions={workspace}
         topPadding

@@ -114,6 +114,9 @@ export interface NotificationDelivery {
   dismissed_at: string | null
   agent_slug: string | null
   chat_id: string | null
+  /** A dashboard path the row opens instead of the agent/chat deep link
+   * (a shared app, a shared chat); empty or absent on older rows. */
+  href?: string
 }
 
 export async function fetchDeliveries(): Promise<NotificationDelivery[]> {

@@ -3,7 +3,7 @@
 Pure, testable module. SandboxBuilder constructs bwrap command prefixes
 based on a SandboxConfig. No side effects — only produces command lists.
 
-ensure_persistent_claude_dir() creates and populates the persistent
+The engines' config-dir builders (core/layers/<x>/config_dir.py) create and populate the persistent
 .claude/ directory for a session (hooks, settings.json).
 """
 
@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import config as app_config
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.sandbox")
 
@@ -47,8 +49,8 @@ def _verified_literal_path(root_real: Path, *parts: str) -> Path | None:
     holding the parent RW in one session can plant a symlink there, and a
     follow at build/bind time moves the operation to the symlink's target
     on the HOST (the file-transfer B4 class — a planted
-    ``knowledge/.credentials → /`` would otherwise become an RW bind of the
-    host root in the next agent-scope session).
+    ``users/<u>/.claude → /`` would otherwise become an RW bind of the host
+    root in that person's next session).
     """
     expected = root_real.joinpath(*parts)
     if os.path.realpath(expected) != str(expected):
@@ -469,13 +471,18 @@ def cli_version_preflight() -> None:
     """
     import re
     import subprocess
+    from core.session.session_manager import get_all_layers
 
+    # Every registered engine with a CLI: its display name, the binary this
+    # host is configured to run and the pin VERSIONS.md carries — read from
+    # the layer, so a fourth engine is checked the day it registers.
     checks = (
-        ("Claude Code", app_config.CLAUDE_BIN, app_config.PINNED_CLAUDE_CODE_VERSION),
-        ("Codex", app_config.CODEX_BIN, app_config.PINNED_CODEX_VERSION),
+        (layer.capabilities.display_name, layer.cli_binary_path(), layer.pinned_cli_version())
+        for layer in get_all_layers().values()
+        if layer.capabilities.runtime.binary
     )
     for label, bin_name, want in checks:
-        if not want:
+        if not want or not bin_name:
             continue
         exe = shutil.which(bin_name)
         if not exe:
@@ -577,6 +584,13 @@ class SandboxConfig:
     # which stays human-manager-only. Computed by resolve_task_identity
     # from the dynamic task's creator; False everywhere else.
     knowledge_rw: bool = False
+    # The judge profile (CHECKS.md "The judge profile"): every row of the
+    # table this identity would get, flipped read-only after it is built —
+    # the CLI's own state dirs (.claude / .codex / .credentials) excepted,
+    # since the CLI writes its session there. /config never mounts for a
+    # judge (config_visible is False). Kernel-enforced locally; the gate's
+    # ``judge`` mode is the same rule on a machine.
+    read_only: bool = False
     # External routes (core/session/external_identity.py): the session's
     # caller is not a platform user. ``external`` masks the shared memory
     # (knowledge/memory) out of the RO /knowledge bind; ``external_home``
@@ -612,6 +626,16 @@ class SandboxConfig:
     #                    Docker-MCP container IPs + enabled homelab MCP targets).
     net_forwards: list[str] = field(default_factory=list)
     net_allow_hosts: list[str] = field(default_factory=list)
+    # App servers (services/apps/app_sandbox.py, APPS.md): an explicit mount
+    # table that REPLACES the role table above (the release copy read-only
+    # at /app, the app's data directory read-write at /app/data, the Bun
+    # binary), a cwd of /app, one inbound splice "hostport:port" so the
+    # proxy can reach the server, and a closed public internet. None / ""
+    # / False for every agent session.
+    app_mounts: list[Mount] | None = None
+    app_cwd: str = ""
+    net_inbound: str = ""
+    net_egress_deny: bool = False
 
 
 # Sandbox-internal destinations an MCP manifest mount must NEVER target.
@@ -622,11 +646,11 @@ class SandboxConfig:
 # ``/etc``/``/proc``/the shared ``/config`` + ``/knowledge`` trees. The
 # permission hook + per-session config/secrets live under ``.claude``/``.codex``.
 _PROTECTED_MOUNT_DEST_ROOTS = (
-    "/config", "/knowledge", "/etc", "/proc", "/sys", "/dev", "/run",
+    layout.V_CONFIG, layout.V_KNOWLEDGE, "/etc", "/proc", "/sys", "/dev", "/run",
     "/tmp", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/var", "/root",
     "/boot", "/home",
 )
-_PROTECTED_MOUNT_DEST_EXACT = frozenset({"/", "/workspace", "/users"})
+_PROTECTED_MOUNT_DEST_EXACT = frozenset({"/", layout.V_WORKSPACE, layout.V_USERS})
 
 
 def _is_safe_mcp_mount_dest(dest: str) -> bool:
@@ -709,10 +733,25 @@ class SandboxBuilder:
         single signal — file existence).
         """
         prefix = [str(_NETNS_LAUNCHER), "--block-private"]
+        # The proxy-port forward lands on the internal listener when the app
+        # bound one (``config.INTERNAL_LISTENER_PORT``, 0 when it did not):
+        # pasta's ``-T <namespace port>:<host port>`` splices the sandbox's
+        # ``127.0.0.1:PORT`` onto that listener, whose requests carry no
+        # forwarded-client headers, so nothing inside the sandbox changes
+        # and nothing inside it can speak for another client address.
+        internal = int(getattr(app_config, "INTERNAL_LISTENER_PORT", 0) or 0)
+        proxy_port = str(app_config.PORT)
         for port in self.cfg.net_forwards:
-            prefix.extend(["--forward", str(port)])
+            spec = str(port)
+            if internal and spec == proxy_port:
+                spec = f"{proxy_port}:{internal}"
+            prefix.extend(["--forward", spec])
         for host in self.cfg.net_allow_hosts:
             prefix.extend(["--allow-host", str(host)])
+        if self.cfg.net_inbound:
+            prefix.extend(["--inbound", self.cfg.net_inbound])
+        if self.cfg.net_egress_deny:
+            prefix.append("--egress-deny")
         if netns_resolv_path().exists():
             prefix.extend(["--dns-forward", _NETNS_DNS_FORWARD_ADDR])
         prefix.append("--")
@@ -722,14 +761,16 @@ class SandboxBuilder:
         """Sandbox-internal CWD for this role."""
         username = self.cfg.username
 
+        if self.cfg.app_cwd:
+            return self.cfg.app_cwd
         if self.cfg.external_home:
             # External caller with a private tree — their own home.
             return EXTERNAL_SANDBOX_HOME
         if not username:
             # Agent-scoped task
-            return "/workspace"
+            return layout.V_WORKSPACE
         # All user roles (viewer / manager / admin)
-        return f"/users/{username}"
+        return layout.virtual_user_root(username)
 
     def get_env_overrides(
         self,
@@ -747,9 +788,9 @@ class SandboxBuilder:
         if self.cfg.external_home:
             cfg_dir = f"{EXTERNAL_SANDBOX_HOME}/{config_dir_name}"
         elif self.cfg.username:
-            cfg_dir = f"/users/{self.cfg.username}/{config_dir_name}"
+            cfg_dir = f"{layout.virtual_user_root(self.cfg.username)}/{config_dir_name}"
         else:
-            cfg_dir = f"/workspace/{config_dir_name}"
+            cfg_dir = f"{layout.V_WORKSPACE}/{config_dir_name}"
 
         env = {
             config_env_var: cfg_dir,
@@ -915,13 +956,14 @@ class SandboxBuilder:
         | agent-scope (no user) | (none)  | RO†        | RW         | (none)     |
 
         *RW* = the user dir's ROOT is RO; its known subdirs (workspace/,
-        context/, .claude/, .codex/, .credentials/) stack RW on top, so
-        stray root-level files are kernel-denied for every tool path.
+        context/, .claude/, .codex/) stack RW on top, so stray root-level
+        files are kernel-denied for every tool path.
 
-        †RO with `knowledge/.credentials/` stacked RW on top (when it
-        exists): agent-scope MCP credentials live there and MCP processes
-        write-check + self-refresh tokens in place. Tool access to the
-        subtree stays blocked at the application layer (path_policy).
+        †RO. No OAuth token file is mounted into any sandbox: a
+        ``.credentials`` directory under /knowledge or under /users/{u} is
+        masked with an empty read-only dir (``_credentials_mask``), and a
+        stdio OAuth MCP receives its token file through the credential
+        broker at spawn.
 
         `/config/` is **owner-only** — editor + viewer don't see it at all.
         Config shapes agent BEHAVIOR (prompt, MCP wiring, auto-loaded
@@ -935,6 +977,10 @@ class SandboxBuilder:
         list so they see exactly the kernel's view.
         """
         mounts: list[Mount] = []
+        if self.cfg.app_mounts is not None:
+            # An app server: its own table, no workspace, no users, no
+            # config (APPS.md "The app sandbox").
+            return list(self.cfg.app_mounts)
         role = self.cfg.role
         username = self.cfg.username
         agent_dir_path = self._agent_dir
@@ -949,7 +995,7 @@ class SandboxBuilder:
         # template creation (agent_store.create_agent) now creates knowledge/
         # up front, but legacy agents won't have it until the one-shot
         # role_v2 migration runs. mkdir(exist_ok=True) is cheap insurance.
-        (agent_dir_path / "knowledge").mkdir(parents=True, exist_ok=True)
+        (agent_dir_path / layout.KNOWLEDGE).mkdir(parents=True, exist_ok=True)
 
         # Belt-and-braces: bind this agent's quota scopes to their XFS project
         # IDs before the RW bind mounts below expose the tree to writes. Free
@@ -982,7 +1028,7 @@ class SandboxBuilder:
             # behind). Verify BEFORE mkdir — mkdir(parents=True) through a
             # symlinked component would create dirs at the TARGET — and fail
             # the build loudly on tampering rather than bind the target.
-            parts = ["knowledge", "shared", *Path(src).parts]
+            parts = [layout.KNOWLEDGE, "shared", *Path(src).parts]
             if subdir:
                 parts += Path(subdir).parts
             p = _verified_literal_path(agent_root_real, *parts)
@@ -1001,35 +1047,63 @@ class SandboxBuilder:
             return str(p)
 
         def _mirror_dest(src: str, subdir: str) -> str:
-            return (f"/knowledge/shared/{src}/{subdir}" if subdir
-                    else f"/knowledge/shared/{src}")
+            return (f"{layout.V_KNOWLEDGE}/shared/{src}/{subdir}" if subdir
+                    else f"{layout.V_KNOWLEDGE}/shared/{src}")
 
         config_visible = self.cfg.config_visible
         if config_visible is None:
             # Not explicitly resolved (direct construction / pre-visibility-modes
             # caller): historical behavior — /config for an owner-tier role with
             # a real mount user (user-scope manager/admin).
-            config_visible = role in ("manager", "admin") and bool(username)
+            config_visible = roles.can_manage(role) and bool(username)
         mount_shared = self.cfg.mount_shared
 
         if not username:
             # Agent-scope MOUNT — a service session (phone / task / trigger /
             # meeting) OR a Shared-only HUMAN chat (``mount_username==""`` for
-            # both). Role-aware: a Shared-only viewer is read-only while a
-            # manager curates. Service sessions force role=manager +
+            # both). Role-aware: below the workspace tier (a Shared-only
+            # viewer, or a word the table does not know) the workspace is
+            # read-only. Service sessions force role=manager +
             # config_visible=False, so this stays byte-identical to the
             # pre-visibility-modes agent branch (/workspace RW + /knowledge RO).
-            if role == "viewer":
-                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", False))
+            if roles.can_write_workspace(role):
+                mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, True))
             else:
-                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
+                mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, False))
+            if not self.cfg.external and not roles.can_edit(role):
+                # A person below the editor tier never runs from the agent's
+                # own CLI state (the engines refuse such a session,
+                # session_config_dir.refuse_session_on_agent_state): a script
+                # or an app button run as them sees it masked.
+                mounts.extend(self._agent_state_masks(agent_root_real))
+            elif not roles.can_write_workspace(role) and not self.cfg.external_home:
+                # An external caller with no tree of its own runs from the
+                # agent's CLI state (CLAUDE_CONFIG_DIR / CODEX_HOME =
+                # /workspace/.claude or .codex) and writes its session files
+                # there, so the two stack RW on the RO root as the user-scope
+                # branch does for users/<u>/ (the caller has no shell; the
+                # gate refuses a write to the hooks and settings).
+                # Existence-guarded (bwrap cannot create a mountpoint under
+                # an RO parent) and symlink-refusing: the workspace is RW
+                # for the tiers above, so a planted link would bind its
+                # target read-write into this sandbox.
+                for sub in (".claude", ".codex"):
+                    state_dir = _verified_literal_path(agent_root_real, layout.WORKSPACE, sub)
+                    if state_dir is None:
+                        logger.error(
+                            "Refusing workspace/%s bind for agent %s: path contains "
+                            "a symlinked component (possible tampering)",
+                            sub, self.cfg.agent_name,
+                        )
+                    elif state_dir.is_dir():
+                        mounts.append(Mount(str(state_dir), f"{layout.V_WORKSPACE}/{sub}", True))
             if config_visible or self.cfg.knowledge_rw:
                 # Owner-tier human in the agent scope (curates knowledge +
                 # config) — or a manager-provenance task fire (knowledge_rw:
                 # knowledge RW, /config deliberately NOT mounted).
-                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", True))
+                mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, True))
                 if config_visible:
-                    mounts.append(Mount(f"{agent_dir}/config", "/config", True))
+                    mounts.append(Mount(f"{agent_dir}/{layout.CONFIG}", layout.V_CONFIG, True))
                 # Read-only library mirrors stay kernel-RO under the RW
                 # parent — one nested bind per library SUBTREE.
                 for _src, _subdir, _writable in lib_attachments:
@@ -1039,34 +1113,12 @@ class SandboxBuilder:
             else:
                 # Knowledge is universal + RO for non-owners / service sessions
                 # (mirrors ride the RO parent — no nested binds needed).
-                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
-                # Agent-scope MCP credentials live at knowledge/.credentials
-                # (path_roles credentials_dir role) and MCP processes must
-                # WRITE there: workspace-mcp write-checks the dir on boot and
-                # self-refreshes tokens in place. RW child bind AFTER the RO
-                # root (bwrap later-bind precedence) — fixed literal subtree,
-                # never a manifest-supplied path. Existence-guarded: bwrap
-                # cannot create a mountpoint under an RO parent, and the dir
-                # exists iff credential_resolver materialized a bound account
-                # (which runs before the sandbox is built).
-                # Symlink-refusing: owner-tier sessions hold /knowledge RW,
-                # so this path is agent-plantable across runs — a symlink
-                # here would bind its TARGET read-write into this sandbox
-                # (bwrap resolves bind sources). Refuse and boot without the
-                # bind instead: the MCP shows up unconnected, nothing leaks.
-                cred_dir = _verified_literal_path(
-                    agent_root_real, "knowledge", ".credentials")
-                if cred_dir is None:
-                    logger.error(
-                        "Refusing knowledge/.credentials bind for agent %s: "
-                        "path contains a symlinked component (possible "
-                        "tampering)", self.cfg.agent_name,
-                    )
-                elif cred_dir.is_dir():
-                    mounts.append(Mount(str(cred_dir),
-                                        "/knowledge/.credentials", True))
+                mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, False))
+            mounts.extend(self._credentials_mask(
+                agent_root_real, layout.KNOWLEDGE, layout.CREDENTIALS_DIR,
+                sandbox=f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}"))
             mounts.extend(self._external_mounts(agent_dir_path, agent_root_real))
-            return mounts
+            return self._apply_read_only(mounts)
 
         # User-scope MOUNT — the session has its own personal dir. The dir
         # ROOT is read-only with the known subdirs stacked RW on top: agents
@@ -1076,7 +1128,7 @@ class SandboxBuilder:
         # Unknown future subdirs stay visible (RO) — a clean EROFS beats a
         # silent stray. Mirrored by the path-policy write allowlist
         # (auth/path_policy.py::_USER_DIR_WRITABLE_SUBDIRS).
-        user_dir = agent_dir_path / "users" / username
+        user_dir = layout.user_dir(agent_dir_path, username)
         # Codex's own Linux sandbox (a nested bwrap) mounts read-only tmpfs
         # over <writable-root>/{.git,.agents,.codex} for every writable root,
         # cwd included — and bwrap must CREATE a missing mountpoint, which
@@ -1088,43 +1140,50 @@ class SandboxBuilder:
         # .codex is session_config_dir's job and is RW-bound below.
         for sub in (".git", ".agents"):
             (user_dir / sub).mkdir(parents=True, exist_ok=True)
-        mounts.append(Mount(str(user_dir), f"/users/{username}", False))
-        for sub in ("workspace", "context"):
+        v_user = layout.virtual_user_root(username)
+        mounts.append(Mount(str(user_dir), v_user, False))
+        for sub in layout.USER_SUBDIRS:
             (user_dir / sub).mkdir(parents=True, exist_ok=True)
-            mounts.append(Mount(str(user_dir / sub), f"/users/{username}/{sub}", True))
-        # CLI state dirs (session's own is pre-created by the layer) + the
-        # per-user MCP OAuth token dir (MCP processes refresh tokens in place).
-        for sub in (".claude", ".codex", ".credentials"):
+            mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
+        # CLI state dirs (session's own is pre-created by the layer).
+        for sub in (".claude", ".codex"):
             if (user_dir / sub).is_dir():
-                mounts.append(Mount(str(user_dir / sub), f"/users/{username}/{sub}", True))
+                mounts.append(Mount(str(user_dir / sub), f"{v_user}/{sub}", True))
+        mounts.extend(self._credentials_mask(
+            agent_root_real, layout.USERS, username, layout.CREDENTIALS_DIR,
+            sandbox=f"{v_user}/{layout.CREDENTIALS_DIR}"))
 
         # /config — owner-tier only (the agent's behavior layer). Hoisted out of
         # the role branch so Personal-only managers (no shared dirs) still get it.
         if config_visible:
-            mounts.append(Mount(f"{agent_dir}/config", "/config", True))
+            mounts.append(Mount(f"{agent_dir}/{layout.CONFIG}", layout.V_CONFIG, True))
 
         # Shared workspace + knowledge — present only when the agent's mode
         # offers the agent scope. Personal-only (``mount_shared=False``) omits
         # BOTH: it is fully private, no shared collaboration surface.
         if mount_shared:
-            if role in ("manager", "admin"):
+            if roles.can_manage(role):
                 # Owner tier: knowledge RW (reference library) + workspace RW.
-                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", True))
-                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
+                mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, True))
+                mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, True))
                 # Read-only library mirrors stay kernel-RO under the RW
                 # parent — one nested bind per library SUBTREE.
                 for _src, _subdir, _writable in lib_attachments:
                     if not _writable:
                         mounts.append(Mount(_mirror_host(_src, _subdir),
                                             _mirror_dest(_src, _subdir), False))
-            elif role == "editor":
-                # Editor: workspace RW (collaboration), knowledge RO.
-                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
-                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
+            elif roles.can_write_workspace(role):
+                # Editor / contributor: workspace RW (collaboration), knowledge RO.
+                mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, False))
+                mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, True))
             else:
                 # Viewer (or unknown): both RO — SEE state + docs, mutate nothing.
-                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
-                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", False))
+                mounts.append(Mount(f"{agent_dir}/{layout.KNOWLEDGE}", layout.V_KNOWLEDGE, False))
+                mounts.append(Mount(f"{agent_dir}/{layout.WORKSPACE}", layout.V_WORKSPACE, False))
+            mounts.extend(self._credentials_mask(
+                agent_root_real, layout.KNOWLEDGE, layout.CREDENTIALS_DIR,
+                sandbox=f"{layout.V_KNOWLEDGE}/{layout.CREDENTIALS_DIR}"))
+            mounts.extend(self._agent_state_masks(agent_root_real))
         elif lib_attachments:
             # Personal-only: no shared /knowledge exists, but attached
             # libraries still mount — each mirror individually, ALWAYS
@@ -1136,7 +1195,76 @@ class SandboxBuilder:
                 mounts.append(Mount(_mirror_host(_src, _subdir),
                                     _mirror_dest(_src, _subdir), False))
 
-        return mounts
+        return self._apply_read_only(mounts)
+
+    def _credentials_mask(
+        self, agent_root_real: Path, *rel_parts: str, sandbox: str,
+    ) -> list[Mount]:
+        """An empty read-only dir over a ``.credentials`` directory the parent
+        bind would otherwise show. No OAuth token file is mounted into a
+        sandbox: a stdio OAuth MCP receives its file through the credential
+        broker at spawn (``core/credentials/credential_files.py``), so any
+        copy in the tree stays
+        out of every session's view. Existence-guarded (bwrap cannot make a
+        mountpoint under a read-only parent; no copy, nothing to hide) and
+        symlink-refusing: a planted link refuses the build, as the state
+        masks do. A link AT the name is never legitimate and, left in
+        place, would refuse every later build of the agent: it is removed
+        here and logged."""
+        parent = _verified_literal_path(agent_root_real, *rel_parts[:-1])
+        if parent is None:
+            raise RuntimeError(
+                f"Refusing sandbox build: {'/'.join(rel_parts[:-1])} contains a "
+                "symlinked component (possible tampering)"
+            )
+        leaf = parent / rel_parts[-1]
+        if leaf.is_symlink():
+            leaf.unlink(missing_ok=True)
+            logger.warning("credentials: removed a symlink planted at %s", leaf)
+        cred_dir = _verified_literal_path(agent_root_real, *rel_parts)
+        if cred_dir is None:
+            raise RuntimeError(
+                f"Refusing sandbox build: {'/'.join(rel_parts)} contains a "
+                "symlinked component (possible tampering)"
+            )
+        if not cred_dir.is_dir():
+            return []
+        return [Mount(str(empty_mount_dir()), sandbox, False)]
+
+    def _agent_state_masks(self, agent_root_real: Path) -> list[Mount]:
+        """An empty read-only dir over the agent scope's CLI state
+        (``workspace/.claude``, ``workspace/.codex``) for a session that does
+        not run from it: the hooks, settings and MCP config every agent-scope
+        session executes, the subscription login and the session tokens they
+        carry. Seen through /workspace, any role could read the tokens with an
+        opaque command, and a workspace-tier role could rewrite a hook that a
+        manager's task runs next. The mountpoints are made host-side (bwrap
+        cannot make one under a read-only /workspace) and a planted link
+        refuses the build."""
+        masks: list[Mount] = []
+        for sub in (".claude", ".codex"):
+            state_dir = _verified_literal_path(agent_root_real, layout.WORKSPACE, sub)
+            if state_dir is None:
+                raise RuntimeError(
+                    f"Refusing sandbox build: workspace/{sub} contains a "
+                    "symlinked component (possible tampering)"
+                )
+            state_dir.mkdir(exist_ok=True)
+            masks.append(Mount(str(empty_mount_dir()), f"{layout.V_WORKSPACE}/{sub}", False))
+        return masks
+
+    # The CLI state dirs a judge still writes (its own session files);
+    # everything else goes read-only.
+    _READ_ONLY_KEEP_RW = (".claude", ".codex")
+
+    def _apply_read_only(self, mounts: list[Mount]) -> list[Mount]:
+        """The judge profile: the identity's table with every row read-only
+        except the CLI state dirs (CHECKS.md). A no-op for every other
+        session."""
+        if not self.cfg.read_only:
+            return mounts
+        return [m if (not m.rw or m.sandbox.rstrip("/").rsplit("/", 1)[-1] in self._READ_ONLY_KEEP_RW)
+                else Mount(m.host, m.sandbox, False) for m in mounts]
 
     def _external_mounts(self, agent_dir_path: Path, agent_root_real: Path) -> list[Mount]:
         """The external-session additions to the agent-scope mount set
@@ -1158,8 +1286,8 @@ class SandboxBuilder:
         if not cfg.external:
             return []
         mounts: list[Mount] = []
-        if (agent_dir_path / "knowledge" / "memory").is_dir():
-            mounts.append(Mount(str(empty_mount_dir()), "/knowledge/memory", False))
+        if (agent_dir_path / layout.KNOWLEDGE / "memory").is_dir():
+            mounts.append(Mount(str(empty_mount_dir()), f"{layout.V_KNOWLEDGE}/memory", False))
         if not cfg.external_home:
             return mounts
         home = Path(cfg.external_home)
@@ -1170,7 +1298,7 @@ class SandboxBuilder:
                 "plain directory under the agent tree (possible tampering)"
             )
         rel_parts = home_real.relative_to(agent_root_real).parts
-        for sub in ("workspace", "context"):
+        for sub in layout.USER_SUBDIRS:
             p = _verified_literal_path(agent_root_real, *rel_parts, sub)
             if p is None:
                 raise RuntimeError(
@@ -1184,12 +1312,14 @@ class SandboxBuilder:
                     "changed underneath the build (possible tampering)"
                 )
         mounts.append(Mount(str(home), EXTERNAL_SANDBOX_HOME, False))
-        for sub in ("workspace", "context"):
+        for sub in layout.USER_SUBDIRS:
             mounts.append(Mount(str(home / sub), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
         for sub in (".claude", ".codex"):
             p = _verified_literal_path(agent_root_real, *rel_parts, sub)
             if p is not None and p.is_dir():
                 mounts.append(Mount(str(p), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
+        # This caller's CLI state is its own (/caller): the agent scope's is masked.
+        mounts.extend(self._agent_state_masks(agent_root_real))
         return mounts
 
     def _mcp_mounts(self) -> list[str]:
@@ -1258,16 +1388,11 @@ class SandboxBuilder:
         return args
 
 
-# Per-session config-directory setup lives in session_config_dir.py; the hook
-# helpers + ensure_persistent_*/prepare_mcp builders are re-exported here so
-# existing `from core.sandbox.sandbox import ensure_persistent_claude_dir` (and the many
-# call-time local imports across the codebase) keep working unchanged.
+# Per-session config-directory setup lives in session_config_dir.py (the
+# shared spine; the engines' own bodies sit in core/layers/<x>/config_dir.py);
+# the funnel and the MCP config copy are re-exported here for the call-time
+# local imports across the codebase.
 from core.sandbox.session_config_dir import (  # noqa: F401
-    _copy_hook_lf,
-    _DISALLOWED_BUILTIN_TOOLS,
-    _build_sandbox_cli_settings,
-    ensure_persistent_claude_dir,
-    ensure_persistent_codex_dir,
     ensure_persistent_agent_dir,
     prepare_mcp_config_for_sandbox,
 )
@@ -1335,6 +1460,7 @@ def resolve_sandbox_config(
     mcp_dir_binds: list[str] | None = None,
     external: bool = False,
     external_home: str = "",
+    read_only: bool = False,
 ) -> SandboxConfig:
     """Build a SandboxConfig from session context.
 
@@ -1427,4 +1553,5 @@ def resolve_sandbox_config(
         ),
         external=external,
         external_home=external_home or "",
+        read_only=read_only,
     )

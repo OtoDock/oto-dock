@@ -11,7 +11,13 @@ import threading
 from datetime import datetime, timezone
 
 import config
+from core.execution_layer import DEFAULT_EXECUTION_PATH  # the leaf: no cycle
 from storage.pg import get_conn
+from auth import roles
+from core import layout
+
+# ``agents.default_for_new_users_role``: off (""), or the per-agent role a new user is attached with.
+_DEFAULT_ROLE_CHOICES = (roles.NO_ACCESS, *roles.AGENT_ROLES)
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +246,7 @@ def create_agent(
     display_name: str,
     *,
     admin_only: bool = False,
-    execution_path: str = "claude-code-cli",
+    execution_path: str = DEFAULT_EXECUTION_PATH,
     default_model: str = "",
     default_effort: str = "",
     created_by: str = "",
@@ -301,12 +307,12 @@ def create_agent(
     try:
         from services.infra import git_writer
         agent_dir = config.AGENTS_DIR / slug
-        (agent_dir / "config" / "context").mkdir(parents=True, exist_ok=True)
-        (agent_dir / "knowledge").mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.CONFIG / layout.CONTEXT).mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.KNOWLEDGE).mkdir(parents=True, exist_ok=True)
         # Create workspace/ up front too. It otherwise materializes lazily at
         # first session (core/sandbox/sandbox.py), which is too late to stamp the XFS
         # project-inherit flag BEFORE the agent's first write — see ensure_scope.
-        (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
+        (agent_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
         git_writer.init_if_missing(agent_dir / "config")
     except Exception:
         pass
@@ -340,6 +346,18 @@ def set_community_template_data(slug: str, data: dict) -> None:
     _invalidate_cache()
 
 
+def set_community_template_version(slug: str, version: str) -> None:
+    """The template version an agent now carries (a template update moves
+    it last, after every piece it replaced)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agents SET community_template_version = %s, updated_at = %s WHERE slug = %s",
+            (version, _now(), slug),
+        )
+        conn.commit()
+    _invalidate_cache()
+
+
 def get_community_template_data(slug: str) -> dict | None:
     """Return the persisted template JSON for an agent, or None if absent.
 
@@ -365,9 +383,9 @@ def set_default_for_new_users_role(slug: str, role: str) -> None:
     constraint enforces this; the Python guard here gives a friendlier
     error message.
     """
-    if role not in ("", "viewer", "editor", "manager"):
+    if role not in _DEFAULT_ROLE_CHOICES:
         raise ValueError(
-            f"role must be one of '', 'viewer', 'editor', 'manager'; got {role!r}"
+            f"role must be one of {', '.join(repr(r) for r in _DEFAULT_ROLE_CHOICES)}; got {role!r}"
         )
     with get_conn() as conn:
         conn.execute(
@@ -424,9 +442,10 @@ def update_agent(slug: str, **fields) -> dict | None:
             f"default_scope must be 'user' or 'agent', got {updates['default_scope']!r}"
         )
     if "default_for_new_users_role" in updates and \
-            updates["default_for_new_users_role"] not in ("", "viewer", "editor", "manager"):
+            updates["default_for_new_users_role"] not in _DEFAULT_ROLE_CHOICES:
         raise ValueError(
-            f"default_for_new_users_role must be one of '', 'viewer', 'editor', 'manager'; "
+            f"default_for_new_users_role must be one of "
+            f"{', '.join(repr(r) for r in _DEFAULT_ROLE_CHOICES)}; "
             f"got {updates['default_for_new_users_role']!r}"
         )
     if "default_execution_mode" in updates and \
@@ -472,7 +491,7 @@ def delete_agent(slug: str) -> bool:
         agent's chat URLs (``/chat/<slug>/<id>``) 404 instead of replaying.
         Chatless media_tokens rows stamped with the agent (workspace mints,
         task-session artifacts) are deleted directly. pinned_apps rows
-        (mini-app registry) and pinned_files rows (Dock file pins) likewise.
+        (app registry) and pinned_files rows (Dock file pins) likewise.
       - Remote-machine attachments: user_remote_targets (personal overrides);
         agent_remote_targets (admin defaults) cascade via their agents-FK.
       - File-sync state: sync_state, file_tombstones, file_author.
@@ -491,6 +510,15 @@ def delete_agent(slug: str) -> bool:
     ``enabled=FALSE`` for an admin to reassign, rather than tearing down the PBX.
     """
     with get_conn() as conn:
+        # About 35 DELETEs in one transaction: a large agent's teardown must
+        # not be cut by the pool's 300 s statement timeout halfway (the
+        # transaction rolls back whole and the API answers 500 with the agent
+        # still there), and one blocked behind a stuck lock must fail rather
+        # than hold a pooled connection for ever (the lanes set no lock
+        # timeout of their own). Both LOCAL: the connection returns to the
+        # pool with its defaults.
+        conn.execute("SET LOCAL statement_timeout = '30min'")
+        conn.execute("SET LOCAL lock_timeout = '60s'")
         # MCP + RBAC
         conn.execute("DELETE FROM agent_mcps WHERE agent_name = %s", (slug,))
         conn.execute("DELETE FROM agent_skills WHERE agent_name = %s", (slug,))
@@ -521,7 +549,7 @@ def delete_agent(slug: str) -> bool:
         # task-session artifacts) — their files live under the agent folder
         # being removed, so the rows would only ever serve 404s.
         conn.execute("DELETE FROM media_tokens WHERE agent = %s", (slug,))
-        # Pinned mini-apps registry (shared + every user's personal rows —
+        # Pinned apps registry (shared + every user's personal rows —
         # their HTML files live under the agent folder being removed).
         conn.execute("DELETE FROM pinned_apps WHERE agent = %s", (slug,))
         # Dock file pins — references into the agent folder being removed
@@ -542,6 +570,9 @@ def delete_agent(slug: str) -> bool:
         # Task-run history + per-agent usage/cost ledger.
         conn.execute("DELETE FROM task_runs WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM usage_records WHERE agent = %s", (slug,))
+        # Checks (CHECKS.md): the index and the settings cascade off the
+        # agents FK; the verdict store has none.
+        conn.execute("DELETE FROM check_verdicts WHERE agent = %s", (slug,))
         # Webhook trigger subscriptions. The endpoint's cleanup_agent_subscriptions
         # already ran the vendor-side DELETE for service-scope rows before we got
         # here; this drops any remaining rows so none reference the dead slug.

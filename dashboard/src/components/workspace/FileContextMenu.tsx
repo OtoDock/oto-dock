@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { pushEscHandler } from '../../lib/escStack'
+import { usePopoverPlacement } from '../ui/popoverPosition'
 
 export interface MenuAction {
   key: string
@@ -18,9 +19,14 @@ interface Props {
 }
 
 /** Shared context menu rendered at a fixed (x, y) — right-click, long-press
- * and the 3-dot tile button all open this. */
+ * and the 3-dot tile button all open this. The panel is measured after it
+ * mounts and clamped to the viewport (`usePopoverPlacement`, the same rule
+ * as the app tab menu): a menu opened near the right or bottom edge slides
+ * in, and one opened near the bottom flips above the point. */
 export default function FileContextMenu({ x, y, actions, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null)
+  const anchor = useMemo(() => ({ top: y, bottom: y, left: x, right: x }), [x, y])
+  const placement = usePopoverPlacement(anchor, ref, { align: 'left', gap: 0 })
 
   useEffect(() => pushEscHandler(onClose), [onClose])
   useEffect(() => {
@@ -31,16 +37,16 @@ export default function FileContextMenu({ x, y, actions, onClose }: Props) {
     return () => document.removeEventListener('mousedown', onMouseDown)
   }, [onClose])
 
-  // Clamp inside viewport.
-  const maxX = typeof window !== 'undefined' ? window.innerWidth - 200 : x
-  const maxY = typeof window !== 'undefined' ? window.innerHeight - 220 : y
-  const clampedX = Math.min(x, maxX)
-  const clampedY = Math.min(y, maxY)
-
   return (
     <div
       ref={ref}
-      style={{ position: 'fixed', top: clampedY, left: clampedX, zIndex: 60 }}
+      style={{
+        position: 'fixed',
+        top: placement?.top ?? y,
+        left: placement?.left ?? x,
+        visibility: placement ? 'visible' : 'hidden',
+        zIndex: 60,
+      }}
       className="min-w-[170px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
     >
       {actions.map((a) => (

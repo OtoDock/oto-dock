@@ -12,6 +12,7 @@ Run individually (the conftest DB pool exhausts if test files run together):
 """
 
 import pytest
+from pathlib import Path
 
 import config
 from storage.files import recover_bin_store as rb
@@ -301,7 +302,10 @@ def _fanout_calls(monkeypatch):
     """
     calls = []
 
-    async def _fake(agent_slug, rel_path, content, **kw):
+    async def _fake(agent_slug, rel_path, source, **kw):
+        # The publish hands the fan-out the platform copy's Path (read beneath
+        # the root there); the recorder reads it so the assertions see bytes.
+        content = source if isinstance(source, bytes) else Path(source).read_bytes()
         calls.append((agent_slug, rel_path, content))
 
     monkeypatch.setattr("services.remote.workspace_fanout.fan_out_write", _fake)

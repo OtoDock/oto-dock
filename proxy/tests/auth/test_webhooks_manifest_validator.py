@@ -578,3 +578,57 @@ def test_validator_event_catalog_vendor_create_fields():
         ]
         with pytest.raises(ValueError, match="vendor_create_fields"):
             _validate_webhooks_block(block, "test-mcp")
+
+
+def _kinds_block():
+    """The GitHub shape: two target kinds, the second restating the URLs."""
+    block = _minimal_valid_block()
+    block["registration"]["delete"] = {
+        "method": "DELETE",
+        "url_template": "https://api.example.com/repos/${vendor_target}/hooks/${vendor_subscription_id}",
+        "expected_status": [204, 404],
+    }
+    block["vendor_target_spec"]["target_kinds"] = [
+        {"key": "repository", "label": "One repository",
+         "validation_regex": "^[^/]+/[^/]+$"},
+        {"key": "organization", "label": "Every repository in an organization",
+         "validation_regex": "^[^/]+$", "required_scopes": ["admin:org_hook"],
+         "registration": {
+             "create": {"url_template": "https://api.example.com/orgs/${vendor_target}/hooks"},
+             "delete": {"url_template": "https://api.example.com/orgs/${vendor_target}/hooks/${vendor_subscription_id}"},
+         }},
+    ]
+    return block
+
+
+def test_validator_target_kinds_valid_and_optional():
+    """Kinds pass; the same block without them is what an older proxy sees."""
+    from services.mcp.mcp_registry import _validate_webhooks_block
+    block = _kinds_block()
+    _validate_webhooks_block(block, "test-mcp")
+    del block["vendor_target_spec"]["target_kinds"]
+    _validate_webhooks_block(block, "test-mcp")
+
+
+def test_validator_target_kinds_rejections():
+    """Shape errors name the kind; an override is validated merged with the
+    top-level call, so a bad method in the override is a bad method."""
+    from services.mcp.mcp_registry import _validate_webhooks_block
+
+    def mutate(fn, match):
+        block = _kinds_block()
+        fn(block["vendor_target_spec"]["target_kinds"])
+        with pytest.raises(ValueError, match=match):
+            _validate_webhooks_block(block, "test-mcp")
+
+    mutate(lambda k: k.clear(), "non-empty list")
+    mutate(lambda k: k.append(dict(k[0])), "repeats an earlier kind")
+    mutate(lambda k: k[0].pop("label"), r"target_kinds\[0\].label")
+    mutate(lambda k: k[1].update(validation_regex="("), "does not compile")
+    mutate(lambda k: k[1].update(required_scopes="admin:org_hook"), "required_scopes")
+    mutate(lambda k: k[1]["registration"].update(renew={"url_template": "x"}),
+           "does not declare")
+    mutate(lambda k: k[1]["registration"].update(list_endpoint={"url_template": "x"}),
+           "may only restate")
+    mutate(lambda k: k[1]["registration"]["create"].update(method="TRACE"),
+           "target kind 'organization'")

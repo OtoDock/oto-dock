@@ -1,5 +1,7 @@
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
 import { cleanUserMessageText } from './transcriptCleanup'
+import { LIVE_BLOCK, PERSISTED, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
+import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from './status/run'
 
 // Pure mappers from wire/DB event shapes to renderable MessageBlocks.
 // Single source of truth shared by AgentChat (live chat + task chats)
@@ -24,7 +26,7 @@ export function costBilledOf(evt: { cost_billed?: unknown }): boolean | undefine
 export function latestCostBilled(dbMessages: any[]): boolean {
   for (let i = dbMessages.length - 1; i >= 0; i--) {
     const m = dbMessages[i]
-    if (m?.role !== 'event' || m.event_type !== 'metadata' || !m.event_data) continue
+    if (m?.role !== 'event' || m.event_type !== WIRE.METADATA || !m.event_data) continue
     try {
       return costBilledOf(JSON.parse(m.event_data)) !== false
     } catch {
@@ -37,7 +39,7 @@ export function latestCostBilled(dbMessages: any[]): boolean {
 /** Convert a live_state inline_block to a MessageBlock for reconnect rendering. */
 export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
   switch (ib.type) {
-    case 'images':
+    case WIRE.IMAGES:
       return {
         type: 'images',
         images: (Array.isArray(ib.images) ? ib.images : []).map((it: any) => ({
@@ -50,36 +52,41 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
           downloadUrl: it.download_url || undefined,
         })),
       }
-    case 'image_generating':
+    case WIRE.IMAGE_GENERATING:
       return { type: 'image_generating', promptPreview: ib.prompt_preview || '', model: ib.model || '' }
-    case 'url':
+    case WIRE.URL:
       return { type: 'url', url: ib.url, title: ib.title, description: ib.description || '' }
-    case 'file':
+    case WIRE.FILE:
       return { type: 'file', filename: ib.filename, downloadUrl: ib.download_url, description: ib.description || '' }
-    case 'video':
+    case WIRE.VIDEO:
       return { type: 'video', srcKind: ib.src_kind === 'token' ? 'token' : 'url', url: ib.url || undefined, mediaUrl: ib.media_url || undefined, token: ib.token || undefined, mime: ib.mime || undefined, caption: ib.caption || undefined, title: ib.title || undefined, poster: ib.poster || undefined }
-    case 'audio':
+    case WIRE.AUDIO:
       return { type: 'audio', srcKind: ib.src_kind === 'token' ? 'token' : 'url', url: ib.url || undefined, mediaUrl: ib.media_url || undefined, token: ib.token || undefined, mime: ib.mime || undefined, caption: ib.caption || undefined, title: ib.title || undefined }
-    case 'media_processing':
+    case WIRE.MEDIA_PROCESSING:
       return { type: 'media_processing', mediaKind: ib.media_kind === 'audio' ? 'audio' : 'video', caption: ib.caption || undefined }
-    case 'document_preview':
+    case WIRE.DOCUMENT_PREVIEW:
       return { type: 'document_preview', wopiUrl: ib.wopi_url, filename: ib.filename, fileId: ib.file_id, downloadUrl: ib.download_url, snapshotId: ib.snapshot_id || undefined, generation: ib.generation || undefined }
-    case 'ui':
+    case WIRE.UI:
       return { type: 'ui', token: ib.token || '', uiUrl: ib.ui_url || '', title: ib.title || undefined, height: typeof ib.height === 'number' ? ib.height : undefined, path: ib.path || undefined }
-    case 'artifact_interaction':
+    case WIRE.ARTIFACT_INTERACTION:
       return { type: 'artifact_interaction', token: ib.token || '', title: ib.title || undefined, payload: ib.payload }
-    case 'app_action':
+    case WIRE.APP_ACTION:
       return { type: 'app_action', appId: ib.app_id || '', slug: ib.slug || undefined, title: ib.title || undefined, actionId: ib.action_id || '', label: ib.label || undefined, prompt: ib.prompt || undefined }
-    case 'question':
+    case WIRE.QUESTION:
       return { type: 'question', toolName: ib.tool_name || '', toolInput: ib.tool_input || {}, answered: false }
-    case 'thinking':
+    case WIRE.THINKING:
       return { type: 'thinking', content: ib.content || '', collapsed: true, done: true }
-    case 'metadata':
+    case WIRE.METADATA:
       return { type: 'metadata', costUsd: ib.cost_usd ?? 0, durationMs: ib.duration_ms ?? 0, costBilled: costBilledOf(ib) }
-    case 'plan_mode':
+    case WIRE.PLAN_MODE:
       return { type: 'plan', action: ib.action || 'enter', toolInput: ib.tool_input }
-    case 'system':
+    case WIRE.SYSTEM:
       return { type: 'system', subtype: ib.subtype || '', message: ib.message, agentName: ib.agent_display_name || ib.agent, agentColor: ib.agent_color }
+    case WIRE.CHECK_VERDICT:
+      // The pump keeps the verdict card event in the live state as-is.
+      return eventToBlock(ib)
+    case WIRE.CONTEXT_COMPACT:
+      return { type: 'system', subtype: SYSTEM_SUBTYPE.CONTEXT_COMPRESSED }
     default:
       return null
   }
@@ -87,7 +94,7 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
 
 export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | null {
   switch (evt.type) {
-    case 'images':
+    case WIRE.IMAGES:
       return {
         type: 'images',
         images: (Array.isArray(evt.images) ? evt.images : []).map((it: any) => ({
@@ -100,23 +107,23 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
           downloadUrl: it.download_url || undefined,
         })),
       }
-    case 'url':
+    case WIRE.URL:
       return { type: 'url', url: evt.url, title: evt.title, description: evt.description || '' }
-    case 'file':
+    case WIRE.FILE:
       return { type: 'file', filename: evt.filename, downloadUrl: evt.download_url, description: evt.description || '' }
-    case 'video':
+    case WIRE.VIDEO:
       return { type: 'video', srcKind: evt.src_kind === 'token' ? 'token' : 'url', url: evt.url || undefined, mediaUrl: evt.media_url || undefined, token: evt.token || undefined, mime: evt.mime || undefined, caption: evt.caption || undefined, title: evt.title || undefined, poster: evt.poster || undefined }
-    case 'audio':
+    case WIRE.AUDIO:
       return { type: 'audio', srcKind: evt.src_kind === 'token' ? 'token' : 'url', url: evt.url || undefined, mediaUrl: evt.media_url || undefined, token: evt.token || undefined, mime: evt.mime || undefined, caption: evt.caption || undefined, title: evt.title || undefined }
-    case 'document_preview':
+    case WIRE.DOCUMENT_PREVIEW:
       return { type: 'document_preview', wopiUrl: evt.wopi_url, filename: evt.filename, fileId: evt.file_id, downloadUrl: evt.download_url, dbMessageId, snapshotId: evt.snapshot_id || undefined, generation: evt.generation || undefined }
-    case 'ui':
+    case WIRE.UI:
       return { type: 'ui', token: evt.token || '', uiUrl: evt.ui_url || '', title: evt.title || undefined, height: typeof evt.height === 'number' ? evt.height : undefined, path: evt.path || undefined }
-    case 'artifact_interaction':
+    case WIRE.ARTIFACT_INTERACTION:
       return { type: 'artifact_interaction', token: evt.token || '', title: evt.title || undefined, payload: evt.payload }
-    case 'app_action':
+    case WIRE.APP_ACTION:
       return { type: 'app_action', appId: evt.app_id || '', slug: evt.slug || undefined, title: evt.title || undefined, actionId: evt.action_id || '', label: evt.label || undefined, prompt: evt.prompt || undefined }
-    case 'tool':
+    case PERSISTED.TOOL:
       // The synthesized Task-tool checklist snapshot (persisted with panel_only) is
       // restore-only: the TaskCreate/TaskUpdate calls already render their own inline
       // cards, so suppress this one inline. It still drives the panel restore via the
@@ -133,7 +140,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         toolResult: evt.tool_result,
         resultSummary: evt.result_summary,
       }
-    case 'task_spawn':
+    case WIRE.TASK_SPAWN:
       return {
         type: 'subagent',
         description: evt.description || '',
@@ -144,7 +151,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         toolInput: evt.tool_input,      // full Agent input (expandable pill)
         toolResult: evt.tool_result,    // fg subagent report, when attached
       }
-    case 'bg_command_spawn':
+    case WIRE.BG_COMMAND_SPAWN:
       return {
         type: 'bgcommand',
         command: evt.command || '',
@@ -152,7 +159,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         isActive: false,  // Historical = finished (spawn-only persist, mirrors subagents)
         _toolId: evt.tool_use_id || undefined,
       }
-    case 'delegate_spawn':
+    case WIRE.DELEGATE_SPAWN:
       return {
         type: 'delegate',
         taskName: evt.task_name || '',
@@ -163,14 +170,24 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         prompt: evt.prompt || '',       // full prompt (expandable pill)
         workerChatId: evt.chat_id || undefined,  // chat-surface lane → open-lane link
       }
-    case 'delegate_result':
+    case WIRE.DELEGATE_RESULT:
       return null  // Handled by post-processing (marks matching delegate_spawn as completed)
-    case 'schedule_wake':
+    case PERSISTED.SCHEDULE_WAKE:
       // A scheduled self-continuation drove this turn — show the wake row.
       return { type: 'schedulewake', prompt: evt.prompt || '' }
-    case 'thinking':
+    case WIRE.CHECK_VERDICT:
+      // A check judged this turn (CHECKS.md): the compact verdict card.
+      return {
+        type: 'checkverdict', check: evt.check || '', status: evt.status || 'error',
+        pass: !!evt.pass, score: evt.score ?? null, summary: evt.summary || '',
+        findings: Array.isArray(evt.findings) ? evt.findings : [],
+        findingsTotal: typeof evt.findings_total === 'number' ? evt.findings_total : (Array.isArray(evt.findings) ? evt.findings.length : 0),
+        round: evt.round || 1, rounds: evt.rounds || 0, ranOn: evt.ran_on || '',
+        costUsd: typeof evt.cost_usd === 'number' ? evt.cost_usd : 0, verdictId: evt.verdict_id || undefined,
+      }
+    case WIRE.THINKING:
       return { type: 'thinking', content: evt.content || '', collapsed: true, done: true }
-    case 'permission_prompt':
+    case WIRE.PERMISSION_PROMPT:
       return {
         type: 'permission',
         requestId: evt.request_id || '',
@@ -180,11 +197,11 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         resolved: true,
         approved: evt.approved !== false,  // Default true unless explicitly rejected (dead session)
       }
-    case 'question':
+    case WIRE.QUESTION:
       return { type: 'question', toolName: evt.tool_name || '', toolInput: evt.tool_input || {}, answered: false }
-    case 'plan_mode':
+    case WIRE.PLAN_MODE:
       return { type: 'plan', action: evt.action || 'enter', toolInput: evt.tool_input }
-    case 'plan_review':
+    case WIRE.PLAN_REVIEW:
       return {
         type: 'plan_review',
         requestId: evt.request_id || '',
@@ -194,16 +211,20 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         resolved: true,  // Historical = already resolved
         action: evt.action || 'reject',  // No action saved = was never resolved = cancelled
       }
-    case 'system':
+    case WIRE.SYSTEM:
       return { type: 'system', subtype: evt.subtype || '', message: evt.message, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
-    case 'metadata':
+    case WIRE.METADATA:
       return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0, costBilled: costBilledOf(evt) }
-    case 'bg_nudge':
-      return { type: 'system', subtype: 'bg_agents_completed' }
-    case 'bg_command_nudge':
-      return { type: 'system', subtype: 'bg_commands_completed' }
-    case 'fg_agents_complete':
-    case 'bg_agent_done':
+    case PERSISTED.BG_NUDGE:
+      return { type: 'system', subtype: SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED }
+    case PERSISTED.BG_COMMAND_NUDGE:
+      return { type: 'system', subtype: SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED }
+    case WIRE.CONTEXT_COMPACT:
+      // The pump persists the compaction's `completed` block; the live path
+      // shows the same separator (core-seams phase 6, D9b).
+      return { type: 'system', subtype: SYSTEM_SUBTYPE.CONTEXT_COMPRESSED }
+    case WIRE.FG_AGENTS_COMPLETE:
+    case WIRE.BG_AGENT_DONE:
       return null  // Status update, no block
     default:
       return null
@@ -218,6 +239,32 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
  * view-toggle (terminal ⇄ rich DB history). `agents`
  * supplies delegate identity (display_name + color) — pass useAgents()'s data.
  */
+/**
+ * The attachment blocks of a user message from the server's meta — the
+ * `event_data` of a stored row and the `images` / `files` of a `queued`,
+ * `steered` or `queue_sent` frame are the same shape, so a bubble rendered
+ * live looks like the same bubble after a reload.
+ */
+export function attachmentBlocks(
+  images?: Array<{ name: string; path?: string }> | null,
+  files?: Array<{ name: string; path?: string }> | null,
+): MessageBlock[] {
+  const blocks: MessageBlock[] = []
+  if (Array.isArray(files) && files.length) {
+    blocks.push({ type: 'file_attachments', files: files.map(f => ({ name: f.name, path: f.path })) })
+  }
+  if (Array.isArray(images) && images.length) {
+    blocks.push({
+      type: 'image_attachments',
+      images: images.map(i => i.name),
+      // saved upload paths — rows persisted before paths were stored
+      // carry none, and the renderer falls back to the count badge
+      paths: images.map(i => i.path ?? null),
+    })
+  }
+  return blocks
+}
+
 export function dbMessagesToDisplay(
   dbMessages: any[],
   agents: Array<{ name: string; display_name?: string; color?: string }> | undefined,
@@ -237,18 +284,7 @@ export function dbMessagesToDisplay(
       if (m.event_data) {
         try {
           const ed = JSON.parse(m.event_data)
-          if (Array.isArray(ed.files) && ed.files.length) {
-            blocks.push({ type: 'file_attachments', files: ed.files.map((f: { name: string; path?: string }) => ({ name: f.name, path: f.path })) })
-          }
-          if (Array.isArray(ed.images) && ed.images.length) {
-            blocks.push({
-              type: 'image_attachments',
-              images: ed.images.map((i: { name: string }) => i.name),
-              // saved upload paths — rows persisted before paths were stored
-              // carry none, and the renderer falls back to the count badge
-              paths: ed.images.map((i: { path?: string }) => i.path ?? null),
-            })
-          }
+          blocks.push(...attachmentBlocks(ed.images, ed.files))
           if (ed.agent_slug) agentMeta = ed
         } catch { /* ignore */ }
       }
@@ -310,15 +346,15 @@ export function dbMessagesToDisplay(
       newTurnNext = false
     } else if (m.role === 'event' && m.event_data) {
       // delegate_result / bg_nudge / artifact_interaction / app_action signal a new LLM turn
-      if (m.event_type === 'delegate_result' || m.event_type === 'bg_nudge' || m.event_type === 'bg_command_nudge' || m.event_type === 'artifact_interaction' || m.event_type === 'app_action') {
+      if (m.event_type === WIRE.DELEGATE_RESULT || m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION) {
         newTurnNext = true
       }
       // Meeting turn start: force new message with agent identity
       let meetingTurnAgent: { slug: string; displayName: string; color: string } | null = null
-      if (m.event_type === 'system') {
+      if (m.event_type === WIRE.SYSTEM) {
         try {
           const sysEd = JSON.parse(m.event_data || '{}')
-          if (sysEd.subtype === 'meeting_turn_start') {
+          if (sysEd.subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) {
             newTurnNext = true
             meetingTurnAgent = {
               slug: sysEd.agent || '',
@@ -377,7 +413,7 @@ export function dbMessagesToDisplay(
         // Delegate result with output: insert as separate agent message.
         // output_text is non-empty for failed/canceled terminals too (the
         // backend synthesizes a ⚠ marker), so this never mints an empty bubble.
-        if (m.event_type === 'delegate_result' && evt.output_text) {
+        if (m.event_type === WIRE.DELEGATE_RESULT && evt.output_text) {
           const delegateAgent = agents?.find(a => a.name === evt.agent)
           displayMsgs.push({
             id: `db-delresult-${m.id}`,
@@ -387,8 +423,9 @@ export function dbMessagesToDisplay(
             agentSlug: evt.agent || '',
             agentDisplayName: delegateAgent?.display_name,
             agentColor: delegateAgent?.color || '',
-            badge: evt.status === 'cancelled' ? 'delegate canceled'
-              : evt.status === 'failed' ? 'delegate failed'
+            badge: evt.status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
+              : evt.status === DELEGATE_RESULT.FAILED ? 'delegate failed'
+              : evt.status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
               : 'delegate response',
           })
           // The response bubble belongs to the DELEGATE agent — whatever
@@ -438,13 +475,13 @@ export function dbMessagesToDisplay(
     try {
       const ed = JSON.parse(m.event_data)
       const name = ed.task_name || ''
-      if (m.event_type === 'delegate_spawn') {
+      if (m.event_type === WIRE.DELEGATE_SPAWN) {
         spawnCounts[name] = (spawnCounts[name] || 0) + 1
-      } else if (m.event_type === 'delegate_result') {
+      } else if (m.event_type === WIRE.DELEGATE_RESULT) {
         resultCounts[name] = (resultCounts[name] || 0) + 1
         if (ed.task_id) {
           completedTaskIds.add(ed.task_id)
-          statusByTaskId[ed.task_id] = ed.status || 'completed'
+          statusByTaskId[ed.task_id] = ed.status || DELEGATE_RESULT.COMPLETED
         }
       }
     } catch { /* skip */ }
@@ -460,20 +497,20 @@ export function dbMessagesToDisplay(
       const b = msg.blocks[j]
       if (b.type !== 'delegate') continue
       if (b._taskId) {
-        // Resolve the terminal status (completed/failed/cancelled) from the
-        // matching delegate_result; still 'running' until its result arrives.
-        const st = completedTaskIds.has(b._taskId)
-          ? ((statusByTaskId[b._taskId] || 'completed') as 'completed' | 'failed' | 'cancelled' | 'user_interrupted')
-          : ('running' as const)
+        // Resolve the delegate result from the matching delegate_result
+        // row; still running until its result arrives.
+        const st: DelegateBlockStatus = completedTaskIds.has(b._taskId)
+          ? ((statusByTaskId[b._taskId] || DELEGATE_RESULT.COMPLETED) as DelegateBlockStatus)
+          : RUN_STATUS.RUNNING
         msg.blocks[j] = { ...b, status: st }
       } else {
         const name = b.taskName
         const left = runningLeft[name] || 0
         if (left > 0) {
-          msg.blocks[j] = { ...b, status: 'running' as const }
+          msg.blocks[j] = { ...b, status: RUN_STATUS.RUNNING }
           runningLeft[name] = left - 1
         } else {
-          msg.blocks[j] = { ...b, status: 'completed' as const }
+          msg.blocks[j] = { ...b, status: DELEGATE_RESULT.COMPLETED }
         }
       }
     }

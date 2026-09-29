@@ -19,7 +19,7 @@ from storage.mcp import mcp_store
 from storage import database as task_store
 from services.mcp import mcp_registry
 from services.oauth import oauth_account_store
-from auth.providers import UserContext, get_current_user
+from auth.providers import UserContext, get_current_user, require_auth
 
 logger = logging.getLogger("claude-proxy.credential-api")
 router = APIRouter()
@@ -110,6 +110,24 @@ def _read_account_token_scopes(
     return list(raw)
 
 
+def _service_binding_summary(agent_name: str, user: UserContext) -> dict:
+    """One ``service_bindings`` entry of an account summary: the agent an
+    account serves as service identity, whether the caller manages it and
+    whether its visibility mode offers agent scope (a service-scope
+    subscription needs both)."""
+    from core.session.visibility import available_scopes_for
+    row = agent_store.get_agent(agent_name) or {}
+    scopes = available_scopes_for(
+        bool(row.get("collaborative", True)), row.get("default_scope") or "user",
+    )
+    return {
+        "agent_name": agent_name,
+        "display_name": row.get("display_name") or agent_name,
+        "can_manage": user.can_manage_agent(agent_name),
+        "agent_scope_available": "agent" in scopes,
+    }
+
+
 # --- MCP Schema ---
 
 @router.get("/v1/mcp-credential-schema")
@@ -117,7 +135,7 @@ async def get_credential_schema(
     user: UserContext = Depends(get_current_user),
 ):
     """Return all MCP credential schemas (drives dashboard forms)."""
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     return mcp_registry.get_all_credential_schemas()
 
@@ -133,7 +151,7 @@ async def list_my_integrations(
     Scans the user's assigned agents, collects all per-user MCPs, and returns
     status for each.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
 
     # Two separate agent sets:
@@ -204,11 +222,23 @@ async def list_my_integrations(
         email_key, services_key = oauth_account_store.resolve_account_credential_keys(
             oauth_block, provider_id,
         )
+        # Agents whose service identity is one of THIS user's accounts: the
+        # Connected Accounts card offers "Subscribe as <agent>" from them,
+        # so the option never rests on a client-side role guess.
+        service_rows = await asyncio.to_thread(
+            credential_store.list_service_agent_bindings, mcp_name,
+        )
+        service_rows = [b for b in service_rows if b.get("account_owner_sub") == user.sub]
         for acc in accounts_raw:
             acc_creds = await asyncio.to_thread(
                 credential_store.get_user_credentials,
                 user.sub, mcp_name, acc["account_label"],
             )
+            service_bindings = [
+                _service_binding_summary(b["agent_name"], user)
+                for b in service_rows
+                if b.get("account_label") == acc["account_label"]
+            ]
             connected_services = [
                 s for s in (acc_creds.get(services_key, "") or "").split(",") if s
             ]
@@ -240,6 +270,7 @@ async def list_my_integrations(
                     bindings_by_account.get(acc["account_label"], [])
                 ),
                 "missing_scopes": missing_scopes,
+                "service_bindings": service_bindings,
             })
 
         # Build user-overridable config fields with admin defaults
@@ -308,7 +339,7 @@ async def set_my_integration(
     account to upsert. Adding a second account = same endpoint with a
     different ``account_label`` and the same field values.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
 
     cred_info = _get_cred_schema(mcp_name)
@@ -360,7 +391,7 @@ async def delete_my_integration(
     ``?account_label=<label>`` is required. To remove every account for an
     MCP, the dashboard issues one DELETE per account row.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
 
     await asyncio.to_thread(
@@ -384,7 +415,7 @@ async def set_default_account(
     Unsets any other account's default — partial unique index enforces
     one default per (user_sub, mcp_name).
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     ok = await asyncio.to_thread(
         credential_store.set_default_account,
@@ -417,7 +448,7 @@ async def set_agent_binding(
        it on). A binding to an agent where the MCP isn't running would
        never resolve at session start, so reject up-front.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     user_assigned_agents = await asyncio.to_thread(
         task_store.get_user_agents, user.sub,
@@ -460,7 +491,7 @@ async def remove_agent_binding(
     by the caller if they're assigned to the agent. Safe to call when no
     binding exists (idempotent).
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     user_assigned_agents = await asyncio.to_thread(
         task_store.get_user_agents, user.sub,
@@ -503,7 +534,7 @@ async def get_agent_service_account_options(
                             set_by, set_at} | null,
       }
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     if not user.can_manage_agent(agent_name):
         raise HTTPException(
@@ -610,7 +641,7 @@ async def set_agent_service_binding(
 
     Visibility gate: the MCP must be in the agent's visible set.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     if not user.can_manage_agent(agent_name):
         raise HTTPException(
@@ -667,12 +698,32 @@ async def clear_agent_service_binding(
 
     Same per-agent manager/admin gate as the PUT. Idempotent.
     """
-    if user.is_api_key:
+    if require_auth(user).is_api_key:
         raise HTTPException(403, "Dashboard only")
     if not user.can_manage_agent(agent_name):
         raise HTTPException(
             403, f"Manager role on agent {agent_name!r} required",
         )
+    # The agent's service-scope subscriptions resolve their vendor token
+    # through this binding: unregister them while it still resolves, or a
+    # later re-bind makes their delete read the new owner's dir at the old
+    # label and the vendor hook leaks.
+    binding = await asyncio.to_thread(
+        credential_store.get_service_agent_binding, mcp_name, agent_name,
+    )
+    if binding is not None:
+        bound_label, bound_owner = binding
+        try:
+            from services.webhooks import subscription_manager
+            await subscription_manager.cleanup_account_subscriptions(
+                scope="service", owner=bound_owner, mcp_name=mcp_name,
+                account_label=bound_label, agent=agent_name,
+            )
+        except Exception:
+            logger.exception(
+                "Subscription cleanup raised while clearing the %s binding of %s "
+                "(continuing)", mcp_name, agent_name,
+            )
     await asyncio.to_thread(
         credential_store.remove_service_agent_binding,
         mcp_name, agent_name,
@@ -682,7 +733,8 @@ async def clear_agent_service_binding(
 
 # --- Admin: Infrastructure Credentials ---
 
-def _require_admin(user: UserContext):
+def _require_admin(user: UserContext | None):
+    user = require_auth(user)
     if user.is_service:
         return  # the trusted master key is admin-equivalent (service-to-service)
     if not user.is_admin:

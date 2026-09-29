@@ -7,6 +7,7 @@ Attaches to the shared core-auth router."""
 import asyncio
 import hmac
 import logging
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -17,15 +18,18 @@ from pydantic import BaseModel
 import config
 from auth.lan_check import check_local_auth_allowed, get_client_ip
 from auth.license import check_seat_limit
-from auth.password import check_password_strength, hash_password, verify_password
+from auth.password import HashBusy, check_password_strength_async, hash_password_async, verify_password_async
 from auth.providers import UserContext, apply_session_cookie, create_session_jwt, get_current_user, mask_email, require_auth, validate_oauth_state
 from auth.providers.local_provider import LocalAuthProvider
 from auth.providers.oidc_provider import OIDCAuthProvider, ensure_oidc_discovery
-from auth.rate_limiter import check_ip_rate_limit, clear_rate_limit, hit as rate_limit_hit, record_failed_attempt, record_successful_login
+from auth import rate_limiter
+from auth.rate_limiter import clear_rate_limit, hit as rate_limit_hit, record_successful_login
 from auth.totp import consume_2fa_session_token, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, validate_2fa_session_token, verify_recovery_code, verify_totp
+from services.agents import offboarding_sessions
 from storage import database as task_store
+from storage.pg import run_db
 
-from api.auth._common import _build_user_response, build_feature_flags
+from api.auth._common import build_feature_flags, user_payload
 from api.auth._router import router
 
 logger = logging.getLogger("claude-proxy")
@@ -119,10 +123,69 @@ class UpdateProfileRequest(BaseModel):
 
 
 def _issue_session_cookie(response: JSONResponse, sub: str, email: str,
-                          name: str, role: str, auth_provider: str = "local"):
-    """Set the HttpOnly session JWT cookie on a response."""
-    token = create_session_jwt(sub, email, name, role, auth_provider=auth_provider)
-    apply_session_cookie(response, token)
+                          name: str, role: str, auth_provider: str = "local", *,
+                          expiry_hours: int | None = None):
+    """Set the HttpOnly session JWT cookie on a response. ``expiry_hours``
+    (read off the loop with ``config.get_jwt_expiry_hours``) saves the two
+    settings reads the JWT and the cookie would each make on the loop."""
+    token = create_session_jwt(sub, email, name, role, auth_provider=auth_provider,
+                               expiry_hours=expiry_hours)
+    apply_session_cookie(response, token, expiry_hours=expiry_hours)
+
+
+async def _login_response(user_row: dict, auth_provider: str) -> JSONResponse:
+    """The answer to a full login: the user payload, the session cookie and
+    (password and passkey logins) the trusted-device cookie; every store read
+    on the DB executor."""
+    def _job():
+        return user_payload(user_row), config.get_jwt_expiry_hours()
+
+    user_data, hours = await run_db(_job)
+    response = JSONResponse(content={"user": user_data})
+    _issue_session_cookie(response, user_row["sub"], user_row["email"], user_row["name"],
+                          user_row["role"], auth_provider=auth_provider, expiry_hours=hours)
+    if auth_provider == "local":
+        _issue_device_cookie(response, user_row["sub"])
+    return response
+
+
+# The trusted-device cookie: set on every full password
+# or passkey login; that browser's later password logins for the same account
+# skip the account tarpit (``auth/rate_limiter.py``, "Trusted devices"). It
+# grants nothing on its own, so logout keeps it; a password change voids it.
+def _device_cookie_name() -> str:
+    return "__Host-otodock_device" if config.COOKIE_SECURE else "otodock_device"
+
+
+def _issue_device_cookie(response: JSONResponse, sub: str) -> None:
+    response.set_cookie(
+        _device_cookie_name(), rate_limiter.mint_device_token(sub),
+        max_age=rate_limiter.DEVICE_TOKEN_DAYS * 86400, httponly=True,
+        secure=config.COOKIE_SECURE, samesite="lax", path="/",
+    )
+
+
+def _hash_busy() -> HTTPException:
+    return HTTPException(503, "Too many sign-ins at once. Try again in a few seconds.",
+                         headers={"Retry-After": "5", "Connection": "close"})
+
+
+async def _password_matches(plain: str, hashed: str) -> bool:
+    try:
+        return await verify_password_async(plain, hashed)
+    except HashBusy:
+        raise _hash_busy()
+
+
+async def _new_password_hash(plain: str) -> str:
+    """The strength check (400 with its reason), then the hash."""
+    ok, msg, _ = await check_password_strength_async(plain)
+    if not ok:
+        raise HTTPException(400, msg)
+    try:
+        return await hash_password_async(plain)
+    except HashBusy:
+        raise _hash_busy()
 
 
 def _check_platform_configured(user_sub: str, role: str) -> bool:
@@ -133,11 +196,12 @@ def _check_platform_configured(user_sub: str, role: str) -> bool:
     never disagree — in particular it must NOT report "configured" when the only
     platform subscriptions are admin OAuth logins, which a user may not borrow.
     """
+    from core.session.session_manager import valid_execution_paths
     from services.engines import subscription_pool
 
     return any(
         subscription_pool.user_can_run(layer, user_sub)
-        for layer in ("claude-code-cli", "codex-cli", "direct-llm")
+        for layer in sorted(valid_execution_paths())
     )
 
 
@@ -145,39 +209,29 @@ def _oidc_state_cookie_name() -> str:
     return "__Host-oidc_state" if config.COOKIE_SECURE else "oidc_state"
 
 
-def _must_enroll_2fa(db_user: dict | None) -> bool:
-    """Whether the admin require-2FA policy forces enrollment for this user.
-
-    Local-password accounts without a second factor (TOTP or a registered
-    passkey) when ``require_2fa`` is on. OIDC users are exempt (their IdP owns
-    MFA). Enforcement is a forced enrollment screen after login (mirrors
-    must_change_password) — never a silent lockout. Sync — call via
-    asyncio.to_thread."""
-    if not db_user or not (db_user.get("auth_provider") or "local").startswith("local"):
-        return False
-    if db_user.get("totp_enabled"):
-        return False
-    if task_store.get_all_platform_settings().get("require_2fa", "") != "1":
-        return False
-    from storage.identity import webauthn_store
-    return webauthn_store.count_credentials(db_user["sub"]) == 0
-
-
 @router.get("/auth/config")
 async def auth_config():
     """Public endpoint: auth configuration for the login page.
 
-    No authentication required — frontend needs this before login.
+    No authentication required: the frontend needs this before login. Every
+    read (the users count, the settings, the license behind the relay
+    answers) runs as ONE job on the DB executor, the settings read once.
     """
-    setup_required = await asyncio.to_thread(task_store.count_users) == 0
-    settings = await asyncio.to_thread(task_store.get_all_platform_settings)
+    return await run_db(_auth_config_payload)
+
+
+def _auth_config_payload() -> dict:
+    setup_required = task_store.count_users() == 0
+    settings = task_store.get_all_platform_settings()
     smtp_configured = bool(settings.get("smtp_host", ""))
     # Cloudflare Turnstile: serve the (public) site key ONLY when verification is
     # actually enabled, so the rendered widget matches backend enforcement exactly.
     from services.infra import turnstile
     tcfg = turnstile.load_config(settings)
     from services.billing import relay_client
-    from api.auth.webauthn import passkey_login_mode, passkey_rp_host, passkeys_enabled
+    from api.auth.webauthn import passkey_rp_host, passkeys_enabled
+    mode = settings.get("passkey_login_mode", "")
+    relay_offered = relay_client.relay_offered()
     return {
         "oidc_enabled": config.OIDC_ENABLED,
         "oidc_provider_name": config.OIDC_PROVIDER_NAME,
@@ -196,7 +250,7 @@ async def auth_config():
         # decides whether that button exists at all (passwordless) or passkeys
         # appear only at the 2FA step after a correct password (second_factor).
         "passkeys_enabled": passkeys_enabled(),
-        "passkey_login_mode": passkey_login_mode(),
+        "passkey_login_mode": mode if mode in ("passwordless", "second_factor") else "passwordless",
         # The RP hostname passkeys are bound to (the public dashboard URL's
         # host). A browser on any OTHER origin (localhost, LAN IP) cannot run
         # the ceremony, so the login page hides its passkey buttons and points
@@ -206,14 +260,14 @@ async def auth_config():
         # OtoDock connectivity + deployment. `air_gapped` (effective — forced
         # false on cloud) = this install makes no outbound calls to OtoDock.
         # `relay_base` stays server-side; only these derived booleans are exposed.
-        "air_gapped": not relay_client.relay_offered(),
+        "air_gapped": not relay_offered,
         "relay_available": relay_client.is_available(),
         "cloud": config.OTODOCK_CLOUD,
     }
 
 
 @router.get("/auth/login")
-async def auth_login(mobile: bool = False):
+async def auth_login(request: Request, mobile: bool = False):
     """Generate OIDC authorization URL or signal that a login page should be shown.
 
     If AUTH_PROVIDER_BYPASS is set and OIDC is enabled, returns the OIDC URL directly
@@ -228,11 +282,32 @@ async def auth_login(mobile: bool = False):
             mobile=mobile,
         )
         if url:
-            return {"url": url}
+            resp = JSONResponse({"url": url})
+            _bind_oidc_state(request, resp, url)
+            return resp
         raise HTTPException(status_code=503, detail="OIDC not configured")
 
     # Normal mode: frontend shows login page
     return {"login_page": True}
+
+
+def _bind_oidc_state(request: Request, resp: JSONResponse, url: str) -> None:
+    """The login-CSRF binding: the state the URL carries joins the browser's
+    ring of recent states (the note above the cookie name). Every state is
+    bound, the native app's included: its WebView fetches the URL itself, so
+    the cookie lands in the WebView's jar, and the deep link reloads that
+    same WebView at the callback."""
+    state_val = parse_qs(urlparse(url).query).get("state", [""])[0]
+    if not state_val:
+        return
+    name = _oidc_state_cookie_name()
+    prior = [s for s in (request.cookies.get(name) or "").split(".") if s]
+    states = (prior + [state_val])[-_OIDC_STATE_COOKIE_MAX:]
+    resp.set_cookie(
+        name, ".".join(states),
+        max_age=_OIDC_STATE_TTL, httponly=True, secure=config.COOKIE_SECURE,
+        samesite="lax", path="/",
+    )
 
 
 @router.get("/auth/oidc-url")
@@ -248,20 +323,123 @@ async def auth_oidc_url(request: Request, mobile: bool = False):
     if not url:
         raise HTTPException(status_code=503, detail="OIDC not configured")
     resp = JSONResponse({"url": url})
-    # Web flow only — the native (mobile) app completes the callback without a
-    # browser cookie, so its binding is the custom-scheme redirect instead.
-    if not mobile:
-        state_val = parse_qs(urlparse(url).query).get("state", [""])[0]
-        if state_val:
-            name = _oidc_state_cookie_name()
-            prior = [s for s in (request.cookies.get(name) or "").split(".") if s]
-            states = (prior + [state_val])[-_OIDC_STATE_COOKIE_MAX:]
-            resp.set_cookie(
-                name, ".".join(states),
-                max_age=_OIDC_STATE_TTL, httponly=True, secure=config.COOKIE_SECURE,
-                samesite="lax", path="/",
-            )
+    _bind_oidc_state(request, resp, url)
     return resp
+
+
+# A same-origin path for the confirm flow to come back to: one leading
+# slash, no scheme, no backslash, no whitespace, at most 512 chars. The
+# encoded separators are refused below (an open redirect otherwise).
+_RETURN_TO_RE = re.compile(r"^/(?!/)[^\\\s]{0,511}$")
+
+
+def _safe_return_to(raw: str) -> str:
+    value = (raw or "").strip()
+    low = value.lower()
+    if not _RETURN_TO_RE.match(value) or "://" in low or "%2f%2f" in low or "%5c" in low:
+        raise HTTPException(status_code=400, detail="return_to must be a path on this site")
+    return value
+
+
+@router.get("/auth/confirm/oidc-url")
+async def auth_confirm_oidc_url(request: Request, return_to: str = "", mobile: bool = False,
+                                user: UserContext | None = Depends(get_current_user)):
+    """The identity-provider confirm (SHARING.md "The confirm"): the same
+    login URL a sign-in uses, with a confirm-purpose state, so the provider
+    answers whether this browser is signed in there as the same account and
+    the callback hands back a confirm, never a session. A new login is asked
+    for only under ``OIDC_CONFIRM_FRESH_LOGIN``. A cookie principal whose
+    account signed in through the provider; paced on the ``confirm`` bucket
+    like the other confirm methods."""
+    from auth.providers import require_human
+    u = require_human(user)
+    if not config.OIDC_ENABLED:
+        raise HTTPException(status_code=503, detail="OIDC not configured")
+    db_user = await asyncio.to_thread(task_store.get_user, u.sub)
+    if not db_user or not str(db_user.get("auth_provider") or "").startswith("oidc:"):
+        raise HTTPException(status_code=400,
+                            detail="This account did not sign in through the identity provider")
+    ok, retry_after = rate_limit_hit("confirm", u.sub)
+    if not ok:
+        raise HTTPException(429, f"Too many attempts. Try again in {retry_after} seconds.",
+                            headers={"Retry-After": str(retry_after)})
+    path = _safe_return_to(return_to) if return_to else "/"
+    await ensure_oidc_discovery()
+    url = _oidc_provider.get_login_url(
+        redirect_uri="otodock://auth/callback" if mobile else None,
+        mobile=mobile, prompt_login=config.OIDC_CONFIRM_FRESH_LOGIN,
+        purpose="confirm", sub=u.sub, return_to=path,
+    )
+    if not url:
+        raise HTTPException(status_code=503, detail="OIDC not configured")
+    resp = JSONResponse({"url": url})
+    _bind_oidc_state(request, resp, url)
+    return resp
+
+
+def _require_fresh_login(claims: dict, state_meta: dict, email: str) -> None:
+    """The strict confirm (``OIDC_CONFIRM_FRESH_LOGIN``): the ID token's
+    ``auth_time`` must be at or after the instant the confirm was started,
+    with a minute of slack for clocks; the state's own TTL bounds the
+    window. A provider that skips the login for a signed-in person answers
+    with the old login time (Authentik's defaults, the VM pass 2026-09-18):
+    the refusal says how old it was and what makes the next one fresh."""
+    auth_time = claims.get("auth_time")
+    started = float(state_meta.get("created_at") or 0)
+    if auth_time is None:
+        if config.OIDC_CONFIRM_REQUIRE_AUTH_TIME:
+            logger.warning(f"OIDC confirm refused for {mask_email(email)}: no auth_time in the ID token")
+            raise HTTPException(status_code=403,
+                                detail="The identity provider did not say when you logged in")
+        return
+    try:
+        at = float(auth_time)
+        fresh = at >= started - 60
+    except (TypeError, ValueError):
+        at, fresh = 0.0, False
+    if fresh:
+        return
+    ago = max(0, int((started - at) / 60)) if at else 0
+    logger.warning(f"OIDC confirm refused for {mask_email(email)}: the login was not fresh "
+                   f"(auth_time {at:.0f}, confirm started {started:.0f}, {ago} min earlier)")
+    raise HTTPException(
+        status_code=403,
+        detail=(f"The login was not fresh: {config.OIDC_PROVIDER_NAME or 'the identity provider'} "
+                f"let you through without a new login (your last one was {ago} minute(s) "
+                f"earlier). Sign out of it, then try again."))
+
+
+async def _finish_oidc_confirm(state_meta: dict, code: str) -> JSONResponse:
+    """The confirm half of the callback: the same code exchange as a login,
+    then the proof that the provider answered for the account the confirm
+    was started for (and, under ``OIDC_CONFIRM_FRESH_LOGIN``, that the login
+    is newer than the click). No session is issued and nothing is upserted;
+    the answer is a one-shot confirm token the share routes consume
+    (``auth/confirm.py``)."""
+    from auth import confirm
+    result = await _oidc_provider.authenticate({
+        "code": code, "redirect_uri": state_meta.get("redirect_uri"),
+    })
+    if not result.success:
+        raise HTTPException(status_code=403 if result.error_code == "no_group" else 502,
+                            detail=result.error)
+    expected = state_meta.get("sub") or ""
+    if not expected or result.sub != expected:
+        raise HTTPException(status_code=403, detail="Signed in as a different account")
+    claims = result.id_claims or {}
+    if claims:
+        aud = claims.get("aud")
+        auds = aud if isinstance(aud, list) else [aud]
+        if config.OIDC_CLIENT_ID not in auds:
+            raise HTTPException(status_code=403, detail="The login was not for this platform")
+        if str(claims.get("sub") or "") != result.sub:
+            raise HTTPException(status_code=403, detail="Signed in as a different account")
+    if config.OIDC_CONFIRM_FRESH_LOGIN:
+        _require_fresh_login(claims, state_meta, result.email)
+    token = confirm.mint_confirm_token(result.sub)
+    logger.info(f"OIDC confirm: {mask_email(result.email)} provider={result.auth_provider}")
+    return JSONResponse(content={"purpose": "confirm", "confirm_token": token,
+                                 "return_to": state_meta.get("return_to") or "/"})
 
 
 @router.post("/auth/login/local")
@@ -269,8 +447,10 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
     """Authenticate with email + password. Sets session cookie on success."""
     client_ip = get_client_ip(request)
 
-    # IP rate limit
-    ip_ok, retry_after = check_ip_rate_limit(client_ip)
+    # The address's attempt is counted before anything awaits, so a burst
+    # from one address cannot all pass the check while the hashes run; one
+    # that proves the password or is refused by the tarpit is given back.
+    ip_ok, retry_after = rate_limiter.hit_ip_login(client_ip)
     if not ip_ok:
         raise HTTPException(
             status_code=429,
@@ -280,59 +460,67 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
 
     # Cloudflare Turnstile bot verification (if configured). Runs BEFORE the user
     # lookup so a 403 is identical for existing and non-existing emails (no enumeration).
-    settings = await asyncio.to_thread(task_store.get_all_platform_settings)
+    settings = await run_db(task_store.get_all_platform_settings)
     from services.infra import turnstile
     tcfg = turnstile.load_config(settings)
     if tcfg.enabled and not await turnstile.verify_token(tcfg, req.turnstile_token or "", client_ip):
         raise HTTPException(status_code=403, detail="Bot verification failed")
 
-    # Authenticate
-    result = await _local_provider.authenticate({"email": req.email, "password": req.password})
+    device = rate_limiter.device_token_claims(request.cookies.get(_device_cookie_name(), ""))
+    try:
+        result = await _local_provider.authenticate(
+            {"email": req.email, "password": req.password}, device=device)
+    except HashBusy:
+        rate_limiter.release_ip_attempt(client_ip)
+        raise _hash_busy()
 
     if not result.success:
-        record_failed_attempt(client_ip, result.sub or None)
         if result.error_code == "account_locked":
+            # The tarpit refused it before any password was checked.
+            rate_limiter.release_ip_attempt(client_ip)
             raise HTTPException(status_code=429, detail=result.error)
         raise HTTPException(status_code=401, detail=result.error)
+    # The password was right: whatever follows, this attempt guessed nothing.
+    rate_limiter.release_ip_attempt(client_ip)
 
     # LAN restriction — checked ONLY after the credentials verify, so the
     # distinctive "local network" 403 can no longer be used pre-auth as an
     # oracle for which emails are local_only accounts. The restriction itself
     # is unchanged: a valid-credential remote login to a local_only account is
     # still refused (before any session token / 2FA step is handed out).
-    user_row = await asyncio.to_thread(task_store.get_user, result.sub)
+    user_row = await run_db(task_store.get_user, result.sub)
     if user_row and not check_local_auth_allowed(request, user_row):
         raise HTTPException(status_code=403, detail="This account can only be accessed from the local network")
 
     # Second-factor assembly. TOTP is provider-flagged; passkeys join the 2FA
-    # step whenever enrolled (nice-to-have in passwordless mode, MANDATORY gate
-    # in second_factor mode — there a passkey-only user must still do step 2).
+    # step whenever enrolled. A passkey-only account must still do step 2 in
+    # second_factor mode, and in either mode while Require 2FA is on: there
+    # the passkey is the account's second factor, so the password alone must
+    # not open a session.
     from api.auth.webauthn import passkey_login_mode, passkeys_enabled
     from storage.identity import webauthn_store
-    pk_count = 0
-    if passkeys_enabled():
-        pk_count = await asyncio.to_thread(webauthn_store.count_credentials, result.sub)
+
+    def _second_factor_job() -> tuple[int, str]:
+        if not passkeys_enabled():
+            return 0, ""
+        return webauthn_store.count_credentials(result.sub), passkey_login_mode()
+
+    pk_count, pk_mode = await run_db(_second_factor_job)
     factors = (["passkey"] if pk_count else []) + (["totp"] if result.requires_2fa else [])
+    require_2fa_on = settings.get("require_2fa", "") == "1"
 
     if result.requires_2fa:
         return {"requires_2fa": True, "totp_session_token": result.totp_session_token,
                 "second_factors": factors}
-    if pk_count and await asyncio.to_thread(passkey_login_mode) == "second_factor":
+    if pk_count and (pk_mode == "second_factor" or require_2fa_on):
         return {"requires_2fa": True,
                 "totp_session_token": create_2fa_session_token(result.sub),
                 "second_factors": factors}
 
     # Full success
-    record_successful_login(client_ip, result.sub)
-    # Update last_login
-    user = await asyncio.to_thread(task_store.get_user, result.sub)
-    user_data = _build_user_response(user) if user else {}
-    if await asyncio.to_thread(_must_enroll_2fa, user):
-        user_data["must_enroll_2fa"] = True
-
-    response = JSONResponse(content={"user": user_data})
-    _issue_session_cookie(response, result.sub, result.email, result.name,
-                          result.role, auth_provider="local")
+    await record_successful_login(client_ip, result.sub)
+    user = await run_db(task_store.get_user, result.sub)
+    response = await _login_response(user or user_row, "local")
     logger.info(f"Local login: {mask_email(result.email)} role={result.role}")
     return response
 
@@ -355,7 +543,7 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     if not sub:
         raise HTTPException(status_code=401, detail="2FA session expired. Please log in again.")
 
-    user = await asyncio.to_thread(task_store.get_user, sub)
+    user = await run_db(task_store.get_user, sub)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
@@ -381,7 +569,7 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
         # lock so a concurrent request can't match the same code against a stale
         # copy: the second caller sees the already-consumed list and is rejected.
         async with _recovery_consume_lock:
-            fresh = await asyncio.to_thread(task_store.get_user, sub)
+            fresh = await run_db(task_store.get_user, sub)
             recovery_enc = fresh.get("totp_recovery_enc") if fresh else None
             matched = False
             if recovery_enc:
@@ -389,7 +577,7 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
                 matched, remaining = verify_recovery_code(code, hashed_codes)
                 if matched:
                     new_enc = encrypt_recovery_codes(remaining)
-                    await asyncio.to_thread(
+                    await run_db(
                         task_store.update_user_auth_fields, sub, totp_recovery_enc=new_enc
                     )
                     logger.info(f"2FA recovery code used for {mask_email(user['email'])} ({len(remaining)} remaining)")
@@ -399,13 +587,9 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     # 2FA verified — issue session. Spend the step token so a replay can't
     # mint a second session (failed attempts above did NOT consume it).
     consume_2fa_session_token(req.totp_session_token)
-    record_successful_login(client_ip, sub)
+    await record_successful_login(client_ip, sub)
     clear_rate_limit("2fa", client_ip)
-    user_data = _build_user_response(user)
-
-    response = JSONResponse(content={"user": user_data})
-    _issue_session_cookie(response, sub, user["email"], user["name"],
-                          user["role"], auth_provider="local")
+    response = await _login_response(user, "local")
     logger.info(f"2FA verified: {mask_email(user['email'])}")
     return response
 
@@ -425,18 +609,23 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
     if not state_meta:
         raise HTTPException(status_code=400, detail="Invalid or expired state")
 
-    # Login-CSRF: for the web flow, the callback must come from the same browser
-    # that started it — req.state must be one of the recent states this browser
-    # was issued (the binding cookie). The native app uses the ``otodock://``
-    # redirect_uri instead and carries no browser cookie.
-    is_mobile = (state_meta.get("redirect_uri") or "").startswith("otodock://")
-    if not is_mobile:
-        bound = [s for s in (request.cookies.get(_oidc_state_cookie_name()) or "").split(".") if s]
-        if not any(hmac.compare_digest(s, req.state) for s in bound):
-            raise HTTPException(
-                status_code=400,
-                detail="Login state does not match this browser. Please try signing in again.",
-            )
+    # Login-CSRF: the callback must come from the browser that started the
+    # flow (the native app's WebView included): req.state must be one of the
+    # recent states this browser was issued (the binding cookie).
+    bound = [s for s in (request.cookies.get(_oidc_state_cookie_name()) or "").split(".") if s]
+    if not any(hmac.compare_digest(s, req.state) for s in bound):
+        raise HTTPException(
+            status_code=400,
+            detail="Login state does not match this browser. Please try signing in again.",
+        )
+
+    # A state serves the purpose it was minted for and no other: a confirm
+    # never issues a session, a login never mints a confirm token.
+    purpose = state_meta.get("purpose") or "login"
+    if purpose == "confirm":
+        return await _finish_oidc_confirm(state_meta, req.code)
+    if purpose != "login":
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
 
     result = await _oidc_provider.authenticate({
         "code": req.code,
@@ -449,7 +638,7 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
         raise HTTPException(status_code=502, detail=result.error)
 
     # Seat-limit check for new OIDC users (deployment-aware; two-stage grace).
-    existing = await asyncio.to_thread(task_store.get_user, result.sub)
+    existing = await run_db(task_store.get_user, result.sub)
     if not existing:
         allowed, current, max_users = await asyncio.to_thread(check_seat_limit)
         if not allowed:
@@ -458,11 +647,21 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
                 detail=f"User limit reached ({current}/{max_users}). Upgrade your license to add more users.",
             )
 
-    # Upsert user in DB
-    await asyncio.to_thread(
+    # Upsert user in DB. The identity provider may have changed the platform
+    # role (its groups): a change gets the rule an admin's change does
+    # (``apply_platform_role_change``), with no person as its actor.
+    rows_before = await run_db(task_store.get_user_agent_roles, result.sub) if existing else {}
+    prev_role = await run_db(
         task_store.upsert_user, result.sub, result.email, result.name,
         result.role, display_name=result.display_name,
     )
+    if prev_role is not None and prev_role != result.role:
+        from api.auth.admin_users import apply_platform_role_change
+        try:
+            await apply_platform_role_change(result.sub, existing, result.role, rows_before, "")
+        except Exception:
+            logger.exception("OIDC login: the role change of %s was not applied in full",
+                             mask_email(result.email))
     # Update auth_provider for this user
     await asyncio.to_thread(
         task_store.update_user_auth_fields, result.sub,
@@ -483,12 +682,8 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
             default_agent_assigner.assign_default_agents, result.sub,
         )
 
-    user = await asyncio.to_thread(task_store.get_user, result.sub)
-    user_data = _build_user_response(user) if user else {}
-
-    response = JSONResponse(content={"user": user_data})
-    _issue_session_cookie(response, result.sub, result.email, result.name,
-                          result.role, auth_provider=result.auth_provider)
+    user = await run_db(task_store.get_user, result.sub)
+    response = await _login_response(user, result.auth_provider)
     # NB: we deliberately do NOT delete the state-binding cookie here — clearing
     # it would break a second login tab still in flight in the same browser. The
     # bound states are single-use (validate_oauth_state consumed this one) and
@@ -523,35 +718,58 @@ async def auth_me(user: UserContext | None = Depends(get_current_user)):
     if user is None or user.is_api_key:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    platform_configured = _check_platform_configured(user.sub, user.role)
+    if user.render_app:
+        # The platform's own headless render (auth/render_principal.py): the
+        # shell's guards must let the app page through (a configured
+        # platform, nothing to change or enrol), and nothing personal is read.
+        return {"user": {
+            "sub": user.sub, "email": user.email, "name": user.name, "username": "",
+            "role": user.role, "agents": user.agents, "default_agent": "",
+            "display_name": user.display_name, "agent_roles": user.agent_roles,
+            "platform_configured": True, "has_own_engine": False,
+            "auth_provider": "render", "totp_enabled": False, "is_owner": False,
+            "must_change_password": False, "must_enroll_2fa": False, "render": True,
+            "feature_flags": await asyncio.to_thread(build_feature_flags),
+        }}
 
-    # Whether THIS user has connected their OWN AI engine (a personal Claude
-    # Code or Codex subscription). Distinct from platform_configured (which is
-    # true if they can merely BORROW a platform sub): drives the per-user
-    # "connect an AI engine" banner — the user is nudged to add their own even
-    # when borrowing works, because borrowing is for agent/phone work, not their
-    # personal user-scoped chats. direct-llm (relay) is deliberately excluded —
-    # it's the low-latency phone path, not a tool-capable chat engine.
+    # Whether THIS user has connected their OWN AI engine (a personal
+    # subscription on a CODING engine — Claude Code, Codex). Distinct from
+    # platform_configured (which is true if they can merely BORROW a platform
+    # sub): drives the per-user "connect an AI engine" banner — the user is
+    # nudged to add their own even when borrowing works, because borrowing is
+    # for agent/phone work, not their personal user-scoped chats. A supporting
+    # engine (Direct LLM, the low-latency phone path) is deliberately not
+    # counted — ``identity.role``; a row on an engine no longer registered is
+    # skipped, as it always was.
     def _has_own_engine(sub: str) -> bool:
+        from core.session.session_manager import get_layer_capabilities
         from storage.billing import subscription_store
+
+        def _coding(layer: str) -> bool:
+            caps = get_layer_capabilities(layer)
+            return caps is not None and caps.identity.role == "coding"
+
         rows = subscription_store.list_personal(None, sub)
-        return any(r.get("layer") in ("claude-code-cli", "codex-cli") for r in rows)
+        return any(_coding(r.get("layer") or "") for r in rows)
 
-    has_own_engine = await asyncio.to_thread(_has_own_engine, user.sub)
+    # Every read in ONE job on the DB executor. The forced password
+    # change and 2FA enrolment come from the one gate rule the server's
+    # refusals and the dashboard socket apply (``auth_gate``). The feature
+    # flags are shared with every login payload (``_common.build_feature_flags``):
+    # the flags must be identical on every path the dashboard stores as its
+    # user object.
+    def _me_job():
+        from auth.providers import GATE_CHANGE_PASSWORD, GATE_ENROLL_2FA, auth_gate
+        db_user = task_store.get_user(user.sub)
+        gate = auth_gate(db_user)
+        return (_check_platform_configured(user.sub, user.role), _has_own_engine(user.sub),
+                db_user, gate == GATE_CHANGE_PASSWORD, gate == GATE_ENROLL_2FA,
+                build_feature_flags())
 
-    # Get fresh DB fields for totp/owner/must_change_password
-    db_user = await asyncio.to_thread(task_store.get_user, user.sub)
+    (platform_configured, has_own_engine, db_user, must_change_password,
+     must_enroll_2fa, feature_flags) = await run_db(_me_job)
     totp_enabled = bool(db_user.get("totp_enabled")) if db_user else False
     is_owner = bool(db_user.get("is_owner")) if db_user else False
-    must_change_password = bool(db_user.get("must_change_password")) if db_user else False
-    must_enroll_2fa = await asyncio.to_thread(_must_enroll_2fa, db_user)
-
-    # Surface user-facing feature flags so the dashboard can hide
-    # the Remote Machines section when the admin has disabled the feature
-    # (or the build ships without it entirely). Shared with every login
-    # payload via _common.build_feature_flags — the flags must be identical
-    # on every path the dashboard stores as its user object.
-    feature_flags = await asyncio.to_thread(build_feature_flags)
 
     return {
         "user": {
@@ -630,23 +848,27 @@ async def change_my_password(
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "No password set for this account")
 
-    if not verify_password(req.current_password, db_user["password_hash"]):
+    if not await _password_matches(req.current_password, db_user["password_hash"]):
         raise HTTPException(401, "Current password is incorrect")
 
-    ok, msg, _ = check_password_strength(req.new_password)
-    if not ok:
-        raise HTTPException(400, msg)
-
-    pw_hash = hash_password(req.new_password)
+    pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, u.sub, pw_hash)
     logger.info(f"User {mask_email(u.email)} changed their password")
+    # Their warm chats hold session tokens the change just invalidated:
+    # close them so the next message re-warms with fresh ones.
+    await offboarding_sessions.close_person_sessions(
+        u.sub, db_user.get("username") or "", "password_changed")
     # The caller's CURRENT cookie now predates password_changed_at and would be
     # rejected on their next request (that rejection is the whole point — it
     # evicts any OTHER live session on the old credential). Re-issue a fresh
     # cookie on THIS response so the person who just changed it stays signed in.
     response = JSONResponse(content={"status": "ok"})
+    hours = await run_db(config.get_jwt_expiry_hours)
     _issue_session_cookie(response, u.sub, u.email, u.name, u.role,
-                          auth_provider=u.auth_provider or "local")
+                          auth_provider=u.auth_provider or "local", expiry_hours=hours)
+    # The change voided this browser's trusted-device token with the rest:
+    # the person who made it keeps theirs.
+    _issue_device_cookie(response, u.sub)
     return response
 
 
@@ -669,7 +891,7 @@ async def change_my_email(
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "Cannot change email for OIDC accounts")
 
-    if not verify_password(req.password, db_user["password_hash"]):
+    if not await _password_matches(req.password, db_user["password_hash"]):
         raise HTTPException(401, "Password is incorrect")
 
     try:
@@ -703,7 +925,7 @@ async def totp_setup(
                                 headers={"Retry-After": str(_retry)})
         if not db_user.get("password_hash"):
             raise HTTPException(400, "Cannot reconfigure 2FA without a password")
-        if not req or not verify_password(req.password, db_user["password_hash"]):
+        if not req or not await _password_matches(req.password, db_user["password_hash"]):
             raise HTTPException(401, "Password confirmation required to reconfigure 2FA")
 
     secret = generate_totp_secret()
@@ -770,7 +992,7 @@ async def totp_disable(
     if not db_user or not db_user.get("password_hash"):
         raise HTTPException(400, "Cannot disable 2FA without a password")
 
-    if not verify_password(req.password, db_user["password_hash"]):
+    if not await _password_matches(req.password, db_user["password_hash"]):
         raise HTTPException(401, "Password is incorrect")
 
     await asyncio.to_thread(
@@ -875,13 +1097,11 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
         except (ValueError, TypeError):
             pass
 
-    ok, msg, _ = check_password_strength(req.new_password)
-    if not ok:
-        raise HTTPException(400, msg)
-
-    pw_hash = hash_password(req.new_password)
+    pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, sub, pw_hash)
     logger.info(f"Password reset completed for {mask_email(user['email'])}")
+    await offboarding_sessions.close_person_sessions(
+        sub, user.get("username") or "", "password_changed")
     return {"status": "ok"}
 
 
@@ -922,11 +1142,7 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
     if user.get("password_hash"):
         raise HTTPException(400, "This invite has already been used.")
 
-    ok, msg, _ = check_password_strength(req.new_password)
-    if not ok:
-        raise HTTPException(400, msg)
-
-    pw_hash = hash_password(req.new_password)
+    pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, user["sub"], pw_hash)
     logger.info(f"Invite accepted for {mask_email(user['email'])}")
     return {"status": "ok", "email": user["email"]}

@@ -64,6 +64,29 @@ class TestCleanupOrder:
         assert order.index("scheduler") < order.index("pool")
         assert order.index("pool") < order.index("mcp-io")
 
+    def test_session_index_flushed_synchronously_before_the_watchdog_stops(self, monkeypatch):
+        order: list[str] = []
+        monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
+        monkeypatch.setattr(startup.task_store, "mark_orphaned_runs_failed",
+                            lambda exclude_ids=None: 0)
+        monkeypatch.setattr(startup.task_store, "mark_orphaned_meetings_failed",
+                            lambda: 0)
+        monkeypatch.setattr(startup.scheduler, "stop", lambda: None)
+        monkeypatch.setattr(pg_pool, "close_pool",
+                            lambda timeout=3.0: order.append("pool"))
+        from core import loop_watchdog
+        monkeypatch.setattr(loop_watchdog, "stop", lambda: order.append("watchdog"))
+        from core.layers.direct import mcp as direct_mcp
+        monkeypatch.setattr(direct_mcp, "stop_mcp_thread",
+                            lambda join_timeout=2.0: None)
+        from core.session import session_state
+        monkeypatch.setattr(session_state, "flush_session_index",
+                            lambda: order.append("index"))
+
+        asyncio.run(startup._shutdown_cleanup(startup.logger))
+
+        assert order.index("index") < order.index("watchdog") < order.index("pool")
+
     def test_bg_tasks_cancelled_before_pool_close(self, monkeypatch):
         events: list[str] = []
         monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
@@ -189,3 +212,50 @@ class TestStopMcpThread:
         # Second call: state cleared — a no-op.
         direct_mcp.stop_mcp_thread(join_timeout=0.01)
         loop.close.assert_called_once()
+
+
+class TestRouteWarmup:
+    """FastAPI builds each included router's route state lazily, on the
+    first request that falls through it (0.38 s of loop on the proxy's
+    routes): warm_routes builds it at boot, matching only."""
+
+    def _app(self):
+        from fastapi import APIRouter, FastAPI
+        calls: list[str] = []
+        inner = APIRouter()
+
+        @inner.get("/inner/{x}")
+        def _inner(x: str):
+            calls.append(x)
+            return {}
+
+        outer = APIRouter()
+        outer.include_router(inner, prefix="/nested")
+        app = FastAPI()
+        app.include_router(outer, prefix="/v1")
+
+        @app.get("/{path:path}")
+        def _spa(path: str):
+            calls.append(path)
+            return {}
+        return app, calls
+
+    def test_every_included_router_is_built_and_no_handler_runs(self):
+        from fastapi.routing import _IncludedRouter
+        app, calls = self._app()
+        included = [r for r in app.router.routes if isinstance(r, _IncludedRouter)]
+        assert included
+        startup.warm_routes(app)
+        for r in included:
+            assert r._effective_candidates_version == r.original_router._get_routes_version()
+        assert calls == []
+
+    def test_a_route_whose_match_raises_does_not_stop_the_boot(self):
+        app, _ = self._app()
+
+        class _Broken:
+            def matches(self, scope):
+                raise RuntimeError("broken route")
+
+        app.router.routes.insert(0, _Broken())
+        startup.warm_routes(app)

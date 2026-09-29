@@ -55,9 +55,15 @@ def test_scope_keys():
 def test_scope_dirs(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     dirs = sq.shared_scope_dirs("acme")
-    assert [d.name for d in dirs] == ["workspace", "knowledge", "config"]
-    assert all(d.parent == tmp_path / "acme" for d in dirs)
+    # The three workspace roots plus the shared apps' release copies and
+    # databases (APPS.md: both live outside the workspace).
+    assert [d.relative_to(tmp_path / "acme").as_posix() for d in dirs] == [
+        "workspace", "knowledge", "config", "app-releases/shared", "app-data/shared"]
     assert sq.user_scope_dir("acme", "bob") == tmp_path / "acme" / "users" / "bob"
+    # One user's bucket: their tree, their apps' releases and databases,
+    # their chat snapshots.
+    assert [d.relative_to(tmp_path / "acme").as_posix() for d in sq.user_scope_dirs("acme", "bob")] == [
+        "users/bob", "app-releases/users/bob", "app-data/users/bob", "shares/users/bob"]
 
 
 # --- limits (settings are the single source of truth) ----------------------
@@ -165,13 +171,14 @@ def test_iter_scopes(monkeypatch, tmp_path):
 
     shared = by_key["acme:shared"]
     assert shared.scope_type == "shared"
-    assert len(shared.dirs) == 3
+    assert len(shared.dirs) == 5
     assert shared.owner_sub is None
 
     user = by_key["user:acme:mgr"]
     assert user.scope_type == "user"
     assert user.owner_sub == "user-manager"
-    assert user.dirs == (tmp_path / "acme" / "users" / "mgr",)
+    assert user.dirs == tuple(sq.user_scope_dirs("acme", "mgr"))
+    assert user.dirs[0] == tmp_path / "acme" / "users" / "mgr"
 
 
 def test_iter_scopes_skips_user_without_username(monkeypatch, tmp_path):

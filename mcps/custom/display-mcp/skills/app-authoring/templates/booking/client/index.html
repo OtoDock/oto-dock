@@ -1,0 +1,328 @@
+<script src="/ui-kit/tailwind.js"></script>
+<div class="px-1 py-2 min-w-0">
+  <div class="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+    <h2 id="service" class="text-base font-semibold break-words">Booking</h2>
+    <span id="price" class="text-sm text-[var(--p-text-secondary)]"></span>
+    <span id="status" class="ml-auto text-xs text-[var(--p-text-light)]">Connecting…</span>
+  </div>
+  <div id="notice" class="card mb-3 p-3 text-sm" hidden></div>
+
+  <!-- Accounts: shown on a link only. The dashboard has an identity already
+       (otodock.session is unavailable there), so members see the slots and
+       an editor or a manager sees the owner's view below. No <form>: the
+       frame is sandboxed without allow-forms; buttons and Enter do the work. -->
+  <div id="auth" class="card mb-3 p-3" hidden>
+    <div id="auth-out">
+      <div class="mb-2 flex gap-3 text-sm">
+        <button type="button" id="tab-login" class="font-semibold underline">Log in</button>
+        <button type="button" id="tab-register" class="text-[var(--p-text-secondary)]">Register</button>
+      </div>
+      <div class="grid gap-2 sm:grid-cols-3">
+        <input id="name" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Your name" maxlength="80" hidden>
+        <input id="email" type="email" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Email" maxlength="200" autocomplete="username">
+        <input id="password" type="password" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Password (8 or more characters)" maxlength="200" autocomplete="current-password">
+      </div>
+      <div class="mt-2 flex flex-wrap items-center gap-2">
+        <button class="btn primary" type="button" id="auth-btn">Log in</button>
+        <span id="auth-err" class="text-xs text-red-500"></span>
+      </div>
+    </div>
+    <div id="auth-in" class="flex flex-wrap items-center gap-2 text-sm" hidden>
+      <span>Signed in as <strong id="me-name"></strong></span>
+      <button class="btn" type="button" id="logout-btn">Sign out</button>
+    </div>
+  </div>
+  <p id="dash-note" class="mb-3 text-xs text-[var(--p-text-secondary)]" hidden>Customers register and book through the public link (the app's menu → Share).</p>
+
+  <section id="mine" class="card mb-3 p-3" hidden>
+    <h3 class="mb-2 text-sm font-semibold">Your bookings</h3>
+    <ul id="mine-list" class="space-y-1 text-sm"></ul>
+  </section>
+
+  <section>
+    <h3 class="mb-2 text-sm font-semibold">Pick a time</h3>
+    <div id="slots" class="space-y-3"></div>
+    <p id="no-slots" class="text-sm text-[var(--p-text-secondary)]" hidden>No times are open right now.</p>
+  </section>
+
+  <!-- The owner's view: settings and every booking. Hidden unless /me says owner. -->
+  <section id="owner" class="mt-4 space-y-3" hidden>
+    <h3 class="text-sm font-semibold">Owner</h3>
+    <div class="card p-3">
+      <div class="grid gap-2 sm:grid-cols-2 text-sm" id="settings-form">
+        <label class="block min-w-0">Service<input data-key="service_name" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Price in minor units (1250 = 12.50; 0 = free)<input data-key="price_cents" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Currency<input data-key="currency" maxlength="3" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Slot length (minutes)<input data-key="slot_minutes" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Open from (HH:MM)<input data-key="open_from" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Open to (HH:MM)<input data-key="open_to" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Weekdays (1 Monday … 7 Sunday)<input data-key="weekdays" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Days ahead<input data-key="days_ahead" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Hold an unpaid booking (minutes)<input data-key="hold_minutes" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="block min-w-0">Time zone<input data-key="timezone" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+      </div>
+      <div class="mt-2 flex flex-wrap items-center gap-2">
+        <button class="btn primary" type="button" id="save-btn">Save</button>
+        <span id="save-msg" class="text-xs text-[var(--p-text-secondary)]"></span>
+      </div>
+    </div>
+    <div class="card p-3">
+      <h4 class="mb-2 text-sm font-semibold">Bookings <span id="customers" class="font-normal text-[var(--p-text-secondary)]"></span></h4>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-left text-xs text-[var(--p-text-secondary)]"><th class="pr-3">When</th><th class="pr-3">Who</th><th class="pr-3">Status</th><th></th></tr></thead>
+          <tbody id="owner-list"></tbody>
+        </table>
+      </div>
+      <p id="owner-empty" class="text-sm text-[var(--p-text-secondary)]" hidden>No bookings yet.</p>
+    </div>
+  </section>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var me = null, owner = false, onLink = false, service = null, mode = "login";
+  var slots = [], mine = [];
+
+  function money(cents, cur) {
+    if (!cents) return "Free";
+    try { return new Intl.NumberFormat(undefined, { style: "currency", currency: cur.toUpperCase() }).format(cents / 100); }
+    catch (e) { return (cents / 100).toFixed(2) + " " + cur.toUpperCase(); }
+  }
+  function api(path, init) {
+    init = init || {};
+    init.headers = Object.assign({ "content-type": "application/json" }, init.headers || {});
+    return otodock.fetch(path, init).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) { d._status = r.status; d._ok = r.ok; return d; });
+    }).catch(function () { $("status").textContent = "Could not reach the app's server"; return { _ok: false, error: "no answer" }; });
+  }
+  function notice(text, tone) {
+    var n = $("notice");
+    n.hidden = !text;
+    n.textContent = text || "";
+    n.className = "card mb-3 p-3 text-sm " + (tone === "ok" ? "text-green-600" : tone === "warn" ? "text-amber-600" : "");
+  }
+
+  // ── rendering ───────────────────────────────────────────────────────────
+  function renderHeader() {
+    if (!service) return;
+    $("service").textContent = service.service_name;
+    $("price").textContent = money(service.price_cents, service.currency) + " · " + service.slot_minutes + " min · " + service.timezone;
+  }
+  function renderAuth() {
+    $("auth").hidden = !onLink;
+    $("dash-note").hidden = onLink || owner;
+    $("auth-out").hidden = !!me;
+    $("auth-in").hidden = !me;
+    if (me) $("me-name").textContent = me.name;
+    $("name").hidden = mode !== "register";
+    $("auth-btn").textContent = mode === "register" ? "Create account" : "Log in";
+    $("tab-login").className = mode === "login" ? "font-semibold underline" : "text-[var(--p-text-secondary)]";
+    $("tab-register").className = mode === "register" ? "font-semibold underline" : "text-[var(--p-text-secondary)]";
+  }
+  function renderMine() {
+    $("mine").hidden = !me || !mine.length;
+    var ul = $("mine-list");
+    ul.replaceChildren();
+    mine.forEach(function (b) {
+      var li = document.createElement("li");
+      li.className = "flex flex-wrap items-center gap-2";
+      var t = document.createElement("span");
+      t.textContent = b.label;
+      li.appendChild(t);
+      var st = document.createElement("span");
+      st.className = "text-xs " + (b.status === "confirmed" ? "text-green-600" : b.status === "held" ? "text-amber-600" : "text-[var(--p-text-light)]");
+      st.textContent = b.status === "confirmed" ? "confirmed" : b.status === "held" ? "awaiting payment" : "cancelled";
+      li.appendChild(st);
+      if (b.status === "held") {
+        var pay = document.createElement("button");
+        pay.type = "button"; pay.className = "btn primary"; pay.textContent = "Pay";
+        pay.onclick = function () { pay.disabled = true; checkout(b.id).then(function () { pay.disabled = false; }); };
+        li.appendChild(pay);
+      }
+      ul.appendChild(li);
+    });
+  }
+  function renderSlots() {
+    var box = $("slots");
+    box.replaceChildren();
+    $("no-slots").hidden = slots.length > 0;
+    var byDay = {};
+    var order = [];
+    slots.forEach(function (s) { if (!byDay[s.day]) { byDay[s.day] = []; order.push(s.day); } byDay[s.day].push(s); });
+    order.forEach(function (day) {
+      var sec = document.createElement("div");
+      var h = document.createElement("div");
+      h.className = "mb-1 text-xs font-medium text-[var(--p-text-secondary)]";
+      h.textContent = day;
+      sec.appendChild(h);
+      var grid = document.createElement("div");
+      grid.className = "grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6";
+      byDay[day].forEach(function (s) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "btn" + (s.taken ? " opacity-50" : "");
+        b.textContent = s.time;
+        b.disabled = s.taken;
+        b.title = s.taken ? "Taken" : "Book " + s.time;
+        b.onclick = function () { book(s, b); };
+        grid.appendChild(b);
+      });
+      sec.appendChild(grid);
+      box.appendChild(sec);
+    });
+  }
+  function renderOwner(data) {
+    $("owner").hidden = !owner;
+    if (!owner || !data) return;
+    var tb = $("owner-list");
+    tb.replaceChildren();
+    $("owner-empty").hidden = data.bookings.length > 0;
+    $("customers").textContent = "· " + data.customers + " customer" + (data.customers === 1 ? "" : "s");
+    data.bookings.forEach(function (b) {
+      var tr = document.createElement("tr");
+      tr.className = "border-t border-[var(--p-border-light)]";
+      [b.label, b.name + " <" + b.email + ">", b.status === "held" ? "awaiting payment" : b.status].forEach(function (txt) {
+        var td = document.createElement("td");
+        td.className = "py-1 pr-3 whitespace-nowrap";
+        td.textContent = txt;
+        tr.appendChild(td);
+      });
+      var td = document.createElement("td");
+      td.className = "py-1";
+      if (b.status !== "cancelled") {
+        var c = document.createElement("button");
+        c.type = "button"; c.className = "text-xs text-[var(--p-text-light)] hover:text-red-500"; c.textContent = "cancel";
+        // Two clicks instead of a confirm() dialog, which the sandbox refuses.
+        c.onclick = function () {
+          if (c.dataset.sure) { api("/owner/bookings/" + b.id + "/cancel", { method: "POST" }).then(load); }
+          else { c.dataset.sure = "1"; c.textContent = "sure?"; setTimeout(function () { delete c.dataset.sure; c.textContent = "cancel"; }, 4000); }
+        };
+        td.appendChild(c);
+      }
+      tr.appendChild(td);
+      tb.appendChild(tr);
+    });
+  }
+  function fillSettings(s) {
+    document.querySelectorAll("#settings-form input").forEach(function (inp) {
+      if (inp.dataset.key in s) inp.value = s[inp.dataset.key];
+    });
+  }
+
+  // ── actions ─────────────────────────────────────────────────────────────
+  function linkPath() {
+    var sl = otodock.sharedLink;
+    if (!sl || !sl.url) return "";
+    try { return new URL(sl.url).pathname; } catch (e) { return ""; }
+  }
+  function checkout(bookingId) {
+    return api("/checkout", { method: "POST", body: JSON.stringify({ booking_id: bookingId, return_path: linkPath() }) }).then(function (d) {
+      if (!d._ok) { notice(d.error || "The payment page could not be created", "warn"); return; }
+      // The host opens the declared host in a new tab; the visitor comes
+      // back to this link with ?paid=<id>. Called from the click itself —
+      // a user gesture is required.
+      return otodock.openExternal(d.url).then(function (r) {
+        if (r.status === "opened") notice("The payment page opened in a new tab. Your booking is held until you pay.", "ok");
+        else notice("The payment page did not open (" + (r.reason || r.status) + "). Press Pay next to your booking to try again.", "warn");
+      });
+    });
+  }
+  function book(slot, btn) {
+    if (!me) {
+      if (onLink) { notice("Log in or register to book " + slot.time + ".", "warn"); $("email").focus(); }
+      else notice("Customers book through the public link.", "warn");
+      return;
+    }
+    btn.disabled = true;
+    api("/bookings", { method: "POST", body: JSON.stringify({ starts_at: slot.starts_at }) }).then(function (d) {
+      if (!d._ok) { notice(d.error || "Could not book", "warn"); btn.disabled = false; return load(); }
+      if (d.booking.status === "confirmed") { notice("Booked: " + d.booking.label, "ok"); return load(); }
+      return load().then(function () { return checkout(d.booking.id); });
+    });
+  }
+  function submitAuth() {
+    var body = { email: $("email").value.trim(), password: $("password").value };
+    $("auth-err").textContent = "";
+    $("auth-btn").disabled = true;
+    var go;
+    if (mode === "register") {
+      body.name = $("name").value.trim();
+      // The bot check: the host shows it and resolves with a token, or null
+      // where there is none (the dashboard, an install without Turnstile) —
+      // call anyway; the platform verifies the token on /register.
+      go = otodock.challenge().then(function (t) {
+        return api("/register", { method: "POST", headers: { "X-OtoDock-Challenge": t || "" }, body: JSON.stringify(body) });
+      });
+    } else {
+      go = api("/login", { method: "POST", body: JSON.stringify(body) });
+    }
+    go.then(function (d) {
+      $("auth-btn").disabled = false;
+      if (!d._ok) { $("auth-err").textContent = d.error || "Could not sign in"; return; }
+      $("password").value = "";
+      // Hand the session to the host: it keeps it in a cookie of the link's
+      // and puts it inside every claim from now on.
+      return otodock.session.set(d.token).then(function (r) {
+        if (r.status !== "ok") $("auth-err").textContent = "The login could not be kept (" + r.status + ")";
+        return load();
+      });
+    });
+  }
+  $("auth-btn").addEventListener("click", submitAuth);
+  ["email", "password", "name"].forEach(function (id) {
+    $(id).addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } });
+  });
+  $("tab-login").addEventListener("click", function () { mode = "login"; renderAuth(); });
+  $("tab-register").addEventListener("click", function () { mode = "register"; renderAuth(); $("name").focus(); });
+  $("logout-btn").addEventListener("click", function () {
+    api("/logout", { method: "POST" }).then(function () { return otodock.session.clear(); }).then(load);
+  });
+  $("save-btn").addEventListener("click", function () {
+    var body = {};
+    document.querySelectorAll("#settings-form input").forEach(function (inp) { body[inp.dataset.key] = inp.value; });
+    $("save-msg").textContent = "Saving…";
+    api("/owner/settings", { method: "POST", body: JSON.stringify(body) }).then(function (d) {
+      $("save-msg").textContent = d._ok ? "Saved" : (d.error || "Not saved");
+      if (d._ok) load();
+    });
+  });
+
+  // ── loading ─────────────────────────────────────────────────────────────
+  function load() {
+    return api("/me").then(function (d) {
+      if (!d._ok) return;
+      me = d.me; owner = !!d.owner; onLink = !!d.link; service = d.service;
+      renderHeader(); renderAuth();
+      var wants = [api("/slots"), me ? api("/bookings") : Promise.resolve({ bookings: [] })];
+      if (owner) wants.push(api("/owner/bookings"), api("/owner/settings"));
+      return Promise.all(wants).then(function (r) {
+        slots = r[0].slots || []; mine = r[1].bookings || [];
+        renderSlots(); renderMine();
+        if (owner) { renderOwner(r[2]); if (r[3].settings && document.activeElement.tagName !== "INPUT") fillSettings(r[3].settings); }
+        else renderOwner(null);
+      });
+    });
+  }
+
+  // Back from Stripe: the link carries ?paid=<id> or ?cancelled=<id>. The
+  // confirmation itself comes from Stripe's event through the inbound hook,
+  // and the socket ping refreshes the list when it lands.
+  function readQuery() {
+    var sl = otodock.sharedLink;
+    var q = sl && sl.query ? new URLSearchParams(sl.query) : null;
+    if (!q) return;
+    if (q.get("paid")) notice("Thank you — your payment is being confirmed. The booking shows as confirmed as soon as Stripe tells us.", "ok");
+    else if (q.get("cancelled")) notice("The payment was cancelled. Your booking is held for a while — press Pay to try again.", "warn");
+  }
+  addEventListener("otodock:shared-link", function () { readQuery(); load(); });
+  addEventListener("otodock:session", function () { load(); });
+
+  // Live: the server pings on every change; each page refetches its own view.
+  var ws = otodock.ws("/live");
+  ws.onopen = function () { $("status").textContent = "Live"; };
+  ws.onclose = function () { $("status").textContent = "Reconnecting…"; };
+  ws.onmessage = function () { load(); };
+  load();
+})();
+</script>

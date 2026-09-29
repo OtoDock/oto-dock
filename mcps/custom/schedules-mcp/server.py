@@ -30,6 +30,10 @@ from mcp.types import TextContent, Tool
 AGENT = os.environ.get("SCHEDULES_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("SCHEDULES_MCP_API_KEY") or os.environ.get("PROXY_API_KEY", "")
+# This tool's own wait outcome for ``run_task(wait=true)``: the stream was
+# still open when the wait gave up listening. Not a run status — the run
+# keeps going and its real status is read later with get_task_result.
+WAIT_TIMED_OUT = "timeout"
 
 
 # The shared `agent` arg of the read tools (list_tasks / get_task_history /
@@ -55,11 +59,13 @@ _MODEL_ARG_SCHEMA = {
         "OPTIONAL model override for THIS task's runs — every run uses it "
         f"instead of {AGENT}'s default model. Use it to pin one demanding "
         "task (a daily briefing, a report) to a stronger model while the "
-        "agent's everyday default stays cheap, or the reverse. Must be a "
+        "agent's everyday default stays lighter, or the reverse. Must be a "
         "model enabled on the task's execution layer — read the valid ids "
-        "off this agent's `layers:` line in the prompt. Omit to inherit the "
-        "agent's default (recommended). On `edit_task`, pass \"\" to clear "
-        "an existing pin."
+        "off this agent's `layers:` line in the prompt, and pick by the "
+        "capability tier tagged there ([t1] frontier … [t4] fast; the Model "
+        "tiers list explains each), never by how an id sounds. Omit to "
+        "inherit the agent's default (recommended). On `edit_task`, pass "
+        "\"\" to clear an existing pin."
     ),
 }
 
@@ -72,6 +78,77 @@ _LAYER_ARG_SCHEMA = {
         "pass \"\" to clear an existing pin."
     ),
 }
+
+_CHECKS_ARG_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "OPTIONAL checks to run at the end of each run (the agent's offered "
+        "checks or your own, by name — the checks tool's list_checks names "
+        "them). A failing check hands the run its findings for another round "
+        "before the run ends; the agent's mandatory checks run regardless. On "
+        "`edit_task`, pass the whole list ([] clears it)."
+    ),
+}
+
+# The zone a schedule and a naive run_at are read in. The trap this wording
+# guards against: an agent in a task or trigger session sees the PLATFORM
+# zone in its [Current time] line and passes it "to be safe" — which pins a
+# literal that stops following the platform timezone setting, while an
+# omitted zone keeps following it (the row stays NULL for such sessions).
+_TIMEZONE_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "OPTIONAL IANA zone the schedule and run_at are read in (e.g. "
+        "'Europe/Athens'). Omit `timezone`: the task follows the zone of the "
+        "person you are talking to when there is one, else the platform "
+        "zone, and keeps following it. Pass it only when the person asked "
+        "for a schedule in another named zone — never the zone from the "
+        "[Current time] line as a guess."
+    ),
+}
+
+
+def _fires_info(t: dict) -> str:
+    """When a task fires, in words: cron, run_at, interval, delay, a
+    trigger-type task's triggers, or an app handler's schedule."""
+    if t.get("task_type") == "trigger":
+        trig = t.get("triggers")
+        if trig is None:
+            return "on trigger"
+        return f"on trigger ({len(trig)} wired)" if trig else "on trigger (none wired yet)"
+    return (
+        t.get("schedule")
+        or t.get("run_at")
+        or (f"every {t['interval_seconds']}s" if t.get("interval_seconds") else None)
+        or (f"delay {t['delay_seconds']}s" if t.get("delay_seconds") is not None else None)
+        or "one-time"
+    )
+
+
+def _runs_on(t: dict) -> str:
+    """What the task's runs execute on, as a ', runs on: …' suffix. The
+    backend resolves effective_model / effective_execution_path (the task's
+    pin, else the agent's CURRENT default resolved with the effective
+    layer) and tags the source; the model's capability tier rides along.
+    An unresolved default comes back "" — render nothing rather than a
+    wrong claim (matches the dashboard). An app handler row runs no LLM
+    turn at all, so it never claims a model."""
+    if t.get("task_type") == "app":
+        return ""
+    eff_model = t.get("effective_model") or ""
+    source = t.get("effective_model_source") or (
+        "pinned" if t.get("override_model") else "agent default")
+    tier = t.get("effective_model_tier")
+    tier_bit = f", tier {tier} {t.get('tier_label') or ''}".rstrip() if tier else ", untiered"
+    layer_bit = (
+        f" via {t['effective_execution_path']} [pinned layer]"
+        if t.get("override_execution_path")
+           and t.get("effective_execution_path") else ""
+    )
+    if eff_model:
+        return f", runs on: {eff_model} [{source}{tier_bit}]{layer_bit}"
+    return layer_bit and f", runs{layer_bit}"
 
 
 def _lane_line(args: dict, cleared: bool = False) -> str:
@@ -261,6 +338,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "checks": _CHECKS_ARG_SCHEMA,
+                    "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
@@ -349,6 +428,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "checks": _CHECKS_ARG_SCHEMA,
+                    "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
@@ -432,7 +513,9 @@ async def list_tools() -> list[Tool]:
                 "Use this to manually run a static or dynamic task that already exists "
                 "(e.g. the scheduled auto-update or health-check tasks). "
                 "Call list_tasks first to find the task_id. "
-                "Set wait=true to block and get the output inline (good for short tasks). "
+                "Set wait=true to block and get the output inline (good for short tasks); "
+                "the wait ends when the run ends with any status (completed, failed or "
+                "cancelled) or when timeout_seconds passes. "
                 "Set wait=false (default) to fire-and-forget."
             ),
             inputSchema={
@@ -441,7 +524,11 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "description": "ID of the existing task to run"},
                     "wait": {
                         "type": "boolean",
-                        "description": "If true, block until the task completes and return output. Default false.",
+                        "description": (
+                            "If true, block until the run ends (completed, failed or cancelled; "
+                            "the status is reported with the output) or timeout_seconds passes, "
+                            "and return the output. Default false."
+                        ),
                         "default": False,
                     },
                     "timeout_seconds": {
@@ -475,10 +562,12 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List all tasks (static + agent-created) for this agent, including "
                 "pending session continuations. Shows each task's schedule, next run "
-                "time, status (active or paused), and what its runs execute on — "
-                "the effective model and execution layer, marked [pinned] when the "
-                "task carries its own override or [agent default] when it follows "
-                "the agent's current setting. This is the authoritative read for "
+                "time, status (active or paused), and what its runs execute on: "
+                "`runs on: <model> [pinned|agent default|layer default, tier N "
+                "<label>]`, plus `via <layer> [pinned layer]` when the engine is "
+                "pinned (`layer default` = only the engine is pinned and its own "
+                "first choice runs); an `[app]` handler row runs no LLM turn and "
+                "shows no model. This is the authoritative read for "
                 "\"what model does this task run on?\" — never assume the default. "
                 "Use this to find a task before "
                 "calling pause_task, resume_task, run_task, or delete_task. "
@@ -489,6 +578,30 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {"agent": _AGENT_ARG_SCHEMA},
+            },
+        ),
+        Tool(
+            name="get_task",
+            description=(
+                "Read ONE task's full definition: its prompt (verbatim), when "
+                "it fires (schedule with timezone, run_at, interval, delay, "
+                "or the triggers pointing at a trigger-type task), status and "
+                "next run, timeout, notification mode, what its runs execute "
+                "on (model with its capability tier, pinned or default, and "
+                "the layer when one is pinned), warnings when a pin no longer resolves, "
+                "run count and limits. The read for \"what does this task do "
+                "and should it run on another model?\": list_tasks never "
+                "shows the prompt and get_task_history only covers tasks that "
+                "have run. Read-only; task ids are global, so another accessible "
+                "agent's task reads with its id alone (same visibility as "
+                "list_tasks)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID (from list_tasks, any accessible agent)"},
+                },
+                "required": ["task_id"],
             },
         ),
         Tool(
@@ -617,6 +730,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "checks": _CHECKS_ARG_SCHEMA,
+                    "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["task_id"],
             },
@@ -624,12 +739,15 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_task_history",
             description=(
-                "Get recent run history for this agent's tasks. With `agent`, "
-                "reads another accessible agent's history instead — runs carry "
-                "their prompt + output text, exactly what your user would see "
-                "on that agent's Task History page. Runs are NOT stamped with "
-                "the model they executed on — a task's current model/layer "
-                "(pinned or agent default) is read via list_tasks."
+                "Recent runs of this agent's tasks: run id, task, status, start, "
+                "duration, the error when one failed, and `Left running: N` when "
+                "a run ended with background commands or subagents still running "
+                "(the run waited for them up to the task's timeout, then finished "
+                "without their output; the session was kept for them). No prompt "
+                "or output text: get_task_result shows the latest run's output, "
+                "get_task the prompt. Runs are NOT stamped with the model they "
+                "executed on — read it from list_tasks or get_task. With `agent`, "
+                "reads another accessible agent's history instead."
             ),
             inputSchema={
                 "type": "object",
@@ -649,7 +767,10 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cancel_task_run",
-            description="Cancel a currently running task execution.",
+            description=(
+                "Cancel a running or queued task run. A run_task(wait=true) waiting on it "
+                "returns at once with status cancelled."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -704,6 +825,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             for k in ("model", "layer"):
                 if arguments.get(k):
                     body[k] = arguments[k]
+            if arguments.get("checks"):
+                body["checks"] = list(arguments["checks"])
+            if arguments.get("timezone"):
+                body["user_tz"] = arguments["timezone"]
             if has_schedule:
                 body["schedule"] = arguments["schedule"]
                 timing_line = f"Schedule: {arguments['schedule']}"
@@ -714,6 +839,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(x for x in [
                 f"Created scheduled task: {result['task_id']}",
                 timing_line,
+                f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
                 f"Scope: {arguments.get('scope') or SCOPE_DEFAULT}",
                 f"Notification mode: {arguments['notification_mode']}",
                 _lane_line(arguments),
@@ -760,6 +886,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             for k in ("model", "layer"):
                 if arguments.get(k):
                     body[k] = arguments[k]
+            if arguments.get("checks"):
+                body["checks"] = list(arguments["checks"])
+            if arguments.get("timezone"):
+                body["user_tz"] = arguments["timezone"]
             result = await _post("/v1/tasks/one-time", body)
             if task_type == "trigger":
                 timing = "on trigger fire"
@@ -771,6 +901,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(x for x in [
                 f"Created {task_type} task: {result['task_id']}",
                 f"Runs: {timing}",
+                f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
                 _lane_line(arguments),
                 f"Name: {arguments['name']}",
             ] if x))]
@@ -826,11 +957,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     text=f"Task triggered: {task_id}\nRun ID: {run_id}\nRunning in background.",
                 )]
 
-            # Wait for completion via SSE stream
+            # Wait for completion via SSE stream. ``final_status`` is the
+            # run's own word from the ``done`` frame (the proxy's run
+            # vocabulary, read as a string over the API) — or this tool's
+            # own WAIT_TIMED_OUT when the wait gave up listening first.
             url = f"{PROXY_URL}/v1/tasks/runs/{run_id}/stream"
             output_parts: list[str] = []
-            final_status = "unknown"
-            try:
+
+            async def _listen() -> str:
                 async with httpx.AsyncClient() as client:
                     async with client.stream(
                         "GET", url,
@@ -859,10 +993,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             elif ev.get("type") == "text":
                                 output_parts.append(ev.get("text", ""))
                             elif ev.get("type") == "done":
-                                final_status = ev.get("status", "completed")
-                                break
-            except httpx.ReadTimeout:
-                final_status = "timeout"
+                                return ev.get("status", "completed")
+                return "unknown"
+
+            try:
+                # The wall-clock bound: httpx's read timeout is per read, and
+                # the stream's keep-alive every 30 s resets it for the whole run.
+                final_status = await asyncio.wait_for(_listen(), timeout_seconds)
+            except (asyncio.TimeoutError, httpx.ReadTimeout):
+                final_status = WAIT_TIMED_OUT
             except httpx.HTTPError as e:
                 return [TextContent(
                     type="text",
@@ -873,7 +1012,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     ),
                 )]
 
-            if final_status == "timeout":
+            if final_status == WAIT_TIMED_OUT:
                 return [TextContent(
                     type="text",
                     text=(
@@ -887,7 +1026,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(
                 type="text",
                 text=(
-                    f"Task run completed: {task_id} (run: {run_id})\n"
+                    f"Task run ended: {task_id} (run: {run_id})\n"
                     f"Status: {final_status}\n\n"
                     f"Output:\n{output}"
                 ),
@@ -923,37 +1062,74 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text="No tasks found.")]
             lines = [f"Tasks ({len(tasks)} total):"]
             for t in tasks:
-                schedule_info = (
-                    t.get("schedule")
-                    or t.get("run_at")
-                    or (f"every {t['interval_seconds']}s" if t.get("interval_seconds") else None)
-                    or (f"delay {t['delay_seconds']}s" if t.get("delay_seconds") is not None else None)
-                    or "one-time"
-                )
                 next_run = t.get("next_run_time") or "—"
                 status = "active" if t.get("enabled") else "paused"
                 task_type = t.get("task_type", "task")
-                # What the task's runs execute on. The backend resolves
-                # effective_model/effective_execution_path (task pin, else the
-                # agent's CURRENT default); the raw override_* fields tell pin
-                # from default. An unresolved default comes back "" — render
-                # nothing rather than a wrong claim (matches the dashboard).
-                eff_model = t.get("effective_model") or ""
-                model_tag = "pinned" if t.get("override_model") else "agent default"
-                layer_bit = (
-                    f" via {t['effective_execution_path']} [pinned layer]"
-                    if t.get("override_execution_path")
-                       and t.get("effective_execution_path") else ""
-                )
-                runs_on = (
-                    f", runs on: {eff_model} [{model_tag}]{layer_bit}"
-                    if eff_model else (layer_bit and f", runs{layer_bit}")
-                )
                 lines.append(
                     f"  [{task_type}] {t['id']} — {t['name']} "
-                    f"({t['agent']}, {schedule_info}, {status}, next: {next_run}"
-                    f"{runs_on})"
+                    f"({t['agent']}, {_fires_info(t)}, {status}, next: {next_run}"
+                    f"{_runs_on(t)})"
                 )
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        elif name == "get_task":
+            task_id = arguments["task_id"]
+            t = await _get(f"/v1/tasks/{task_id}")
+            status = "active" if t.get("enabled") else "paused"
+            # The zone a cron, an interval anchor or a naive run_at is read
+            # in: the row's own, else the platform's (which the row keeps
+            # following). Meaningless for a trigger-type task.
+            tz_note = ""
+            if t.get("task_type") != "trigger":
+                if t.get("user_tz"):
+                    tz_note = f" (timezone {t['user_tz']})"
+                elif t.get("effective_tz"):
+                    tz_note = f" (platform timezone {t['effective_tz']})"
+            lines = [
+                f"Task: {t['id']} — {t['name']}",
+                f"Type: {t.get('task_type', 'task')}   Agent: {t.get('agent')}   "
+                f"Scope: {t.get('scope')}   Created by: {t.get('created_by') or '—'} "
+                f"at {t.get('created_at') or '—'}",
+                f"Fires: {_fires_info(t)}{tz_note}",
+                f"Status: {status}   Next run: {t.get('next_run_time') or '—'}   "
+                f"Runs so far: {t.get('run_count', 0)}"
+                + (f" of {t['max_runs']}" if t.get("max_runs") else "")
+                + (f"   Until: {t['until_at']}" if t.get("until_at") else ""),
+                f"Timeout: {t.get('timeout_seconds', '—')}s   "
+                f"Notification: {t.get('notification_mode', '—')}"
+                + (f" ({t['notify_severity']})" if t.get("notify_severity") else "")
+                + (f"   Target chat: {t['target_chat_id']}" if t.get("target_chat_id") else ""),
+            ]
+            runs_on = _runs_on(t)
+            if runs_on:
+                lines.append("Runs on: " + runs_on[len(", runs on: "):]
+                             if runs_on.startswith(", runs on: ") else "Runs" + runs_on[len(", runs"):])
+            elif t.get("task_type") == "app":
+                lines.append("Runs on: no model (an app handler, no LLM turn)")
+            for w in t.get("pin_warnings") or []:
+                lines.append(f"Warning: {w}")
+            if t.get("task_type") == "trigger":
+                trig = t.get("triggers") or []
+                if trig:
+                    lines.append("Triggers pointing at it:")
+                    for r in trig:
+                        lines.append(
+                            f"  • {r.get('name')} [{r.get('scope')}] "
+                            f"[{'active' if r.get('enabled') else 'paused'}] "
+                            f"fires={r.get('fired_count', 0)} last={r.get('last_fired_at') or 'never'} "
+                            f"{'vendor subscription' if r.get('subscription_id') else r.get('webhook_path') or ''} "
+                            f"id={r.get('id')}"
+                        )
+                else:
+                    lines.append("Triggers pointing at it: none yet — wire one with "
+                                 f"create_trigger(task_id='{t['id']}')")
+            if t.get("on_complete_agent"):
+                lines.append(f"On complete: {t['on_complete_agent']} ← {t.get('on_complete_prompt') or ''}")
+            lines.append("")
+            lines.append("Prompt:")
+            lines.append("```")
+            lines.append(t.get("prompt") or "(empty)")
+            lines.append("```")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "delete_task":
@@ -989,9 +1165,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             edit_keys = (
                 "name", "prompt", "schedule", "run_at", "interval_seconds",
                 "timeout_seconds", "notification_mode", "notify_severity",
-                "model", "layer",
+                "model", "layer", "checks",
             )
             body = {k: arguments[k] for k in edit_keys if k in arguments}
+            # The zone travels as user_tz on the wire; a zone edit alone is
+            # a valid edit (the proxy re-registers on it).
+            if arguments.get("timezone"):
+                body["user_tz"] = arguments["timezone"]
             if not body:
                 return [TextContent(
                     type="text",
@@ -1007,7 +1187,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     ),
                 )]
             await _post(f"/v1/tasks/{task_id}/edit", body)
-            changed = ", ".join(body.keys())
+            changed = ", ".join("timezone" if k == "user_tz" else k for k in body)
             lane = _lane_line(body, cleared=True)
             return [TextContent(
                 type="text",
@@ -1040,6 +1220,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
                 if r.get("error_message"):
                     lines.append(f"    Error: {r['error_message']}")
+                if r.get("background_pending"):
+                    lines.append(
+                        f"    Left running: {r['background_pending']} background "
+                        f"command(s)/subagent(s) past the task's timeout; the session "
+                        f"was kept for them, their output is not in this run"
+                    )
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "cancel_task_run":
@@ -1054,10 +1240,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     except httpx.HTTPStatusError as e:
+        # The proxy's refusals carry their sentence under "detail": show the
+        # sentence itself, not the JSON around it; anything else verbatim.
         error_body = e.response.text
+        try:
+            detail = json.loads(error_body).get("detail")
+        except (ValueError, AttributeError):
+            detail = None
         return [TextContent(
             type="text",
-            text=f"API error {e.response.status_code}: {error_body}",
+            text=f"API error {e.response.status_code}: {detail if isinstance(detail, str) else error_body}",
         )]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {e}")]

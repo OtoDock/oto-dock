@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch, fetchAuthConfig } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
+import { ROLE, roleBadge, roleLabel } from '../../lib/permissions'
 import { useSetPlatformAuth } from '../../api/executionLayers'
 
 interface UserRecord {
@@ -51,22 +52,8 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
-const ROLE_BADGE: Record<string, string> = {
-  admin: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  creator: 'bg-brand-100 text-brand',
-  member: 'bg-p-surface text-p-text-secondary',
-}
-
 const SELECT_CLS = 'text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text'
 const SELECT_XS_CLS = 'text-[10px] border border-p-border-light rounded-sm px-1 py-0.5 bg-white dark:bg-p-surface text-p-text'
-
-// Per-agent role tag shown on every agent chip. Viewer was previously rendered
-// with no indicator at all (looked role-less); now all three are explicit.
-const AGENT_ROLE_TAG: Record<string, { label: string; cls: string }> = {
-  manager: { label: 'Manager', cls: 'bg-brand-100 text-brand' },
-  editor: { label: 'Editor', cls: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' },
-  viewer: { label: 'Viewer', cls: 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary' },
-}
 
 /**
  * Agents-and-roles popover, triggered by a compact "N agents" chip next to the
@@ -131,7 +118,7 @@ function AgentsPopover({ user }: { user: UserRecord }) {
           <p className="text-[10px] uppercase tracking-wide text-p-text-light px-1 pb-1.5">Agents &amp; roles</p>
           <div className="flex flex-wrap gap-1.5">
             {user.agents.map((a) => {
-              const tag = AGENT_ROLE_TAG[user.agent_roles?.[a] || 'viewer'] || AGENT_ROLE_TAG.viewer
+              const tag = { label: roleLabel(user.agent_roles?.[a]), cls: roleBadge(user.agent_roles?.[a]) }
               const isDefault = a === user.default_agent
               return (
                 <span key={a}
@@ -345,7 +332,7 @@ export default function UsersPage() {
       editAgents.length !== current.agents.length ||
       editAgents.some((a) => !current.agents.includes(a))
     const rolesChanged = editAgents.some(
-      (a) => (editAgentRoles[a] || 'viewer') !== (current.agent_roles?.[a] || 'viewer')
+      (a) => (editAgentRoles[a] || ROLE.VIEWER) !== (current.agent_roles?.[a] || ROLE.VIEWER)
     )
     if (agentsChanged || rolesChanged) {
       await updateAgents.mutateAsync({ sub: editingSub, agents: editAgents, agent_roles: editAgentRoles })
@@ -370,7 +357,7 @@ export default function UsersPage() {
     <div className="space-y-2">
       <div className="flex flex-col gap-1.5">
         {allAgents?.map((agent) => (
-          <label key={agent} className="flex items-center gap-2 text-xs text-p-text">
+          <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-p-text">
             <input
               type="checkbox"
               checked={editAgents.includes(agent)}
@@ -378,15 +365,19 @@ export default function UsersPage() {
               className="rounded-sm border-p-border-light shrink-0"
             />
             <span className="min-w-[120px]">{agent}</span>
+            {/* The role select shrinks to what the row has left (its
+                longest option is wider than a phone) and clips its closed
+                text; the native picker still shows every option in full. */}
             {editAgents.includes(agent) && (
               <select
                 value={editAgentRoles[agent] || 'viewer'}
                 onChange={(e) => setEditAgentRoles((prev) => ({ ...prev, [agent]: e.target.value }))}
-                className={SELECT_XS_CLS}
+                className={`${SELECT_XS_CLS} min-w-0 truncate`}
               >
-                <option value="viewer">viewer</option>
-                <option value="editor">editor</option>
-                <option value="manager">manager</option>
+                <option value="viewer">viewer — reads and chats</option>
+                <option value="contributor">contributor — also writes the shared workspace</option>
+                <option value="editor">editor — also automates as the agent</option>
+                <option value="manager">manager — configures the agent</option>
               </select>
             )}
           </label>
@@ -682,7 +673,7 @@ export default function UsersPage() {
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <p className="font-medium text-sm text-p-text truncate">{u.name}</p>
                       {!!u.is_owner && <span title="Platform owner" className="text-amber-500 text-sm">&#9733;</span>}
-                      <span className={`px-1.5 py-0.5 rounded-sm text-[10px] font-medium ${ROLE_BADGE[u.role] || ''}`}>{u.role}</span>
+                      <span className={`px-1.5 py-0.5 rounded-sm text-[10px] font-medium ${roleBadge(u.role)}`}>{u.role}</span>
                       {/* Only SSO/OIDC users get an auth badge — "no badge = local". */}
                       {!isLocal && <AuthBadge user={u} />}
                       <AgentsPopover user={u} />

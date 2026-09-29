@@ -7,12 +7,13 @@ that lexical gate.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
 import config
 from services.infra.path_confinement import (
-    PathOutsideRoot, join_under, resolve_under, safe_agent_dir,
+    PathOutsideRoot, join_under, normalize_rel_path, resolve_under, safe_agent_dir,
 )
 
 
@@ -71,3 +72,20 @@ def test_safe_agent_dir_matches_config_and_refuses_escape(monkeypatch, tmp_path)
     for bad in ("", "..", "../other", "/tmp/x", "a/../.."):
         with pytest.raises(PathOutsideRoot):
             safe_agent_dir(bad)
+
+
+def test_normalize_rel_path_is_the_segment_guard():
+    """The leading and trailing slashes go; an empty, ``.`` or ``..`` segment
+    and a NUL are refused; backslashes and unicode are names (core-seams
+    phase 3)."""
+    assert normalize_rel_path("workspace/x") == "workspace/x"
+    assert normalize_rel_path("/workspace/x/") == "workspace/x"
+    assert normalize_rel_path("a\\b") == "a\\b"
+    assert normalize_rel_path("．．/x") == "．．/x"
+    for bad in ("", "/", ".", "..", "a/../b", "a//b", "./a", "a/.", "../a", "a/..", "a\x00b", None):
+        with pytest.raises(PathOutsideRoot):
+            normalize_rel_path(bad)
+    # The canonical test a caller makes when a leading slash must be an error.
+    assert normalize_rel_path("/workspace/x") != "/workspace/x"
+    # Unlike join_under, an interior ``..`` is refused, not collapsed.
+    assert join_under("/root", "a/../b") == Path("/root/b")

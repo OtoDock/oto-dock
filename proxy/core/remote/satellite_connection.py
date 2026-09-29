@@ -11,9 +11,11 @@ import json
 import logging
 import time
 import uuid
+from core import placement
 from dataclasses import dataclass, field
 
 from fastapi import WebSocket
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.satellite")
 
@@ -63,11 +65,14 @@ _GRACE_WINDOW_S = 90.0
 # — a visible marker beats a silent truncation that looks
 # like a clean finish.
 
-# Minimum SATELLITE_VERSION (as a version tuple) that forwards Codex background
-# sub-agent thread events past the main turn, enabling proxy-side remote bg
-# supervision. Older satellites degrade to sweep-at-turn-end. See
-# satellite_supports_bg + RemoteExecutionLayer.start_session.
-_REMOTE_CODEX_BG_MIN_VERSION = (0, 5, 18)
+# The engines a satellite that reports no ``engines`` capability can run:
+# every satellite released before the field existed dispatches exactly these
+# two, so an ABSENT field must read as the pair — never as empty, or the whole
+# fielded fleet would stop spawning. The one place the pair is spelled on the
+# proxy; a newer satellite's own list replaces it.
+_LEGACY_SATELLITE_ENGINES = frozenset({"claude-code-cli", "codex-cli"})
+_ENGINES_MAX = 16          # a bounded list of short ids — the field is satellite-supplied
+_ENGINE_ID_MAX_LEN = 64
 
 # Minimum SATELLITE_VERSION that handles `pty_inject` (server-prompt stdin
 # injection into otodock-attached sessions — the delegation-delivery PTY rung).
@@ -99,6 +104,7 @@ _CODEX_THREAD_OPS_MIN_VERSION = (0, 5, 98)
 # supporting machines (effective_ignore_rules below) — asymmetric walks
 # would misattribute whole excluded trees as deletes.
 _SYNC_IGNORE_RULES_MIN_VERSION = (0, 5, 110)
+_PAGED_MANIFEST_MIN_VERSION = (0, 5, 130)
 
 # Minimum SATELLITE_VERSION that honours the config-driven sync file cap
 # delivered in the auth_result policy handshake (``sync_max_file_bytes``).
@@ -134,12 +140,48 @@ _LOCAL_MODEL_CATALOG_MIN_VERSION = (0, 5, 117)
 # Minimum SATELLITE_VERSION whose Codex app-server sessions honour the
 # ``codex_hooks_floor`` start-payload field: ``[features] hooks = true``,
 # thread-level ``bypass_hook_trust`` and the deny-only / no-forward hook env,
-# so an UNATTENDED remote Codex session (task / phone / meeting / trigger /
-# internal) runs ``permission_gate.py`` as its PreToolUse hook exactly like
+# so an UNATTENDED remote Codex session (a kind ``session_kind.attended()``
+# refuses) runs ``permission_gate.py`` as its PreToolUse hook exactly like
 # the local layer does. Additive: an older satellite ignores the field and
 # gates by the prompt rules only (today's behaviour), so the proxy only warns
 # and auto-update brings the satellite here at its next reconnect.
 _CODEX_HOOKS_FLOOR_MIN_VERSION = (0, 5, 118)
+# The satellite's post-turn stdout forwarder keeps running up to the
+# background-work ceiling instead of stopping after ten minutes, so a
+# background command's completion frame reaches the proxy however long the
+# command takes; the remote reaper's background-command leash relies on it.
+_LONG_BG_DRAIN_MIN_VERSION = (0, 5, 120)
+# Minimum SATELLITE_VERSION with hook parity (proxy docs/architecture/HOOKS.md):
+# the Claude writer names the ``Stop`` hook, the Codex writer names ``Stop``
+# and ``SubagentStop``, the Claude PTY spawn sets ``OTO_INTERACTIVE``, and
+# the tunnel allowlist admits ``/v1/hooks/stop`` and
+# ``/v1/hooks/codex-question``. Additive: an older satellite ignores the
+# shipped ``stop_tracker.py``, delivers no Stop signal (the hook's POST fails
+# silently) and answers a remote Codex question empty; the proxy warns once
+# per session start and auto-update brings the satellite here.
+_HOOK_PARITY_MIN_VERSION = (0, 5, 121)
+# Minimum SATELLITE_VERSION that runs app steps (proxy APPS.md "Steps"):
+# the ``step_run`` frame, the private steps directory with the hash check,
+# ``step_output`` streaming, the tunnel allowlist line for
+# ``/v1/apps/<id>/actions/<id>``. NOT additive: an older satellite drops the
+# frame silently, so the proxy never sends it — the delivery dies with
+# "this machine's satellite is too old for steps" until the satellite
+# updates at its next reconnect.
+_STEPS_MIN_VERSION = (0, 5, 122)
+# Minimum SATELLITE_VERSION for checks on a machine (proxy CHECKS.md): the
+# ``step_run`` frame's ``payload_env`` and ``cwd_absolute`` fields, and a
+# Codex judge in the default collaboration mode (plan iff the platform
+# mode is plan). Additive: below it a check script reads the step's payload
+# name, a check outside the synced tree is an ``error`` verdict, and a Codex
+# judge gets the ordinary sandbox with the gate alone enforcing.
+_CHECKS_MIN_VERSION = (0, 5, 123)
+# Minimum SATELLITE_VERSION that handles `steer_turn` (a user frame written
+# into a running headless Claude CLI turn's stdin — the satellite twin of
+# PersistentSession.steer). NOT additive: an older satellite drops the frame
+# silently and the ack would only burn its timeout, so the Claude remote
+# adapter refuses before sending and the caller keeps its queue fallback
+# (stop-and-send).
+_STEER_TURN_MIN_VERSION = (0, 5, 128)
 
 # Heartbeat persistence cadence. The heartbeat handler refreshes the in-memory
 # ``last_heartbeat`` / ``last_seen_iso`` on EVERY heartbeat (20 s) but hands a
@@ -179,6 +221,15 @@ def _persist_write(lane: str, machine_id: str, value) -> None:
 
 
 @dataclass
+class _ManifestJoin:
+    """The pages of one paged manifest reply joined so far: the entries,
+    their serialized size, and the index the next page must carry."""
+    entries: list = field(default_factory=list)
+    size: int = 0
+    next_page: int = 0
+
+
+@dataclass
 class SatelliteConnection:
     """Per-machine connection state."""
     machine_id: str
@@ -192,8 +243,9 @@ class SatelliteConnection:
     # un-orderable (platform-wins). See ``core/remote/file_sync.py``.
     clock_offset: float | None = None
     capabilities: dict = field(default_factory=dict)
-    # Reported SATELLITE_VERSION from the auth message. Drives feature gates like
-    # remote Codex bg-sub-agent supervision (see satellite_supports_bg).
+    # Reported SATELLITE_VERSION from the auth message. Drives the feature
+    # gates (``satellite_supports_*``) for frames an older satellite would
+    # silently drop.
     satellite_version: str = ""
     # Wall-clock ISO of the last contact (auth or heartbeat). The DB's
     # ``last_seen`` is a COALESCED copy of this (HEARTBEAT_PERSIST_INTERVAL_S);
@@ -295,7 +347,7 @@ def _list_admin_subs() -> list[str]:
     """All platform admins. Used as the notify-target for admin-paired
     satellite up/down events."""
     from storage import database as task_store
-    return [u["sub"] for u in task_store.list_users() if u.get("role") == "admin"]
+    return [u["sub"] for u in task_store.list_users() if roles.is_admin(u.get("role"))]
 
 
 async def _notify_admins_machine_state_change(
@@ -315,7 +367,7 @@ async def _notify_admins_machine_state_change(
     from storage.pg import run_db
 
     machine = await run_db(remote_store.get_remote_machine, machine_id)
-    if not machine or (machine.get("pairing_scope") or "") != "admin":
+    if not placement.machine_is_admin_paired(machine):
         return
 
     machine_name = machine.get("name") or machine_id[:8]
@@ -351,7 +403,9 @@ async def _notify_admins_machine_state_change(
 
 from core.remote.satellite_grace import SatelliteGraceMixin
 from core.remote.satellite_admin_alerts import SatelliteAdminAlertsMixin
-from core.remote.satellite_file_transfer import SatelliteFileTransferMixin, _PullStream  # noqa: F401
+from core.remote.satellite_file_transfer import (  # noqa: F401
+    SatelliteFileTransferMixin, _FileChangedLane, _PullStream, evict_file_changed_stamps,
+)
 
 
 class SatelliteConnectionManager(
@@ -373,11 +427,19 @@ class SatelliteConnectionManager(
         # command_id -> (machine_id, future) so we can reject all pending acks
         # for a machine on deregister instead of letting them wait 30s timeout.
         self._pending_acks: dict[str, tuple[str, asyncio.Future]] = {}
+        # The pages of a paged manifest reply, by command id, until the last
+        # frame resolves the wait (cleared with the ack on every other end).
+        self._manifest_pages: dict[str, _ManifestJoin] = {}
         # request_id -> _PullStream for streaming file pulls. Kept separate
         # from _pending_acks (which is push acks): file_content chunks are
         # written straight to a .partial on disk and the future resolves on
         # the final chunk. Rejected + cleaned up on deregister.
         self._pending_pulls: dict[str, _PullStream] = {}
+        # file_changed appliers: one bounded lane per machine inside one
+        # global bound (SatelliteFileTransferMixin._dispatch_file_changed).
+        import config as _cfg
+        self._fc_lanes: dict[str, _FileChangedLane] = {}
+        self._fc_global_sem = asyncio.Semaphore(_cfg.SAT_FILE_CHANGED_CONCURRENCY_GLOBAL)
         # Per-machine lock for MCP install/sync orchestration. Concurrent
         # warmups on the same machine serialize so they don't race on
         # in-flight installs. Acquired by sync_mcps_for_session; not held
@@ -391,6 +453,10 @@ class SatelliteConnectionManager(
         # Per-command install progress callbacks. mcp_sync registers one
         # before issuing sync_mcps and removes it after the ack arrives.
         self._install_progress_cbs: dict[str, object] = {}
+        # Per-command step output callbacks (APPS.md "Steps"): app_steps
+        # registers one around its step_run send_command so the script's
+        # lines reach the app log as they arrive.
+        self._step_output_cbs: dict[str, object] = {}
         # Per-machine reconnect-grace holding area. On a WS
         # drop we move the connection's in-flight session_queues here
         # (machine_id -> {session_id -> (queue, execution_path)}) + start a
@@ -538,14 +604,16 @@ class SatelliteConnectionManager(
         on a status transition or when the last write is older than
         HEARTBEAT_PERSIST_INTERVAL_S; otherwise the in-memory refresh is all
         that happens."""
+        from storage import remote_store
         now = time.monotonic()
-        transition = getattr(conn, "persisted_status", "") != "online"
+        transition = getattr(conn, "persisted_status", "") != remote_store.STATUS_ONLINE
         stale = (
             now - float(getattr(conn, "last_seen_persisted_at", 0.0) or 0.0)
             >= HEARTBEAT_PERSIST_INTERVAL_S
         )
         if transition or stale:
-            self._persist_status(conn, "online", getattr(conn, "last_seen_iso", "") or None)
+            self._persist_status(conn, remote_store.STATUS_ONLINE,
+                                 getattr(conn, "last_seen_iso", "") or None)
 
     async def _refresh_machine_cache(self, machine_id: str, conn) -> None:
         """Read the admin ``max_sessions`` override + machine name off-loop
@@ -637,6 +705,14 @@ class SatelliteConnectionManager(
 
     def unregister_install_progress(self, command_id: str) -> None:
         self._install_progress_cbs.pop(command_id, None)
+
+    def register_step_output(self, command_id: str, cb) -> None:
+        """A callback for the ``step_output`` frames of one ``step_run``
+        command (APPS.md "Steps"); ``cb(text)`` may be a coroutine."""
+        self._step_output_cbs[command_id] = cb
+
+    def unregister_step_output(self, command_id: str) -> None:
+        self._step_output_cbs.pop(command_id, None)
 
     def get_install_lock(self, machine_id: str) -> asyncio.Lock:
         """Return the per-machine install lock, creating if needed.
@@ -759,6 +835,7 @@ class SatelliteConnectionManager(
                 conn.session_queues.update(old.session_queues)
                 conn.session_execution_paths.update(old.session_execution_paths)
             self._connections[machine_id] = conn
+            self._reset_file_changed_lane(machine_id)
 
             # Re-adopt any sessions held from a recent drop
             # of THIS machine so their in-flight turns continue on the new
@@ -799,8 +876,9 @@ class SatelliteConnectionManager(
         # `offline_alerted` flag and fires the "back online" notice on its
         # next tick. Keeping it out of the hot connect path is what makes a
         # reconnect after a proxy restart / auto-update / blip silent.
+        from storage import remote_store
         conn.last_seen_iso = _iso_now()
-        self._persist_status(conn, "online", conn.last_seen_iso)
+        self._persist_status(conn, remote_store.STATUS_ONLINE, conn.last_seen_iso)
         # Bounded persist — same rule as the cli_status handler: an
         # authenticated-but-compromised satellite must not park arbitrary
         # payloads in the capabilities column (it is parsed and returned to
@@ -936,6 +1014,13 @@ class SatelliteConnectionManager(
                     machine_id[:8], len(conn.session_queues), _GRACE_WINDOW_S,
                 )
 
+        # The machine's file_changed lane restarts with its next connection;
+        # its quiet-window stamps go with the connection unless sessions are
+        # held in the reconnect grace (the satellite replays their frames).
+        self._reset_file_changed_lane(machine_id)
+        if machine_id not in self._grace_sessions:
+            evict_file_changed_stamps(machine_id)
+
         if conn:
             # Cancel the writer task first so it stops trying to send.
             # If it's already done (returned due to send failure), this is
@@ -972,6 +1057,7 @@ class SatelliteConnectionManager(
             ]
             for cid in to_reject:
                 entry = self._pending_acks.pop(cid, None)
+                self._manifest_pages.pop(cid, None)
                 if entry:
                     _, future = entry
                     if not future.done():
@@ -1004,8 +1090,9 @@ class SatelliteConnectionManager(
             # Off-loop, newest-wins; carries the EXACT last contact so the
             # admin offline-alert downtime clock is unaffected by the
             # coalesced heartbeat writes.
+            from storage import remote_store
             self._persist_status(
-                conn, "disconnected", getattr(conn, "last_seen_iso", "") or None,
+                conn, remote_store.STATUS_DISCONNECTED, getattr(conn, "last_seen_iso", "") or None,
             )
             logger.info("Satellite %s disconnected", machine_id[:8])
             # No admin notification on this disconnect edge: the
@@ -1105,13 +1192,25 @@ class SatelliteConnectionManager(
         conn = self._connections.get(machine_id)
         return str(conn.capabilities.get("os", "")) if conn else ""
 
-    def satellite_supports_bg(self, machine_id: str) -> bool:
-        """True if the connected satellite is new enough to forward background
-        sub-agent thread events AFTER the main turn (the satellite-side change in
-        SATELLITE_VERSION 0.5.18). When False — older satellite, or unknown
-        version — the proxy leaves remote Codex bg supervision off and the
-        translator sweeps bg subs at turn end (today's behavior, no regression)."""
-        return self._satellite_at_least(machine_id, _REMOTE_CODEX_BG_MIN_VERSION)
+    def satellite_engines(self, machine_id: str) -> frozenset[str]:
+        """The engine ids (``execution_path`` values) the connected satellite's
+        CODE can dispatch — its advertised ``engines`` capability, or the
+        legacy pair when the field is absent or malformed (every satellite
+        released before the field ran exactly those two). Binary presence is
+        a different fact (``installed_clis`` / ``cli_status``): the pin
+        reconcile may install a pinned binary after auth, so a spawn is never
+        gated on it. Empty for a machine that is not connected."""
+        conn = self._connections.get(machine_id)
+        if not conn:
+            return frozenset()
+        raw = conn.capabilities.get("engines")
+        if not isinstance(raw, list):
+            return _LEGACY_SATELLITE_ENGINES
+        engines = {
+            e for e in raw[:_ENGINES_MAX]
+            if isinstance(e, str) and 0 < len(e) <= _ENGINE_ID_MAX_LEN
+        }
+        return frozenset(engines) if engines else _LEGACY_SATELLITE_ENGINES
 
     def satellite_supports_pty_inject(self, machine_id: str) -> bool:
         """True if the connected satellite handles ``pty_inject`` (server-prompt
@@ -1176,6 +1275,45 @@ class SatelliteConnectionManager(
         runs prompt-gated until the satellite updates."""
         return self._satellite_at_least(machine_id, _CODEX_HOOKS_FLOOR_MIN_VERSION)
 
+    def satellite_supports_hook_parity(self, machine_id: str) -> bool:
+        """True if the connected satellite carries the full hook set for
+        both engines (SATELLITE_VERSION 0.5.121): the Stop hook, the Codex
+        SubagentStop hook, the interactive flag on the Claude PTY and the
+        two extra tunnel paths. When False the session still runs; it sends
+        no Stop signal and a remote Codex question gets empty answers."""
+        return self._satellite_at_least(machine_id, _HOOK_PARITY_MIN_VERSION)
+
+    def satellite_supports_steps(self, machine_id: str) -> bool:
+        """True if the connected satellite runs app steps (SATELLITE_VERSION
+        0.5.122 and the ``steps`` capability in its handshake). When False
+        the proxy never sends ``step_run`` — the frame would be dropped
+        silently — and the delivery dies with a reason naming the version."""
+        conn = self._connections.get(machine_id)
+        if not conn or not (conn.capabilities or {}).get("steps"):
+            return False
+        return self._satellite_at_least(machine_id, _STEPS_MIN_VERSION)
+
+    def satellite_supports_checks(self, machine_id: str) -> bool:
+        """True if the connected satellite carries the checks additions
+        (SATELLITE_VERSION 0.5.123): the two ``step_run`` fields a check
+        script needs and the Codex collaboration mode from the platform
+        mode. Everything degrades below it (CHECKS.md "Satellite 0.5.123")."""
+        return self._satellite_at_least(machine_id, _CHECKS_MIN_VERSION)
+
+    def satellite_supports_steer_turn(self, machine_id: str) -> bool:
+        """True if the connected satellite handles ``steer_turn`` (a user
+        frame into a running headless Claude CLI turn, SATELLITE_VERSION
+        0.5.128). When False the Claude remote adapter refuses the steer
+        before sending and the caller queues the message as before."""
+        return self._satellite_at_least(machine_id, _STEER_TURN_MIN_VERSION)
+
+    def satellite_supports_long_bg_drain(self, machine_id: str) -> bool:
+        """True if the connected satellite forwards post-turn stdout up to
+        the background-work ceiling (SATELLITE_VERSION 0.5.120). When False
+        the remote reaper keeps today's behaviour for background commands
+        (subagents are still spared: their Stop hook is not stdout)."""
+        return self._satellite_at_least(machine_id, _LONG_BG_DRAIN_MIN_VERSION)
+
     def satellite_version(self, machine_id: str) -> str:
         """The connected satellite's reported SATELLITE_VERSION, or ``""`` when
         it is offline or never reported one (user-facing messages)."""
@@ -1216,6 +1354,66 @@ class SatelliteConnectionManager(
         import config as app_config
         from core.remote.file_sync import validate_ignore_rules
         return validate_ignore_rules(app_config.SYNC_IGNORE_RULES)
+
+    # A satellite from this version answers ``request_manifest`` in pages
+    # when asked; the joined reply is bounded to this many entries and this
+    # much serialized text (a page is about 2 MiB, a frame at most the
+    # socket's cap).
+    _MANIFEST_MAX_ENTRIES = 500_000
+    _MANIFEST_MAX_BYTES = 256 * 1024 * 1024
+
+    def satellite_supports_paged_manifest(self, machine_id: str) -> bool:
+        """True if the connected satellite pages a manifest reply on request
+        (SATELLITE_VERSION 0.5.130); an older one answers in one frame and
+        must not be asked (it would ignore the key anyway)."""
+        return self._satellite_at_least(machine_id, _PAGED_MANIFEST_MIN_VERSION)
+
+    def _on_manifest_frame(self, machine_id: str, msg: dict) -> None:
+        """One ``file_manifest`` frame, only from the machine the command
+        went to. A frame with no ``page`` and no ``more`` is a whole reply
+        and resolves the wait at once. A paged reply's frames carry
+        ``page`` 0, 1, 2 and so on, ``more`` on all but the last: they are
+        joined in that order and the last resolves the wait. A page out of
+        order (one lost on the way, or repeated) and a joined reply past the
+        entry or size ceiling fail the wait, so no caller mistakes a partial
+        manifest for a whole one."""
+        command_id = msg.get("command_id", "")
+        entry = self._pending_acks.get(command_id)
+        if not entry:
+            self._manifest_pages.pop(command_id, None)
+            return
+        mid, future = entry
+        if mid != machine_id or future.done():
+            return
+        files = msg.get("files")
+        files = files if isinstance(files, list) else []
+        page = msg.get("page")
+        more = bool(msg.get("more"))
+        if page is None and not more and command_id not in self._manifest_pages:
+            future.set_result(msg)
+            return
+
+        def _fail(why: str) -> None:
+            self._manifest_pages.pop(command_id, None)
+            future.set_exception(RuntimeError(f"manifest from {machine_id[:8]} {why}"))
+
+        join = self._manifest_pages.setdefault(command_id, _ManifestJoin())
+        if not isinstance(page, int) or isinstance(page, bool) or page != join.next_page:
+            _fail(f"sent page {page!r} where page {join.next_page} was due")
+            return
+        join.next_page += 1
+        join.entries.extend(files)
+        join.size += len(json.dumps(files, separators=(",", ":")))
+        if len(join.entries) > self._MANIFEST_MAX_ENTRIES:
+            _fail(f"exceeds {self._MANIFEST_MAX_ENTRIES} entries")
+            return
+        if join.size > self._MANIFEST_MAX_BYTES:
+            _fail(f"exceeds {self._MANIFEST_MAX_BYTES} bytes")
+            return
+        if more:
+            return
+        self._manifest_pages.pop(command_id, None)
+        future.set_result({**msg, "files": join.entries})
 
     def _satellite_at_least(self, machine_id: str, version: tuple) -> bool:
         conn = self._connections.get(machine_id)
@@ -1258,6 +1456,8 @@ class SatelliteConnectionManager(
         # cancel them en masse on disconnect.
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_acks[command_id] = (machine_id, future)
+        # A paged manifest's pages end with the wait, however it ends.
+        future.add_done_callback(lambda _f, _cid=command_id: self._manifest_pages.pop(_cid, None))
 
         try:
             # Enqueue rather than ws.send_text(). The writer task does the
@@ -1277,6 +1477,7 @@ class SatelliteConnectionManager(
             )
         finally:
             self._pending_acks.pop(command_id, None)
+            self._manifest_pages.pop(command_id, None)
 
     async def send_fire_and_forget(self, machine_id: str, msg: dict) -> None:
         """Send a message without waiting for ack.
@@ -1376,15 +1577,18 @@ class SatelliteConnectionManager(
 
         ``maxsize`` is raised by the run-recovery adoption path (the replay
         of a retained turn buffer arrives as one burst larger than the
-        default cap; session_event dispatch silently drops on full). Codex
-        sessions default deeper: the router's between-turns OOB delivery
-        makes a QueueFull drop correctness-bearing (a lost item/completed
-        leaves a badge only the 0.5.105 drain backstop can clear)."""
+        default cap; session_event dispatch silently drops on full). The
+        default is the ENGINE's declared ``runtime.event_queue_depth``: an
+        engine whose between-turns events are routed out of band (Codex's
+        bg terminals) declares a deeper one, because there a QueueFull drop
+        is correctness-bearing (a lost item/completed leaves a badge only the
+        0.5.105 drain backstop can clear)."""
         conn = self._connections.get(machine_id)
         if not conn:
             raise RuntimeError(f"Satellite {machine_id[:8]} not connected")
         if maxsize is None:
-            maxsize = 4096 if execution_path == "codex-cli" else 1000
+            from core.session.session_manager import capabilities_for_path
+            maxsize = capabilities_for_path(execution_path).runtime.event_queue_depth
         queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         conn.session_queues[session_id] = queue
         conn.session_execution_paths[session_id] = execution_path
@@ -1438,7 +1642,15 @@ class SatelliteConnectionManager(
                 clis_raw = msg.get("clis")
                 clis: dict = {}
                 if isinstance(clis_raw, dict):
-                    for name in ("claude", "codex"):
+                    # The whitelist is the registered engines' binaries
+                    # (``runtime.binary``) — the keys the satellite's pin
+                    # reconcile reports under.
+                    from core.session.session_manager import get_all_layers
+                    for name in sorted({
+                        lay.capabilities.runtime.binary
+                        for lay in get_all_layers().values()
+                        if lay.capabilities.runtime.binary
+                    }):
                         entry = clis_raw.get(name)
                         if not isinstance(entry, dict):
                             continue
@@ -1686,16 +1898,22 @@ class SatelliteConnectionManager(
                         )
 
         elif msg_type == "codex_thread_id":
+            # The satellite reported the engine's RESUME HANDLE for a session
+            # (the frame type is Codex's own wire vocabulary — frozen; the
+            # marker it becomes on the session queue is the generic one every
+            # engine's remote adapter records through
+            # ``remote_turn.record_resume_handle`` and persists on its first
+            # turn).
             session_id = msg.get("session_id", "")
-            thread_id = msg.get("thread_id", "")
-            if session_id and thread_id:
+            handle = msg.get("thread_id", "")
+            if session_id and handle:
                 conn = self._connections.get(machine_id)
                 if conn:
                     queue = conn.session_queues.get(session_id)
                     if queue:
                         queue.put_nowait({
-                            "type": "_codex_thread_id",
-                            "thread_id": thread_id,
+                            "type": "_resume_handle",
+                            "handle": handle,
                         })
 
         elif msg_type == "file_changed":
@@ -1703,15 +1921,12 @@ class SatelliteConnectionManager(
             # workspace listing reflects what the satellite agent did.
             # Large files (>1 MB) are sent without `content_b64` — the
             # satellite already wrote them; we issue a pull to fetch the body.
-            asyncio.create_task(self._apply_file_changed(machine_id, msg))
+            # Admitted, bounded and shed in the mixin; never one task per
+            # frame with nothing above it.
+            self._dispatch_file_changed(machine_id, msg)
 
         elif msg_type == "file_manifest":
-            command_id = msg.get("command_id", "")
-            entry = self._pending_acks.get(command_id)
-            if entry:
-                _, future = entry
-                if not future.done():
-                    future.set_result(msg)
+            self._on_manifest_frame(machine_id, msg)
 
         elif msg_type == "file_content":
             request_id = msg.get("request_id", "")
@@ -1722,8 +1937,8 @@ class SatelliteConnectionManager(
         elif msg_type == "mcp_install_progress":
             # Satellite streaming install progress during a sync_mcps batch.
             # Delivered to any registered per-command callback (mcp_sync
-            # keeps one keyed by command_id) so the pump can surface these
-            # as SYSTEM CommonEvents with `subtype="mcp_installation_progress"`.
+            # keeps one keyed by command_id); remote_session_start turns them
+            # into the dashboard's install_progress frames.
             command_id = msg.get("command_id", "")
             cb = self._install_progress_cbs.get(command_id)
             logger.info(
@@ -1739,6 +1954,18 @@ class SatelliteConnectionManager(
                         await r
                 except Exception:
                     logger.exception("install progress cb raised")
+
+        elif msg_type == "step_output":
+            # A running app step's output (APPS.md "Steps"): to the callback
+            # app_steps registered for the command; nothing else keeps it.
+            cb = self._step_output_cbs.get(msg.get("command_id", ""))
+            if cb is not None:
+                try:
+                    r = cb(str(msg.get("text") or ""))
+                    if asyncio.iscoroutine(r):
+                        await r
+                except Exception:
+                    logger.exception("step output cb raised")
 
         elif msg_type == "http_request":
             # HTTP-over-WS tunnel: subprocess on satellite wants to call a
@@ -1791,6 +2018,7 @@ class SatelliteConnectionManager(
             now = time.monotonic()
             stale: list[str] = []
 
+            from storage import remote_store
             for machine_id, conn in list(self._connections.items()):
                 elapsed = now - conn.last_heartbeat
                 if elapsed > 300:
@@ -1800,9 +2028,9 @@ class SatelliteConnectionManager(
                     # the next heartbeat flips it back to online at once via
                     # the transition rule) with the exact last contact so the
                     # admin offline-alert grace clock stays honest.
-                    if getattr(conn, "persisted_status", "") != "disconnected":
+                    if getattr(conn, "persisted_status", "") != remote_store.STATUS_DISCONNECTED:
                         self._persist_status(
-                            conn, "disconnected",
+                            conn, remote_store.STATUS_DISCONNECTED,
                             getattr(conn, "last_seen_iso", "") or None,
                         )
 

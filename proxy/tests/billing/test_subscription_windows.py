@@ -8,11 +8,18 @@ Run: cd proxy && python -m pytest tests/billing/test_subscription_windows.py -v
 """
 
 import sys
+from datetime import datetime, timezone
 
 from tests._paths import PROXY_DIR
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
+
+
+# Every sample here is observed on 2026-09-11 and resets on the 16th; a
+# reading that settles windows is taken at this instant between the two so
+# the fixtures never expire under the wall clock.
+NOW = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
 
 
 def _sub(owner="user-1", layer="claude-code-cli", provider="anthropic"):
@@ -154,7 +161,12 @@ class TestListingsAndSetting:
             assert "windows" not in codex["user_subscriptions"][0]  # keys have no windows
             assert key["auth_type"] == "api_key"
 
-            assert _insert(sub["id"], "2026-09-11T05:00:00+00:00", seven=55.0,
+            # Observed at the wall clock: the listings settle a sample against
+            # now, and a sample older than the window's own length reads as
+            # unknown (a fixed date here expired a week after it, on
+            # 2026-09-18T05:00Z). The reset instants stay far in the future.
+            observed = datetime.now(timezone.utc).isoformat()
+            assert _insert(sub["id"], observed, seven=55.0,
                            seven_reset="2999-01-01T00:00:00+00:00",
                            five=None, five_reset=None,
                            data={"scoped": [{"key": "fable", "label": "Fable", "pct": 100.0,
@@ -203,6 +215,6 @@ class TestLatestBySource:
         assert subscription_store.latest_window_samples([a], source="codex_event") == {}
         # The merged reading keeps the Fable window through the event.
         from services.engines import subscription_windows as sw
-        r = sw.latest([a])[a]
-        assert r.source == "claude_event" and r.seven_day.pct == 41.0
+        r = sw.latest([{"id": a, "layer": "claude-code-cli"}], now=NOW)[a]
+        assert r.source == "claude_event" and r.windows["seven_day"].pct == 41.0
         assert r.scoped_for("fable").pct == 100.0 and r.reached == "scoped:fable"

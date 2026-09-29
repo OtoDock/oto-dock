@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { askNative, callNative } from '../../lib/nativeBridge'
 
 interface Props {
   open: boolean
@@ -13,12 +14,10 @@ interface Install {
   active: boolean
 }
 
-function readInstallations(): Install[] {
-  try {
-    const raw = (window as any).Android?.getInstallations?.()
-    if (raw) return JSON.parse(raw) as Install[]
-  } catch { /* not native / parse error */ }
-  return []
+/** The app's list; undefined when it does not answer (the shown list stays). */
+async function readInstallations(): Promise<Install[] | undefined> {
+  const list = await askNative<Install[]>('getInstallations')
+  return Array.isArray(list) ? list : undefined
 }
 
 function hostOf(url: string): string {
@@ -34,7 +33,11 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
 
-  const refresh = () => setInstalls(readInstallations())
+  // The app runs channel calls in order, so a refresh posted after a change
+  // reads the changed list.
+  const refresh = () => {
+    void readInstallations().then((list) => { if (list) setInstalls(list) })
+  }
 
   useEffect(() => {
     if (open) {
@@ -49,21 +52,21 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   // modal is torn down with the WebView — no local state update needed for those.
   const handleSwitch = (inst: Install) => {
     if (inst.active) return
-    try { (window as any).Android?.switchInstallation(inst.id) } catch { /* not native */ }
+    callNative('switchInstallation', inst.id)
   }
 
   const handleFavorite = (id: string) => {
-    try { (window as any).Android?.setFavorite(id) } catch { /* not native */ }
+    callNative('setFavorite', id)
     refresh()
   }
 
   const handleRemove = (id: string) => {
     // Native shows the confirm dialog and recreates on confirm.
-    try { (window as any).Android?.removeInstallation(id) } catch { /* not native */ }
+    callNative('removeInstallation', id)
   }
 
   const handleAdd = () => {
-    try { (window as any).Android?.openAddInstallation() } catch { /* not native */ }
+    callNative('openAddInstallation')
   }
 
   const startRename = (inst: Install) => {
@@ -74,7 +77,7 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   const commitRename = (id: string) => {
     const v = renameValue.trim()
     if (v) {
-      try { (window as any).Android?.renameInstallation(id, v) } catch { /* not native */ }
+      callNative('renameInstallation', id, v)
     }
     setRenamingId(null)
     refresh()

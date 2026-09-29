@@ -9,7 +9,10 @@
 
 // Shown until a coding agent (Claude Code or Codex) has a working platform
 // subscription.
-export function SetupBanner() {
+export function SetupBanner({ engines }: {
+  /** The coding engines' labels, in engine order (lib/engines codingEngineNames). */
+  engines: string[]
+}) {
   return (
     <div className="rounded-xl border border-amber-300 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-900/20 px-4 py-3">
       <div className="flex items-start gap-3">
@@ -19,7 +22,18 @@ export function SetupBanner() {
         <div>
           <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">Finish setting up OtoDock</p>
           <p className="text-sm text-amber-700 dark:text-amber-400/90 mt-0.5">
-            Connect at least one AI engine — <span className="font-medium">Claude Code</span> or <span className="font-medium">Codex</span> — to unlock chat and agents for your team. Add an account or API key on its card below.
+            Connect at least one AI engine{engines.length > 0 && (
+              <>
+                {' — '}
+                {engines.map((name, i) => (
+                  <span key={name}>
+                    {i > 0 && (i === engines.length - 1 ? ' or ' : ', ')}
+                    <span className="font-medium">{name}</span>
+                  </span>
+                ))}
+                {' —'}
+              </>
+            )} to unlock chat and agents for your team. Add an account or API key on its card below.
           </p>
         </div>
       </div>

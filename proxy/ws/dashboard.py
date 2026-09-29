@@ -15,8 +15,11 @@ at module level (several are imported by tests from this path).
 """
 
 import asyncio
+import collections
 import contextlib
 import json
+from core.events import tool_roles
+from core import placement
 import logging
 import time
 import uuid
@@ -26,9 +29,11 @@ from typing import NamedTuple
 from fastapi import WebSocket, WebSocketDisconnect
 
 from storage import database as task_store
-from storage.automation import notification_store
+from storage.automation import notification_store, run_status
 from services.notifications import notification_manager
-from auth.providers import validate_session_jwt, session_iat_after_password_change
+from auth.providers import acting_role_of, auth_gate, validate_session_jwt, session_iat_after_password_change
+from auth import roles
+from ws import wire_events as wire
 
 # A dashboard socket outlives a single request; re-validate its session +
 # re-read the user's role/agents at most this often (on client activity) so a
@@ -41,15 +46,17 @@ from core.session.session_state import (
 from core.execution_layer import ExecutionLayer
 from core.session.session_manager import get_execution_layer
 from core.config.task_config_builder import (
-    resolve_task_identity, task_allows_knowledge_rw,
+    resolve_task_identity, run_allows_knowledge_rw,
 )
 from core.events.stream_pump import (
     _active_pumps,
 )
+from core.events.common_events import TurnInput
 from core.remote import install_registry
 from core.session import warmup_registry
 from core.session import visibility as _vis
 from core import execution_mode
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy")
 
@@ -61,18 +68,6 @@ logger = logging.getLogger("claude-proxy")
 # (well below the 300s producer ceiling; a healthy turn advances last_activity
 # on every event so it never trips this).
 STALE_TURN_SECS = 90.0
-
-# Source types whose pump is consumed OUT-OF-BAND by a non-dashboard driver.
-# Today: the phone pipeline (ws/phone.py) drains the pump to play the agent's
-# reply as TTS and to watch for the [CALL_COMPLETE] hangup sentinel. A dashboard
-# viewer must NEVER attach() to these — ChatStreamPump.attach() is single-
-# consumer, so attaching swaps the live stream away from the phone, silently
-# killing the call (no TTS, no hangup). They are viewed READ-ONLY via
-# chat_history. Future external inputs (e.g. an agent invoked from a website /
-# webhook that awaits its reply on its own connection) join this set. NOTE:
-# "task" and "meeting" pumps are deliberately NOT here — the dashboard IS their
-# live viewer, so it correctly attaches to stream them.
-_EXTERNAL_DRIVEN_SOURCES = frozenset({"phone"})
 
 # Chat history loads the newest page; older turns lazy-load on scroll-up via
 # GET /v1/chats/{id}?before_id= (see api/agents/chats.py, which mirrors this size).
@@ -125,7 +120,7 @@ def _build_chat_restore(chat_id: str) -> dict:
                 goal = parsed
         except (ValueError, TypeError):
             pass
-    return {"todos": task_store.get_last_todo_snapshot(chat_id), "meeting": meeting,
+    return {"todos": task_store.get_last_todo_snapshot(chat_id, tool_roles.TODO_SNAPSHOT), "meeting": meeting,
             "goal": goal}
 
 
@@ -150,28 +145,15 @@ class _SpawnResult(NamedTuple):
     first_prompt_in_argv: bool = False
 
 
-def _effective_agent_role(user_sub: str, agent: str, fallback_user: dict | None = None) -> str:
-    """Effective per-agent role for a user (admin > per-agent assignment >
-    viewer). Reads live DB state so mid-session role changes take effect.
-    Used wherever a session's execution target is (re)resolved so the layer
-    matches the role the session was created with — a viewer on an admin-remote
-    agent otherwise resolves to a different layer than its config.
-
-    Two store reads: async handlers call it through ``run_db`` (or
-    ``_role_and_layer`` when the layer is resolved right after)."""
-    live_user = task_store.get_user(user_sub) or fallback_user or {}
-    if (live_user.get("role") or "") == "admin":
-        return "admin"
-    return task_store.get_user_agent_roles(user_sub).get(agent, "viewer")
-
-
 def _role_and_layer(
     user_sub: str, agent: str, chat: dict | None, fallback_user: dict | None = None,
 ) -> "tuple[str, ExecutionLayer]":
     """Role + the chat's execution layer (its stored path + pinned target) in
     ONE executor job: ``get_execution_layer`` reads remote_store and platform
-    settings for a remote target, so the pair belongs off the loop together."""
-    role = _effective_agent_role(user_sub, agent, fallback_user=fallback_user)
+    settings for a remote target, so the pair belongs off the loop together.
+    The role is ``acting_role_of`` (the live row, or the connect-time dict a
+    socket kept): a session's target must match the role it was built with."""
+    role = acting_role_of(user_sub, agent, fallback_user=fallback_user)
     row = chat or {}
     layer = get_execution_layer(
         agent, execution_path=row.get("execution_path", ""),
@@ -194,19 +176,35 @@ def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> 
     - **User-scoped** task → the creator or a platform admin.
 
     ``effective_role`` is the live per-agent role from
-    ``_effective_agent_role`` ("admin" for platform admins, which is why the
+    ``acting_role_of`` ("admin" for platform admins, which is why the
     user-scope branch needs no separate admin check beyond it).
 
     NOTE: this gates CONTINUING. Read-only VIEWING of an agent-scoped run
     (history load) follows the broader REST ``_check_run_access`` rule.
     """
-    if (run.get("scope") or "agent") == "user":
-        return run.get("created_by") == user_sub or effective_role == "admin"
-    return effective_role in ("admin", "manager", "editor")
+    if (run.get("scope") or _vis.SCOPE_AGENT) == _vis.SCOPE_USER:
+        return run.get("created_by") == user_sub or roles.is_admin(effective_role)
+    return roles.can_edit(effective_role)
+
+
+# Pasted photos: the longest side kept, and the pixel count past which a
+# format that must be decoded whole (anything but JPEG, which decodes at a
+# reduced scale through draft()) is refused.
+_MAX_IMAGE_DIM = 1568
+_MAX_FULL_DECODE_PIXELS = 50_000_000
+# Modes a JPEG can hold once converted to RGB; anything deeper (16-bit,
+# float) is kept as PNG.
+_JPEG_SAFE_MODES = {"RGB", "RGBA", "L", "LA", "1", "CMYK", "YCbCr", "P", "PA"}
 
 
 def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
     """Decode a base64 data URL, resize if needed, and save to disk.
+
+    The saved format follows the input: a JPEG stays a JPEG (q85); an image
+    with transparency or a palette, or one deeper than 8 bits, is saved as a
+    PNG (default compression); anything else becomes a JPEG. The re-encode
+    drops every metadata block but the colour profile (EXIF, GPS, comments),
+    after applying the EXIF orientation to the pixels.
 
     Args:
         data_url: Base64 data URL (data:image/...;base64,...)
@@ -226,44 +224,62 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         compression), not the original input — sending this through to a
         Direct-LLM agent's vision content block keeps payload small. CLI/Codex
         agents read from disk via their built-in Read tool and use ``path``.
+
+    Raises:
+        AttachmentsRefused: a non-JPEG image too large to decode.
     """
+    import base64
+    import io
+    from PIL import Image, ImageOps
+
     try:
-        import base64
-        from PIL import Image
-        import io
-
-        _MAX_IMAGE_DIM = 1568
-
         # Parse: data:image/png;base64,iVBOR...
         header, b64data = data_url.split(",", 1)
         raw_bytes = base64.b64decode(b64data)
-
-        # Open with Pillow to validate and optionally resize
-        img = Image.open(io.BytesIO(raw_bytes))
+        img = Image.open(io.BytesIO(raw_bytes))  # reads the header only
         w, h = img.size
+        source_format = img.format
+    except Exception as e:
+        logger.error(f"Failed to save image: {e}")
+        return None
+    if source_format not in ("JPEG", "MPO") and w * h > _MAX_FULL_DECODE_PIXELS:
+        from ws.dashboard_chat_support import AttachmentsRefused
+        raise AttachmentsRefused(
+            f"This photo is too large to process: {w * h / 1e6:.0f} megapixels, "
+            f"the limit is {_MAX_FULL_DECODE_PIXELS // 1_000_000}."
+        )
+    try:
         original_size = len(raw_bytes)
-
-        # Resize if either dimension exceeds the limit
+        # thumbnail() first: on a JPEG it decodes at a reduced scale. The
+        # orientation is applied to the small image afterwards.
         if max(w, h) > _MAX_IMAGE_DIM:
             img.thumbnail((_MAX_IMAGE_DIM, _MAX_IMAGE_DIM), Image.LANCZOS)
             logger.info(f"Resized image from {w}x{h} to {img.size[0]}x{img.size[1]}")
-
-        # Save as JPEG for large photos (much smaller file size), PNG otherwise
-        use_jpeg = original_size > 500_000 and img.mode in ("RGB", "RGBA", "L")
-        if use_jpeg:
-            if img.mode == "RGBA":
-                img = img.convert("RGB")
-            ext = "jpg"
-            media_type = "image/jpeg"
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85, optimize=True)
-            out_bytes = buf.getvalue()
         else:
-            ext = "png"
-            media_type = "image/png"
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            out_bytes = buf.getvalue()
+            img.load()
+        img = ImageOps.exif_transpose(img)
+        keep_png = source_format not in ("JPEG", "MPO") and (
+            img.has_transparency_data or img.mode in ("P", "PA")
+            or img.mode not in _JPEG_SAFE_MODES
+        )
+        # Only the colour profile and a PNG's transparency key survive.
+        icc = img.info.get("icc_profile")
+        transparency = img.info.get("transparency")
+        img.info.clear()
+        buf = io.BytesIO()
+        if keep_png:
+            ext, media_type = "png", "image/png"
+            extra = {"icc_profile": icc} if icc else {}
+            if transparency is not None:
+                extra["transparency"] = transparency
+            img.save(buf, format="PNG", **extra)
+        else:
+            ext, media_type = "jpg", "image/jpeg"
+            if img.mode != "RGB" and img.mode != "L":
+                img = img.convert("RGB")
+            img.save(buf, format="JPEG", quality=85, optimize=True,
+                     **({"icc_profile": icc} if icc else {}))
+        out_bytes = buf.getvalue()
 
         save_dir.mkdir(parents=True, exist_ok=True)
         filename = f"img_{uuid.uuid4().hex[:8]}.{ext}"
@@ -311,13 +327,13 @@ def _park_delegate_result(item: dict) -> bool:
     # for this item. Persist the bubble row here, then park the prompt for
     # replay.
     task_store.add_chat_message(_cid, "event", "",
-        event_type="delegate_result",
+        event_type=wire.DELEGATE_RESULT,
         event_data=json.dumps({
             "task_id": item.get("task_id", ""),
             "task_name": item.get("task_name", ""),
             "agent": item.get("delegate_agent", ""),
             "output_text": item.get("output_text", ""),
-            "status": item.get("status", "completed"),
+            "status": item.get("status", run_status.COMPLETED),
         }))
     return bool(task_store.append_pending_delegate_wake(_cid, _prompt))
 
@@ -349,9 +365,9 @@ async def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
             break
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "_server_kick":
+        if item.get("type") == wire.NOTIFY_SERVER_KICK:
             kicks.append(item)
-        elif item.get("type") == "task_result_prompt":
+        elif item.get("type") == wire.NOTIFY_TASK_RESULT_PROMPT:
             if item.get("chat_id") and item.get("result_prompt"):
                 to_park.append(item)
     for item in to_park:
@@ -398,10 +414,12 @@ def _resolve_session_interactive(agent_cfg, chat_exec_mode: str = "") -> bool:
     if interactive and not execution_mode.is_interactive_enabled():
         step, interactive = "kill-switch", False
     exec_path = agent_cfg.execution_path or ""
-    exec_target = agent_cfg.execution_target or "local"
-    if interactive and exec_path not in ("claude-code-cli", "codex-cli"):
+    exec_target = agent_cfg.execution_target or placement.LOCAL
+    from core.session.session_manager import get_layer_capabilities as _caps
+    _c = _caps(exec_path)
+    if interactive and not (_c and _c.runtime.supports_interactive_pty):
         step, interactive = "path", False
-    if interactive and exec_target != "local":
+    if interactive and not placement.is_local(exec_target):
         from core.remote.satellite_connection import get_connection_manager
         if not get_connection_manager().satellite_supports_pty(exec_target):
             step, interactive = "satellite-pty", False
@@ -463,26 +481,29 @@ async def chat_process_alive(chat: dict) -> bool:
         return False
     try:
         from core.session.session_manager import (
-            _remote_layer, resolve_execution_path,
+            _remote_layer, find_layer_for_session, resolve_execution_path,
         )
-        from core.layers.cli.session import _persistent_sessions
-        from core.layers.codex.session import _codex_sessions
-        if _remote_layer is not None and sid in _remote_layer._sessions:
-            if await _remote_layer.is_session_alive(sid):
+        holder = find_layer_for_session(sid)
+        if holder is not None and holder is _remote_layer:
+            if await holder.is_session_alive(sid):
                 return True
-            return _remote_layer.is_session_grace_held(sid)
-        if sid in _persistent_sessions:
-            return bool(_persistent_sessions[sid].is_alive)
-        if sid in _codex_sessions:
-            return bool(_codex_sessions[sid].is_alive)
+            return holder.is_session_grace_held(sid)
+        # An engine with no OS process is excluded: its in-memory session
+        # object reads "alive" with nothing behind it, and abandoning one
+        # loses nothing (it rebuilds full history from the DB).
+        if holder is not None and holder.capabilities.runtime.has_os_process:
+            return bool(await holder.is_session_alive(sid))
         # Not in any registry → dead for every real layer (their
         # is_session_alive reads the same registries, so this fallback is a
         # production no-op) — but it keeps stubbed layers (tests) visible.
-        # direct-llm stays excluded: its in-memory object reads "alive" with
-        # no process behind it.
         agent = chat.get("agent") or ""
         path = resolve_execution_path(agent, chat.get("execution_path") or "")
-        if path != "direct-llm":
+        # Only an engine with a process is worth probing here (an in-process
+        # engine's fallback reads "alive" with nothing behind it — the same
+        # rule as the holder branch); an unknown id reads as dead.
+        from core.session.session_manager import get_layer_capabilities
+        path_caps = get_layer_capabilities(path)
+        if holder is None and path_caps is not None and path_caps.runtime.has_os_process:
             layer = get_execution_layer(
                 agent, execution_path=path,
                 execution_target=chat.get("execution_target") or "",
@@ -504,12 +525,12 @@ def task_run_active(chat_id: str) -> bool:
     ``chats.model`` at record time) and can kill a launching run. Non-task
     chats and lookup errors return False (this augments, never replaces,
     ``chat_process_alive``)."""
-    if not chat_id.startswith("task-"):
+    if not session_kind.is_task_chat_id(chat_id):
         return False
     try:
-        run = (task_store.get_run(chat_id.removeprefix("task-"))
+        run = (task_store.get_run(session_kind.run_id_of_chat(chat_id))
                or task_store.get_run_for_chat(chat_id))
-        return bool(run) and (run.get("status") or "") in ("pending", "running")
+        return bool(run) and run_status.is_live(run.get("status"))
     except Exception:
         logger.debug("task_run_active: lookup failed for %s", chat_id,
                      exc_info=True)
@@ -519,7 +540,7 @@ def task_run_active(chat_id: str) -> bool:
 async def task_run_active_async(chat_id: str) -> bool:
     """``task_run_active`` with its two run reads on the DB executor — for
     the async handlers (non-task chats short-circuit without a job)."""
-    if not chat_id.startswith("task-"):
+    if not session_kind.is_task_chat_id(chat_id):
         return False
     from storage.pg import run_db
     return await run_db(task_run_active, chat_id)
@@ -538,13 +559,12 @@ def _resume_username_for_chat(
     Without either branch the resume CHECK looks in the viewer's dir and always
     returns False → a fresh, context-less spawn even though the conversation is
     resumable on disk."""
-    if cid_for_resume.startswith("task-"):
-        trun = task_store.get_run(cid_for_resume.removeprefix("task-"))
+    if session_kind.is_task_chat_id(cid_for_resume):
+        trun = task_store.get_run(session_kind.run_id_of_chat(cid_for_resume))
         if trun:
             tident = resolve_task_identity(
                 agent_for_resume, trun.get("scope") or "agent", trun.get("created_by"),
-                allow_knowledge_rw=task_allows_knowledge_rw(
-                    trun.get("task_type")),
+                allow_knowledge_rw=run_allows_knowledge_rw(trun.get("task_type")),
             )
             return tident.username or ""
     if _vis.is_shared_only(agent_for_resume):
@@ -568,7 +588,10 @@ def _rewarm_chat_allowed(
     silently overwrites the chat's session binding."""
     if chat["user_sub"] == viewer_sub:
         return True
-    if cid.startswith("task-"):
+    if session_kind.is_task_chat_id(cid):
+        # The id shape alone — a run row is not required here because the
+        # continue-gate (_deny_task_continue, which fails closed without a
+        # run) runs BEFORE this at every warmup / chat entry point.
         return True
     return (
         _vis.is_shared_chat_owner(chat["user_sub"])
@@ -576,21 +599,89 @@ def _rewarm_chat_allowed(
     )
 
 
+# The close codes of the handshake: 4001 no valid session, 4003 a foreign
+# Origin (both before accept, so a browser sees a failed handshake), 4403 a
+# session held by the forced password change or 2FA enrolment (after accept,
+# so the dashboard reads the code and moves the tab to that screen). The
+# periodic revalidation of an open socket closes with 4001 and 4403 too.
+WS_CLOSE_SESSION = 4001
+WS_CLOSE_ORIGIN = 4003
+WS_CLOSE_GATE = 4403
+_ORIGIN_WARN_EVERY_S = 60.0
+_ORIGIN_WARN_MAX = 256
+_origin_warned: dict[str, float] = {}
+
+
+def _dashboard_origin_ok(websocket: WebSocket) -> bool:
+    """The Origin rule of the cookie-authenticated socket: a client that
+    sends no Origin carries no ambient cookie (not a
+    browser page) and passes; ``null`` or an empty value never; otherwise the
+    origin must be the request's own, the ``DASHBOARD_PUBLIC_URL`` origin, or
+    name the host the request was sent to (a page cannot set ``Host`` on a
+    WebSocket handshake): LAN addresses, the Android app, installs with no
+    public URL."""
+    from urllib.parse import urlsplit
+
+    import config
+    from api.media.ui import request_origin
+
+    origin = websocket.headers.get("origin")
+    if origin is None:
+        return True
+    o = origin.strip().lower()
+    if not o or o == "null":
+        return False
+    if o == request_origin(websocket).lower():
+        return True
+    public = (config.DASHBOARD_PUBLIC_URL or "").strip().rstrip("/")
+    if public:
+        p = urlsplit(public)
+        if p.scheme and p.netloc and o == f"{p.scheme}://{p.netloc}".lower():
+            return True
+    host = (websocket.headers.get("host") or "").strip().lower()
+    try:
+        return bool(host) and urlsplit(o).netloc == host
+    except ValueError:
+        return False
+
+
+def _warn_refused_origin(websocket: WebSocket) -> None:
+    origin = (websocket.headers.get("origin") or "")[:200]
+    now = time.monotonic()
+    if now - _origin_warned.get(origin, 0.0) < _ORIGIN_WARN_EVERY_S:
+        return
+    if len(_origin_warned) >= _ORIGIN_WARN_MAX:
+        _origin_warned.clear()
+    _origin_warned[origin] = now
+    logger.warning(
+        "Dashboard socket refused for Origin %r (Host %r): the page is not on this "
+        "platform's address. If this is your own dashboard, keep the Host header at "
+        "the reverse proxy or set DASHBOARD_PUBLIC_URL to the address people use.",
+        origin, (websocket.headers.get("host") or "")[:200])
+
+
 async def ws_dashboard_handler(websocket: WebSocket):
     """Persistent WebSocket for dashboard chat interface.
 
-    Auth: JWT from session cookie (same-origin) — validated here, before
-    anything is accepted or allocated. Everything after auth lives on
-    ``DashboardConnection``: one instance == one socket == one invocation.
+    Auth: the Origin rule (``_dashboard_origin_ok``), then the JWT from the
+    session cookie, validated here before anything is accepted or allocated;
+    a session held by the forced password change or 2FA enrolment is closed
+    with 4403. Everything after auth lives on ``DashboardConnection``: one
+    instance == one socket == one invocation.
     """
+    if not _dashboard_origin_ok(websocket):
+        _warn_refused_origin(websocket)
+        await websocket.close(code=WS_CLOSE_ORIGIN, reason="Origin not allowed")
+        return
+
     session_cookie = websocket.cookies.get("session")
     if not session_cookie:
-        await websocket.close(code=4001, reason="No session cookie")
+        await websocket.close(code=WS_CLOSE_SESSION, reason="No session cookie")
         return
 
     payload = validate_session_jwt(session_cookie)
     if not payload:
-        await websocket.close(code=4001, reason="Invalid or expired session")
+        await websocket.close(code=WS_CLOSE_SESSION, reason="Invalid or expired session")
         return
 
     user_sub = payload["sub"]
@@ -598,9 +689,21 @@ async def ws_dashboard_handler(websocket: WebSocket):
     # proxy restart EVERY dashboard reconnects at once, and a synchronous
     # read here per socket would serialize the storm on the loop thread.
     from storage.pg import run_db
-    user = await run_db(task_store.get_user, user_sub)
+
+    def _connect_job():
+        row = task_store.get_user(user_sub)
+        return row, auth_gate(row)
+
+    user, gate = await run_db(_connect_job)
     if not user:
-        await websocket.close(code=4001, reason="User not found")
+        await websocket.close(code=WS_CLOSE_SESSION, reason="User not found")
+        return
+    if not session_iat_after_password_change(user, payload):
+        await websocket.close(code=WS_CLOSE_SESSION, reason="Invalid or expired session")
+        return
+    if gate:
+        await websocket.accept()
+        await websocket.close(code=WS_CLOSE_GATE, reason=gate)
         return
 
     conn = DashboardConnection(websocket, user_sub=user_sub, user=user)
@@ -628,45 +731,29 @@ class DashboardConnection(
     reader: it accepts, registers the notify queue, then multiplexes client
     messages / server notifications / the pump poll exactly as before.
 
-    Client -> Server:
-      {"type": "warmup", "agent": "...", "chat_id": "...", "permission_mode": "default"}
-      {"type": "chat", "text": "...", "chat_id": "..."}
-      {"type": "resume_chat", "chat_id": "..."}
-      {"type": "permission_response", "request_id": "...", "approved": true}
-      {"type": "mode_change", "mode": "..."}
-      {"type": "model_change", "model": "..."}
-      {"type": "thinking_change", "max_tokens": 16000}
-      {"type": "implement_plan", "plan_path": "...", "mode": "acceptEdits"}
-      {"type": "close"}
-
-    Server -> Client:
-      {"type": "warmup_ready", ...}
-      {"type": "chat_history", "messages": [...]}
-      {"type": "text", "content": "..."}
-      {"type": "thinking", "phase": "...", "text": "..."}
-      {"type": "tool_start", ...} / {"type": "tool_info", ...} / {"type": "tool_end", ...}
-      {"type": "task_spawn", ...}
-      {"type": "permission_prompt", ...}
-      {"type": "plan_mode", ...}
-      {"type": "system", ...}
-      {"type": "image", ...} / {"type": "url", ...} / {"type": "file", ...}
-      {"type": "metadata", ...}
-      {"type": "done"}
-      {"type": "error", "message": "..."}
-      {"type": "mode_changed", "mode": "..."}
-      {"type": "model_changed", "model": "..."}
-      {"type": "queued", "index": N, "text": "..."}
-      {"type": "queue_removed", "index": N}
-      {"type": "queue_sent", "text": "..."}
-      {"type": "user_message", "content": "..."}
-      {"type": "server_info", "build_id": "...", "version": "..."}   (last of the connect-time frames)
-      {"type": "pong", "build_id": "..."}   (reply to ping; the build id lets a stale page reload)
+    The wire — every frame this socket sends and every message it accepts,
+    with their payloads — is catalogued once in ``ws/wire_events.py``
+    (``FRAMES``, the payload TypedDicts, ``INBOUND``); the dashboard's mirror
+    is ``dashboard/src/api/wireEvents.ts``.
     """
+
+    # The gate that holds this person's browser session, found at the
+    # periodic revalidation ("" = none): the socket then closes 4403.
+    _held_gate = ""
+    # The periodic revalidation closed the socket (4001 or 4403): nothing
+    # more is read or dispatched on it.
+    _closed_by_revalidation = False
+    # The viewed chat may be opened but not driven by this user (set at every
+    # resume and warmup): no notify-queue registration, no session zone.
+    _view_only = False
 
     def __init__(self, websocket: WebSocket, *, user_sub: str, user: dict):
         self.websocket = websocket
         self.user_sub = user_sub
         self.user = user
+        # Client messages a loop received but left unprocessed (it ended with
+        # them in hand); read before the socket (_receive_client_text).
+        self._client_pushback: collections.deque[str] = collections.deque()
 
     async def run(self) -> None:
         from storage.pg import run_db
@@ -682,7 +769,7 @@ class DashboardConnection(
         self.session_id: str | None = None
         self.chat_id: str | None = None
         self.agent_name: str = ""
-        self.message_queue: list[str] = []  # queued user messages during streaming
+        self.message_queue: list[TurnInput] = []  # queued user messages during streaming
         self.artifact_queue: list[dict] = []  # queued display_ui backchannel interactions
         self.streaming = False
         self.deferred_model: str = ""  # model change before session exists
@@ -726,7 +813,7 @@ class DashboardConnection(
         # suppress the first turn. Reset at the start of each _do_warmup.
         self._warmup_abort_chat: "str | None" = None
         self.layer: ExecutionLayer | None = None   # resolved on warmup, used by producer + handlers
-        self.session_execution_target: str = "local"    # surfaced in warmup_ready for badge rendering
+        self.session_execution_target: str = placement.LOCAL    # surfaced in warmup_ready for badge rendering
         self.session_fallback_reason: str | None = None  # non-None iff target differs from intent
         self._attached_warmups: set[str] = set()  # chat_ids this WS is attached to in warmup_registry
         # Tracks whether _handle_warmup is currently mid-flight. When True, a
@@ -759,13 +846,17 @@ class DashboardConnection(
         # Each WS connection gets its own UUID so the multi-connection routing in
         # notification_manager can track per-tab/device visibility + platform.
         self.notify_queue: asyncio.Queue = asyncio.Queue()
+        # Live-app frames (push, state, open) have their own queue: it is
+        # drained inside a streaming turn too, where the notify queue waits.
+        self.live_queue = notification_manager.LiveQueue()
         self.notify_connection_id = str(uuid.uuid4())
         notification_manager.register_user_connection(
             self.user_sub, self.notify_connection_id, self.notify_queue, platform="web",
+            live_queue=self.live_queue,
         )
         # Send initial unread count so bell badge shows immediately
         _initial_count = await run_db(notification_store.get_unread_count, self.user_sub)
-        await self.websocket.send_json({"type": "notification_count", "count": _initial_count})
+        await self.websocket.send_json({"type": wire.NOTIFICATION_COUNT, "count": _initial_count})
 
         # Replay in-flight MCP-install progress this user participates in, so a tab
         # opened (or transparently reconnected) mid-install renders the bar at the
@@ -815,7 +906,7 @@ class DashboardConnection(
         try:
             from ws import satellite as _satellite_ws
             await self.websocket.send_json({
-                "type": "satellite_update_sync",
+                "type": wire.SATELLITE_UPDATE_SYNC,
                 "inflight": await run_db(
                     _satellite_ws.inflight_pushed_updates_for_user, self.user_sub,
                 ),
@@ -856,12 +947,12 @@ class DashboardConnection(
                 # agent-scope runs are visible to every user of the agent
                 # (the Task history view is the reader).
                 if _owner == self.user_sub or (
-                    (_is_shared_owner(_owner) or _owner.startswith("task::"))
+                    (_is_shared_owner(_owner) or _vis.is_task_chat_owner(_owner))
                     and self._can_access_agent(_row.get("agent") or "")
                 ):
                     _live_ids.append(_cid)
             await self.websocket.send_json({
-                "type": "chat_status_snapshot", "chat_ids": _live_ids,
+                "type": wire.CHAT_STATUS_SNAPSHOT, "chat_ids": _live_ids,
             })
         except Exception:
             logger.exception("chat-status snapshot on connect failed")
@@ -881,10 +972,11 @@ class DashboardConnection(
             ws_closing = False
             while not ws_closing:
                 # Multiplex: wait for client message, server notification, or task pump poll
-                recv_task = asyncio.create_task(self.websocket.receive_text())
+                recv_task = asyncio.create_task(self._receive_client_text())
                 notify_task = asyncio.create_task(self.notify_queue.get())
+                live_task = asyncio.create_task(self.live_queue.get())
 
-                wait_tasks: set[asyncio.Task] = {recv_task, notify_task}
+                wait_tasks: set[asyncio.Task] = {recv_task, notify_task, live_task}
                 # Periodic poll for a pump that APPEARS on the viewed chat while the
                 # socket is idle between turns — so resume mid-turn shows live
                 # generation. Covers task/meeting turns AND a regular
@@ -899,10 +991,7 @@ class DashboardConnection(
                 done, pending = await asyncio.wait(
                     wait_tasks, return_when=asyncio.FIRST_COMPLETED,
                 )
-                for t in pending:
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await t
+                done = await self._collect_late_results(done, pending)
 
                 for t in done:
                     if t is recv_task:
@@ -930,14 +1019,9 @@ class DashboardConnection(
                         # Periodically re-validate the session + refresh role
                         # (demotion / logout / password change / expiry) before
                         # acting on a client message on this long-lived socket.
-                        _now = time.time()
-                        if _now - self._last_authz_check >= _AUTHZ_REVALIDATE_S:
-                            self._last_authz_check = _now
-                            if not await asyncio.to_thread(self._revalidate_session):
-                                await self._send_error(
-                                    "Session expired — please sign in again")
-                                ws_closing = True
-                                break
+                        if not await self._session_still_holds():
+                            ws_closing = True
+                            break
                         try:
                             result = await self._dispatch_client_message(msg)
                         except RuntimeError as e:
@@ -949,11 +1033,14 @@ class DashboardConnection(
                             logger.warning(f"WS dashboard model resolution failed: {e}")
                             await self._send_error(str(e))
                             result = None
-                        if result == "close":
+                        if result == "close" or self._closed_by_revalidation:
                             ws_closing = True
                     elif t is notify_task:
                         notification = t.result()
                         await self._handle_server_notification(notification)
+                    elif t is live_task:
+                        await self._send(t.result())
+                        await self._drain_live_queue()
                     elif t is poll_task:
                         await self._task_pump_poll()
 
@@ -1066,13 +1153,9 @@ class DashboardConnection(
                 release_chat_slot(orphan_sid)
                 from core.session import prewarm_session_registry as _prewarm
                 await _prewarm.discard(orphan_sid)
-            # Release session_id's concurrency slot on WS disconnect.
-            # The session PROCESS stays alive for reconnection (reaper handles
-            # eventual cleanup), but the concurrency SLOT is freed immediately.
-            # On reconnect, acquire_chat_slot() re-acquires the slot.
-            if self.session_id:
-                from core.concurrency import release_chat_slot
-                release_chat_slot(self.session_id)
+            # No release for self.session_id: its process outlives the socket,
+            # so its reservation does too. The path that ends the session
+            # releases it (layer close, reapers, the reconciler backstop).
             logger.info(f"WS dashboard cleanup: session={self.session_id}, chat={self.chat_id}")
 
 
@@ -1083,13 +1166,44 @@ class DashboardConnection(
         except Exception:
             pass
 
+    async def _receive_client_text(self) -> str:
+        """The next client message: one a loop handed back first, else the
+        socket's next."""
+        if self._client_pushback:
+            return self._client_pushback.popleft()
+        return await self.websocket.receive_text()
+
+    @staticmethod
+    async def _collect_late_results(done: set, pending: set) -> set:
+        """Cancel ``pending`` all at once, await them together, and add the
+        ones that completed meanwhile to ``done``: cancelling and awaiting
+        one by one lost a result (a client message, a server kick, a live
+        frame) that landed while an earlier sibling was being awaited."""
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        late = {t for t in pending if t.done() and not t.cancelled()}
+        return set(done) | late
+
+    async def _drain_live_queue(self) -> None:
+        """Forward every waiting live-app frame (APPS.md "Live apps").
+        Called between turns by the multiplex and inside a streaming turn
+        by the pump loop, so a push reaches the screen while the agent's
+        own turn runs."""
+        while True:
+            frame = self.live_queue.get_nowait()
+            if frame is None:
+                return
+            await self._send(frame)
+
     @staticmethod
     def _server_info_frame() -> dict:
         import config
         from static_assets import dashboard_build_id
 
         return {
-            "type": "server_info",
+            "type": wire.SERVER_INFO,
             "build_id": dashboard_build_id(),
             "version": config.PINNED_OTODOCK_VERSION or "",
         }
@@ -1101,20 +1215,57 @@ class DashboardConnection(
         only signal a streaming page gets)."""
         from static_assets import dashboard_build_id
 
-        await self._send({"type": "pong", "build_id": dashboard_build_id()})
+        await self._send({"type": wire.PONG, "build_id": dashboard_build_id()})
 
     async def _send_error(self, msg: str):
-        await self._send({"type": "error", "message": msg})
+        await self._send({"type": wire.ERROR, "message": msg})
 
     def _can_access_agent(self, name: str) -> bool:
-        return self.user_role == "admin" or name in self.user_agents
+        return roles.is_admin(self.user_role) or name in self.user_agents
+
+    async def _session_still_holds(self) -> bool:
+        """The throttled connection revalidation, run before a client message
+        is acted on, between turns and inside a streaming turn alike: once
+        ``_AUTHZ_REVALIDATE_S`` has passed since the last check, the cookie,
+        the user row and the gate are read again. False when the socket was
+        closed for it: 4001 when the session no longer holds (expired,
+        revoked by a password change or logout-all, the user deleted), 4403
+        with the gate's name when the forced password change or 2FA
+        enrolment now holds the person."""
+        now = time.time()
+        if now - self._last_authz_check < _AUTHZ_REVALIDATE_S:
+            return True
+        self._last_authz_check = now
+        if not await asyncio.to_thread(self._revalidate_session):
+            self._refuse_further_work()
+            await self._send_error("Session expired: please sign in again")
+            with contextlib.suppress(Exception):
+                await self.websocket.close(code=WS_CLOSE_SESSION,
+                                           reason="Invalid or expired session")
+            return False
+        if self._held_gate:
+            self._refuse_further_work()
+            with contextlib.suppress(Exception):
+                await self.websocket.close(code=WS_CLOSE_GATE, reason=self._held_gate)
+            return False
+        return True
+
+    def _refuse_further_work(self) -> None:
+        """The socket is closing for its session: the turns this connection
+        queued are dropped, so no path that drains them after the viewer
+        loop ends starts a turn for it."""
+        self._closed_by_revalidation = True
+        self.message_queue.clear()
+        self.artifact_queue.clear()
 
     def _revalidate_session(self) -> bool:
         """Re-check the session cookie and refresh cached role/agents.
 
         Returns False (→ close the socket) when the session is no longer
         valid: cookie expired/invalid, user deleted, or the cookie predates a
-        password change (logout-all / reset). Otherwise refreshes
+        password change (logout-all / reset). ``_held_gate`` names the forced
+        password change or 2FA enrolment when one now holds the person (the
+        caller closes 4403). Otherwise refreshes
         ``user_role``/``agent_roles``/``user_agents`` from the DB so a mid-
         connection role or roster change is honored by the view/read gates
         instead of the connect-time snapshot. Throttled by the caller.
@@ -1130,6 +1281,7 @@ class DashboardConnection(
         self.user_role = user["role"]
         self.agent_roles = task_store.get_user_agent_roles(self.user_sub)
         self.user_agents = list(self.agent_roles.keys())
+        self._held_gate = auth_gate(user)
         return True
 
     def _register_notify_queue(self, *, replaces: str = ""):
@@ -1145,6 +1297,10 @@ class DashboardConnection(
         if (replaces and replaces != self.session_id
                 and _dashboard_notify_queues.get(replaces) is self.notify_queue):
             del _dashboard_notify_queues[replaces]
+        if self._view_only:
+            # A read-only viewer of this chat is never its session's sink
+            # (server kicks, location requests land with the driver).
+            return
         if self.session_id:
             _dashboard_notify_queues[self.session_id] = self.notify_queue
             logger.info(f"WS dashboard: registered notify queue for session={self.session_id[:8]} (dict_id={id(_dashboard_notify_queues)}, len={len(_dashboard_notify_queues)})")
@@ -1170,14 +1326,14 @@ class DashboardConnection(
         if not rec:
             return None
         ag = rec.get("agent") or ""
-        role = _effective_agent_role(self.user_sub, ag, fallback_user=self.user)
+        role = acting_role_of(self.user_sub, ag, fallback_user=self.user)
         try:
             return get_execution_layer(
                 ag,
                 execution_path=rec.get("execution_path") or "",
                 user_sub=self.user_sub,
                 role=role,
-                execution_target=rec.get("execution_target") or "local",
+                execution_target=rec.get("execution_target") or placement.LOCAL,
             )
         except Exception as e:
             logger.warning(f"WS dashboard: cannot resolve layer for chat {cid}: {e}")
@@ -1206,9 +1362,10 @@ class DashboardConnection(
             await self._handle_resume_chat({"chat_id": self.chat_id})
             await self._enter_pump_loop()
             return True
-        if not self.chat_id.startswith("task-"):
+        if not session_kind.is_task_chat_id(self.chat_id):
             return False
-        pump = self._find_task_pump()
+        from storage.pg import run_db
+        pump = await run_db(self._find_task_pump)
         if pump and not pump.is_done:
             # Related turn has active pump — re-send history + attach
             await self._handle_resume_chat({"chat_id": self.chat_id})

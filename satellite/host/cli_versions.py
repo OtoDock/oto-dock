@@ -40,6 +40,9 @@ import threading
 import time
 from pathlib import Path
 
+from ..engines import ENGINES
+from .. import config
+
 logger = logging.getLogger("satellite")
 
 _VER_RE = re.compile(r"(\d+\.\d+\.\d+)")
@@ -52,11 +55,8 @@ _VER_RE = re.compile(r"(\d+\.\d+\.\d+)")
 # startup) makes binaries installed here resolvable by every spawn.
 _USER_NPM_PREFIX = Path.home() / ".npm-global"
 
-# cli_pins key -> (npm package, bin name on PATH)
-_PACKAGES = {
-    "claude_code": ("@anthropic-ai/claude-code", "claude"),
-    "codex": ("@openai/codex", "codex"),
-}
+# cli_pins key -> (npm package, bin name on PATH) — each engine's row.
+_PACKAGES = {e.pin_key: (e.npm_package, e.binary) for e in ENGINES.values()}
 _PIN_KEY_TO_BIN = {key: bin_name for key, (_pkg, bin_name) in _PACKAGES.items()}
 
 # Module state. Writes go through _state_lock; readers are lock-free — every
@@ -133,7 +133,7 @@ def set_pins(cli_pins: dict, config_bins: dict[str, str] | None = None) -> None:
 
 
 def _is_windows() -> bool:
-    return os.name == "nt"
+    return not config.HOST.posix
 
 
 def _probe_version_at(path: str) -> str:

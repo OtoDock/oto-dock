@@ -12,7 +12,9 @@ tool:
 - **Keys**: uploaded via `Admin → SSH keys` into `keys/` (0600). Keys are
   NEVER synced or tarballed off the platform host; each session gets only the
   keys its agent's authorized instances reference, copied 0600 into the
-  session's private config dir and exposed as `$OTO_SSH_KEY_DIR`.
+  session's private config dir and exposed as `$OTO_SSH_KEY_DIR`. A check's
+  judge and a phone caller who is not a platform user get no keys, locally or
+  on a machine.
 - **Prompt block**: a dynamic-context provider renders the authorized host
   list as ready-to-run `ssh -i "$OTO_SSH_KEY_DIR/<key>" -p <port> user@host`
   lines.

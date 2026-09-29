@@ -15,10 +15,13 @@ module load using the auto-injected ``OTO_*`` env vars (mirror of
 
 - ``viewer`` (any scope) → ``complete_setup`` only; viewers don't manage
   agents, but they do walk their own per-user onboarding.
-- ``manager``/``admin`` → the full tool set.
-- ``scope=agent`` service sessions (task / phone / trigger, ``ROLE==""``)
-  → the full tool set (the agent is editing its own row; nothing escalates
-  beyond the platform's per-endpoint role checks).
+- ``editor``/``manager``/``admin`` → the full tool set (the proxy refuses
+  the owner-tier writes an editor cannot make, per call).
+- ``scope=agent`` — a person's chat on a Shared-only agent, or a user-tied
+  phone route on one, carrying that person's own role — → the same rows as
+  above. The manifest's ``exclude_from`` keeps this MCP out of task,
+  trigger, meeting and external-caller sessions, so no service session
+  ever loads it.
 
 All HTTP calls go through ``PROXY_URL`` + ``PROXY_API_KEY`` (auto-injected,
 session-scoped JWT) so the platform applies the calling user's role server
@@ -28,6 +31,7 @@ side. Local checks are best-effort defense.
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import re
 from typing import Any
@@ -36,6 +40,11 @@ import httpx
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
+# The sibling module (the tool schemas, pure data): found on sys.path[0] when
+# the MCP runs as ``python server.py`` from its folder, and put there by the
+# proxy's test loader while this module executes.
+from agent_config_tool_schemas import _TOOL_SCHEMAS  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Env + permission matrix
@@ -43,6 +52,12 @@ from mcp.types import TextContent, Tool
 
 AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
 ROLE = os.environ.get("OTO_ROLE", "")
+
+# The tier questions the tools gate on, answered by the proxy in the env
+# (core/sandbox/oto_env.py): a separate process cannot import the proxy
+# and carries no role vocabulary of its own.
+CAN_MANAGE = os.environ.get("OTO_CAN_MANAGE_AGENT", "") == "true"
+CAN_EDIT = os.environ.get("OTO_CAN_EDIT_AGENT", "") == "true"
 SCOPE = os.environ.get("OTO_SCOPE", "")
 # Non-empty for task-fired sessions (scheduled / one-time / trigger /
 # delegated worker): the "unattended" signal the persona write keys on.
@@ -82,16 +97,18 @@ _WRITE_TOOLS = {
 
 
 def _resolve_tool_set() -> set[str]:
-    if ROLE == "viewer":
-        # Viewers get exactly complete_setup: per-user onboarding
-        # (user-setup.md) targets the default-attach audience, who join as
-        # viewers — the endpoint's user scope only ever touches the caller's
-        # own file. Everything else stays manager-tier.
+    if ROLE and not CAN_EDIT:
+        # A person below the editor tier (a viewer, a contributor) gets
+        # exactly complete_setup: per-user onboarding (user-setup.md)
+        # targets the default-attach audience, who join as viewers — the
+        # endpoint's user scope only ever touches the caller's own file.
+        # Everything else stays manager-tier.
         #
         # Scope-independent on purpose: a Shared-only agent mounts agent-scope
         # for HUMAN chats too (OTO_SCOPE=="agent" with a real viewer driving),
         # so keying on scope advertised a surface every endpoint then refused.
-        # Service sessions carry ROLE=="" and are unaffected.
+        # No service session loads this MCP (the manifest excludes task,
+        # meeting and external), so only a person's session reaches here.
         return {"complete_setup"}
     if SCOPE in ("user", "agent"):
         return _READ_TOOLS | _WRITE_TOOLS
@@ -101,9 +118,6 @@ def _resolve_tool_set() -> set[str]:
 ENABLED_TOOLS = _resolve_tool_set()
 
 HEX_COLOR_REGEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
-# Must match ``api/agents.py::create_agent::valid_paths`` and the keys in
-# ``core/session_manager._LAYERS``. ``codex-cli`` not ``codex``.
-VALID_LAYERS = {"claude-code-cli", "direct-llm", "codex-cli"}
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +136,15 @@ async def _request(method: str, path: str, **kwargs) -> Any:
         headers["X-Agent-Name"] = AGENT_NAME
     url = f"{PROXY_URL}{path}"
     timeout = kwargs.pop("timeout", 10.0)
+    # One retry by default (a 5xx or a network error waits a second and tries
+    # again); a caller that must answer fast — tools/list — asks for one attempt.
+    attempts = max(1, int(kwargs.pop("attempts", 2)))
     last_exc: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(attempts):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.request(method, url, headers=headers, **kwargs)
-            if resp.status_code >= 500 and attempt == 0:
+            if resp.status_code >= 500 and attempt < attempts - 1:
                 await asyncio.sleep(1.0)
                 continue
             if resp.status_code >= 400:
@@ -145,13 +162,63 @@ async def _request(method: str, path: str, **kwargs) -> Any:
             raise
         except Exception as exc:
             last_exc = exc
-            if attempt == 0:
+            if attempt < attempts - 1:
                 await asyncio.sleep(1.0)
                 continue
             raise _ApiError(f"{method} {path}: {exc}") from exc
     if last_exc:
         raise _ApiError(f"{method} {path}: {last_exc}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# The engine catalog — the platform's registered engines, from
+# ``GET /v1/execution-layers`` (a dict keyed by engine id, each value the
+# engine's descriptor). Read once per process: the registry is static for the
+# proxy's lifetime, and this MCP lives for one session. Nothing here names an
+# engine — a fourth engine the platform registers is valid the moment it
+# appears in the catalog, and the interactive gate reads its descriptor.
+#
+# ``None`` when the proxy cannot be reached: every reader then defers to the
+# proxy, which validates every PATCH itself (an unknown engine id fails
+# closed there), so the only thing lost is a hint in the tool schema.
+# ---------------------------------------------------------------------------
+
+_ENGINE_CATALOG: dict[str, dict] | None = None
+
+
+async def _engine_catalog() -> dict[str, dict] | None:
+    global _ENGINE_CATALOG
+    if _ENGINE_CATALOG is not None:
+        return _ENGINE_CATALOG
+    try:
+        # One short attempt: tools/list is the first thing every session does
+        # and must not block on the default retry (~21 s against a dead proxy).
+        data = await _request("GET", "/v1/execution-layers", timeout=3.0, attempts=1)
+    except _ApiError:
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    _ENGINE_CATALOG = {k: v for k, v in data.items() if isinstance(v, dict)}
+    return _ENGINE_CATALOG
+
+
+async def _valid_layers() -> list[str] | None:
+    """The engine ids the platform registers, sorted; None without a catalog."""
+    catalog = await _engine_catalog()
+    return sorted(catalog) if catalog is not None else None
+
+
+async def _interactive_layers() -> list[str] | None:
+    """The engines with a native TUI (``runtime.supports_interactive_pty`` on
+    their descriptor) — the only ones a default session mode applies to."""
+    catalog = await _engine_catalog()
+    if catalog is None:
+        return None
+    return sorted(
+        path for path, layer in catalog.items()
+        if (layer.get("runtime") or {}).get("supports_interactive_pty")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +250,12 @@ async def _tool_list_available_models() -> str:
     can plan the right multi-step update.
 
     Endpoint shape: ``GET /v1/execution-layers`` returns a dict keyed by
-    layer path (e.g. ``"claude-code-cli"``, ``"codex-cli"``, ``"direct-llm"``)
-    where each value carries ``display_name`` + ``models[]`` (each model is
-    ``{value, label, supports_xhigh?, provider?}``).
+    engine id (the engines the platform registers) where each value carries
+    ``display_name`` + ``models[]`` (each model is ``{value, label,
+    supports_xhigh?, provider?, tier?, tier_label?, good_at?}``) and
+    ``auto_model`` / ``auto_model_label`` — what an agent with no
+    ``default_model`` runs on that engine right now. Read fresh on every
+    call: the model list and the auto default follow the admin's enablement.
     """
     data = await _request("GET", "/v1/execution-layers")
     if not isinstance(data, dict) or not data:
@@ -204,14 +274,25 @@ async def _tool_list_available_models() -> str:
     if current_default:
         current_layers.add(current_default)
 
-    lines = ["# Available models", ""]
+    lines = [
+        "# Available models", "",
+        "Tier = capability, most capable first: 1 frontier (complex coding, "
+        "the hardest reasoning and judgement), 2 strong, 3 balanced, 4 fast "
+        "(mechanical, routine); untiered = a local or custom model nobody "
+        "rated. Complex, open-ended or judgement-heavy work belongs on tier 1; "
+        "only mechanical, well-defined work should run lower; never assume a "
+        "newer or bigger-sounding id is stronger.", "",
+    ]
     for layer_path, layer in sorted(data.items()):
         if not isinstance(layer, dict):
             continue
         models = layer.get("models") or []
         # Filter out the "System Default" placeholder (value=="") — agents
-        # set real model IDs.
-        real_models = [m for m in models if m.get("value")]
+        # set real model IDs. Tier order: the table is the ranking.
+        real_models = sorted(
+            (m for m in models if m.get("value")),
+            key=lambda m: (m.get("tier") or 99, models.index(m)),
+        )
         if not real_models:
             continue
         enabled_here = layer_path in current_layers
@@ -224,10 +305,21 @@ async def _tool_list_available_models() -> str:
         display = layer.get("display_name") or layer_path
         lines.append(f"## {display} (`{layer_path}`) — {flag}")
         lines.append("")
-        lines.append("| Model ID | Label |")
-        lines.append("|---|---|")
+        auto = layer.get("auto_model") or ""
+        if auto:
+            auto_label = layer.get("auto_model_label") or auto
+            lines.append(
+                f"Auto (no `default_model`) currently runs `{auto}`"
+                + (f" ({auto_label})" if auto_label != auto else "") + " on this engine."
+            )
+            lines.append("")
+        lines.append("| Model ID | Label | Tier | Good at |")
+        lines.append("|---|---|---|---|")
         for m in real_models:
-            lines.append(f"| `{m['value']}` | {m.get('label', '')} |")
+            tier = m.get("tier")
+            tier_cell = f"{tier} {m.get('tier_label') or ''}".strip() if tier else "untiered"
+            lines.append(
+                f"| `{m['value']}` | {m.get('label', '')} | {tier_cell} | {m.get('good_at') or ''} |")
         lines.append("")
     lines.append(
         "Multi-step model change: if the model you want is on a layer "
@@ -322,9 +414,13 @@ async def _tool_update_execution_layers(layers: list[str]) -> str:
     """
     if not isinstance(layers, list) or not layers:
         return "❌ Error: layers must be a non-empty list"
-    bad = [layer for layer in layers if layer not in VALID_LAYERS]
-    if bad:
-        return f"❌ Error: invalid execution layer(s): {bad}. Valid: {sorted(VALID_LAYERS)}"
+    # The platform's registered engines; without a catalog the PATCH's own
+    # validation answers (an unknown id fails closed on the proxy).
+    valid = await _valid_layers()
+    if valid is not None:
+        bad = [layer for layer in layers if layer not in valid]
+        if bad:
+            return f"❌ Error: invalid execution layer(s): {bad}. Valid: {valid}"
     info = await _request("GET", f"/v1/agents/{AGENT_NAME}/info")
     current_default = info.get("execution_path") if isinstance(info, dict) else None
     # Preserve the current default at position 0 if it survives the change.
@@ -360,8 +456,11 @@ async def _tool_update_default_layer(layer: str) -> str:
     and PATCH ``execution_paths`` with the reordered list.
     """
     layer = (layer or "").strip()
-    if layer not in VALID_LAYERS:
-        return f"❌ Error: invalid layer '{layer}'. Valid: {sorted(VALID_LAYERS)}"
+    if not layer:
+        return "❌ Error: layer is required"
+    valid = await _valid_layers()
+    if valid is not None and layer not in valid:
+        return f"❌ Error: invalid layer '{layer}'. Valid: {valid}"
     info = await _request("GET", f"/v1/agents/{AGENT_NAME}/info")
     current_paths = info.get("execution_paths") or [] if isinstance(info, dict) else []
     if not isinstance(current_paths, list):
@@ -440,8 +539,10 @@ async def _tool_update_persona(content: str) -> str:
     the tool can enforce it. "Human present" is ``OTO_ROLE`` non-empty and
     no ``OTO_TASK_TYPE``: scope is NOT the signal, because a Shared-only
     agent mounts agent-scope for HUMAN chats too (``OTO_SCOPE == "agent"``
-    with a manager driving); service sessions (phone / trigger) carry an
-    empty role, and task fires carry their creator's role but run
+    with a manager driving); a phone caller carries ``viewer`` (refused by
+    the owner-tier check), a trigger fire the agent's intrinsic ``manager``
+    or ``admin`` (refused by ``TASK_TYPE``), and task fires carry their
+    creator's role but run
     unattended. A no-user session reaching the file API would otherwise slip
     past the role check on the proxy side, and rewriting an agent's soul is
     not something an unattended session should do.
@@ -452,7 +553,7 @@ async def _tool_update_persona(content: str) -> str:
             "user present — this session has none. Ask a manager of this "
             "agent to make the change from their own chat."
         )
-    if ROLE not in ("manager", "admin"):
+    if not CAN_MANAGE:
         return (
             "❌ Manager or admin role on this agent is required to rewrite "
             "the persona."
@@ -554,11 +655,11 @@ async def _tool_update_default_execution_mode(mode: str) -> str:
     - `-p` — the normal headless stream.
     - `` (empty) — unset; fall back to the platform default.
 
-    Only valid when this agent's DEFAULT model runs on a CLI execution layer
-    (claude-code-cli or codex-cli): the interactive terminal IS that CLI's own
-    TUI, so a Direct-LLM default has nothing to run interactively. Governs NEW
-    chats + tasks; meetings always run headless regardless. Already-warm
-    sessions need a fresh chat to pick up the change.
+    Only valid when this agent's DEFAULT model runs on an engine whose
+    descriptor declares ``supports_interactive_pty`` (a native TUI the platform
+    runs under a terminal): an engine without one has nothing to run
+    interactively. Governs NEW chats + tasks; meetings always run headless
+    regardless. Already-warm sessions need a fresh chat to pick up the change.
     """
     mode = (mode or "").strip()
     if mode not in ("", "interactive", "-p"):
@@ -567,26 +668,31 @@ async def _tool_update_default_execution_mode(mode: str) -> str:
             "Valid values: `interactive`, `-p`, or `` (empty, to unset)."
         )
     # When SETTING a real mode, mirror the backend gate: the agent's default
-    # model must be on a CLI layer (Direct-LLM can't run the interactive TUI).
+    # model must be on an engine with a TUI. Which engines those are is read
+    # from their descriptors (never a literal pair).
     if mode in ("interactive", "-p"):
         info = await _request("GET", f"/v1/agents/{AGENT_NAME}/info")
         default_model = info.get("default_model") if isinstance(info, dict) else ""
         if default_model:
             data = await _request("GET", "/v1/execution-layers")
             layers_for_model: set[str] = set()
+            interactive: set[str] = set()
             if isinstance(data, dict):
                 for layer_path, layer in data.items():
                     if not isinstance(layer, dict):
                         continue
+                    if (layer.get("runtime") or {}).get("supports_interactive_pty"):
+                        interactive.add(layer_path)
                     for m in (layer.get("models") or []):
                         if m.get("value") == default_model:
                             layers_for_model.add(layer_path)
-            if layers_for_model and not (layers_for_model & {"claude-code-cli", "codex-cli"}):
+            if layers_for_model and not (layers_for_model & interactive):
                 return (
-                    f"❌ Error: default_execution_mode only applies to CLI execution "
-                    f"layers. This agent's default model `{default_model}` runs on "
-                    f"`{'/'.join(sorted(layers_for_model))}` (not claude-code-cli / "
-                    f"codex-cli). Switch the default model first if you want interactive."
+                    f"❌ Error: default_execution_mode only applies to engines with a "
+                    f"native terminal ({', '.join(sorted(interactive)) or 'none registered'}). "
+                    f"This agent's default model `{default_model}` runs on "
+                    f"`{'/'.join(sorted(layers_for_model))}`. Switch the default model "
+                    f"first if you want interactive."
                 )
     await _request(
         "PATCH", f"/v1/agents/{AGENT_NAME}",
@@ -952,416 +1058,9 @@ async def _tool_set_department(department: str, level: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas + MCP dispatch
+# MCP dispatch (the tool schemas: agent_config_tool_schemas.py)
 # ---------------------------------------------------------------------------
 
-_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
-    "get_agent_config": {
-        "description": (
-            "Inspect this agent's current settings (display name, description, "
-            "color, default model, execution layers, community-template "
-            "provenance). Read-only."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    "list_available_models": {
-        "description": (
-            "List models available across the platform's enabled execution "
-            "layers. Call this before `update_default_model` to know which "
-            "model IDs are valid."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    "update_display_name": {
-        "description": (
-            "Change this agent's display name (shown in agent picker, chat "
-            "header, and cards). The slug stays the same — only the human "
-            "label changes."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "new_name": {
-                    "type": "string",
-                    "minLength": 1, "maxLength": 80,
-                    "description": "1–80 chars; any printable Unicode.",
-                },
-            },
-            "required": ["new_name"],
-            "additionalProperties": False,
-        },
-    },
-    "update_description": {
-        "description": "Change this agent's description (1–500 chars).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "new_description": {
-                    "type": "string",
-                    "minLength": 1, "maxLength": 500,
-                },
-            },
-            "required": ["new_description"],
-            "additionalProperties": False,
-        },
-    },
-    "update_color": {
-        "description": (
-            "Change this agent's accent color (used in UI badges + cards). "
-            "Pass a hex code like `#3B82F6`."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "hex_color": {
-                    "type": "string",
-                    "pattern": "^#[0-9A-Fa-f]{6}$",
-                },
-            },
-            "required": ["hex_color"],
-            "additionalProperties": False,
-        },
-    },
-    "update_default_model": {
-        "description": (
-            "Set this agent's default model. Must be one of the model_id "
-            "values from `list_available_models`."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "model_id": {"type": "string"},
-            },
-            "required": ["model_id"],
-            "additionalProperties": False,
-        },
-    },
-    "update_execution_layers": {
-        "description": (
-            "Set which execution layers this agent can use. Must be a non-"
-            "empty subset of [claude-code-cli, codex-cli, direct-llm]. The "
-            "current default layer is preserved at position 0 if it survives "
-            "the change; otherwise the new layers[0] becomes the default."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "layers": {
-                    "type": "array", "minItems": 1,
-                    "items": {"type": "string", "enum": [
-                        "claude-code-cli", "codex-cli", "direct-llm",
-                    ]},
-                },
-            },
-            "required": ["layers"],
-            "additionalProperties": False,
-        },
-    },
-    "update_default_layer": {
-        "description": (
-            "Set the default execution layer. Must already be in this agent's "
-            "execution_paths list."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "layer": {"type": "string", "enum": [
-                    "claude-code-cli", "codex-cli", "direct-llm",
-                ]},
-            },
-            "required": ["layer"],
-            "additionalProperties": False,
-        },
-    },
-    "update_default_scope": {
-        "description": (
-            "Set this agent's `default_scope` — `user` for personal-leaning "
-            "agents (tasks / notifications / memories default to the user), "
-            "`agent` for operational agents where most work is shared across "
-            "all users of this agent. (For the full mode, prefer "
-            "`set_visibility_mode`.)"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "default_scope": {"type": "string", "enum": ["user", "agent"]},
-            },
-            "required": ["default_scope"],
-            "additionalProperties": False,
-        },
-    },
-    "update_default_execution_mode": {
-        "description": (
-            "Set this agent's default SESSION MODE for new chats & tasks — "
-            "`interactive` runs the native CLI as a live terminal (TUI), `-p` "
-            "is the normal headless stream, `` (empty) unsets it (platform "
-            "default). Only valid when this agent's DEFAULT model runs on a CLI "
-            "execution layer (claude-code-cli / codex-cli); Direct-LLM can't run "
-            "interactively. Meetings always run headless regardless."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "mode": {"type": "string", "enum": ["interactive", "-p", ""]},
-            },
-            "required": ["mode"],
-            "additionalProperties": False,
-        },
-    },
-    "set_visibility_mode": {
-        "description": (
-            "Set this agent's visibility mode — how it relates to users. One of: "
-            "`personal_shared` (each person private + a shared team space), "
-            "`shared_personal` (one shared space + personal files too), "
-            "`personal_only` (fully private per person, NO shared space), "
-            "`shared_only` (ONE shared workspace + ONE shared chat history for "
-            "everyone, no personal space). Changing modes never deletes folders."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": ["personal_shared", "shared_personal",
-                             "personal_only", "shared_only"],
-                },
-            },
-            "required": ["mode"],
-            "additionalProperties": False,
-        },
-    },
-    "list_context_files": {
-        "description": (
-            "List files auto-loaded into this agent's context from "
-            "`config/context/`. Read-only."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    "update_persona": {
-        "description": (
-            "Replace this agent's persona — `config/agent.md`, the first "
-            "thing loaded into every session. Use it when the user says who "
-            "this agent should be, what it is for, how it should work, or "
-            "what standards it holds; facts about people, projects and "
-            "state go to memory instead. REPLACES the whole file, so send "
-            "the complete persona (the current one is at the top of your "
-            "own prompt). Write role, working style, judgment and "
-            "boundaries in the second person — never capability lists (each "
-            "tool ships its own instructions). Takes effect in the next new "
-            "session. Requires manager/admin role with a user present."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": (
-                        "The complete new persona in markdown. Usually 20–60 "
-                        "lines, starting with an `# <Agent name>` heading."
-                    ),
-                },
-            },
-            "required": ["content"],
-            "additionalProperties": False,
-        },
-    },
-    "get_memory_settings": {
-        "description": (
-            "Inspect this agent's memory toggle overrides (per-agent layer "
-            "above the platform-wide default). Shows the state of "
-            "`user_memory_enabled` and `agent_memory_enabled`. Read-only."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    "update_user_memory_enabled": {
-        "description": (
-            "Enable or disable per-user memory for this agent (the "
-            "`/memories/user/` scope). Overrides the platform-wide default. "
-            "Disabling stops the user-memory prompt section from injecting "
-            "and rejects `memory` tool writes to that scope."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"enabled": {"type": "boolean"}},
-            "required": ["enabled"],
-            "additionalProperties": False,
-        },
-    },
-    "update_agent_memory_enabled": {
-        "description": (
-            "Enable or disable the shared agent memory for this agent "
-            "(the `/memories/agent/` scope). Overrides the platform-wide "
-            "default. Disabling stops the agent-memory section from "
-            "injecting in every session and rejects `memory` tool writes "
-            "to that scope."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"enabled": {"type": "boolean"}},
-            "required": ["enabled"],
-            "additionalProperties": False,
-        },
-    },
-    "complete_setup": {
-        "description": (
-            "Mark this agent's post-install setup complete. Two scopes: "
-            "'agent' removes the agent-wide `config/context/setup.md` "
-            "(manager-level; call ONLY when every checklist item in setup.md "
-            "is verified done), 'user' removes the current user's own "
-            "`user-setup.md` onboarding from their context (call when their "
-            "personal onboarding is finished or they decline it). Omit scope "
-            "when only one applies — it is resolved automatically."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Optional one-line summary of what was configured (for the audit trail).",
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["agent", "user"],
-                    "description": "Which setup to complete; omit to auto-resolve when only one applies.",
-                },
-            },
-            "additionalProperties": False,
-        },
-    },
-    "list_knowledge_libraries": {
-        "description": (
-            "Show this agent's shared-knowledge state: which libraries it "
-            "shares (whole folder or a knowledge subfolder, and to whom), "
-            "which libraries are attached here (at "
-            "/knowledge/shared/<source>/<subdir>/), and — for platform "
-            "admins/creators — every library on the installation. Read-only."
-        ),
-        "inputSchema": {"type": "object", "properties": {},
-                        "additionalProperties": False},
-    },
-    "share_knowledge_folder": {
-        "description": (
-            "Share (or un-share) THIS agent's knowledge folder — or one of "
-            "its subfolders — as an installation-wide knowledge library that "
-            "other agents can attach. An agent can share several disjoint "
-            "subfolders as independent libraries. Platform admins/creators "
-            "only — the server rejects everyone else. Un-sharing detaches "
-            "that library's consumers and removes their mirrors."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "enable": {
-                    "type": "boolean",
-                    "description": "true = share, false = un-share.",
-                },
-                "name": {
-                    "type": "string",
-                    "description": (
-                        "The library's display name, e.g. 'Brand Guidelines' "
-                        "— how people pick it out in the dashboard, and the "
-                        "name of its bulletin file. REQUIRED when "
-                        "enable=true, ignored when un-sharing. Re-share with "
-                        "a different name to rename it. Never part of the "
-                        "mirror path (consumers read "
-                        "/knowledge/shared/<this-agent>/<subdir>/)."
-                    ),
-                },
-                "subdir": {
-                    "type": "string",
-                    "description": (
-                        "Knowledge subfolder to share, relative to this "
-                        "agent's knowledge/ root (e.g. 'marketing' or "
-                        "'docs/public'). Empty/omitted = the whole folder. "
-                        "Identifies the library on un-share too. Subtrees "
-                        "must be disjoint from the agent's other libraries."
-                    ),
-                },
-            },
-            "required": ["enable"],
-            "additionalProperties": False,
-        },
-    },
-    "attach_knowledge_library": {
-        "description": (
-            "Attach a shared knowledge library to THIS agent — its content "
-            "mirrors to /knowledge/shared/<source>/<subdir>/ (read-only "
-            "unless writable). Also updates the writable flag of an "
-            "existing attachment. Platform admins/creators only."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "source_agent": {
-                    "type": "string",
-                    "description": "Slug of the agent sharing the library.",
-                },
-                "subdir": {
-                    "type": "string",
-                    "description": (
-                        "The library's subfolder as shown by "
-                        "list_knowledge_libraries; empty/omitted for a "
-                        "whole-folder library."
-                    ),
-                },
-                "writable": {
-                    "type": "boolean",
-                    "description": "true = edits here flow back to the source library. Default false (read-only).",
-                },
-            },
-            "required": ["source_agent"],
-            "additionalProperties": False,
-        },
-    },
-    "detach_knowledge_library": {
-        "description": (
-            "Detach a shared knowledge library from THIS agent and remove "
-            "its mirror. Platform admins/creators only."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "source_agent": {
-                    "type": "string",
-                    "description": "Slug of the attached library's source agent.",
-                },
-                "subdir": {
-                    "type": "string",
-                    "description": (
-                        "The attachment's library subfolder; empty/omitted "
-                        "for a whole-folder library."
-                    ),
-                },
-            },
-            "required": ["source_agent"],
-            "additionalProperties": False,
-        },
-    },
-    "set_department": {
-        "description": (
-            "Assign THIS agent to a department + level on the company map "
-            "(names resolved case-insensitively), or clear the assignment "
-            "by passing an empty department. Wires delegation edges per "
-            "the department's structure. Platform admins/creators only."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "department": {
-                    "type": "string",
-                    "description": "Department name or id; empty string clears the assignment.",
-                },
-                "level": {
-                    "type": "string",
-                    "description": "Level name or id within the department; may be omitted when the department has exactly one level.",
-                },
-            },
-            "required": ["department"],
-            "additionalProperties": False,
-        },
-    },
-}
 
 
 _TOOL_HANDLERS = {
@@ -1408,11 +1107,40 @@ _TOOL_HANDLERS = {
 server = Server("agent-config-mcp")
 
 
+async def _engine_schemas() -> dict[str, dict[str, Any]]:
+    """``_TOOL_SCHEMAS`` with the engine-typed tools filled from the
+    platform's catalog: the two layer ``enum``s and the three descriptions
+    that name engines. Without a catalog the enums are left out (the proxy
+    validates every PATCH) and the descriptions point at
+    ``list_available_models``."""
+    schemas = copy.deepcopy(_TOOL_SCHEMAS)
+    valid = await _valid_layers()
+    interactive = await _interactive_layers()
+    layers_items = schemas["update_execution_layers"]["inputSchema"]["properties"]["layers"]["items"]
+    layer_prop = schemas["update_default_layer"]["inputSchema"]["properties"]["layer"]
+    if valid:
+        layers_items["enum"] = list(valid)
+        layer_prop["enum"] = list(valid)
+        engines_text = ", ".join(valid)
+    else:
+        engines_text = "the engines the platform registers (see list_available_models)"
+    interactive_text = (
+        ", ".join(interactive) if interactive
+        else "the engines whose descriptor declares supports_interactive_pty (see list_available_models)"
+    )
+    for name in ("update_execution_layers", "update_default_layer", "update_default_execution_mode"):
+        schemas[name]["description"] = schemas[name]["description"].format(
+            engines=engines_text, interactive=interactive_text,
+        )
+    return schemas
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
+    schemas = await _engine_schemas()
     return [
         Tool(name=name, description=schema["description"], inputSchema=schema["inputSchema"])
-        for name, schema in _TOOL_SCHEMAS.items()
+        for name, schema in schemas.items()
         if name in ENABLED_TOOLS
     ]
 

@@ -68,7 +68,7 @@ class TestPermissionMatrix:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         assert m.ENABLED_TOOLS == {
             "list_enabled_mcps",
@@ -91,12 +91,12 @@ class TestPermissionMatrix:
         admin = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "admin",
+            "OTO_ROLE": "admin", "OTO_CAN_MANAGE_AGENT": "true",
         })
         manager = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         assert admin.ENABLED_TOOLS == manager.ENABLED_TOOLS
         # Explicit assertion the removed tools are gone.
@@ -133,7 +133,7 @@ class TestPermissionMatrix:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         tool_names = {t.name for t in asyncio.run(m.list_tools())}
         assert tool_names == m.ENABLED_TOOLS
@@ -145,7 +145,7 @@ class TestPermissionMatrix:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         tools = {t.name: t for t in asyncio.run(m.list_tools())}
         for name in ("request_mcp_install", "request_mcp_access"):
@@ -159,7 +159,7 @@ class TestPermissionMatrix:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         out = asyncio.run(m.call_tool("ghost_tool", {"mcp_name": "x"}))
         assert "not available" in out[0].text
@@ -184,7 +184,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -211,7 +211,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -252,7 +252,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -272,7 +272,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -303,7 +303,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -327,7 +327,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -370,7 +370,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -407,7 +407,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -433,7 +433,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         out = asyncio.run(m.call_tool("request_mcp_install", {"reason": "x"}))
         assert "mcp_name is required" in out[0].text
@@ -443,7 +443,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
         })
         out = asyncio.run(m.call_tool(
             "request_mcp_install", {"mcp_name": "email-server"},
@@ -454,7 +454,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -487,7 +487,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -513,7 +513,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -537,7 +537,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "manager",
+            "OTO_ROLE": "manager", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })
@@ -560,7 +560,7 @@ class TestToolBehavior:
         m = _load_server({
             "OTO_AGENT_NAME": "pa",
             "OTO_SCOPE": "user",
-            "OTO_ROLE": "admin",
+            "OTO_ROLE": "admin", "OTO_CAN_MANAGE_AGENT": "true",
             "PROXY_URL": "http://test",
             "PROXY_API_KEY": "k",
         })

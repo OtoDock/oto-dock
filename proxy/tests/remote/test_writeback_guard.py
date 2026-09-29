@@ -12,6 +12,8 @@ contract.
 import base64
 import sys
 from types import SimpleNamespace
+
+from core import placement
 from unittest.mock import patch
 
 import pytest
@@ -30,38 +32,38 @@ from core.remote.file_sync import can_write_back  # noqa: E402
 class TestCanWriteBackMatrix:
     # --- knowledge/ + config/ : owner-tier only ---
     @pytest.mark.parametrize("role,expected", [
-        ("viewer", False), ("editor", False), ("manager", True), ("admin", True),
+        ("viewer", False), ("contributor", False), ("editor", False), ("manager", True), ("admin", True),
     ])
     def test_knowledge(self, role, expected):
         assert can_write_back("knowledge/ref.md", role, "alice") is expected
 
     @pytest.mark.parametrize("role,expected", [
-        ("viewer", False), ("editor", False), ("manager", True), ("admin", True),
+        ("viewer", False), ("contributor", False), ("editor", False), ("manager", True), ("admin", True),
     ])
     def test_config_prompt(self, role, expected):
         assert can_write_back("config/prompt.md", role, "alice") is expected
 
     @pytest.mark.parametrize("role,expected", [
-        ("viewer", False), ("editor", False), ("manager", True), ("admin", True),
+        ("viewer", False), ("contributor", False), ("editor", False), ("manager", True), ("admin", True),
     ])
     def test_config_context(self, role, expected):
         assert can_write_back("config/context/doc.md", role, "alice") is expected
 
     # --- workspace/ : editor tier and up ---
     @pytest.mark.parametrize("role,expected", [
-        ("viewer", False), ("editor", True), ("manager", True), ("admin", True),
+        ("viewer", False), ("contributor", True), ("editor", True), ("manager", True), ("admin", True),
     ])
     def test_shared_workspace(self, role, expected):
         assert can_write_back("workspace/out.md", role, "alice") is expected
 
     # --- users/{own}/ : any role on own dir ---
-    @pytest.mark.parametrize("role", ["viewer", "editor", "manager", "admin"])
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
     def test_own_user_dir(self, role):
         assert can_write_back("users/alice/workspace/a.md", role, "alice") is True
         assert can_write_back("users/alice/context/c.md", role, "alice") is True
 
     # --- users/{other}/ : never (even admin — stricter on remote) ---
-    @pytest.mark.parametrize("role", ["viewer", "editor", "manager", "admin"])
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
     def test_other_user_dir_denied(self, role):
         assert can_write_back("users/bob/workspace/b.md", role, "alice") is False
 
@@ -90,7 +92,7 @@ class TestCanWriteBackMatrix:
         "users/alice/.codex/sessions/t.jsonl",
         ".claude/settings.json",
     ])
-    @pytest.mark.parametrize("role", ["viewer", "editor", "manager", "admin"])
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
     def test_claude_codex_machinery_never(self, path, role):
         assert can_write_back(path, role, "alice") is False
 
@@ -176,7 +178,8 @@ class TestApplierGuard:
             "session_id": "sess-1",
             "content_b64": base64.b64encode(b"x").decode() if action == "write" else "",
         }
-        sec = SimpleNamespace(role=role, username=username)
+        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role=role, username=username,
+                              agent="my-agent")
         if mount_username is not None:
             sec.mount_username = mount_username
         called = {"n": 0}
@@ -270,21 +273,71 @@ class TestDenialLogLevel:
 
     @pytest.mark.asyncio
     async def test_engine_machinery_denial_is_debug(self, caplog):
-        sec = SimpleNamespace(role="admin", username="alice")
+        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="admin", username="alice",
+                              agent="my-agent")
         records = await self._run_capturing(
             caplog, "users/alice/.codex/models_cache.json", sec)
         assert records and all(lvl == "DEBUG" for lvl, _ in records)
 
     @pytest.mark.asyncio
     async def test_role_denial_stays_warning(self, caplog):
-        sec = SimpleNamespace(role="viewer", username="alice")
+        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="viewer", username="alice",
+                              agent="my-agent")
         records = await self._run_capturing(caplog, "knowledge/x.md", sec)
         assert records and all(lvl == "WARNING" for lvl, _ in records)
 
     @pytest.mark.asyncio
-    async def test_missing_ctx_on_engine_path_stays_warning(self, caplog):
-        # No SecurityContext is anomalous even on a machinery path — the
-        # quiet lane is only for authenticated sessions' routine engine noise.
+    async def test_missing_ctx_on_engine_path_is_info_not_warning(self, caplog):
+        # A machinery path with NO registered context is the engine's last
+        # write landing after the session's close (a mode-switch close
+        # unregisters the context a few ms before Claude stamps
+        # `.claude/.last-cleanup`): denied the same way, said at INFO so the
+        # close race stays visible without a WARNING (786f37d0). A missing
+        # context on a NORMAL path stays the WARNING the log exists for.
         records = await self._run_capturing(
             caplog, "users/alice/.codex/models_cache.json", None)
+        assert records and all(lvl == "INFO" for lvl, _ in records)
+        assert all("no session context" in msg for _, msg in records)
+        caplog.clear()
+        records = await self._run_capturing(caplog, "knowledge/x.md", None)
         assert records and all(lvl == "WARNING" for lvl, _ in records)
+
+
+# ---------------------------------------------------------------------------
+# Admission runs before any query or stamp
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissionOrder:
+    @pytest.mark.asyncio
+    async def test_a_session_less_mirror_frame_runs_no_query_and_leaves_no_stamp(self):
+        from core.remote import satellite_file_transfer as sft
+        from core.remote.satellite_connection import SatelliteConnectionManager
+        sft.LAST_FILE_CHANGED.clear()
+        cm = SatelliteConnectionManager()
+        msg = {"agent_slug": "my-agent", "path": "knowledge/shared/lib/x.md", "action": "write",
+               "session_id": "sess-none", "content_b64": base64.b64encode(b"x").decode()}
+        calls = []
+        with patch("core.session.session_state.get_session_security", return_value=None), \
+             patch("storage.knowledge.db_knowledge_libraries.writable_pairs_for",
+                   side_effect=lambda a: calls.append(a) or frozenset()):
+            await cm._apply_file_changed("machine-1", msg)
+            await cm.handle_message("machine-1", {"type": "file_changed", **msg})
+        assert calls == []
+        assert sft.LAST_FILE_CHANGED == {}
+
+    @pytest.mark.asyncio
+    async def test_an_agent_mismatch_leaves_no_stamp(self):
+        from core.remote import satellite_file_transfer as sft
+        from core.remote.satellite_connection import SatelliteConnectionManager
+        sft.LAST_FILE_CHANGED.clear()
+        cm = SatelliteConnectionManager()
+        sec = SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="manager",
+                              username="alice", agent="other-agent")
+        msg = {"agent_slug": "my-agent", "path": "workspace/x.md", "action": "write",
+               "session_id": "sess-1", "content_b64": base64.b64encode(b"x").decode()}
+        with patch("core.session.session_state.get_session_security", return_value=sec), \
+             patch("core.remote.file_sync.apply_incoming_file") as applied:
+            await cm._apply_file_changed("machine-1", msg)
+        applied.assert_not_called()
+        assert sft.LAST_FILE_CHANGED == {}

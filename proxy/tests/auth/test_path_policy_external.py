@@ -13,6 +13,7 @@ import pytest
 
 from auth import path_policy
 from auth.path_policy import SecurityContext, check_tool_access
+from core import placement
 
 
 @pytest.fixture
@@ -106,12 +107,19 @@ class TestWrites:
         assert not path_policy._is_memory_file(tree / "externals" / "phone" / "1" / "workspace" / "memory" / "t.md")
 
 
-def test_denied_cli_tools_constant():
-    """The shell in every spelling; the web tools are deliberately NOT here
-    (2026-09-08 — a caller can already hear anything the session reads)."""
-    assert set(path_policy.EXTERNAL_DENIED_CLI_TOOLS) == {"Bash", "Monitor", "PowerShell"}
-    assert "WebFetch" not in path_policy.EXTERNAL_DENIED_CLI_TOOLS
-    assert "WebSearch" not in path_policy.EXTERNAL_DENIED_CLI_TOOLS
+def test_the_floored_shell_tools():
+    """The shell in every spelling — the Claude engine's own shell names, and
+    the ``shell`` role the hook floor keys on; the web tools are deliberately
+    NOT floored (2026-09-08 — a caller can already hear anything the session
+    reads)."""
+    from core.events import tool_roles
+    from core.layers.cli.layer import CLIExecutionLayer
+    layer = CLIExecutionLayer()
+    assert set(layer.capabilities.behaviour.tools["shell"]) == {"Bash", "Monitor", "PowerShell"}
+    assert layer.session_denied_tools(external=True, read_only=False) == ["Bash", "Monitor", "PowerShell"]
+    assert set(tool_roles.names_of(tool_roles.SHELL)) == {"Bash", "Monitor", "PowerShell"}
+    assert tool_roles.role_of("WebFetch") != tool_roles.SHELL
+    assert tool_roles.role_of("WebSearch") != tool_roles.SHELL
 
 
 class TestConfigDirAndPatches:
@@ -127,8 +135,15 @@ class TestConfigDirAndPatches:
         ctx = _ctx(tree)
         assert _write(ctx, "/caller/workspace/notes.md").allowed
         assert _write(ctx, "/caller/context/prefs.md").allowed
+        # The hook scripts and settings are the universal protected set;
+        # anything else in the config dirs falls to the caller-root rule.
         for path in ("/caller/.codex/permission_gate.py", "/caller/.codex/hooks.json",
-                     "/caller/.claude/settings.json", "/caller/.claude/permission_gate.py"):
+                     "/caller/.claude/settings.json", "/caller/.claude/permission_gate.py",
+                     "/caller/.codex/notes.md"):
+            decision = _write(ctx, path)
+            assert not decision.allowed, path
+            assert "protected" in decision.reason
+        for path in ("/caller/.claude/todos/x.json",):
             decision = _write(ctx, path)
             assert not decision.allowed, path
             assert "workspace/ and context/" in decision.reason
@@ -179,13 +194,14 @@ class TestWebFetch:
     def test_no_webfetch_on_a_remote_target(self, tree):
         """No netns on a satellite and the gate is literal-URL only, so an
         external session gets no WebFetch there at all."""
-        for kind in ("admin_remote", "user_remote"):
-            ctx = dataclasses.replace(_ctx(tree, home=False), target_kind=kind)
+        for kind in (placement.KIND_ADMIN_REMOTE, placement.KIND_USER_REMOTE):
+            ctx = dataclasses.replace(_ctx(tree, home=False), placement=placement.PlacementCapabilities(kind=kind))
             decision = self._fetch(ctx, "https://docs.otodock.io/")
             assert not decision.allowed and "remote machine" in decision.reason
         # A user session on the same target keeps the ordinary gate.
         user = SecurityContext(
             role="viewer", username="alice", agent="support", is_admin_agent=False,
-            session_scope="user", target_kind="admin_remote",
-        )
+            session_scope="user",
+            placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE),
+            )
         assert self._fetch(user, "https://docs.otodock.io/").allowed

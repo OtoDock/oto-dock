@@ -72,6 +72,36 @@ _oneshot_inflight: dict[str, asyncio.Event] = {}
 _ONESHOT_WARMUP_WAIT_S = 90.0
 
 
+async def chat_layer(chat: dict):
+    """The execution layer that owns a chat's session: the engine layer for a
+    local chat, the remote placement for a chat pinned to a satellite —
+    resolved from the row (agent, stored path, pinned target, the owner's
+    acting role) off the loop, since the resolver reads the remote store.
+    None when the row cannot be resolved (a target machine that is gone), so
+    the caller takes its fallback instead of failing the delivery."""
+    from storage.pg import run_db
+    from auth.providers import acting_role_of
+    from core.session.session_manager import get_execution_layer
+
+    agent = chat.get("agent", "") or ""
+    owner = chat.get("user_sub", "") or ""
+    try:
+        def _resolve():
+            role = acting_role_of(owner, agent) if owner else "manager"
+            return get_execution_layer(
+                agent, execution_path=chat.get("execution_path", "") or "",
+                user_sub=owner or None, role=role,
+                execution_target=chat.get("execution_target") or "",
+            )
+        return await run_db(_resolve)
+    except Exception:
+        logger.warning(
+            f"chat_layer: layer resolution failed for chat={str(chat.get('id', ''))[:8]}",
+            exc_info=True,
+        )
+        return None
+
+
 def oneshot_inflight(chat_id: str) -> "asyncio.Event | None":
     """The in-flight one-shot delivery on ``chat_id``, or None. Warmups await
     the returned event (set on completion) before resuming the session."""
@@ -277,22 +307,24 @@ async def deliver_prompt(
     _persist_once(target_chat_id or "")
 
     # Rung 3a: a pump is streaming this chat AND the engine supports mid-turn
-    # steering (Codex turn/steer) — the prompt goes INTO the running turn,
-    # consumed at the next sampling-round boundary. Accept = exactly-once
-    # (never also queued); reject (turn just ended, review/compaction turn,
-    # unsupported engine) falls through to the post-turn queue.
+    # steering (Codex turn/steer, Claude's stdin frame) — the prompt goes INTO
+    # the running turn, consumed at the next tool boundary. Accept =
+    # exactly-once (never also queued); reject (turn just ended,
+    # review/compaction turn, a parked card, unsupported engine) falls through
+    # to the post-turn queue. The chat's OWN layer answers — the remote
+    # placement for a chat pinned to a satellite (the local engine layer
+    # never owns that session, so it refused every remote steer) — and only
+    # a pump whose kind takes a steer is asked (a meeting or phone turn keeps
+    # the queue, like the dashboard's own steer branch).
     if target_chat_id:
         from core.events.stream_pump import _active_pumps
-        from core.session.session_manager import (
-            get_layer_by_path, resolve_execution_path,
-        )
+        from core.session import session_kind as _kind
         _pump = _active_pumps.get(target_chat_id)
-        if _pump is not None and not _pump.is_done:
-            _layer = get_layer_by_path(resolve_execution_path(
-                (chat or {}).get("agent", ""),
-                (chat or {}).get("execution_path", ""),
-            ))
-            if await _layer.steer(_pump.session_id, text):
+        if (_pump is not None and not _pump.is_done
+                and getattr(_pump, "source_type", _kind.DASHBOARD.source_type)
+                in _kind.STEERABLE_SOURCE_TYPES):
+            _layer = await chat_layer(chat or {})
+            if _layer is not None and await _layer.steer(_pump.session_id, text):
                 if pump_event:
                     push_pump_event(target_chat_id, pump_event)
                 logger.info(

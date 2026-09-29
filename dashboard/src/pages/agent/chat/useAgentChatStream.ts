@@ -24,6 +24,7 @@ import { useRef, useEffect } from 'react'
 import type { RefObject } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 import { useChatStream } from '../../../hooks/useChatStream'
+import type { WireImage } from '../../../hooks/useDashboardWs'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import type { useChatNotifications } from '../../../hooks/useChatNotifications'
 import type { useAgents } from '../../../api/agents'
@@ -33,6 +34,7 @@ import { isDictationActive, onIdle as speechIdle } from '../../../audio/speechAc
 import { useChatStore } from '../../../store/chatStore'
 import type { useModelEngineSelection } from './useModelEngineSelection'
 import type { useFindBar } from './useFindBar'
+import { isTaskChatId } from '../../../lib/session/kind'
 
 type Selection = ReturnType<typeof useModelEngineSelection>
 type FindBar = ReturnType<typeof useFindBar>
@@ -88,7 +90,7 @@ export function useAgentChatStream({
   // Warmup-pending message + attachments (held while the session spins up;
   // sent by the post-warmup effect once sessionId + chatId land).
   const pendingMessageRef = useRef<string | null>(null)
-  const pendingImagesRef = useRef<Array<{ base64: string; name: string }> | null>(null)
+  const pendingImagesRef = useRef<WireImage[] | null>(null)
   // Set when we send a prompt WITH warmup (server-kicked first turn). On
   // warmup_ready we adopt the server-driven turn into the streaming UI so the
   // stop button + timer + live generation engage (the client sent `warmup`,
@@ -128,8 +130,26 @@ export function useAgentChatStream({
     // duplicate "Warmup failed" strip was removed from InstallProgressBar.
     appendErrorOnEmptyWarmupFail: true,
     queue: {
-      addQueued: (index, text) => { if (latest.current.draftKey) useChatStore.getState().addQueuedMessage(latest.current.draftKey, index, text) },
+      addQueued: (index, item) => { if (latest.current.draftKey) useChatStore.getState().addQueuedMessage(latest.current.draftKey, index, item) },
       clearQueued: () => { if (latest.current.draftKey) useChatStore.getState().clearQueuedMessages(latest.current.draftKey) },
+      // A cancelled queued message hands its attachments back to the
+      // composer: the photos by their saved path (re-sent in place, shown
+      // through the agent files URL), the files as already-uploaded chips.
+      restoreAttachments: (images, files) => {
+        const key = latest.current.draftKey
+        if (!key) return
+        const st = useChatStore.getState()
+        if (images.length) {
+          st.addPendingImages(key, images.filter(i => i.path).map(i => ({
+            id: `img-${i.path}`, path: i.path, name: i.name,
+          })))
+        }
+        if (files.length) {
+          st.addPendingFiles(key, files.map(f => ({
+            id: `file-${f.path}`, name: f.name, size: 0, uploadedPath: f.path,
+          })))
+        }
+      },
     },
     clearQueueOnAbort: false,
     onWarmupRefetch: () => latest.current.refetchChats(),
@@ -158,9 +178,10 @@ export function useAgentChatStream({
         if (data.chat_id) useChatStore.getState().setStreaming(data.chat_id)
         setTurnStartTime(Date.now())
       }
-      // Near-instant paths (pre-warmed reuse / alive-session reuse) emit
-      // warmup_ready WITHOUT a preceding warmup_started, so own the URL here
-      // too. Idempotent via lastResumedChatIdRef — the slow spawn path already
+      // The alive-session reuse paths emit warmup_ready WITHOUT a preceding
+      // warmup_started (pre-warmed reuse is decided in the backgrounded spawn
+      // tail, after the inline warmup_started), so own the URL here too.
+      // Idempotent via lastResumedChatIdRef — the spawn path already
       // navigated at warmup_started. Only auto-own from the NEW-chat screen
       // (!urlChatId) — with a backgrounded spawn the
       // user may have switched to another chat, and warmup_ready for the
@@ -287,7 +308,7 @@ export function useAgentChatStream({
       // Task chats store permission_mode 'auto' (the scheduler's posture) —
       // restore it so the status bar reflects the run's real mode (rendered
       // as Don't Ask) instead of this page's 'default' seed.
-      if (data.mode && data.chat_id?.startsWith('task-')) setMode(data.mode)
+      if (data.mode && isTaskChatId(data.chat_id)) setMode(data.mode)
       // Restore the per-chat interactive toggle from the stored execution_mode.
       // The live flag stays false until a warmup_ready{interactive} arrives — a
       // dead interactive chat shows its DB history with the toggle reflected on.

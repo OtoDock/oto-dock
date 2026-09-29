@@ -10,6 +10,7 @@ import DefaultAgentRedirect from './components/DefaultAgentRedirect'
 import AuthCallback from './pages/AuthCallback'
 import RunRedirect from './pages/RunRedirect'
 import UserSettings from './pages/UserSettings'
+import AppPage from './pages/apps/AppPage'
 import AgentOverview from './pages/agent/AgentOverview'
 import AgentChat from './pages/agent/AgentChat'
 import AgentSchedules from './pages/agent/AgentSchedules'
@@ -21,11 +22,13 @@ import ConversationView from './pages/ConversationView'
 import AgentMcps from './pages/agent/AgentMcps'
 import AgentSkills from './pages/agent/AgentSkills'
 import AgentConfig from './pages/agent/AgentConfig'
+import AgentChecks from './pages/agent/AgentChecks'
 import ChangePassword from './pages/ChangePassword'
 import ResetPassword from './pages/ResetPassword'
 import AcceptInvite from './pages/AcceptInvite'
 import Setup2FA from './pages/Setup2FA'
 import NativePasskey from './pages/NativePasskey'
+import { callNative } from './lib/nativeBridge'
 
 // The agents page carries three.js (the 3D company map) — the app's first
 // lazy route, so the 3D chunk never taxes the initial load. Stale-chunk
@@ -49,6 +52,8 @@ const PlatformPage = lazy(() => import('./pages/admin/PlatformPage'))
 const NotificationsPage = lazy(() => import('./pages/admin/NotificationsPage'))
 const MeetingsPage = lazy(() => import('./pages/admin/MeetingsPage'))
 const RemoteMachinesPage = lazy(() => import('./pages/admin/RemoteMachinesPage'))
+const SharesPage = lazy(() => import('./pages/admin/SharesPage'))
+const SharedChatPage = lazy(() => import('./pages/SharedChatPage'))
 
 /**
  * Ensures back button works on secondary pages (settings, agents, admin).
@@ -73,7 +78,9 @@ function NavigationGuard() {
       location.pathname !== '/accept-invite' &&
       location.pathname !== '/setup-2fa' &&
       location.pathname !== '/native-passkey' &&
-      !location.pathname.startsWith('/chat/')
+      !location.pathname.startsWith('/chat/') &&
+      !location.pathname.startsWith('/apps/') &&
+      !location.pathname.startsWith('/shared/')
     ) {
       const returnTo = location.pathname + location.search
       navigate('/', { replace: true })
@@ -89,7 +96,7 @@ export default function App() {
   useEffect(() => {
     // Signal native that the SPA has mounted, so it can deliver any OAuth deep
     // link it is holding for this installation (see MainActivity.dashboardReady).
-    try { (window as any).Android?.dashboardReady?.() } catch { /* not native */ }
+    callNative('dashboardReady')
   }, [])
 
   return (
@@ -121,6 +128,12 @@ export default function App() {
           {/* User settings */}
           <Route path="user-settings" element={<UserSettings />} />
 
+          {/* One app, full screen: the menu's "Open full screen", app
+              navigation, notification taps */}
+          <Route path="apps/:appId" element={<AppPage />} />
+          {/* A chat shared with the viewer, as a read-only snapshot (SHARING.md). */}
+          <Route path="shared/:shareId" element={<SharedChatPage />} />
+
           {/* Agent selector */}
           <Route
             path="agents"
@@ -137,6 +150,7 @@ export default function App() {
               <Route index element={<AgentOverview />} />
               <Route path="scheduled-tasks" element={<AgentSchedules />} />
               <Route path="config" element={<AgentConfig />} />
+              <Route path="checks" element={<AgentChecks />} />
               <Route path="mcps" element={<AgentMcps />} />
               <Route path="skills" element={<AgentSkills />} />
               <Route path="triggers" element={<AgentTriggers />} />
@@ -161,6 +175,7 @@ export default function App() {
               <Route path="skills" element={<SkillsPage />} />
               <Route path="mcp-requests" element={<McpRequestsPage />} />
               <Route path="remote-machines" element={<RemoteMachinesPage />} />
+              <Route path="shares" element={<SharesPage />} />
               <Route path="platform" element={<PlatformPage />} />
             </Route>
           </Route>

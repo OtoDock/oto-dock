@@ -76,7 +76,7 @@ describe('steered frame', () => {
 
     act(() => captured.cb.onQueued({ index: 0, text: 'after the turn' }))
 
-    expect(addQueued).toHaveBeenCalledWith(0, 'after the turn')
+    expect(addQueued).toHaveBeenCalledWith(0, { text: 'after the turn' })
     // A queued message renders no bubble — it stays a chip until queue_sent.
     const texts = result.current.messages.flatMap((m: any) => m.blocks)
     expect(texts).not.toContainEqual({ type: 'text', content: 'after the turn' })
@@ -116,6 +116,117 @@ describe('steered frame', () => {
     expect(msgs[msgs.length - 1].blocks)
       .toEqual([{ type: 'text', content: 'one more thing' }])
   })
+
+  it('shows a held steer as pending until the boundary renders it', () => {
+    // A steer accepted while a tool call runs sat invisible for the whole
+    // call; it is now listed as pending (display only — it already sits in
+    // the engine) and leaves the list the moment the bubble renders.
+    const { result } = renderStream()
+
+    act(() => captured.cb.onText('running the long command'))
+    act(() => captured.cb.onSteered({ text: 'and count the rows', files: [{ path: 'users/u/workspace/uploads/files/a.csv', name: 'a.csv' }] }))
+    expect(result.current.pendingSteers).toEqual([
+      { text: 'and count the rows', files: [{ path: 'users/u/workspace/uploads/files/a.csv', name: 'a.csv' }] },
+    ])
+    expect(result.current.messages.filter((m: any) => m.role === 'user')).toHaveLength(0)
+
+    act(() => captured.cb.onToolStart({ name: 'Bash', tool_id: 't1' }))
+    expect(result.current.pendingSteers).toEqual([])
+    const user = result.current.messages.find((m: any) => m.role === 'user')!
+    // The bubble carries the chips the frame named, then the text.
+    expect(user.blocks).toEqual([
+      { type: 'file_attachments', files: [{ name: 'a.csv', path: 'users/u/workspace/uploads/files/a.csv' }] },
+      { type: 'text', content: 'and count the rows' },
+    ])
+  })
+
+  it('a held steer stays with its chat when the view moves to a new chat', () => {
+    const { result } = renderStream()
+
+    act(() => captured.cb.onText('working on A'))
+    act(() => captured.cb.onSteered({ text: 'steer meant for A' }))
+    expect(result.current.pendingSteers).toHaveLength(1)
+
+    act(() => { result.current.setChatId(null) })
+    expect(result.current.pendingSteers).toEqual([])
+
+    act(() => captured.cb.onText('first turn of the new chat'))
+    act(() => captured.cb.onToolStart({ name: 'Bash', tool_id: 't1' }))
+    const userTexts = result.current.messages
+      .filter((m: any) => m.role === 'user')
+      .flatMap((m: any) => m.blocks.map((b: any) => b.content))
+    expect(userTexts).not.toContain('steer meant for A')
+  })
+
+  it('an error ending the turn renders the held steer instead of leaving it pending', () => {
+    const { result } = renderStream()
+
+    act(() => captured.cb.onText('halfway'))
+    act(() => captured.cb.onSteered({ text: 'and the logs' }))
+    act(() => captured.cb.onError('engine crashed'))
+
+    expect(result.current.pendingSteers).toEqual([])
+    const msgs = result.current.messages
+    expect(msgs[msgs.length - 1].role).toBe('user')
+    expect(msgs[msgs.length - 1].blocks).toEqual([{ type: 'text', content: 'and the logs' }])
+  })
+
+  it('a delegated steer wears the delegating agent badge', () => {
+    const { result } = renderStream()
+    act(() => captured.cb.onSteered({
+      text: 'also X',
+      event_data: { agent_slug: 'ceo', agent_display_name: 'CEO', agent_color: '#123', badge: 'delegated by' },
+    }))
+    const user = result.current.messages.find((m: any) => m.role === 'user')!
+    expect(user).toMatchObject({ agentSlug: 'ceo', agentDisplayName: 'CEO', badge: 'delegated by' })
+  })
+})
+
+describe('queued attachments', () => {
+  it('the queue chip and the drained bubble carry the attachment meta', () => {
+    const { result } = renderStream()
+    const images = [{ name: 'dot.png', path: 'users/u/workspace/uploads/photos/img_1.png' }]
+
+    act(() => captured.cb.onQueued({ index: 0, text: 'look', images }))
+    expect(addQueued).toHaveBeenCalledWith(0, { text: 'look', images })
+
+    act(() => captured.cb.onQueueSent({ text: 'look', images }))
+    const user = result.current.messages.find((m: any) => m.role === 'user')!
+    expect(user.blocks).toEqual([
+      { type: 'image_attachments', images: ['dot.png'], paths: ['users/u/workspace/uploads/photos/img_1.png'] },
+      { type: 'text', content: 'look' },
+    ])
+  })
+
+  it('a cancelled queued message hands its attachments back to the composer', () => {
+    const restoreAttachments = vi.fn()
+    const { result } = renderHook(() =>
+      useChatStream({
+        agents: [],
+        initialChatId: 'chat-1',
+        queue: { addQueued, clearQueued: vi.fn(), restoreAttachments },
+      }),
+    )
+    const files = [{ path: 'users/u/workspace/uploads/files/a.csv', name: 'a.csv' }]
+    act(() => captured.cb.onQueueEditReturn({ index: 0, text: 'later', files }))
+    expect(result.current.editText).toBe('later')
+    expect(restoreAttachments).toHaveBeenCalledWith([], files)
+  })
+
+  it('an attachment-only message comes back without touching the draft', () => {
+    const restoreAttachments = vi.fn()
+    const { result } = renderHook(() =>
+      useChatStream({
+        agents: [],
+        initialChatId: 'chat-1',
+        queue: { addQueued, clearQueued: vi.fn(), restoreAttachments },
+      }),
+    )
+    const images = [{ name: 'dot.png', path: 'users/u/workspace/uploads/photos/img_1.png' }]
+    act(() => captured.cb.onQueueEditReturn({ index: 0, text: '', images }))
+    expect(result.current.editText).toBeNull()
+    expect(restoreAttachments).toHaveBeenCalledWith(images, [])
+  })
 })
 
 describe('mid-turn queue chips (claude fallback)', () => {
@@ -127,7 +238,7 @@ describe('mid-turn queue chips (claude fallback)', () => {
 
     // A mid-turn send got queued (claude has no steer) → its chip MUST show.
     act(() => captured.cb.onQueued({ index: 0, text: 'second prompt' }))
-    expect(addQueued).toHaveBeenCalledWith(0, 'second prompt')
+    expect(addQueued).toHaveBeenCalledWith(0, { text: 'second prompt' })
 
     // The reconnect/stale-pump dedup still holds for the SAME text.
     addQueued.mockClear()

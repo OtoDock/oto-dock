@@ -11,16 +11,24 @@ import McpCategoryFilter, { matchesMcpCategory, type McpCategoryFilterValue } fr
 import McpIcon from '../../components/McpIcon'
 import { ServiceAccountBindingDropdown } from '../../components/ServiceAccountBindingDropdown'
 import { useAuth } from '../../contexts/AuthContext'
-import { canManageAgent } from '../../lib/permissions'
+import { useAgentInfo } from '../../api/agents'
+import { ROLE, canManageAgent } from '../../lib/permissions'
+import { availableScopes, modeOfAgent } from '../../lib/visibility'
 
 export default function AgentMcps() {
   const { name } = useParams<{ name: string }>()
-  const { data: mcpData, isLoading, refetch } = useAgentMcps(name!)
-  const { data: skills } = useAgentSkills(name!)
-  const setMcps = useSetAgentMcps()
   const { user } = useAuth()
   const canManage = canManageAgent(user, name!)
   const agentRole = user?.agent_roles?.[name!]
+  // Both lists are owner-only; a non-owner who opens the URL gets the
+  // read-only notice, not a fetch that 403s into an endless "Loading".
+  const { data: mcpData, isLoading, refetch } = useAgentMcps(name!, canManage)
+  const { data: skills } = useAgentSkills(name!, canManage)
+  const { data: info } = useAgentInfo(name!)
+  const setMcps = useSetAgentMcps()
+  // A service-scope subscription runs in the agent's agent scope; a
+  // Personal-only agent has none, so its binding row offers no subscriptions.
+  const agentScopeAvailable = !!info && availableScopes(modeOfAgent(info)).includes('agent')
 
   // `selected` mirrors the in-flight enabled set the manager is editing.
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -45,6 +53,20 @@ export default function AgentMcps() {
       setSelected(new Set(mcpData.mcps.filter(m => m.enabled).map(m => m.name)))
     }
   }, [mcpData])
+
+  if (!canManage) {
+    return (
+      <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl px-4 py-3 text-xs text-amber-800 dark:text-amber-200">
+        <strong>Read-only.</strong> MCP assignments and service-account bindings
+        are owner-only.{' '}
+        {agentRole === ROLE.EDITOR
+          ? 'As an editor you can collaborate on the agent\'s shared workspace; agent behavior is curated by an owner.'
+          : agentRole === ROLE.CONTRIBUTOR
+            ? 'As a contributor you can add files to the agent\'s shared workspace; agent behavior is curated by an owner.'
+            : 'As a viewer you can chat with the agent; only owners see and change its MCPs.'}
+      </div>
+    )
+  }
 
   if (isLoading || !mcpData) {
     return <div className="text-sm text-p-text-light">Loading...</div>
@@ -109,15 +131,6 @@ export default function AgentMcps() {
 
   return (
     <div>
-      {!canManage && (
-        <div className="mb-6 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl px-4 py-3 text-xs text-amber-800 dark:text-amber-200">
-          <strong>Read-only.</strong> MCP assignments and service-account bindings
-          are owner-only.{' '}
-          {agentRole === 'editor'
-            ? 'As an editor you can collaborate on the agent\'s shared workspace; agent behavior is curated by an owner.'
-            : 'As a viewer you can see which MCPs the agent uses but only owners can change them.'}
-        </div>
-      )}
       {/* MCP Assignments */}
       <div className="mb-8">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center mb-4">
@@ -219,6 +232,7 @@ export default function AgentMcps() {
                   agentName={name}
                   mcpName={mcp.name}
                   callerSub={user.sub}
+                  agentScopeAvailable={agentScopeAvailable}
                 />
               )}
             </div>

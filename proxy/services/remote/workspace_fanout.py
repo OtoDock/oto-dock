@@ -49,9 +49,19 @@ raises (the file reconciles at that machine's next session start).
 from __future__ import annotations
 
 import asyncio
-import logging
 import contextlib
-from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
+import errno
+import hashlib
+import logging
+import os
+from pathlib import Path
+
+import config
+from core import layout
+from core import placement
+from services.infra import safe_fs
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.workspace-fanout")
 
@@ -64,7 +74,7 @@ def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, s
     fan-out and the fingerprint sweep, so the sweep merged every 60 s against
     a tree the live session was actively mutating (and scrubbed files the
     session had just written), while live pushes skipped the machine entirely.
-    Local PTY sessions (``target == "local"``) run on the platform tree itself
+    Local PTY sessions (``is_remote`` false) run on the platform tree itself
     — nothing to push, excluded like local headless sessions."""
     try:
         from core.session import interactive_session as _isess
@@ -73,8 +83,7 @@ def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, s
     out: list[tuple[str, str, str, str]] = []
     for sid, s in list(getattr(_isess, "_sessions", {}).items()):
         try:
-            if (s.agent_name == agent_slug and s.alive
-                    and (s.target or "local") != "local"):
+            if s.agent_name == agent_slug and s.alive and not placement.is_local(s.target):
                 out.append((sid, s.target, s.username or "", s.role or ""))
         except Exception:
             continue
@@ -83,6 +92,7 @@ def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, s
 
 def fanout_targets(
     agent_slug: str, rel_path: str, *, exclude_machine_id: str | None = None,
+    shared_only: bool | None = None,
 ) -> list[str]:
     """machine_ids of active remote sessions of ``agent_slug`` ALLOWED to receive
     ``rel_path`` (per-session isolation), with the source machine excluded and
@@ -100,14 +110,19 @@ def fanout_targets(
       * user-paired (one owner session) → only that owner's allowed paths;
       * admin-shared (many users' sessions) → pushed where any active user is allowed.
 
-    Synchronous and registry-only (no I/O) so it is unit-testable in isolation.
+    Synchronous and registry-only so it is unit-testable in isolation, but for
+    the one store read a ``users/`` path needs: ``shared_only`` is that answer
+    when the caller resolved it off the loop (``shared_only_of``); ``None``
+    reads it here (the sync callers outside the file-sync path).
     """
     # Shared-only agents have no per-user scope — users/ paths (stray dirs
     # from older installs at most) never fan out to any machine, mirroring
     # compute_manifest's exclude_user_dirs.
-    if rel_path.startswith("users/"):
-        from core.session.visibility import is_shared_only
-        if is_shared_only(agent_slug):
+    if layout.is_personal(rel_path):
+        if shared_only is None:
+            from core.session.visibility import is_shared_only
+            shared_only = is_shared_only(agent_slug)
+        if shared_only:
             return []
     # External callers' trees never fan out (proxy host only).
     if rel_path.startswith("externals/"):
@@ -186,6 +201,7 @@ def _active_machine_ids(agent_slug: str) -> set[str]:
 def has_fanout_candidates(
     agent_slug: str, rel_path: str, *,
     include_idle: bool = False, exclude_machine_id: str | None = None,
+    shared_only: bool | None = None,
 ) -> bool:
     """Cheap (in-memory, NO DB) gate: is there ANY machine that might receive this
     file — so a caller can skip an expensive disk read without DB I/O?
@@ -194,9 +210,10 @@ def has_fanout_candidates(
     ``include_idle`` — if ANY other connected machine exists (an idle candidate; the
     precise pairing + isolation filter runs later in ``idle_connected_targets``).
     Over-approximates idle (a connected machine that doesn't hold the agent still
-    says "yes" → at worst one wasted read, NEVER a wrong push).
+    says "yes" → at worst one wasted read, NEVER a wrong push). ``shared_only``
+    as in ``fanout_targets``.
     """
-    if fanout_targets(agent_slug, rel_path, exclude_machine_id=exclude_machine_id):
+    if _targets(agent_slug, rel_path, exclude_machine_id, shared_only):
         return True
     if not include_idle:
         return False
@@ -212,8 +229,29 @@ def has_fanout_candidates(
     return False
 
 
+def _targets(agent_slug: str, rel_path: str, exclude_machine_id: str | None,
+             shared_only: bool | None) -> list[str]:
+    """``fanout_targets`` with the Shared-only answer passed only when a
+    ``users/`` path resolved it (the keyword reaches the gate for those
+    paths alone; every other call keeps the two-argument shape)."""
+    if shared_only is None:
+        return fanout_targets(agent_slug, rel_path, exclude_machine_id=exclude_machine_id)
+    return fanout_targets(agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
+                          shared_only=shared_only)
+
+
+async def shared_only_of(agent_slug: str, rel_path: str) -> bool | None:
+    """The Shared-only answer a ``users/`` path needs, read on the DB lane;
+    None for a path that never asks it."""
+    if not layout.is_personal(rel_path):
+        return None
+    from core.session.visibility import is_shared_only
+    return await run_db(is_shared_only, agent_slug)
+
+
 async def idle_connected_targets(
     agent_slug: str, rel_path: str, *, exclude_machine_id: str | None = None,
+    shared_only: bool | None = None,
 ) -> list[str]:
     """machine_ids of CONNECTED-but-IDLE machines (no active session for this agent)
     that ALREADY hold ``agent_slug`` and may receive ``rel_path`` under their PAIRING
@@ -236,9 +274,10 @@ async def idle_connected_targets(
         from storage.files import sync_state_store
 
         # Same shared-only users/ exclusion as fanout_targets.
-        if rel_path.startswith("users/"):
-            from core.session.visibility import is_shared_only
-            if await asyncio.to_thread(is_shared_only, agent_slug):
+        if layout.is_personal(rel_path):
+            if shared_only is None:
+                shared_only = await shared_only_of(agent_slug, rel_path)
+            if shared_only:
                 return []
 
         cm = get_connection_manager()
@@ -299,43 +338,112 @@ async def fan_out_write(
     the workspace toolbar popup shows per-machine state. Registry calls are
     best-effort — a registry failure never affects the push.
     """
-    machines = fanout_targets(
-        agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
-    )
+    shared_only = await shared_only_of(agent_slug, rel_path)
+    machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
     if include_idle:
         idle = await idle_connected_targets(
-            agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
+            agent_slug, rel_path, exclude_machine_id=exclude_machine_id, shared_only=shared_only,
         )
         if idle:
             machines = list(set(machines) | set(idle))
     from core.remote import transfer_registry
     from core.remote.file_sync import MAX_CHUNK_SIZE
-    if isinstance(source, (bytes, bytearray)):
-        size = len(source)
-    else:
-        # Every caller passes the platform copy of ``rel_path`` inside the
-        # agent tree; the size probe re-states that instead of trusting the
-        # path it was handed.
-        try:
-            size = resolve_under(source, safe_agent_dir(agent_slug)).stat().st_size
-        except (OSError, PathOutsideRoot):
-            size = 0
-    if not machines:
+
+    async def _empty_terminal(size: int) -> None:
+        # The caller promised the client a tracked push (the cheap candidate
+        # gate said yes) but nothing will be pushed: register it with no rows
+        # so the registry emits the terminal the client is waiting for,
+        # instead of returning silently.
         if transfer_id is not None:
-            # The caller promised the client a tracked push (the cheap
-            # candidate gate said yes) but the precise target set is empty —
-            # register it with no rows so the registry emits the terminal
-            # the client is waiting for, instead of returning silently.
             await transfer_registry.begin(
                 agent_slug, rel_path, kind=transfer_kind, bytes_total=size,
                 machine_ids=[], transfer_id=transfer_id,
                 origin_user_sub=origin_user_sub,
             )
+
+    # A source Path is the platform copy of ``rel_path`` or nothing: neither
+    # the size probe below nor a push ever touches another file.
+    from_path = not isinstance(source, (bytes, bytearray))
+    rel = ""
+    if from_path:
+        try:
+            if not config.is_safe_agent_name(agent_slug):
+                raise PathOutsideRoot(agent_slug)
+            rel = f"{agent_slug}/{normalize_rel_path(rel_path)}"
+            if safe_fs.rel_under(source, config.AGENTS_DIR) != rel:
+                raise safe_fs.EscapeRefused(errno.EXDEV, "not the platform copy", str(source))
+        except (OSError, PathOutsideRoot) as exc:
+            logger.warning(
+                "fan_out_write %s/%s: source refused (%s)", agent_slug, rel_path,
+                type(exc).__name__,
+            )
+            await _empty_terminal(0)
+            return
+    if not machines:
+        size = 0
+        if not from_path:
+            size = len(source)
+        else:
+            with contextlib.suppress(OSError):
+                size = (await asyncio.to_thread(
+                    safe_fs.lstat_beneath, config.AGENTS_DIR, rel)).st_size
+        await _empty_terminal(size)
         return
+
+    # The bytes every push reads are that platform copy, opened ONCE beneath
+    # the agents root with no link followed; ``push_file`` receives the
+    # descriptor's own path, so a swap of any name meanwhile changes nothing
+    # it sends, and the merge base recorded below is the hash of what was
+    # read from that same descriptor (D3: taken before the pushes, never
+    # after).
+    src_fd: int | None = None
+    base_mtime = 0.0
+    if from_path:
+        try:
+            src_fd, st = await asyncio.to_thread(
+                safe_fs.open_regular_for_read, config.AGENTS_DIR, rel)
+        except OSError as exc:
+            logger.warning(
+                "fan_out_write %s/%s: source refused (%s)", agent_slug, rel_path,
+                type(exc).__name__,
+            )
+            await _empty_terminal(0)
+            return
+        size, base_mtime = st.st_size, st.st_mtime
+        content_hash = await asyncio.to_thread(_hash_fd, src_fd)
+        source = Path(safe_fs.fd_path(src_fd))
+    else:
+        size = len(source)
+        content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
+    try:
+        await _fan_out_pushes(
+            agent_slug, rel_path, source, machines, size, content_hash, base_mtime,
+            transfer_kind=transfer_kind, transfer_id=transfer_id,
+            origin_user_sub=origin_user_sub, max_chunk=MAX_CHUNK_SIZE,
+        )
+    finally:
+        if src_fd is not None:
+            os.close(src_fd)
+
+
+def _hash_fd(fd: int) -> str:
+    h = hashlib.sha256()
+    for chunk in safe_fs.iter_fd(fd):
+        h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+async def _fan_out_pushes(
+    agent_slug: str, rel_path: str, source: "bytes | Path", machines: list[str],
+    size: int, content_hash: str, base_mtime: float, *,
+    transfer_kind: str, transfer_id: str | None, origin_user_sub: str, max_chunk: int,
+) -> None:
+    from core.remote import transfer_registry
     from core.remote.satellite_connection import get_connection_manager
     from services.path_policy_v2 import PathRef
     cm = get_connection_manager()
     ref = PathRef("agent_tree", rel_path)
+    MAX_CHUNK_SIZE = max_chunk
 
     tid: str | None = None
     if transfer_id is not None or size > MAX_CHUNK_SIZE:
@@ -392,28 +500,22 @@ async def fan_out_write(
                 )
     # Advance each successfully-pushed machine's merge base so it stays converged:
     # a later live edit there isn't mis-flagged as clobbering an unseen change, and
-    # the next session-start merge sees in-sync. Hash/stat computed once,
-    # only when there are targets (already gated above).
+    # the next session-start merge sees in-sync. The hash and the mtime were
+    # taken from the source before the pushes (a Path source: from the very
+    # descriptor the pushes read), so the base names the bytes each target got.
     acked = [
         mid for mid, res in zip(machines, results)
         if not isinstance(res, Exception) and res is not False
     ]
     if acked:
-        import hashlib
-        import config as _cfg
-        from core.remote import file_sync as _file_sync
         from storage.files import sync_state_store
         if isinstance(source, (bytes, bytearray)):
-            content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
-        else:
             try:
-                content_hash = await asyncio.to_thread(_file_sync._hash_file, source)
-            except OSError:
-                content_hash = ""
-        try:
-            base_mtime = (_cfg.AGENTS_DIR / agent_slug / rel_path).stat().st_mtime
-        except OSError:
-            base_mtime = 0.0
+                base_mtime = (await asyncio.to_thread(
+                    safe_fs.lstat_beneath, config.AGENTS_DIR,
+                    f"{agent_slug}/{normalize_rel_path(rel_path)}")).st_mtime
+            except (OSError, PathOutsideRoot):
+                base_mtime = 0.0
         if content_hash:
             for mid in acked:
                 try:
@@ -448,12 +550,11 @@ async def fan_out_delete(
     the dashboard file-API delete has always used (``path_kind`` defaults to
     ``agent_tree`` on the satellite).
     """
-    machines = fanout_targets(
-        agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
-    )
+    shared_only = await shared_only_of(agent_slug, rel_path)
+    machines = _targets(agent_slug, rel_path, exclude_machine_id, shared_only)
     if include_idle:
         idle = await idle_connected_targets(
-            agent_slug, rel_path, exclude_machine_id=exclude_machine_id,
+            agent_slug, rel_path, exclude_machine_id=exclude_machine_id, shared_only=shared_only,
         )
         if idle:
             machines = list(set(machines) | set(idle))
@@ -487,28 +588,22 @@ async def _atomic_write_agent_file(
     agent_slug: str, rel_path: str, content: bytes,
 ) -> None:
     """Write ``content`` to ``AGENTS_DIR/<agent_slug>/<rel_path>`` atomically
-    (``.partial`` + ``os.replace``), path-traversal-checked. Runs in a thread.
-    Raises ``ValueError`` (traversal) / ``OSError`` (I/O) on failure — the caller
-    decides whether that's fatal (Collabora save) or best-effort (file-tools)."""
-    def _write() -> None:
-        import os
-        import config
-        base = (config.AGENTS_DIR / agent_slug).resolve()
-        dest = (base / rel_path).resolve()
-        dest.relative_to(base)  # raises ValueError on `..` traversal
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(dest.suffix + ".partial")
-        try:
-            tmp.write_bytes(content)
-            os.replace(tmp, dest)
-        except OSError:
-            # EDQUOT / ENOSPC: drop the orphan .partial (manifest-invisible →
-            # would leak quota) and re-raise so the caller surfaces the failed
-            # write instead of falsely converging sync state.
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
-            raise
-    await asyncio.to_thread(_write)
+    beneath the agents root: the string guards first, then ``atomic_writer``
+    (a ``.partial`` temp renamed within the parent's handle, no component
+    followed, a link at the name replaced and never written through). Runs
+    in a thread. Raises ``ValueError`` (a bad slug or rel) / ``OSError`` (I/O,
+    a refusal of the helpers) on failure; the caller decides whether that's
+    fatal (Collabora save) or best-effort (file-tools). A failed write leaves
+    no temp behind (quota is never leaked by an orphan)."""
+    try:
+        if not config.is_safe_agent_name(agent_slug):
+            raise PathOutsideRoot(agent_slug)
+        rel = f"{agent_slug}/{normalize_rel_path(rel_path)}"
+    except PathOutsideRoot as exc:
+        raise ValueError(str(exc)) from None
+    await asyncio.to_thread(
+        safe_fs.atomic_write_beneath, config.AGENTS_DIR, rel, content, mkdirs=True,
+    )
 
 
 async def propagate_write(
@@ -545,7 +640,7 @@ async def propagate_write(
     its own-machine push, so it calls ``fan_out_write`` directly (re-acquiring the
     same non-reentrant lock here would deadlock).
     """
-    from core.remote.remote_file_flow import _acquire_global_path_lock
+    from core.remote.remote_file_flow import _acquire_global_path_lock, acquire_fanout_lock
     lock = await _acquire_global_path_lock(agent_slug, rel_path)
     async with lock:
         await _atomic_write_agent_file(agent_slug, rel_path, content)
@@ -557,9 +652,14 @@ async def propagate_write(
         await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
         if writer:
             await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
-        await fan_out_write(
-            agent_slug, rel_path, content, exclude_machine_id=exclude_machine_id,
-        )
+        # The fan-out lock is taken inside the path lock (the lock order every
+        # writer keeps: path lock, fan-out lock, transfer gate), so fan-outs
+        # of one path never interleave, whoever starts them.
+        fanout_lock = await acquire_fanout_lock(agent_slug, rel_path)
+        async with fanout_lock:
+            await fan_out_write(
+                agent_slug, rel_path, content, exclude_machine_id=exclude_machine_id,
+            )
     # Knowledge-library projection (outside the lock — the projector takes
     # its own per-source lock): Collabora/file-tools writes into a promoted
     # source's knowledge propagate to consumer mirrors; RW mirror edits flow

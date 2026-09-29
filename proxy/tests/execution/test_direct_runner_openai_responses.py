@@ -114,7 +114,16 @@ def openai_session(monkeypatch):
     session.tools = [_TOOL]              # the builtins are not under test here
     session.mcp_manager = _FakeMCP()
     set_session_mode(session.session_id, "dontAsk")
-    return session
+    # MCP calls go through the one permission authority (HOOKS.md row 11),
+    # which fails closed without the session's SecurityContext — a live
+    # session always has one; give this fixture its own.
+    from auth.path_policy import SecurityContext
+    from core.session.session_state import cleanup_session_permission_state, set_session_security
+    set_session_security(session.session_id, SecurityContext(
+        role="manager", username="alice", agent=AGENT, is_admin_agent=False,
+    ))
+    yield session
+    cleanup_session_permission_state(session.session_id)
 
 
 async def _collect(session, prompt="hi"):

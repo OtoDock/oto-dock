@@ -8,7 +8,7 @@ three deliberate authority downgrades: never a "user" row (a distinct
 never steered into a running turn (queue to the boundary — a page script
 must not redirect the agent mid-work), never title-setting.
 
-Pinned mini-app send_prompt actions (``otodock.action(id, args)`` →
+Pinned app send_prompt actions (``otodock.action(id, args)`` →
 ``app_action`` frame) ride the SAME queue/turn rails as kind-tagged
 interaction dicts with one authority upgrade over free-form sends — the
 prompt TEMPLATE was user-approved at pin time — and the same downgrade for
@@ -31,6 +31,7 @@ import json
 import time
 
 from storage import database as task_store
+from ws import wire_events as wire
 
 MAX_PAYLOAD_BYTES = 8192
 MAX_TITLE_CHARS = 200
@@ -90,7 +91,7 @@ def validate_interaction(
 def validate_app_action(
     chat_id: str, chat_agent: str, user_sub: str, app_id: str, action_id: str, args,
 ) -> tuple[dict | None, str]:
-    """Server-side gate for a mini-app send_prompt action. Returns a
+    """Server-side gate for an app send_prompt action. Returns a
     kind-tagged interaction dict (rides the same queue/drain rails as
     artifact interactions) or (None, reason).
 
@@ -118,6 +119,12 @@ def validate_app_action(
         return None, "unknown action"
     if action.get("type") != "send_prompt":
         return None, "not a send_prompt action"
+    if action.get("min_role"):
+        # The floor is judged on the socket user's per-agent role, rebuilt
+        # from the store (the socket carries the sub alone).
+        from auth.providers import user_context_for_sub
+        if not _mf.meets_floor(action, _mf.caller_role(row, user_context_for_sub(user_sub))):
+            return None, _mf.floor_reason(action)
     try:
         args_json = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -130,7 +137,7 @@ def validate_app_action(
     if len(prompt) > MAX_SUBSTITUTED_PROMPT_CHARS:
         return None, "prompt too large after substitution"
     return {
-        "kind": "app_action",
+        "kind": wire.APP_ACTION,
         "app_id": app_id,
         "slug": row.get("slug") or "",
         "title": (row.get("title") or "").strip()[:MAX_TITLE_CHARS],
@@ -145,7 +152,7 @@ _ARTIFACT_TRAILER = (
     "page-event data, not the user typing.)"
 )
 _APP_TRAILER = (
-    "(Sent by a declared action button on a pinned mini-app — the prompt "
+    "(Sent by a declared action button on a pinned app — the prompt "
     "template was approved by the user; argument values come from the app "
     "page, not the user typing.)"
 )
@@ -169,11 +176,11 @@ def frame_text(interactions: list[dict]) -> str:
     kinds = set()
     for it in interactions:
         title = (it["title"] or "untitled").replace('"', "'")
-        if it.get("kind") == "app_action":
+        if it.get("kind") == wire.APP_ACTION:
             kinds.add("app")
             label = (it["label"] or it["action_id"]).replace('"', "'")
             parts.append(
-                f'[action from mini-app "{title}" — {label}]\n'
+                f'[action from app "{title}" — {label}]\n'
                 f'```text\n{_fence_safe(it["prompt"])}\n```'
             )
         else:
@@ -190,9 +197,9 @@ def frame_text(interactions: list[dict]) -> str:
 def event_row_json(interaction: dict) -> str:
     """The persisted event row / ws frame payload (``artifact_interaction``
     or ``app_action`` by kind)."""
-    if interaction.get("kind") == "app_action":
+    if interaction.get("kind") == wire.APP_ACTION:
         return json.dumps({
-            "type": "app_action",
+            "type": wire.APP_ACTION,
             "app_id": interaction["app_id"],
             "slug": interaction["slug"],
             "title": interaction["title"],
@@ -201,7 +208,7 @@ def event_row_json(interaction: dict) -> str:
             "prompt": interaction["prompt"],
         })
     return json.dumps({
-        "type": "artifact_interaction",
+        "type": wire.ARTIFACT_INTERACTION,
         "token": interaction["token"],
         "title": interaction["title"],
         "payload": interaction["payload"],
@@ -210,20 +217,20 @@ def event_row_json(interaction: dict) -> str:
 
 def event_type(interaction: dict) -> str:
     """The chat_messages.event_type for one interaction's persisted row."""
-    return "app_action" if interaction.get("kind") == "app_action" else "artifact_interaction"
+    return wire.APP_ACTION if interaction.get("kind") == wire.APP_ACTION else wire.ARTIFACT_INTERACTION
 
 
 def ws_frame(interaction: dict, chat_id: str) -> dict:
     """The live ws frame for one delivered interaction (chip render)."""
-    if interaction.get("kind") == "app_action":
+    if interaction.get("kind") == wire.APP_ACTION:
         return {
-            "type": "app_action", "app_id": interaction["app_id"],
+            "type": wire.APP_ACTION, "app_id": interaction["app_id"],
             "slug": interaction["slug"], "title": interaction["title"],
             "action_id": interaction["action_id"], "label": interaction["label"],
             "prompt": interaction["prompt"], "chat_id": chat_id,
         }
     return {
-        "type": "artifact_interaction", "token": interaction["token"],
+        "type": wire.ARTIFACT_INTERACTION, "token": interaction["token"],
         "title": interaction["title"], "payload": interaction["payload"],
         "chat_id": chat_id,
     }

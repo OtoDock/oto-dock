@@ -11,10 +11,12 @@ DB-free by design: everything is monkeypatched, so these run fast and never
 touch the conftest Postgres pool.
 """
 import pytest
+from unittest.mock import AsyncMock
 
 from services.mcp import mcp_registry as reg
 from services.mcp.mcp_registry import McpManifest, ServerConfig, CredentialConfig
 from storage import remote_store
+from core import placement
 
 
 def _mk(name, *, placement="any", requires_display=False, device_capability=None,
@@ -36,10 +38,11 @@ def _mk(name, *, placement="any", requires_display=False, device_capability=None
 # ---------------------------------------------------------------------------
 
 def _reason(m, *, is_remote=False, target_has_display=None, target_device_grants=None):
-    return reg._device_placement_reason(
-        m, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants or set(),
-    )
+    return reg._device_placement_reason(m, placement=placement.PlacementCapabilities(
+        kind=placement.KIND_ADMIN_REMOTE if is_remote else placement.KIND_LOCAL,
+        machine_id="m" if is_remote else "", has_display=target_has_display,
+        device_grants=target_device_grants or set(),
+    ))
 
 
 def test_normal_mcp_never_gated():
@@ -102,14 +105,15 @@ def test_get_agent_mcps_fail_closed_on_local(registry):
 
 
 def test_get_agent_mcps_remote_granted_with_display(registry):
-    names = {m.name for m in reg.get_agent_mcps(
-        "a", is_remote=True, target_has_display=True, target_device_grants={"computer"},
-    )}
+    names = {m.name for m in reg.get_agent_mcps("a", placement=placement.PlacementCapabilities(
+        kind=placement.KIND_ADMIN_REMOTE, machine_id="m", has_display=True, device_grants={"computer"},
+    ))}
     assert "computer-control" in names
 
 
 def test_get_agent_mcps_remote_ungranted_excluded(registry):
-    names = {m.name for m in reg.get_agent_mcps("a", is_remote=True, target_has_display=True)}
+    names = {m.name for m in reg.get_agent_mcps("a", placement=placement.PlacementCapabilities(
+        kind=placement.KIND_ADMIN_REMOTE, machine_id="m", has_display=True))}
     assert "computer-control" not in names  # no machine grant → consent gate
 
 
@@ -123,41 +127,45 @@ def test_all_placements_includes_device_regardless(registry):
 # ---------------------------------------------------------------------------
 
 def test_parse_device_grants():
-    assert remote_store._parse_device_grants(None) == set()
-    assert remote_store._parse_device_grants("[]") == set()
-    assert remote_store._parse_device_grants('["computer","browser"]') == {"computer", "browser"}
-    assert remote_store._parse_device_grants(["app"]) == {"app"}
-    assert remote_store._parse_device_grants("not-json") == set()
-    assert remote_store._parse_device_grants('{"a": 1}') == set()  # non-list
+    assert placement.parse_device_grants(None) == set()
+    assert placement.parse_device_grants("[]") == set()
+    assert placement.parse_device_grants('["computer","browser"]') == {"computer", "browser"}
+    assert placement.parse_device_grants(["app"]) == {"app"}
+    assert placement.parse_device_grants("not-json") == set()
+    assert placement.parse_device_grants('{"a": 1}') == set()  # non-list
 
 
-def test_get_target_has_display(monkeypatch):
+def test_placement_of_reads_the_display(monkeypatch):
+    monkeypatch.setattr(remote_store, "get_user_remote_target", lambda *a: None)
     monkeypatch.setattr(remote_store, "get_remote_machine",
-                        lambda m: {"capabilities": '{"display": {"has_display": true}}'})
-    assert remote_store.get_target_has_display("admin_remote", "m") is True
+                        lambda m: {"id": m, "capabilities": '{"display": {"has_display": true}}'})
+    assert remote_store.placement_of("m", None, "a").has_display is True
     monkeypatch.setattr(remote_store, "get_remote_machine",
-                        lambda m: {"capabilities": '{"display": {"has_display": false}}'})
-    assert remote_store.get_target_has_display("user_remote", "m") is False
+                        lambda m: {"id": m, "capabilities": '{"display": {"has_display": false}}'})
+    assert remote_store.placement_of("m", "u", "a").has_display is False
     monkeypatch.setattr(remote_store, "get_remote_machine",
-                        lambda m: {"capabilities": '{"os": "linux"}'})  # no display key
-    assert remote_store.get_target_has_display("admin_remote", "m") is None
-    # local target never reads the DB
+                        lambda m: {"id": m, "capabilities": '{"os": "linux"}'})  # no display key
+    assert remote_store.placement_of("m", None, "a").has_display is None
+    # a local target never reads the DB
     def _boom(_):
         raise AssertionError("should not read DB for local target")
     monkeypatch.setattr(remote_store, "get_remote_machine", _boom)
-    assert remote_store.get_target_has_display("local", "") is None
+    assert remote_store.placement_of("", None, "a").has_display is None
+    assert remote_store.placement_of(placement.LOCAL, None, "a") is placement.LOCAL_PLACEMENT
 
 
-def test_get_target_device_grants(monkeypatch):
+def test_placement_of_reads_the_grants(monkeypatch):
+    monkeypatch.setattr(remote_store, "get_user_remote_target", lambda *a: None)
     monkeypatch.setattr(remote_store, "get_remote_machine",
-                        lambda m: {"device_grants": '["computer"]'})
-    assert remote_store.get_target_device_grants("admin_remote", "m") == {"computer"}
+                        lambda m: {"id": m, "device_grants": '["computer"]'})
+    assert remote_store.placement_of("m", None, "a").device_grants == {"computer"}
     monkeypatch.setattr(remote_store, "get_remote_machine", lambda m: None)
-    assert remote_store.get_target_device_grants("user_remote", "m") == set()  # machine gone
+    gone = remote_store.placement_of("m", "u", "a")
+    assert gone.device_grants == set() and gone.is_remote and gone.machine_id == ""  # machine gone
     def _boom(_):
         raise AssertionError("should not read DB for local target")
     monkeypatch.setattr(remote_store, "get_remote_machine", _boom)
-    assert remote_store.get_target_device_grants("local", "m") == set()
+    assert remote_store.placement_of(placement.LOCAL, None, "a").device_grants == set()
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +268,9 @@ def _hook_env(monkeypatch, *, grants):
 
     ctx = SecurityContext(
         role="manager", username="u", agent="a", is_admin_agent=False,
-        target_kind="user_remote", target_machine_id="m1deadbeef",
-        target_device_grants=set(grants),
-    )
-    monkeypatch.setattr(permission, "verify_session_match", lambda *a, **k: None)
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1deadbeef", device_grants=set(grants)),
+        )
+    monkeypatch.setattr(permission, "verify_session_match_async", AsyncMock(return_value=None))
     monkeypatch.setattr(permission, "get_session_mode", lambda sid: "default")
     monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "dashboard")
     monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: None)
@@ -361,3 +368,69 @@ def test_hook_high_risk_device_tool_prompts_even_when_granted(monkeypatch):
         session_id="s1", tool_name="mcp__blender__get_scene_info", tool_input={},
     )
     assert asyncio.run(permission.hook_permission(ok, authorization="Bearer x")) == {"decision": "allow"}
+
+
+# ---------------------------------------------------------------------------
+# High-risk device tools are critical in effect
+# ---------------------------------------------------------------------------
+
+def _browser_env(monkeypatch, *, client_type, mode):
+    """The hook wired for a session of ``client_type`` in ``mode`` on an
+    admin-paired machine that grants the browser, with browser-control
+    (server key ``local``) pinning ``browser_run_code_unsafe`` high-risk."""
+    permission, _ = _hook_env(monkeypatch, grants={"browser"})
+    reg._manifests["browser-control"] = _mk(
+        "browser-control", placement="satellite_only", device_capability="browser",
+        server_name="local", device_high_risk_tools=["browser_run_code_unsafe"],
+    )
+    from auth.path_policy import SecurityContext
+    ctx = SecurityContext(
+        role="manager", username="", agent="a", is_admin_agent=False,
+        placement=placement.PlacementCapabilities(
+            kind=placement.KIND_ADMIN_REMOTE, machine_id="m1deadbeef",
+            device_grants={"browser"}, has_display=True),
+        session_scope="agent",
+    )
+    monkeypatch.setattr(permission, "get_session_security", lambda sid: ctx)
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: client_type)
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: mode)
+    return permission
+
+
+def _call(permission, tool_name, tool_input=None):
+    import asyncio
+    req = permission.HookPermissionRequest(
+        session_id="s1", tool_name=tool_name, tool_input=tool_input or {},
+    )
+    return asyncio.run(permission.hook_permission(req, authorization="Bearer x"))
+
+
+@pytest.mark.parametrize("client_type", ["task", "phone"])
+def test_hook_high_risk_device_tool_refused_unattended(monkeypatch, client_type):
+    """A no-human session in auto mode is refused a high-risk device tool
+    with the unattended reason, and keeps the granted server's other tools."""
+    permission = _browser_env(monkeypatch, client_type=client_type, mode="auto")
+    out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
+    assert out["decision"] == "deny" and "unattended" in out["reason"]
+    assert _call(permission, "mcp__local__browser_navigate",
+                 {"url": "https://example.com"}) == {"decision": "allow"}
+
+
+def test_hook_high_risk_device_tool_prompts_in_dont_ask(monkeypatch):
+    """A dashboard chat in Don't Ask reaches the prompt for a high-risk
+    device tool (the stub answers no), while its plain tools stay silent."""
+    permission = _browser_env(monkeypatch, client_type="dashboard", mode="dontAsk")
+    prompted = []
+
+    class _Q:
+        async def put(self, item):
+            prompted.append(item["tool_name"])
+    async def _wait(_request_id, _session_id="", timeout=0):
+        return False
+    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
+    monkeypatch.setattr(permission, "wait_for_permission", _wait)
+    out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
+    assert out["decision"] == "deny" and prompted == ["mcp__local__browser_run_code_unsafe"]
+    assert _call(permission, "mcp__local__browser_navigate",
+                 {"url": "https://example.com"}) == {"decision": "allow"}
+    assert prompted == ["mcp__local__browser_run_code_unsafe"]

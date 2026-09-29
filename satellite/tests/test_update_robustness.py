@@ -104,7 +104,7 @@ def test_boot_guard_rollback_swaps_and_relaunches(tmp_path, monkeypatch):
     (force_rmtree / atomic_replace / relaunch_self) deliberately — they were
     called here but never imported into __main__, so every rollback branch
     NameError'd. Forces the Unix path (relaunch_self is a no-op on Linux)."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     prev = tmp_path / "satellite.previous"
     prev.mkdir()
@@ -124,7 +124,7 @@ def test_boot_guard_rollback_swaps_and_relaunches(tmp_path, monkeypatch):
 def test_boot_guard_increments_attempts_before_giving_up(tmp_path, monkeypatch):
     """attempts<2 → no rollback yet; just bump the counter and let the new code
     try to auth. (Guards the other side of the >=2 branch.)"""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     (tmp_path / "satellite.previous").mkdir()
     (tmp_path / ".update_in_progress").write_text("0.5.27\n0.5.64\n0\n")  # attempts=0
@@ -176,7 +176,7 @@ def test_boot_guard_rollback_carries_venv_into_previous(tmp_path, monkeypatch):
     satellite.previous venv-less. On rollback the guard must carry the venv back
     from the crash-looping build, else the restored code has no interpreter and
     systemd's ExecStart dies 203/EXEC (the second bug that re-bricked the box)."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     sat = tmp_path / "satellite"
     sat.mkdir()
     (sat / "VERSION").write_text("broken-new")
@@ -204,7 +204,7 @@ def test_boot_guard_keeps_marker_when_rollback_swap_fails(tmp_path, monkeypatch)
     """A failed rollback swap must NOT clear the marker or relaunch — otherwise
     the next boot sees no marker and silently crash-loops the broken build. The
     failure has to retry, not give up quietly."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     (tmp_path / "satellite.previous").mkdir()
     (tmp_path / ".update_in_progress").write_text("0.5.64\n0.5.67\n2\n")
@@ -224,7 +224,7 @@ def test_boot_guard_loud_when_no_previous_to_roll_back_to(tmp_path, monkeypatch)
     """attempts>=2 but satellite.previous is gone (e.g. a prior successful update
     dropped it) → fail loud + KEEP the marker; do not relaunch into the broken
     build pretending success."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     # NO satellite.previous on disk
     (tmp_path / ".update_in_progress").write_text("0.5.64\n0.5.67\n2\n")
@@ -242,7 +242,7 @@ def test_boot_guard_stale_marker_cleared_when_target_already_authed(tmp_path, mo
     already authed → the marker is stale (finalize's unlink must have failed).
     Clean it up + drop satellite.previous; never roll back working code — even
     with a high attempt count (the version signal wins over the counter)."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     prev = tmp_path / "satellite.previous"
     prev.mkdir()
@@ -265,7 +265,7 @@ def test_boot_guard_stale_check_is_clock_independent(tmp_path, monkeypatch):
     rollback copy. Here the stamp is a DIFFERENT version but far-future mtime."""
     import os
     import time as _t
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     (tmp_path / "satellite.previous").mkdir()
     marker = tmp_path / ".update_in_progress"
@@ -287,7 +287,7 @@ def test_boot_guard_legacy_timestamp_stamp_is_not_stale(tmp_path, monkeypatch):
     """A pre-0.5.68 .last_successful_boot is a bare timestamp (no version on
     line 1), so it never matches a target version → the guard safely falls
     through to the attempts path. Backward compatible across the upgrade."""
-    monkeypatch.setattr(sat_main.sys, "platform", "linux")
+    monkeypatch.setattr(sat_main.satconfig, "HOST", sat_main.satconfig.ROWS[sat_main.satconfig.LINUX])
     (tmp_path / "satellite").mkdir()
     (tmp_path / "satellite.previous").mkdir()
     (tmp_path / ".update_in_progress").write_text("0.5.66\n0.5.68\n0\n")

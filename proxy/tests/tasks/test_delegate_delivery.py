@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from services.scheduler import scheduler
 from services.scheduler import delivery, lanes
 from services.scheduler.scheduler import TaskDefinition
@@ -41,6 +43,25 @@ def _alive_cli_session(sid):
 
 def _task() -> TaskDefinition:
     return TaskDefinition(id="task-1", name="sub", agent="pa", prompt="p", scope="agent")
+
+
+@pytest.fixture(autouse=True)
+def ledger(monkeypatch):
+    """The admission ledger a one-shot wake reserves in: room for ten
+    1000 MB sessions, a fresh condition (it binds to this test's loop)."""
+    import config
+    import core.concurrency as C
+    monkeypatch.setattr(config, "SESSION_EST_HEAVY_MB", 1000)
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 0)
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 0)
+    monkeypatch.setattr(config, "ADMISSION_WAKE_WAIT_S", 0.3)
+    for name, value in (("_sessions", {}), ("_session_est", {}), ("_session_added_at", {}),
+                        ("_session_owner", {}), ("_line", []), ("_reserved_mb", 0),
+                        ("_parked_tasks", 0), ("_budget_mb", 10_000), ("_floor_mb", 100)):
+        monkeypatch.setattr(C, name, value)
+    monkeypatch.setattr(C, "_cond", asyncio.Condition())
+    monkeypatch.setattr(C, "_live_available_mb", lambda: 100_000)
+    return C
 
 
 def _delegate_events(chat_id):
@@ -75,6 +96,7 @@ class TestDelegateOutputPreview:
 
 class TestDelegateDelivery:
     def test_failed_delivery_persists_result_once_no_echo(self, temp_db, monkeypatch):
+        _owner()
         task_store.create_chat("chat-x", "user-1", "pa")
 
         async def _fail(*a, **k):
@@ -101,6 +123,7 @@ class TestDelegateDelivery:
         whatever chat the socket happens to be viewing. Regression guard for the
         contamination fix."""
         from core.session.session_state import _dashboard_notify_queues
+        _owner()
         task_store.create_chat("chat-z", "user-1", "pa")
         # push_pump_event (live-only UI nudge) is a safe no-op here — its hook
         # (_push_pump_event_fn) is unset in tests, so it just returns False.
@@ -122,6 +145,7 @@ class TestDelegateDelivery:
             _dashboard_notify_queues.pop("sess-z", None)
 
     def test_successful_delivery_persists_result_and_echo(self, temp_db, monkeypatch):
+        _owner()
         task_store.create_chat("chat-y", "user-1", "pa")
 
         async def _ok(*a, **k):
@@ -144,6 +168,7 @@ class TestDelegateDelivery:
 
     def test_notify_payload_carries_status(self, temp_db, monkeypatch):
         from core.session.session_state import _dashboard_notify_queues
+        _owner()
         task_store.create_chat("chat-s", "user-1", "pa")
         q: asyncio.Queue = asyncio.Queue()
         _dashboard_notify_queues["sess-s"] = q
@@ -158,6 +183,210 @@ class TestDelegateDelivery:
             assert payload["status"] == "user_interrupted"
         finally:
             _dashboard_notify_queues.pop("sess-s", None)
+
+
+class TestEchoOffTheLoop:
+    def test_echo_row_rides_the_chat_writer(self, temp_db, monkeypatch):
+        # The assistant echo is written on the chat's lane,
+        # on the DB executor, never with a store call on the event loop.
+        import threading
+        from core.events import chat_writer
+        _owner()
+        task_store.create_chat("chat-w1", "user-1", "pa")
+        labels: list[str] = []
+        real_submit = chat_writer.submit
+
+        def _submit(chat_id, job, *, label=""):
+            labels.append(label)
+            return real_submit(chat_id, job, label=label)
+        monkeypatch.setattr(chat_writer, "submit", _submit)
+        threads: list[bool] = []
+        real_add = task_store.add_chat_message
+
+        def _add(chat_id, role, content, **kw):
+            threads.append(threading.current_thread() is threading.main_thread())
+            return real_add(chat_id, role, content, **kw)
+        monkeypatch.setattr(task_store, "add_chat_message", _add)
+
+        async def _text(*a, **k):
+            return "ECHO RESPONSE"
+
+        async def _none(*a, **k):
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _text)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _none)
+        asyncio.run(scheduler._do_deliver("sess-w1", "pa", "echo prompt", _task(),
+                                          chat_id="chat-w1", output_text="R"))
+        # The event row too: on the lane, ahead of the echo, off the loop.
+        assert labels == ["delegate_result", "delegate_echo"] and threads == [False, False]
+        assert len(_delegate_events("chat-w1")) == 1
+        assert [m["content"] for m in _assistant_msgs("chat-w1")] == ["ECHO RESPONSE"]
+
+    def test_a_continuation_wake_row_rides_the_chat_writer(self, temp_db, monkeypatch):
+        import threading
+        from core.events import chat_writer
+        from core.session import session_delivery
+        from services.scheduler import firing
+        _owner()
+        task_store.create_chat("chat-w2", "user-1", "pa")
+        labels: list[str] = []
+        real_submit = chat_writer.submit
+
+        def _submit(chat_id, job, *, label=""):
+            labels.append(label)
+            return real_submit(chat_id, job, label=label)
+        monkeypatch.setattr(chat_writer, "submit", _submit)
+        threads: list[bool] = []
+        real_add = task_store.add_chat_message
+
+        def _add(chat_id, role, content, **kw):
+            threads.append(threading.current_thread() is threading.main_thread())
+            return real_add(chat_id, role, content, **kw)
+        monkeypatch.setattr(task_store, "add_chat_message", _add)
+
+        async def _ladder(chat_id, text, **kw):
+            kw["persist_event"](chat_id)
+            return session_delivery.DeliveryOutcome("pty", chat_id=chat_id)
+        monkeypatch.setattr(session_delivery, "deliver_prompt", _ladder)
+        cont = TaskDefinition(id="cont-w2", name="later", agent="pa", prompt="CHECK BACK",
+                              scope="user", created_by="user-1", target_chat_id="chat-w2")
+        asyncio.run(firing._fire_continuation(cont))
+        assert labels[0] == "schedule_wake" and threads == [False]
+        assert [m["event_type"] for m in task_store.get_chat_messages("chat-w2")] == ["schedule_wake"]
+        # The coalescing cursor already counts the wake's own row.
+        last = task_store.get_last_chat_message_id("chat-w2")
+        assert firing._continuation_cursors["chat-w2"] == last
+        firing._continuation_cursors.pop("chat-w2", None)
+
+
+def _grant(sub: str, agent: str, role: str) -> None:
+    from storage.agents import agent_store
+    from storage.identity import db_users
+    if not agent_store.get_agent(agent):
+        agent_store.create_agent(agent, agent.upper(), collaborative=True, default_scope="user")
+    db_users.add_user_agent(sub, agent, role, "user-admin")
+
+
+def _revoke(sub: str, agent: str) -> None:
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("DELETE FROM user_agents WHERE sub=%s AND agent=%s", (sub, agent))
+        conn.commit()
+
+
+def _owner(sub: str = "user-1", agent: str = "pa") -> None:
+    """The chat's owner as a person holding the agent: a person's own chat
+    is woken as them, and only while they hold it."""
+    from datetime import datetime, timezone
+    from storage.pg import get_conn
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO users (sub, email, name, role, created_at, last_login) "
+            "VALUES (%s, %s, %s, 'member', %s, %s) ON CONFLICT DO NOTHING",
+            (sub, f"{sub}@test.com", sub, now, now))
+        conn.commit()
+    _grant(sub, agent, "editor")
+
+
+def _user_task(created_by: str) -> TaskDefinition:
+    return TaskDefinition(id="task-u1", name="sub", agent="worker", prompt="p",
+                          scope="user", created_by=created_by)
+
+
+class TestStandingGate:
+    """A user-scope delegate result warms the delegating
+    chat only for a person who still holds the agent."""
+
+    def _spy_rungs(self, monkeypatch, *, answer=None, during=None):
+        calls: list[dict] = []
+
+        async def _rung(sid, agent, text, **kw):
+            calls.append(kw)
+            if during is not None:
+                during()
+            return answer
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _rung)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _rung)
+        return calls
+
+    def test_user_scope_result_for_a_person_without_the_agent_persists_event_only(
+            self, temp_db, monkeypatch):
+        from core.session.session_state import _dashboard_notify_queues
+        _grant("user-viewer", "pa", "contributor")
+        _revoke("user-viewer", "pa")
+        task_store.create_chat("chat-g1", "user-viewer", "pa")
+        calls = self._spy_rungs(monkeypatch)
+        q: asyncio.Queue = asyncio.Queue()
+        _dashboard_notify_queues["sess-bystander-g1"] = q
+        try:
+            asyncio.run(scheduler._do_deliver("sess-g1", "pa", "RESULT", _user_task("user-viewer"),
+                                              chat_id="chat-g1", output_text="OUT"))
+        finally:
+            _dashboard_notify_queues.pop("sess-bystander-g1", None)
+        assert calls == []                                        # nothing warmed
+        assert len(_delegate_events("chat-g1")) == 1              # the result is kept
+        frames = [f for f in (q.get_nowait() for _ in range(q.qsize()))
+                  if f.get("type") == "chat_ui_frame"]
+        assert frames and frames[0]["frame"]["type"] == "delegate_result"
+        assert task_store.claim_pending_delegate_wake("chat-g1") == []
+
+    def test_user_scope_result_for_a_person_with_the_agent_delivers_at_the_row_role(
+            self, temp_db, monkeypatch):
+        _grant("user-viewer", "pa", "contributor")
+        task_store.create_chat("chat-g2", "user-viewer", "pa")
+        calls = self._spy_rungs(monkeypatch, answer="")
+        asyncio.run(scheduler._do_deliver("sess-g2", "pa", "RESULT", _user_task("user-viewer"),
+                                          chat_id="chat-g2", output_text="OUT"))
+        assert calls and calls[0]["user_sub"] == "user-viewer"
+        assert calls[0]["role"] == "contributor"
+
+    def test_agent_scope_result_wakes_a_persons_chat_as_its_owner(self, temp_db, monkeypatch):
+        # The chat decides, not the worker's scope: a person's own chat runs
+        # as them, in their tree, at their row, and only while they hold the
+        # agent.
+        task_store.create_chat("chat-g3", "user-viewer", "pa")
+        task = TaskDefinition(id="task-a1", name="sub", agent="worker", prompt="p",
+                              scope="agent", created_by="user-viewer")
+        calls = self._spy_rungs(monkeypatch, answer="")
+        asyncio.run(scheduler._do_deliver("sess-g3", "pa", "RESULT", task,
+                                          chat_id="chat-g3", output_text="OUT"))
+        assert calls == []                                        # holds no agent yet
+        _grant("user-viewer", "pa", "contributor")
+        asyncio.run(scheduler._do_deliver("sess-g3", "pa", "RESULT", task,
+                                          chat_id="chat-g3", output_text="OUT"))
+        assert calls and calls[0]["user_sub"] == "user-viewer"
+        assert calls[0]["role"] == "contributor"
+
+    def test_agent_scope_result_into_a_task_chat_is_not_gated(self, temp_db, monkeypatch):
+        # The agent's own chats keep the agent identity.
+        from storage.agents import agent_store
+        agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
+        task_store.create_chat("chat-g6", "task::pa", "pa")
+        calls = self._spy_rungs(monkeypatch, answer="")
+        task = TaskDefinition(id="task-a2", name="sub", agent="worker", prompt="p",
+                              scope="agent", created_by="user-viewer")
+        asyncio.run(scheduler._do_deliver("sess-g6", "pa", "RESULT", task,
+                                          chat_id="chat-g6", output_text="OUT"))
+        assert calls and calls[0]["user_sub"] is None and calls[0]["role"] == "manager"
+
+    def test_admin_without_a_row_is_delivered(self, temp_db, monkeypatch):
+        task_store.create_chat("chat-g4", "user-admin", "pa")
+        calls = self._spy_rungs(monkeypatch, answer="")
+        asyncio.run(scheduler._do_deliver("sess-g4", "pa", "RESULT", _user_task("user-admin"),
+                                          chat_id="chat-g4", output_text="OUT"))
+        assert calls and calls[0]["user_sub"] == "user-admin"
+        assert calls[0]["role"] == "viewer"                       # the row reading, as before
+
+    def test_no_durable_wake_for_a_person_who_lost_the_agent_meanwhile(
+            self, temp_db, monkeypatch):
+        _grant("user-viewer", "pa", "contributor")
+        task_store.create_chat("chat-g5", "user-viewer", "pa")
+        calls = self._spy_rungs(monkeypatch, during=lambda: _revoke("user-viewer", "pa"))
+        asyncio.run(scheduler._do_deliver("sess-g5", "pa", "RESULT", _user_task("user-viewer"),
+                                          chat_id="chat-g5", output_text="OUT"))
+        assert calls                                              # delivery was tried
+        assert task_store.claim_pending_delegate_wake("chat-g5") == []
 
 
 class TestLaneCollection:
@@ -188,6 +417,22 @@ class TestLaneCollection:
 
         out = scheduler._collect_lane_output_since("lane-2", 0, 0, "do the work")
         assert out == "answer\n\n[User interjected]: do the work"
+
+    def test_own_prompt_matched_through_the_terminals_paste_wrapper(self, temp_db):
+        # The Claude TUI journals a multi-line injected prompt wrapped as
+        # pasted content, with its whitespace re-flowed: still the run's own
+        # prompt, never an interjection.
+        task_store.create_chat("lane-3", "user-1", "pa")
+        task_store.add_chat_message(
+            "lane-3", "user",
+            '  <pasted_content id="adda"> [DELEGATED_WORK] do the\n  work\n'
+            'please </pasted_content id="adda">',
+        )
+        task_store.add_chat_message("lane-3", "assistant", "borrowed")
+
+        out = scheduler._collect_lane_output_since(
+            "lane-3", 0, 0, "[DELEGATED_WORK] do the work\nplease")
+        assert out == "borrowed"
 
 
 class TestLaneQuiescence:
@@ -300,6 +545,29 @@ class TestLaneFinalization:
         assert got["output_text"] == "partial"
         assert "s=user_interrupted" in got["result_prompt"]
 
+    def test_a_failed_run_carries_only_its_own_check_verdict(self, temp_db, monkeypatch):
+        # A reused worker chat: an earlier run's failing verdict must not
+        # ride a later run that failed for another reason.
+        from storage.checks import db_checks
+        task_store.create_chat("lane-f3", "user-1", "pa")
+        db_checks.insert_verdict(
+            agent="pa", owner="", check_name="answer", section="schema", status="fail",
+            passed=False, score=None, findings=[], summary="no json", reason="",
+            session_id="s", chat_id="lane-f3", run_id="", judge_run_id="",
+            user_sub="user-1", round_no=1, ran_on="local", engine="", model="",
+            cost_usd=0.0, duration_ms=1, script_sha256="")
+        later = self._deliver(
+            monkeypatch, self._lane_task("lane-f3"), "failed", "boom",
+            worker_chat_id="lane-f3", run_started_at="2999-01-01T00:00:00+00:00",
+        )
+        assert later["verdict"] is None
+        assert "did not pass" not in later["result_prompt"]
+        same = self._deliver(
+            monkeypatch, self._lane_task("lane-f3"), "failed", "boom",
+            worker_chat_id="lane-f3", run_started_at="2000-01-01T00:00:00+00:00",
+        )
+        assert same["verdict"]["check"] == "answer"
+
     def test_no_lane_kwargs_delivers_unchanged(self, temp_db, monkeypatch):
         got = self._deliver(
             monkeypatch, self._lane_task(""), "failed", "boom",
@@ -409,7 +677,7 @@ class TestOneshotSecurityContext:
         assert ctx is not None
         assert ctx.agent == "pa"
         assert ctx.role == "manager"
-        assert ctx.target_kind == "local"
+        assert ctx.placement.is_local
 
 
 class TestTaskStallWatchdog:
@@ -718,6 +986,7 @@ class TestPumpedEchoTurn:
         assert out is None  # never dual-pump a chat
 
     def test_ladder_passes_chat_id_to_rungs(self, temp_db, monkeypatch):
+        _owner()
         task_store.create_chat("chat-k", "user-1", "pa")
         seen: dict = {}
 
@@ -734,6 +1003,7 @@ class TestPumpedEchoTurn:
         assert seen.get("chat_id") == "chat-k"
 
     def test_pump_delivered_echo_not_double_saved(self, temp_db, monkeypatch):
+        _owner()
         task_store.create_chat("chat-e", "user-1", "pa")
 
         async def _pumped(*a, **k):

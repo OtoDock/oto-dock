@@ -1,0 +1,19 @@
+{
+  "name": "coding",
+  "description": "Lint and type-check the changed code, then a short review of structure, naming and comments against the repo's rules",
+  "mandatory": true,
+  "applies": ["chats", "tasks", "delegations"],
+  "condition": {"kinds": ["code"], "events": ["commit"]},
+  "rounds": 2,
+  "inputs": ["knowledge/coding-rules.md"],
+  "script": {"run": "lint.sh", "timeout": 600},
+  "judge": {
+    "rubric": "Judge the files written this turn against the repo's rules in the input. Pass only when: the change is complete for the request, names follow the rules, no debugging leftovers or TODOs remain, comments explain why rather than what, and the answer says what changed and how it was verified. Give one finding per problem, located as path:line.",
+    "engine": "",
+    "model": "",
+    "threshold": null,
+    "mcps": [],
+    "judge_on": "auto",
+    "timeout": 600
+  }
+}

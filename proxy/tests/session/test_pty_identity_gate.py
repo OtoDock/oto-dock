@@ -94,12 +94,13 @@ async def test_ownerless_session_fails_open():
     assert s.deliver_dashboard_input(b"x", sender_sub=OTHER) is True
 
 
-@pytest.mark.parametrize("chat_id", ["task-run-42", "meeting-abc"])
-async def test_task_and_meeting_chats_are_exempt(chat_id):
-    """These carry their OWN authorization models (``_task_continue_allowed`` is
-    role-based on purpose, so delegate lanes stay steerable by whoever holds the
-    role). An ownership gate on top would break live lane steering."""
-    s = _mk(chat_id)
+async def test_task_chats_are_exempt():
+    """A task chat carries its OWN authorization model (``_task_continue_allowed``
+    is role-based on purpose, so delegate lanes stay steerable by whoever holds
+    the role). An ownership gate on top would break live lane steering. A
+    meeting never runs an interactive session, so there is no meeting row here
+    (core-seams phase 4 dropped the dead ``meeting-`` exemption)."""
+    s = _mk("task-run-42")
     assert s.may_drive(OTHER) is True
     assert s.deliver_dashboard_input(b"steer\r", sender_sub=OTHER) is True
 
@@ -134,3 +135,37 @@ async def test_author_sub_for_resolves_the_controller():
         assert transcript_tailer.author_sub_for("headless-sid") == ""
     finally:
         I._sessions.pop(s.session_id, None)
+
+
+async def test_a_mirror_keeps_its_listener_and_learns_of_the_close():
+    """A read-only mirror survives a controller change and is told when the
+    session closes (a take-over is a close: the requester's terminal re-warms
+    on that notice)."""
+    s = _mk()
+    seen: list[str] = []
+    mirror_out = []
+    ctrl_out = []
+
+    async def _mirror(data): mirror_out.append(data)
+    async def _ctrl(data): ctrl_out.append(data)
+    async def _ctrl2(data): ctrl_out.append(data)
+    async def _mirror_closed(_s, reason): seen.append(f"mirror:{reason}")
+    async def _ctrl_closed(_s, reason): seen.append(f"ctrl:{reason}")
+    def _evict(reason): seen.append(f"evict:{reason}")
+
+    s.add_output_listener(_mirror, on_close=_mirror_closed)
+    s.on_close = _ctrl_closed
+    s.add_output_listener(_ctrl, on_evict=_evict)
+    # A second controller evicts only the first controller; the mirror stays.
+    s.add_output_listener(_ctrl2, on_evict=lambda r: None)
+    assert _mirror in s._output_listeners and _ctrl not in s._output_listeners
+    assert seen == ["evict:superseded"]
+    # The controller's own detach frees the evict slot, so its re-attach on
+    # the same socket evicts nobody.
+    s.remove_output_listener(_ctrl2)
+    assert s._viewer_evict is None and _mirror in s._output_listeners
+    s.add_output_listener(_ctrl2, on_evict=_evict)
+    assert seen == ["evict:superseded"]
+
+    await s.close(reason="taken_over")
+    assert "mirror:taken_over" in seen and "ctrl:taken_over" in seen

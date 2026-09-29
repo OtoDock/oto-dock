@@ -25,8 +25,11 @@ def app_with_router(tmp_path, monkeypatch):
 
     agents_dir = tmp_path / "agents"
     staging_dir = tmp_path / "upload-staging"
+    # The agents root exists on every install; the code never creates it.
+    agents_dir.mkdir()
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
     monkeypatch.setattr(config, "UPLOAD_STAGING_DIR", staging_dir)
+    uploads._chunk_locks.clear()
 
     user = UserContext(
         sub="user-test-sub", email="alice@test.com", name="Alice",
@@ -117,7 +120,7 @@ def test_chunked_roundtrip_assembles_and_lands_like_single_shot(
     final = agents_dir / "test-agent" / "users" / "alice" / "workspace" / \
         "uploads" / "files" / "video.bin"
     assert final.read_bytes() == payload
-    assert list(staging_dir.iterdir()) == []  # staging + meta gone
+    assert _staged_files(staging_dir) == []  # staging + meta gone
 
 
 def test_chunked_conflict_rename_matches_single_shot(app_with_router, monkeypatch):
@@ -250,7 +253,8 @@ def test_complete_rejects_missing_chunks_and_keeps_staging(app_with_router, monk
     resp = client.post(f"/v1/upload/chunked/{up['upload_id']}/complete")
     assert resp.status_code == 409
     assert "1 chunks missing" in resp.json()["detail"]
-    assert (staging_dir / f"{up['upload_id']}.partial").exists()  # resumable
+    from api.media import uploads
+    assert uploads._staging_paths(up["upload_id"], _user.sub)[0].exists()  # resumable
 
 
 def test_foreign_owner_gets_403(app_with_router, monkeypatch):
@@ -258,7 +262,8 @@ def test_foreign_owner_gets_403(app_with_router, monkeypatch):
     client = TestClient(app)
     up = _init(client, 10).json()
     # Rewrite the meta's owner — the caller is no longer the initiator.
-    meta_path = staging_dir / f"{up['upload_id']}.json"
+    from api.media import uploads
+    _staging, meta_path = uploads._staging_paths(up["upload_id"], user.sub)
     meta = json.loads(meta_path.read_text())
     meta["sub"] = "someone-else"
     meta_path.write_text(json.dumps(meta))
@@ -293,15 +298,25 @@ def test_hostile_upload_id_is_404_not_traversal(app_with_router):
 
 def test_reaped_staging_is_410_gone(app_with_router, monkeypatch):
     import config
-    app, _agents, staging_dir, _user = app_with_router
+    from api.media import uploads
+    app, _agents, staging_dir, user = app_with_router
     monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
     client = TestClient(app)
     up = _init(client, 8).json()
-    (staging_dir / f"{up['upload_id']}.partial").unlink()
+    staging, _meta = uploads._staging_paths(up["upload_id"], user.sub)
+    assert client.put(f"/v1/upload/chunked/{up['upload_id']}/1", content=b"BBBB").status_code == 200
+    assert up["upload_id"] in uploads._chunk_locks
+    staging.unlink()
     resp = client.put(f"/v1/upload/chunked/{up['upload_id']}/0", content=b"AAAA")
     assert resp.status_code == 410
-    # The 410 also cleared the meta → subsequent calls are a plain 404.
+    # The 410 also cleared the meta → subsequent calls are a plain 404, and
+    # the upload's lock is gone with it.
     assert client.get(f"/v1/upload/chunked/{up['upload_id']}").status_code == 404
+    assert up["upload_id"] not in uploads._chunk_locks
+
+
+def _staged_files(staging_dir):
+    return sorted(p for p in staging_dir.rglob("*") if p.is_file())
 
 
 def test_delete_cleans_staging_and_is_idempotent(app_with_router):
@@ -309,25 +324,279 @@ def test_delete_cleans_staging_and_is_idempotent(app_with_router):
     client = TestClient(app)
     up = _init(client, 10).json()
     assert client.delete(f"/v1/upload/chunked/{up['upload_id']}").json() == {"ok": True}
-    assert list(staging_dir.iterdir()) == []
+    assert _staged_files(staging_dir) == []
     assert client.delete(f"/v1/upload/chunked/{up['upload_id']}").json() == {"ok": True}
 
 
-def test_stale_staging_swept_on_init(app_with_router):
-    app, _agents, staging_dir, _user = app_with_router
-    client = TestClient(app)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    old_partial = staging_dir / "oldid123.partial"
-    old_meta = staging_dir / "oldid123.json"
-    old_partial.write_bytes(b"x")
-    old_meta.write_text("{}")
-    stale = time.time() - 25 * 3600
+def _age(path, seconds):
     import os
-    os.utime(old_partial, (stale, stale))
-    os.utime(old_meta, (stale, stale))
+    stale = time.time() - seconds
+    os.utime(path, (stale, stale))
+
+
+def test_init_never_sweeps(app_with_router, monkeypatch):
+    """The sweep left the request path: init costs the caller's own admission
+    and nothing that scales with what other users left behind."""
+    from api.media import uploads
+    app, _agents, _staging, _user = app_with_router
+    called = []
+    monkeypatch.setattr(uploads, "sweep_stale_staging", lambda: called.append(1) or [])
+    assert _init(TestClient(app), 10).status_code == 200
+    assert called == []
+
+
+def test_sweep_reaps_stale_pairs_and_pops_only_idle_locks(app_with_router, monkeypatch):
+    import asyncio
+    import config
+    from api.media import uploads
+    app, _agents, staging_dir, user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    # (a) chunks received, idle past the 24 h TTL: reaped, lock popped
+    old = _init(client, 8).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{old}/0", content=b"AAAA").status_code == 200
+    for p in uploads._staging_paths(old, user.sub):
+        _age(p, 25 * 3600)
+    # (b) no chunk at all, older than the first-chunk window: reaped
+    empty = _init(client, 8).json()["upload_id"]
+    for p in uploads._staging_paths(empty, user.sub):
+        _age(p, config.UPLOAD_FIRST_CHUNK_S + 60)
+    # (c) no chunk yet, but young: kept
+    young = _init(client, 8).json()["upload_id"]
+    # (d) chunks received an hour ago: kept
+    live = _init(client, 8).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{live}/0", content=b"AAAA").status_code == 200
+    for p in uploads._staging_paths(live, user.sub):
+        _age(p, 3600)
+    # (e) a pre-upgrade flat pair at the root, past the TTL: reaped
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    (staging_dir / "oldflat01.partial").write_bytes(b"x")
+    (staging_dir / "oldflat01.json").write_text("{}")
+    _age(staging_dir / "oldflat01.partial", 25 * 3600)
+    _age(staging_dir / "oldflat01.json", 25 * 3600)
+    # (f) a swept id whose lock is held keeps the lock (the holder answers 410)
+    uploads._chunk_locks[old].locked() is False
+    held = asyncio.Lock()
+    asyncio.run(held.acquire())
+    uploads._chunk_locks[empty] = held
+
+    swept = uploads.sweep_stale_staging()
+    assert set(swept) == {old, empty, "oldflat01"}
+    assert not any(p.exists() for p in uploads._staging_paths(old, user.sub))
+    assert not any(p.exists() for p in uploads._staging_paths(empty, user.sub))
+    assert not (staging_dir / "oldflat01.partial").exists()
+    assert all(p.exists() for p in uploads._staging_paths(young, user.sub))
+    assert all(p.exists() for p in uploads._staging_paths(live, user.sub))
+    uploads.release_swept_locks(swept)
+    assert old not in uploads._chunk_locks
+    assert empty in uploads._chunk_locks  # held: left for its holder
+    assert live in uploads._chunk_locks
+
+
+def test_open_uploads_are_capped_per_user_and_an_idle_pair_is_evicted_first(
+        app_with_router, monkeypatch):
+    import config
+    from api.media import uploads
+    app, _agents, _staging, user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 2)
+    client = TestClient(app)
+    first = _init(client, 10).json()["upload_id"]
     assert _init(client, 10).status_code == 200
-    assert not old_partial.exists()
-    assert not old_meta.exists()
+    r = _init(client, 10)
+    assert r.status_code == 429, r.text
+    assert "UPLOAD_MAX_OPEN" in r.text
+    # An interrupted upload (no chunk in the idle window) gives its slot up.
+    for p in uploads._staging_paths(first, user.sub):
+        _age(p, uploads._IDLE_EVICT_S + 60)
+    assert _init(client, 10).status_code == 200
+    assert not any(p.exists() for p in uploads._staging_paths(first, user.sub))
+    assert _init(client, 10).status_code == 429
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)  # 0 = no cap
+    assert _init(client, 10).status_code == 200
+
+
+def test_staged_bytes_are_capped_per_user_by_real_occupancy(app_with_router, monkeypatch):
+    import config
+    app, _agents, _staging, _user = app_with_router
+    chunk = 64 * 1024
+    mb = 1024 * 1024
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", chunk, raising=False)
+    monkeypatch.setattr(config, "UPLOAD_STAGING_USER_MB", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)
+    client = TestClient(app)
+    # An open upload counts what it holds on disk, not what it declared: a
+    # 1.5 MB declaration with one chunk landed is 64 KB, so a second 1.5 MB
+    # declaration still fits under 2 MB (declared sizes would sum to 3 MB).
+    big = _init(client, 3 * mb // 2).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{big}/0", content=b"A" * chunk).status_code == 200
+    assert _init(client, 3 * mb // 2).status_code == 200
+    # Seven more chunks on the big one (512 KB staged): a 1.6 MB request is
+    # refused, a 100 KB one is not, and the new upload's own size counts.
+    for i in range(1, 8):
+        assert client.put(f"/v1/upload/chunked/{big}/{i}", content=b"A" * chunk).status_code == 200
+    r = _init(client, 16 * mb // 10)
+    assert r.status_code == 429 and "UPLOAD_STAGING_USER_MB" in r.text
+    assert _init(client, 100 * 1024).status_code == 200
+    assert _init(client, 3 * mb).status_code == 429
+
+
+def test_the_global_open_cap_answers_503(app_with_router, monkeypatch):
+    import config
+    app, _agents, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN_TOTAL", 1)
+    client = TestClient(app)
+    assert _init(client, 10).status_code == 200
+    assert _init(client, 10).status_code == 503
+
+
+def _no_disk(monkeypatch):
+    import shutil
+    import config
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 5)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_PCT", 0)
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(100 << 20, 99 << 20, 1 << 20))
+
+
+def test_the_free_disk_floor_refuses_every_write(app_with_router, monkeypatch):
+    import config
+    from api.media import uploads
+    app, _agents, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    up = _init(client, 8).json()["upload_id"]
+    _no_disk(monkeypatch)
+    assert _init(client, 8).status_code == 507
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"AAAA").status_code == 507
+    # The floor is checked in the thread that writes, never on the loop.
+    import threading
+    seen = []
+    real = uploads._free_disk_ok
+
+    def _spy(path, incoming):
+        seen.append(threading.current_thread().name)
+        return real(path, incoming)
+    monkeypatch.setattr(uploads, "_free_disk_ok", _spy)
+    assert _init(client, 8).status_code == 507
+    assert seen and all(not n.startswith("MainThread") and "anyio" not in n for n in seen)
+
+
+def test_a_same_filesystem_complete_ignores_the_floor_and_the_copy_path_honours_it(
+        app_with_router, monkeypatch):
+    import errno
+    import config
+    from services.infra import safe_fs
+    app, agents_dir, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    payload = b"ABCDEFGH"
+    up = _init(client, 8).json()["upload_id"]
+    _upload_all(client, up, payload, 4)
+    _no_disk(monkeypatch)
+    assert client.post(f"/v1/upload/chunked/{up}/complete").status_code == 200
+    up2 = _init(client, 8, filename="two.bin")
+    # (init is refused under the floor; lift it for the init, then re-arm it)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 0)
+    up2 = _init(client, 8, filename="two.bin").json()["upload_id"]
+    _upload_all(client, up2, payload, 4)
+    monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 5)
+    real = safe_fs.rename_beneath
+
+    def _exdev(*a, **kw):
+        raise OSError(errno.EXDEV, "cross-device")
+    monkeypatch.setattr(safe_fs, "rename_beneath", _exdev)
+    assert client.post(f"/v1/upload/chunked/{up2}/complete").status_code == 507
+    monkeypatch.setattr(safe_fs, "rename_beneath", real)
+
+
+def test_a_failed_first_put_leaves_no_lock(app_with_router, monkeypatch):
+    import config
+    from api.media import uploads
+    app, _agents, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    up = _init(client, 8).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"").status_code == 400
+    assert up not in uploads._chunk_locks
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"AAAA").status_code == 200
+    assert up in uploads._chunk_locks
+
+
+def test_a_duplicate_complete_answers_404_with_one_file_landed(app_with_router, monkeypatch):
+    import config
+    app, agents_dir, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    up = _init(client, 8).json()["upload_id"]
+    _upload_all(client, up, b"ABCDEFGH", 4)
+    assert client.post(f"/v1/upload/chunked/{up}/complete").status_code == 200
+    assert client.post(f"/v1/upload/chunked/{up}/complete").status_code == 404
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    assert sorted(p.name for p in landed.iterdir()) == ["video.bin"]
+
+
+def test_two_completes_of_one_name_land_two_files(app_with_router, monkeypatch):
+    import config
+    app, agents_dir, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    a = _init(client, 4).json()["upload_id"]
+    b = _init(client, 4).json()["upload_id"]
+    _upload_all(client, a, b"AAAA", 4)
+    _upload_all(client, b, b"BBBB", 4)
+    assert client.post(f"/v1/upload/chunked/{a}/complete").json()["filename"] == "video.bin"
+    assert client.post(f"/v1/upload/chunked/{b}/complete").json()["filename"] == "video_1.bin"
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    assert (landed / "video.bin").read_bytes() == b"AAAA"
+    assert (landed / "video_1.bin").read_bytes() == b"BBBB"
+
+
+def test_a_planted_link_at_the_landing_name_is_never_written_through(
+        app_with_router, monkeypatch, tmp_path):
+    import config
+    app, agents_dir, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    landed = agents_dir / "test-agent" / "users" / "alice" / "workspace" / "uploads" / "files"
+    landed.mkdir(parents=True)
+    target = tmp_path / "elsewhere.txt"
+    target.write_bytes(b"untouched")
+    (landed / "video.bin").symlink_to(target)
+    up = _init(client, 4).json()["upload_id"]
+    _upload_all(client, up, b"AAAA", 4)
+    done = client.post(f"/v1/upload/chunked/{up}/complete")
+    assert done.status_code == 200 and done.json()["filename"] == "video_1.bin"
+    assert target.read_bytes() == b"untouched"
+    assert (landed / "video_1.bin").read_bytes() == b"AAAA"
+
+
+def test_writes_fsync_and_finalize_run_off_the_loop(app_with_router, monkeypatch):
+    import os
+    import threading
+    import config
+    from api.media import uploads
+    app, _agents, _staging, _user = app_with_router
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", 4, raising=False)
+    client = TestClient(app)
+    threads = {"fsync": set(), "finalize": set()}
+    real_fsync = os.fsync
+
+    def _fsync(fd):
+        threads["fsync"].add(threading.current_thread().name)
+        return real_fsync(fd)
+    real_finalize = uploads._finalize_staged_file
+
+    def _finalize(*a, **kw):
+        threads["finalize"].add(threading.current_thread().name)
+        return real_finalize(*a, **kw)
+    monkeypatch.setattr(os, "fsync", _fsync)
+    monkeypatch.setattr(uploads, "_finalize_staged_file", _finalize)
+    up = _init(client, 8).json()["upload_id"]
+    _upload_all(client, up, b"ABCDEFGH", 4)
+    assert client.post(f"/v1/upload/chunked/{up}/complete").status_code == 200
+    assert threads["fsync"] and all(n.startswith("file-commit") for n in threads["fsync"])
+    assert threads["finalize"] and all(n.startswith("file-commit") for n in threads["finalize"])
 
 
 def test_complete_schedules_push_with_transfer_id(app_with_router, monkeypatch):
@@ -372,19 +641,41 @@ def test_complete_survives_cross_device_staging(app_with_router, monkeypatch):
     up = _init(client, len(payload)).json()
     _upload_all(client, up["upload_id"], payload, 8)
 
-    real_replace = os.replace
+    from services.infra import safe_fs
+    real_rename = safe_fs.rename_beneath
+    calls = []
 
-    def _exdev_from_staging(src, dst, *a, **kw):
-        if str(src).startswith(str(staging_dir)):
+    def _exdev_from_staging(root, src_rel, dst_rel, **kw):
+        calls.append(str(src_rel))
+        if str(src_rel).startswith("upload-staging/"):
             raise OSError(errno.EXDEV, "Invalid cross-device link")
-        return real_replace(src, dst, *a, **kw)
+        return real_rename(root, src_rel, dst_rel, **kw)
 
-    monkeypatch.setattr(os, "replace", _exdev_from_staging)
+    monkeypatch.setattr(safe_fs, "rename_beneath", _exdev_from_staging)
     done = client.post(f"/v1/upload/chunked/{up['upload_id']}/complete")
     assert done.status_code == 200, done.text
 
     final = agents_dir / "test-agent" / "users" / "alice" / "workspace" / \
         "uploads" / "files" / "video.bin"
     assert final.read_bytes() == payload
-    assert not [p for p in final.parent.iterdir() if p.name.endswith(".part")]
-    assert list(staging_dir.iterdir()) == []  # staging + meta gone
+    assert os.stat(final).st_mode & 0o777 == 0o644
+    assert [p.name for p in final.parent.iterdir()] == ["video.bin"]  # no temp survives
+    assert _staged_files(staging_dir) == []  # staging + meta gone
+
+
+def test_staged_bytes_for_one_user(app_with_router, monkeypatch):
+    """The quota monitor reads one user's staged bytes without walking the
+    other users' staging directories."""
+    import config
+    from api.media import uploads
+    app, _agents, _staging, user = app_with_router
+    chunk = 64 * 1024
+    monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", chunk, raising=False)
+    monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)
+    client = TestClient(app)
+    assert uploads.staged_bytes_for(user.sub) == 0
+    up = _init(client, 4 * chunk).json()["upload_id"]
+    assert client.put(f"/v1/upload/chunked/{up}/0", content=b"A" * chunk).status_code == 200
+    assert uploads.staged_bytes_for(user.sub) == chunk
+    assert uploads.staged_bytes_for("local:someone-else") == 0
+    assert uploads.staged_bytes_total() == chunk

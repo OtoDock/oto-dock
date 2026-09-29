@@ -140,15 +140,22 @@ def test_pump_and_interactive_union_dedupe_and_unknown_skip(temp_db, _as):
 
 
 def test_task_run_chats_report_source_type_task(temp_db, _as):
-    """Task-run chats are created with the DEFAULT source_type ('chat') —
-    the id prefix is the durable marker, and the widget needs the row typed
-    as 'task' (purple identity + task-history click-through)."""
+    """A task-run chat minted BEFORE the proxy wrote the column (the default
+    'chat' with a task- id) and one minted with it both report 'task' — the
+    widget needs the row typed as 'task' (purple identity + task-history
+    click-through), and the read-side resolver answers for both shapes."""
     cid = _mk_task_run_chat("user-alice", scope="user", created_by="user-alice",
                             title="Nightly digest")
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    new = f"task-{run_id}"
+    task_store.create_chat(new, "user-alice", AGENT, source_type="task")
+    task_store.create_run(run_id, "t-nightly", AGENT, "schedule", None, "x",
+                          scope="user", created_by="user-alice")
     plain = _mk_chat("user-alice")
-    _as(_user(), pump=[cid, plain])
+    _as(_user(), pump=[cid, new, plain])
     rows = {r["id"]: r for r in client.get("/v1/chats/active").json()["chats"]}
     assert rows[cid]["source_type"] == "task"
+    assert rows[new]["source_type"] == "task"
     assert rows[plain]["source_type"] == "chat"
 
 
@@ -460,3 +467,64 @@ def test_first_turn_title_branch_broadcasts_and_keeps_socket_send(temp_db, monke
                               {"agent": slug})]
             ws.client_send({"type": "close"})
     run_ws_scenario(scenario)
+
+
+# ---------------------------------------------------------------------------
+# Off the loop, in three batched reads
+# ---------------------------------------------------------------------------
+
+def test_active_seed_runs_off_the_loop(temp_db, _as, loop_db_guard):
+    """The seed is one executor job; the handler coroutine is awaited
+    on this thread with the guard armed and answers the same rows, in the
+    same order (streaming, warming, finished), as before."""
+    from api.agents import chats as api
+    own = _mk_chat("user-alice", title="Mine")
+    shared = _mk_chat(f"agent::{AGENT}", title="Ours")
+    hidden = _mk_chat("user-bob", title="Theirs")
+    task_store.create_dynamic_task("t-nightly", AGENT, "Nightly report", "p", "cli",
+                                   "scheduled", "0 9 * * *", None, None, 3600,
+                                   "user-alice", scope="agent")
+    run_chat = _mk_task_run_chat(f"task::{AGENT}", title="raw prompt")
+    warm = _mk_chat("user-alice", title="Warming up")
+    _warming(warm)
+    done = _mk_chat("user-alice", title="Done but unseen")
+    _finish(done)
+    u = _user()
+    _as(u, pump=[own, hidden, run_chat], interactive=[shared])
+
+    async def scenario():
+        with loop_db_guard.active():
+            return await api.list_active_chats(user=u)
+
+    rows = asyncio.run(scenario())["chats"]
+    assert [(r["id"], r["status"]) for r in rows] == [
+        (own, "streaming"), (run_chat, "streaming"), (shared, "streaming"),
+        (warm, "warming"), (done, "finished"),
+    ]
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[run_chat]["title"] == "Nightly report"
+    assert by_id[run_chat]["source_type"] == "task"
+    assert by_id[shared]["owner_is_shared"] is True
+    assert by_id[done]["unread"] is True
+
+
+def test_active_seed_never_reads_per_chat(temp_db, _as, monkeypatch):
+    """The per-id reads are gone: with ``get_chat``, ``get_run`` and
+    ``get_dynamic_task`` unavailable the seed still answers every row."""
+    from api.agents import chats as api
+    for name in ("get_chat", "get_run", "get_dynamic_task"):
+        def boom(*a, _n=name, **k):
+            raise AssertionError(f"{_n} read per row")
+        monkeypatch.setattr(task_store, name, boom)
+    own = _mk_chat("user-alice", title="Mine")
+    task_store.create_dynamic_task("t-nightly", AGENT, "Nightly report", "p", "cli",
+                                   "scheduled", "0 9 * * *", None, None, 3600,
+                                   "user-alice", scope="agent")
+    run_chat = _mk_task_run_chat(f"task::{AGENT}", title="raw prompt")
+    warm = _mk_chat("user-alice", title="Warming up")
+    _warming(warm)
+    u = _user()
+    _as(u, pump=[own, run_chat, "ghost-id"])
+    rows = asyncio.run(api.list_active_chats(user=u))["chats"]
+    assert [r["id"] for r in rows] == [own, run_chat, warm]
+    assert rows[1]["title"] == "Nightly report"

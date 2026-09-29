@@ -9,10 +9,11 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import config
 from core.config import deployment
+from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from storage.mcp import mcp_store
 from auth.session_token import SESSION_JWT_SENTINEL_BEARER
 # The manifest schema (data classes + validation enums), template resolution,
@@ -274,15 +275,17 @@ def core_mcp_names() -> list[str]:
     ]
 
 
-def assign_core_mcps(agent_slug: str) -> list[str]:
-    """Assign every core MCP (and its skill rows) to ``agent_slug``.
+def assign_core_mcps(agent_slug: str, names: list[str] | None = None) -> list[str]:
+    """Assign every core MCP (and its skill rows) to ``agent_slug`` — or
+    only ``names`` (a template update enabling the core MCPs the platform
+    gained since the install, COMMUNITY-AGENTS-REGISTRY.md "Updates").
 
     Additive — safe to call on an agent that already has some of them, and
     safe to call after a template's own MCP cascade. Returns the names
     assigned. Callers treat failures as non-fatal: the startup backfill
     re-runs this for every agent on the next boot.
     """
-    names = core_mcp_names()
+    names = list(names) if names is not None else core_mcp_names()
     for name in names:
         mcp_store.add_agent_mcp(agent_slug, name)
         manifest = _manifests.get(name)
@@ -383,9 +386,7 @@ def get_protected_credentials_subpaths() -> frozenset[str]:
 def _device_placement_reason(
     manifest: McpManifest,
     *,
-    is_remote: bool,
-    target_has_display: bool | None,
-    target_device_grants: set[str] | None,
+    placement: PlacementCapabilities,
 ) -> str | None:
     """Return a human-readable exclusion reason if a device-local MCP must NOT
     attach to this session, else None. The single source of truth for the
@@ -395,24 +396,25 @@ def _device_placement_reason(
     Three gates, all fail-closed:
       1. PLACEMENT — a ``satellite_only`` MCP, OR any MCP declaring a
          ``device_capability``, runs ONLY on a satellite (device control on the
-         proxy would drive the SERVER's screen/input). ``is_remote`` defaults
-         False at every call site, so such an MCP attaches ONLY when the session
-         is explicitly known to run on a satellite.
+         proxy would drive the SERVER's screen/input). The placement defaults
+         to the LOCAL one at every call site, so such an MCP attaches ONLY
+         when the session is explicitly known to run on a satellite.
       2. CONSENT — a ``device_capability`` MCP attaches only when the
-         target machine's owner has GRANTED that capability. ``target_device_
-         grants`` defaults to the empty set, so an ungranted machine blocks it.
+         target machine's owner has GRANTED that capability (the placement's
+         ``device_grants``; the local placement carries none, so an ungranted
+         machine blocks it).
       3. DISPLAY — a ``requires_display`` MCP is excluded only when the remote
-         target is KNOWN to have no display (``target_has_display is False``);
+         target is KNOWN to have no display (``has_display is False``);
          None = unknown → don't exclude (the tool reports "no display" at call
          time if it turns out to be missing).
     """
-    if (manifest.placement == "satellite_only" or manifest.device_capability) and not is_remote:
+    if (manifest.placement == "satellite_only" or manifest.device_capability) and not placement.is_remote:
         return "Requires a remote machine (satellite)"
-    # Reaching here with a device_capability set means is_remote is True (gate 1
-    # returned otherwise) — this is the on-satellite owner-consent check.
-    if manifest.device_capability and manifest.device_capability not in (target_device_grants or set()):
+    # Reaching here with a device_capability set means the placement is remote
+    # (gate 1 returned otherwise) — this is the on-satellite owner-consent check.
+    if manifest.device_capability and manifest.device_capability not in (placement.device_grants or set()):
         return f"Machine has not granted '{manifest.device_capability}' device control"
-    if manifest.requires_display and is_remote and target_has_display is False:
+    if manifest.requires_display and placement.is_remote and placement.has_display is False:
         return "Remote machine has no interactive display"
     return None
 
@@ -458,9 +460,7 @@ def _agent_base_manifests(agent_name: str) -> list[McpManifest]:
 def _get_agent_mcps_with_device_exclusions(
     agent_name: str,
     *,
-    is_remote: bool,
-    target_has_display: bool | None,
-    target_device_grants: set[str] | None,
+    placement: PlacementCapabilities,
 ) -> tuple[list[McpManifest], dict[str, str]]:
     """Core of ``get_agent_mcps`` — returns (kept manifests, {excluded: reason})
     where exclusions are ONLY the device-local placement / consent / display
@@ -469,10 +469,7 @@ def _get_agent_mcps_with_device_exclusions(
     result: list[McpManifest] = []
     device_exclusions: dict[str, str] = {}
     for manifest in _agent_base_manifests(agent_name):
-        reason = _device_placement_reason(
-            manifest, is_remote=is_remote, target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
-        )
+        reason = _device_placement_reason(manifest, placement=placement)
         if reason:
             device_exclusions[manifest.name] = reason
             continue
@@ -483,9 +480,7 @@ def _get_agent_mcps_with_device_exclusions(
 def get_agent_mcps(
     agent_name: str,
     *,
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
 ) -> list[McpManifest]:
     """Return manifests for runtime: the base set (visible AND manager-enabled
     AND platform-enabled) minus device-local MCPs whose placement / consent /
@@ -495,17 +490,15 @@ def get_agent_mcps(
     target" function used by skill loading, system prompt building, and runtime
     config generation.
 
-    ``is_remote`` / ``target_has_display`` / ``target_device_grants`` gate
-    device-local MCPs (computer / browser / app-connector control). **Fail-
-    closed**: the defaults (``is_remote=False``, empty grants) mean callers that
-    don't know the target NEVER leak a ``satellite_only`` / device-capability
-    MCP onto a local session — every consumer that builds a local session
-    (sandbox mounts, Direct-LLM in-process pool, system prompt) relies on this.
+    The ``placement`` (the session's resolved placement, ``core.placement``)
+    gates device-local MCPs (computer / browser / app-connector control).
+    **Fail-closed**: the default is the LOCAL placement (no grants), so
+    callers that don't know the target NEVER leak a ``satellite_only`` /
+    device-capability MCP onto a local session — every consumer that builds
+    a local session (sandbox mounts, Direct-LLM in-process pool, system
+    prompt) relies on this.
     """
-    kept, _ = _get_agent_mcps_with_device_exclusions(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
-    )
+    kept, _ = _get_agent_mcps_with_device_exclusions(agent_name, placement=placement)
     return kept
 
 
@@ -576,6 +569,137 @@ def _is_local_host_ip(ip: str) -> bool:
         s.close()
 
 
+class _PlatformTargets(NamedTuple):
+    """What a sandbox may never reach through a carve or a splice."""
+    compose: bool
+    networks: tuple            # control-plane networks (compose only)
+    addresses: frozenset[str]  # platform service addresses (compose only)
+    ports: frozenset[int]      # local platform listeners (never spliced)
+    # The document-sidecar plane (file-tools, Collabora): carved only for a
+    # platform-shipped Docker MCP (compose only).
+    sidecar_networks: tuple = ()
+    # Platform hosts that start after the proxy and move when their container
+    # is recreated (the phone daemon): resolved at every egress computation
+    # (compose only).
+    late_hosts: tuple[str, ...] = ()
+
+
+# The phone daemon's AudioSocket listener has no config key: the phone
+# overlay publishes it on the bind address next to the HTTP API.
+_AUDIOSOCKET_PORT = 9092
+
+_platform_targets_cache: dict[bool, _PlatformTargets] = {}
+
+
+def _host_is_local(host: str) -> bool:
+    import ipaddress
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    for ip in _resolve_to_ips(host):
+        with contextlib.suppress(ValueError):
+            if ipaddress.ip_address(ip).is_loopback:
+                return True
+        if _is_local_host_ip(ip):
+            return True
+    return False
+
+
+def _subnet_setting(key: str, default: str):
+    """A subnet config key as a network; an invalid value falls back to the
+    default, which is then refused as well."""
+    import ipaddress
+    value = config._cfg(key, default)
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        logger.warning("%s=%r is not a network; refusing the default %s", key, value, default)
+        return ipaddress.ip_network(default)
+
+
+def _platform_targets() -> _PlatformTargets:
+    """Computed once per process and mode (this runs on the loop at session
+    start): the control-plane networks, the document-sidecar plane and the
+    database and socket-proxy addresses in compose mode, the phone daemon's
+    host to resolve per computation, and the ports of the platform listeners
+    on this host, which the bare-metal loopback splice must never open."""
+    from urllib.parse import urlsplit
+    compose = deployment.in_docker_compose()
+    cached = _platform_targets_cache.get(compose)
+    if cached is not None:
+        return cached
+    networks: list = []
+    sidecar_networks: list = []
+    late_hosts: list[str] = []
+    addresses: set[str] = set()
+    ports: set[int] = set()
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+        db = conninfo_to_dict(config.DATABASE_URL)
+    except Exception:
+        db = {}
+    db_hosts = [h.strip() for h in str(db.get("host") or "localhost").split(",") if h.strip()]
+    try:
+        db_port = int(db.get("port") or 5432)
+    except (TypeError, ValueError):
+        db_port = 5432
+    phone = urlsplit(config.PHONE_SERVER_URL or "")
+    if compose:
+        # The compose interpolation variables never reach the container's
+        # environment; ``config.env`` is the bind-mounted ``.env`` there.
+        for key, default in (("OTODOCK_SOCKETPROXY_SUBNET", "10.202.0.0/24"),
+                             ("OTODOCK_DATA_SUBNET", "10.203.0.0/24")):
+            networks.append(_subnet_setting(key, default))
+        sidecar_networks.append(_subnet_setting("OTODOCK_INTERNAL_SUBNET", "10.204.0.0/24"))
+        for host in (*db_hosts, config.DOCKER_SOCKET_PROXY_HOST):
+            addresses.update(_resolve_to_ips(host))
+        if phone.hostname:
+            late_hosts.append(phone.hostname)
+        ports.add(int(config.DOCKER_SOCKET_PROXY_PORT))
+    if any(_host_is_local(h) for h in db_hosts):
+        ports.add(db_port)
+    if phone.hostname and _host_is_local(phone.hostname):
+        ports.add(phone.port or 9093)
+        ports.add(_AUDIOSOCKET_PORT)
+    targets = _PlatformTargets(
+        compose, tuple(networks), frozenset(addresses), frozenset(ports),
+        tuple(sidecar_networks), tuple(late_hosts),
+    )
+    _platform_targets_cache[compose] = targets
+    return targets
+
+
+def _is_platform_ip(
+    ip: str, targets: _PlatformTargets, *,
+    late_addresses: set[str] | frozenset[str] = frozenset(), sidecar_ok: bool = False,
+) -> bool:
+    """Loopback in every mode; in compose mode also the control-plane
+    networks, the document-sidecar plane (unless ``sidecar_ok``), the service
+    addresses, the late hosts' current addresses and the proxy container's
+    own addresses. A mapped IPv4 form is judged as its IPv4 address."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    if addr.is_loopback or str(addr) in targets.addresses or str(addr) in late_addresses:
+        return True
+    if any(addr in net for net in targets.networks):
+        return True
+    if not sidecar_ok and any(addr in net for net in targets.sidecar_networks):
+        return True
+    return targets.compose and _is_local_host_ip(str(addr))
+
+
+def _is_platform_shipped(manifest) -> bool:
+    """The MCP's folder is in the platform's own ``custom`` tree (the catalog
+    installs into ``community``, whatever category its manifest declares)."""
+    mcp_dir = getattr(manifest, "mcp_dir", None)
+    return mcp_dir is not None and Path(mcp_dir).parent == Path(config.MCPS_DIR) / "custom"
+
+
 def resolve_sandbox_egress(
     agent_name: str, *, user_sub: str = "", extra_targets: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
@@ -592,7 +716,7 @@ def resolve_sandbox_egress(
         (already reachable); Postgres / other siblings / the rest of the LAN
         stay blocked.
 
-    ``is_remote=False`` (fail-closed): a ``satellite_only`` MCP never runs
+    The local placement (fail-closed): a ``satellite_only`` MCP never runs
     locally, so it contributes nothing here. Deterministic order for stable
     argv + golden tests.
     """
@@ -602,33 +726,64 @@ def resolve_sandbox_egress(
     fseen: set[str] = {str(config.PORT)}
     allow_hosts: list[str] = []
     aseen: set[str] = set()
+    targets = _platform_targets()
 
     def _add_forward(port) -> None:
         s = str(port)
-        if s not in fseen:
-            fseen.add(s)
-            forwards.append(s)
+        if s in fseen:
+            return
+        try:
+            refused = int(port) in targets.ports
+        except (TypeError, ValueError):
+            refused = True
+        if refused:
+            logger.warning(
+                "egress for %s: port %s is a platform listener on this host; "
+                "not spliced", agent_name, s,
+            )
+            return
+        fseen.add(s)
+        forwards.append(s)
 
-    def _add_allow(host: str) -> None:
+    late: set[str] | None = None
+
+    def _late_addresses() -> set[str]:
+        nonlocal late
+        if late is None:
+            late = {ip for h in targets.late_hosts for ip in _resolve_to_ips(h)}
+        return late
+
+    def _add_allow(host: str, *, sidecar_ok: bool = False) -> None:
         for ip in _resolve_to_ips(host):
-            if ip not in aseen and _is_carveable_ip(ip):
-                aseen.add(ip)
-                allow_hosts.append(ip)
+            if ip in aseen or not _is_carveable_ip(ip):
+                continue
+            if _is_platform_ip(
+                ip, targets, late_addresses=_late_addresses(), sidecar_ok=sidecar_ok,
+            ):
+                logger.warning(
+                    "egress for %s: %s resolves to %s, a platform control-plane "
+                    "address; not carved", agent_name, host, ip,
+                )
+                continue
+            aseen.add(ip)
+            allow_hosts.append(ip)
 
-    mcps = get_agent_mcps(agent_name, is_remote=False) or []
+    mcps = get_agent_mcps(agent_name, placement=LOCAL_PLACEMENT) or []
 
     # 1. Docker MCPs the agent dials.
     for manifest in mcps:
         srv = manifest.server
-        if getattr(srv, "runtime", "") != "docker" or not srv.port:
+        if not _mt.is_container(srv) or not srv.port:
             continue
         if deployment.in_docker_compose():
             # T2: a sibling container reached by service-DNS on the shared
             # network. The on-link subnet is now blackholed, so resolve the
             # service name to its container IP and carve exactly that.
+            # Only the platform's own Docker MCP (file-tools) lives on the
+            # document-sidecar plane; nothing else is carved into it.
             host = (deployment.docker_mcp_host(manifest)
                     or getattr(srv, "service_name", "") or manifest.name)
-            _add_allow(host)
+            _add_allow(host, sidecar_ok=_is_platform_shipped(manifest))
         else:
             resolved = _resolve_template(srv.url_template, manifest, agent_name)
             host = (urlparse(resolved).hostname or "localhost") if resolved else "localhost"
@@ -675,10 +830,7 @@ def resolve_sandbox_egress(
             if (not is_t2) and port and any(_is_local_host_ip(ip) for ip in ips):
                 _add_forward(port)
                 continue
-            for ip in ips:
-                if ip not in aseen and _is_carveable_ip(ip):
-                    aseen.add(ip)
-                    allow_hosts.append(ip)
+            _add_allow(host)
 
     # 3. Layer-supplied targets (e.g. a Codex local-LLM endpoint URL the agent
     #    dials from the sandbox). Same handling as a homelab target: loopback →
@@ -1214,10 +1366,9 @@ def get_credentials_dirs(mcp_name: str) -> list[tuple[str, str]]:
     item.
 
     Used by the OAuth flow (``services/oauth/credential_resolver.py``) and the
-    session-close writeback (``core/credentials/credential_writeback.py``) to know:
+    token-file delivery (``core/credentials/credential_files.py``) to know:
       - which env var carries the credentials path (so the MCP gets a value)
-      - which subpath to use under the user/agent dir (for token copy +
-        writeback)
+      - which subpath the delivered directory carries
 
     For shorthand entries with role ``credentials_dir``, we return
     ``(env_var, decl.subpath)``. For multi-value entries that include one or
@@ -1274,9 +1425,7 @@ def build_available_mcps_section(
     agent_name: str,
     *,
     context: str = "",
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
 ) -> str:
@@ -1297,7 +1446,7 @@ def build_available_mcps_section(
         context: session context string — ``"dashboard"`` / ``"phone"`` /
             ``"task"`` / ``"terminal"``. Empty string skips context filtering
             (defense-only — upstream usually filters).
-        is_remote / target_has_display / target_device_grants: forwarded to
+        placement: the session's resolved placement, forwarded to
             ``get_agent_mcps`` so the prompt catalog only lists device-local
             MCPs the session can actually use. Fail-closed defaults.
         skip_http_mcps: drop manifests with ``server.transport == "http"`` —
@@ -1305,10 +1454,7 @@ def build_available_mcps_section(
             (``core/layers/direct/mcp.py`` skips them), so the prompt does
             not advertise tools the session cannot reach.
     """
-    manifests = get_agent_mcps(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
-    ) or []
+    manifests = get_agent_mcps(agent_name, placement=placement) or []
     if skip_http_mcps:
         manifests = [m for m in manifests if not _is_http_transport(m)]
     # Sort alphabetically by label for deterministic output — registry scan
@@ -1354,9 +1500,7 @@ def get_skills_for_agent(
     agent_name: str,
     context: str = "dashboard",
     *,
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
 ) -> list[tuple[str, str, str]]:
@@ -1365,37 +1509,41 @@ def get_skills_for_agent(
     Reads agent_skills DB table, checks exclude_from, loads skill files from
     disk with any SKILL.md frontmatter stripped (frontmatter is index
     metadata for the CLI skills dir, never prompt text). Context is the
-    session's ``client_type`` — ``"dashboard"`` / ``"phone"`` / ``"task"`` /
-    ``"terminal"`` / … — matched against the skill's ``exclude_from``; ``""``
-    skips the exclusion filter.
+    session kind's name (``core/session/session_kind.py``) or the ``terminal``
+    placement — matched against the skill's ``exclude_from``; ``""`` skips
+    the exclusion filter.
 
     ``loading`` is the manifest stamp (``"always"`` | ``"on_demand"``) — the
     caller decides what to inline vs. hand to the CLI's own progressive
     disclosure.
 
-    ``is_remote`` / ``target_has_display`` / ``target_device_grants`` forward to
-    ``get_agent_mcps`` so a device-local MCP's skill text is dropped on sessions
-    that can't run it. Fail-closed defaults. ``skip_http_mcps`` drops the
+    ``placement`` forwards to ``get_agent_mcps`` so a device-local MCP's
+    skill text is dropped on sessions that can't run it (fail-closed: the
+    local placement by default). ``skip_http_mcps`` drops the
     skills of sidecar (HTTP) MCPs — see ``build_available_mcps_section``.
     """
     from services.mcp.skill_format import strip_frontmatter
 
     result: list[tuple[str, str, str]] = []
     for manifest, skill_def in _iter_agent_skills(
-        agent_name, context, is_remote=is_remote,
-        target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        agent_name, context, placement=placement,
         skip_http_mcps=skip_http_mcps,
         external=external,
     ):
-        # Load skill file content
-        skill_path = manifest.mcp_dir / skill_def.file
-        if skill_path.is_file():
-            try:
-                content = strip_frontmatter(skill_path.read_text())
-                result.append((skill_def.id, content, skill_def.loading))
-            except Exception as e:
-                logger.warning("Failed to read skill %s: %s", skill_path, e)
+        # The file must be a regular file inside this MCP's own folder; a
+        # value that escapes it is never read.
+        skill_path = _mmp.resolve_skill_file(manifest.mcp_dir, skill_def.file)
+        if skill_path is None:
+            logger.warning(
+                "Skill %s of %s names %r, which is not a file inside its "
+                "folder; skipped", skill_def.id, manifest.name, skill_def.file,
+            )
+            continue
+        try:
+            content = strip_frontmatter(skill_path.read_text())
+            result.append((skill_def.id, content, skill_def.loading))
+        except Exception as e:
+            logger.warning("Failed to read skill %s: %s", skill_path, e)
 
     return result
 
@@ -1404,9 +1552,7 @@ def _iter_agent_skills(
     agent_name: str,
     context: str,
     *,
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
 ):
@@ -1421,10 +1567,7 @@ def _iter_agent_skills(
     db_skills = mcp_store.get_agent_skills(agent_name)
     skill_map: dict[str, dict] = {s["skill_id"]: s for s in db_skills}
 
-    assigned_mcps = get_agent_mcps(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
-    )
+    assigned_mcps = get_agent_mcps(agent_name, placement=placement)
     for manifest in assigned_mcps:
         if skip_http_mcps and _is_http_transport(manifest):
             continue
@@ -1451,9 +1594,7 @@ def get_skill_catalog_for_agent(
     agent_name: str,
     context: str = "dashboard",
     *,
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     skip_http_mcps: bool = False,
     external: bool = False,
 ) -> list[tuple[str, str]]:
@@ -1466,9 +1607,7 @@ def get_skill_catalog_for_agent(
     rows = [
         (skill_def.id, skill_def.description or "")
         for _m, skill_def in _iter_agent_skills(
-            agent_name, context, is_remote=is_remote,
-            target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
+            agent_name, context, placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
         )
@@ -1515,9 +1654,17 @@ def get_on_demand_skills_for_materialization(
             row = db_skills.get(skill_def.id)
             if row and not row["enabled"]:
                 continue
+            source = _mmp.resolve_skill_file(manifest.mcp_dir, skill_def.file)
+            if source is None:
+                logger.warning(
+                    "Skill %s of %s names %r, which is not a file inside its "
+                    "folder; not materialized", skill_def.id, manifest.name,
+                    skill_def.file,
+                )
+                continue
             out.append((
                 skill_def.id,
-                manifest.mcp_dir / skill_def.file,
+                source,
                 manifest.name,
                 manifest.version,
                 skill_def.description,
@@ -1613,7 +1760,7 @@ def resolve_server_config(
     manifest: McpManifest,
     agent_name: str,
     *,
-    mcp_config_format: str = "json",
+    mcp_config_format: str | None = "json",
     session_ctx: dict[str, str] | None = None,
 ) -> dict:
     """Build a single mcpServers entry from a manifest.
@@ -1969,20 +2116,22 @@ def build_session_mcp_config(
     task_scope: str = "user",
     delegation_targets: list[str] | None = None,
     extra_mcps: list[str] | None = None,
-    mcp_config_format: str = "json",
+    mcp_config_format: str | None = "json",   # None = JSON consumed in-process (Direct LLM)
     username: str = "",
     user_role: str = "",
     chat_id: str = "",
     task_owner: str = "",
     task_username: str = "",
-    is_remote: bool = False,
-    target_has_display: bool | None = None,
-    target_device_grants: set[str] | None = None,
-    target_admin_paired: bool = False,
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     target_browser=None,
     external: bool = False,
+    only_mcps: list[str] | None = None,
 ) -> tuple[Path | None, dict[str, str], dict[str, str], dict, set]:
     """Main entry point: build a complete MCP config for a session.
+
+    ``only_mcps`` (CHECKS.md, the judge profile) keeps ONLY the named MCPs
+    of what the agent's assignment and the gates above resolved — an
+    intersection, never an addition (``[]`` = no MCP at all).
 
     Args:
         target_browser: the target machine's ``remote_store.BrowserTargetSettings``
@@ -2057,9 +2206,9 @@ def build_session_mcp_config(
     # consent / display filtering happens here; the dropped device MCPs
     # come back as exclusion reasons so the prompt can surface them.
     assigned, exclusion_reasons = _get_agent_mcps_with_device_exclusions(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        agent_name, placement=placement,
     )
+    is_remote = placement.is_remote
 
     # Force-include extra MCPs (e.g. meetings-mcp for meeting participants).
     # NOTE: extra_mcps is an engine-level escape hatch — it BYPASSES both
@@ -2077,14 +2226,15 @@ def build_session_mcp_config(
             manifest = get_manifest(mcp_name)
             if not manifest:
                 continue
-            reason = _device_placement_reason(
-                manifest, is_remote=is_remote, target_has_display=target_has_display,
-                target_device_grants=target_device_grants,
-            )
+            reason = _device_placement_reason(manifest, placement=placement)
             if reason:
                 exclusion_reasons[mcp_name] = reason
                 continue
             assigned.append(manifest)
+
+    if only_mcps is not None:
+        keep = {str(n) for n in only_mcps}
+        assigned = [m for m in assigned if m.name in keep]
 
     if not assigned:
         # Preserve device-placement exclusion reasons even when nothing remains.
@@ -2137,7 +2287,7 @@ def build_session_mcp_config(
         # on admin-paired satellites. A user-paired machine gets a visible
         # exclusion instead (mirrors the agent-scope-credentials rule).
         if (manifest.remote_policy == "admin_paired_only"
-                and is_remote and not target_admin_paired):
+                and is_remote and not placement.admin_paired):
             exclusion_reasons[mcp_name] = (
                 f"{manifest.label} is unavailable on this machine — "
                 "it is delivered only to admin-paired machines"
@@ -2151,7 +2301,7 @@ def build_session_mcp_config(
         # targets — their session data rides the session-file broker there;
         # key material never reaches a user-paired satellite.
         if manifest.server.transport == "none":
-            if is_remote and not target_admin_paired:
+            if is_remote and not placement.admin_paired:
                 exclusion_reasons[mcp_name] = (
                     f"{manifest.label} is unavailable on this machine — "
                     "its key material is delivered only to admin-paired "

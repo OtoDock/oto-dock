@@ -22,31 +22,174 @@ Cross-platform helpers used across the package:
 
 import configparser
 import contextlib
+import dataclasses
 import logging
 import os
+import platform
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .engines import ENGINES
 
 logger = logging.getLogger("satellite")
 
+# ---------------------------------------------------------------------------
+# The host OS table — the TWIN of ``proxy/core/host_os.py`` (core-seams
+# phase 10). This module is the boot guard's leaf: it may import nothing but
+# the standard library, so the table cannot be vendored here — the gate's
+# twin rule pins ``_table`` / ``family_of`` / ``of`` to the proxy's and the
+# proxy suite compares every row. Every satellite module asks a FACT on
+# ``config.HOST`` at call time (never ``from .config import HOST`` — the
+# tests patch the global); ``HOST`` is bound once at import, from
+# ``sys.platform``. Edit the proxy module first, then this block, verbatim.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The words (twin: satellite/config.py)
+# ---------------------------------------------------------------------------
+
+LINUX = "linux"
+DARWIN = "darwin"
+WINDOWS = "windows"
+#: The three families a satellite runs on, keyed by their wire word.
+FAMILIES = (LINUX, DARWIN, WINDOWS)
+
+#: The per-user service manager that (re)starts the satellite.
+SERVICE_SYSTEMD = "systemd"
+SERVICE_LAUNCHD = "launchd"
+SERVICE_SCHTASKS = "schtasks"
+
+#: The display server a machine reports (``capabilities.display.server``).
+DISPLAY_X11 = "x11"
+DISPLAY_WAYLAND = "wayland"
+DISPLAY_QUARTZ = "quartz"
+DISPLAY_WINDOWS = "windows"
+DISPLAY_NONE = "none"
+DISPLAY_SERVERS = (DISPLAY_X11, DISPLAY_WAYLAND, DISPLAY_QUARTZ, DISPLAY_WINDOWS, DISPLAY_NONE)
+
+
+@dataclass(frozen=True)
+class HostOS:
+    """One host family's facts. ``name`` is the wire word (``""`` on the
+    ``OTHER`` row until ``host_os()`` fills it with the interpreter's)."""
+
+    name: str
+    dirname: str                # the per-user install root: .oto-dock | OtoDock
+    exe_suffix: str             # "" | .exe
+    venv_bin: str               # a venv's binary dir: bin | Scripts
+    python_exe: str             # the interpreter a venv ships: python3 | python
+    base_python: tuple          # the base interpreter under sys.base_prefix
+    posix: bool                 # mode bits, signals, process groups, AF_UNIX, setproctitle, symlinked shims
+    peercred: bool              # SO_PEERCRED on a unix socket (Linux)
+    case_insensitive: bool      # the default filesystem folds case
+    conpty: bool                # the PTY backend is ConPTY (pywinpty)
+    locks_running_files: bool   # a running tree cannot be swapped in place (the update stages through runner.ps1)
+    service_manager: str        # SERVICE_* or "" (none known)
+    powershell: bool            # the install language: install.ps1 / uninstall.ps1 / the PowerShell bootstrap
+    tray: bool                  # a system-tray icon
+    display_server: str         # DISPLAY_* or "" (probed at connect)
+    xdg_user_dirs: bool         # ~/.config/user-dirs.dirs names the well-known folders
+    videos_folder: str          # Videos | Movies
+
+    @property
+    def script_suffix(self) -> str:
+        """The install scripts' suffix (``uninstall.sh`` / ``uninstall.ps1``)."""
+        return ".ps1" if self.powershell else ".sh"
+
+
+def _table() -> dict:
+    linux = HostOS(
+        name=LINUX, dirname=".oto-dock", exe_suffix="", venv_bin="bin",
+        python_exe="python3", base_python=("bin", "python3"), posix=True,
+        peercred=True, case_insensitive=False, conpty=False,
+        locks_running_files=False, service_manager=SERVICE_SYSTEMD,
+        powershell=False, tray=False, display_server="", xdg_user_dirs=True,
+        videos_folder="Videos",
+    )
+    darwin = HostOS(
+        name=DARWIN, dirname=".oto-dock", exe_suffix="", venv_bin="bin",
+        python_exe="python3", base_python=("bin", "python3"), posix=True,
+        peercred=False, case_insensitive=True, conpty=False,
+        locks_running_files=False, service_manager=SERVICE_LAUNCHD,
+        powershell=False, tray=False, display_server=DISPLAY_QUARTZ,
+        xdg_user_dirs=False, videos_folder="Movies",
+    )
+    windows = HostOS(
+        name=WINDOWS, dirname="OtoDock", exe_suffix=".exe", venv_bin="Scripts",
+        python_exe="python", base_python=("python.exe",), posix=False,
+        peercred=False, case_insensitive=True, conpty=True,
+        locks_running_files=True, service_manager=SERVICE_SCHTASKS,
+        powershell=True, tray=True, display_server=DISPLAY_WINDOWS,
+        xdg_user_dirs=False, videos_folder="Videos",
+    )
+    other = HostOS(
+        name="", dirname=".oto-dock", exe_suffix="", venv_bin="bin",
+        python_exe="python3", base_python=("bin", "python3"), posix=True,
+        peercred=False, case_insensitive=False, conpty=False,
+        locks_running_files=False, service_manager="", powershell=False,
+        tray=False, display_server=DISPLAY_NONE, xdg_user_dirs=False,
+        videos_folder="Videos",
+    )
+    return {LINUX: linux, DARWIN: darwin, WINDOWS: windows, "": other}
+
+
+#: The rows by wire word; ``ROWS[""]`` is the row of an interpreter outside
+#: the three families (POSIX facts, no service manager, no probes).
+ROWS: dict = _table()
+OTHER: HostOS = ROWS[""]
+
+
+def family_of(sys_platform: str) -> str:
+    """The family of an interpreter's ``sys.platform`` word, or ``""``."""
+    if sys_platform == "win32":
+        return WINDOWS
+    if sys_platform == "darwin":
+        return DARWIN
+    if sys_platform.startswith("linux"):
+        return LINUX
+    return ""
+
+
+def of(word) -> HostOS | None:
+    """The row of a reported ``os`` word (folded: ``strip().lower()``), or
+    ``None`` when unreported or unknown — an unreported OS never gets a
+    POSIX fact."""
+    w = str(word or "").strip().lower()
+    if not w or w not in FAMILIES:
+        return None
+    return ROWS[w]
+
+
+def host_os() -> HostOS:
+    """The row of THIS interpreter. Outside the three families the ``OTHER``
+    row, its name the interpreter's own ``platform.system().lower()`` — the
+    wire word an exotic host always reported."""
+    fam = family_of(sys.platform)
+    if fam:
+        return ROWS[fam]
+    return dataclasses.replace(ROWS[""], name=platform.system().lower())
+
+
+#: THIS machine's row — the one table every satellite module asks.
+HOST: HostOS = host_os()
+
 # Per-user install root. Dotfile on Unix, visible folder on Windows
 # (dotfiles are unusual on Windows and would render as hidden in Explorer).
-OTODOCK_DIRNAME = "OtoDock" if sys.platform == "win32" else ".oto-dock"
+OTODOCK_DIRNAME = HOST.dirname
 
-# Executable suffix and venv binary subdir, platform-aware.
-EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
+# Executable suffix, platform-aware (the venv binary subdir is ``venv_bin``).
+EXE_SUFFIX = HOST.exe_suffix
 
 # subprocess creationflags for spawning detached children on Windows
 # (used by self-uninstall + self-relaunch so the child outlives the
 # satellite's own exit — its own process group, not killed when we go).
-# 0 on non-Windows, so the same constant can be used unconditionally.
+# 0 on a POSIX host, so the same constant can be used unconditionally.
 WINDOWS_DETACHED_FLAGS = (
-    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    if sys.platform == "win32"
-    else 0
+    0 if HOST.posix
+    else subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 )
 
 
@@ -57,7 +200,7 @@ def otodock_dir() -> Path:
 
 def venv_bin(venv_dir: Path) -> Path:
     """Return the venv's binary directory (``Scripts``/Win, ``bin``/Unix)."""
-    return venv_dir / ("Scripts" if sys.platform == "win32" else "bin")
+    return venv_dir / HOST.venv_bin
 
 
 def venv_exe(venv_dir: Path, name: str) -> Path:
@@ -97,7 +240,7 @@ def codex_hook_command(hook_path: Path) -> str:
     the OEM codepage, not UTF-8. Residual limit: a ``&<>()@^|`` character
     in the .codex dir path would still defeat cmd's quote handling.
     """
-    if sys.platform != "win32":
+    if HOST.posix:
         return hook_command(hook_path)
     wrapper = hook_path.with_suffix(".cmd")
     wrapper.write_text(
@@ -198,7 +341,7 @@ def atomic_replace(src: Path, dst: Path, *, attempts: int = 3, delay: float = 0.
             os.replace(src, dst)
             return
         except (PermissionError, OSError):
-            if attempt == attempts - 1 or sys.platform != "win32":
+            if attempt == attempts - 1 or not HOST.locks_running_files:
                 raise
             time.sleep(delay)
 
@@ -243,7 +386,7 @@ def force_rmtree(path: Path, *, attempts: int = 12, delay: float = 0.5) -> None:
             return
         except (PermissionError, OSError) as e:
             last_err = e
-            if attempt == attempts - 1 or sys.platform != "win32":
+            if attempt == attempts - 1 or not HOST.locks_running_files:
                 break
             time.sleep(delay)
 
@@ -252,7 +395,7 @@ def force_rmtree(path: Path, *, attempts: int = 12, delay: float = 0.5) -> None:
     # ``shutil.rmtree`` (which goes through Python's path-handling
     # layer) gives up — particularly for read-only attributes and
     # some lock types. Synchronous; ~5s timeout for large trees.
-    if sys.platform == "win32" and path.exists():
+    if HOST.locks_running_files and path.exists():
         try:
             r = subprocess.run(
                 ["cmd.exe", "/c", "rmdir", "/s", "/q", str(path)],
@@ -358,7 +501,7 @@ def relaunch_self() -> None:
                  still need a one-time manual start; every update after
                  self-restarts.
     """
-    if sys.platform == "win32":
+    if HOST.service_manager == SERVICE_SCHTASKS:
         ok, detail = windows_schedule_oneshot(
             "OtoDockSatelliteRelaunch",
             "schtasks.exe", "/Run /TN OtoDockSatellite",
@@ -382,7 +525,7 @@ def relaunch_self() -> None:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=WINDOWS_DETACHED_FLAGS,
             )
-    elif sys.platform == "darwin":
+    elif HOST.service_manager == SERVICE_LAUNCHD:
         subprocess.Popen(
             ["launchctl", "kickstart", "-k",
              f"gui/{os.getuid()}/com.otodock.satellite"],
@@ -424,7 +567,7 @@ def ensure_windows_install_artifacts() -> None:
       3. Start-Menu ``OtoDock Satellite.lnk`` missing or mis-targeted →
          (re)write.
     """
-    if sys.platform != "win32":
+    if HOST.posix:
         return
     oto = otodock_dir()
     runner = oto / "satellite" / "runner.ps1"
@@ -544,11 +687,18 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.118"
+SATELLITE_VERSION = "0.5.130"
+SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
+SHARED_TERMINAL_QUERIES_HASH = "9d73a19b21e363dd688f4501d0376de7f5274db3cc79be863891461884bc595a"
 SHARED_STDIO_INTERCEPTOR_HASH = "7afe65d06ada641e89c9901c261417dbf3d0786f043ff415b7a580248b831449"
-SHARED_CODEX_APPROVALS_HASH = "118ad311166465a2ab4990177cefc056af3ca236af38a112556dfc0a3e362391"
-SHARED_APP_SERVER_CLIENT_HASH = "dca6faa22c0275c59712a7887f3eed7eec0ebe302a44b2cba17728aed48bbd39"
-SHARED_MCP_INSTALLER_HASH = "61b99c692d36c17760d6de93abd2a269d4a3ed9a8da861fa9c829fb351221419"
+SHARED_CODEX_APPROVALS_HASH = "1af4fbad6fd1e3483c2a420f85b7dfe7e91bb46b957950526270d8d7905a06e1"
+SHARED_APP_SERVER_CLIENT_HASH = "36ccdaed5e23751c81e26df5f3ac9c15d9bf310ed471ac27579ddcbd0cff719d"
+SHARED_MCP_INSTALLER_HASH = "ce3d89b5e9b718da3a4190f0899ad12aad3caa6133547cf1b260f42503c53052"
+
+
+def _default_cli_bins() -> dict[str, str]:
+    """Every engine's binary hint defaults to the bare binary name (PATH)."""
+    return {e.binary: e.binary for e in ENGINES.values()}
 
 
 @dataclass
@@ -558,12 +708,19 @@ class SatelliteConfig:
     platform_url: str
     agents_dir: Path
     mcps_dir: Path
-    claude_bin: str = "claude"
-    codex_bin: str = "codex"
+    # Per-engine binary hints from ``satellite.conf`` (each engine's row names
+    # its INI section and key), keyed by the binary name the pin reconcile and
+    # the spawns resolve. The pin-verified path wins over the hint.
+    cli_bins: dict[str, str] = field(default_factory=_default_cli_bins)
     # Opt-in for plaintext ws:// to a publicly-resolving host (split-horizon
     # DNS / VPN overlays) — without it the daemon refuses that transport
     # (transport/ws_client.assert_transport_secure).
     allow_insecure_transport: bool = False
+
+    def bin_hint(self, binary: str) -> str:
+        """The configured hint for ``binary`` (``claude`` / ``codex``), else
+        the bare name."""
+        return self.cli_bins.get(binary) or binary
 
 
 def load_config(path: Path | None = None) -> SatelliteConfig:
@@ -597,8 +754,12 @@ def load_config(path: Path | None = None) -> SatelliteConfig:
             Path(mcps_str).expanduser() if mcps_str
             else otodock_dir() / "mcps"
         ),
-        claude_bin=cp.get("cli", "claude_bin", fallback="claude"),
-        codex_bin=cp.get("codex", "codex_bin", fallback="codex"),
+        # The INI sections and keys are the engine rows' — an installed file's
+        # vocabulary ([cli] claude_bin, [codex] codex_bin), kept as written.
+        cli_bins={
+            e.binary: cp.get(e.conf_section, e.conf_key, fallback=e.binary)
+            for e in ENGINES.values()
+        },
         allow_insecure_transport=sat.getboolean(
             "allow_insecure_transport", fallback=False,
         ),

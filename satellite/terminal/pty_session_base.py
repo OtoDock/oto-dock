@@ -4,7 +4,7 @@ The OS-agnostic machinery common to the Claude (:mod:`pty_session`) and Codex
 (:mod:`codex_pty_session`) interactive sessions:
 
 - the PTY spawn + output/exit wiring (``pty_relay`` on Unix / ``winpty_relay``
-  ConPTY on Windows, picked by ``sys.platform`` — both expose the same
+  ConPTY on Windows, picked by ``config.HOST.conpty`` — both expose the same
   ``spawn_pty``/handle interface);
 - proxy-driven I/O (``write`` ← ``pty_input``, ``resize`` ← ``pty_resize``,
   ``close`` ← ``pty_close``);
@@ -26,7 +26,6 @@ import base64
 import contextlib
 import logging
 import os
-import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -34,7 +33,9 @@ from typing import Callable
 
 from ..host import env_hygiene, path_translator
 from ..transport import file_sync
-from . import terminal_queries
+from .._vendored import terminal_queries
+from .. import config
+from .._vendored import layout
 
 logger = logging.getLogger("satellite")
 
@@ -352,7 +353,7 @@ class BasePtySession:
     def _translate_env(self, env: dict[str, str]) -> dict[str, str]:
         """Rewrite sandbox-virtual paths in the env to satellite-absolute (same
         convention as bwrap on local)."""
-        username = path_translator.derive_username_from_cwd_relative(
+        username = layout.user_of(
             self.config.get("cwd_relative", ""),
         )
         return path_translator.translate_env(
@@ -371,7 +372,7 @@ class BasePtySession:
         # Pick the PTY backend for this OS, imported lazily so importing this module
         # never pulls in pty/fcntl/termios (Unix) or pywinpty (Windows) on the wrong
         # host. Both expose the same spawn_pty/handle interface.
-        if sys.platform == "win32":
+        if config.HOST.conpty:
             from . import winpty_relay as pty_relay
         else:
             from . import pty_relay

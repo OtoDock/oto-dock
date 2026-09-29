@@ -4,7 +4,7 @@ Fast, parallel-safe PostgreSQL-backed tests for the OtoDock proxy.
 
 ## Requirements
 
-- Python 3.10+ with the proxy dependencies plus the test extras:
+- Python 3.13 (`PYTHON_VERSION` in VERSIONS.md — the proxy's interpreter; the 3.10 floor is the satellite's) with the proxy dependencies plus the test extras:
 
   ```bash
   python -m pip install -r requirements.txt -r requirements-test.txt

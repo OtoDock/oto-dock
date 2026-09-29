@@ -36,7 +36,7 @@ import asyncio
 import logging
 import time
 
-from storage.billing import subscription_store
+from storage.billing import subscription_status, subscription_store
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,6 @@ _WARN_THRESHOLDS = (("24h", 24 * 3600 * 1000), ("72h", 72 * 3600 * 1000))
 _REARM_DELTA_MS = 24 * 3600 * 1000
 # ...and never repeat one key faster than this, whatever the stamps say.
 _MIN_RENOTIFY_MS = 20 * 3600 * 1000
-
-_LAYER_PRODUCT = {"claude-code-cli": "Claude", "codex-cli": "ChatGPT"}
 
 
 async def check_subscription_health() -> None:
@@ -82,16 +80,17 @@ async def check_subscription_health() -> None:
 
 async def _check_row(sub: dict) -> None:
     status = sub.get("status")
-    if status not in ("active", "expired"):
+    if status not in (subscription_status.ACTIVE, subscription_status.EXPIRED):
         return
     sub_id = sub["id"]
     cred = await asyncio.to_thread(subscription_store.get_credential_data, sub_id)
     oauth = cred.get("oauth_token") or {}
     alerts = dict(oauth.get("healthAlerts") or {})
-    product = _LAYER_PRODUCT.get(sub.get("layer", ""), "AI engine")
+    from core.session.session_manager import account_label_for
+    product = account_label_for(sub.get("layer", ""), "AI engine")
     label = sub.get("label") or sub.get("oauth_email") or product
 
-    if status == "expired":
+    if status == subscription_status.EXPIRED:
         if alerts.get("expired"):
             return
         await _notify(

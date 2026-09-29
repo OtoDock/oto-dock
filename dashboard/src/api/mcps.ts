@@ -1,5 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { McpRuntime } from '../lib/kinds/mcpRuntime'
+import type { DockerStatus, EnableDockerResult } from '../lib/status/docker'
 
 export interface ConfigField {
   key: string
@@ -67,7 +69,8 @@ export interface McpServer {
   author?: string
   author_url?: string
   icon?: boolean
-  runtime: 'python' | 'node' | 'docker'
+  // lib/kinds/mcpRuntime.ts: a skill package's manifest says `none`.
+  runtime: McpRuntime
   transport: 'stdio' | 'sse'
   source: string
   enabled: boolean
@@ -86,7 +89,7 @@ export interface McpServer {
   // Skill packages only: the package bundles executable scripts/ content
   // (allowed since 2026-08-27; always surfaced as a provenance badge).
   has_scripts?: boolean
-  docker_status?: 'running' | 'unhealthy' | 'starting' | 'stopped' | 'not_found' | 'not_checked' | 'unknown' | 'error'
+  docker_status?: DockerStatus
   // false = operator-owned compose sibling (core file-tools on containerized
   // installs) — no status pill, no start/stop/restart controls.
   docker_managed?: boolean
@@ -145,7 +148,7 @@ export function useAdminMcps() {
 export interface EnableMcpResult {
   status: 'enabled'
   name: string
-  docker_status?: 'started' | 'failed' | null
+  docker_status?: EnableDockerResult | null
   docker_error?: string | null
 }
 
@@ -570,7 +573,9 @@ export class AgentMcpsNotVisibleError extends Error {
   }
 }
 
-export function useAgentMcps(agent: string) {
+// The list is owner-only server-side; a page a non-owner can reach by URL
+// passes `enabled: false` instead of collecting a 403.
+export function useAgentMcps(agent: string, enabled = true) {
   return useQuery({
     queryKey: ['agent-mcps', agent],
     queryFn: async (): Promise<AgentMcpData> => {
@@ -578,7 +583,7 @@ export function useAgentMcps(agent: string) {
       if (!res.ok) throw new Error('Failed to fetch agent MCPs')
       return res.json()
     },
-    enabled: !!agent,
+    enabled: !!agent && enabled,
   })
 }
 
@@ -635,7 +640,7 @@ export interface AgentSkill {
   default_exclude_from: string[]
 }
 
-export function useAgentSkills(agent: string) {
+export function useAgentSkills(agent: string, enabled = true) {
   return useQuery({
     queryKey: ['agent-skills', agent],
     queryFn: async (): Promise<AgentSkill[]> => {
@@ -644,7 +649,7 @@ export function useAgentSkills(agent: string) {
       const data = await res.json()
       return data.skills
     },
-    enabled: !!agent,
+    enabled: !!agent && enabled,
   })
 }
 

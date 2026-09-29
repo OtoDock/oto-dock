@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 
 import type { TargetMismatch } from '../../store/chatStore'
+import { isLocalTarget } from '../../lib/placement'
 import { loadDismissedTargets, recordDismissedTarget } from '../../lib/targetNoticeDismissals'
 import MoveChatConfirm from './MoveChatConfirm'
 
@@ -38,7 +39,7 @@ export default function ChatTargetBanner({ chatId, mismatch, moveDisabled = fals
   if (!chatId || !mismatch) return null
   if (dismissed.has(mismatch.resolvedTarget)) return null
 
-  const copy = mismatch.pinnedTarget === 'local'
+  const copy = isLocalTarget(mismatch.pinnedTarget)
     ? `This chat still runs on the local sandbox — new chats run on ${mismatch.resolvedLabel}.`
     : `This chat runs on ${mismatch.pinnedLabel} — new chats run on ${mismatch.resolvedLabel}.`
 

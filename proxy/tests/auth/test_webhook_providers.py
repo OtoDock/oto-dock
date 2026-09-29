@@ -1117,3 +1117,125 @@ def test_platform_signing_secret_falls_back_to_mcp_name(monkeypatch):
         row={"id": "sub-2", "mcp_name": "some-mcp"},
     )
     assert secret == "legacy"
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Zoom URL verification answers only a token from Zoom's own alphabet
+# ───────────────────────────────────────────────────────────────────────
+
+
+def _zoom_uv_block():
+    return {"kind": "zoom_endpoint_validation", "request_field": "plainToken",
+            "request_source": "body", "response_field": "encryptedToken",
+            "response_content_type": "application/json"}
+
+
+def _zoom_handshake(plain, secret="zsecret"):
+    from auth.webhook_providers.generic import GenericWebhookProvider
+    p = GenericWebhookProvider(provider_id="zoom")
+    return asyncio.run(p.handle_url_verification(
+        request_body={"event": "endpoint.url_validation", "payload": {"plainToken": plain}},
+        query_params={}, manifest_uv_block=_zoom_uv_block(), signing_secret=secret,
+    ))
+
+
+@pytest.mark.parametrize("plain", [
+    'v0:1700000000:{"event":"meeting.started"}',  # the shape a signed payload has
+    "a:b", "{}", '"x"', "", "x" * 257, "with space", "tab\there", "semi;colon",
+])
+def test_zoom_handshake_answers_only_zoom_shaped_tokens(plain):
+    assert _zoom_handshake(plain) is None
+
+
+def test_zoom_handshake_refuses_a_non_string_token_and_an_empty_secret():
+    assert _zoom_handshake(12345) is None
+    assert _zoom_handshake(["qgg8vlvZRS6UYooatFL8Aw"]) is None
+    assert _zoom_handshake("qgg8vlvZRS6UYooatFL8Aw", secret="") is None
+    status, body, _headers = _zoom_handshake("qgg8vlvZRS6UYooatFL8Aw")
+    assert status == 200 and "encryptedToken" in body
+    status, _body, _headers = _zoom_handshake("a-b_c+d/e=")
+    assert status == 200
+
+
+# ───────────────────────────────────────────────────────────────────────
+# The HMAC over the raw bytes
+# ───────────────────────────────────────────────────────────────────────
+
+
+def _slack_headers(secret: str, body: bytes, ts: str) -> dict:
+    mac = hmac.new(secret.encode(), f"v0:{ts}:".encode() + body, hashlib.sha256).hexdigest()
+    return {"x-slack-signature": f"v0={mac}", "x-slack-request-timestamp": ts}
+
+
+def test_a_body_that_contains_the_timestamp_marker_verifies():
+    from auth.webhook_providers.generic import GenericWebhookProvider
+    secret, ts = "s3cret", str(int(time.time()))
+    body = b'{"text": "{timestamp} is a literal here"}'
+    r = GenericWebhookProvider(provider_id="slack").verify_signature(
+        raw_body=body, headers=_slack_headers(secret, body, ts), signing_secret=secret,
+        manifest_sig_block=_SLACK_SIG_BLOCK)
+    assert r.ok, r.reason
+
+
+def test_a_body_that_is_not_utf8_is_signed_as_sent():
+    from auth.webhook_providers.generic import GenericWebhookProvider
+    secret, ts = "s3cret", str(int(time.time()))
+    body = b'{"blob": "\xff\xfe\xfd"}'
+    r = GenericWebhookProvider(provider_id="slack").verify_signature(
+        raw_body=body, headers=_slack_headers(secret, body, ts), signing_secret=secret,
+        manifest_sig_block=_SLACK_SIG_BLOCK)
+    assert r.ok, r.reason
+
+
+class _Untouchable(bytes):
+    """A body whose bytes must not be read."""
+
+    def decode(self, *a, **kw):
+        raise AssertionError("the body was read")
+
+    def __iter__(self):
+        raise AssertionError("the body was read")
+
+
+@pytest.mark.parametrize("case", ["empty_secret", "no_header", "no_timestamp", "stale"])
+def test_the_early_refusals_never_touch_the_body(case, monkeypatch):
+    from auth.webhook_providers import generic
+    body = _Untouchable(b"x" * 4096)
+    updates = []
+    real_new = generic.hmac.new
+
+    def watched_new(*a, **kw):
+        mac = real_new(*a, **kw)
+        updates.append(mac)
+        return mac
+
+    monkeypatch.setattr(generic.hmac, "new", watched_new)
+    headers = {"x-slack-signature": "v0=abc", "x-slack-request-timestamp": str(int(time.time()))}
+    secret = "s3cret"
+    if case == "empty_secret":
+        secret = ""
+    elif case == "no_header":
+        headers.pop("x-slack-signature")
+    elif case == "no_timestamp":
+        headers.pop("x-slack-request-timestamp")
+    else:
+        headers["x-slack-request-timestamp"] = str(int(time.time()) - 3600)
+    r = generic.GenericWebhookProvider(provider_id="slack").verify_signature(
+        raw_body=body, headers=headers, signing_secret=secret, manifest_sig_block=_SLACK_SIG_BLOCK)
+    assert not r.ok and not updates
+
+
+def test_the_microsoft_body_is_parsed_from_bytes_under_the_cap(monkeypatch):
+    import json as _json
+
+    import config
+    from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
+    p = MicrosoftWebhookProvider()
+    body = _json.dumps({"value": [{"clientState": "cs-1"}]}).encode()
+    assert p.verify_signature(raw_body=body, headers={}, signing_secret="cs-1",
+                              manifest_sig_block={}).ok
+    assert p.verify_signature(raw_body=b"\xff\xfe{", headers={}, signing_secret="cs-1",
+                              manifest_sig_block={}).reason == "malformed_body"
+    monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 16)
+    assert p.verify_signature(raw_body=body, headers={}, signing_secret="cs-1",
+                              manifest_sig_block={}).reason == "malformed_body"

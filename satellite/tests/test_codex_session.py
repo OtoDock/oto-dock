@@ -36,8 +36,6 @@ def sat_config():
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=Path("/tmp/test-agents"),
         mcps_dir=Path("/tmp/test-mcps"),
-        claude_bin="claude",
-        codex_bin="codex",
     )
 
 
@@ -83,7 +81,12 @@ class TestWriteCodexHooks:
         # core/sandbox._build_codex_hooks); a LIST is rejected by Codex's parser.
         assert isinstance(hooks, dict)
         events = hooks["hooks"]
-        assert set(events) == {"PreToolUse", "PostToolUse"}
+        # Hook parity (0.5.121): the same four events the proxy's
+        # _build_codex_hooks writes for the local sandbox.
+        assert set(events) == {"PreToolUse", "PostToolUse", "SubagentStop", "Stop"}
+        assert events["Stop"][0]["hooks"][0]["timeout"] == 604800
+        assert "stop_tracker.py" in events["Stop"][0]["hooks"][0]["command"]
+        assert "subagent_tracker.py" in events["SubagentStop"][0]["hooks"][0]["command"]
 
     def test_hook_commands_reference_dir(self, tmp_path):
         _write_codex_hooks(tmp_path)
@@ -208,6 +211,21 @@ class TestCodexSessionControlRequest:
         session = CodexSession("sess-1", tmp_agent_dir, codex_config, sat_config)
         await session.send_control_request("set_permission_mode", sandbox_mode="danger-full-access")
         assert session.config["sandbox_mode"] == "danger-full-access"
+
+    @pytest.mark.asyncio
+    async def test_plan_follows_the_live_sandbox_unless_a_judge(self, tmp_agent_dir, codex_config, sat_config):
+        """A mode change carries the sandbox alone: with no shipped mode (the
+        proxy ships one only for a judge) plan follows it both ways."""
+        session = CodexSession("sess-1", tmp_agent_dir, {**codex_config, "permission_mode": "",
+                                                         "sandbox_mode": "read-only"}, sat_config)
+        assert session._plan_mode(session.config["sandbox_mode"]) is True
+        await session.send_control_request("set_permission_mode", sandbox_mode="workspace-write")
+        assert session._plan_mode(session.config["sandbox_mode"]) is False
+        await session.send_control_request("set_permission_mode", sandbox_mode="read-only")
+        assert session._plan_mode(session.config["sandbox_mode"]) is True
+        judge = CodexSession("sess-2", tmp_agent_dir, {**codex_config, "permission_mode": "judge",
+                                                       "sandbox_mode": "read-only"}, sat_config)
+        assert judge._plan_mode("read-only") is False
 
 
 class TestRequestStopTurn:
@@ -353,9 +371,9 @@ class TestAskQuestionRemote:
 # ---------------------------------------------------------------------------
 
 def test_pty_config_toml_header_keys():
-    import tomllib
+    from satellite.tests._toml import toml_loads
     from satellite.terminal.codex_pty_session import _build_codex_config_toml
-    cfg = tomllib.loads(_build_codex_config_toml("/home/u/work", ""))
+    cfg = toml_loads(_build_codex_config_toml("/home/u/work", ""))
     # Root keys must parse at root (not swallowed by a [table] header): the
     # update check would break the version pin, the suppress key pairs with
     # the request_user_input feature flag below.
@@ -406,11 +424,11 @@ def test_local_provider_toml_shapes():
 
 
 def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
-    import tomllib
+    from satellite.tests._toml import toml_loads
     from satellite.sessions.codex_session import local_provider_toml
     codex_dir = tmp_path / "users" / "alice" / ".codex"
     root, table = local_provider_toml(_LOCAL_FULL, codex_dir)
-    cfg = tomllib.loads(root + "\n" + table + "\n")
+    cfg = toml_loads(root + "\n" + table + "\n")
     # Both root keys precede the table; the catalog path is this host's
     # absolute CODEX_HOME path (TOML-escaped, so a Windows path round-trips).
     assert cfg["model_provider"] == "oto_local"
@@ -419,7 +437,7 @@ def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
     assert "env_key" not in cfg["model_providers"]["oto_local"]
     win = Path(r"C:\Users\d\.codex") if sys.platform == "win32" else None
     if win is not None:
-        assert tomllib.loads(local_provider_toml(_LOCAL_FULL, win)[0])["model_catalog_json"] == str(win / "models.json")
+        assert toml_loads(local_provider_toml(_LOCAL_FULL, win)[0])["model_catalog_json"] == str(win / "models.json")
     # No codex_dir (a caller without a CODEX_HOME) or an empty catalog → no key.
     assert "model_catalog_json" not in local_provider_toml(_LOCAL_FULL)[0]
     assert "model_catalog_json" not in local_provider_toml(dict(_LOCAL_FULL, catalog_json=""), codex_dir)[0]
@@ -443,13 +461,13 @@ def test_write_or_drop_model_catalog(tmp_path):
 
 
 def test_pty_config_toml_local_provider_block(tmp_path):
-    import tomllib
+    from satellite.tests._toml import toml_loads
     from satellite.terminal.codex_pty_session import _build_codex_config_toml
     text = _build_codex_config_toml(
         "/home/u/work", '[mcp_servers.task-mcp]\ncommand = "python3"',
         local_provider=_LOCAL,
     )
-    cfg = tomllib.loads(text)
+    cfg = toml_loads(text)
     # The selector is a ROOT key: it parses at root, i.e. precedes every table.
     assert cfg["model_provider"] == "oto_local"
     assert text.index('model_provider = "oto_local"') < text.index("[memories]")
@@ -466,7 +484,7 @@ def test_pty_config_toml_local_provider_block(tmp_path):
     text = _build_codex_config_toml(
         "/home/u/work", "", local_provider=_LOCAL_FULL, codex_dir=tmp_path,
     )
-    cfg = tomllib.loads(text)
+    cfg = toml_loads(text)
     assert cfg["model_catalog_json"] == str(tmp_path / "models.json")
     assert text.index("model_catalog_json") < text.index("[memories]")
     assert cfg["model_providers"]["oto_local"]["stream_idle_timeout_ms"] == 1800000
@@ -507,12 +525,12 @@ class TestCodexSessionLocalProvider:
 
     @pytest.mark.asyncio
     async def test_keyed_provider_block_with_mcp_sections(self, tmp_agent_dir, sat_config):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(local_model_provider=_LOCAL),
         )
         text = path.read_text()
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert cfg["model_provider"] == "oto_local"
         # Root keys (the headless header's cap + the provider's) precede every
         # [table] header.
@@ -536,12 +554,12 @@ class TestCodexSessionLocalProvider:
 
     @pytest.mark.asyncio
     async def test_catalog_and_idle_timeout_land_in_codex_home(self, tmp_agent_dir, sat_config):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(local_model_provider=_LOCAL_FULL),
         )
         text = path.read_text()
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         codex_dir = path.parent
         assert cfg["model_catalog_json"] == str(codex_dir / "models.json")
         assert text.index("model_catalog_json") < text.index("[mcp_servers")
@@ -566,14 +584,14 @@ class TestCodexSessionLocalProvider:
     async def test_keyless_provider_and_empty_mcp_toml_still_writes(
         self, tmp_agent_dir, sat_config,
     ):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(
                 mcp_config_toml="",
                 local_model_provider={"base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
             ),
         )
-        cfg = tomllib.loads(path.read_text())
+        cfg = toml_loads(path.read_text())
         assert cfg["model_provider"] == "oto_local"
         assert "env_key" not in cfg["model_providers"]["oto_local"]
         assert "mcp_servers" not in cfg
@@ -582,7 +600,7 @@ class TestCodexSessionLocalProvider:
     async def test_root_key_precedes_the_proxys_features_block(
         self, tmp_agent_dir, sat_config,
     ):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(
                 mcp_config_toml=(
@@ -593,7 +611,7 @@ class TestCodexSessionLocalProvider:
             ),
         )
         text = path.read_text()
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert cfg["model_provider"] == "oto_local"
         assert text.index("model_provider") < text.index("[features]")
         assert cfg["features"]["default_mode_request_user_input"] is True
@@ -612,7 +630,7 @@ class TestCodexSessionLocalProvider:
             'model_provider = "oto_local"\n\n[model_providers.oto_local]\n'
             'base_url = "http://192.168.1.8:8080/v1"\nenv_key = "OTO_LOCAL_API_KEY"\n'
         )
-        import tomllib
+        from satellite.tests._toml import toml_loads
         path = await self._start(
             tmp_agent_dir, sat_config, self._config(
                 mcp_config_toml="", model="gpt-5.6-terra",
@@ -620,7 +638,7 @@ class TestCodexSessionLocalProvider:
             ),
         )
         assert path.exists()
-        cfg = tomllib.loads(path.read_text())
+        cfg = toml_loads(path.read_text())
         # Only the always-on headless header remains — no provider, no MCPs,
         # no hook floor (an attended session).
         assert cfg == {
@@ -712,11 +730,11 @@ class TestHooksFloor:
     async def test_floor_writes_the_feature_trusts_the_thread_and_sets_the_env(
         self, tmp_agent_dir, sat_config,
     ):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         text, calls, env = await self._start(
             tmp_agent_dir, sat_config, self._config(codex_hooks_floor=True),
         )
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert cfg["features"] == {"plugins": False, "hooks": True}
         assert text.count("[features]") == 1
         start = next(p for m, p in calls if m == "thread/start")
@@ -728,9 +746,9 @@ class TestHooksFloor:
 
     @pytest.mark.asyncio
     async def test_attended_session_gets_none_of_it(self, tmp_agent_dir, sat_config):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         text, calls, env = await self._start(tmp_agent_dir, sat_config, self._config())
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert cfg["features"] == {"plugins": False}
         assert "hooks" not in cfg["features"]
         start = next(p for m, p in calls if m == "thread/start")
@@ -751,7 +769,7 @@ class TestHooksFloor:
 
     @pytest.mark.asyncio
     async def test_floor_merges_with_the_proxys_features_block(self, tmp_agent_dir, sat_config):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         text, _, _ = await self._start(
             tmp_agent_dir, sat_config, self._config(
                 codex_hooks_floor=True,
@@ -762,7 +780,7 @@ class TestHooksFloor:
                 local_model_provider=_LOCAL,
             ),
         )
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert text.count("[features]") == 1
         assert cfg["features"] == {
             "plugins": False, "default_mode_request_user_input": True, "hooks": True,
@@ -774,9 +792,9 @@ class TestHooksFloor:
 
     @pytest.mark.asyncio
     async def test_headless_header_matches_the_local_writer(self, tmp_agent_dir, sat_config):
-        import tomllib
+        from satellite.tests._toml import toml_loads
         text, _, _ = await self._start(tmp_agent_dir, sat_config, self._config())
-        cfg = tomllib.loads(text)
+        cfg = toml_loads(text)
         assert cfg["project_doc_max_bytes"] == 300000
         assert cfg["memories"] == {"use_memories": False, "generate_memories": False}
         assert cfg["features"]["plugins"] is False

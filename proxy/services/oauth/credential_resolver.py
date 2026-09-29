@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from storage.identity import credential_store
 from storage.mcp import mcp_store
+import config
 from storage import database as task_store
-import contextlib
+from services.mcp import mcp_manifest_types as _mt
+from core import layout
 
 logger = logging.getLogger("claude-proxy")
 
@@ -352,15 +355,10 @@ def _resolve_oauth_mcp(
     credentials_dir (so workspace-mcp's ``--single-user`` mode picks the
     right token without confusion).
 
-    For every path_env entry on the MCP manifest with role 'credentials_dir',
-    copies the bound account's token file from the central OAuth-store
-    location to the scope-appropriate agent dir and returns
-    ``{env_var: host_path}``.
-
-    The path_env loop in ``config_builder``/``task_config_builder`` later
-    overwrites the env value to a sandbox-style virtual path; the host path
-    we return here is only used to find the **destination** of the file copy
-    (which has to be a real filesystem path).
+    For every path_env entry on the MCP manifest with role 'credentials_dir'
+    the answer carries the sandbox-virtual path of that directory; the
+    bound account's token file reaches the MCP through the session's
+    delivery route, never through the agent tree.
     """
     from services.mcp import mcp_registry
     from services.oauth import oauth_account_store
@@ -485,83 +483,74 @@ def _resolve_oauth_mcp(
             return {**env_injection_vars, **mcp_env_vars}
         return None
 
-    import os as _os
-    from pathlib import Path as _Path
-    from core.sandbox.sandbox import _verified_literal_path
-    from services.infra.path_confinement import PathOutsideRoot, safe_agent_dir
-
-    try:
-        root_real = _Path(_os.path.realpath(safe_agent_dir(agent_name)))
-    except PathOutsideRoot:
-        logger.error(
-            "Refusing credential materialization for %s/%s: agent name "
-            "would leave the agents tree", agent_name, mcp_name,
-        )
-        return None
+    # The MCP's ``credentials_dir`` value is the sandbox-virtual path the
+    # config builders write for the role; the file itself never lands in the
+    # agent tree (no token directory is mounted into a sandbox): a local
+    # session receives it in the MCP's secret bundle
+    # (``core/credentials/credential_files.py``), a remote one over the
+    # session-file channel.
+    from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
     result: dict[str, str] = {}
     for env_var, subpath in cred_entries:
-        # Destination paths MUST match the virtual paths resolved by
-        # ``path_roles.resolve_role("credentials_dir", ...)``:
-        # - User-scope: ``/users/{u}/.credentials/{subpath}`` →
-        #   host ``agents/{a}/users/{u}/.credentials/{subpath}``
-        # - Agent-scope: ``/knowledge/.credentials/{subpath}`` →
-        #   host ``agents/{a}/knowledge/.credentials/{subpath}``
-        # Bwrap (local) + satellite path_translator (remote) map virtual→host
-        # using the same convention; keeping the destination in lockstep
-        # ensures the MCP can read the file at the env var's value.
-        # Symlink-refusing: both destinations live under agent-writable
-        # binds (users/<u>/.credentials rides the RW user dir, knowledge/
-        # .credentials rides owner-tier RW /knowledge) — an agent-planted
-        # symlink would otherwise receive REAL OAuth token copies host-side
-        # at its target before the sandbox is even built. Verify the whole
-        # chain is literal (also normalizes away a traversal-shaped manifest
-        # ``subpath``), refuse + skip on mismatch: the MCP just shows up
-        # unconnected.
+        try:
+            sub = normalize_rel_path(str(subpath))
+        except PathOutsideRoot:
+            logger.error(
+                "Refusing credential delivery for %s/%s: the manifest subpath is "
+                "not a clean relative path", agent_name, mcp_name,
+            )
+            continue
         if username and task_scope == "user":
-            rel_parts = ("users", username, ".credentials",
-                         *_Path(subpath).parts)
+            result[env_var] = f"/{layout.USERS}/{username}/{layout.CREDENTIALS_DIR}/{sub}"
         else:
-            rel_parts = ("knowledge", ".credentials", *_Path(subpath).parts)
-        dest_dir = _verified_literal_path(root_real, *rel_parts)
-        if dest_dir is None:
-            logger.error(
-                "Refusing credential materialization for %s/%s: destination "
-                "path contains a symlinked component (possible tampering)",
-                agent_name, mcp_name,
-            )
-            continue
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        if _os.path.realpath(dest_dir) != str(dest_dir):
-            logger.error(
-                "Refusing credential materialization for %s/%s: destination "
-                "changed underneath the build (possible tampering)",
-                agent_name, mcp_name,
-            )
-            continue
-        # Drop any other accounts' files left from a prior session —
-        # workspace-mcp picks the first file alphabetically in
-        # --single-user mode, so the dir must contain only the bound
-        # account's token.
-        for existing in dest_dir.glob("*.json"):
-            if existing.name != source_file.name:
-                with contextlib.suppress(OSError):
-                    existing.unlink()
-        # No-follow token write (a leaf-level symlink must not redirect it).
-        token_dst = dest_dir / source_file.name
-        with contextlib.suppress(OSError):
-            if token_dst.is_symlink():
-                token_dst.unlink()
-        _fd = _os.open(token_dst,
-                       _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
-                       | _os.O_NOFOLLOW, 0o600)
-        with _os.fdopen(_fd, "wb") as _f:
-            _f.write(source_file.read_bytes())
-
-        result[env_var] = str(dest_dir)
+            result[env_var] = f"/{layout.KNOWLEDGE}/{layout.CREDENTIALS_DIR}/{sub}"
 
     result.update(env_injection_vars)
     result.update(mcp_env_vars)
     return result if result else None
+
+
+def purge_agent_tree_credentials() -> int:
+    """Remove every ``.credentials`` directory earlier releases materialised
+    inside agent trees (``knowledge/.credentials`` and
+    ``users/<u>/.credentials``); the central store is the only copy now. A
+    link at that name is never legitimate and, left in place, refuses every
+    sandbox build of the agent: it is removed and logged. The walk enters no
+    linked directory. Runs once at boot, off the loop; returns the number
+    removed."""
+    import shutil
+    root = config.AGENTS_DIR
+    if not root or not root.is_dir():
+        return 0
+
+    def _plain_dirs(parent: Path) -> list[Path]:
+        try:
+            return [p for p in parent.iterdir() if p.is_dir() and not p.is_symlink()]
+        except OSError:
+            return []
+
+    removed = 0
+    for agent in _plain_dirs(root):
+        candidates = [agent / layout.KNOWLEDGE / layout.CREDENTIALS_DIR]
+        users = agent / layout.USERS
+        if users.is_dir() and not users.is_symlink():
+            candidates += [u / layout.CREDENTIALS_DIR for u in _plain_dirs(users)]
+        for d in candidates:
+            if d.parent.is_symlink() or not d.parent.is_dir():
+                continue
+            if d.is_symlink():
+                d.unlink(missing_ok=True)
+                logger.warning("credentials: removed a symlink planted at %s", d)
+                removed += 1
+                continue
+            if not d.is_dir():
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("credentials: removed %d agent-tree .credentials dir(s) left by "
+                    "earlier releases", removed)
+    return removed
 
 
 def _bound_token_source(
@@ -637,7 +626,7 @@ def collect_oauth_token_files(
         oauth = manifest.credentials.oauth
         if not oauth or oauth.get("bearer_required", False):
             continue
-        if (manifest.server.runtime or "").lower() in ("docker", "none"):
+        if not _mt.installs_on_host(manifest.server):
             continue
         provider_id = oauth.get("provider_id", "")
         if not provider_id:

@@ -1,20 +1,14 @@
 import type { Run } from '../api/runs'
+import { RUN_KIND_LABEL, RUN_KIND_STYLE, formatTrigger, isRunKind } from './kinds/task'
 
-const TASK_TYPE_LABELS: Record<string, string> = {
-  static: 'Static',
-  scheduled: 'Recurring',
-  'one-time': 'One-time',
-  delegate: 'Delegate',
-  trigger: 'Trigger',
-}
+export { formatTrigger }
 
-const TASK_TYPE_STYLES: Record<string, string> = {
-  static: 'bg-gray-100 text-gray-700',
-  scheduled: 'bg-blue-100 text-blue-700',
-  'one-time': 'bg-amber-100 text-amber-700',
-  delegate: 'bg-purple-100 text-purple-700',
-  trigger: 'bg-orange-100 text-orange-700',
-}
+// A run row older than the platform's dynamic tasks may carry `static`
+// (the initial release's config-file tasks); no writer has minted it since,
+// so it is a legacy read-through beside the mirror's kinds, not a kind.
+const LEGACY_RUN_KIND_LABEL: Record<string, string> = { static: 'Static' }
+const LEGACY_RUN_KIND_STYLE: Record<string, string> = { static: 'bg-gray-100 text-gray-700' }
+const NEUTRAL_STYLE = 'bg-gray-100 text-gray-700'
 
 // Internal task types that should be filtered out of user-facing lists
 // (admin History). Admin views show them via the audit log.
@@ -27,19 +21,17 @@ export function isInternalTaskType(taskType: string | null): boolean {
   return !!taskType && INTERNAL_TASK_TYPES.has(taskType)
 }
 
+/** The run kind's badge word (lib/kinds/task.ts); an unknown word verbatim. */
 export function getTaskTypeLabel(taskType: string | null): string {
-  return taskType ? TASK_TYPE_LABELS[taskType] ?? taskType : '—'
+  if (!taskType) return '—'
+  if (isRunKind(taskType)) return RUN_KIND_LABEL[taskType]
+  return LEGACY_RUN_KIND_LABEL[taskType] ?? taskType
 }
 
 export function getTaskTypeStyle(taskType: string | null): string {
-  return taskType ? TASK_TYPE_STYLES[taskType] ?? 'bg-gray-100 text-gray-700' : 'bg-gray-100 text-gray-700'
-}
-
-export function formatTrigger(triggerType: string, triggerSource: string | null): string {
-  if (triggerType === 'triggered') return triggerSource ? `Trigger: ${triggerSource}` : 'Trigger'
-  if (triggerType === 'scheduled') return 'Scheduled'
-  if (triggerType === 'manual' && triggerSource) return triggerSource
-  return triggerType
+  if (!taskType) return NEUTRAL_STYLE
+  if (isRunKind(taskType)) return RUN_KIND_STYLE[taskType]
+  return LEGACY_RUN_KIND_STYLE[taskType] ?? NEUTRAL_STYLE
 }
 
 export interface SessionGroup {

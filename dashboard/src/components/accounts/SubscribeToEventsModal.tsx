@@ -4,18 +4,30 @@
  * Three logical steps in one modal:
  *   1. Vendor target — driven by manifest's `vendor_target_spec.kind`
  *      (free_text + regex / static_list dropdown). remote_list pickers
- *      are deferred until the list endpoint lands.
+ *      are deferred until the list endpoint lands. A manifest with
+ *      `target_kinds` (GitHub: one repository, or every repository in an
+ *      organization) puts the choice above the field; the chosen kind's
+ *      hints and regex replace the flat ones.
  *   2. Event picker — checkbox list from manifest's `event_catalog`.
  *   3. Confirm — POST /v1/subscriptions; errors surface inline.
+ *
+ * Scope-agnostic: the same modal creates a personal subscription or one for
+ * an agent (`scope='service'`). From Connected Accounts a "Subscribe as"
+ * control offers the agents this account serves as service identity; from
+ * the agent's MCPs tab the agent is fixed.
  */
 
 import { useState } from 'react'
 import { safeHref } from '../../lib/safeUrl'
+import type { ServiceBindingSummary } from '../../api/credentials'
 import {
+  SubscriptionRequestError,
   useCreateSubscription,
+  type CreateSubscriptionRequest,
   type WebhookEventCatalogEntry,
   type VendorTargetSpec,
 } from '../../api/subscriptions'
+import { describeSubscriptionError } from './SubscriptionRow'
 
 interface Props {
   mcpName: string
@@ -29,8 +41,18 @@ interface Props {
   manualInstructionsUrl?: string
   /** Prefill for the vendor-target input (slack: the account's team_id). */
   vendorTargetPrefill?: string
+  /** 'service' subscribes for `agent` with the bound account, no choice
+   * offered; 'user' (default) is personal unless `serviceOptions` adds
+   * agents to choose from. */
+  scope?: 'user' | 'service'
+  agent?: string
+  /** Agents this account serves as service identity. Non-empty renders the
+   * "Subscribe as" control (personal stays the default). */
+  serviceOptions?: ServiceBindingSummary[]
   onClose: () => void
 }
+
+const PERSONAL = '__me__'
 
 export function SubscribeToEventsModal({
   mcpName,
@@ -41,6 +63,9 @@ export function SubscribeToEventsModal({
   registrationMode = 'manual',
   manualInstructionsUrl,
   vendorTargetPrefill,
+  scope = 'user',
+  agent,
+  serviceOptions,
   onClose,
 }: Props) {
   const create = useCreateSubscription()
@@ -58,6 +83,27 @@ export function SubscribeToEventsModal({
     ),
   )
   const [error, setError] = useState<string | null>(null)
+  const kinds = vendorTargetSpec.target_kinds ?? []
+  const [kindKey, setKindKey] = useState(kinds[0]?.key ?? '')
+  const kind = kinds.find((k) => k.key === kindKey)
+  // What the field shows and checks: the kind's fields over the flat spec.
+  const fieldSpec: VendorTargetSpec = kind
+    ? {
+        ...vendorTargetSpec,
+        label: kind.label,
+        placeholder: kind.placeholder,
+        validation_regex: kind.validation_regex,
+        help_text: kind.help_text,
+      }
+    : vendorTargetSpec
+  // A personal-only agent cannot hold agent-scope subscriptions: it is not
+  // offered. A binding the caller does not manage stays visible but disabled
+  // (the binding lends the token, the role decides who may subscribe).
+  const options = (serviceOptions ?? []).filter((o) => o.agent_scope_available)
+  const fixedAgent = scope === 'service' ? agent : undefined
+  const [target, setTarget] = useState<string>(fixedAgent ?? PERSONAL)
+  const chosenScope: 'user' | 'service' = target === PERSONAL ? 'user' : 'service'
+  const chosenAgent = target === PERSONAL ? undefined : target
 
   // MS-Graph-style vendors pair each catalog event 1:1 with a vendor
   // resource (mail_inbox ↔ me/.../messages, calendar_events ↔ me/events)
@@ -101,16 +147,37 @@ export function SubscribeToEventsModal({
   const validateVendorTarget = (normalized: string): string | null => {
     if (!normalized) return 'Vendor target is required'
     if (
-      vendorTargetSpec.validation_regex &&
-      !new RegExp(vendorTargetSpec.validation_regex).test(normalized)
+      fieldSpec.validation_regex &&
+      !new RegExp(fieldSpec.validation_regex).test(normalized)
     ) {
-      const hint = vendorTargetSpec.placeholder
-        ? ` Expected: ${vendorTargetSpec.placeholder}`
+      const hint = fieldSpec.placeholder
+        ? ` Expected: ${fieldSpec.placeholder}`
         : ''
       return `'${normalized}' doesn't look right.${hint}`
     }
     return null
   }
+
+  // The scope, agent and account are decided once; every request of a
+  // paired loop carries the same ones.
+  const requestFor = (
+    vendor_target: string,
+    selected_events: string[],
+  ): CreateSubscriptionRequest => ({
+    scope: chosenScope,
+    agent: chosenAgent,
+    mcp_name: mcpName,
+    account_label: accountLabel,
+    vendor_target,
+    selected_events,
+    // The first kind is the default and travels as '' — the row convention
+    // for every subscription made before kinds existed — so only the other
+    // kinds carry a name (and a badge).
+    ...(kinds.length ? { vendor_target_kind: kindKey === kinds[0].key ? '' : kindKey } : {}),
+  })
+
+  const describe = (err: unknown) =>
+    describeSubscriptionError(err, { scope: chosenScope, accountLabel })
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -123,8 +190,8 @@ export function SubscribeToEventsModal({
     if (fullyPaired) {
       // One subscription per selected event, each with its paired
       // resource. Sequential so a vendor rejection stops the run with a
-      // clear per-event error (already-created ones stay and show in the
-      // panel — re-submitting the rest is safe).
+      // clear per-event error; a row that already exists (409, a re-submit
+      // after a partial failure) is skipped so the rest still land.
       const entries = eventCatalog.filter((en) => selectedEvents.has(en.key))
       for (const entry of entries) {
         const target = pairedTargetFor(entry)
@@ -135,15 +202,10 @@ export function SubscribeToEventsModal({
           return
         }
         try {
-          await create.mutateAsync({
-            scope: 'user',
-            mcp_name: mcpName,
-            account_label: accountLabel,
-            vendor_target: target,
-            selected_events: [entry.key],
-          })
+          await create.mutateAsync(requestFor(target, [entry.key]))
         } catch (err) {
-          setError(`${entry.label}: ${(err as Error).message}`)
+          if (err instanceof SubscriptionRequestError && err.status === 409) continue
+          setError(`${entry.label}: ${describe(err)}`)
           return
         }
       }
@@ -157,19 +219,10 @@ export function SubscribeToEventsModal({
       setError(validationError)
       return
     }
-    create.mutate(
-      {
-        scope: 'user',
-        mcp_name: mcpName,
-        account_label: accountLabel,
-        vendor_target: normalized,
-        selected_events: Array.from(selectedEvents),
-      },
-      {
-        onSuccess: () => onClose(),
-        onError: (e) => setError((e as Error).message),
-      },
-    )
+    create.mutate(requestFor(normalized, Array.from(selectedEvents)), {
+      onSuccess: () => onClose(),
+      onError: (err) => setError(describe(err)),
+    })
   }
 
   const toggleEvent = (key: string) => {
@@ -197,6 +250,13 @@ export function SubscribeToEventsModal({
             <p className="text-sm text-p-text-light mt-1">
               Account: <span className="font-mono">{accountLabel}</span>
             </p>
+            {fixedAgent && (
+              <p className="text-xs text-p-text-light mt-1">
+                For agent <span className="font-medium">{fixedAgent}</span>. The
+                webhook is registered with the account bound as its service
+                account; its triggers and shared apps fire from these events.
+              </p>
+            )}
             {registrationMode === 'relay' && (
               <p className="text-xs text-purple-700 dark:text-purple-300 mt-1">
                 Events are delivered through OtoDock — no vendor console
@@ -225,9 +285,67 @@ export function SubscribeToEventsModal({
           </header>
 
           <div className="px-5 py-4 space-y-4">
+            {!fixedAgent && options.length > 0 && (
+              <div>
+                <label
+                  htmlFor="subscribe-as"
+                  className="block text-sm font-medium mb-1"
+                >
+                  Subscribe as
+                </label>
+                <select
+                  id="subscribe-as"
+                  value={target}
+                  onChange={(e) => setTarget(e.target.value)}
+                  className="w-full px-3 py-2 border border-p-border-light rounded-sm text-sm bg-white dark:bg-gray-800"
+                >
+                  <option value={PERSONAL}>Me (personal)</option>
+                  {options.map((o) => (
+                    <option
+                      key={o.agent_name}
+                      value={o.agent_name}
+                      disabled={!o.can_manage}
+                    >
+                      Agent {o.display_name}
+                      {o.can_manage ? '' : ' (managers only)'}
+                    </option>
+                  ))}
+                </select>
+                <div className="text-xs text-p-text-light mt-1">
+                  {chosenScope === 'service'
+                    ? "An agent's subscription fires the agent's own triggers and shared apps."
+                    : 'A personal subscription fires only your own triggers. Choose an agent when a shared app or an agent trigger should react.'}
+                </div>
+              </div>
+            )}
+
+            {!fullyPaired && kinds.length > 1 && (
+              <div role="radiogroup" aria-label="Subscribe to" className="flex flex-wrap gap-1.5">
+                {kinds.map((k) => (
+                  <button
+                    key={k.key}
+                    type="button"
+                    role="radio"
+                    aria-checked={k.key === kindKey}
+                    onClick={() => {
+                      setKindKey(k.key)
+                      setVendorTarget('')
+                      setError(null)
+                    }}
+                    className={`px-2.5 py-1 rounded-full border text-xs ${
+                      k.key === kindKey
+                        ? 'bg-p-primary text-white border-p-primary'
+                        : 'bg-white dark:bg-gray-800 border-p-border-light text-p-text-secondary hover:text-p-text'
+                    }`}
+                  >
+                    {k.label}
+                  </button>
+                ))}
+              </div>
+            )}
             {!fullyPaired && (
               <VendorTargetField
-                spec={vendorTargetSpec}
+                spec={fieldSpec}
                 value={vendorTarget}
                 onChange={setVendorTarget}
               />

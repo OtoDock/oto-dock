@@ -141,6 +141,32 @@ def test_patch_v2_lean_without_correlation_is_pathless():
     assert ti["_codex_paths"] == []
 
 
+@pytest.mark.asyncio
+async def test_patch_approval_gates_every_file_through_the_decision_authority():
+    """A multi-file change reaches the gate as one Write carrying every path
+    in ``_codex_paths``; the path policy checks each of them, so a file the
+    session may not write denies the whole change even when the first path
+    is fine."""
+    from auth.path_policy import SecurityContext, check_tool_access
+    ctx = SecurityContext(role="manager", username="alice", agent="personal-assistant",
+                          is_admin_agent=False)
+    seen: list[tuple[str, dict]] = []
+
+    async def decide(tool_name: str, tool_input: dict) -> dict:
+        seen.append((tool_name, tool_input))
+        decision, _ = check_tool_access(tool_name, tool_input, ctx)
+        return {"decision": "allow" if decision.allowed else "deny"}
+
+    handler = make_server_request_handler(decide)
+    changes = {"/users/alice/workspace/a.md": {}, "/users/bob/workspace/b.md": {}}
+    res = await handler("applyPatchApproval", {"fileChanges": changes})
+    assert res == {"decision": "denied"}
+    assert seen[-1][0] == "Write" and set(seen[-1][1]["_codex_paths"]) == set(changes)
+    res = await handler("applyPatchApproval", {"fileChanges": {
+        "/users/alice/workspace/a.md": {}, "/users/alice/workspace/b.md": {}}})
+    assert res == {"decision": "approved"}
+
+
 def test_escalation_maps_to_synthetic_tool():
     tn, ti = approval_to_tool(_esc := "item/permissions/requestApproval",
                               {"reason": "wants network"})
@@ -280,6 +306,24 @@ def test_approval_for_sandbox():
     assert approval_for_sandbox("danger-full-access") == "never"
     assert approval_for_sandbox("workspace-write") == "on-request"
     assert approval_for_sandbox("read-only") == "on-request"
+
+
+def test_attended_chats_ask_for_every_command_and_patch():
+    """An attended app-server chat (a person answers the bridge) sends the
+    ``untrusted`` policy in every prompting mode, so an in-workspace ``rm``
+    reaches decide_tool_permission like Claude's hook; dontAsk/auto stay
+    ``never`` (nothing asks), and the fallback trigger recognises a daemon
+    that retired the wire value."""
+    from core.layers.codex.codex_approvals import (
+        UNTRUSTED_FALLBACK, UNTRUSTED_POLICY, is_untrusted_policy_rejection,
+    )
+    assert approval_for_sandbox("workspace-write", attended=True) == UNTRUSTED_POLICY
+    assert approval_for_sandbox("read-only", attended=True) == UNTRUSTED_POLICY
+    assert approval_for_sandbox("danger-full-access", attended=True) == "never"
+    assert UNTRUSTED_FALLBACK == "on-request"
+    assert is_untrusted_policy_rejection("invalid params: unknown variant `untrusted`")
+    assert is_untrusted_policy_rejection(RuntimeError("approvalPolicy: UnlessTrusted is not supported"))
+    assert not is_untrusted_policy_rejection("thread not found")
 
 
 def test_sandbox_policy_danger_full_access():
@@ -443,3 +487,30 @@ async def test_request_user_input_ask_failure_never_hangs():
 
     handler = make_server_request_handler(lambda *a: None, ask_question=ask)
     assert await handler("item/tool/requestUserInput", {"questions": _QS}) == {"answers": {}}
+
+
+@pytest.mark.asyncio
+async def test_the_router_records_a_patchs_paths_before_its_approval_runs():
+    """A lean fileChange approval arriving in the same stdout chunk as its
+    item/started runs in its own task before the turn stream reads the item:
+    the paths must be recorded where the notification is first read, or the
+    decision sees a pathless Write (auto-allowed in acceptEdits)."""
+    import asyncio
+    from types import SimpleNamespace
+    from core.layers.codex.session import CodexAppServerSession
+    s = CodexAppServerSession.__new__(CodexAppServerSession)
+    s._client = SimpleNamespace(notif_queue=asyncio.Queue())
+    s.thread_id = "T"
+    s._default_consumer = None
+    s._thread_consumers = {}
+    s._item_paths = {}
+    s.translator = None
+    s.last_activity = 0.0
+    q = s._client.notif_queue
+    q.put_nowait(("item/started", {"threadId": "T", "item": {
+        "type": "fileChange", "id": "fc1", "changes": [{"path": "/users/a/x.py"}]}}))
+    q.put_nowait(("item/started", {"threadId": "SUB", "item": {
+        "type": "fileChange", "id": "fc2", "changes": [{"path": "/users/a/y.py"}]}}))
+    q.put_nowait(("__daemon_exit__", {}))
+    await asyncio.wait_for(s._route_notifications(), timeout=5)
+    assert s._item_paths == {"fc1": ["/users/a/x.py"], "fc2": ["/users/a/y.py"]}

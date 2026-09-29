@@ -36,6 +36,8 @@ import time
 from typing import Awaitable, Callable
 
 from core.events.common_events import PRODUCER_DONE, SYSTEM, CommonEvent
+from core.session import session_kind
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -97,6 +99,7 @@ async def capture_wake_turn(
     from core.layers.cli.layer import cli_chunk_to_events
     from core.layers.cli.translator import ClaudeCLIEventTranslator
     from core.events.stream_pump import ChatStreamPump, _active_pumps
+    from core.session.session_state import get_session_client_type
 
     chat = None
     try:
@@ -124,7 +127,12 @@ async def capture_wake_turn(
             event_queue=queue,
             perm_queue=None,
             scope=chat.get("scope") or "user",
-            source_type=chat.get("source_type") or "chat",
+            # The DRIVER's kind, never the row's: a wake into the scheduler's
+            # own session bills as a task turn; a dashboard session's as a
+            # chat turn (and flips a finished run around it); a phone chat's
+            # pump stays one the dashboard never attaches to.
+            source_type=session_kind.driver_source_type(
+                get_session_client_type(session_id), chat),
         )
         # Register for live streaming ONLY when the chat has no active pump.
         # A stale-drain capture runs with the NEXT user turn's pump already
@@ -137,7 +145,7 @@ async def capture_wake_turn(
         # Provenance marker row — history reload must explain the
         # unprompted assistant turn that follows.
         queue.put_nowait(CommonEvent(type=SYSTEM, data={
-            "subtype": "bg_wake",
+            "subtype": wire.SUBTYPE_BG_WAKE,
             "message": "Background work finished — reviewing the result.",
             "source": source,
         }))

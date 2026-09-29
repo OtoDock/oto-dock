@@ -72,6 +72,19 @@ def test_materialize_refuses_traversal_paths(stub_fetch, temp_secrets_root):
     assert env  # the legit file still landed
 
 
+def test_materialize_refuses_the_root_and_a_sibling_prefix(stub_fetch, temp_secrets_root):
+    """An empty relpath names the session dir itself (a write onto a directory)
+    and a sibling whose name extends the root is not under it."""
+    stub_fetch.files = {
+        "": {"content_b64": base64.b64encode(b"X").decode()},
+        "ssh/ok": {"content_b64": base64.b64encode(b"OK").decode()},
+    }
+    env = session_files.materialize(_payload(stub_fetch.files), "sid-2b")
+    assert (temp_secrets_root / "sid-2b" / "ssh" / "ok").exists()
+    assert env
+    assert not (temp_secrets_root / "sid-2bevil").exists()
+
+
 def test_materialize_noop_without_token(stub_fetch):
     assert session_files.materialize({"env": {}}, "sid-3") == {}
 

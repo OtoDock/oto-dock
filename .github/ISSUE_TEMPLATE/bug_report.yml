@@ -16,7 +16,7 @@ body:
       description: >-
         `/health` on the proxy returns it as `version`; it is the `OTODOCK_VERSION`
         pinned in your `docker-compose.yml` (in `VERSIONS.md` on a source checkout).
-      placeholder: "1.6.1"
+      placeholder: "1.7.0"
     validations:
       required: true
   - type: dropdown

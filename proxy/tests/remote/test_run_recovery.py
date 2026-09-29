@@ -109,14 +109,15 @@ class _FakeLayer:
         self.closed = []
 
     async def adopt_session(self, *, machine_id, session_id, agent_name,
-                            command_id, use_native_permissions=False):
+                            execution_path, command_id,
+                            use_native_permissions=False):
         from core.events.common_events import CommonEvent, TEXT, DONE
         self.adopted.append(session_id)
         yield CommonEvent(type=TEXT, data={"content": "recovered answer"})
         yield CommonEvent(type=DONE, data={})
 
     async def adopt_idle_session(self, *, machine_id, session_id, agent_name,
-                                 use_native_permissions=False):
+                                 execution_path, use_native_permissions=False):
         self.idle_adopted.append(session_id)
         self._sessions[session_id] = object()
 

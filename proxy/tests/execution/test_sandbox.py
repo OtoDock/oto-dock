@@ -4,11 +4,12 @@ import os
 
 import pytest
 
+from core.layers.cli.config_dir import ensure_persistent_claude_dir
 from core.sandbox.sandbox import (
     SandboxBuilder,
     SandboxConfig,
     SandboxMount,
-    ensure_persistent_claude_dir,
+    empty_mount_dir,
     resolve_sandbox_config,
 )
 
@@ -307,30 +308,46 @@ class TestSandboxBuilderAgentTask:
         )
         assert knowledge_ro
 
-    def test_knowledge_credentials_rw_over_ro_root(self, tmp_agents):
-        """Agent-scope MCP credentials (knowledge/.credentials) stack RW on
-        top of the RO knowledge root — MCP processes write-check and
-        self-refresh tokens in place (workspace-mcp refused to boot on the
-        plain RO mount). RW child must come AFTER the RO root in argv."""
+    def test_knowledge_credentials_are_masked_not_bound(self, tmp_agents):
+        """No OAuth token file is mounted into a sandbox:
+        a knowledge/.credentials copy in the tree is never bound, and the
+        empty platform dir is bound read-only over it AFTER the knowledge
+        root, so the copy is out of every agent-scope session's view."""
+        from core.sandbox.sandbox import empty_mount_dir
         agents_dir, mcps_dir = tmp_agents
         agent_dir = str(agents_dir / "personal-assistant")
         cred_dir = agents_dir / "personal-assistant" / "knowledge" / ".credentials"
         cred_dir.mkdir(parents=True)
-        cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
-        sb = SandboxBuilder(cfg)
-        cmd = sb.build_command_prefix(["claude"])
-        bind_pairs = list(zip(cmd, cmd[1:]))
-        assert any(
-            a == "--ro-bind" and b == f"{agent_dir}/knowledge"
-            for a, b in bind_pairs
-        ), "knowledge root must stay RO"
-        assert any(
-            a == "--bind" and b == f"{agent_dir}/knowledge/.credentials"
-            for a, b in bind_pairs
-        ), "knowledge/.credentials must be RW"
-        root_idx = cmd.index(f"{agent_dir}/knowledge")
-        cred_idx = cmd.index(f"{agent_dir}/knowledge/.credentials")
-        assert root_idx < cred_idx, "RW child must shadow the RO root"
+        (cred_dir / "google-tokens").mkdir()
+        (cred_dir / "google-tokens" / "a@b.json").write_text("{}")
+        for role, username, sandbox in (
+            ("manager", "", "/knowledge/.credentials"),
+            ("editor", "", "/knowledge/.credentials"),
+            ("manager", "alice", "/knowledge/.credentials"),
+        ):
+            cfg = _make_config(agents_dir, mcps_dir, role=role, username=username)
+            cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+            assert f"{agent_dir}/knowledge/.credentials" not in cmd, (role, username)
+            bind_pairs = list(zip(cmd, cmd[1:], cmd[2:]))
+            masks = [i for i, (a, b, c) in enumerate(bind_pairs)
+                     if a == "--ro-bind" and b == str(empty_mount_dir()) and c == sandbox]
+            assert len(masks) == 1, (role, username, cmd)
+            assert cmd.index(f"{agent_dir}/knowledge") < masks[0], "the mask shadows the root"
+
+    def test_user_credentials_are_masked_not_bound(self, tmp_agents):
+        """The same for a person's users/<u>/.credentials: never bound RW,
+        masked read-only over the read-only user root."""
+        from core.sandbox.sandbox import empty_mount_dir
+        agents_dir, mcps_dir = tmp_agents
+        user_dir = agents_dir / "personal-assistant" / "users" / "alice"
+        (user_dir / ".credentials" / "google-tokens").mkdir(parents=True)
+        (user_dir / ".credentials" / "google-tokens" / "a@b.json").write_text("{}")
+        cfg = _make_config(agents_dir, mcps_dir, role="editor", username="alice")
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        assert f"{user_dir}/.credentials" not in cmd
+        joined = " ".join(cmd)
+        assert f"--ro-bind {empty_mount_dir()} /users/alice/.credentials" in joined
+        assert joined.index(f"{user_dir} /users/alice") < joined.index("/users/alice/.credentials")
 
     def test_no_credentials_bind_when_dir_absent(self, tmp_agents):
         """No .credentials dir on disk (no bound account) → no bind emitted;
@@ -342,21 +359,25 @@ class TestSandboxBuilderAgentTask:
         agent_dir = str(agents_dir / "personal-assistant")
         assert f"{agent_dir}/knowledge/.credentials" not in " ".join(cmd)
 
-    def test_symlinked_credentials_dir_refused(self, tmp_agents, tmp_path):
-        """A symlinked knowledge/.credentials (plantable by an owner-tier
-        session holding /knowledge RW) must NOT be bound — bwrap resolves bind
-        sources, so binding it would RW-mount the symlink's TARGET into the
-        next agent-scope sandbox (host escape). The bind is refused entirely."""
+    def test_symlinked_credentials_dir_is_removed_never_bound(self, tmp_agents, tmp_path):
+        """A link at knowledge/.credentials (plantable by an owner-tier session
+        holding /knowledge RW) is never bound: bwrap resolves bind sources, so
+        binding it would mount the link's TARGET into the next agent-scope
+        sandbox. The link is removed and the build goes on without it, so a
+        planted link cannot hold the whole agent out of every session."""
         agents_dir, mcps_dir = tmp_agents
-        agent_dir = str(agents_dir / "personal-assistant")
         knowledge = agents_dir / "personal-assistant" / "knowledge"
         knowledge.mkdir(parents=True, exist_ok=True)
         outside = tmp_path / "escape-target"
         outside.mkdir()
+        (outside / "token.json").write_text("{}")
         os.symlink(outside, knowledge / ".credentials")
         cfg = _make_config(agents_dir, mcps_dir, role="manager", username="")
         cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
-        assert f"{agent_dir}/knowledge/.credentials" not in " ".join(cmd)
+        assert not (knowledge / ".credentials").is_symlink()
+        assert not (knowledge / ".credentials").exists()
+        assert str(outside) not in " ".join(cmd)
+        assert (outside / "token.json").read_text() == "{}"
 
     def test_namespace_flags_isolate_ipc_and_uts(self, tmp_agents):
         """Every sandbox unshares IPC (else same-uid agents share a SysV/POSIX
@@ -566,6 +587,11 @@ class TestEnsurePersistentClaudeDir:
         data = json.loads((result / "settings.json").read_text())
         assert data["sandbox"]["enabled"] is False
         assert data["sandbox"]["failIfUnavailable"] is False
+        # Claude Code ≥ 2.1.275 would sync the pool account's claude.ai skills
+        # and plugins into every session — both off (satellite twin asserts
+        # the same in satellite/tests/test_cli_session.py).
+        assert data["syncClaudeAiSkills"] is False
+        assert data["syncClaudeAiPlugins"] is False
         # Hooks must remain alongside sandbox config
         assert "PreToolUse" in data["hooks"]
         assert "PostToolUse" in data["hooks"]
@@ -597,7 +623,7 @@ class TestCopyHookLf:
     """
 
     def test_strips_crlf_and_sets_executable(self, tmp_path):
-        from core.sandbox.sandbox import _copy_hook_lf
+        from core.sandbox.session_config_dir import _copy_hook_lf
         src = tmp_path / "h.py"
         src.write_bytes(b"#!/usr/bin/env python3\r\nimport os\r\nos.getpid()\r\n")
         dst = tmp_path / "out.py"
@@ -608,7 +634,7 @@ class TestCopyHookLf:
         assert os.access(dst, os.X_OK)
 
     def test_lf_source_unchanged(self, tmp_path):
-        from core.sandbox.sandbox import _copy_hook_lf
+        from core.sandbox.session_config_dir import _copy_hook_lf
         src = tmp_path / "h.py"
         body = b"#!/usr/bin/env python3\nprint(1)\n"
         src.write_bytes(body)
@@ -619,12 +645,13 @@ class TestCopyHookLf:
 
 
 class TestDisallowedBuiltinsConstant:
-    """The deny list is a single source of truth in core/sandbox/sandbox.py and
-    is wired into all three settings.json build paths. These tests guard
-    the constant + the symmetry across builders."""
+    """The deny list is a single source of truth in core/layers/cli/config_dir.py
+    (the Claude engine's own) and is wired into every settings.json build
+    path and the satellite payload. These tests guard the constant + the
+    symmetry across builders."""
 
     def test_constant_contains_critical_entries(self):
-        from core.sandbox.sandbox import _DISALLOWED_BUILTIN_TOOLS
+        from core.layers.cli.config_dir import DISALLOWED_BUILTIN_TOOLS
         critical = {
             "RemoteTrigger", "CronCreate", "CronDelete", "CronList",
             "PushNotification", "ScheduleWakeup",
@@ -635,10 +662,10 @@ class TestDisallowedBuiltinsConstant:
             "mcp__claude_ai_Google_Drive__authenticate",
             "mcp__claude_ai_Google_Drive__complete_authentication",
         }
-        assert critical.issubset(set(_DISALLOWED_BUILTIN_TOOLS))
+        assert critical.issubset(set(DISALLOWED_BUILTIN_TOOLS))
 
     def test_constant_does_not_contain_kept_tools(self):
-        from core.sandbox.sandbox import _DISALLOWED_BUILTIN_TOOLS
+        from core.layers.cli.config_dir import DISALLOWED_BUILTIN_TOOLS
         kept = {
             # Task* family (session-internal todo, kept on purpose)
             "TaskCreate", "TaskUpdate", "TaskList",
@@ -655,21 +682,21 @@ class TestDisallowedBuiltinsConstant:
             # the no-parallel-memory guarantee moved to reconciliation.
             "Skill",
         }
-        denied = set(_DISALLOWED_BUILTIN_TOOLS)
+        denied = set(DISALLOWED_BUILTIN_TOOLS)
         for t in kept:
             assert t not in denied, f"{t} must remain available"
 
     def test_sandbox_cli_settings_uses_same_list(self):
-        from core.sandbox.sandbox import _build_sandbox_cli_settings, _DISALLOWED_BUILTIN_TOOLS
-        settings = _build_sandbox_cli_settings("/users/test/.claude")
-        assert set(settings["permissions"]["deny"]) == set(_DISALLOWED_BUILTIN_TOOLS)
+        from core.layers.cli.config_dir import build_settings, DISALLOWED_BUILTIN_TOOLS
+        settings = build_settings("/users/test/.claude")
+        assert set(settings["permissions"]["deny"]) == set(DISALLOWED_BUILTIN_TOOLS)
 
     def test_sandbox_cli_settings_disables_plugins(self):
         """Platform is the only skill source: with the Skill tool allowed,
         plugin skills must not activate outside install/approval — the
         always-rewritten settings.json keeps every plugin off."""
-        from core.sandbox.sandbox import _build_sandbox_cli_settings
-        settings = _build_sandbox_cli_settings("/users/test/.claude")
+        from core.layers.cli.config_dir import build_settings
+        settings = build_settings("/users/test/.claude")
         assert settings["enabledPlugins"] == {}
 
 
@@ -830,7 +857,9 @@ def _netns_cfg(agents_dir, mcps_dir, *, forwards, allow_hosts=None,
 class TestNetnsAlwaysOn:
     """Isolation is always on: every resolved session is launcher-wrapped."""
 
-    def test_launcher_prefix_shape(self, tmp_agents):
+    def test_launcher_prefix_shape(self, tmp_agents, monkeypatch):
+        import config as app_config
+        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 0, raising=False)
         agents_dir, mcps_dir = tmp_agents
         cfg = _netns_cfg(agents_dir, mcps_dir, forwards=["8400", "8931", "8932"])
         cmd = SandboxBuilder(cfg).build_command_prefix(["claude", "-p"])
@@ -849,6 +878,24 @@ class TestNetnsAlwaysOn:
         assert cmd[-2:] == ["claude", "-p"]
         # Postgres is never forwarded.
         assert "5432" not in [cmd[i + 1] for i in fwd_idx]
+
+    def test_proxy_port_forward_lands_on_the_internal_listener(self, tmp_agents, monkeypatch):
+        """With an internal listener bound (``config.INTERNAL_LISTENER_PORT``),
+        the proxy-port forward alone becomes pasta's ``<namespace>:<host>``
+        splice; the other forwards and the sandbox side are unchanged, and
+        with no listener the argv is byte-identical to before."""
+        import config as app_config
+        agents_dir, mcps_dir = tmp_agents
+        proxy_port = str(app_config.PORT)
+        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[proxy_port, "8931"])
+        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 0, raising=False)
+        plain = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        monkeypatch.setattr(app_config, "INTERNAL_LISTENER_PORT", 8123, raising=False)
+        spliced = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        fwd = lambda cmd: [cmd[i + 1] for i, a in enumerate(cmd) if a == "--forward"]  # noqa: E731
+        assert fwd(plain) == [proxy_port, "8931"]
+        assert fwd(spliced) == [f"{proxy_port}:8123", "8931"]
+        assert [a for a in plain if a != proxy_port] == [a for a in spliced if a != f"{proxy_port}:8123"]
 
     def test_allow_hosts_emitted(self, tmp_agents):
         """Routable carve-outs become one --allow-host per entry."""
@@ -1338,3 +1385,199 @@ class TestCliInstallRoBinds:
         elf = bindir / "native-cli"
         elf.write_bytes(b"\x7fELF")
         assert cli_install_ro_binds(str(elf)) == [str(bindir)]
+
+
+class TestSandboxBuilderContributor:
+    """A contributor writes the shared workspace and nothing else: the
+    editor's mounts (workspace RW, knowledge RO, no /config), read off the
+    workspace tier, so a word the table does not know lands on the viewer's
+    row in BOTH scopes (the agent-scope branch used to open RW to anything
+    that was not the viewer word)."""
+
+    def _pairs(self, tmp_agents, **kw):
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir, **kw)
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        return str(agents_dir / "personal-assistant"), list(zip(cmd, cmd[1:]))
+
+    def test_workspace_rw_knowledge_ro_no_config(self, tmp_agents):
+        agent_dir, pairs = self._pairs(tmp_agents, role="contributor")
+        assert ("--bind", f"{agent_dir}/workspace") in pairs
+        assert ("--ro-bind", f"{agent_dir}/knowledge") in pairs
+        assert not any(b == f"{agent_dir}/config" for _a, b in pairs)
+
+    def test_shared_only_chat_mounts_workspace_rw(self, tmp_agents):
+        # A Shared-only human chat mounts the agent scope with the person's role.
+        agent_dir, pairs = self._pairs(tmp_agents, role="contributor", username="")
+        assert ("--bind", f"{agent_dir}/workspace") in pairs
+        assert ("--ro-bind", f"{agent_dir}/knowledge") in pairs
+
+    def test_unknown_word_is_read_only_in_both_scopes(self, tmp_agents):
+        for username in ("alice", ""):
+            agent_dir, pairs = self._pairs(tmp_agents, role="none", username=username)
+            assert ("--ro-bind", f"{agent_dir}/workspace") in pairs, username
+            assert ("--bind", f"{agent_dir}/workspace") not in pairs, username
+
+    def _ext_pairs(self, tmp_agents, **kw):
+        import dataclasses
+        agents_dir, mcps_dir = tmp_agents
+        cfg = dataclasses.replace(_make_config(agents_dir, mcps_dir, **kw), external=True)
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        return str(agents_dir / "personal-assistant"), list(zip(cmd, cmd[1:]))
+
+    def test_an_external_caller_keeps_the_cli_state_dirs_writable(self, tmp_agents):
+        """An external caller with no tree of its own runs from the agent's
+        CLI state under the read-only workspace (CLAUDE_CONFIG_DIR /
+        CODEX_HOME = /workspace/.claude or .codex): the two stack RW on the
+        RO root, or the CLI cannot even start (Codex's sqlite state runtime
+        refused a read-only home, T1 2026-09-24)."""
+        agents_dir, _ = tmp_agents
+        workspace = agents_dir / "personal-assistant" / "workspace"
+        for sub in (".claude", ".codex"):
+            (workspace / sub).mkdir(parents=True, exist_ok=True)
+        agent_dir, pairs = self._ext_pairs(tmp_agents, role="viewer", username="")
+        assert ("--ro-bind", f"{agent_dir}/workspace") in pairs
+        assert ("--bind", f"{agent_dir}/workspace/.claude") in pairs
+        assert ("--bind", f"{agent_dir}/workspace/.codex") in pairs
+
+    def test_a_person_below_the_editor_tier_never_sees_the_agents_state(self, tmp_agents):
+        """A Shared-only viewer or contributor (whose CLI session the engines
+        refuse) sees the agent's CLI state masked in any sandbox run as them,
+        a script or an app button; an editor runs from it."""
+        empty = str(empty_mount_dir())
+        for role in ("viewer", "contributor"):
+            agent_dir, pairs = self._pairs(tmp_agents, role=role, username="")
+            for sub in (".claude", ".codex"):
+                assert ("--ro-bind", empty) in pairs and (empty, f"/workspace/{sub}") in pairs, role
+                assert ("--bind", f"{agent_dir}/workspace/{sub}") not in pairs, role
+        agent_dir, pairs = self._pairs(tmp_agents, role="editor", username="")
+        assert ("--bind", f"{agent_dir}/workspace") in pairs
+        assert not any(b == "/workspace/.claude" for _a, b in pairs)
+
+    def test_an_external_callers_state_dir_symlink_is_refused(self, tmp_agents, tmp_path):
+        """The workspace is RW for the tiers above: a planted link must not
+        become an RW bind of its target in a caller's sandbox, and a person's
+        sandbox refuses to build over one."""
+        agents_dir, mcps_dir = tmp_agents
+        workspace = agents_dir / "personal-assistant" / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / ".claude").mkdir(exist_ok=True)
+        (workspace / ".codex").symlink_to(tmp_path)
+        agent_dir, pairs = self._ext_pairs(tmp_agents, role="viewer", username="")
+        assert ("--bind", f"{agent_dir}/workspace/.claude") in pairs
+        assert not any(b.endswith("/workspace/.codex") for _a, b in pairs)
+        assert not any(b == str(tmp_path) for _a, b in pairs)
+        with pytest.raises(RuntimeError, match="symlinked"):
+            SandboxBuilder(_make_config(agents_dir, mcps_dir, role="viewer", username="")
+                           ).workspace_mount_table()
+
+
+class TestAgentStateMasked:
+    """The agent scope's CLI state (workspace/.claude, workspace/.codex: the
+    hooks, settings and MCP config every agent-scope session runs, the
+    subscription login and the session tokens) is masked out of every
+    session that does not run from it."""
+
+    def _pairs(self, tmp_agents, **kw):
+        agents_dir, mcps_dir = tmp_agents
+        cfg = _make_config(agents_dir, mcps_dir, **kw)
+        cmd = SandboxBuilder(cfg).build_command_prefix(["claude"])
+        return str(agents_dir / "personal-assistant"), cmd
+
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
+    def test_a_user_scope_session_sees_an_empty_read_only_dir(self, tmp_agents, role):
+        agent_dir, cmd = self._pairs(tmp_agents, role=role)
+        empty = str(empty_mount_dir())
+        ws = cmd.index(f"{agent_dir}/workspace")
+        for sub in (".claude", ".codex"):
+            at = cmd.index(f"/workspace/{sub}")
+            assert cmd[at - 2:at + 1] == ["--ro-bind", empty, f"/workspace/{sub}"], role
+            assert at > ws, role            # after the /workspace bind: it wins
+            assert os.path.isdir(f"{agent_dir}/workspace/{sub}")   # the mountpoint
+
+    def test_the_agent_scope_runs_from_its_own_state(self, tmp_agents):
+        _agent_dir, cmd = self._pairs(tmp_agents, role="manager", username="")
+        assert "/workspace/.claude" not in cmd and str(empty_mount_dir()) not in cmd
+
+    def test_a_planted_link_refuses_the_build(self, tmp_agents, tmp_path):
+        agents_dir, mcps_dir = tmp_agents
+        (agents_dir / "personal-assistant" / "workspace" / ".codex").symlink_to(tmp_path)
+        with pytest.raises(RuntimeError, match="symlinked"):
+            SandboxBuilder(_make_config(agents_dir, mcps_dir, role="contributor")).workspace_mount_table()
+
+    @_needs_netns
+    def test_a_contributor_can_neither_read_nor_rewrite_the_agents_hooks(self, tmp_agents):
+        agents_dir, mcps_dir = tmp_agents
+        state = agents_dir / "personal-assistant" / "workspace" / ".claude"
+        state.mkdir()
+        (state / "permission_gate.py").write_text("GATE\n")
+        (state / ".credentials.json").write_text("TOKEN\n")
+        cfg = _netns_cfg(agents_dir, mcps_dir, forwards=[str(_free_port())], role="contributor")
+        probe = (
+            "import sys\n"
+            "def t(f):\n"
+            "  try: f(); return 'ok'\n"
+            "  except Exception as e: return type(e).__name__\n"
+            "base='/workspace/.cl'+'aude/'\n"
+            "sys.stdout.write('read='+t(lambda: open(base+'.credentials.json').read())+'\\n')\n"
+            "sys.stdout.write('hook='+t(lambda: open(base+'permission_gate.py','w').write('X'))+'\\n')\n"
+            "sys.stdout.write('plant='+t(lambda: open(base+'json.py','w').write('X'))+'\\n')\n"
+            "sys.stdout.write('shared='+t(lambda: open('/workspace/notes.txt','w').write('X'))+'\\n')\n"
+        )
+        out = _subprocess.run(SandboxBuilder(cfg).build_command_prefix(["python3", "-c", probe]),
+                              capture_output=True, text=True, timeout=30)
+        assert "read=FileNotFoundError" in out.stdout, (out.stdout, out.stderr)
+        assert "hook=ok" not in out.stdout and "plant=ok" not in out.stdout, out.stdout
+        assert "shared=ok" in out.stdout, (out.stdout, out.stderr)
+        assert (state / "permission_gate.py").read_text() == "GATE\n"
+        assert not (state / "json.py").exists()
+
+
+class TestEnginesRefuseTheAgentStateBelowEditor:
+    """The start-time floor: no engine runs a CLI from the agent's own state
+    for a person below the editor tier (its sandbox masks that dir, so the
+    CLI would start with no hooks), locally or on a machine."""
+
+    def _ctx(self, role, username="", scope="agent", **kw):
+        from auth.path_policy import SecurityContext
+        return SecurityContext(role=role, username=username, agent="personal-assistant",
+                               is_admin_agent=False, session_scope=scope, **kw)
+
+    def test_the_floor(self):
+        from core.sandbox.session_config_dir import AgentStateRefused, refuse_session_on_agent_state
+        for role in ("viewer", "contributor", "", "none"):
+            with pytest.raises(AgentStateRefused):
+                refuse_session_on_agent_state(self._ctx(role))
+        with pytest.raises(AgentStateRefused):
+            refuse_session_on_agent_state(None)
+        # A Shared-only chat carries the person's name but mounts the agent.
+        with pytest.raises(AgentStateRefused):
+            refuse_session_on_agent_state(self._ctx("viewer", username="alice", scope="agent"))
+        for ctx in (self._ctx("editor"), self._ctx("manager"), self._ctx("admin"),
+                    self._ctx("viewer", username="alice", scope="user"),
+                    self._ctx("viewer", principal="external")):
+            refuse_session_on_agent_state(ctx)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["claude-code-cli", "codex-cli"])
+    async def test_a_local_engine_refuses_before_it_spawns(self, path, tmp_path):
+        from core.execution_layer import AgentConfig
+        from core.sandbox.session_config_dir import AgentStateRefused
+        from core.session.session_manager import get_layer_by_path
+        cfg = AgentConfig(agent_name="personal-assistant", sandbox_host_claude_dir=str(tmp_path),
+                          security_context=self._ctx("contributor"), execution_path=path)
+        with pytest.raises(AgentStateRefused):
+            await get_layer_by_path(path)._start_session_impl("sess-x", cfg)
+
+    @pytest.mark.asyncio
+    async def test_a_machine_refuses_before_any_frame(self):
+        from unittest.mock import MagicMock
+        from core.execution_layer import AgentConfig
+        from core.remote.remote_execution import RemoteExecutionLayer
+        from core.sandbox.session_config_dir import AgentStateRefused
+        layer = RemoteExecutionLayer(MagicMock())
+        cfg = AgentConfig(agent_name="personal-assistant", execution_target="machine-1",
+                          security_context=self._ctx("viewer", username="alice", scope="agent"))
+        with pytest.raises(AgentStateRefused):
+            await layer.start_session("sess-x", cfg)
+        layer._cm.is_connected.assert_not_called()

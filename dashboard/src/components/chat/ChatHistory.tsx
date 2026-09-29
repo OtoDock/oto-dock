@@ -11,6 +11,11 @@ import TitleTooltip from '../ui/TitleTooltip'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
 import MoveChatConfirm from './MoveChatConfirm'
+import SharePopover, { type ShareTarget } from '../sharing/SharePopover'
+import { SOURCE_TYPE } from '../../lib/session/kind'
+import { isSharedChatOwner } from '../../lib/visibility'
+import { CHAT_PHASE, isLiveChatPhase } from '../../lib/status/chat'
+import { isLiveRunStatus } from '../../lib/status/run'
 
 // Unread-row age steps: a fresh response tints the whole row with the full
 // brand surface; one that has sat unread fades in two steps, so the sidebar
@@ -32,7 +37,7 @@ export function unreadRowClass(lastResponseAt?: string | null): string {
 function ChatStatusDot({ chatId }: { chatId: string }) {
   const slice = useChatSlice(chatId)
   const status = slice?.status
-  if (status === 'warming') {
+  if (status === CHAT_PHASE.WARMING) {
     return (
       <span
         title="Preparing remote environment…"
@@ -40,7 +45,7 @@ function ChatStatusDot({ chatId }: { chatId: string }) {
       />
     )
   }
-  if (status === 'failed') {
+  if (status === CHAT_PHASE.FAILED) {
     return (
       <span
         title="Warmup failed"
@@ -243,7 +248,7 @@ function highlightTitle(title: string, query: string): JSX.Element {
 // stays constant while the background pulses/fades so the row keeps a crisp
 // edge. Ring, not border — border-l is the project accent rail.
 function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveChat,
-                   onRename, canDelete, edit }: {
+                   onRename, onShare, canDelete, edit }: {
   chat: Chat
   active: boolean
   title: string | JSX.Element
@@ -254,11 +259,13 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
   onDelete: (id: string) => void
   onMoveChat?: () => void
   onRename?: () => void
+  /** Present → a "Share" row (server-flag gated at the call site). */
+  onShare?: () => void
   canDelete: boolean
   edit: RowEdit | null
 }) {
   const slice = useChatSlice(chat.id)
-  const streaming = slice?.status === 'streaming'
+  const streaming = slice?.status === CHAT_PHASE.STREAMING
   const unread = slice?.unread !== undefined ? slice.unread : chat.unread
   let stateClass = 'text-p-text-secondary hover:bg-p-surface-hover'
   let stateTitle: string | undefined
@@ -310,10 +317,10 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
           </>
         )}
       </div>
-      {!edit && (onRename || canDelete) && (
+      {!edit && (onRename || onShare || canDelete) && (
         <ChatItemMenu
           chatId={chat.id} onDelete={onDelete} onBrand={active} isOpen={active}
-          onMoveChat={onMoveChat} onRename={onRename} canDelete={canDelete}
+          onMoveChat={onMoveChat} onRename={onRename} onShare={onShare} canDelete={canDelete}
           fullTitle={plainTitle}
         />
       )}
@@ -345,8 +352,8 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
   // Between chat_status frames the joined run status seeds the live state
   // (page load / reconnect); a slice that exists wins in both directions.
   const streaming = slice
-    ? slice.status === 'streaming'
-    : chat.run_status === 'running' || chat.run_status === 'pending'
+    ? slice.status === CHAT_PHASE.STREAMING
+    : isLiveRunStatus(chat.run_status)
   let stateClass = 'text-p-text-secondary hover:bg-p-surface-hover'
   let stateTitle: string | undefined
   if (active) {
@@ -405,7 +412,7 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
 // `isOpen`: this row is the OPEN chat — the move_chat op acts on the
 // connection's open chat, so only then is the target-mismatch row actionable.
 function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
-                        onMoveChat, onRename, canDelete = true,
+                        onMoveChat, onRename, onShare, canDelete = true,
                         taskKind = false, fullTitle }: {
   chatId: string
   onDelete: (id: string) => void
@@ -414,6 +421,8 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   onMoveChat?: () => void
   /** Present → a "Rename" row above Delete (server-flag gated at the call site). */
   onRename?: () => void
+  /** Present → a "Share" row: the chat as a read-only snapshot (SHARING.md). */
+  onShare?: () => void
   /** False hides the Delete row (e.g. an editor on another user's task run). */
   canDelete?: boolean
   /** Task-history wording for the delete confirmation. */
@@ -433,7 +442,7 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   // the row appears/disappears reactively while the menu is open.
   const slice = useChatSlice(chatId)
   const mismatch = slice?.targetMismatch ?? null
-  const moveBusy = slice?.status === 'streaming' || slice?.status === 'warming'
+  const moveBusy = isLiveChatPhase(slice?.status)
 
   // Close menu on outside click
   useEffect(() => {
@@ -540,6 +549,17 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
                 Rename
               </button>
             )}
+            {onShare && (
+              <button
+                onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onShare() }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                </svg>
+                Share
+              </button>
+            )}
             {canDelete && (
               <button
                 onClick={handleDeleteClick}
@@ -627,6 +647,9 @@ export default function ChatHistory({
   useEffect(() => {
     onRenameEditingChange?.(editing !== null)
   }, [editing, onRenameEditingChange])
+  // The chat being shared (the row menu's Share): the popover takes the
+  // chat as its target and makes a snapshot on the server.
+  const [shareTarget, setShareTarget] = useState<ShareTarget | null>(null)
 
   // Search follows the mode: chat search over the history owner's chats,
   // task search over the agent's task-run chats (run-permission gated).
@@ -639,7 +662,7 @@ export default function ChatHistory({
   const activeRows = useActiveChats()
   const hasActiveTasks = useMemo(
     () => activeRows.some((r) =>
-      r.sourceType === 'task' && r.agent === agentName && r.phase === 'streaming'),
+      r.sourceType === SOURCE_TYPE.TASK && r.agent === agentName && r.phase === CHAT_PHASE.STREAMING),
     [activeRows, agentName],
   )
 
@@ -665,9 +688,12 @@ export default function ChatHistory({
 
   const handleDelete = useCallback((chatId: string) => {
     deleteChat.mutate(chatId, {
+      // The open chat's terminal is closed by the server before the row goes:
+      // leave the page for a fresh chat rather than stay on a vanished one.
+      onSuccess: () => { if (chatId === activeChatId) onNew() },
       onError: (e) => surfaceError((e as Error)?.message || 'Failed to delete chat'),
     })
-  }, [deleteChat, surfaceError])
+  }, [deleteChat, surfaceError, activeChatId, onNew])
 
   const startRename = useCallback((chat: Chat | TaskChat) => {
     const tc = chat as TaskChat
@@ -835,6 +861,7 @@ export default function ChatHistory({
               // their historical owner rights, task rows stay menu-less.
               const canRename = chat.can_rename ?? !tasksMode
               const canDelete = chat.can_delete ?? !tasksMode
+              const canShare = !tasksMode && !!chat.can_share
               const edit = editing?.id === chat.id
                 ? { initial: editing.initial, onCommit: commitRename, onCancel: cancelRename }
                 : null
@@ -862,6 +889,10 @@ export default function ChatHistory({
                   onDelete={handleDelete}
                   onMoveChat={onMoveChat}
                   onRename={canRename ? () => startRename(chat) : undefined}
+                  onShare={canShare ? () => setShareTarget({
+                    kind: 'chat', id: chat.id, title: chat.title || 'New Chat',
+                    scope: isSharedChatOwner(chat.user_sub) ? 'shared' : 'personal',
+                  }) : undefined}
                   canDelete={canDelete}
                   edit={edit}
                 />
@@ -869,6 +900,7 @@ export default function ChatHistory({
             })}
           </div>
         ))}
+        {shareTarget && <SharePopover target={shareTarget} onClose={() => setShareTarget(null)} />}
 
         {/* Empty state */}
         {!isSearchActive && modeChats.length === 0 && (

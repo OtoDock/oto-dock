@@ -24,8 +24,9 @@
 #   6. Downloads the release-pinned docker-compose.yml, starts the stack, and
 #      prints the dashboard URL.
 #
-# Fresh installs only — it never upgrades or overwrites an existing install
-# (upgrades: https://docs.otodock.io/administration/upgrading). Safe to re-run
+# Fresh installs only: it never upgrades or overwrites an existing install
+# (upgrade one with scripts/upgrade.sh, see
+# https://docs.otodock.io/administration/upgrading). Safe to re-run
 # if a step stopped it: everything that already exists is kept. All files land
 # in the current directory; nothing else on the host is touched (except the
 # optional AppArmor profile in step 4 and the optional sysctl drop-in in
@@ -105,7 +106,10 @@ fi
 if [ -f docker-compose.yml ]; then
     fail "this directory already contains a docker-compose.yml — this script performs
   fresh installs only and never touches an existing one.
-    To upgrade it:            https://docs.otodock.io/administration/upgrading
+    To upgrade it:            run upgrade.sh in that folder:
+                                curl -fsSLO $_raw/scripts/upgrade.sh
+                                bash upgrade.sh
+                              (https://docs.otodock.io/administration/upgrading)
     To install fresh:         create a new, empty folder (mkdir otodock && cd otodock)
                               and re-run this script from there."
 fi
@@ -115,31 +119,73 @@ say "installing into $(pwd)"
 # One file is the whole configuration: Compose reads it automatically, and on
 # first boot the server generates its remaining secrets (API key, signing
 # keys, …) and appends them here — so back this file up with your data.
+# A random hex secret (openssl if present, else /dev/urandom).
+rand_hex() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 24
+    else
+        od -vAn -N24 -tx1 /dev/urandom | tr -d ' \n'
+    fi
+}
+
+# Compose loads docker-compose.override.yml by itself only while COMPOSE_FILE
+# is unset, so an override placed here goes on that line, after the base file
+# and the phone overlay (the order upgrade.sh keeps too).
+_compose_files="docker-compose.yml:docker-compose.phone.yml"
+if [ -f docker-compose.override.yml ]; then
+    _compose_files="${_compose_files}:docker-compose.override.yml"
+fi
+
 if [ -f .env ]; then
     say "keeping the existing .env"
-else
-    say "writing .env with a generated PostgreSQL password"
-    if command -v openssl >/dev/null 2>&1; then
-        _pw="$(openssl rand -hex 24)"
-    else
-        _pw="$(od -vAn -N24 -tx1 /dev/urandom | tr -d ' \n')"
+    if [ -f docker-compose.override.yml ] \
+            && ! grep -qE '^[[:space:]]*COMPOSE_FILE=.*docker-compose\.override\.yml' .env; then
+        say "docker-compose.override.yml is here but the kept .env does not list it on
+  COMPOSE_FILE, so compose will not load it: add it at the end of that line."
     fi
-    cat > .env <<EOF
+    # A set key gives the DB superuser a network password on every start (the
+    # opt-in described in the template below); say so rather than keep it quietly.
+    if grep -qE '^OTODOCK_DB_ADMIN_PASSWORD=.' .env; then
+        say "OTODOCK_DB_ADMIN_PASSWORD is set: the DB superuser gets that network password
+  on every start (opt-in). Delete the line to drop it again."
+    fi
+else
+    say "writing .env with a generated database password"
+    _pw="$(rand_hex)"
+    # Created private (umask 077 in a subshell): the file holds the database
+    # password now and every generated secret after first boot.
+    ( umask 077; cat > .env ) <<EOF
 # OtoDock configuration — docker compose reads this file automatically, and
 # the server appends its own generated secrets here on first boot.
 # Every knob: https://github.com/OtoDock/oto-dock/blob/main/config.env.example
 
-# The bundled PostgreSQL initialises with this password on first run.
+# The bundled PostgreSQL initialises with this APP-role password on first run;
+# the platform connects as the non-superuser role 'otodock' with it.
 POSTGRES_PASSWORD=${_pw}
+
+# The DB superuser 'otodock_admin' has NO network password: reach it over the
+# container's local socket with
+#   docker compose exec otodock-postgres psql -U otodock_admin -d otodock
+# Optional: a value here gives it a password for TCP admin tools (pgAdmin); it
+# is applied on every start and removed again when you unset it.
+#OTODOCK_DB_ADMIN_PASSWORD=
 
 # The phone/voice service ships enabled by default (it idles until you
 # configure telephony in the dashboard). To run without it, remove the
 # phone overlay from this line:
-COMPOSE_FILE=docker-compose.yml:docker-compose.phone.yml
+COMPOSE_FILE=${_compose_files}
 
-# FreePBX/Asterisk telephony only (Twilio needs nothing here): the address
-# your PBX reaches this server on, for the raw audio socket:
+# FreePBX/Asterisk telephony only (Twilio needs nothing here): the LAN IP your
+# PBX reaches this server on, for the raw audio socket. The phone ports listen
+# on it too, so give a literal IP this host owns, never a hostname:
 #OTO_AUDIOSOCKET_PUBLIC_HOST=192.168.1.10
+
+# The phone daemon's AudioSocket (9092) and register API (9093) listen on
+# OTO_AUDIOSOCKET_PUBLIC_HOST above, else on 127.0.0.1. Set this only when the
+# PBX dials a hostname or an address this host does not own: this host's LAN
+# IP, a literal IP. Never 0.0.0.0 on an internet-facing host: AudioSocket has
+# no authentication of its own.
+#OTO_PHONE_BIND=192.168.1.10
 
 # Uncomment if users browse to this server by name/IP rather than localhost —
 # it drives login cookies, OAuth redirects, and links in notifications:
@@ -148,10 +194,15 @@ COMPOSE_FILE=docker-compose.yml:docker-compose.phone.yml
 # Uncomment to publish the dashboard on a different port:
 #PROXY_PORT=8400
 
+# Behind a reverse proxy: bind the published port to loopback and name the
+# address the edge connects from, so X-Forwarded-For cannot be forged. See
+# https://docs.otodock.io/getting-started/installation#put-it-behind-https
+#PROXY_BIND_IP=127.0.0.1
+#TRUSTED_PROXY=
+
 # Container timezone — scheduled tasks and notification times use this:
 #TZ=Europe/Athens
 EOF
-    chmod 600 .env
 fi
 
 # --- 4. Ubuntu 24.04+ user-namespace restriction -----------------------------
@@ -223,10 +274,11 @@ fi
 
 # --- 6. Fetch the compose files and start ------------------------------------
 # The compose files pin the OtoDock release they shipped with, so the install
-# is reproducible; upgrading later is a one-line version bump (see the upgrade
-# docs). docker-compose.yml is fetched LAST on purpose: its presence is what
-# marks this directory as an install, so the overlay must already be in place
-# by then (a failed overlay fetch must not leave a half-marked install).
+# is reproducible; scripts/upgrade.sh moves it to a newer release later, new
+# compose files included. docker-compose.yml is fetched LAST on purpose: its
+# presence is what marks this directory as an install, so the overlay must
+# already be in place by then (a failed overlay fetch must not leave a
+# half-marked install).
 say "downloading the phone service overlay (docker-compose.phone.yml)"
 fetch "$_raw/docker-compose.phone.yml" docker-compose.phone.yml
 

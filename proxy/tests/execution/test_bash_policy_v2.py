@@ -17,6 +17,7 @@ if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
 from auth.path_policy import SecurityContext, check_tool_access
+from core import placement
 
 
 def _ctx(role="manager", username="alice", agent="personal-assistant",
@@ -87,9 +88,24 @@ class TestAdminFloorUniversal:
     @pytest.mark.parametrize("cmd", [
         "rm -rf /", ":(){ :|:& };:", "dd if=/dev/zero of=/dev/sda",
         'bash -c "rm -rf /"', "echo $(rm -rf /)", "timeout 5 rm -rf /",
+        # Forms the raw scan alone missed: the bare root only exists after
+        # the continuation is joined; a newline after the root; a space or a
+        # quote before /etc/shadow is not a word boundary.
+        "rm -rf \\\n/", "rm -rf /\nls", "cat /etc/shadow", 'cat "/etc/shadow"',
+        "cat <<EOF\n$(rm -rf /)\nEOF",
     ])
     def test_catastrophe_denied_for_admin_agent(self, cmd):
         assert not _d(cmd, self._admin()).allowed, f"admin agent ran catastrophe: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        "rm -rf /tmp/build", "rm -rf ./dist", "cat /etc/shadowfax",
+        "cat /var/lib/etc/shadow", "rm -rf ~/.cache",
+        # A heredoc DATA body is inert even when a line of it looks like
+        # the catastrophe: the segment scan never sees data lines.
+        "cat > /tmp/n.txt <<'EOF'\nrm -rf /\nEOF",
+    ])
+    def test_floor_lookalikes_still_run_for_admin_agent(self, cmd):
+        assert _d(cmd, self._admin()).allowed, f"admin agent blocked on lookalike: {cmd}"
 
     @pytest.mark.parametrize("cmd", [
         "docker ps",                              # admin-tier — role-gate skipped
@@ -113,6 +129,46 @@ class TestUnknownAsk:
         d = _d(cmd)
         assert d.allowed, f"unknown hard-denied: {cmd}"
         assert d.permission_tier == "ask", f"{cmd} -> {d.permission_tier}"
+
+
+class TestUnparsableAsk:
+    """A segment shlex refuses (a dangling backslash) is an unknown command:
+    it asks instead of being refused — after every path-looking token and
+    redirect target in it is checked as a write, so it never reaches further
+    than a parsable form would."""
+
+    @pytest.mark.parametrize("cmd", [
+        "echo hi \\",
+        "cat /users/alice/workspace/notes.md \\",
+        "python3 -c pass < /dev/null \\",
+        "echo hi > /users/alice/workspace/out.txt \\",
+    ])
+    def test_unparsable_asks(self, cmd):
+        d = _d(cmd, _ctx(role="manager"))
+        assert d.allowed, (cmd, d.reason)
+        assert d.permission_tier == "ask"
+
+    @pytest.mark.parametrize("cmd", [
+        "cat /users/bob/workspace/secret \\",
+        'cat "/users/bob/workspace/secret" \\',
+        "echo x > /users/bob/workspace/out.txt \\",
+        "sort < /users/bob/workspace/secret \\",
+    ])
+    def test_unparsable_still_denies_a_denied_path(self, cmd):
+        d = _d(cmd, _ctx(role="manager"))
+        assert not d.allowed, cmd
+        assert "could not parse" in d.reason and "/users/bob/workspace/" in d.reason
+
+    def test_unparsable_path_is_checked_as_a_write(self):
+        # The direction is unknown: a viewer's unparsable line naming a
+        # read-only tree is denied, where the parsable read would pass.
+        assert _d("cat /knowledge/faq.md", _ctx(role="viewer")).allowed
+        d = _d("cat /knowledge/faq.md \\", _ctx(role="viewer"))
+        assert not d.allowed and "/knowledge/faq.md" in d.reason
+
+    def test_unclosed_quote_stays_a_deny(self):
+        d = _d('echo "hi', _ctx(role="manager"))
+        assert not d.allowed and "Unclosed quote" in d.reason
 
 
 # ===== Read long-tail auto-approves (the UX win) =====
@@ -224,6 +280,42 @@ class TestInputRedirect:
         assert d.allowed
 
 
+class TestPseudoPaths:
+    """The null device, the standard streams and ``/dev/fd/N`` are not files:
+    neither redirect direction sends them through the path gate, so they work
+    on every target (a satellite's home band would otherwise deny them)."""
+
+    LOCAL = _ctx(role="viewer")
+    REMOTE = SecurityContext(
+        role="manager", username="dave", agent="my-agent", is_admin_agent=False,
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, home_dir="/home/dave", agents_dir="/home/dave/.oto-dock/agents", machine_id="m1"),
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        "python3 -c pass < /dev/null",
+        "cat < /dev/stdin",
+        "read -r line < /dev/fd/3",
+        "echo x > /dev/stderr",
+        "echo x >> /dev/stdout",
+        "echo x > /dev/null 2> /dev/null",
+    ])
+    @pytest.mark.parametrize("ctx", [LOCAL, REMOTE])
+    def test_pseudo_redirects_allowed_everywhere(self, cmd, ctx):
+        d = _d(cmd, ctx)
+        assert d.allowed, (cmd, d.reason)
+
+    def test_pseudo_output_redirect_does_not_bump_tier(self):
+        assert _d("echo x > /dev/stderr", self.LOCAL).permission_tier == "read"
+
+    @pytest.mark.parametrize("cmd", [
+        "cat < /dev/sda",
+        "cat < /devnull",
+        "cat < /dev/null/../shadow",
+    ])
+    def test_lookalikes_still_go_through_the_path_gate(self, cmd):
+        assert not _d(cmd, self.LOCAL).allowed, cmd
+
+
 # ===== Network pseudo-devices are sockets, not files — never floor-denied =====
 
 class TestNetworkPseudoDevices:
@@ -251,9 +343,9 @@ class TestNetworkPseudoDevices:
     def test_allowed_on_home_restricted_satellite(self, cmd):
         ctx = SecurityContext(
             role="editor", username="alice", agent="personal-assistant",
-            is_admin_agent=False, target_kind="admin_remote",
-            target_home_dir="/home/alice", target_allow_full_fs=False,
-        )
+            is_admin_agent=False,
+            placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, home_dir="/home/alice", allow_full_fs=False),
+            )
         assert _d(cmd, ctx).allowed, cmd
 
     def test_real_device_writes_stay_denied(self):
@@ -330,9 +422,259 @@ class TestNewlineSeparatorBypass:
 # SHELL (`bash <<EOF` executes its stdin) keep per-line classification so the
 # dangerous floor still sees them.
 
+_REPORTED_SCRIPT = r'''PN=$(curl -s --max-time 25 "https://api.ted.europa.eu/v3/notices/search" -X POST -H "Content-Type: application/json" \
+ -d '{"query":"buyer-country=\"GRC\" AND notice-type=\"can-standard\" AND publication-date>=20260601","limit":1,"page":1,"fields":["publication-number"]}' \
+ | python3 -c "import sys,json;print(json.load(sys.stdin)['notices'][0]['publication-number'])")
+echo "Greek award notice: $PN"
+curl -s --max-time 30 "https://ted.europa.eu/en/notice/$PN/xml" -o /tmp/n.xml
+echo "XML bytes: $(wc -c < /tmp/n.xml)"
+echo ""
+echo "=== submission statistics found in notice XML ==="
+grep -oE '<efac:ReceivedSubmissionsStatistics>.*?</efac:ReceivedSubmissionsStatistics>' /tmp/n.xml | head -c 800
+echo ""
+grep -oE 'StatisticsCode[^>]*>[^<]*|StatisticsNumeric[^>]*>[^<]*' /tmp/n.xml | head -20'''
+
+
+class TestLocalTmp:
+    """The sandbox's /tmp is a private tmpfs and the agent's HOME: on a local
+    target every path under it is admitted both ways, the CLI state that
+    could live there excepted. A satellite keeps its home band, where the
+    session's own runtime tree is the only carve."""
+
+    LOCAL = _ctx(role="manager")
+    VIEWER = _ctx(role="viewer")
+    REMOTE = SecurityContext(
+        role="manager", username="dave", agent="my-agent", is_admin_agent=False,
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, home_dir="/home/dave", agents_dir="/home/dave/.oto-dock/agents", machine_id="m1"),
+        )
+    FULL = SecurityContext(
+        role="manager", username="dave", agent="my-agent", is_admin_agent=False,
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, home_dir="/home/dave", agents_dir="/home/dave/.oto-dock/agents", machine_id="m1", allow_full_fs=True),
+        )
+
+    @pytest.mark.parametrize("cmd, tier", [
+        ("cat /tmp/n.xml", "read"),
+        ("wc -c < /tmp/n.xml", "read"),
+        ("echo hi > /tmp/x.txt", "edit"),
+        ("mkdir -p /tmp/foo", "edit"),
+        ("cp /tmp/a /tmp/b", "edit"),
+        ("curl -o /tmp/n.xml https://example.test", "extended"),
+        ("echo hi > ~/x.txt", "edit"),
+        ("cat ~/x.txt", "read"),
+    ])
+    @pytest.mark.parametrize("ctx", [LOCAL, VIEWER])
+    def test_tmp_is_admitted_both_ways_locally(self, cmd, tier, ctx):
+        d = _d(cmd, ctx)
+        assert d.allowed, (cmd, d.reason)
+        assert d.permission_tier == tier, cmd
+
+    def test_reported_script_passes_as_one_call(self):
+        d = _d(_REPORTED_SCRIPT, self.LOCAL)
+        assert d.allowed, d.reason
+        assert d.permission_tier == "ask"
+
+    @pytest.mark.parametrize("cmd", [
+        "cat /tmp/n.xml", "echo hi > /tmp/x.txt", "mkdir -p /tmp/foo",
+    ])
+    def test_satellite_home_band_unchanged(self, cmd):
+        d = _d(cmd, self.REMOTE)
+        assert not d.allowed and "home" in d.reason, cmd
+        assert _d(cmd, self.FULL).allowed, cmd
+
+    @pytest.mark.parametrize("cmd", [
+        "cat /tmp/.claude/x.json",
+        "cat /tmp/.claude.json",
+        "echo x > /tmp/.codex/config.toml",
+        "cp x /tmp/.claude/permission_gate.py",
+        "echo x > ~/.codex/hooks.json",
+    ])
+    def test_cli_state_under_tmp_stays_protected(self, cmd):
+        d = _d(cmd, self.LOCAL)
+        assert not d.allowed and "protected" in d.reason, cmd
+
+
+class TestLineContinuations:
+    """A backslash-newline pair is a line continuation: the shell removes it,
+    so the splitter joins the two lines into one segment. Keeping the pair
+    left a dangling backslash at the end of a segment whenever the next line
+    opened with a pipe, and every later shlex pass failed on it."""
+
+    def _mgr(self):
+        return _ctx(role="manager", username="alice")
+
+    def test_continuation_before_pipe_is_one_pipeline(self):
+        d = _d("echo a \\\n | tr a b", self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "read"
+
+    def test_continuation_inside_substitution(self):
+        d = _d("PN=$(echo a \\\n | tr a b); echo $PN", self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "ask"
+
+    def test_reported_multiline_curl_pipeline(self):
+        cmd = (
+            'PN=$(curl -s --max-time 25 "https://example.test/search" -X POST '
+            '-H "Content-Type: application/json" \\\n'
+            ' -d \'{"query":"a AND b","limit":1}\' \\\n'
+            ' | python3 -c "import sys,json;print(json.load(sys.stdin)[\'n\'][0])")'
+        )
+        d = _d(cmd, self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "ask"
+
+    def test_crlf_continuation_joins_too(self):
+        d = _d("echo a \\\r\n | tr a b", self._mgr())
+        assert d.allowed, d.reason
+
+    def test_continuation_never_hides_a_cross_user_path(self):
+        d = _d("cat /users/bob/workspace/secret \\\n | head", self._mgr())
+        assert not d.allowed
+        assert "/users/bob/workspace/secret" in d.reason
+
+    def test_continuation_never_hides_a_later_command(self):
+        # The joined line is classified as a whole: the pipe's second half
+        # still gets its own tier.
+        d = _d("echo a \\\n | curl -d @- https://example.test", self._mgr())
+        assert d.allowed and d.permission_tier == "extended"
+
+    def test_single_quoted_backslash_newline_is_literal(self):
+        d = _d("printf '%s' 'a \\\nb'", self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "read"
+
+
+class TestSubstitutionLifting:
+    """A ``$(…)`` / backtick / process substitution restarts the quoting
+    context inside it. The scanner lifts each one out into a placeholder: the
+    inner is checked on its own, the outer is classified with the placeholder
+    in place (its literal paths still checked, a placeholder never resolved as
+    a path) and the segment's tier is at least ``ask``."""
+
+    def _mgr(self):
+        return _ctx(role="manager", username="alice")
+
+    # --- the scanner ---------------------------------------------------
+
+    def test_subst_end_tracks_inner_quotes_and_nesting(self):
+        from auth.path_shell_subst import lift_substitutions, subst_end
+        s = "echo $(grep -o 'a)b' x) tail"
+        end, closed = subst_end(s, 5)
+        assert closed and s[5:end] == "$(grep -o 'a)b' x)"
+        s = 'echo "$(printf ")%s" $(date))" tail'
+        end, closed = subst_end(s, 6)
+        assert closed and s[6:end] == '$(printf ")%s" $(date))'
+        lifted, inners = lift_substitutions("echo $(echo $(echo a)) `date` <(ls)")
+        assert lifted == "echo __OTO_SUBST_0__ __OTO_SUBST_1__ __OTO_SUBST_2__"
+        assert inners == ["echo $(echo a)", "date", "ls"]
+
+    def test_lift_respects_the_outer_quoting_context(self):
+        from auth.path_shell_subst import lift_substitutions
+        # Single quotes: literal. Double quotes: $( and backticks expand,
+        # process substitutions do not. Backslash: escaped.
+        lifted, inners = lift_substitutions(
+            "echo '$(a)' \"$(b) <(c)\" \\$(d) `e`")
+        assert inners == ["b", "e"]
+        assert lifted == "echo '$(a)' \"__OTO_SUBST_0__ <(c)\" \\$(d) __OTO_SUBST_1__"
+
+    def test_unbalanced_substitution_lifts_to_the_end(self):
+        from auth.path_shell_subst import lift_substitutions
+        lifted, inners = lift_substitutions("echo $(cat x | head")
+        assert inners == ["cat x | head"] and lifted == "echo __OTO_SUBST_0__"
+
+    # --- the gate ------------------------------------------------------
+
+    def test_nested_quotes_inside_substitution_parse(self):
+        # The phrase from the installs' transcripts: valid bash that shlex
+        # cannot parse because the quoting restarts inside the substitution.
+        cmd = ("echo \"stamp: $(curl -s $B/ | grep -o "
+               "'otodock-build\" content=\"[0-9a-f]*\"')\"")
+        d = _d(cmd, self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "ask"
+
+    @pytest.mark.parametrize("cmd", [
+        "X=$(cd /tmp; ls); echo $X",
+        "echo $(echo $(echo a))",
+        "PN=$(echo a | tr a b); echo $PN",
+        'bash -c "$(printf ls)"',
+        "cat $(dirname x)/y",
+    ])
+    def test_substituted_segments_are_ask(self, cmd):
+        d = _d(cmd, self._mgr())
+        assert d.allowed, (cmd, d.reason)
+        assert d.permission_tier == "ask", cmd
+
+    def test_inner_tier_and_destructive_flag_propagate(self):
+        d = _d("X=$(curl -s https://example.test); echo $X", self._mgr())
+        assert d.allowed and d.permission_tier == "ask"
+        d = _d("echo $(rm -f /users/alice/workspace/x)", self._mgr())
+        assert d.allowed and d.destructive
+
+    @pytest.mark.parametrize("cmd", [
+        # An apostrophe inside double quotes used to flip the scanner's
+        # single-quote state and hide the whole substitution.
+        "echo \"it's $(cat /users/bob/workspace/secret)\"",
+        "echo \"it's $(cat /users/bob/workspace/secret)\" > /users/alice/workspace/out.txt",
+        "echo \"it's `cat /users/bob/workspace/secret`\"",
+        # The outer command's literal paths are checked with the
+        # substitution lifted out.
+        "cat $(echo x) /users/bob/workspace/secret",
+        "echo $(true) > /users/bob/workspace/out.txt",
+        # A pipe inside the substitution: the inner is a pipeline of its own.
+        "X=$(cat /users/bob/workspace/secret | head); echo $X",
+    ])
+    def test_cross_user_paths_inside_and_around_substitutions_denied(self, cmd):
+        d = _d(cmd, self._mgr())
+        assert not d.allowed, cmd
+        assert "/users/bob/workspace/secret" in d.reason or "/users/bob/workspace/out.txt" in d.reason
+
+    def test_dangerous_inner_inside_double_quotes_denied(self):
+        # The raw scan misses `rm -rf /)"`; only the lifted inner catches it.
+        assert not _d('echo "$(rm -rf /)"', self._mgr()).allowed
+        assert not _d('echo "`rm -rf /`"', self._mgr()).allowed
+
+    def test_typed_placeholder_never_buys_an_auto_allow(self):
+        d = _d("cat __OTO_SUBST_0__/../x", self._mgr())
+        assert d.allowed and d.permission_tier == "ask"
+
+    def test_single_quoted_substitution_is_literal(self):
+        d = _d("echo '$(rm -f x)'", self._mgr())
+        assert d.allowed and d.permission_tier == "read" and not d.destructive
+
+
 class TestHeredocBodies:
     def _mgr(self):
         return _ctx(role="manager", username="alice")
+
+    # --- an unquoted delimiter: the shell expands the body -------------
+
+    @pytest.mark.parametrize("body", [
+        "$(cat /users/bob/workspace/secret)",
+        "`cat /users/bob/workspace/secret`",
+        "value: \"$(cat /users/bob/workspace/secret)\"",
+        "it's $(cat /users/bob/workspace/secret)",
+    ])
+    def test_expanded_body_substitutions_are_classified(self, body):
+        d = _d(f"cat <<EOF\n{body}\nEOF", self._mgr())
+        assert not d.allowed, body
+        assert "/users/bob/workspace/secret" in d.reason
+
+    def test_expanded_body_substitution_makes_the_pipeline_ask(self):
+        d = _d("cat > /users/alice/workspace/n.txt <<EOF\ntoday: $(date)\nEOF", self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "ask"
+
+    @pytest.mark.parametrize("delim", ["'EOF'", '"EOF"', "\\EOF"])
+    def test_quoted_delimiter_keeps_the_body_literal(self, delim):
+        d = _d(f"cat <<{delim}\n$(cat /users/bob/workspace/secret)\nEOF", self._mgr())
+        assert d.allowed, d.reason
+        assert d.permission_tier == "read"
+
+    def test_expanded_body_dangerous_substitution_denied(self):
+        assert not _d("cat <<EOF\n$(rm -rf /)\nEOF", self._mgr()).allowed
+
+    # --- bodies are data otherwise ---------------------------------------
 
     def test_code_body_is_data_not_commands(self):
         # Python-ish body lines (colons, braces, odd quotes) must not classify.
@@ -472,9 +814,10 @@ class TestAssignmentOnlySegments:
         assert not _d("F=$(rm -rf /)").allowed          # dangerous inner
         assert _d("F=$(date)").permission_tier == "ask"  # unanalyzable outer
 
-    def test_dangling_backslash_still_parse_denied(self):
+    def test_dangling_backslash_is_not_an_assignment(self):
+        # Unparsable, not command-less: it takes the unknown-command ask.
         d = _d("echo \\")
-        assert not d.allowed and "could not parse" in d.reason
+        assert d.allowed and d.permission_tier == "ask"
 
     def test_admin_floor_unchanged(self):
         d = _d("F=/x; x=1 y=2", _ctx(role="admin", is_admin_agent=True))
@@ -561,3 +904,98 @@ class TestShellStructureIsStripped:
         assert d.allowed and d.permission_tier == "edit"
         d = _d("echo a\nthen cat /users/bob/workspace/f")
         assert not d.allowed
+
+
+# ===== The machine's own state on a remote, and find's exec clauses =====
+
+def _remote_ctx(role="manager", username="alice", agent="head", *, is_admin_agent=False,
+                allow_full_fs=False):
+    return SecurityContext(
+        role=role, username=username, agent=agent, is_admin_agent=is_admin_agent,
+        placement=placement.PlacementCapabilities(
+            kind=placement.KIND_ADMIN_REMOTE, machine_id="office-pc", home_dir="/home/office",
+            os_user="office", agents_dir="/home/office/.oto-dock/agents", os="linux",
+            allow_full_fs=allow_full_fs, claude_runtime_root="/tmp/claude-1000"),
+        session_scope="user" if username else "agent",
+    )
+
+
+class TestRemoteShellIsRefusedTheMachinesOwnState:
+    @pytest.mark.parametrize("cmd", [
+        "cat /home/office/.oto-dock/satellite.conf",
+        "cat ~/.oto-dock/satellite.conf",
+        "grep -r machine_secret ~/.oto-dock",
+        "cp ~/.oto-dock/agents/other/workspace/x.md /tmp/x.md",
+        "echo x > ~/.oto-dock/mcps/workspace-mcp/run.sh",
+        "sort < ~/.oto-dock/satellite.conf",
+    ])
+    def test_a_manager_is_refused(self, cmd):
+        d = _d(cmd, _remote_ctx())
+        assert not d.allowed and "OtoDock folder" in d.reason
+
+    @pytest.mark.parametrize("cmd", [
+        "cat ~/.oto-dock/satellite.conf",
+        "grep -r machine_secret ~/.oto-dock",
+        "echo x > ~/.oto-dock/mcps/workspace-mcp/run.sh",
+        "sort < ~/.oto-dock/satellite.conf",
+        "timeout 5 cat ~/.oto-dock/satellite.conf",
+        "bash -c 'cat ~/.oto-dock/satellite.conf'",
+    ])
+    def test_an_admin_on_an_admin_agent_is_refused_on_every_pairing(self, cmd):
+        for full in (False, True):
+            d = _d(cmd, _remote_ctx("admin", "root", "ops", is_admin_agent=True, allow_full_fs=full))
+            assert not d.allowed and "OtoDock folder" in d.reason, (cmd, full)
+
+    def test_an_admin_on_an_admin_agent_keeps_the_admin_tier_elsewhere(self):
+        d = _d("cat ~/Desktop/notes.txt && systemctl status nginx",
+               _remote_ctx("admin", "root", "ops", is_admin_agent=True))
+        assert d.allowed and d.permission_tier == "admin"
+        d = _d("cat /home/office/.oto-dock/agents/ops/workspace/x.md",
+               _remote_ctx("admin", "root", "ops", is_admin_agent=True))
+        assert d.allowed and d.permission_tier == "admin"
+
+    def test_the_sessions_own_tree_and_the_home_band_work(self):
+        d = _d("cat /home/office/.oto-dock/agents/head/workspace/report.md", _remote_ctx())
+        assert d.allowed and d.permission_tier == "read"
+        assert _d("cat ~/Desktop/notes.txt", _remote_ctx()).allowed
+
+
+class TestFindExecClausesCarryTheirTier:
+    _ORDER = {"": 0, "read": 1, "edit": 2, "extended": 3, "ask": 3, "admin": 4}
+
+    def _tier(self, cmd, ctx=None):
+        d = _d(cmd, ctx)
+        assert d.allowed, (cmd, d)
+        return d.permission_tier or "read"
+
+    @pytest.mark.parametrize("ctx", [None, "remote"])
+    @pytest.mark.parametrize("cmd", [
+        'find . -maxdepth 0 -exec python3 -c "print(1)" \\;',
+        "find . -maxdepth 0 -exec curl -s https://x.example \\;",
+        "find . -maxdepth 0 -exec cat {} \\; -exec python3 -c 1 \\;",
+        "find . -maxdepth 0 -execdir node -e 1 \\; -exec cat {} +",
+        "find . -maxdepth 0 -ok sh -c 'python3 -c 1' \\;",
+    ])
+    def test_an_inner_interpreter_or_downloader_lifts_the_segment(self, cmd, ctx):
+        c = _remote_ctx() if ctx else None
+        assert self._tier('python3 -c "print(1)"', c) == "extended"
+        assert self._ORDER[self._tier(cmd, c)] >= self._ORDER["extended"], cmd
+
+    def test_a_read_inner_keeps_find_at_read(self):
+        assert self._tier("find . -name '*.md' -exec cat {} +") == "read"
+        assert self._tier("find . -name '*.md' -exec cat {} \\; -exec wc -l {} \\;") == "read"
+        d = _d("find /users/alice/workspace -name '*.tmp' -exec rm {} \\; -exec cat {} +")
+        assert d.allowed and d.destructive is True
+
+
+def test_powershell_admin_floor_refuses_the_machines_own_state():
+    ctx = SecurityContext(
+        role="admin", username="root", agent="ops", is_admin_agent=True,
+        placement=placement.PlacementCapabilities(
+            kind=placement.KIND_ADMIN_REMOTE, machine_id="pc", home_dir="C:/Users/eve",
+            os_user="eve", agents_dir="C:/Users/eve/OtoDock/agents", os="windows"),
+    )
+    d, _ = check_tool_access("PowerShell", {"command": "Get-Content C:\\Users\\eve\\OtoDock\\satellite.conf"}, ctx)
+    assert not d.allowed and "OtoDock folder" in d.reason
+    d, _ = check_tool_access("PowerShell", {"command": "Get-Content C:\\Users\\eve\\Documents\\plan.txt"}, ctx)
+    assert d.allowed and d.permission_tier == "admin"

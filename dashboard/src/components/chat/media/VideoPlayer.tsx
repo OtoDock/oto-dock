@@ -3,6 +3,7 @@ import { safeHref } from '../../../lib/safeUrl'
 
 import { ensureMediaDownloadName } from '../../../lib/fileTypes'
 import { useCoarsePointer } from '../../../hooks/useCoarsePointer'
+import { callNative } from '../../../lib/nativeBridge'
 
 interface Props {
   /** Final playable URL: a web URL or /v1/media/{token}. */
@@ -258,8 +259,7 @@ export default function VideoPlayer({
     // used to rotate PORTRAIT videos to landscape when fullscreen came fast).
     const landscape = coarse && !!v && v.videoWidth > 0 && v.videoWidth >= v.videoHeight
     const close = () => { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}) }
-    const native = !!w.Android?.enterVideoFullscreen
-    try { w.Android?.enterVideoFullscreen?.(landscape) } catch { /* no native bridge */ }
+    const native = callNative('enterVideoFullscreen', landscape)
     w.__otodockVideoFullscreenActive = true       // MainActivity.handleBackAction checks this
     w.__otodockVideoFullscreenClose = close
     let stopFollow: (() => void) | null = null
@@ -274,7 +274,7 @@ export default function VideoPlayer({
     return () => {
       window.removeEventListener('popstate', onPop)
       stopFollow?.()
-      try { w.Android?.exitVideoFullscreen?.() } catch { /* ignore */ }
+      callNative('exitVideoFullscreen')
       if (w.__otodockVideoFullscreenActive) {
         w.__otodockVideoFullscreenActive = false
         w.__otodockVideoFullscreenClose = undefined

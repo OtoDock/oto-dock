@@ -36,11 +36,13 @@ import logging
 import uuid
 from dataclasses import dataclass
 
+import config
 from core.config.config_builder import (
-    build_agent_config, is_hard_fail_target, release_config_seat,
+    build_agent_config, release_config_seat,
 )
+from core import placement
 from core.config.task_config_builder import (
-    resolve_task_identity, task_allows_knowledge_rw,
+    resolve_task_identity, run_allows_knowledge_rw,
 )
 from core.execution_layer import ExecutionLayer
 from core.session import interactive_session
@@ -51,13 +53,13 @@ from core.session.session_state import (
     set_session_user_tz,
 )
 from storage import database as task_store
-# Module-level pure helpers of ws/dashboard.py (same intra-unit import
-# ws/duplex_attach.py already leans on for _effective_agent_role).
+# Module-level pure helpers of ws/dashboard.py (an intra-unit import).
 from ws.dashboard import (
-    _effective_agent_role,
     _resolve_session_interactive,
     _resume_username_for_chat,
 )
+from core.session import session_kind
+from auth.providers import acting_role_of
 
 logger = logging.getLogger("claude-proxy")
 
@@ -110,6 +112,20 @@ async def resume_dead_session_headless(
     pinned = chat.get("execution_target") or ""
     exec_mode = chat.get("execution_mode") or ""
 
+    # A one-shot wake still writing this chat's conversation file finishes
+    # first (the dashboard warmup's rule): the heal never renders a
+    # half-written turn or dual-writes the file. Past the cap, proceed.
+    from core.session import session_delivery
+    inflight = session_delivery.oneshot_inflight(chat_id)
+    if inflight is not None:
+        try:
+            await asyncio.wait_for(inflight.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"headless resume: one-shot still running after 120s on "
+                f"chat={chat_id}: resuming anyway"
+            )
+
     # ORDER IS LOAD-BEARING: can_resume_session BEFORE prepare_resume (see
     # module doc). Same rule as the dashboard helper.
     can_resume = await layer_for_chat.can_resume_session(
@@ -135,28 +151,28 @@ async def resume_dead_session_headless(
         sid = str(uuid.uuid4())
 
     from storage.pg import run_db
-    effective_role = await run_db(_effective_agent_role, user_sub, agent, fallback_user=user)
+    effective_role = await run_db(acting_role_of, user_sub, agent, fallback_user=user)
     task_identity = None
-    if chat_id.startswith("task-"):
-        run = task_store.get_run(chat_id.removeprefix("task-"))
+    if session_kind.is_task_chat_id(chat_id):
+        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
         if run:
             # Same fire, same provenance: the knowledge-RW opt-in follows
-            # the run's stored task shape (delegate stays False).
+            # the run row's kind (task_kinds.RUN_KINDS: scheduled and
+            # delegate opt in).
             task_identity = resolve_task_identity(
                 agent, run.get("scope") or "agent", run.get("created_by"),
-                allow_knowledge_rw=task_allows_knowledge_rw(
-                    run.get("task_type")),
+                allow_knowledge_rw=run_allows_knowledge_rw(run.get("task_type")),
             )
     agent_cfg = await build_agent_config(
         agent_name=agent, user=user, user_sub=user_sub,
         user_role=effective_role, permission_mode=perm_mode,
-        client_type="dashboard", resume=can_resume, model=chat_model,
+        client_type=session_kind.DASHBOARD.name, resume=can_resume, model=chat_model,
         execution_path=exec_path, chat_id=chat_id, session_id=sid,
         task_identity=task_identity, pinned_target=pinned,
     )
     # Every exit below abandons the spawn after the build acquired its pool
     # seat — give it back, or the counter drifts up one per refused heal.
-    if is_hard_fail_target(agent_cfg.execution_target):
+    if placement.is_offline_sentinel(agent_cfg.execution_target):
         # Pinned remote machine offline with fallback disabled — surface it;
         # migrating the session off its workspace would be worse.
         release_config_seat(sid, agent_cfg)
@@ -168,10 +184,14 @@ async def resume_dead_session_headless(
         raise ResumeUnavailable("interactive_chat")
     agent_cfg.interactive = False
 
+    # Waits its turn in the admission queue like a new chat; a Direct-LLM
+    # session reserves for its stdio MCPs.
     from core.concurrency import acquire_chat_slot
     adm = await acquire_chat_slot(sid, target=agent_cfg.execution_target,
                                   execution_path=agent_cfg.execution_path,
-                                  user_sub=user_sub)
+                                  user_sub=user_sub,
+                                  queue_wait_s=config.ADMISSION_QUEUE_WAIT_S,
+                                  mcp_config_path=agent_cfg.mcp_config_path or "")
     if not adm:
         release_config_seat(sid, agent_cfg)
         raise RuntimeError(adm.user_message)
@@ -194,7 +214,7 @@ async def resume_dead_session_headless(
     tz = get_user_tz(user_sub)
     if tz:
         set_session_user_tz(sid, tz)
-    if not pinned and not is_hard_fail_target(agent_cfg.execution_target):
+    if not pinned and not placement.is_offline_sentinel(agent_cfg.execution_target):
         await asyncio.to_thread(
             task_store.update_chat, chat_id,
             execution_target=agent_cfg.execution_target,
@@ -207,6 +227,6 @@ async def resume_dead_session_headless(
     logger.info(
         "headless_resume: chat %s session %s → %s (resumed=%s, target=%s)",
         chat_id[:8], dead_sid[:8], sid[:8], can_resume,
-        agent_cfg.execution_target or "local",
+        agent_cfg.execution_target or placement.LOCAL,
     )
     return HeadlessSpawn(session_id=sid, layer=resolved_layer, resumed=can_resume)

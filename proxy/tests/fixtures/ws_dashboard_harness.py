@@ -63,10 +63,15 @@ class FakeDashboardWebSocket:
     ``next_frame``/``expect`` await recorded outbound frames in order.
     """
 
-    def __init__(self, cookie: str | None):
+    def __init__(self, cookie: str | None, headers: dict[str, str] | None = None):
+        from starlette.datastructures import URL, Headers
         self.cookies: dict[str, str] = {}
         if cookie is not None:
             self.cookies["session"] = cookie
+        # The handshake's Origin rule reads these; no Origin = a non-browser
+        # client, which every test before the rule was written stands for.
+        self.headers = Headers(headers=headers or {})
+        self.url = URL("ws://testserver/ws/dashboard")
         self.accepted = False
         self.closed: tuple[int, str] | None = None
         self.sent: list[dict] = []
@@ -181,6 +186,68 @@ class FakeExecutionLayer:
         if getattr(agent_cfg, "security_context", None) is not None:
             set_session_security(sid, agent_cfg.security_context)
 
+    def owns_session(self, sid: str) -> bool:
+        """Registry membership, the way a real layer answers it.
+
+        A session this fake knows about in ANY state — live, dead-process,
+        or merely started — is one it holds, exactly like the real layers'
+        pool dicts (an entry survives its process dying until something
+        pops it).
+        """
+        return (sid in self.alive
+                or sid in self.dead_processes
+                or any(s == sid for s, _ in self.started))
+
+    def capabilities_for(self, sid: str):
+        """A local layer is its own engine — the per-session read answers
+        the same descriptor (the real ABC's default)."""
+        return self.capabilities
+
+    def local_session_ids(self) -> list[str]:
+        return sorted(
+            self.alive | self.dead_processes | {s for s, _ in self.started}
+        )
+
+    # --- The config dir and the interactive resume (phase 6) --------------
+    # The builders reach the registered layer for its config dir; the fake
+    # answers the way the CLI layer does, through the (harness-patched)
+    # builder. The warmup asks the engine whether an interactive spawn
+    # resumes; the fake keeps the warmup's flag, like the ABC default.
+
+    def prepare_config_dir(self, agent_name: str, *, username: str = "",
+                           scope: str = "user", external_home=None,
+                           no_shell: bool = False, read_only: bool = False):
+        from core.layers.cli import config_dir as cli_cd
+        return cli_cd.ensure_persistent_claude_dir(
+            agent_name, username=username, scope=scope)
+
+    def resumes_interactive(self, config) -> bool:
+        return config.resume
+
+    # --- The credential / usage adapter (engine-contract phase 3) ---------
+    # The harness stubs resolve_subscription_env, so none of these is reached
+    # in a dashboard test; they exist so a path that DOES reach the registered
+    # layer's adapter fails with a clear assertion, not an AttributeError
+    # swallowed into an ``error`` frame.
+
+    def subscription_env(self, handle) -> dict[str, str]:
+        return {}
+
+    def credential_file_payload(self, access_token, expires_at_ms, stored):
+        return None
+
+    def credential_file_from_env(self, env: dict):
+        return None
+
+    def usage_scope_key(self, model: str) -> str:
+        return ""
+
+    def record_usage_event(self, session_id: str, payload) -> None:
+        return None
+
+    async def on_subscriptions_changed(self) -> None:
+        return None
+
     async def is_session_alive(self, sid: str) -> bool:
         return sid in self.alive
 
@@ -294,9 +361,10 @@ class FakeInteractiveSession:
         # re-attach paths for the warmup_ready turn_open field).
         return self._turn_open
 
-    def add_output_listener(self, listener, on_evict=None) -> bytes:
+    def add_output_listener(self, listener, on_evict=None, on_close=None) -> bytes:
         self.output_listener = listener
         self.evict_cb = on_evict
+        self.close_cb = on_close
         return self.scrollback
 
     def remove_output_listener(self, listener) -> None:
@@ -347,8 +415,9 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     from storage import remote_store
     monkeypatch.setattr(remote_store, "resolve_execution_target",
                         lambda *a, **k: ("local", None))
-    monkeypatch.setattr(remote_store, "get_target_metadata",
-                        lambda *a, **k: ("local", "Local"))
+    from core import placement as _placement
+    monkeypatch.setattr(remote_store, "placement_of",
+                        lambda *a, **k: _placement.LOCAL_PLACEMENT)
 
     from core.config import config_builder as cb
     monkeypatch.setattr(cb.mcp_registry, "build_session_mcp_config",
@@ -367,14 +436,15 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     monkeypatch.setattr(cfg, "get_cli_model", lambda *a, **k: TEST_MODEL)
     monkeypatch.setattr(cfg, "get_cli_effort", lambda *a, **k: "")
 
-    import core.sandbox.session_config_dir as scd
+    import core.layers.cli.config_dir as cli_cd
+    import core.layers.codex.config_dir as codex_cd
 
-    def _fake_persistent_dir(agent_name, *, username="", scope="user"):
+    def _fake_persistent_dir(agent_name, *, username="", scope="user", **kw):
         d = cfg.AGENTS_DIR / agent_name / ".test-persistent"
         d.mkdir(parents=True, exist_ok=True)
         return d
-    monkeypatch.setattr(scd, "ensure_persistent_claude_dir", _fake_persistent_dir)
-    monkeypatch.setattr(scd, "ensure_persistent_codex_dir", _fake_persistent_dir)
+    monkeypatch.setattr(cli_cd, "ensure_persistent_claude_dir", _fake_persistent_dir)
+    monkeypatch.setattr(codex_cd, "ensure_persistent_codex_dir", _fake_persistent_dir)
 
     # The cross-layer model guard consults the layer's served models; the
     # switch_engine gate additionally requires `enabled` (admin disables).
@@ -405,6 +475,8 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     monkeypatch.setattr(conc, "acquire_chat_slot", _admit)
     monkeypatch.setattr(conc, "release_chat_slot",
                         slots.released.append)
+    # A pre-warm asks the ledger for room first; uninitialised, it says no.
+    monkeypatch.setattr(conc, "prewarm_allowed", lambda *a, **kw: True)
     return slots
 
 
@@ -491,6 +563,7 @@ async def warm_new_chat(ws: FakeDashboardWebSocket, layer: FakeExecutionLayer,
     started = await ws.expect({
         "type": "warmup_started", "chat_id": ANY, "agent": slug,
         "execution_path": "claude-code-cli", "execution_target": "local",
+        "new_chat": True,
     })
     await ws.expect({"type": "notification_count", "count": 0})
     if caller_gate is None:

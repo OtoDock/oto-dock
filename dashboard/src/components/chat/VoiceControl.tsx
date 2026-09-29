@@ -9,7 +9,8 @@
 //     talk; the engine cuts TTS and takes the interjection). The toggle
 //     slides out when the mic engages (same choreography the old headphones
 //     toggle had) or whenever a session is live; slide-left on the mic is
-//     the fast enable. While active, the mic button is a MUTE TOGGLE
+//     the fast enable; HOLD the mic (or right-click it) for the dictation
+//     language menu. While active, the mic button is a MUTE TOGGLE
 //     (operator UX decision 2026-08-12 — the old tap-to-barge-in stop
 //     square is gone; spoken barge-in and the chat's red Stop cover it) and
 //     the live transcript renders in the composer through the dictation
@@ -19,11 +20,17 @@
 // is gone — full duplex replaced it. Dictation is the only client-side speech
 // capture left; everything conversational lives server-side.
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSpeechSession } from '../../hooks/useSpeechSession'
 import { MicGlyph } from './MicGlyph'
+import { SttLanguageMenu } from './SttLanguageMenu'
 
 const SLIDE_PX = 36          // horizontal drag to enable duplex mode
+// Hold-for-the-language: the platform's long-press constants (useLongPress).
+// A slide moves past HOLD_MOVE_PX long before SLIDE_PX, so it always disarms
+// the hold first and keeps working.
+const HOLD_MS = 500
+const HOLD_MOVE_PX = 8
 
 export interface DuplexControlProps {
   available: boolean           // capability.duplex.available (server, fail-closed)
@@ -71,7 +78,13 @@ export function VoiceControl({
 }: VoiceControlProps) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const errorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const dragRef = useRef<{ x: number; slid: boolean } | null>(null)  // slide-to-enable gesture
+  // The current gesture: a slide-to-enable or a hold consumes it, so the
+  // trailing click never toggles dictation.
+  const dragRef = useRef<{ x: number; slid: boolean; held: boolean } | null>(null)
+  const holdRef = useRef<{ timer: ReturnType<typeof setTimeout>; x: number; y: number } | null>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const [menuOpen, setMenuOpen] = useState(false)
+  const closeMenu = useCallback(() => setMenuOpen(false), [])
   const interruptMounted = useRef(false)
   const discardMounted = useRef(false)
   const captionShownRef = useRef(false)
@@ -82,6 +95,7 @@ export function VoiceControl({
     errorTimer.current = setTimeout(() => setErrorMsg(null), 7000)
   }
   useEffect(() => () => { if (errorTimer.current) clearTimeout(errorTimer.current) }, [])
+  useEffect(() => () => { if (holdRef.current) clearTimeout(holdRef.current.timer) }, [])
 
   const speech = useSpeechSession({
     onInterim: onDictateInterim,
@@ -178,14 +192,35 @@ export function VoiceControl({
     speech.toggle()
   }
 
-  // Slide-left on the mic starts a duplex conversation (fast path on mobile).
+  const disarmHold = () => {
+    if (!holdRef.current) return
+    clearTimeout(holdRef.current.timer)
+    holdRef.current = null
+  }
+  const openMenu = () => {
+    disarmHold()
+    if (dragRef.current) dragRef.current.held = true
+    setMenuOpen(true)
+  }
+
+  // Slide-left on the mic starts a duplex conversation (fast path on mobile);
+  // a hold opens the dictation-language menu. Pointer events cover mouse and
+  // touch alike (the button is touch-none).
   const onPointerDown = (e: React.PointerEvent) => {
-    dragRef.current = { x: e.clientX, slid: false }
+    dragRef.current = { x: e.clientX, slid: false, held: false }
     try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    disarmHold()
+    if (disabled) return
+    holdRef.current = {
+      x: e.clientX, y: e.clientY,
+      timer: setTimeout(() => { holdRef.current = null; openMenu() }, HOLD_MS),
+    }
   }
   const onPointerMove = (e: React.PointerEvent) => {
+    const h = holdRef.current
+    if (h && (Math.abs(e.clientX - h.x) > HOLD_MOVE_PX || Math.abs(e.clientY - h.y) > HOLD_MOVE_PX)) disarmHold()
     const d = dragRef.current
-    if (!d || d.slid) return
+    if (!d || d.slid || d.held) return
     if (duplex?.available && !duplex.active && d.x - e.clientX > SLIDE_PX) {
       d.slid = true
       speech.stop(true)
@@ -193,10 +228,17 @@ export function VoiceControl({
     }
   }
   const onMicClick = () => {
-    const slid = dragRef.current?.slid
+    const d = dragRef.current
     dragRef.current = null
-    if (slid) return  // was a slide-to-enable, not a tap
+    if (d?.slid || d?.held) return  // was a slide-to-enable or a hold, not a tap
+    if (menuOpen) { setMenuOpen(false); return }  // a tap on the trigger closes the menu
     onMicTap()
+  }
+  // Desktop right-click is the mouse equivalent of the hold; on Android the
+  // native long-press menu fires the same event and is suppressed here.
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (!disabled) openMenu()
   }
 
   const dupMuted = !!duplex?.muted
@@ -205,7 +247,7 @@ export function VoiceControl({
     : dupPhase ? 'Tap to mute the mic'
     : connecting ? 'Connecting…'
     : recording ? 'Stop dictation'
-    : 'Dictate'
+    : 'Dictate (hold for the language)'
 
   const micClass = dupPhase && dupMuted
     // Muted: the slashed glyph alone — no background chip (operator
@@ -219,7 +261,8 @@ export function VoiceControl({
     : 'text-p-text-secondary hover:text-brand hover:bg-brand/5'
 
   return (
-    <div className="relative flex items-center shrink-0">
+    <div ref={wrapRef} className="relative flex items-center shrink-0">
+      <SttLanguageMenu open={menuOpen} onClose={closeMenu} anchorRef={wrapRef} duplexActive={dupActive} />
       {duplex && duplex.phase === 'error' && duplex.endReason && !errorMsg && (
         <div
           role="alert"
@@ -270,9 +313,16 @@ export function VoiceControl({
         onClick={onMicClick}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
+        onPointerUp={disarmHold}
+        onPointerCancel={disarmHold}
+        onPointerLeave={disarmHold}
+        onContextMenu={onContextMenu}
         disabled={disabled}
         title={micTitle}
         aria-pressed={dupPhase ? dupMuted : undefined}
+        // iOS: no callout on the hold; the text-selection lock keeps the
+        // glyph from highlighting under a long press.
+        style={{ WebkitTouchCallout: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
         className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors shrink-0 touch-none
           disabled:cursor-not-allowed ${micClass}`}
       >

@@ -10,18 +10,32 @@ the core data structures and path RBAC it builds on live in
 import base64
 import contextlib
 import ipaddress
+import posixpath
 import re
 import shlex
 import urllib.parse
 
 from auth.path_policy import (
+    TIER_ADMIN,
+    TIER_EDIT,
+    TIER_EXTENDED,
+    TIER_READ,
     PathDecision,
     SecurityContext,
     _ALLOW,
     _check_path_arg,
     _check_remote_bash_path,
+    _check_remote_protected_path,
+)
+from auth.path_shell_subst import (
+    backtick_end,
+    has_placeholder,
+    heredoc_line_commands,
+    lift_substitutions,
+    subst_end,
 )
 from core.session.external_identity import is_external_ctx
+from auth import roles
 
 # Hostnames always treated as private (no DNS resolution needed)
 _PRIVATE_HOSTNAMES = {"localhost"}
@@ -135,13 +149,13 @@ _BASH_TIER_ADMIN: set[str] = {
 # Combined lookup: command name -> tier string
 _BASH_COMMAND_TIER: dict[str, str] = {}
 for _cmd in _BASH_TIER_READ:
-    _BASH_COMMAND_TIER[_cmd] = "read"
+    _BASH_COMMAND_TIER[_cmd] = TIER_READ
 for _cmd in _BASH_TIER_EDIT:
-    _BASH_COMMAND_TIER[_cmd] = "edit"
+    _BASH_COMMAND_TIER[_cmd] = TIER_EDIT
 for _cmd in _BASH_TIER_EXTENDED:
-    _BASH_COMMAND_TIER[_cmd] = "extended"
+    _BASH_COMMAND_TIER[_cmd] = TIER_EXTENDED
 for _cmd in _BASH_TIER_ADMIN:
-    _BASH_COMMAND_TIER[_cmd] = "admin"
+    _BASH_COMMAND_TIER[_cmd] = TIER_ADMIN
 
 # Tier ordering for "max tier across segments"
 # "ask" ties "extended": both prompt in default/acceptEdits and run in
@@ -156,7 +170,11 @@ _TIER_ORDER: dict[str, int] = {"": 0, "read": 1, "edit": 2, "extended": 3, "ask"
 # ---------------------------------------------------------------------------
 
 _DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # Recursive force-delete at root or home
+    # Recursive force-delete at root or home. The target ends at the end of
+    # the string or at a separator: a newline is deliberately not one here,
+    # because the raw scan also sees heredoc DATA lines — the multi-line
+    # forms (`rm -rf /` followed by a line, `rm -rf \<newline>/`) are
+    # caught by the per-segment scan in _check_command_string instead.
     (re.compile(
         r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r"
         r"|--recursive\s+--force|--force\s+--recursive)"
@@ -177,19 +195,24 @@ _DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Kernel module operations
     (re.compile(r"\b(insmod|modprobe|rmmod)\b"), "Kernel module operations blocked"),
 
-    # Sensitive file reads
-    (re.compile(r"\bcat\b.*\b/etc/shadow\b"), "Reading /etc/shadow blocked"),
+    # Sensitive file reads. A `\b` before the leading slash needs a word
+    # character before it, which a space or a quote is not.
+    (re.compile(r"\bcat\b.*(?<![\w/])/etc/shadow\b"), "Reading /etc/shadow blocked"),
 ]
 
-# Bash's network pseudo-devices are sockets, not files: they are governed by
-# the sandbox network namespace locally (the LAN is blackholed there, exactly
-# as for curl) and by the operator's pairing decision on a satellite — never
-# by the path gate, and they are not a catastrophe-floor matter.
-_NETWORK_PSEUDO_PREFIXES = ("/dev/tcp/", "/dev/udp/")
+# Redirect targets that are not files: the null device and the standard
+# streams (``/dev/fd/N`` is the same object as a numbered stream), and Bash's
+# network pseudo-devices, which are sockets governed by the sandbox network
+# namespace locally (the LAN is blackholed there, exactly as for curl) and by
+# the operator's pairing decision on a satellite. None of them goes through
+# the path gate (on a satellite the home band would deny ``< /dev/null``),
+# and none is a catastrophe-floor matter.
+_PSEUDO_PATHS = frozenset({"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"})
+_PSEUDO_PREFIXES = ("/dev/fd/", "/dev/tcp/", "/dev/udp/")
 
 
-def _is_network_pseudo_path(rp: str) -> bool:
-    return rp.startswith(_NETWORK_PSEUDO_PREFIXES)
+def _is_pseudo_path(rp: str) -> bool:
+    return rp in _PSEUDO_PATHS or rp.startswith(_PSEUDO_PREFIXES)
 
 # ---------------------------------------------------------------------------
 # Path extraction categories for Bash commands
@@ -219,6 +242,14 @@ _WRITE_PATH_COMMANDS: set[str] = {
 
 # Source/dest: last positional = write, rest = read
 _COPY_COMMANDS: set[str] = {"cp", "mv", "ln", "install", "rsync"}
+
+# Copy-family flags whose value is the next token (never a path operand).
+_COPY_VALUE_FLAGS: dict[str, set[str]] = {
+    "cp": {"-S", "--suffix"},
+    "mv": {"-S", "--suffix"},
+    "ln": {"-S", "--suffix"},
+    "install": {"-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g", "--group"},
+}
 
 # First positional is a pattern (not a path), rest are read paths
 _GREP_COMMANDS: set[str] = {"grep", "egrep", "fgrep"}
@@ -295,8 +326,11 @@ _VALUE_FLAGS_BY_CMD: dict[str, set[str]] = {
 #   * An unknown command → tier "ask" (prompt in default/acceptEdits, run in
 #     dontAsk/auto) — never a hard-deny.
 #   * Sub-shell wrappers + prefix wrappers are UNWRAPPED and the inner command
-#     is re-checked; command-substitution `$(…)`/`` `…` ``/`<(…)` makes a
-#     segment "ask" (unanalyzable) after its inner is recursively checked.
+#     is re-checked; a command substitution `$(…)`/`` `…` ``/`<(…)` is lifted
+#     out (auth/path_shell_subst.py), its inner recursively checked, and the
+#     outer command classified with a placeholder in its place — its literal
+#     paths still checked, its tier at least "ask" (the substituted value
+#     feeds it).
 
 # Recursion cap for unwrap / command-substitution nesting (pathological input).
 _MAX_BASH_DEPTH = 8
@@ -382,9 +416,13 @@ def _split_command_segments(command: str) -> list[str]:
     """Split a shell command on unquoted ;, &&, ||, |, and newlines into segments.
 
     Heredoc bodies (``cmd <<DELIM`` … ``DELIM``) are stdin DATA, not commands —
-    they are consumed here and never become segments. Exception: when the
-    receiving line names a shell (``bash <<EOF`` executes its stdin), body
-    lines keep per-line classification so the dangerous floor still sees them.
+    they are consumed here and never become segments. Two exceptions: when
+    the receiving line names a shell (``bash <<EOF`` executes its stdin),
+    body lines keep per-line classification so the dangerous floor still
+    sees them; and when the delimiter is unquoted the shell expands the
+    body, so every ``$(…)`` and backtick substitution in it becomes its own
+    segment (a quoted delimiter, ``<<'EOF'`` or ``<<\\EOF``, keeps the body
+    literal).
 
     Returns a list of stripped, non-empty command strings.
     Raises ValueError on unclosed quotes.
@@ -395,14 +433,26 @@ def _split_command_segments(command: str) -> list[str]:
     in_single = False
     in_double = False
     # Heredocs declared on the current line, in order: (delimiter, strip_tabs
-    # for <<-, body-is-shell). Bodies start after the line's newline.
-    pending_heredocs: list[tuple[str, bool, bool]] = []
+    # for <<-, body-is-shell, body-expands). Bodies start after the line's
+    # newline.
+    pending_heredocs: list[tuple[str, bool, bool, bool]] = []
 
     while i < len(command):
         ch = command[i]
 
-        # Backslash escape (outside single quotes)
+        # Backslash escape (outside single quotes). A backslash-newline pair
+        # is a line continuation: the shell removes both (inside double
+        # quotes too), so the segment continues on the next line — keeping
+        # the pair left a dangling backslash at the end of the segment when
+        # the next line opened with a pipe, and every later shlex pass
+        # failed on it.
         if ch == "\\" and not in_single and i + 1 < len(command):
+            if command[i + 1] == "\n":
+                i += 2
+                continue
+            if command[i + 1:i + 3] == "\r\n":
+                i += 3
+                continue
             current.append(ch)
             current.append(command[i + 1])
             i += 2
@@ -420,28 +470,29 @@ def _split_command_segments(command: str) -> list[str]:
             i += 1
             continue
 
+        # A command substitution is consumed whole: a `|`, `;`, `&&` or a
+        # newline inside it belongs to the inner command, and the quoting
+        # context restarts inside it (a `'` inside `"…"` is literal, a `$(`
+        # inside `"…"` is not). ``$((…))`` rides the same scan, so a `<<`
+        # bit shift can't read as a heredoc operator.
+        if not in_single and (
+            command[i:i + 2] == "$("
+            or (not in_double and command[i:i + 2] in ("<(", ">("))
+        ):
+            end, _closed = subst_end(command, i)
+            current.append(command[i:end])
+            i = end
+            continue
+        if ch == "`" and not in_single:
+            end, _closed = backtick_end(command, i)
+            current.append(command[i:end])
+            i = end
+            continue
+
         # Inside quotes: consume literally
         if in_single or in_double:
             current.append(ch)
             i += 1
-            continue
-
-        # $((…)) arithmetic — consume atomically so `<<` inside (bit shift)
-        # can't read as a heredoc operator and swallow the following lines.
-        if ch == "$" and command[i:i + 3] == "$((":
-            depth = 0
-            k = i + 1
-            while k < len(command):
-                if command[k] == "(":
-                    depth += 1
-                elif command[k] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        k += 1
-                        break
-                k += 1
-            current.append(command[i:k])
-            i = k
             continue
 
         # <<< here-string: an inline word, not a heredoc — pass through.
@@ -462,6 +513,7 @@ def _split_command_segments(command: str) -> list[str]:
             while k < len(command) and command[k] in " \t":
                 k += 1
             delim: str | None = None
+            expands = False  # an unquoted delimiter: the body is expanded
             if k < len(command) and command[k] in "'\"":
                 q = command[k]
                 end = command.find(q, k + 1)
@@ -473,6 +525,7 @@ def _split_command_segments(command: str) -> list[str]:
                 while m < len(command) and command[m] not in " \t\n\r;|&<>()`":
                     m += 1
                 if m > k:
+                    expands = "\\" not in command[k:m]
                     delim = command[k:m].replace("\\", "")
                     k = m
             # Digit/`$`-leading "delimiters" are almost certainly arithmetic
@@ -483,7 +536,7 @@ def _split_command_segments(command: str) -> list[str]:
                 body_is_shell = any(
                     t.rsplit("/", 1)[-1] in _SHELL_DASH_C for t in line_tokens
                 )
-                pending_heredocs.append((delim, strip_tabs, body_is_shell))
+                pending_heredocs.append((delim, strip_tabs, body_is_shell, expands))
                 current.append(command[i:k])
                 i = k
                 continue
@@ -495,9 +548,9 @@ def _split_command_segments(command: str) -> list[str]:
         # A newline / carriage-return is a statement separator: without this,
         # the later lines of a multi-line command inherit the FIRST line's
         # tier / path / role classification (shlex collapses \n to whitespace),
-        # which is a gate bypass on remote / no-bwrap execution. Escaped
-        # newlines (\<newline>) are consumed by the backslash handler above, so
-        # genuine line continuations are preserved.
+        # which is a gate bypass on remote / no-bwrap execution. A line
+        # continuation (\<newline>) was already joined by the backslash
+        # handler above, so it never reaches this branch.
         if ch == "\n" or ch == "\r":
             seg = "".join(current).strip()
             if seg:
@@ -506,8 +559,9 @@ def _split_command_segments(command: str) -> list[str]:
             i += 1
             # Heredoc bodies follow this line: consume each queued one up to
             # its terminator line. Data bodies vanish; shell bodies keep
-            # per-line classification (appended as segments).
-            for delim, strip_tabs, body_is_shell in pending_heredocs:
+            # per-line classification (appended as segments); an expanded
+            # body contributes each of its substitutions as a segment.
+            for delim, strip_tabs, body_is_shell, expands in pending_heredocs:
                 while i < len(command):
                     nl = command.find("\n", i)
                     line = command[i:nl] if nl != -1 else command[i:]
@@ -521,6 +575,8 @@ def _split_command_segments(command: str) -> list[str]:
                         body_seg = line.strip()
                         if body_seg:
                             segments.append(body_seg)
+                    elif expands:
+                        segments.extend(heredoc_line_commands(line))
             pending_heredocs = []
             continue
         if ch == ";":
@@ -803,14 +859,56 @@ def _extract_path_args(
                 write_paths.append(arg)
 
     elif cmd_name in _COPY_COMMANDS:
-        # Last non-flag = destination (write), rest = sources (read)
-        positional = [a for a in args if not a.startswith("-")]
-        if len(positional) >= 2:
-            for p in positional[:-1]:
-                read_paths.append(p)
-            write_paths.append(positional[-1])
-        elif len(positional) == 1:
-            write_paths.append(positional[0])
+        # Last non-flag = destination (write), rest = sources (read), unless
+        # `-t DIR` / `--target-directory=DIR` names the destination up front
+        # (not rsync, where -t is --times). A directory destination receives
+        # DEST/<basename of each source>, so that path is write-checked too:
+        # the literal DEST alone would let `cp x/settings.json .claude` past
+        # the protected-file check. `mv` removes its sources: writes as well.
+        value_flags = _COPY_VALUE_FLAGS.get(cmd_name, set())
+        takes_target = cmd_name != "rsync"
+        positional: list[str] = []
+        target_dir: str | None = None
+        expect: str | None = None
+        options_done = False
+        for arg in args:
+            if expect is not None:
+                if expect == "target":
+                    target_dir = arg
+                expect = None
+                continue
+            if options_done or not arg.startswith("-") or arg == "-":
+                positional.append(arg)
+            elif arg == "--":
+                options_done = True
+            elif takes_target and arg == "--target-directory":
+                expect = "target"
+            elif takes_target and arg.startswith("--target-directory="):
+                target_dir = arg.split("=", 1)[1]
+            elif arg in value_flags:
+                expect = "value"
+            elif takes_target and not arg.startswith("--") and "t" in arg[1:]:
+                # A short cluster: `-t DIR`, `-rt DIR`, `-tDIR`.
+                rest = arg[arg.index("t", 1) + 1:]
+                if rest:
+                    target_dir = rest
+                else:
+                    expect = "target"
+        if target_dir is not None:
+            sources, dest = positional, target_dir
+        elif len(positional) >= 2:
+            sources, dest = positional[:-1], positional[-1]
+        else:
+            sources, dest = [], (positional[0] if positional else None)
+        read_paths.extend(sources)
+        if cmd_name == "mv":
+            write_paths.extend(sources)
+        if dest is not None:
+            write_paths.append(dest)
+            for src in sources:
+                base = posixpath.basename(src.rstrip("/"))
+                if base.strip("."):  # no basename for `.` / `..`
+                    write_paths.append(posixpath.join(dest, base))
 
     elif cmd_name in _INPLACE_FLAG_COMMANDS:
         flag = _INPLACE_FLAG_COMMANDS[cmd_name]
@@ -845,56 +943,6 @@ def _extract_path_args(
                 read_paths.append(args[i + 1])
 
     return read_paths, write_paths
-
-
-def _extract_substitution_inners(segment: str) -> tuple[list[str], bool]:
-    """Find command-substitution inners: ``$(…)`` / `` `…` `` / ``<(…)`` /
-    ``>(…)``. Returns (inner command strings, found_any). Single-quoted spans
-    are literal (skipped). Paren-balanced so nested ``$( … $(…) … )`` returns
-    the full outer inner (re-scanned on recursion). ``${VAR}`` is var expansion,
-    NOT a command substitution — ignored."""
-    inners: list[str] = []
-    found = False
-    i, n = 0, len(segment)
-    in_single = False
-    while i < n:
-        ch = segment[i]
-        if ch == "\\" and not in_single and i + 1 < n:
-            i += 2
-            continue
-        if ch == "'":
-            in_single = not in_single
-            i += 1
-            continue
-        if in_single:
-            i += 1
-            continue
-        if segment[i:i + 2] in ("$(", "<(", ">("):
-            depth = 0
-            j = i + 1  # points at '('
-            start = i + 2
-            while j < n:
-                if segment[j] == "(":
-                    depth += 1
-                elif segment[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            inners.append(segment[start:j])
-            found = True
-            i = j + 1
-            continue
-        if ch == "`":
-            j = segment.find("`", i + 1)
-            if j == -1:
-                break
-            inners.append(segment[i + 1:j])
-            found = True
-            i = j + 1
-            continue
-        i += 1
-    return inners, found
 
 
 def _drop_leading_tokens(s: str, count: int) -> str:
@@ -1025,8 +1073,8 @@ def _strip_shell_structure(segment: str) -> str:
     ``if ! grep …`` — repeated until stable) and ``case`` labels (``a) cat
     f``). Returns "" when the segment was nothing but structure (``do``,
     ``then``, ``(``). ``((…))`` arithmetic is returned whole (structural,
-    nothing runs; the caller handles it). ``$(…)`` never reaches here — a
-    substitution makes the caller return "ask" before this runs."""
+    nothing runs; the caller handles it). A ``$(…)`` never reaches here —
+    the caller lifted it into a placeholder token first."""
     s = segment.strip()
     while s:
         if s.startswith("(("):
@@ -1082,25 +1130,31 @@ def _find_has_delete(segment: str) -> bool:
         return False
 
 
-def _find_exec_inner(segment: str) -> str | None:
-    """For ``find … -exec CMD … ;|+``, return the inner ``CMD …`` string."""
+_FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_exec_inners(segment: str) -> list[str]:
+    """For ``find … -exec CMD … ;|+``, every clause's inner ``CMD …`` string,
+    in order: a line may run several, and each carries its own tier."""
     try:
         tokens = shlex.split(segment)
     except ValueError:
-        return None
-    for flag in ("-exec", "-execdir", "-ok", "-okdir"):
-        if flag in tokens:
-            k = tokens.index(flag)
-            cut: list[str] = []
-            for t in tokens[k + 1:]:
-                if t in (";", "+", "\\;"):
-                    break
-                if t == "{}":
-                    continue
-                cut.append(t)
-            if cut:
-                return " ".join(shlex.quote(t) for t in cut)
-    return None
+        return []
+    inners: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] not in _FIND_EXEC_FLAGS:
+            i += 1
+            continue
+        cut: list[str] = []
+        i += 1
+        while i < len(tokens) and tokens[i] not in (";", "+", "\\;"):
+            if tokens[i] != "{}":
+                cut.append(tokens[i])
+            i += 1
+        if cut:
+            inners.append(" ".join(shlex.quote(t) for t in cut))
+    return inners
 
 
 def _extract_input_redirects(segment: str) -> list[str]:
@@ -1144,13 +1198,37 @@ def _extract_input_redirects(segment: str) -> list[str]:
     return targets
 
 
+_PATH_TOKEN_PREFIXES = ("/", "~", "./", "../")
+
+
+def _path_looking_tokens(segment: str) -> list[str]:
+    """The tokens of a segment shlex refused that could be paths: every
+    whitespace-delimited word with a path prefix (surrounding quotes and a
+    dangling backslash stripped) plus every redirect target. The direction
+    is unknown, so the caller checks them all as writes."""
+    found: list[str] = []
+    for word in segment.split():
+        tok = word.strip("'\"").rstrip("\\")
+        if tok.startswith(_PATH_TOKEN_PREFIXES):
+            found.append(tok)
+    found.extend(_extract_redirect_targets(segment))
+    found.extend(_extract_input_redirects(segment))
+    return found
+
+
 def _classify_segment(
     segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
     dangerous_only: bool = False,
 ) -> PathDecision:
     """Classify one pipeline segment → PathDecision(allowed, permission_tier,
-    destructive). Recurses into command substitutions + wrappers (depth-capped
-    by the caller).
+    destructive). Command substitutions are lifted out first: each inner is
+    checked on its own through the full recursion (dangerous scan, tiers,
+    paths), then the outer command is classified with a placeholder token in
+    each substitution's place — its literal paths are still checked, a path
+    token that carries a placeholder is never checked (it is not a literal),
+    and the segment's tier is at least "ask", since the substituted value
+    feeds the outer command. A placeholder the agent typed itself gets the
+    same floor, so the marker can never buy an auto-allow.
 
     ``dangerous_only`` = the admin catastrophe-floor pass: still recurse through
     substitutions / wrappers / ``find -exec`` so the dangerous scan (in
@@ -1158,18 +1236,9 @@ def _classify_segment(
     admin-role-gate / cross-user PATH checks — an admin-on-admin agent is
     unrestricted beyond the irreversible-catastrophe floor. Allows anything the
     floor doesn't deny."""
-
-    def _bash_path_decision(rp: str, *, writing: bool) -> PathDecision:
-        if is_remote:
-            return _check_remote_bash_path(rp, ctx, writing=writing)
-        return _check_path_arg(rp, ctx, writing=writing)
-
-    # 1. Command substitutions — recurse the inner (carries the dangerous scan); a
-    #    present substitution makes the OUTER command unanalyzable (the substituted
-    #    value feeds the outer) → "ask" (prompt in default/acceptEdits, run dontAsk).
-    inner_cmds, has_subst = _extract_substitution_inners(segment)
+    lifted, inners = lift_substitutions(segment)
     sub_tier, sub_destructive = "read", False
-    for inner in inner_cmds:
+    for inner in inners:
         if not inner.strip():
             continue
         r = _check_command_string(inner, ctx, is_remote=is_remote, depth=depth + 1,
@@ -1180,13 +1249,62 @@ def _classify_segment(
         if _TIER_ORDER.get(t, 0) > _TIER_ORDER.get(sub_tier, 0):
             sub_tier = t
         sub_destructive = sub_destructive or r.destructive
-    if has_subst:
-        if dangerous_only:
-            return PathDecision(allowed=True, permission_tier="read")
-        tier = "ask"
-        if _TIER_ORDER.get(sub_tier, 0) > _TIER_ORDER.get(tier, 0):
-            tier = sub_tier
-        return PathDecision(allowed=True, permission_tier=tier, destructive=sub_destructive)
+    if inners:
+        # The lifted text is a new normalised form of the segment: the
+        # catastrophe floor runs on it like on every other one.
+        for pattern, reason in _DANGEROUS_PATTERNS:
+            if pattern.search(lifted):
+                return PathDecision(False, f"Bash denied: {reason}")
+    outer = _classify_command(lifted, ctx, is_remote=is_remote, depth=depth,
+                              dangerous_only=dangerous_only)
+    if not outer.allowed or dangerous_only:
+        return outer
+    if not inners and not has_placeholder(segment):
+        return outer
+    tier = "ask"
+    for t in (outer.permission_tier or "read", sub_tier):
+        if _TIER_ORDER.get(t, 0) > _TIER_ORDER.get(tier, 0):
+            tier = t
+    return PathDecision(allowed=True, permission_tier=tier,
+                        destructive=outer.destructive or sub_destructive)
+
+
+def _remote_protected_denial(
+    cmd_name: str | None, segment: str, ctx: SecurityContext,
+) -> PathDecision | None:
+    """The admin floor's one path check on a machine: every path argument
+    (when ``cmd_name`` names a command), redirect target and input redirect
+    of the segment goes through the remote resolver, and a path it marks
+    protected is refused. The tier, the role gate and the home band stay
+    skipped for that admin."""
+    reads: list[str] = []
+    writes: list[str] = []
+    if cmd_name:
+        r, w = _extract_path_args(cmd_name, segment)
+        reads.extend(r)
+        writes.extend(w)
+    writes.extend(_extract_redirect_targets(segment))
+    reads.extend(_extract_input_redirects(segment))
+    for rp, writing in [(p, False) for p in reads] + [(p, True) for p in writes]:
+        if _is_pseudo_path(rp) or has_placeholder(rp):
+            continue
+        d = _check_remote_protected_path(rp, ctx, writing=writing)
+        if d is not None:
+            return PathDecision(False, f"Bash denied: path '{rp}': {d.reason}")
+    return None
+
+
+def _classify_command(
+    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    dangerous_only: bool = False,
+) -> PathDecision:
+    """Classify a segment whose substitutions were already lifted: shell
+    structure, wrappers, the command's tier, role gate and path arguments."""
+
+    def _bash_path_decision(rp: str, *, writing: bool) -> PathDecision:
+        if is_remote:
+            return _check_remote_bash_path(rp, ctx, writing=writing)
+        return _check_path_arg(rp, ctx, writing=writing)
 
     def _structural_decision(seg: str) -> PathDecision:
         """Read-tier decision for a segment that runs no command — but the
@@ -1195,27 +1313,31 @@ def _classify_segment(
         command's. ``[[ … ]]`` and ``(( … ))`` are exempt: there ``<``/``>``
         are comparison operators, not redirects."""
         if dangerous_only:
+            if is_remote:
+                denied = _remote_protected_denial(None, seg, ctx)
+                if denied is not None:
+                    return denied
             return PathDecision(allowed=True, permission_tier="read")
         head = seg.lstrip()
         if head.startswith("[[") or head.startswith("(("):
             return PathDecision(allowed=True, permission_tier="read")
         tier = "read"
         for rp in _extract_redirect_targets(seg):
-            if rp == "/dev/null" or _is_network_pseudo_path(rp):
+            if _is_pseudo_path(rp) or has_placeholder(rp):
                 continue
             d = _bash_path_decision(rp, writing=True)
             if not d.allowed:
                 return PathDecision(False, f"Bash denied: redirect target '{rp}' — {d.reason}")
             tier = "edit"
         for rp in _extract_input_redirects(seg):
-            if _is_network_pseudo_path(rp):
+            if _is_pseudo_path(rp) or has_placeholder(rp):
                 continue
             d = _bash_path_decision(rp, writing=False)
             if not d.allowed:
                 return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
         return PathDecision(allowed=True, permission_tier=tier)
 
-    # 2. Shell structure — subshell parens, leading keywords (``do``/``then``/
+    # 1. Shell structure — subshell parens, leading keywords (``do``/``then``/
     #    ``if``/``!``/``{``) and case labels are peeled off so the command
     #    they wrap is what gets classified (``do rm -rf x`` is destructive,
     #    ``then cat /users/bob/x`` is a cross-user read — both used to hide
@@ -1233,7 +1355,7 @@ def _classify_segment(
                 return PathDecision(False, f"Bash denied: {reason}")
     segment = body
 
-    # 3. Wrappers — recurse on the inner command string, or re-classify the
+    # 2. Wrappers — recurse on the inner command string, or re-classify the
     #    wrapper-stripped remainder.
     kind, inner = _unwrap_segment(segment)
     if kind == "string":
@@ -1243,19 +1365,31 @@ def _classify_segment(
         return _classify_segment(inner, ctx, is_remote=is_remote, depth=depth + 1,
                                  dangerous_only=dangerous_only)
 
-    # 4. Plain command. A segment with no command word (``F=/x``, ``x=1 y=2``,
+    # 3. Plain command. A segment with no command word (``F=/x``, ``x=1 y=2``,
     #    ``> out``) is structure — exactly like ``export F=/x`` — not a parse
     #    failure; ``((…))`` arithmetic runs nothing either.
     if segment.startswith("((") or _is_command_less(segment):
         return _structural_decision(segment)
     cmd_name = _extract_command_name(segment)
     if cmd_name is None:
-        # Genuinely unparseable (a dangling backslash, …) ≠ dangerous; the
-        # floor pass lets it through (admin is unrestricted), else keep the
-        # hard parse-deny for non-admin.
+        # Genuinely unparseable (a dangling backslash, an odd quote): the
+        # floor pass lets it through (admin is unrestricted); for everyone
+        # else it is an unknown command, which asks — after every token that
+        # looks like a path is checked, so an unparsable form never reaches
+        # further than a parsable one would.
         if dangerous_only:
             return PathDecision(allowed=True, permission_tier="read")
-        return PathDecision(False, "Bash denied: could not parse command")
+        for tok in _path_looking_tokens(segment):
+            if _is_pseudo_path(tok) or has_placeholder(tok):
+                continue
+            d = _bash_path_decision(tok, writing=True)
+            if not d.allowed:
+                return PathDecision(
+                    False,
+                    f"Bash denied: could not parse command, and it names "
+                    f"'{tok}' — {d.reason}",
+                )
+        return PathDecision(allowed=True, permission_tier="ask")
 
     # Shell control-flow keywords / no-op builtins → structural, read tier
     # (their redirects still checked).
@@ -1265,39 +1399,53 @@ def _classify_segment(
     # find -exec <cmd> — recurse the inner (carries the dangerous scan to it, in
     # BOTH modes) so `find . -exec rm -rf / \;` is dangerous-denied; capture the
     # inner destructiveness for the non-admin tier below.
+    # inner destructiveness and the highest inner tier for the non-admin tier
+    # below: an exec clause never lowers the tier its command has on its own.
     find_exec_destructive = False
+    find_exec_tier = ""
     if cmd_name == "find":
-        exec_inner = _find_exec_inner(segment)
-        if exec_inner:
+        for exec_inner in _find_exec_inners(segment):
             r = _check_command_string(exec_inner, ctx, is_remote=is_remote, depth=depth + 1,
                                       dangerous_only=dangerous_only)
             if not r.allowed:
                 return r
-            find_exec_destructive = r.destructive
+            find_exec_destructive = find_exec_destructive or r.destructive
+            inner_tier = r.permission_tier or "read"
+            if _TIER_ORDER.get(inner_tier, 0) > _TIER_ORDER.get(find_exec_tier, 0):
+                find_exec_tier = inner_tier
 
     # Floor pass: the dangerous scan (in the caller) + the recursions above are the
     # whole check — skip tier / role-gate / path (admin unrestricted beyond it).
+    # On a machine the floor still refuses the paths the remote resolver marks
+    # protected (the machine's own OtoDock state, the OAuth credentials, the
+    # agent's CLI config): those hold for every role, the admin's included.
     if dangerous_only:
+        if is_remote:
+            denied = _remote_protected_denial(cmd_name, segment, ctx)
+            if denied is not None:
+                return denied
         return PathDecision(allowed=True, permission_tier="read")
 
     # ===== Non-admin: tier classification + admin-role-gate + path checks =====
     # Unknown command → "ask" (prompt in default/acceptEdits, run in dontAsk/auto)
     # — NEVER a hard-deny. Known commands keep their tier.
     tier = _BASH_COMMAND_TIER.get(cmd_name) or "ask"
+    if _TIER_ORDER.get(find_exec_tier, 0) > _TIER_ORDER.get(tier, 0):
+        tier = find_exec_tier
 
     # Admin-tier role gating (host-touching ops — docker/systemctl/ssh/apt).
     # Local sandbox: admin only. Remote satellite: open to manager/editor/admin
     # (pairing is a trust act; the path policy is the real boundary there).
-    if tier == "admin":
+    if tier == TIER_ADMIN:
         if is_remote:
-            if ctx.role not in ("admin", "manager", "editor"):
+            if not roles.can_edit(ctx.role):
                 return PathDecision(
                     False,
                     f"Bash denied: '{cmd_name}' is restricted to manager / "
                     f"editor / admin roles on remote satellites (current role: "
                     f"{ctx.role}).",
                 )
-        elif ctx.role not in ("admin",):
+        elif not roles.is_admin(ctx.role):
             return PathDecision(
                 False,
                 f"Bash denied: '{cmd_name}' requires platform admin role on "
@@ -1311,10 +1459,14 @@ def _classify_segment(
 
     read_paths, write_paths = _extract_path_args(cmd_name, segment)
     for rp in read_paths:
+        if has_placeholder(rp):
+            continue
         d = _bash_path_decision(rp, writing=False)
         if not d.allowed:
             return PathDecision(False, f"Bash denied: read path '{rp}' — {d.reason}")
     for rp in write_paths:
+        if has_placeholder(rp):
+            continue
         d = _bash_path_decision(rp, writing=True)
         if not d.allowed:
             return PathDecision(False, f"Bash denied: write path '{rp}' — {d.reason}")
@@ -1322,7 +1474,7 @@ def _classify_segment(
             tier = "edit"
 
     for rp in _extract_redirect_targets(segment):
-        if rp == "/dev/null" or _is_network_pseudo_path(rp):
+        if _is_pseudo_path(rp) or has_placeholder(rp):
             continue
         d = _bash_path_decision(rp, writing=True)
         if not d.allowed:
@@ -1330,7 +1482,7 @@ def _classify_segment(
         if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
             tier = "edit"
     for rp in _extract_input_redirects(segment):
-        if _is_network_pseudo_path(rp):
+        if _is_pseudo_path(rp) or has_placeholder(rp):
             continue
         d = _bash_path_decision(rp, writing=False)
         if not d.allowed:
@@ -1371,6 +1523,12 @@ def _check_command_string(
     max_tier = "read"
     saw_destructive = False
     for segment in segments:
+        # A segment is a normalised form the raw scan never saw: a joined
+        # line continuation (`rm -rf \<newline>/`) or a lifted heredoc
+        # substitution only exist here.
+        for pattern, reason in _DANGEROUS_PATTERNS:
+            if pattern.search(segment):
+                return PathDecision(False, f"Bash denied: {reason}")
         res = _classify_segment(segment, ctx, is_remote=is_remote, depth=depth,
                                 dangerous_only=dangerous_only)
         if not res.allowed:
@@ -1428,7 +1586,7 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     # path args route through path_policy_v2 (home / full-FS for satellite-host,
     # per-role RBAC for in-tree). Local sessions keep agent-tree RBAC (bwrap is
     # the real boundary). Threaded into the recursion via _classify_segment.
-    is_remote = ctx.target_kind in ("admin_remote", "user_remote")
+    is_remote = ctx.placement.is_remote
 
     # Admin on admin agent: unrestricted for normal ops (tier / cross-user PATH
     # checks skipped) EXCEPT the irreversible-catastrophe floor — _DANGEROUS_PATTERNS
@@ -1437,7 +1595,10 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
     # the highest-value prompt-injection target and these patterns are never a
     # legitimate agent-issued action; the admin can still run them by hand on the
     # box. (The cred + agent-config backstops above already ran.)
-    if ctx.is_admin_agent and ctx.role == "admin":
+    # A judge session (CHECKS.md, ``ctx.read_only``) is never fast-pathed:
+    # its gate mode admits the read tier only, so every command must be
+    # classified, an admin's on an admin agent included.
+    if ctx.is_admin_agent and roles.is_admin(ctx.role) and not getattr(ctx, "read_only", False):
         floor = _check_command_string(command, ctx, is_remote=is_remote, depth=0,
                                       dangerous_only=True)
         if not floor.allowed:
@@ -1451,11 +1612,12 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
 # PowerShell tool — command security (cross-platform exec-env hardening)
 # ---------------------------------------------------------------------------
 # Claude Code ships a DISTINCT ``PowerShell`` tool on Windows (and opt-in on
-# Linux/macOS via CLAUDE_CODE_USE_POWERSHELL_TOOL). Without dedicated handling it
-# would hit the ``_ALLOW`` catch-all in check_tool_access → NO dangerous-deny, NO
-# cross-user path check, NO credential / agent-config backstop — i.e. in
-# dontAsk/auto (tasks + phone) fully-ungated PowerShell on a satellite the agent
-# runs on as the operator's OS user. So PowerShell is routed through the SAME
+# Linux/macOS via CLAUDE_CODE_USE_POWERSHELL_TOOL). It is a ``shell`` role of
+# the ``powershell`` dialect (core/events/tool_roles), so check_tool_access
+# routes it here — an undeclared command tool is refused there outright,
+# never allowed ungated (in dontAsk/auto, tasks + phone, that would have been
+# unrestricted PowerShell on a satellite the agent runs on as the operator's
+# OS user). So PowerShell goes through the SAME
 # decision model as Bash (see _check_bash):
 #   * _POWERSHELL_DANGEROUS_PATTERNS = the single hard-deny for non-admin
 #     (catastrophic, never-legitimate forms only — bare-root recursive delete,
@@ -1901,7 +2063,15 @@ def _classify_powershell_segment(
     if cmdlet is None:
         return PathDecision(allowed=True, permission_tier="read")
 
+    # The floor on a machine still refuses the paths the remote resolver
+    # marks protected (mirrors the Bash floor).
     if dangerous_only:
+        if is_remote:
+            reads, writes = _extract_powershell_paths(cmdlet, segment)
+            for rp, writing in [(p, False) for p in reads] + [(p, True) for p in writes]:
+                d = _check_remote_protected_path(rp, ctx, writing=writing)
+                if d is not None:
+                    return PathDecision(False, f"PowerShell denied: path '{rp}': {d.reason}")
         return PathDecision(allowed=True, permission_tier="read")
 
     destructive = cmdlet in _POWERSHELL_DESTRUCTIVE_CMDLETS
@@ -1913,16 +2083,16 @@ def _classify_powershell_segment(
         tier = "edit"
 
     # Admin-tier role gating (host / service control) — mirror _classify_segment.
-    if tier == "admin":
+    if tier == TIER_ADMIN:
         if is_remote:
-            if ctx.role not in ("admin", "manager", "editor"):
+            if not roles.can_edit(ctx.role):
                 return PathDecision(
                     False,
                     f"PowerShell denied: '{cmdlet}' is restricted to manager / "
                     f"editor / admin roles on remote satellites (current role: "
                     f"{ctx.role}).",
                 )
-        elif ctx.role not in ("admin",):
+        elif not roles.is_admin(ctx.role):
             return PathDecision(
                 False,
                 f"PowerShell denied: '{cmdlet}' requires platform admin role "
@@ -2042,7 +2212,7 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
     if not command.strip():
         return PathDecision(False, "Empty PowerShell command")
 
-    is_remote = ctx.target_kind in ("admin_remote", "user_remote")
+    is_remote = ctx.placement.is_remote
 
     # Admin on admin agent: unrestricted for normal ops EXCEPT the
     # irreversible-catastrophe floor (Format-Volume, Clear-Disk, bare-root
@@ -2050,7 +2220,7 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
     # recursively via the dangerous_only pass (so an encoded / `cmd /c`-wrapped
     # catastrophe is caught too). Mirrors _check_bash; admin can still run these by
     # hand on the box. (Cred + agent-config backstops above already ran.)
-    if ctx.is_admin_agent and ctx.role == "admin":
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
         floor = _check_powershell_string(command, ctx, is_remote=is_remote, depth=0,
                                          dangerous_only=True)
         if not floor.allowed:
@@ -2074,9 +2244,9 @@ def _check_webfetch(url: str, ctx: SecurityContext) -> PathDecision:
     remote target there is no netns and this gate sees only literal
     addresses, so external sessions get no WebFetch there at all.
     """
-    if ctx.is_admin_agent and ctx.role == "admin":
+    if ctx.is_admin_agent and roles.is_admin(ctx.role):
         return _ALLOW
-    if is_external_ctx(ctx) and ctx.target_kind != "local":
+    if is_external_ctx(ctx) and ctx.placement.is_remote:
         return PathDecision(
             False, "WebFetch is not available on external routes on a remote machine",
         )

@@ -14,16 +14,25 @@ update / delete, level replace, agent assignment change — and after a manual
 delegation-targets PUT (un-checking a manual edge that a department also
 wants must let the compiler re-assert it as source='department').
 
-Semantics (since 2026-09-02 — SYMMETRIC; operator decision):
-- same level: mutual edges between all members
-- reach='adjacent' (the default): each level ↔ the level DIRECTLY above and
-  DIRECTLY below (both directions, NOT transitive)
-- reach='subtree': full department mesh — every member ↔ every member
-- per-department auto_delegation toggle compiles to nothing when off
+Semantics, per department (``mode`` × ``reach``; the mode words and what
+each wires live in ``db_departments.MODE_WIRING``, this module reads the
+predicates):
+- mode='off': nothing.
+- mode='down' (the default for a NEW department): a strict hierarchy — no
+  same-level edges, no upward edges; reach='adjacent' = each member → every
+  member of the level DIRECTLY below; reach='subtree' = each member → every
+  member of EVERY level below.
+- mode='down_across': the hierarchy above plus mutual edges between the
+  members of one level.
+- mode='both' (every department created before the column existed): same
+  level mutual; reach='adjacent' = each level ↔ the level DIRECTLY above and
+  DIRECTLY below (both directions, NOT transitive); reach='subtree' = full
+  department mesh, every member ↔ every member.
 Note: an edge is also a read grant for no-user sessions
-(core/session/visibility.py nouser_read_targets) — symmetry means a lower
-level's autonomous runs can read the level above. Documented in
-DEPARTMENTS.md; guarded upstream by the spawn-authz chain/depth checks.
+(core/session/visibility.py nouser_read_targets) — under 'both' a lower
+level's autonomous runs can read the level above; under the downward modes
+only the head reads its team. Documented in DEPARTMENTS.md; guarded
+upstream by the spawn-authz chain/depth checks.
 
 Staleness note: running sessions bake their roster at spawn and the
 delegation MCP parses its target list at process start — edges ADDED here
@@ -55,25 +64,24 @@ def compute_desired_edges() -> set[tuple[str, str]]:
 
     desired: set[tuple[str, str]] = set()
     for dept in departments:
-        if not dept["auto_delegation"]:
-            continue
+        wiring = db_departments.MODE_WIRING[dept["mode"]]
         levels = dept["levels"]  # already rank-ordered
         dept_members = members_by_dept.get(dept["id"], {})
         tiers = [dept_members.get(lv["id"], []) for lv in levels]
         subtree = dept["reach"] == "subtree"
         for i, tier in enumerate(tiers):
+            # Each tier adds its OUTGOING edges only; the reverse pairs of a
+            # two-way mode arrive when the other tier iterates.
+            reachable: list[list[str]] = []
+            if wiring.up:
+                reachable += tiers[:i] if subtree else tiers[max(i - 1, 0):i]
+            if wiring.down:
+                reachable += tiers[i + 1:] if subtree else tiers[i + 1:i + 2]
             for slug in tier:
-                for peer in tier:
-                    if peer != slug:
-                        desired.add((slug, peer))
-                if subtree:
-                    # Full department mesh: every other tier, both directions
-                    # (each i adds its outgoing edges; the reverse pairs are
-                    # added when the other tier iterates).
-                    reachable = tiers[:i] + tiers[i + 1:]
-                else:
-                    # Adjacent: one level up + one level down, symmetric.
-                    reachable = tiers[max(i - 1, 0):i] + tiers[i + 1:i + 2]
+                if wiring.peers:
+                    for peer in tier:
+                        if peer != slug:
+                            desired.add((slug, peer))
                 for other_tier in reachable:
                     for target in other_tier:
                         desired.add((slug, target))

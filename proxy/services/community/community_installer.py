@@ -26,10 +26,15 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from urllib.parse import urlsplit
+
 import httpx
 from fastapi import HTTPException
 
 import config
+from services.infra import path_confinement
+from services.mcp import mcp_manifest_parse as _mmp
+from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_registry, mcp_installer
 
 logger = logging.getLogger("claude-proxy.community-installer")
@@ -43,9 +48,22 @@ CATALOG_TARBALL_URL = (
 TARBALL_FETCH_TIMEOUT_SECONDS = 30.0
 
 # Runtime-only directories preserved across update. node_modules / venv are
-# expensive to rebuild; patches / keys / config / screenshots are local state
-# the catalog never knows about.
-_PRESERVE_DIRS = {"node_modules", "venv", "patches", "keys", "config", "screenshots"}
+# expensive to rebuild; keys / config / screenshots are local state the
+# catalog never knows about. ``patches/`` is catalog content (like
+# ``skills/``): a stale local copy would be applied to every new
+# ``node_modules`` and block updates once a failed patch fails the install.
+_PRESERVE_DIRS = {"node_modules", "venv", "keys", "config", "screenshots"}
+
+# An incoming folder (catalog tarball or admin archive) is source content
+# only: a repository, a dependency tree or a package-manager configuration
+# inside it would steer or execute the install. The directories are refused
+# at any depth; the root-level lock and config files are dropped (the proxy
+# resolves its own lock and ships it to satellites).
+_REFUSED_INCOMING_DIRS = frozenset({".git", "node_modules", "venv"})
+_DROPPED_INCOMING_FILES = frozenset({
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    ".npmrc", "uv.toml", "pip.conf",
+})
 
 # Generated runtime FILES (root-level) preserved across an update so their state
 # survives the file-replace. ``docker-compose.override.yml`` carries the T1 subnet
@@ -145,19 +163,246 @@ def _rollback_extracted_files(target_dir: Path, backup_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Source identity: what an update may never change without an uninstall
+# ---------------------------------------------------------------------------
+
+def _pep503(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _image_repository(image: str) -> str:
+    """``ghcr.io/otodock/x:1.2@sha256:…`` → ``ghcr.io/otodock/x``; a port in
+    the registry host survives (the tag colon is the one after the last
+    slash)."""
+    ref = image.split("@", 1)[0]
+    head, sep, tail = ref.rpartition("/")
+    if ":" in tail:
+        tail = tail.split(":", 1)[0]
+    return (head + sep + tail).lower()
+
+
+def _git_identity(source: str) -> str | None:
+    """``git+https://user@Host/r.git@ref#subdirectory=d`` →
+    ``git+https://host/r#d``: the scheme and the host are the identity, the
+    userinfo and the ref (a version) are not, and the subdirectory selects
+    the package. ``None`` when the port is not a number or the fragment names
+    more than one subdirectory (the identity cannot say which one is built)."""
+    url, _, fragment = source.partition("#")
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port:
+        host = f"{host}:{port}"
+    path = parts.path.rsplit("@", 1)[0].rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    subdirs = [
+        value for key, _, value in (piece.partition("=") for piece in fragment.split("&"))
+        if key == "subdirectory"
+    ]
+    if len(subdirs) > 1:
+        return None
+    subdir = subdirs[0].strip("/") if subdirs else ""
+    return f"{parts.scheme.lower()}://{host}{path}#{subdir}"
+
+
+def source_identity(*, runtime, source, image, url_template) -> tuple[str, str]:
+    """The pair an unattended update may never change: the registry and the
+    package for a node/python MCP, the image repository for a container,
+    the vendor host for a remote MCP. Versions, tags, refs and the free-text
+    label of a container source are not part of it. Never raises."""
+    rt = _mt.runtime_of(runtime if isinstance(runtime, str) else "")
+    if rt is not None and rt.container:
+        return "image", _image_repository(image if isinstance(image, str) else "")
+    if not isinstance(source, str):
+        return "unknown", repr(source)
+    if source.startswith("remote:"):
+        host = urlsplit(url_template if isinstance(url_template, str) else "").hostname
+        return "remote", (host or "").lower()
+    if not source:
+        return "none", ""
+    if source.startswith("git+"):
+        ident = _git_identity(source)
+        return ("git", ident) if ident is not None else ("unknown", repr(source))
+    parsed = mcp_installer.parse_source(source)
+    if parsed is None or parsed.registry not in ("npm", "pypi"):
+        return "unknown", repr(source)
+    if parsed.registry == "pypi":
+        return "pypi", _pep503(parsed.package)
+    return "npm", parsed.package
+
+
+def _source_display(kind: str, *, source, image, url_template) -> str:
+    if kind == "image":
+        return str(image or "(built from the folder)")
+    if kind == "remote":
+        return str(url_template or source)
+    return str(source or "(no source)")
+
+
+def _refuse_source_change(name: str, installed, incoming: dict) -> None:
+    """409 when ``incoming`` (the new manifest's server block) names another
+    source identity than the installed manifest's. Nothing has been written
+    yet when this runs; the admin's explicit path to a new source is an
+    uninstall followed by a fresh install."""
+    old = source_identity(
+        runtime=installed.runtime, source=installed.source,
+        image=installed.image, url_template=installed.url_template,
+    )
+    new = source_identity(
+        runtime=incoming.get("runtime"), source=incoming.get("source", ""),
+        image=incoming.get("image", ""), url_template=incoming.get("url_template", ""),
+    )
+    if old == new:
+        return
+    shown_old = _source_display(
+        old[0], source=installed.source, image=installed.image,
+        url_template=installed.url_template,
+    )
+    shown_new = _source_display(
+        new[0], source=incoming.get("source", ""), image=incoming.get("image", ""),
+        url_template=incoming.get("url_template", ""),
+    )
+    logger.warning(
+        "Update of %s refused: source changed from %s to %s", name, shown_old, shown_new,
+    )
+    raise HTTPException(
+        409,
+        f"Update refused: the source of `{name}` changed from `{shown_old}` to "
+        f"`{shown_new}`. Uninstall it, then install it again (from the "
+        "catalog, or upload the new archive) to accept the new source.",
+    )
+
+
+def _refuse_shipped_trees(mcp_root: Path) -> None:
+    """400 when the incoming folder carries a repository or a dependency
+    tree at any depth (a ``.git`` file counts: it points git at one)."""
+    found = sorted(
+        str(p.relative_to(mcp_root)) for p in mcp_root.rglob("*")
+        if p.name in _REFUSED_INCOMING_DIRS
+    )
+    if found:
+        raise HTTPException(
+            400,
+            "MCP archive must not contain a repository or a dependency tree "
+            f"(.git, node_modules, venv). Found: {found}. The platform "
+            "installs dependencies itself from `server.source`.",
+        )
+
+
+def _drop_package_manager_files(mcp_root: Path) -> None:
+    for name in _DROPPED_INCOMING_FILES:
+        p = mcp_root / name
+        if p.is_file() or p.is_symlink():
+            p.unlink()
+
+
+def _check_incoming_tree(mcp_root: Path) -> dict:
+    """The incoming folder's checks, then its parsed ``manifest.json``.
+
+    Synchronous (it walks the whole incoming tree): run via
+    ``asyncio.to_thread``. Raises ``HTTPException`` 400 on a shipped ``.env``,
+    repository or dependency tree, a missing manifest or invalid JSON.
+    """
+    # `.env` files in the install archive have caused every credential leak
+    # in the historical audit. Reject them: the platform generates Docker
+    # MCP `.env` from manifest declarations, stdio MCPs receive env from the
+    # session, and per-user/per-instance credentials live in the DB.
+    env_files = [p for p in mcp_root.rglob(".env") if p.is_file()]
+    if env_files:
+        rel = sorted(str(p.relative_to(mcp_root)) for p in env_files)
+        raise HTTPException(
+            400,
+            "MCP archive must not contain `.env` files. Found: "
+            f"{rel}. Use `manifest.json` env declarations + DB credentials/"
+            "instances layer for sensitive values. See "
+            "https://github.com/OtoDock/community-mcps/blob/main/CONTRIBUTING.md "
+            "for the env contract.",
+        )
+    _refuse_shipped_trees(mcp_root)
+    _drop_package_manager_files(mcp_root)
+
+    manifest_path = mcp_root / "manifest.json"
+    if not manifest_path.is_file():
+        raise HTTPException(400, "manifest.json not found in MCP folder")
+    try:
+        manifest_data = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f"Invalid manifest.json: {e}")
+
+    # A catalog Python MCP installs from its ``server.source``, wheels only.
+    # A requirements file in its folder would be built outside that rule (by
+    # the startup venv bootstrap or a satellite's runtime reconcile), so it
+    # never lands. A Docker MCP keeps its own: the image build reads it.
+    server = manifest_data.get("server") if isinstance(manifest_data, dict) else None
+    if isinstance(server, dict) and server.get("runtime") == _mt.RUNTIME_PYTHON:
+        req = mcp_root / "requirements.txt"
+        if req.is_file() or req.is_symlink():
+            req.unlink()
+    return manifest_data
+
+
+def _check_incoming_compose(mcp_root: Path, mcp_name: str) -> None:
+    """The Docker-Compose refusals, judged on the incoming folder so a refused
+    compose never replaces an installed version. Synchronous: run via
+    ``asyncio.to_thread``. A no-op on bare metal."""
+    from core.config import deployment
+    from services.mcp import compose_rewrite
+    if not deployment.in_docker_compose():
+        return
+    try:
+        incoming = _mmp._parse_manifest(mcp_root / "manifest.json")
+        if incoming is None:
+            raise ValueError("manifest.json could not be read")
+        compose_rewrite.check_pull_compose(incoming)
+    except ValueError as exc:
+        raise HTTPException(
+            400, f"'{mcp_name}' cannot be installed in Docker-Compose mode: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Manifest validation — same rules as the zip-upload path used to enforce
 # locally. Moved here so both flows share one source of truth.
 # ---------------------------------------------------------------------------
 
 def _validate_manifest(data: dict) -> list[str]:
-    """Return a list of human-readable validation errors; empty = valid."""
+    """Return a list of human-readable validation errors; empty = valid.
+
+    Shape defects are errors too, never exceptions: this runs on catalog
+    content and on admin uploads, and a 500 would hide the reason.
+    """
     errors: list[str] = []
     for key in ("name", "label", "description", "version", "category", "server"):
         if key not in data:
             errors.append(f"Missing required field: {key}")
+    cat = data.get("category", "")
     if "server" in data:
         s = data["server"]
-        if str(s.get("source", "")).startswith("remote:"):
+        if not isinstance(s, dict):
+            errors.append("server must be an object")
+            s = {}
+        source = s.get("source", "")
+        if not isinstance(source, str):
+            errors.append("server.source must be a string")
+            source = ""
+        if source.startswith("git+") and _git_identity(source) is None:
+            errors.append(
+                "server.source must name one repository: an invalid port or more "
+                "than one subdirectory"
+            )
+        compose_file = s.get("docker_compose")
+        if compose_file not in (None, ""):
+            compose_error = _mmp.skill_file_error(compose_file)
+            if compose_error is not None:
+                errors.append(
+                    f"server.docker_compose {compose_file!r} must be a relative "
+                    f"path inside the MCP folder ({compose_error})"
+                )
+        if source.startswith("remote:"):
             # Vendor-hosted MCP (linear/slack/zoom …) — nothing runs locally,
             # so no runtime/command; the connection needs a URL and a
             # non-stdio transport instead.
@@ -165,15 +410,51 @@ def _validate_manifest(data: dict) -> list[str]:
                 errors.append("Missing server.url_template (remote MCP)")
             if s.get("transport", "stdio") == "stdio":
                 errors.append("Remote MCPs must declare a non-stdio transport")
-        else:
+        elif s:
             if "runtime" not in s:
                 errors.append("Missing server.runtime")
-            if s.get("runtime") in ("node", "python") and "command" not in s:
-                errors.append("Missing server.command")
+            rt = _mt.runtime_of(s.get("runtime"))
+            if rt is not None and rt.installed:
+                if "command" not in s:
+                    errors.append("Missing server.command")
+                # A community folder is installed from its package source;
+                # without one, its bundled requirements would be built at
+                # the next proxy start, outside the catalog's install path.
+                if not source and cat == "community":
+                    errors.append(
+                        "Missing server.source (a community MCP whose runtime "
+                        "installs on the host must name its package)"
+                    )
+            source_build = s.get("source_build", [])
+            if source_build is None:
+                source_build = []
+            if not isinstance(source_build, list) or not all(
+                isinstance(e, str) and _mmp.SOURCE_BUILD_RE.fullmatch(e) for e in source_build
+            ):
+                errors.append("server.source_build must be a list of package names")
+    skills = data.get("skills", [])
+    if skills is None:
+        skills = []
+    if not isinstance(skills, list):
+        errors.append("skills must be a list")
+        skills = []
+    for sk in skills:
+        if not isinstance(sk, dict):
+            errors.append(f"skill entry {sk!r} must be an object")
+            continue
+        sid = sk.get("id")
+        if not isinstance(sid, str) or not sid:
+            errors.append(f"skill entry {sk!r} is missing a string id")
+            continue
+        file_error = _mmp.skill_file_error(sk.get("file"))
+        if file_error is not None:
+            errors.append(
+                f"skill {sid}: file {sk.get('file')!r} must be a relative path "
+                f"inside the MCP folder ({file_error})"
+            )
     name = data.get("name", "")
     if name and not all(c.isalnum() or c in "-_" for c in name):
         errors.append(f"Invalid name '{name}' — use alphanumeric, dash, underscore only")
-    cat = data.get("category", "")
     if cat and cat not in ("core", "custom", "community"):
         errors.append(f"Invalid category '{cat}' — must be core, custom, or community")
     return errors
@@ -207,34 +488,29 @@ async def install_from_extracted_folder(
     dict matching the existing zip-upload endpoint's response shape so the
     frontend can reuse its install-result UI.
     """
-    # `.env` files in the install archive have caused every credential leak
-    # in the historical audit. Reject them — the platform generates Docker
-    # MCP `.env` from manifest declarations, stdio MCPs receive env from the
-    # session, and per-user/per-instance credentials live in the DB.
-    env_files = [p for p in mcp_root.rglob(".env") if p.is_file()]
-    if env_files:
-        rel = sorted(str(p.relative_to(mcp_root)) for p in env_files)
-        raise HTTPException(
-            400,
-            "MCP archive must not contain `.env` files. Found: "
-            f"{rel}. Use `manifest.json` env declarations + DB credentials/"
-            "instances layer for sensitive values. See "
-            "https://github.com/OtoDock/community-mcps/blob/main/CONTRIBUTING.md "
-            "for the env contract.",
-        )
-
-    manifest_path = mcp_root / "manifest.json"
-    if not manifest_path.is_file():
-        raise HTTPException(400, "manifest.json not found in MCP folder")
-
-    try:
-        manifest_data = json.loads(manifest_path.read_text())
-    except json.JSONDecodeError as e:
-        raise HTTPException(400, f"Invalid manifest.json: {e}")
+    manifest_data = await asyncio.to_thread(_check_incoming_tree, mcp_root)
 
     errors = _validate_manifest(manifest_data)
     if errors:
         raise HTTPException(400, f"Invalid manifest: {'; '.join(errors)}")
+    # The lexical rule passed above; the file must also exist inside THIS
+    # folder as a regular file (a link is judged by its target).
+    for sk in manifest_data.get("skills") or []:
+        if _mmp.resolve_skill_file(mcp_root, sk["file"]) is None:
+            raise HTTPException(
+                400,
+                f"Invalid manifest: skill {sk['id']}: file {sk['file']!r} is "
+                "not a regular file inside the MCP folder",
+            )
+    compose_file = manifest_data["server"].get("docker_compose") or ""
+    rt = _mt.runtime_of(manifest_data["server"].get("runtime"))
+    if rt is not None and rt.container and compose_file:
+        if _mmp.resolve_skill_file(mcp_root, compose_file) is None:
+            raise HTTPException(
+                400,
+                f"Invalid manifest: server.docker_compose {compose_file!r} is "
+                "not a regular file inside the MCP folder",
+            )
 
     mcp_name = manifest_data["name"]
     category = manifest_data["category"]
@@ -265,6 +541,14 @@ async def install_from_extracted_folder(
             f"Name {mcp_name!r} is already an installed skill package — "
             "MCPs and skill packages share the flat registry namespace",
         )
+    if existing is not None and existing.category != "community":
+        raise HTTPException(
+            409,
+            f"Name {mcp_name!r} is already a {existing.category} MCP shipped "
+            "with the platform",
+        )
+    if existing is not None:
+        _refuse_source_change(mcp_name, existing.server, manifest_data["server"])
     for _sk in manifest_data.get("skills") or []:
         _provider = mcp_registry.find_skill_provider(_sk.get("id", ""))
         if _provider is not None and _provider.name != mcp_name:
@@ -273,6 +557,8 @@ async def install_from_extracted_folder(
                 f"Skill id {_sk.get('id')!r} is already provided by "
                 f"{_provider.name!r}",
             )
+    if rt is not None and rt.container:
+        await asyncio.to_thread(_check_incoming_compose, mcp_root, mcp_name)
     old_version = existing.version if existing else None
     # Snapshot the prior enabled state. On update we'll restore it post-scan;
     # on new install we'll force enabled=True so the admin doesn't have to
@@ -352,6 +638,7 @@ async def install_from_extracted_folder(
                 progress_cb=_install_progress,
                 uv_bin=_uv_bin_if_present(),
                 timeout=_INSTALL_TIMEOUT_SECONDS,
+                source_build=list(manifest_data["server"].get("source_build") or []),
             )
             install_ok, install_log = result.ok, result.log
             resolved_version = result.resolved_version
@@ -430,15 +717,15 @@ async def install_from_extracted_folder(
             )
             logger.info("Defaulted relay-capable MCP %s to hosted OAuth", mcp_name)
 
-    if refreshed and refreshed.server.runtime == "docker":
+    if refreshed and _mt.is_container(refreshed.server):
         try:
             from services.mcp import docker_manager
             await asyncio.to_thread(docker_manager._inject_mcp_env, refreshed)
         except Exception as exc:
             logger.warning("Failed to populate .env after install for %s: %s", mcp_name, exc)
-        # T2: rewrite the compose to pull-form now (early), so a no-image Docker
-        # MCP fails the install with a clear message instead of at first start.
-        # Best-effort + idempotent + no-op on bare-metal T1.
+        # T2: write the pull-form rewrite now. Its refusals were already
+        # judged on the incoming folder, before any file moved
+        # (_check_incoming_compose); idempotent, a no-op on bare-metal T1.
         try:
             from services.mcp import compose_rewrite
             await asyncio.to_thread(compose_rewrite.ensure_pull_compose, refreshed)
@@ -634,8 +921,14 @@ def _extract_mcp_subfolder(tarball: bytes, mcp_name: str, dest: Path) -> Path | 
                 stripped = m.name[len(prefix) + 1:]
                 if not stripped:
                     continue
-                # Path-traversal guard.
-                if stripped.startswith("/") or ".." in Path(stripped).parts:
+                # Path-traversal guard: a clean relative name, joined below
+                # the destination (never the raw member name).
+                if stripped.startswith("/"):
+                    raise HTTPException(400, f"Invalid tarball entry: {m.name}")
+                try:
+                    stripped = path_confinement.normalize_rel_path(stripped)
+                    target_path = path_confinement.join_under(dest, stripped)
+                except path_confinement.PathOutsideRoot:
                     raise HTTPException(400, f"Invalid tarball entry: {m.name}")
                 m_copy = tarfile.TarInfo(name=stripped)
                 m_copy.type = m.type
@@ -648,7 +941,6 @@ def _extract_mcp_subfolder(tarball: bytes, mcp_name: str, dest: Path) -> Path | 
                 wanted.append(m_copy)
                 # Extract right away while we still have the source member.
                 src = tf.extractfile(m) if m.isfile() else None
-                target_path = dest / stripped
                 if m.isdir():
                     target_path.mkdir(parents=True, exist_ok=True)
                 elif m.isfile() and src is not None:
@@ -724,7 +1016,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
     from core.config import deployment
     if (
         manifest is not None
-        and manifest.server.runtime == "docker"
+        and _mt.is_container(manifest.server)
         and deployment.current_mode() != deployment.EXTERNAL_POOL
     ):
         from services.mcp import docker_manager
@@ -744,7 +1036,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
         status = await asyncio.to_thread(
             docker_manager.get_container_status, manifest,
         )
-        if status not in ("running", "starting"):
+        if status not in docker_manager.STARTED:
             try:
                 started = await asyncio.to_thread(
                     docker_manager.start_container, manifest,
@@ -797,7 +1089,7 @@ async def approve_request(
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
         raise HTTPException(404, f"Request {request_id} not found")
-    if req["status"] not in ("pending", "install_failed"):
+    if req["status"] not in mcp_request_store.APPROVABLE:
         raise HTTPException(
             409,
             f"Cannot approve request in status {req['status']!r}",
@@ -823,13 +1115,13 @@ async def approve_request(
             )
 
     # pending → approved → installing in one shot (avoid two notifications).
-    if req["status"] == "pending":
+    if req["status"] == mcp_request_store.PENDING:
         await asyncio.to_thread(
             mcp_request_store.update_status,
-            request_id, "approved", resolved_by=admin_sub, admin_note=admin_note,
+            request_id, mcp_request_store.APPROVED, resolved_by=admin_sub, admin_note=admin_note,
         )
     req = await asyncio.to_thread(
-        mcp_request_store.update_status, request_id, "installing",
+        mcp_request_store.update_status, request_id, mcp_request_store.INSTALLING,
     )
 
     mcp_name = req["mcp_name"]
@@ -867,7 +1159,7 @@ async def approve_request(
     if install_failed_msg:
         updated = await asyncio.to_thread(
             mcp_request_store.update_status,
-            request_id, "install_failed",
+            request_id, mcp_request_store.INSTALL_FAILED,
             install_log=install_failed_msg,
         )
         # ``install_failed`` is non-terminal (admin may retry) — don't fire
@@ -921,7 +1213,7 @@ async def approve_request(
         )
         updated = await asyncio.to_thread(
             mcp_request_store.update_status,
-            request_id, "install_failed",
+            request_id, mcp_request_store.INSTALL_FAILED,
             install_log=admin_guidance,
         )
         await _notify_request_failed(updated)
@@ -932,7 +1224,7 @@ async def approve_request(
 
     updated = await asyncio.to_thread(
         mcp_request_store.update_status,
-        request_id, "installed",
+        request_id, mcp_request_store.INSTALLED,
         resolved_by=admin_sub,
         install_log=install_log,
     )
@@ -1020,12 +1312,12 @@ async def reject_request(request_id: int, admin_sub: str, admin_note: str = "") 
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
         raise HTTPException(404, f"Request {request_id} not found")
-    if req["status"] != "pending":
+    if req["status"] != mcp_request_store.PENDING:
         raise HTTPException(409, f"Cannot reject request in status {req['status']!r}")
 
     updated = await asyncio.to_thread(
         mcp_request_store.update_status,
-        request_id, "rejected",
+        request_id, mcp_request_store.REJECTED,
         resolved_by=admin_sub, admin_note=admin_note,
     )
     if updated.get("batch_id"):
@@ -1043,12 +1335,12 @@ async def cancel_request(request_id: int, user_sub: str) -> dict:
         raise HTTPException(404, f"Request {request_id} not found")
     if req["requested_by"] != user_sub:
         raise HTTPException(403, "Only the original requester can cancel")
-    if req["status"] != "pending":
+    if req["status"] != mcp_request_store.PENDING:
         raise HTTPException(409, f"Cannot cancel request in status {req['status']!r}")
 
     updated = await asyncio.to_thread(
         mcp_request_store.update_status,
-        request_id, "cancelled",
+        request_id, mcp_request_store.CANCELLED,
         resolved_by=user_sub,
     )
     if updated.get("batch_id"):
@@ -1168,9 +1460,10 @@ async def _maybe_notify_batch_complete(request: dict) -> None:
 
     requester = rows[0]["requested_by"]
     agent_slug = rows[0]["agent_slug"]
-    installed = [r for r in rows if r["status"] == "installed"]
-    rejected = [r for r in rows if r["status"] == "rejected"]
-    cancelled = [r for r in rows if r["status"] == "cancelled"]
+    from storage.mcp import mcp_request_store
+    installed = [r for r in rows if r["status"] == mcp_request_store.INSTALLED]
+    rejected = [r for r in rows if r["status"] == mcp_request_store.REJECTED]
+    cancelled = [r for r in rows if r["status"] == mcp_request_store.CANCELLED]
 
     lines = [f"Your community agent **{agent_slug}** is ready."]
     lines.append(

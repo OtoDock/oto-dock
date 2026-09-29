@@ -174,3 +174,12 @@ def test_memory_content_appears_exactly_once(temp_db):
     assert "REGULAR-CONTEXT-DOC" in p
     # The generated index files never inject as context docs.
     assert "# Memory index (auto-generated" not in p
+
+
+def test_contributor_gets_readonly_note(temp_db):
+    """The shared memory is the editor tier's to write: a contributor reads
+    it and saves user-scope memories, the same note a viewer gets."""
+    _seed_agent("acme")
+    p = _prompt("acme", username="bob", role="contributor")
+    assert "read-only for your role" in p
+    assert "## Agent memory (shared)" in p

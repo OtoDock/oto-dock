@@ -14,9 +14,14 @@ import {
   type Subscription,
   type LayerModel,
 } from '../../api/executionLayers'
-import { Toggle, Badge, PROVIDER_LABELS } from './ExecutionLayersTab.widgets'
+import type { EngineProvider } from '../../api/engineDescriptor'
+import { providerLabel } from '../../lib/engines'
+import { Toggle, Badge } from './ExecutionLayersTab.widgets'
 import { AddModelForm } from './ExecutionLayersTab.forms'
 import { SubscriptionWindowBars } from '../../components/engines/SubscriptionWindows'
+import { TierMark } from '../../components/common/TierMark'
+import { TIER_LABELS, tierTitle } from '../../lib/tiers'
+import { ENGINE_SUBSCRIPTION_STATUS, type EngineSubscriptionStatus } from '../../lib/status/engineSubscription'
 
 const AUTH_TYPE_LABELS: Record<string, string> = {
   api_key: 'API Key',
@@ -25,7 +30,7 @@ const AUTH_TYPE_LABELS: Record<string, string> = {
   relay: 'Hosted',
 }
 
-const STATUS_VARIANT: Record<string, 'green' | 'amber' | 'red'> = {
+const STATUS_VARIANT: Record<EngineSubscriptionStatus, 'green' | 'amber' | 'red'> = {
   active: 'green',
   disabled: 'amber',
   expired: 'red',
@@ -38,10 +43,15 @@ const STATUS_VARIANT: Record<string, 'green' | 'amber' | 'red'> = {
 export function SubscriptionRow({
   sub,
   layer,
+  vendorId,
   onDiscover,
 }: {
   sub: Subscription
   layer: string
+  /** The engine's own vendor (`identity.vendor_id`; "" for a multi-provider
+   *  engine). A row on the card's own vendor needs no provider badge; every
+   *  other provider is named. */
+  vendorId: string
   onDiscover?: (sub: Subscription) => void
 }) {
   const updateMut = useUpdateSubscription()
@@ -62,7 +72,7 @@ export function SubscriptionRow({
           </span>
           <Badge variant={STATUS_VARIANT[sub.status] || 'default'}>{sub.status}</Badge>
           <Badge>{AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}</Badge>
-          {sub.provider !== 'anthropic' && <Badge variant="blue">{sub.provider}</Badge>}
+          {sub.provider !== vendorId && <Badge variant="blue">{sub.provider}</Badge>}
         </div>
         {sub.oauth_email && sub.label && (
           <p className="text-xs text-p-text-light truncate">{sub.oauth_email}</p>
@@ -99,7 +109,7 @@ export function SubscriptionRow({
 
       {/* Actions row */}
       <div className="flex items-center gap-2 shrink-0">
-        {onDiscover && sub.status === 'active' && sub.auth_type !== 'oauth' && (
+        {onDiscover && sub.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE && sub.auth_type !== 'oauth' && (
           <button
             onClick={() => onDiscover(sub)}
             className="text-xs text-brand hover:text-brand-hover transition-colors sm:opacity-0 sm:group-hover:opacity-100"
@@ -143,7 +153,17 @@ export function SubscriptionRow({
 // Model Row
 // ---------------------------------------------------------------------------
 
-export function ModelRow({ model, layer }: { model: LayerModel; layer: string }) {
+export function ModelRow({ model, layer, pricingEditable: enginePricesModels, xhighEditable }: {
+  model: LayerModel
+  layer: string
+  /** The engine's `model_policy.pricing_editable`: its BYO keys are metered
+   *  per model, so a custom row's price and context are the admin's to set
+   *  (a CLI engine reports its own cost and has nothing to edit). */
+  pricingEditable: boolean
+  /** The row's provider declares xhigh per model (`effort_per_model`), so
+   *  the flag is read at the wire and the checkbox means something. */
+  xhighEditable: boolean
+}) {
   const updateMut = useUpdateModel()
   const deleteMut = useDeleteModel()
   const [expanded, setExpanded] = useState(false)
@@ -154,19 +174,29 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
   const [pCR, setPCR] = useState(String(model.pricing_cache_read || ''))
   const [reasoning, setReasoning] = useState(!!model.supports_reasoning)
   const [xhigh, setXhigh] = useState(!!model.supports_xhigh)
+  const [tier, setTier] = useState(model.tier ? String(model.tier) : '')
+  const [goodAt, setGoodAt] = useState(model.good_at || '')
 
   const hasPricing = model.pricing_input > 0 || model.pricing_output > 0
+  // Pricing and context are meaningful only on an engine that prices its
+  // models (the descriptor says which); the tier and the "good at" line apply
+  // to every custom row. Builtin rows are registry-authoritative for all of it.
+  const pricingEditable = enginePricesModels && !model.is_builtin
+  const tierEditable = !model.is_builtin
 
-  const handleSavePricing = () => {
+  const handleSave = () => {
     updateMut.mutate({
       layer, id: model.id,
-      context_window: ctxWin ? parseInt(ctxWin) : 0,
-      pricing_input: pIn ? parseFloat(pIn) : 0,
-      pricing_output: pOut ? parseFloat(pOut) : 0,
-      pricing_cache_write: pCW ? parseFloat(pCW) : 0,
-      pricing_cache_read: pCR ? parseFloat(pCR) : 0,
-      supports_reasoning: reasoning,
-      supports_xhigh: xhigh,
+      ...(pricingEditable ? {
+        context_window: ctxWin ? parseInt(ctxWin) : 0,
+        pricing_input: pIn ? parseFloat(pIn) : 0,
+        pricing_output: pOut ? parseFloat(pOut) : 0,
+        pricing_cache_write: pCW ? parseFloat(pCW) : 0,
+        pricing_cache_read: pCR ? parseFloat(pCR) : 0,
+        supports_reasoning: reasoning,
+        supports_xhigh: xhigh,
+      } : {}),
+      ...(tierEditable ? { tier: tier ? parseInt(tier) : null, good_at: goodAt.trim() } : {}),
     }, { onSuccess: () => setExpanded(false) })
   }
 
@@ -182,7 +212,14 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
               <span className="text-xs text-p-text-light hidden sm:inline">{model.display_name}</span>
             )}
             {!model.is_builtin && <Badge variant="blue">custom</Badge>}
-            {hasPricing && layer === 'direct-llm' && (
+            <span
+              className="inline-flex items-center gap-1.5 text-[10px] text-p-text-light"
+              title={tierTitle(model.tier, undefined, model.good_at)}
+            >
+              <TierMark tier={model.tier} goodAt={model.good_at} size="xs" />
+              {model.tier ? `${TIER_LABELS[model.tier] || `tier ${model.tier}`}${model.good_at ? ` · ${model.good_at}` : ''}` : 'untiered'}
+            </span>
+            {hasPricing && enginePricesModels && (
               <span className="text-xs text-p-text-light">
                 ${model.pricing_input}/{model.pricing_output}
               </span>
@@ -190,15 +227,15 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
           </div>
         </div>
 
-        {/* Pricing edit (direct-llm custom models only — CLI reports its own
-            cost, and builtin pricing/context is registry-authoritative: the
-            backend overwrites it from MODEL_REGISTRY on every sync, so editing
-            it here would be silently reverted). */}
-        {layer === 'direct-llm' && !model.is_builtin && (
+        {/* Edit (custom models only — CLI reports its own cost, and builtin
+            pricing/context/tier is registry-authoritative: the backend
+            overwrites it from the registry on every sync, so editing it here
+            would be silently reverted). */}
+        {(pricingEditable || tierEditable) && (
           <button
             onClick={() => setExpanded(!expanded)}
             className="text-xs text-p-text-secondary hover:text-brand transition-colors opacity-0 group-hover:opacity-100"
-            title="Edit pricing & context"
+            title={pricingEditable ? 'Edit pricing, context & tier' : 'Edit tier'}
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -227,9 +264,29 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
         )}
       </div>
 
-      {/* Expanded pricing editor */}
+      {/* Expanded editor: tier + "good at" for every custom row, pricing and
+          context on the engines that price their models */}
       {expanded && (
         <div className="px-3 pb-2 pt-1 space-y-2">
+          {tierEditable && (
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              <div>
+                <label className="text-[10px] text-p-text-light block mb-0.5">Capability tier</label>
+                <select value={tier} onChange={(e) => setTier(e.target.value)} className={inputClass} aria-label="Capability tier">
+                  <option value="">untiered</option>
+                  <option value="1">1 · frontier</option>
+                  <option value="2">2 · strong</option>
+                  <option value="3">3 · balanced</option>
+                  <option value="4">4 · fast</option>
+                </select>
+              </div>
+              <div className="col-span-2 sm:col-span-4">
+                <label className="text-[10px] text-p-text-light block mb-0.5">Good at (one line, shown to agents and in the pickers)</label>
+                <input type="text" maxLength={120} placeholder="e.g. quick local answers with no cloud cost" value={goodAt} onChange={(e) => setGoodAt(e.target.value)} className={inputClass} aria-label="Good at" />
+              </div>
+            </div>
+          )}
+          {pricingEditable && (<>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
             <div className="col-span-2 sm:col-span-1">
               <label className="text-[10px] text-p-text-light block mb-0.5">Context Window</label>
@@ -261,8 +318,8 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
             />
             Supports reasoning
           </label>
-          {/* Only meaningful for Anthropic — see AddModelForm comment. */}
-          {model.provider === 'anthropic' && (
+          {/* Only where the provider reads the flag — see AddModelForm. */}
+          {xhighEditable && (
             <label className="flex items-center gap-2 text-xs text-p-text-secondary cursor-pointer">
               <input
                 type="checkbox"
@@ -273,8 +330,9 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
               Supports xhigh effort (Opus 4.7+). Falls back to max on unsupported models.
             </label>
           )}
+          </>)}
           <div className="flex gap-2">
-            <button onClick={handleSavePricing} disabled={updateMut.isPending} className="px-2 py-1 text-xs rounded-sm bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40">
+            <button onClick={handleSave} disabled={updateMut.isPending} className="px-2 py-1 text-xs rounded-sm bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40">
               {updateMut.isPending ? 'Saving...' : 'Save'}
             </button>
             <button onClick={() => setExpanded(false)} className="px-2 py-1 text-xs rounded-sm text-p-text-secondary hover:bg-p-bg-hover transition-colors">
@@ -290,16 +348,26 @@ export function ModelRow({ model, layer }: { model: LayerModel; layer: string })
 export function ModelsByProvider({
   models,
   layer,
+  pricingEditable,
+  providers,
   showAddModel,
   onAddCustom,
   onAddDone,
 }: {
   models: LayerModel[]
   layer: string
+  /** The engine's `model_policy.pricing_editable` (see ModelRow). */
+  pricingEditable: boolean
+  /** The engine's declared providers: the entry whose `effort_per_model`
+   *  names xhigh is the one whose rows get the "Supports xhigh" checkbox
+   *  (its adapter reads the flag; the others send xhigh to every model). */
+  providers: EngineProvider[] | null
   showAddModel: string | false
   onAddCustom: (provider: string) => void
   onAddDone: () => void
 }) {
+  const xhighEditable = (provider: string) =>
+    (providers?.find((p) => p.id === provider)?.effort_per_model ?? []).includes('xhigh')
   // Group models by provider
   const groups: Record<string, LayerModel[]> = {}
   for (const m of models) {
@@ -308,7 +376,8 @@ export function ModelsByProvider({
     groups[p].push(m)
   }
 
-  const providerOrder = ['anthropic', 'openai', 'groq', 'ollama', 'openai_compatible']
+  // The engine's declaration order, then any provider only a row names.
+  const providerOrder = providers?.map((p) => p.id) ?? []
   const sorted = [
     ...providerOrder.filter((p) => groups[p]),
     ...Object.keys(groups).filter((p) => !providerOrder.includes(p)),
@@ -324,7 +393,7 @@ export function ModelsByProvider({
         <div key={provider}>
           <div className="flex items-center justify-between mb-1">
             <span className="text-xs font-medium text-p-text-secondary">
-              {PROVIDER_LABELS[provider] || provider}
+              {providerLabel(providers, provider)}
             </span>
             <button
               onClick={() => onAddCustom(provider)}
@@ -335,12 +404,12 @@ export function ModelsByProvider({
           </div>
           <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface overflow-hidden divide-y divide-p-border-light">
             {groups[provider].map((model) => (
-              <ModelRow key={model.id} model={model} layer={layer} />
+              <ModelRow key={model.id} model={model} layer={layer} pricingEditable={pricingEditable} xhighEditable={xhighEditable(provider)} />
             ))}
           </div>
           {/* Add model form renders directly below the provider it belongs to */}
           {showAddModel === provider && (
-            <AddModelForm layer={layer} provider={provider} onDone={onAddDone} />
+            <AddModelForm layer={layer} provider={provider} xhighEditable={xhighEditable(provider)} onDone={onAddDone} />
           )}
         </div>
       ))}

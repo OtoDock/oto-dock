@@ -12,12 +12,16 @@ import os
 import re as _re
 import secrets
 import shutil
+import stat
 import sys
 import zoneinfo
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import dotenv_values
+from auth import roles
+from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
+from core import layout
 
 # Paths (needed early for config.env resolution)
 BASE_DIR = Path(__file__).parent
@@ -108,13 +112,97 @@ def _reject_directory_config(path: Path) -> None:
     )
 
 
+def _reject_unreadable_config(path: Path) -> None:
+    """Fail fast with the fix when ``config.env`` exists but this account
+    cannot read it (a tightened file owned by another account)."""
+    if path.exists() and not os.access(path, os.R_OK):
+        raise SystemExit(
+            f"FATAL: the OtoDock config file at {path} is not readable by uid {os.getuid()}.\n"
+            "It holds every secret: make it owned by the account the proxy runs as, mode 600."
+        )
+
+
 _reject_directory_config(_config_env)
+_reject_unreadable_config(_config_env)
 _file_cfg = dotenv_values(_config_env) if _config_env.exists() else {}
 
 
 def _cfg(key: str, default: str = "") -> str:
     """Read config: os.environ (Docker/systemd override) > config.env file > default."""
     return os.environ.get(key) or _file_cfg.get(key) or default
+
+
+# Is the PROXY ITSELF running inside a container? Distinct from OTODOCK_CLOUD
+# (which is the multi-tenant SaaS axis): RUNNING_IN_DOCKER is the bare-metal
+# (T1) vs Docker-Compose (T2) split. Drives how the proxy reaches the Docker
+# daemon and Docker-MCP service URLs (the T2 socket-proxy backend).
+# Explicit env wins; ``/.dockerenv`` is only a fallback (absent in some k8s
+# runtimes). No-op on bare-metal (env unset + no /.dockerenv → False), so the
+# live native install is unaffected.
+def _default_running_in_docker() -> bool:
+    import os
+    return os.path.exists("/.dockerenv")
+
+_running_in_docker_env = _cfg("RUNNING_IN_DOCKER", "").lower()
+if _running_in_docker_env in ("1", "true", "yes"):
+    RUNNING_IN_DOCKER = True
+elif _running_in_docker_env in ("0", "false", "no"):
+    RUNNING_IN_DOCKER = False
+else:
+    RUNNING_IN_DOCKER = _default_running_in_docker()
+
+
+def _write_config_env(text: str, *, append: bool) -> None:
+    """Write ``config.env``: it holds every master secret, so a new file is
+    created 0600, and on bare metal an existing one is set to 0600 on its
+    open descriptor. In a container the file is the host's bind-mounted
+    ``.env``, which the host's ``docker compose`` must still read: its mode
+    is the operator's (``_tighten_config_mode`` says when it is too open)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    with os.fdopen(os.open(_config_env, flags, 0o600), "w") as f:
+        f.write(text)
+        if not RUNNING_IN_DOCKER:
+            with contextlib.suppress(OSError):  # a file owned by another uid keeps its mode
+                os.fchmod(f.fileno(), 0o600)
+
+
+def _tighten_config_mode(path: Path, *, in_container: bool) -> None:
+    """Close a ``config.env`` other accounts can read (the umask left 0664
+    on bare-metal installs). On bare metal a file this process owns is set
+    to 0600; one owned by another account (``root:otodock 0640`` is a valid
+    layout) is only reported when everyone can read it. In a container the
+    host fixes it. Never fatal: a read-only mount is a valid layout."""
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    mode = stat.S_IMODE(st.st_mode)
+    if in_container:
+        if mode & 0o077:
+            _boot_note(f"WARNING: the .env mounted at {path} is readable by other accounts "
+                       f"(mode {mode:o}); it holds every secret. On the Docker host: chmod 600 .env "
+                       "(keep it owned by the account that runs docker compose)")
+        return
+    if st.st_uid == os.geteuid():
+        if mode & 0o077:
+            try:
+                os.chmod(path, 0o600)
+                _boot_note(f"config.env at {path} was readable by other accounts; set to 0600")
+                return
+            except OSError:
+                pass
+        else:
+            return
+    elif not mode & 0o007:
+        return
+    _boot_note(f"WARNING: config.env at {path} is readable by other accounts (mode {mode:o}); "
+               "it holds every secret: make it owned by the account the proxy runs as with "
+               "mode 600 (or 640 with a group only the proxy's services share)")
+
+
+_tighten_config_mode(_config_env, in_container=RUNNING_IN_DOCKER)
 
 
 def _persist_secret(key: str, value: str) -> None:
@@ -145,10 +233,9 @@ def _persist_secret(key: str, value: str) -> None:
     try:
         if blank_line_idx is not None:
             lines[blank_line_idx] = f"{key}={value}"
-            _config_env.write_text("\n".join(lines) + "\n")
+            _write_config_env("\n".join(lines) + "\n", append=False)
         else:
-            with open(_config_env, "a") as f:
-                f.write(f"{key}={value}\n")
+            _write_config_env(f"{key}={value}\n", append=True)
     except OSError as e:
         _uid = os.getuid() if hasattr(os, "getuid") else "?"
         raise RuntimeError(
@@ -230,6 +317,12 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # Server
 PORT = int(_cfg("PROXY_PORT", "8400"))
 HOST = _cfg("PROXY_HOST", "0.0.0.0")
+# The internal listener's port on 127.0.0.1, assigned by app.py at boot once
+# its socket is bound (0 = none: tests, scripts, a server not started from
+# app.py). Different on every boot: read it when a connection is made, never
+# at import. Sandboxes and the satellite tunnel reach the proxy there, where
+# forwarding headers are never read (auth/lan_check.py).
+INTERNAL_LISTENER_PORT = 0
 
 # Authentication
 API_KEY = _cfg("PROXY_API_KEY")
@@ -268,10 +361,13 @@ TRUSTED_PROXIES = [s.strip() for s in _cfg("TRUSTED_PROXY", "").split(",") if s.
 
 # Event-loop stall watchdog (core/loop_watchdog.py): a daemon thread logs the
 # loop thread's stack when the loop stops ticking for longer than this many
-# seconds, and counts stalls for GET /health ``loop``. 0 disables it. Added
+# seconds, and counts stalls for the ``loop`` block of GET /v1/admin/health. 0 disables it. Added
 # after the 2026-09-03 stall, whose blocking frame had to be reconstructed
 # from health-probe gaps because nothing in the frozen window was logged.
 LOOP_WATCHDOG_THRESHOLD_S = float(_cfg("LOOP_WATCHDOG_THRESHOLD_S", "2.0") or 0)
+# Shorter stalls, from this long up, are logged once with the stalled stack
+# and counted in the ``loop`` histogram. 0 disables them.
+LOOP_WATCHDOG_REPORT_S = float(_cfg("LOOP_WATCHDOG_REPORT_S", "0.25") or 0)
 
 # Per-sandbox cap on the RAM-backed ``/tmp`` tmpfs (bwrap ``--size``), in MB.
 # ``/tmp`` is the agent's HOME (package caches, model downloads) and the CLI's
@@ -358,6 +454,19 @@ SYNC_DELTA_ALERT_BYTES = int(_cfg("OTODOCK_SYNC_DELTA_ALERT_MB", "500")) * 1024 
 # invite silent offset corruption).
 UPLOAD_CHUNK_MB = int(_cfg("OTODOCK_UPLOAD_CHUNK_MB", "32"))
 UPLOAD_CHUNK_BYTES = UPLOAD_CHUNK_MB * 1024 * 1024
+# Chunked-upload staging bounds: open uploads per user (429) and in total
+# (503), staged MB per user (429; never below one file's cap), and how long
+# an upload may wait for its FIRST chunk before the sweep drops it (one
+# with chunks keeps the 24 h resume window). 0 = no cap for the counts.
+UPLOAD_MAX_OPEN = int(_cfg("OTODOCK_UPLOAD_MAX_OPEN", "4"))
+UPLOAD_MAX_OPEN_TOTAL = int(_cfg("OTODOCK_UPLOAD_MAX_OPEN_TOTAL", "256"))
+UPLOAD_STAGING_USER_MB = max(
+    MAX_FILE_MB, int(_cfg("OTODOCK_UPLOAD_STAGING_USER_MB", str(2 * MAX_FILE_MB))))
+UPLOAD_FIRST_CHUNK_S = int(_cfg("OTODOCK_UPLOAD_FIRST_CHUNK_S", "3600"))
+# Free space a new upload must leave on the data disk: the larger of the two
+# (507 below it).
+MIN_FREE_DISK_MB = int(_cfg("OTODOCK_MIN_FREE_DISK_MB", "5120"))
+MIN_FREE_DISK_PCT = float(_cfg("OTODOCK_MIN_FREE_DISK_PCT", "5"))
 
 # Global cap on CONCURRENT LARGE outbound (proxy→satellite) workspace pushes,
 # across ALL machines and both push paths (live fan-out + initial-sync push
@@ -369,6 +478,18 @@ SYNC_FANOUT_CONCURRENCY = int(_cfg("OTODOCK_SYNC_FANOUT_CONCURRENCY", "3"))
 # a small file is a handful of 512KB frames already bounded by the bulk queue,
 # and gating it would head-of-line-block live edits behind bulk transfers.
 SYNC_FANOUT_MIN_MB = int(_cfg("OTODOCK_SYNC_FANOUT_MIN_MB", "4"))
+# A satellite's file_changed frames: appliers in flight per machine (frames
+# past it are dropped with a rate-limited warning; 0 = no shedding),
+# appliers running at once per machine and in total, and the size of the
+# last-change stamp map.
+SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE = int(
+    _cfg("SAT_FILE_CHANGED_MAX_INFLIGHT_PER_MACHINE", "64"))
+SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE = max(1, int(
+    _cfg("SAT_FILE_CHANGED_CONCURRENCY_PER_MACHINE", "4")))
+SAT_FILE_CHANGED_CONCURRENCY_GLOBAL = max(1, int(_cfg("SAT_FILE_CHANGED_CONCURRENCY_GLOBAL", "8")))
+SAT_FILE_CHANGED_STAMP_MAX = max(1, int(_cfg("SAT_FILE_CHANGED_STAMP_MAX", "4096")))
+# Threads that write, fsync and rename uploaded and pulled files.
+FILE_COMMIT_WORKERS = max(1, int(_cfg("FILE_COMMIT_WORKERS", "4")))
 
 # Global BACKSTOP cap on request body size (bytes), enforced by an ASGI
 # middleware via Content-Length. Defaults to the universal file cap plus margin
@@ -378,8 +499,47 @@ MAX_REQUEST_BODY_BYTES = int(
     _cfg("MAX_REQUEST_BODY_BYTES", str(MAX_FILE_BYTES + 64 * 1024 * 1024))
 )
 
+# Tiered body caps under that backstop, counted on the streamed bytes: the
+# login routes, the webhook receivers, a request with no valid credential (a
+# dashboard session cookie, the service key or a session token as the bearer,
+# or a WOPI access token on the WOPI and Collabora routes; one that is
+# presented but does not validate gets 401), and every other route off the
+# upload allowlist (which keeps the backstop). 0 turns a tier off (the
+# backstop still applies).
+MAX_AUTH_BODY_BYTES = int(_cfg("MAX_AUTH_BODY_BYTES", str(64 * 1024)))
+MAX_WEBHOOK_BODY_BYTES = int(_cfg("MAX_WEBHOOK_BODY_BYTES", str(2 * 1024 * 1024)))
+MAX_UNAUTH_BODY_BYTES = int(_cfg("MAX_UNAUTH_BODY_BYTES", str(64 * 1024)))
+MAX_JSON_BODY_BYTES = int(_cfg("MAX_JSON_BODY_BYTES", str(8 * 1024 * 1024)))
+
 # Hard ceiling for any paginated list endpoint's page size.
 MAX_PAGE_SIZE = int(_cfg("MAX_PAGE_SIZE", "500"))
+
+# A text file larger than this is not read inline by the files API (413):
+# the client downloads it instead.
+INLINE_TEXT_MAX_BYTES = int(_cfg("INLINE_TEXT_MAX_BYTES", str(5 * 1024 * 1024)))
+# Workspace zip downloads: builds at once, paths in one request, files in
+# one archive and the total input size (413 past the last three).
+ZIP_MAX_CONCURRENT = max(1, int(_cfg("ZIP_MAX_CONCURRENT", "2")))
+ZIP_MAX_PATHS = int(_cfg("ZIP_MAX_PATHS", "500"))
+ZIP_MAX_ENTRIES = int(_cfg("ZIP_MAX_ENTRIES", "100000"))
+ZIP_MAX_INPUT_MB = int(_cfg("ZIP_MAX_INPUT_MB", "4096"))
+# Temporary public image URLs (/v1/images/temp): the mint copies the image,
+# so each copy is capped, and so are the copies one session and all
+# sessions hold at once.
+TEMP_IMAGE_MAX_BYTES = int(_cfg("TEMP_IMAGE_MAX_MB", "20")) * 1024 * 1024
+TEMP_IMAGE_MAX_PER_SESSION = int(_cfg("TEMP_IMAGE_MAX_PER_SESSION", "20"))
+TEMP_IMAGE_MAX_TOTAL_BYTES = int(_cfg("TEMP_IMAGE_MAX_TOTAL_MB", "256")) * 1024 * 1024
+
+# Password hashes (bcrypt, about a core for 250 ms each) computed at once;
+# the rest wait their turn off the event loop.
+AUTH_HASH_CONCURRENCY = max(1, int(_cfg("AUTH_HASH_CONCURRENCY", "4")))
+# Password hashes waiting their turn; past this a login or a password change
+# is answered 503 with Retry-After instead of queueing.
+AUTH_HASH_MAX_WAITERS = int(_cfg("AUTH_HASH_MAX_WAITERS", "64"))
+# Webhook-fire key checks (bcrypt) at once, and how many may wait before
+# further fires are refused (503).
+WEBHOOK_KEY_VERIFY_CONCURRENCY = max(1, int(_cfg("WEBHOOK_KEY_VERIFY_CONCURRENCY", "2")))
+WEBHOOK_KEY_VERIFY_MAX_WAITERS = int(_cfg("WEBHOOK_KEY_VERIFY_MAX_WAITERS", "16"))
 
 # Max total DECOMPRESSED size of an uploaded community-MCP zip (zip-bomb guard).
 MCP_ZIP_DECOMPRESSED_MAX = int(_cfg("MCP_ZIP_DECOMPRESSED_MAX", str(500 * 1024 * 1024)))
@@ -401,6 +561,9 @@ def _rate_limit_rule(prefix: str, mx: int, window: int, base_block: int, max_blo
 # the historical thresholds; the rest gate previously-unlimited surfaces.
 RATE_LIMIT_RULES = {
     "login":   _rate_limit_rule("LOGIN", 10, 900, 900, 14400),
+    # Wrong passwords from a trusted-device browser (the device cookie skips
+    # the account tarpit), per device: past it that browser is an unknown one.
+    "login_device": _rate_limit_rule("LOGIN_DEVICE", 5, 900, 900, 3600),
     "2fa":     _rate_limit_rule("2FA", 10, 900, 900, 3600),
     "forgot":  _rate_limit_rule("FORGOT", 5, 3600, 3600, 14400),
     "reset":   _rate_limit_rule("RESET", 10, 3600, 1800, 14400),
@@ -417,6 +580,34 @@ RATE_LIMIT_RULES = {
     # on an already-authed session, so without a cap a stolen session cookie
     # is an unbounded online password oracle.
     "confirm": _rate_limit_rule("CONFIRM", 10, 900, 900, 3600),
+    # An agent opening one of its apps on a user's screen: a few per minute,
+    # never a stream of interruptions.
+    "app_open": _rate_limit_rule("APP_OPEN", 3, 60, 60, 300),
+    # Shares created per user: a share is an exfiltration channel, so a
+    # burst of them is never legitimate.
+    "share_create": _rate_limit_rule("SHARE_CREATE", 10, 3600, 1800, 7200),
+    # Wrong passwords on an external link, per client IP and per link
+    # (failures only, like the login bucket).
+    "share_unlock_ip": _rate_limit_rule("SHARE_UNLOCK_IP", 10, 300, 300, 3600),
+    "share_unlock_share": _rate_limit_rule("SHARE_UNLOCK_SHARE", 10, 300, 300, 3600),
+    # An app's inbound hooks (APPS.md "Inbound hooks"): the one
+    # unauthenticated write path into the platform — counted per client IP
+    # once the app row is found (a malformed or unknown id is a 404 that
+    # counts nothing), skipped when the resolver says the address is shared
+    # by every client, and per app (a vendor's honest burst passes; a flood
+    # trips it).
+    "app_inbound_ip": _rate_limit_rule("APP_INBOUND_IP", 120, 60, 60, 600),
+    "app_inbound_app": _rate_limit_rule("APP_INBOUND_APP", 600, 60, 30, 600),
+    # Webhook-fire key failures per key prefix, checked before bcrypt runs.
+    "webhook_prefix": _rate_limit_rule("WEBHOOK_PREFIX", 10, 300, 300, 3600),
+    # Vendor and relay webhook receivers, per client IP (unauthenticated).
+    "webhook_receive_ip": _rate_limit_rule("WEBHOOK_RECEIVE_IP", 120, 60, 60, 600),
+    # Chunked uploads started per user.
+    "upload_init": _rate_limit_rule("UPLOAD_INIT", 120, 3600, 600, 3600),
+    # Engine connects started per person: each ChatGPT start spawns a host
+    # process; the Claude form restarts its flow after a refused paste.
+    "oauth_start_openai": _rate_limit_rule("OAUTH_START_OPENAI", 10, 900, 900, 3600),
+    "oauth_start_claude": _rate_limit_rule("OAUTH_START_CLAUDE", 20, 900, 900, 3600),
 }
 
 # Stable per-install identifier (short, NOT a secret). Namespaces the proxy's
@@ -447,6 +638,17 @@ CODEX_BIN = _cfg(
     shutil.which("codex")
     or str(Path.home() / ".npm-global" / "bin" / "codex")
 )
+# Bun runs app servers (apps with a server/ folder) inside their own
+# sandbox; the binary is bind-mounted in from this path. Same ladder:
+# explicit override → PATH → the official user install (a dev box without
+# sudo for /usr/local/bin). Empty when none exists: app servers then refuse
+# to start with a log line, everything else runs.
+BUN_BIN = _cfg(
+    "BUN_BIN",
+    shutil.which("bun")
+    or (str(Path.home() / ".bun" / "bin" / "bun")
+        if (Path.home() / ".bun" / "bin" / "bun").is_file() else "")
+)
 CLAUDE_TIMEOUT = int(_cfg("CLAUDE_TIMEOUT", "7200"))  # 2 hours — headroom for long tasks; per-deployment override via CLAUDE_TIMEOUT, per-install override via the session_timeout platform setting
 
 # Audio/video playback transcoding (services/media/media_pipeline.py). ffmpeg/ffprobe
@@ -463,6 +665,15 @@ MEDIA_CACHE_DIR = _cfg("OTO_MEDIA_CACHE_DIR", "")
 
 # Phone server (phone MCP uses this to initiate calls)
 PHONE_SERVER_URL = _cfg("PHONE_SERVER_URL", "http://127.0.0.1:9093")
+# Calls agents may place through the relay: per agent and per tied user
+# each hour, per agent each day (0 = no cap), and optional E.164 prefixes a
+# destination must start with (comma-separated; empty = any number).
+PHONE_CALLS_PER_AGENT_PER_HOUR = int(_cfg("PHONE_CALLS_PER_AGENT_PER_HOUR", "10"))
+PHONE_CALLS_PER_USER_PER_HOUR = int(_cfg("PHONE_CALLS_PER_USER_PER_HOUR", "5"))
+PHONE_CALLS_PER_AGENT_PER_DAY = int(_cfg("PHONE_CALLS_PER_AGENT_PER_DAY", "50"))
+PHONE_CALL_ALLOWED_PREFIXES = [
+    p.strip() for p in _cfg("PHONE_CALL_ALLOWED_PREFIXES", "").split(",") if p.strip()
+]
 
 # Tools the agent is allowed to use automatically
 ALLOWED_TOOLS = _cfg("ALLOWED_TOOLS", "").strip()
@@ -505,7 +716,7 @@ def persona_is_unconfigured(agent_name: str) -> bool:
     """
     if not is_safe_agent_name(agent_name):
         return False
-    config_dir = AGENTS_DIR / agent_name / "config"
+    config_dir = AGENTS_DIR / agent_name / layout.CONFIG
     for candidate in (config_dir / "agent.md", config_dir / "prompt.md"):
         try:
             text = candidate.read_text()
@@ -537,7 +748,7 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
     if not is_safe_agent_name(model):
         return []
     agent_dir = AGENTS_DIR / model
-    config_dir = agent_dir / "config"
+    config_dir = agent_dir / layout.CONFIG
     persona_text: str | None = None
     # Two passes: a concurrent rename/restore can remove the probed file
     # between exists() and read_text() — re-probe both names before giving up.
@@ -555,7 +766,7 @@ def _read_agent_files(model: str) -> list[tuple[str, str]]:
 
     files: list[tuple[str, str]] = [("agent.md", persona_text)]
 
-    context_dir = agent_dir / "config" / "context"
+    context_dir = agent_dir / layout.CONFIG / layout.CONTEXT
     if not context_dir.is_dir():
         return files
 
@@ -680,25 +891,25 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
 
     # An external caller's own tree (mounted at /caller) comes first.
     if external_home:
-        for sub in ("workspace", "context"):
+        for sub in layout.USER_SUBDIRS:
             _emit_root(f"/caller/{sub}/", Path(external_home) / sub)
     # Agent-scope (no username): /workspace/ + /knowledge/
     if not username:
-        _emit_root("/workspace/", agent_dir / "workspace")
-        _emit_root("/knowledge/", agent_dir / "knowledge")
+        _emit_root(f"{layout.V_WORKSPACE}/", agent_dir / layout.WORKSPACE)
+        _emit_root(f"{layout.V_KNOWLEDGE}/", agent_dir / layout.KNOWLEDGE)
     else:
         # User-scope: own user dir + shared spaces + (manager+) config
-        user_dir = agent_dir / "users" / username
+        user_dir = layout.user_dir(agent_dir, username)
         if user_dir.is_dir():
-            for sub in ("workspace", "context"):
-                _emit_root(f"/users/{username}/{sub}/", user_dir / sub)
+            for sub in layout.USER_SUBDIRS:
+                _emit_root(f"{layout.virtual_user_root(username)}/{sub}/", user_dir / sub)
         # Shared workspace + knowledge only when the agent's mode has them
         # (Personal-only omits both — they aren't mounted in that mode).
         if mount_shared:
-            _emit_root("/workspace/", agent_dir / "workspace")
-            _emit_root("/knowledge/", agent_dir / "knowledge")
-        if role in ("manager", "admin"):
-            _emit_root("/config/", agent_dir / "config")
+            _emit_root(f"{layout.V_WORKSPACE}/", agent_dir / layout.WORKSPACE)
+            _emit_root(f"{layout.V_KNOWLEDGE}/", agent_dir / layout.KNOWLEDGE)
+        if roles.can_manage(role):
+            _emit_root(f"{layout.V_CONFIG}/", agent_dir / layout.CONFIG)
 
     if truncated_count:
         lines.append(
@@ -855,7 +1066,10 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         "entry; `MEMORY.md` is auto-generated — never edit it). Never "
         "store secrets, credentials, or tokens.\n"
     )
-    if role == "viewer" and agent_enabled:
+    # The shared memory is the editor tier's to write (the memory API's
+    # rule); a viewer or a contributor reads it and saves user-scope only.
+    agent_writable = roles.can_edit(role)
+    if not agent_writable and agent_enabled:
         directive += (
             "\nAgent memory is read-only for your role — save "
             "user-scope memories only.\n"
@@ -864,7 +1078,6 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
 
     if agent_enabled:
         root = memory_file.scope_root(agent_dir, "agent")
-        agent_writable = role != "viewer"
         parts.append(
             "\n## Agent memory (shared)\n\n"
             + _render_memory_scope(
@@ -874,7 +1087,7 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
             + "\n"
         )
     if user_enabled and external:
-        root = Path(external_home) / "context" / "memory"
+        root = Path(external_home) / layout.CONTEXT / "memory"
         parts.append(
             "\n## Caller memory (private to this caller)\n\n"
             + _render_memory_scope(root, virtual="/memories/user", budget=budget)
@@ -904,7 +1117,7 @@ def _read_bulletin(source_agent: str, sub_rel: str) -> str:
     """The SOURCE-resident bulletin's text, capped at 4 KB and truncated on
     a UTF-8 character boundary (decode drops a split trailing sequence).
     '' when the file is missing/unreadable — injection then skips it."""
-    path = get_agent_dir(source_agent) / "knowledge" / sub_rel
+    path = get_agent_dir(source_agent) / layout.KNOWLEDGE / sub_rel
     try:
         if not path.is_file() or path.is_symlink():
             return ""
@@ -931,7 +1144,8 @@ def _render_library_bulletins(agent_name: str) -> str | None:
     copy stays the single read point). Default-on convention: no flag,
     missing file = no subsection."""
     from storage.knowledge import db_knowledge_libraries
-    # (source, subdir, name, own, writable)
+    # Each entry names the library's source, its subdir, its name, whether
+    # it is the agent's own and whether it is writable.
     entries: list[tuple[str, str, str, bool, bool]] = []
     for a in db_knowledge_libraries.attachments_for_consumer(agent_name):
         entries.append((a["source_agent"], a["subdir"] or "",
@@ -949,10 +1163,10 @@ def _render_library_bulletins(agent_name: str) -> str | None:
             continue
         if own:
             origin = "this agent's own library"
-            hint = f"\n_File: `/knowledge/{rel}`._"
+            hint = f"\n_File: `{layout.V_KNOWLEDGE}/{rel}`._"
         elif writable:
-            mount = (f"/knowledge/shared/{source}/{subdir}/" if subdir
-                     else f"/knowledge/shared/{source}/")
+            mount = (f"{layout.V_KNOWLEDGE}/shared/{source}/{subdir}/" if subdir
+                     else f"{layout.V_KNOWLEDGE}/shared/{source}/")
             origin = f"from the **{source}** agent"
             hint = (f"\n_Writable attachment — publish updates at "
                     f"`{mount}bulletin/{name}.md`._")
@@ -982,9 +1196,7 @@ def build_agent_prompt(model: str, *,
                        dynamic_contexts: list[tuple[str, str]] | None = None,
                        sandboxed: bool = True,
                        client_type: str = "",
-                       is_remote: bool = False,
-                       target_has_display: bool | None = None,
-                       target_device_grants: set[str] | None = None,
+                       placement: PlacementCapabilities = LOCAL_PLACEMENT,
                        mount_shared: bool = True,
                        execution_path: str = "",
                        skip_http_mcps: bool = False,
@@ -1028,16 +1240,16 @@ def build_agent_prompt(model: str, *,
             ``services.mcp.dynamic_context.get_dynamic_contexts``.
         sandboxed: when True, paths in the prompt use sandbox-relative
             prefixes (``/workspace/``, ``/users/{u}/``).
-        client_type: ``"dashboard"`` / ``"phone"`` / ``"task"`` / ``"trigger"``
-            / ``"meeting"`` / ``""``. Drives MCP catalog filtering against
+        client_type: a session kind's name (``core/session/session_kind.py``:
+            the manifests' ``exclude_from`` word) or ``""``. Drives MCP catalog filtering against
             each manifest's ``exclude_from``. Empty string skips the filter
             (defense-only — upstream usually pre-filters).
-        is_remote / target_has_display / target_device_grants: the resolved
-            execution target's placement facts, forwarded to the MCP catalog +
-            skill loaders so a device-local MCP (computer / browser / app
-            control) only appears in the prompt when the session can actually
-            run it — i.e. on a satellite that has granted the capability.
-            Fail-closed defaults keep ``satellite_only`` / device-capability
+        placement: the session's resolved placement (``core.placement``),
+            forwarded to the MCP catalog + skill loaders so a device-local
+            MCP (computer / browser / app control) only appears in the prompt
+            when the session can actually run it — i.e. on a satellite that
+            has granted the capability. The local default keeps
+            ``satellite_only`` / device-capability
             MCPs out of local-session prompts.
         execution_path: ``"claude-code-cli"`` / ``"codex-cli"`` /
             ``"direct-llm"`` / ``""``. Only ``"direct-llm"`` changes the
@@ -1098,9 +1310,9 @@ def build_agent_prompt(model: str, *,
     # Auto-create per-user directories
     if username:
         with contextlib.suppress(Exception):
-            user_dir = agent_dir / "users" / username
-            (user_dir / "workspace").mkdir(parents=True, exist_ok=True)
-            (user_dir / "context").mkdir(parents=True, exist_ok=True)
+            user_dir = layout.user_dir(agent_dir, username)
+            for sub in layout.USER_SUBDIRS:
+                (user_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Available Tools (MCPs) catalog — one-line summary per enabled MCP.
     # Sits BEFORE MCP Tool Skills so the agent gets a top-down map of its
@@ -1113,8 +1325,7 @@ def build_agent_prompt(model: str, *,
         from services.mcp import mcp_registry
         catalog = mcp_registry.build_available_mcps_section(
             model, context=client_type or "",
-            is_remote=is_remote, target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
+            placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
         )
@@ -1130,8 +1341,7 @@ def build_agent_prompt(model: str, *,
         from services.mcp import mcp_registry
         skills = mcp_registry.get_skills_for_agent(
             model, context=client_type or "",
-            is_remote=is_remote, target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
+            placement=placement,
             skip_http_mcps=skip_http_mcps,
             external=external,
         )
@@ -1150,17 +1360,16 @@ def build_agent_prompt(model: str, *,
             for skill_id, content in inline:
                 parts.append(f"\n{content}")
 
-    # On-demand skill catalog — Direct-LLM sessions only. The CLI engines
-    # index the materialized skills dir themselves (their own Skill tool);
-    # the direct layer has a client-side `Skill` builtin instead, so the
-    # prompt lists what it can load (name + description, one line each).
-    if execution_path == "direct-llm":
+    # On-demand skill catalog — only for an engine whose skills are delivered
+    # as a prompt catalog (Direct LLM's client-side `Skill` builtin loads what
+    # the prompt lists, one line each). The CLI engines index the
+    # materialized skills dir themselves with their own Skill tool.
+    if _skills_delivery(execution_path) == "prompt_catalog":
         with contextlib.suppress(Exception):
             from services.mcp import mcp_registry
             catalog = mcp_registry.get_skill_catalog_for_agent(
                 model, context=client_type or "",
-                is_remote=is_remote, target_has_display=target_has_display,
-                target_device_grants=target_device_grants,
+                placement=placement,
                 skip_http_mcps=skip_http_mcps,
                 external=external,
             )
@@ -1193,9 +1402,9 @@ def build_agent_prompt(model: str, *,
     # way — the per-user shape, re-rooted.
     user_ctx_dir = None
     if external_home:
-        user_ctx_dir = Path(external_home) / "context"
+        user_ctx_dir = Path(external_home) / layout.CONTEXT
     elif username:
-        user_ctx_dir = agent_dir / "users" / username / "context"
+        user_ctx_dir = layout.context_dir(agent_dir, username)
     if user_ctx_dir is not None:
         if user_ctx_dir.is_dir():
             ctx_files = sorted(user_ctx_dir.glob("*.md"))
@@ -1275,13 +1484,13 @@ def build_agent_prompt(model: str, *,
         # Path guidance uses sandbox-relative paths
         if external_home:
             parts.append("\nFiles for this caller go to `/caller/workspace/`.")
-            if role != "viewer":
+            if roles.can_write_workspace(role):
                 parts.append(" Shared output goes to `/workspace/`.")
-        elif external and role == "viewer":
+        elif external and not roles.can_write_workspace(role):
             parts.append("\nThis session has no writable folder.")
         elif username:
-            parts.append(f"\nUser files go to `/users/{username}/workspace/`.")
-            if role != "viewer":
+            parts.append(f"\nUser files go to `{layout.virtual_workspace(username)}/`.")
+            if roles.can_write_workspace(role):
                 parts.append(" Agent-scoped output goes to `/workspace/`.")
         else:
             parts.append("\nAgent-scoped output goes to `/workspace/`.")
@@ -1318,6 +1527,12 @@ def build_agent_prompt(model: str, *,
 
 # Persistent sessions: idle timeout before reaping (seconds)
 PERSISTENT_SESSION_TIMEOUT = int(_cfg("PERSISTENT_SESSION_TIMEOUT", "900"))
+
+# A session with tracked background work (a Bash command left running, a
+# background subagent) is not idle: the reapers and the evictor spare it up
+# to this ceiling, then close it anyway (a job that never ends must not pin a
+# slot forever). Default = the per-turn ceiling.
+BACKGROUND_WORK_CEILING_S = int(_cfg("BACKGROUND_WORK_CEILING_S", str(CLAUDE_TIMEOUT)))
 
 
 def get_session_timeout() -> int:
@@ -1474,7 +1689,7 @@ MODEL_REGISTRY: dict[str, dict] = {
     # claude-fable-5-1 (MODEL_SUCCESSORS, walked at startup); sync_builtin_models
     # retires the builtin row so pickers stop offering Fable 5 (still served
     # by Anthropic as a legacy model — admins can re-add claude-fable-5 as a
-    # custom model). First position keeps it the claude-code-cli Auto default.
+    # custom model).
     "claude-fable-5-1": {
         "label": "Fable 5.1",
         "provider": "anthropic",
@@ -1483,27 +1698,39 @@ MODEL_REGISTRY: dict[str, dict] = {
         # CLI-only: Fable's pricing is above Opus-tier, so keeping it off
         # direct-llm bounds accidental spend on the hosted (credit-metered) path.
         # Fable's safety classifiers can refuse a request mid-run; Claude Code
-        # ships a built-in automatic fallback to Opus 5 for that case
-        # (Claude Code >=2.1.219 makes Opus 5 the default Opus).
+        # ships a built-in automatic fallback to its default Opus for that
+        # case (Opus 5.5 since Claude Code 2.1.280; interactive TUI only).
         "layers": ["claude-code-cli"],
         "server_tools": True,   # supports Anthropic web_search/web_fetch
         "supports_reasoning": True,   # thinking is ALWAYS on for Fable (adaptive)
         "supports_xhigh": True,
+        "tier": 1,
+        "good_at": "complex coding, architecture, subtle bugs, judgement calls and long autonomous work",
     },
-    # Opus 5 (2026-07-24) replaces the retired Opus 4.8 builtin at the SAME
-    # price, so the swap is lossless: a one-time boot remap moves 4.8-pinned
-    # agents/tasks/chats to claude-opus-5 (MODEL_SUCCESSORS, walked at startup);
-    # sync_builtin_models retires the builtin row so pickers stop offering
-    # 4.8. Admins can re-add claude-opus-4-8[1m] as a custom model.
-    "claude-opus-5": {
-        "label": "Opus 5",
+    # Opus 5.5 (API id claude-opus-5-5, no alias) replaces the retired Opus 5
+    # builtin (which had itself replaced Opus 4.8) at a LOWER price on every
+    # element of the tuple with the same capabilities
+    # (1M, xhigh, server tools, adaptive thinking always on), so the swap is
+    # lossless: a boot remap moves Opus 5-pinned agents/tasks/chats to
+    # claude-opus-5-5 (MODEL_SUCCESSORS, walked at startup; Opus 4.8 pins
+    # follow the chain); sync_builtin_models retires the builtin row so
+    # pickers stop offering Opus 5 (Anthropic lists it as legacy; retirement
+    # not announced). Admins can re-add claude-opus-5 as a custom model — the
+    # walk then leaves pins on it alone. Prices per 1M from the
+    # platform.claude.com models overview at the swap: $4 in, $20 out, $5 cache write
+    # (1.25x input), $0.20 cache read (5% of input). Needs Claude Code
+    # >= 2.1.280 (VERSIONS.md). Fable 5.1 stays the tier-1 offer above it.
+    "claude-opus-5-5": {
+        "label": "Opus 5.5",
         "provider": "anthropic",
-        "context_window": 1_000_000,   # native 1M window (no [1m] suffix needed)
-        "pricing": (5.0, 25.0, 6.25, 0.50),  # identical to Opus 4.8's tuple — announced "same as Opus 4.8" (2026-07-24)
+        "context_window": 1_000_000,   # native 1M window, the API default (no beta header)
+        "pricing": (4.0, 20.0, 5.0, 0.20),  # (input, output, cache_write, cache_read) per 1M
         "layers": ["claude-code-cli"],
         "server_tools": True,   # supports Anthropic web_search/web_fetch
         "supports_reasoning": True,
         "supports_xhigh": True,   # keeps the xhigh level (low/medium/high/xhigh/max). NOTE: "ultracode" is NOT an effort level — it's a CLI session setting that pairs xhigh with workflow orchestration; see get_model_supports_xhigh() and DEFAULT_EFFORT_LEVEL.
+        "tier": 2,
+        "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
     "claude-sonnet-5": {
         "label": "Sonnet 5",
@@ -1514,6 +1741,8 @@ MODEL_REGISTRY: dict[str, dict] = {
         "server_tools": True,
         "supports_reasoning": True,
         "supports_xhigh": True,   # first Sonnet with the xhigh effort level
+        "tier": 3,
+        "good_at": "drafting, summaries and bounded analysis",
     },
     "claude-haiku-4-5": {
         "label": "Haiku 4.5 (200K)",
@@ -1522,6 +1751,8 @@ MODEL_REGISTRY: dict[str, dict] = {
         "pricing": (1.0, 5.0, 1.25, 0.10),   # Haiku 4.5 rates (input/output/5m-cache-write/cache-read)
         "layers": ["direct-llm"],
         "server_tools": False,  # does not support programmatic tool calling
+        "tier": 4,
+        "good_at": "high-volume routine work; no programmatic tool calling on Direct LLM",
     },
     # Admins can add further models (Ollama, LM Studio, more Groq/OpenAI, etc.)
     # dynamically via the admin discover-models UI; the entries below are the
@@ -1535,17 +1766,21 @@ MODEL_REGISTRY: dict[str, dict] = {
     # orchestration on top of max reasoning (Astra delegates at xhigh) — see
     # core/layers/codex/helpers.map_effort_to_codex.
     #
-    # GPT-5.6 family (2026-07-09): Sol = frontier (replaces the retired
-    # gpt-5.5 builtin at the same price), Terra = 5.5-class capability at
-    # half the cost, Luna = fast/cheap tier. New prompt-caching billing:
-    # cache WRITES cost 1.25x the uncached input rate (previously $0) and
-    # cache reads keep the 90% discount — reflected in the pricing tuples.
-    # Prices re-verified 2026-08-25 against developers.openai.com/api/docs/
-    # pricing after OpenAI's July 30 (Terra/Luna, permanent) and Aug 21
-    # (Sol, promotional through ≥2026-11-21) cuts.
+    # GPT-6 Sol and GPT-6 Luna (API ids gpt-6-sol / gpt-6-luna, no alias)
+    # replace the retired GPT-5.6 Sol and GPT-5.6 Luna builtins at
+    # a LOWER price on every element of the tuple with the same effort
+    # ceilings (Sol: max + ultra; Luna: max, no ultra), so both swaps are
+    # lossless MODEL_SUCCESSORS entries; GPT-5.6 Terra stays (no cheaper
+    # same-capability successor — GPT-6 Sol is dearer). Prices per 1M from
+    # developers.openai.com/api/docs/pricing at the swap, stated by OpenAI
+    # as permanent, not promotional. Prompt-caching billing as the
+    # 5.6 family: cache WRITES cost 1.25x the uncached input rate, cache
+    # reads keep the 90% discount — reflected in the tuples. Codex 0.156.1
+    # bundles both (VERSIONS.md); its catalog marks 5.6 Sol/Terra → GPT-6
+    # Sol and 5.6 Luna → GPT-6 Luna.
     # Context: 272k is the PRICING-TIER line, not the raw model window —
-    # the 5.6 models are really 1.05M (922k input + 128k output), but input
-    # beyond 272k bills the WHOLE request at the long-context tier
+    # the GPT-6 and 5.6 models are really 1.05M (922k input + 128k output),
+    # but input beyond 272k bills the WHOLE request at the long-context tier
     # (2x input / 1.5x output). We keep the registry at 272k deliberately:
     # it is codex-cli's own bundled default cap (raised to an opt-in 872k
     # override ceiling in 0.149.0, default unchanged) and it keeps the
@@ -1553,29 +1788,29 @@ MODEL_REGISTRY: dict[str, dict] = {
     # double-rate territory. codex-cli reads the LIVE modelContextWindow at
     # runtime (headless gauges self-correct); this registry number drives
     # the direct-llm layer's context management and the capability display.
-    # Sol first: registry insertion order makes it the codex-cli "Auto"
-    # default (flagship-first, as gpt-5.5 was). Agents still PINNED to
-    # gpt-5.5 keep running (the CLI supports it; pricing falls back to the
-    # provider default) — sync_builtin_models retires the builtin row so
-    # pickers stop offering it.
-    "gpt-5.6-sol": {
-        "label": "GPT-5.6 Sol",
+    # Agents still PINNED to a retired id with no successor (gpt-5.5) keep
+    # running (the CLI supports it; pricing falls back to the provider
+    # default) — sync_builtin_models retires the builtin row so pickers
+    # stop offering it.
+    "gpt-6-sol": {
+        "label": "GPT-6 Sol",
         "provider": "openai",
-        "context_window": 272_000,   # corrected from 1M — see the family window note above
-        "pricing": (4.0, 20.0, 5.0, 0.40),  # per 1M: (input, output, cache_write, cache_read).
-                                            # 2026-08-21 cut ($5/$30 → $4/$20) — PROMOTIONAL,
-                                            # "at least through November 21, 2026"; revisit then.
+        "context_window": 272_000,   # the pricing-tier line — see the window note above
+        "pricing": (2.0, 10.0, 2.50, 0.20),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli"],
         "supports_reasoning": True,
         "supports_xhigh": True,
         "supports_ultra": True,   # Codex "ultra": max reasoning + proactive multi-agent
+        "tier": 2,
+        "good_at": "substantial, well-scoped coding and analysis; complex or open-ended work belongs on the frontier",
     },
     # GPT-6 Astra (2026-09-03; API id gpt-6-astra, no alias, no snapshots): a
-    # NEW model next to the 5.6 family, not a rename — the 5.6 rows stay and
-    # no MODEL_SUCCESSORS entry. OpenAI's flagship and Codex's own bundled
-    # default since 0.153.4; listed SECOND here on purpose so the codex-cli
-    # "Auto" default (registry order) stays on Sol — Astra costs 2.5× Sol on
-    # an API key, and moving every unpinned agent is the operator's call.
+    # NEW model, not a rename of any row — no MODEL_SUCCESSORS entry points
+    # at it. OpenAI's flagship and Codex's own bundled default since 0.153.4.
+    # The platform's codex-cli default is DECLARED (core/layers/codex
+    # ModelPolicy.default_model = GPT-6 Sol, tier 2): Astra costs 5× GPT-6
+    # Sol on an API key, so a frontier model stays a deliberate choice —
+    # registry order no longer decides the "Auto" default.
     # Context: the same 272k pricing-tier line as the 5.6 family (1.05M real:
     # 922k in + 128k out; input beyond 272k bills the whole request at
     # 2× input / 1.5× output — $20 / $75 there). Prices per 1M verified
@@ -1594,6 +1829,8 @@ MODEL_REGISTRY: dict[str, dict] = {
         "supports_reasoning": True,
         "supports_xhigh": True,
         "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning
+        "tier": 1,
+        "good_at": "complex coding, architecture, subtle bugs, judgement calls and long autonomous work",
     },
     "gpt-5.6-terra": {
         "label": "GPT-5.6 Terra",
@@ -1606,23 +1843,33 @@ MODEL_REGISTRY: dict[str, dict] = {
         "supports_xhigh": True,
         "supports_ultra": True,   # codex-cli only — the dashboard offers Ultra
                                   # solely when the codex engine serves the model
+        "tier": 3,
+        "good_at": "drafting, summaries and bounded analysis",
     },
-    "gpt-5.6-luna": {
-        "label": "GPT-5.6 Luna",
+    # GPT-6 Luna is on direct-llm too: the hosted relay prices per model and
+    # rejects unknown ids, so its relay row (otodock-commercial
+    # relay_vendors.py) must be served BEFORE an OSS release lists a new
+    # direct-llm builtin — a direct-llm row here without one fails every
+    # hosted install's titles and Luna chats.
+    "gpt-6-luna": {
+        "label": "GPT-6 Luna",
         "provider": "openai",
-        "context_window": 272_000,   # corrected from 1M — see the family window note above
-        "pricing": (0.20, 1.20, 0.25, 0.02),  # 2026-07-30 cut ($1/$6 → $0.20/$1.20, −80%), permanent
+        "context_window": 272_000,   # the pricing-tier line — see the window note above
+        "pricing": (0.10, 0.50, 0.125, 0.01),  # per 1M: (input, output, cache_write, cache_read)
         "layers": ["codex-cli", "direct-llm"],
         "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
         "supports_reasoning": True,
         "supports_xhigh": True,
         # No supports_ultra: OpenAI's own model manifest caps Luna (the fast/
         # cheap tier) at "max" — ultra is a Sol/Terra/Astra capability.
+        "tier": 4,
+        "good_at": "high-volume routine work",
     },
     # (Older GPT-5.x builtins — gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
-    # — were retired with the 5.6 family: the three 5.6 tiers cover the same
-    # frontier/mid/cheap spread. Agents pinned to a retired id keep running;
-    # admins can re-add any of them as custom models via discover-models.)
+    # — were retired with the 5.6 family, and 5.6 Sol / 5.6 Luna with the
+    # GPT-6 pair. Agents pinned to a retired id with a successor
+    # move at boot; the others keep running; admins can re-add any of them
+    # as custom models via discover-models.)
 
     # --- Groq models (direct-llm; OpenAI-compatible API) ---
     # gpt-oss-120b is GroqCloud production; qwen3.6-27b is Groq "preview" (kept
@@ -1642,6 +1889,8 @@ MODEL_REGISTRY: dict[str, dict] = {
         "context_window": 131_072,
         "pricing": (0.60, 3.00, 0.0, 0.30),
         "layers": ["direct-llm"],
+        "tier": 4,
+        "good_at": "general-purpose answers served on Groq",
     },
     "openai/gpt-oss-120b": {
         "label": "GPT-OSS 120B",
@@ -1650,14 +1899,59 @@ MODEL_REGISTRY: dict[str, dict] = {
         "pricing": (0.15, 0.60, 0.0, 0.075),
         "layers": ["direct-llm"],
         "supports_reasoning": True,
+        "tier": 4,
+        "good_at": "open-weight answers served on Groq",
     },
 }
+
+# Capability tiers, most capable first. A tier is a judgement about which
+# offered model an agent should pick for a job (a curated table shipped with
+# the registry, never fetched: installs on private networks must give the
+# same answer as everyone else). Builtins carry theirs on the entry above;
+# admin-added models are untiered until an admin tags them.
+MODEL_TIER_LABELS: dict[int, str] = {
+    1: "frontier",
+    2: "strong",
+    3: "balanced",
+    4: "fast",
+}
+MODEL_GOOD_AT_MAX_CHARS = 120
+
+
+def get_model_tier(model: str) -> tuple[int | None, str, str]:
+    """``(tier, tier_label, good_at)`` for a model id: registry first, then
+    the first tiered ``execution_layer_models`` row for the id (a custom
+    model tagged by an admin), else ``(None, "", "")`` = untiered."""
+    entry = MODEL_REGISTRY.get(model)
+    if entry:
+        tier = entry.get("tier")
+        return tier, MODEL_TIER_LABELS.get(tier, ""), entry.get("good_at", "")
+    with contextlib.suppress(Exception):
+        from storage.billing import subscription_store
+        for m in subscription_store.list_models():
+            if m.get("model_id") == model and m.get("tier"):
+                tier = int(m["tier"])
+                return tier, MODEL_TIER_LABELS.get(tier, ""), m.get("good_at") or ""
+    return None, "", ""
+
+
+def model_catalog_sort_key(m: dict) -> tuple:
+    """Sort key for model rows wherever a list is shown to an agent or a
+    human: tier first (untiered last), builtins before customs, then
+    registry order, then creation time."""
+    tier = m.get("tier")
+    return (
+        int(tier) if tier else 99,
+        not m.get("is_builtin", True),
+        _MODEL_REGISTRY_ORDER.get(m.get("model_id") or m.get("value") or "", 999),
+        str(m.get("created_at") or ""),
+    )
 
 
 def model_supports_server_tools(model: str) -> bool:
     """Whether the Direct LLM engine offers the provider's own server-run tools
     on this model: Anthropic ``web_search`` / ``web_fetch``
-    (``EXECUTION_PATH_BUILTIN_TOOLS``), OpenAI's built-in ``web_search`` on the
+    (``AnthropicAdapter.SERVER_TOOLS``), OpenAI's built-in ``web_search`` on the
     Responses API. Registry builtins only — an admin-added model stays False
     (a custom OpenAI id may be a gateway that rejects the tool)."""
     entry = MODEL_REGISTRY.get(model)
@@ -1693,10 +1987,10 @@ def get_model_supports_xhigh(model: str) -> bool:
 def get_model_supports_ultra(model: str) -> bool:
     """Return True if the model accepts the platform's "ultra" effort level.
 
-    Ultra is Codex-only (gpt-5.6 Sol/Terra, GPT-6 Astra): max reasoning plus
+    Ultra is Codex-only (GPT-6 Sol, gpt-5.6 Terra, GPT-6 Astra): max reasoning plus
     Codex-native proactive multi-agent orchestration. Registry-only on purpose — custom
     admin-added models have no supports_ultra column (the wire clamp in
-    map_effort_to_codex is prefix-based, so a custom "gpt-5.6-sol-*" id still
+    map_effort_to_codex is prefix-based, so a custom "gpt-6-sol-*" id still
     maps correctly; the dashboard just won't offer the option). Unknown
     models → False: a stored "ultra" then clamps to the model's ceiling in
     every execution layer rather than risking an API rejection.
@@ -1740,7 +2034,7 @@ def get_model_layers(model: str) -> list[str]:
     Resolution: MODEL_REGISTRY (builtins) → DB execution_layer_models (custom).
     Empty list = unknown model. Used to keep an agent's PRIMARY execution layer
     consistent with its default model — a model only runs on its own layer
-    (e.g. ``gpt-5.6-sol`` is ``codex-cli`` only), so the no-picker default (primary
+    (e.g. ``gpt-6-sol`` is ``codex-cli`` only), so the no-picker default (primary
     layer + default model) must agree or tasks hard-reject the model.
     """
     if not model:
@@ -1772,7 +2066,9 @@ MODEL_DEFAULT_PRICING = PROVIDER_DEFAULT_PRICING["anthropic"]
 MODEL_DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Retired builtin → successor. Walked at boot (startup.py →
-# subscription_store.remap_retired_model per entry) so every persisted PIN of
+# subscription_store.remap_retired_model per entry, each retired id remapped
+# to the END of its chain via successor_model, so the dict's order never
+# strands a pin on an intermediate retired id) so every persisted PIN of
 # a retired id — agents.default_model, chats.model, dynamic_tasks.override_model
 # — moves to the successor. Why pins need this at all: sync_builtin_models
 # retires the old row, the retired id then fails the model-allowed check, and a
@@ -1781,10 +2077,32 @@ MODEL_DEFAULT_CONTEXT_WINDOW = 200_000
 # it — they follow MODEL_REGISTRY order. Only list lossless swaps (same or
 # lower price, same capabilities); a retirement WITHOUT a successor just
 # leaves the pins to the fallback. One line per retirement, no startup code.
+# The walk skips a retired id an admin has re-added as a custom row (the
+# admin chose to keep it; its pins stay). Pins the walk never sees — a
+# check's judge.model, the title-model setting — resolve through
+# successor_model() at read time.
 MODEL_SUCCESSORS: dict[str, str] = {
     "claude-opus-4-8[1m]": "claude-opus-5",   # 2026-07-24 — identical price tuple
     "claude-fable-5": "claude-fable-5-1",     # 2026-09-01 — same base price, cheaper cache reads
+    "claude-opus-5": "claude-opus-5-5",       # 2026-09-24 — cheaper on every element of the tuple
+    "gpt-5.6-sol": "gpt-6-sol",               # 2026-09-24 — cheaper on every element, keeps ultra
+    "gpt-5.6-luna": "gpt-6-luna",             # 2026-09-24 — cheaper on every element, max-only as before
 }
+
+
+def successor_model(model: str) -> str:
+    """The id a retired builtin pin resolves to today: ``MODEL_SUCCESSORS``
+    followed to the end of its chain (``claude-opus-4-8[1m]`` →
+    ``claude-opus-5`` → ``claude-opus-5-5``), the id itself when no entry
+    applies (cycle-safe). The boot walk remaps every retired id to this end;
+    the pins the walk never rewrites (a check's ``judge.model``, the
+    title-model setting) read through it instead."""
+    cur = model or ""
+    seen: set[str] = set()
+    while cur in MODEL_SUCCESSORS and cur not in seen:
+        seen.add(cur)
+        cur = MODEL_SUCCESSORS[cur]
+    return cur
 
 
 def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, float, float]:
@@ -1793,10 +2111,15 @@ def get_model_pricing(model: str, provider: str = "") -> tuple[float, float, flo
     Resolution order: DB (custom pricing) → MODEL_REGISTRY → provider default.
     If provider is given, use it directly for fallback instead of heuristic.
     """
-    # 1. Check DB for custom pricing (dynamically added models)
+    # 1. Check DB for custom pricing (dynamically added models).
+    # EVERY layer's rows, not just direct-llm: an admin who priced a custom
+    # model on the Codex or Claude card had that price silently ignored and
+    # got the registry's (or the provider default's) numbers in every usage
+    # record. The row is keyed by (layer, model_id), so the first row for
+    # this model id is the admin's answer whichever card they set it on.
     with contextlib.suppress(Exception):
         from storage.billing import subscription_store
-        for m in subscription_store.list_models(layer="direct-llm"):
+        for m in subscription_store.list_models():
             if m.get("model_id") == model and m.get("pricing_input", 0) > 0:
                 return (
                     m["pricing_input"], m["pricing_output"],
@@ -1816,10 +2139,13 @@ def get_model_context_window(model: str) -> int:
 
     Resolution order: DB → MODEL_REGISTRY → default.
     """
-    # Check DB for custom context window
+    # Check DB for a custom context window — every layer's rows, for the same
+    # reason as get_model_pricing above (an admin's window set on the Codex or
+    # Claude card was ignored, so the gauge and the direct-llm truncation
+    # threshold used the registry's number instead).
     with contextlib.suppress(Exception):
         from storage.billing import subscription_store
-        for m in subscription_store.list_models(layer="direct-llm"):
+        for m in subscription_store.list_models():
             if m.get("model_id") == model and m.get("context_window", 0) > 0:
                 return m["context_window"]
     entry = MODEL_REGISTRY.get(model)
@@ -1845,10 +2171,14 @@ def model_supports_reasoning(model: str) -> bool:
     return False
 
 
-def get_layer_models(layer: str) -> list[dict]:
+def get_layer_models(layer: str, *, offers_ultra: bool = False) -> list[dict]:
     """Get the builtin model list for an execution layer (for LayerCapabilities).
 
     Includes pricing and context_window so sync_builtin_models can populate DB.
+    ``offers_ultra``: the ENGINE can run the "ultra" effort at all (Codex's
+    proactive multi-agent orchestration); the per-model registry flag is then
+    ANDed with it, so Terra — also a direct-llm model — shows ultra on the
+    codex list only, and Luna never does.
     """
     models = [{"value": "", "label": "System Default"}]
     for model_id, info in MODEL_REGISTRY.items():
@@ -1865,12 +2195,10 @@ def get_layer_models(layer: str) -> list[dict]:
                 "pricing_cache_read": pricing[3],
                 "supports_reasoning": info.get("supports_reasoning", False),
                 "supports_xhigh": info.get("supports_xhigh", False),
-                # Ultra is a CODEX capability, not a model property in the
-                # abstract: Terra is also a direct-llm model, but only the
-                # codex engine can run the multi-agent orchestration — so the
-                # flag is emitted per-layer and the dashboard's effort picker
-                # sees it only on the codex-cli list.
-                "supports_ultra": bool(info.get("supports_ultra", False)) and layer == "codex-cli",
+                "supports_ultra": bool(info.get("supports_ultra", False)) and offers_ultra,
+                "tier": info.get("tier"),
+                "tier_label": MODEL_TIER_LABELS.get(info.get("tier"), ""),
+                "good_at": info.get("good_at", ""),
             })
     return models
 
@@ -1901,13 +2229,24 @@ def _pool_providers(layer: str) -> set[str]:
 def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     """Resolve the effective model for an agent session.
 
-    Precedence:
-      1. agents.default_model (admin-set per-agent) — used if non-empty AND
-         served by the effective layer (see below).
-      2. First enabled model for the effective layer from the
-         execution_layer_models DB table — builtins first in MODEL_REGISTRY
-         insertion order, then custom models by created_at ASC.
-      3. Raise RuntimeError — no silent Anthropic fallback, no env-var
+    Precedence (engine-contract lane, phase 2 — the declared default is the
+    new middle term; the operator's rule is "the tier is the rule": each
+    engine DECLARES its default as the best tier it serves with tier 1
+    offered but never defaulted):
+      1. agents.default_model (the per-agent PIN). Two-mode, byte for byte as
+         before: with ``layer=None`` it is returned with no check at all; with
+         ``layer`` given it is returned when a row for it exists on that
+         layer — enabled or not. A pin is an explicit human choice; the
+         admin's ``enabled`` toggle moves the DEFAULT below, never a pin.
+      2. The layer's declared ``ModelPolicy.default_model``, when its row on
+         the layer exists, is ENABLED, and the platform pool can serve its
+         provider (no pool at all = no filter).
+      3. Else the enabled (+ pool-served) rows, sorted so the fallback falls
+         DOWN the tiers from the declared default and never up: tiers at or
+         below the default's tier first (tier order, builtins first, then
+         registry order, then created_at); tiers ABOVE it only when nothing
+         else is enabled — so disabling Opus 5 lands on Sonnet 5, not Fable.
+      4. Raise RuntimeError — no silent Anthropic fallback, no env-var
          default. The caller decides how to surface this to the user.
 
     ``layer`` — the execution path the session will ACTUALLY run on. Task /
@@ -1933,11 +2272,14 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     """
     from storage.agents import agent_store
     from storage.billing import subscription_store
+    # Function-local: config is imported by nearly everything, so it must not
+    # take a module-level dependency on the execution-layer package.
+    from core.execution_layer import DEFAULT_EXECUTION_PATH
 
     agent = agent_store.get_agent(agent_name)
     path = (layer
             or (agent.get("execution_path") if agent else None)
-            or "claude-code-cli")
+            or DEFAULT_EXECUTION_PATH)
     default_model = (agent or {}).get("default_model") or ""
     if default_model:
         if not layer:
@@ -1955,30 +2297,64 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
             served = True
         if served:
             return default_model
-    db_models = subscription_store.list_models(layer=path)
+    return resolve_layer_default_model(path, agent_name=agent_name)
+
+
+def resolve_layer_default_model(layer: str, *, agent_name: str = "") -> str:
+    """The model an UNPINNED agent on ``layer`` runs right now — steps 2-4 of
+    :func:`resolve_agent_model`, which calls this after the pin check. The
+    catalog (``GET /v1/execution-layers``) serves it per engine as
+    ``auto_model`` so the dashboard's "Auto" option names the model that
+    will actually run instead of re-deriving it (and getting it wrong).
+
+    ``agent_name`` only decorates the error: the rule itself is per engine
+    and per install (enablement + the platform pool), never per agent.
+
+    Raises:
+        RuntimeError: when no model is enabled on ``layer``.
+    """
+    from storage.billing import subscription_store
+
+    db_models = subscription_store.list_models(layer=layer)
     enabled = [m for m in db_models if m.get("enabled")]
     if not enabled:
+        who = f"for agent '{agent_name}' " if agent_name else ""
         raise RuntimeError(
-            f"No enabled model available for agent '{agent_name}' "
-            f"(execution_path='{path}'). Configure one at Admin > "
+            f"No enabled model available {who}"
+            f"(execution_path='{layer}'). Configure one at Admin > "
             f"Execution Layers."
         )
 
-    # Prefer a provider the platform pool can actually serve: registry order
-    # alone lands a local-only install on the first builtin (Haiku 4.5 on
-    # direct-llm) and fails with "no credentials". A pool with no providers
-    # (personal accounts only) keeps the plain registry order.
-    configured = _pool_providers(path)
+    # Prefer a provider the platform pool can actually serve: a local-only
+    # install would otherwise land on a vendor builtin and fail with "no
+    # credentials". A pool with no providers (personal accounts only) applies
+    # no filter — and neither does a lookup error (_pool_providers returns an
+    # empty set for both).
+    configured = _pool_providers(layer)
     if configured:
         served = [m for m in enabled if (m.get("provider") or "") in configured]
         if served:
             enabled = served
 
+    # 2. The engine's DECLARED default, if it survived both filters above.
+    declared = _declared_default_model(layer)
+    if declared and any(m.get("model_id") == declared for m in enabled):
+        return declared
+
+    # 3. Fall DOWN the tiers from the declared default, never up: a row whose
+    # tier is better (numerically lower) than the default's sorts LAST, so it
+    # is reached only when nothing at or below the default's tier is enabled
+    # and servable. Within a band: tier order, builtins first, registry
+    # order, created_at. Untiered custom rows count as the worst tier.
+    default_tier = get_model_tier(declared)[0] if declared else None
+
     def _sort_key(m: dict) -> tuple:
-        # Builtins first (is_builtin=True sorts before False via `not`),
-        # then within builtins by MODEL_REGISTRY order,
-        # then by created_at for tie-breaks + custom-model ordering.
+        tier = m.get("tier")
+        tier_n = int(tier) if tier else 99
+        above_default = default_tier is not None and tier_n < default_tier
         return (
+            above_default,
+            tier_n,
             not m.get("is_builtin"),
             _MODEL_REGISTRY_ORDER.get(m.get("model_id", ""), 999),
             m.get("created_at", ""),
@@ -1986,6 +2362,29 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
 
     enabled.sort(key=_sort_key)
     return enabled[0]["model_id"]
+
+
+def _skills_delivery(layer: str) -> str:
+    """The engine's ``behaviour.skills_delivery`` ("materialized_dir" for an
+    unregistered or empty id — nothing is appended to the prompt)."""
+    try:
+        from core.session.session_manager import get_layer_capabilities
+        caps = get_layer_capabilities(layer or "")
+    except Exception:
+        return "materialized_dir"
+    return caps.behaviour.skills_delivery if caps else "materialized_dir"
+
+
+def _declared_default_model(layer: str) -> str:
+    """The ``ModelPolicy.default_model`` the layer declares, or "" when the
+    layer is unknown or the registry cannot be reached (a test that stubs
+    the store must not need the layer packages)."""
+    try:
+        from core.session.session_manager import get_layer_capabilities
+        caps = get_layer_capabilities(layer)
+    except Exception:
+        return ""
+    return caps.model_policy.default_model if caps else ""
 
 
 # Thin aliases kept for semantic clarity at call sites — CLI vs Direct path
@@ -2010,26 +2409,6 @@ def get_cli_effort(agent_name: str) -> str:
     agent = agent_store.get_agent(agent_name)
     return (agent["default_effort"] if agent and agent["default_effort"] else DEFAULT_EFFORT_LEVEL)
 
-# Execution-path-level builtin tools (server-side Anthropic API tools).
-# Each execution path defines its own available builtin tools.
-#
-# The BASIC tool versions on purpose (decided 2026-09-07): the 2026 versions
-# add "dynamic filtering" — the model writes code that filters the results
-# inside a code-execution sandbox before reading them — which on a chat
-# assistant showed as a pile of code_execution rows (a weather question ran 3
-# searches + 2 fetches through 6 code executions, 41 s, and still answered
-# without live data because fetched weather pages carry no readable forecast).
-# Direct search hands the result snippets straight to the model, the way
-# OpenAI's built-in search does, and needs one step for the same question.
-EXECUTION_PATH_BUILTIN_TOOLS: dict[str, list[dict]] = {
-    "direct-llm": [
-        {"type": "web_search_20250305", "name": "web_search"},
-        {"type": "web_fetch_20250910", "name": "web_fetch"},
-    ],
-    # "claude-code-cli": []  — CLI has its own builtin tools
-    # "ollama": []           — future: custom search tools
-}
-
 # What one provider-run web search costs on top of the tokens (USD per search):
 # Anthropic's web_search tool and OpenAI's built-in web_search both list $10 per
 # 1k calls. Added to the per-turn cost by ProviderAdapter.calculate_cost from
@@ -2048,6 +2427,31 @@ DATABASE_URL = _cfg(
     "DATABASE_URL",
     "postgresql://otodock:otodock@localhost:5432/otodock"
 )
+
+# Connection pools and the threads around the event loop (storage/pg.py,
+# startup.py, app.py). Per process at these defaults: the shared pool (30),
+# the run_db lane pool (fast + bulk + 2) and the loop pool (3): 52, plus 3
+# for a moment during a loop-pool recovery, against Postgres' 100.
+DB_POOL_MAX_SIZE = int(_cfg("DB_POOL_MAX_SIZE", "30"))
+DB_POOL_TIMEOUT_S = float(_cfg("DB_POOL_TIMEOUT_S", "10"))
+DB_FAST_LANE_WORKERS = max(1, int(_cfg("DB_FAST_LANE_WORKERS", "6")))
+DB_BULK_LANE_WORKERS = max(1, int(_cfg("DB_BULK_LANE_WORKERS", "10")))
+# The event loop's own pool: how long it waits for a connection before the
+# breaker opens, how long the breaker stays open, and after how long one
+# operation triggers a liveness probe of Postgres (0 disables the probe).
+DB_LOOP_POOL_TIMEOUT_S = float(_cfg("DB_LOOP_POOL_TIMEOUT_S", "0.5"))
+DB_LOOP_BREAKER_S = float(_cfg("DB_LOOP_BREAKER_S", "5"))
+DB_LOOP_LIVENESS_PROBE_S = float(_cfg("DB_LOOP_LIVENESS_PROBE_S", "1.0"))
+# Server-side statement_timeout and idle_in_transaction_session_timeout on
+# every pool connection; 0 disables each (PgBouncer in transaction mode).
+DB_STATEMENT_TIMEOUT_S = float(_cfg("DB_STATEMENT_TIMEOUT_S", "300"))
+DB_IDLE_IN_TX_TIMEOUT_S = float(_cfg("DB_IDLE_IN_TX_TIMEOUT_S", "60"))
+# The asyncio default executor (asyncio.to_thread). More threads worsen GIL
+# contention with the loop (measured); 32 covers the to_thread sites.
+DEFAULT_EXECUTOR_WORKERS = max(1, int(_cfg("DEFAULT_EXECUTOR_WORKERS", "32")))
+# uvicorn limit_concurrency: past this many open connections (WebSockets
+# included) a new HTTP request gets 503. 0 disables.
+HTTP_LIMIT_CONCURRENCY = int(_cfg("HTTP_LIMIT_CONCURRENCY", "4000"))
 
 # ---------------------------------------------------------------------------
 # Concurrency admission (core/concurrency.py + core/sandbox/host_resources.py)
@@ -2071,7 +2475,7 @@ DATABASE_URL = _cfg(
 # reclaims/penalizes the difference as sessions actually grow, so a smaller
 # estimate buys small hosts real concurrency without losing the burst bound.
 SESSION_EST_HEAVY_MB = int(_cfg("SESSION_EST_HEAVY_MB", "850"))    # CLI/Codex/interactive/phone-CLI/task reserve
-SESSION_EST_LIGHT_MB = int(_cfg("SESSION_EST_LIGHT_MB", "250"))    # Direct-LLM reserve (no CLI process)
+SESSION_EST_LIGHT_MB = int(_cfg("SESSION_EST_LIGHT_MB", "250"))    # floor of the Direct-LLM estimate (no CLI process)
 # Gate-1 budget = total RAM × this. Generous on purpose — Gate 1 is a coarse cap +
 # burst bound, Gate 2 is the real safety, so this never needs precise tuning.
 BUDGET_FRACTION = float(_cfg("BUDGET_FRACTION", "0.90"))
@@ -2094,6 +2498,18 @@ SESSION_EVICT_FLOOR_S = int(_cfg("SESSION_EVICT_FLOOR_S", "300"))
 # UI). 0 = no cap (pure budget, the default). For operators on noisy shared boxes who
 # want a deterministic ceiling regardless of the live-RAM reading.
 OTODOCK_MAX_LOCAL_SESSIONS = int(_cfg("OTODOCK_MAX_LOCAL_SESSIONS", "0") or "0")
+# Sessions one person may hold at once (0 = no cap), and the session spawns
+# allowed at once (0 = half the CPUs this process may use, at least 2).
+MAX_SESSIONS_PER_USER = int(_cfg("OTODOCK_MAX_SESSIONS_PER_USER", "8") or "0")
+SESSION_SPAWN_CONCURRENCY = int(_cfg("SESSION_SPAWN_CONCURRENCY", "0") or "0") or max(
+    2, len(os.sched_getaffinity(0)) // 2 if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4) // 2)
+# Admission: how long a session start waits in the queue for a slot, and how
+# long a parked delegate result or continuation wake waits for one before it
+# is stored for the chat's next turn.
+ADMISSION_QUEUE_WAIT_S = float(_cfg("ADMISSION_QUEUE_WAIT_S", "30"))
+ADMISSION_WAKE_WAIT_S = float(_cfg("ADMISSION_WAKE_WAIT_S", "600"))
+# The session index is written behind: dirty entries flush at most this often.
+SESSION_INDEX_FLUSH_S = float(_cfg("SESSION_INDEX_FLUSH_S", "2.0"))
 
 SCHEDULER_TIMEZONE = _cfg("SCHEDULER_TIMEZONE", "UTC")
 SCHEDULER_MODE = _cfg("SCHEDULER_MODE", "embedded")  # embedded | standalone
@@ -2105,6 +2521,13 @@ SCHEDULER_SYNC_INTERVAL = int(_cfg("SCHEDULER_SYNC_INTERVAL", "30"))
 # hosts. The fire times themselves stay exact; only the session starts are
 # spaced. 0 disables. Manual Run-Now and event triggers are never spaced.
 TASK_SPAWN_SPACING_SECONDS = int(_cfg("TASK_SPAWN_SPACING_SECONDS", "10"))
+# Active clocked tasks (recurring, and one-time not yet fired) one person may
+# create and one agent may hold (429 past them; admins are exempt), and the
+# pending self-continuations per chat and per agent. 0 = no cap.
+TASK_MAX_ACTIVE_PER_USER = int(_cfg("TASK_MAX_ACTIVE_PER_USER", "25"))
+TASK_MAX_ACTIVE_PER_AGENT = int(_cfg("TASK_MAX_ACTIVE_PER_AGENT", "100"))
+CONTINUATION_MAX_ACTIVE_PER_CHAT = int(_cfg("CONTINUATION_MAX_ACTIVE_PER_CHAT", "10"))
+CONTINUATION_MAX_ACTIVE_PER_AGENT = int(_cfg("CONTINUATION_MAX_ACTIVE_PER_AGENT", "100"))
 
 
 def get_platform_timezone() -> str:
@@ -2266,24 +2689,25 @@ elif _local_pbx_raw in ("0", "false", "no", "off"):
 else:
     LOCAL_PBX_ENABLED = not OTODOCK_CLOUD
 
-# Is the PROXY ITSELF running inside a container? Distinct from OTODOCK_CLOUD
-# (which is the multi-tenant SaaS axis): RUNNING_IN_DOCKER is the bare-metal
-# (T1) vs Docker-Compose (T2) split. Drives how the proxy reaches the Docker
-# daemon and Docker-MCP service URLs (the T2 socket-proxy backend).
-# Explicit env wins; ``/.dockerenv`` is only a fallback (absent in some k8s
-# runtimes). No-op on bare-metal (env unset + no /.dockerenv → False), so the
-# live native install is unaffected.
-def _default_running_in_docker() -> bool:
-    import os
-    return os.path.exists("/.dockerenv")
+def _warn_untrusted_edge(in_docker: bool, public_url: str, trusted: list[str]) -> bool:
+    """In a container the edge never connects from 127.0.0.1, so an https
+    public URL with no TRUSTED_PROXY means every visitor shares the edge's
+    address. Said at boot, never refused: fronted installs must still start."""
+    if not (in_docker and public_url.strip().lower().startswith("https://") and not trusted):
+        return False
+    _boot_note(
+        "ERROR: DASHBOARD_PUBLIC_URL is https but TRUSTED_PROXY is empty: behind a "
+        "reverse proxy every visitor shares its address, so one person's failed "
+        "logins lock everyone out. In .env set TRUSTED_PROXY to the address the "
+        "reverse proxy connects from: for one on this host, the otodock network's "
+        "gateway (docker network inspect otodock -f "
+        "'{{(index .IPAM.Config 0).Gateway}}', 10.200.0.1 by default) with the "
+        "proxy port published on 127.0.0.1 only; for one on another machine, its IP."
+    )
+    return True
 
-_running_in_docker_env = _cfg("RUNNING_IN_DOCKER", "").lower()
-if _running_in_docker_env in ("1", "true", "yes"):
-    RUNNING_IN_DOCKER = True
-elif _running_in_docker_env in ("0", "false", "no"):
-    RUNNING_IN_DOCKER = False
-else:
-    RUNNING_IN_DOCKER = _default_running_in_docker()
+
+_warn_untrusted_edge(RUNNING_IN_DOCKER, DASHBOARD_PUBLIC_URL, TRUSTED_PROXIES)
 
 # --- T2 (Docker-Compose) service-DNS + daemon wiring ---
 # All of these are consumed ONLY when RUNNING_IN_DOCKER is true (see
@@ -2471,6 +2895,17 @@ OIDC_REDIRECT_URI = _cfg("OIDC_REDIRECT_URI", "") or (
 OIDC_ROLE_ADMIN_GROUP = _cfg("OIDC_ROLE_ADMIN_GROUP", "")
 OIDC_ROLE_CREATOR_GROUP = _cfg("OIDC_ROLE_CREATOR_GROUP", "")
 OIDC_ROLE_MEMBER_GROUP = _cfg("OIDC_ROLE_MEMBER_GROUP", "")
+# The identity-provider confirm (SHARING.md "The confirm") is a plain login
+# round trip by default: the provider says whether the signed-in browser is
+# the same account, and a signed-in one answers at once. True asks the
+# provider for a new login instead (prompt=login, max_age=0) and refuses an
+# answer whose ``auth_time`` is older than the click — only for a provider
+# whose flows honour that (Authentik's defaults do not: they land the
+# browser on the callback with no answer, or let the old session through).
+OIDC_CONFIRM_FRESH_LOGIN = _cfg("OIDC_CONFIRM_FRESH_LOGIN", "").lower() == "true"
+# With the fresh login on, an ID token without ``auth_time`` passes unless
+# this is true (some providers omit the claim).
+OIDC_CONFIRM_REQUIRE_AUTH_TIME = _cfg("OIDC_CONFIRM_REQUIRE_AUTH_TIME", "").lower() == "true"
 
 # Explicit UA — Authentik (and many WAFs) reject the default Python client
 # User-Agents with 403.
@@ -2523,7 +2958,6 @@ if OIDC_ROLE_CREATOR_GROUP:
 if OIDC_ROLE_MEMBER_GROUP:
     OIDC_ROLE_GROUPS[OIDC_ROLE_MEMBER_GROUP] = "member"
 
-ROLE_PRIORITY = {"admin": 0, "creator": 1, "member": 2}
 
 # WOPI / Collabora
 WOPI_SECRET = _cfg("WOPI_SECRET", JWT_SECRET)
@@ -2544,14 +2978,13 @@ COLLABORA_URL = _cfg("COLLABORA_URL", _default_collabora_url())
 # Internal URL that Collabora (inside Docker) uses to reach proxy WOPI endpoints.
 # Must bypass Cloudflare/Authentik — direct to proxy on the host network.
 #
-# Auto-derived from deployment shape:
-#   - Proxy in Docker-Compose (RUNNING_IN_DOCKER)
-#       → "http://${PROXY_SERVICE_NAME}:${PORT}" (service DNS; the shipped compose
-#         names the proxy service `otodock-proxy`).
-#   - Proxy on host (native install + Docker Collabora — file-tools-mcp default)
-#       → "http://host.docker.internal:${PORT}" (works on Linux with
-#         `extra_hosts: host.docker.internal:host-gateway` already declared in
-#         the file-tools-mcp compose).
+# Auto-derived from the deployment shape. A proxy in Docker Compose
+# (RUNNING_IN_DOCKER) is reached by service DNS, the PROXY_SERVICE_NAME host
+# on the proxy's port (the shipped compose names the proxy service
+# `otodock-proxy`). A proxy on the host (a native install with the Docker
+# Collabora of file-tools-mcp) is reached as host.docker.internal on the
+# proxy's port, which works on Linux because the file-tools-mcp compose
+# already declares `extra_hosts: host.docker.internal:host-gateway`.
 #
 # Same deployment split (and the same proxy service-DNS name) as the Docker-MCP
 # callback host in ``core/config/deployment.proxy_callback_host`` — keyed on

@@ -7,6 +7,7 @@ import {
   wakeDiagPcm, WAKE_DIAG_RATE, WAKE_DIAG_RING_SECONDS,
 } from '@/audio/wakeDiag'
 import WakeDiagBadge from '@/components/WakeDiagBadge'
+import { installFakeNativeChannel } from './fixtures/nativeChannel'
 
 function ramp(n: number, start: number): Float32Array {
   const out = new Float32Array(n)
@@ -122,21 +123,22 @@ describe('wake diagnostics store', () => {
     expect(bytes).toHaveLength(44 + 1.5 * WAKE_DIAG_RATE * 2)
   })
 
-  it('saves through the Android Downloads bridge when the app exposes it', () => {
+  it('saves through the Android app\'s Downloads channel when the app exposes it', () => {
     setWakeDiag(true)
     wakeDiagFrames(new Float32Array(1600))
-    const save = vi.fn()
-    ;(window as unknown as { Android?: unknown }).Android = { saveImageFromBase64: save }
+    const ch = installFakeNativeChannel()
     try {
       const status = saveWakeDiag()
       expect(status).toMatch(/saved wake-diag-.*\.json to Downloads/)
-      expect(save).toHaveBeenCalledTimes(1)
-      const [b64, filename, mime] = save.mock.calls[0]
+      expect(ch.posted).toHaveLength(1)
+      const { m, a: [filename, mime], body } = ch.posted[0]
+      expect(m).toBe('saveImageFromBase64')
       expect(filename).toMatch(/^wake-diag-.*\.json$/)
       expect(mime).toBe('application/json')
-      expect(JSON.parse(atob(b64)).kind).toBe('otodock-wake-diag')
+      expect(JSON.parse(atob(body!)).kind).toBe('otodock-wake-diag')
+      expect(exportWakeDiag().json).toContain('"android_app":true')
     } finally {
-      delete (window as unknown as { Android?: unknown }).Android
+      ch.uninstall()
     }
   })
 

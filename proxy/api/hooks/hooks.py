@@ -35,10 +35,10 @@ route (``api.hooks.artifacts.verify_session_match``), never this facade.
 
 from fastapi import APIRouter
 
-from api.hooks import artifacts, lifecycle, paths, permission, pins, preview
+from api.hooks import app_deploy, artifacts, lifecycle, paths, permission, pins, preview
 from api.hooks.permission import ask_user_question, decide_tool_permission  # noqa: F401
 from api.hooks.routing import resolve_hook_chat_id, resolve_hook_route  # noqa: F401
 
 router = APIRouter()
-for _piece in (paths, permission, artifacts, pins, preview, lifecycle):
+for _piece in (paths, permission, artifacts, pins, app_deploy, preview, lifecycle):
     router.include_router(_piece.router)

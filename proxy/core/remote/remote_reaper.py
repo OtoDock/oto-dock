@@ -15,7 +15,7 @@ logger = logging.getLogger("remote-layer")
 
 
 def _idle_session_has_pending_work(
-    sid: str, now: float, idle_timeout: float,
+    sid: str, now: float, idle_timeout: float, *, bg_commands: bool = False,
 ) -> bool:
     """Between-turns leash for the idle reaper (mirrors the LOCAL reaper's
     hook-activity extension): a warm session whose subagent children are
@@ -34,7 +34,15 @@ def _idle_session_has_pending_work(
     # The local reaper (cli/session.py) guards the same way.
     if last_hook and now - last_hook <= idle_timeout:
         return True
-    return get_subagent_registry(sid).has_pending
+    if get_subagent_registry(sid).has_pending:
+        return True
+    # A running background COMMAND completes on the satellite's forwarded
+    # stdout; only a satellite that keeps forwarding past ten minutes can
+    # resolve it, so the leg is opt-in per satellite version.
+    if bg_commands:
+        from core.session.background_leash import pending_background
+        return pending_background(sid)[0] > 0
+    return False
 
 
 async def reap_idle_remote_sessions() -> None:
@@ -54,7 +62,8 @@ async def reap_idle_remote_sessions() -> None:
             now = time.monotonic()
             to_reap: list[str] = []
 
-            idle_timeout = app_config.get_idle_timeout()
+            from core.session import session_state as _state
+            idle_timeout = await _state.cached_idle_timeout()
             for sid, info in list(layer._sessions.items()):
                 idle = now - info.last_activity
                 # Grace fix: a session held in reconnect-grace (a WS blip where
@@ -82,9 +91,11 @@ async def reap_idle_remote_sessions() -> None:
                 if idle > idle_timeout or not connected:
                     # Between-turns leash, bounded by the CLI turn ceiling so
                     # a stuck subagent can't pin the session forever.
-                    if (connected and idle <= app_config.CLAUDE_TIMEOUT
+                    if (connected and idle <= app_config.BACKGROUND_WORK_CEILING_S
                             and _idle_session_has_pending_work(
-                                sid, now, idle_timeout)):
+                                sid, now, idle_timeout,
+                                bg_commands=layer._cm.satellite_supports_long_bg_drain(
+                                    info.machine_id))):
                         continue
                     to_reap.append(sid)
 

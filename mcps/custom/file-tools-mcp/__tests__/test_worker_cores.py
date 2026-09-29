@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import isolation  # noqa: E402
 import pdf as pdf_mod  # noqa: E402
 import shared  # noqa: E402
-from isolation_targets import partial_write_target  # noqa: E402
 
 
 async def _async_ident(p, writing=False, **kw):
@@ -168,7 +167,9 @@ def test_spawn_edit_pdf_core(tmp_path, spawn):
 
 def test_write_pdf_failure_cleans_tmp_and_keeps_original(tmp_path, monkeypatch):
     """A core dying mid-atomic-save must leave the original file intact and
-    the wrapper must remove the orphaned deterministic tmp."""
+    no staging temp behind (the helper's ``.<name>.<hex>.partial`` beside
+    it: removed by the helper on the failure, and by the wrapper after a
+    kill)."""
     target = tmp_path / "report.pdf"
     target.write_bytes(b"%PDF-ORIGINAL")
 
@@ -177,11 +178,13 @@ def test_write_pdf_failure_cleans_tmp_and_keeps_original(tmp_path, monkeypatch):
         asyncio.run(pdf_mod.handle_write_pdf(
             {"path": str(target), "content": "# hi"}))
     assert target.read_bytes() == b"%PDF-ORIGINAL"
-    assert not Path(str(target) + ".otodock-tmp").exists()
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".partial")]
 
 
-def partial_write_target1(full_html, path):
-    return partial_write_target(path)
+def partial_write_target1(full_html, path, allowed=()):
+    with shared.safe_open_write(path) as fh:
+        fh.write(b"%PDF-PART")
+        raise RuntimeError("boom-mid-save")
 
 
 def test_edit_pdf_per_op_containment(tmp_path, monkeypatch):

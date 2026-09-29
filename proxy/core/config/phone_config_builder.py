@@ -41,6 +41,8 @@ from core.execution_layer import AgentConfig
 from core.sandbox.session_config_dir import ensure_persistent_agent_dir
 from core.session import external_identity
 from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, RouteIdentity
+from core.execution_layer import DEFAULT_EXECUTION_PATH
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy")
 
@@ -129,7 +131,7 @@ async def _build_user_route_config(
     cfg = await build_agent_config(
         agent_name, user, user.get("sub", ""), identity.user_role,
         permission_mode="auto",
-        client_type="phone",
+        client_type=session_kind.PHONE.name,
         session_id=session_id,
         phone_mode=True,
         trigger_payload=trigger_payload,
@@ -170,23 +172,16 @@ async def _build_external_config(
     phone_target_value = await asyncio.to_thread(
         resolve_phone_execution_target, agent_name, role=role,
     )
-    phone_target_kind, phone_target_label = await asyncio.to_thread(
-        _remote_store.get_target_metadata, phone_target_value, None, agent_name,
+    # The resolved placement from one read of the machine row — the kind,
+    # the path facts (without them the Pass-1 path gate fail-closes every
+    # file access when the call runs on a remote target), the grants, the
+    # display.
+    target = await asyncio.to_thread(
+        _remote_store.placement_of, phone_target_value, None, agent_name,
     )
-    is_remote = phone_target_kind in ("admin_remote", "user_remote")
-    target_has_display = await asyncio.to_thread(
-        _remote_store.get_target_has_display, phone_target_kind, phone_target_value,
-    )
-    target_device_grants = await asyncio.to_thread(
-        _remote_store.get_target_device_grants, phone_target_kind, phone_target_value,
-    )
+    is_remote = target.is_remote
     target_browser = await asyncio.to_thread(
-        _remote_store.get_target_browser_settings, phone_target_kind, phone_target_value,
-    )
-    # Satellite path-policy fields — without them the Pass-1 path gate
-    # fail-closes every file access when the call runs on a remote target.
-    target_path_policy = await asyncio.to_thread(
-        _remote_store.get_target_path_policy, phone_target_kind, phone_target_value,
+        _remote_store.get_target_browser_settings, target,
     )
 
     # The caller's own tree (/caller): only with a tree-bearing identity, and
@@ -200,7 +195,7 @@ async def _build_external_config(
         if is_remote:
             logger.warning(
                 f"Phone call on agent {agent_name}: caller tree not mounted on "
-                f"remote target {phone_target_label or phone_target_value} "
+                f"remote target {target.label or phone_target_value} "
                 "(externals/ never syncs) — agent-scope mount, caller memory "
                 "stays proxy-side"
             )
@@ -213,16 +208,7 @@ async def _build_external_config(
         username="",
         agent=agent_name,
         is_admin_agent=is_admin_only,
-        target_kind=phone_target_kind,
-        target_label=phone_target_label,
-        target_agents_dir=target_path_policy["agents_dir"],
-        target_machine_id=target_path_policy["machine_id"],
-        target_home_dir=target_path_policy["home_dir"],
-        target_allow_full_fs=target_path_policy["allow_full_fs"],
-        target_claude_runtime_root=target_path_policy.get("claude_runtime_root", ""),
-        target_os_user=target_path_policy["os_user"],
-        target_user_dirs=target_path_policy["user_dirs"],
-        target_device_grants=target_device_grants,
+        placement=target,
         session_scope="agent",
         config_visible=False,
         # Callers read /knowledge and never see /config.
@@ -239,16 +225,18 @@ async def _build_external_config(
     # Resolve execution path early — it picks the MCP config format (Codex
     # reads TOML), gates the permission-context layer mentions (Bash +
     # plans dir) and selects the subscription pool below.
-    execution_path = (agent_info or {}).get("execution_path", "claude-code-cli")
-    mcp_format = "toml" if execution_path == "codex-cli" else "json"
+    execution_path = ((agent_info or {}).get("execution_path")
+                      or DEFAULT_EXECUTION_PATH)
+    from core.session.session_manager import capabilities_for_path
+    _caps = capabilities_for_path(execution_path)
+    mcp_format = _caps.mcp_config_format
 
     # MCP config — phone mode filters out tools that don't apply mid-call;
     # the external rule drops the platform-management MCPs.
     mcp_config_path, credential_env, excluded_mcps, secret_bundles, _ = await asyncio.to_thread(
         mcp_registry.build_session_mcp_config,
         agent_name, None, phone_mode=phone_mode,
-        is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        placement=target,
         target_browser=target_browser,
         external=True,
         mcp_config_format=mcp_format,
@@ -269,10 +257,7 @@ async def _build_external_config(
     # the MCPs that actually attach contribute blocks (and scope nouns in the
     # permission context): an excluded MCP must not describe itself.
     assigned_mcp_names = [
-        m.name for m in (mcp_registry.get_agent_mcps(
-            agent_name, is_remote=is_remote, target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
-        ) or [])
+        m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])
         if m.name not in (excluded_mcps or {})
     ]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
@@ -294,16 +279,14 @@ async def _build_external_config(
         excluded_mcps=excluded_mcps or None,
         dynamic_contexts=dynamic_contexts or None,
         sandboxed=True,
-        client_type="phone",
-        is_remote=is_remote,
-        target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        client_type=session_kind.PHONE.name,
+        placement=target,
         execution_path=execution_path or "",
-        # A phone Direct-LLM session never connects the sidecar HTTP MCPs
-        # (core/layers/direct/layer.py::direct_mcp_policy) — keep their
-        # catalog rows and skills out of the prompt. CLI engines connect
-        # them on a call themselves, so the flag is layer-specific.
-        skip_http_mcps=(execution_path == "direct-llm"),
+        # An engine that keeps a call on stdio MCPs (Direct LLM's
+        # direct_mcp_policy) never connects the sidecar HTTP MCPs — keep
+        # their catalog rows and skills out of the prompt. The CLI engines
+        # connect them on a call themselves, so the flag is per engine.
+        skip_http_mcps=not _caps.behaviour.phone_http_mcps,
         external=True,
         external_home=external_home,
     ) or ""
@@ -363,7 +346,7 @@ async def _build_external_config(
         system_prompt=agent_prompt,
         mcp_config_path=str(mcp_config_path) if mcp_config_path else "",
         permission_mode="auto",
-        client_type="phone",
+        client_type=session_kind.PHONE.name,
         model=resolved_model,
         effort=resolved_effort,
         security_context=phone_security,

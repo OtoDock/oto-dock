@@ -173,7 +173,7 @@ class TestUserDirRootWriteReserved:
     (_USER_DIR_WRITABLE_SUBDIRS) — a file at the dir root is denied for
     every role. Mirrors the RO-root + RW-subdir bwrap mount."""
 
-    @pytest.mark.parametrize("role", ["viewer", "editor", "manager", "admin"])
+    @pytest.mark.parametrize("role", ["viewer", "contributor", "editor", "manager", "admin"])
     def test_root_level_file_denied(self, role):
         path = _resolve("personal-assistant/users/alice/google-home.png")
         decision = _check_write_path(path, _ctx(role, "alice"))
@@ -189,8 +189,13 @@ class TestUserDirRootWriteReserved:
         assert _check_write_path(path, _ctx("viewer", "alice")).allowed
 
     def test_codex_state_allowed(self):
-        path = _resolve("personal-assistant/users/alice/.codex/config.toml")
+        # The CLI's own state under .codex is writable; its config, auth and
+        # hooks are the protected set (written proxy-side, never by a tool).
+        path = _resolve("personal-assistant/users/alice/.codex/sessions/2026/x.jsonl")
         assert _check_write_path(path, _ctx("manager", "alice")).allowed
+        path = _resolve("personal-assistant/users/alice/.codex/config.toml")
+        decision = _check_write_path(path, _ctx("manager", "alice"))
+        assert not decision.allowed and "protected" in decision.reason
 
     def test_admin_on_admin_agent_fast_path_kept(self):
         """Admin-on-admin-agent skips path checks (contract) — the bwrap
@@ -727,7 +732,7 @@ class TestBashTierForDevTools:
     # Admin tier (docker/systemctl/ssh/apt) — admin only
     # ---------------------------------------------------------------------
     def test_docker_admin_only(self):
-        for role in ("manager", "editor", "viewer"):
+        for role in ("manager", "editor", "contributor", "viewer"):
             ctx = _ctx(role, "alice")
             d = self._decision("docker ps", ctx)
             assert not d.allowed, f"docker should deny for {role}"
@@ -804,6 +809,31 @@ class TestBashTierForDevTools:
 # treated `8` as a file path argument to head. Fixed via
 # _VALUE_FLAGS_BY_CMD table + skip-next-after-flag rule.
 
+class TestCodexBridgePaths:
+    """The Codex approval bridge gates a multi-file change as one Write whose
+    ``_codex_paths`` lists every file: each takes a Write decision of its own."""
+
+    def _write(self, ctx, first, *rest):
+        from auth.path_policy import check_tool_access
+        return check_tool_access(
+            "Write", {"file_path": first, "_codex_paths": [first, *rest]}, ctx)[0]
+
+    def test_a_denied_extra_path_denies_the_change(self):
+        ctx = _ctx("manager", "alice")
+        d = self._write(ctx, "/users/alice/workspace/a.md", "/users/bob/workspace/b.md")
+        assert not d.allowed and "other users" in d.reason
+
+    def test_all_writable_paths_allow(self):
+        ctx = _ctx("manager", "alice")
+        assert self._write(ctx, "/users/alice/workspace/a.md",
+                           "/workspace/b.md", "/users/alice/context/c.md").allowed
+
+    def test_viewer_extra_path_in_shared_workspace_denied(self):
+        ctx = _ctx("viewer", "alice")
+        assert self._write(ctx, "/users/alice/workspace/a.md").allowed
+        assert not self._write(ctx, "/users/alice/workspace/a.md", "/workspace/b.md").allowed
+
+
 class TestValueFlagParser:
     @staticmethod
     def _decision(command: str, ctx: SecurityContext):
@@ -869,3 +899,23 @@ class TestValueFlagParser:
         ctx = _ctx("manager", "alice")
         d = self._decision("ls -w 80 /users/alice/workspace", ctx)
         assert d.allowed, f"denied: {d.reason}"
+
+
+class TestContributorWrites:
+    """The workspace tier: a contributor writes workspace/ and their own
+    dir, never knowledge/ or config/, and the deny names the role."""
+
+    def test_workspace_and_own_dir_allowed(self):
+        ctx = _ctx("contributor", "alice")
+        assert _check_write_path(_resolve("personal-assistant/workspace/note.md"), ctx).allowed
+        assert _check_write_path(_resolve("personal-assistant/users/alice/workspace/n.md"), ctx).allowed
+
+    def test_knowledge_and_config_denied_by_name(self):
+        ctx = _ctx("contributor", "alice")
+        for rel in ("personal-assistant/knowledge/ref.md", "personal-assistant/config/agent.md"):
+            d = _check_write_path(_resolve(rel), ctx)
+            assert not d.allowed and "contributors" in d.reason, rel
+
+    def test_other_user_dir_denied(self):
+        d = _check_write_path(_resolve("personal-assistant/users/bob/workspace/n.md"), _ctx("contributor", "alice"))
+        assert not d.allowed

@@ -34,6 +34,8 @@ import re
 
 import httpx
 
+from services.mcp import mcp_manifest_types as _mt
+
 logger = logging.getLogger("claude-proxy.community-catalog")
 
 
@@ -431,12 +433,13 @@ def augment_entry(
     # AHEAD of the catalog always mismatches (the image tag is in the hash)
     # and the converge would be a downgrade, so the signal needs the same
     # version, as ``mcp_updater.detect_available_updates`` requires.
+    entry_rt = _mt.runtime_of(entry.get("runtime"))
     if (
         installed
         and not update_available
         and installed_manifest_hashes
         and manifest_hash_signal_applies(entry)
-        and (entry.get("runtime") != "docker" or str(catalog_version) == str(local_version))
+        and (not (entry_rt and entry_rt.container) or str(catalog_version) == str(local_version))
     ):
         catalog_hash = entry.get("manifest_hash")
         installed_hash = installed_manifest_hashes.get(name)
@@ -485,11 +488,11 @@ def manifest_hash_signal_applies(entry: dict[str, Any]) -> bool:
     git+ and remote entries have no converge path, so a mismatch there would
     badge an update nobody can run: they pick up manifest changes with a
     version bump or a reinstall."""
-    runtime = entry.get("runtime")
-    if runtime == "none":
-        return True
-    if runtime not in ("node", "python", "docker"):
+    rt = _mt.runtime_of(entry.get("runtime"))
+    if rt is None:
         return False
+    if not rt.process:
+        return True
     return not str(entry.get("source") or "").startswith(NON_CONVERGEABLE_SOURCE_PREFIXES)
 
 
@@ -507,7 +510,7 @@ def _collect_installed_manifest_hashes() -> dict[str, str]:
 
     out: dict[str, str] = {}
     for name, m in mcp_registry.get_all_manifests().items():
-        if getattr(m.server, "runtime", "") not in ("node", "python", "docker", "none"):
+        if _mt.runtime_of(getattr(m.server, "runtime", "")) is None:
             continue
         try:
             data = json.loads((Path(m.mcp_dir) / "manifest.json").read_text())

@@ -31,11 +31,35 @@ def resolve_under(path: str | Path, root: str | Path) -> Path:
     return Path(real)
 
 
+def normalize_rel_path(raw: str) -> str:
+    """``raw`` as a clean relative path: the leading and trailing slashes
+    stripped (the sandbox-virtual forms clients send — ``/workspace/x`` —
+    name a relative path of the tree), refused (``PathOutsideRoot``) when
+    the result is empty, carries a NUL, or has a segment that is empty,
+    ``.`` or ``..``. Lexical, no filesystem, backslashes untouched (a Linux
+    name may carry one; a guard that takes a NAME keeps its own
+    no-separator rule). Unlike ``join_under`` it refuses an interior ``..``
+    instead of collapsing it. A caller for which an absolute form is an
+    error refuses the leading slash BEFORE calling; a caller whose value
+    must be canonical asks ``normalize_rel_path(x) == x``; every caller
+    joins the value returned here, never the raw one."""
+    if not isinstance(raw, str) or "\x00" in raw:
+        raise PathOutsideRoot(f"{raw!r} is not a relative path")
+    norm = raw.strip("/")
+    if not norm:
+        raise PathOutsideRoot(f"{raw!r} names no path")
+    if any(seg in ("", ".", "..") for seg in norm.split("/")):
+        raise PathOutsideRoot(f"{raw!r} has an empty or dot segment")
+    return norm
+
+
 def join_under(root: str | Path, *parts: str) -> Path:
     """``root/parts...`` without touching the filesystem, guaranteed to stay
     lexically BELOW ``root``: a ``..``, absolute or empty segment that would
-    land on or above the root is refused. Symlinks are not followed — an
-    agent root that is itself a symlink keeps working, as everywhere else."""
+    land on or above the root is refused (an interior ``a/../b`` collapses
+    to ``b`` — ``normalize_rel_path`` is the guard that refuses it).
+    Symlinks are not followed — an agent root that is itself a symlink
+    keeps working, as everywhere else."""
     root_norm = os.path.normpath(root)
     prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
     joined = os.path.normpath(os.path.join(root_norm, *parts))

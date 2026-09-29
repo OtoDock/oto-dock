@@ -1,0 +1,23 @@
+{
+  "title": "Kanban",
+  "actions": [],
+  "exports": {
+    "snapshots": {
+      "board": {
+        "description": "every card with its column and who moved it last"
+      }
+    },
+    "events": {
+      "card-moved": {
+        "description": "a card was added, moved or removed"
+      }
+    }
+  },
+  "handlers": {
+    "on_schedule": {
+      "republish": {
+        "cron": "0 6 * * 1-5"
+      }
+    }
+  }
+}

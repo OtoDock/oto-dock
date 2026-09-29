@@ -130,6 +130,60 @@ def test_missing_skill_file_is_skipped(temp_db, tmp_path):
     assert [s[0] for s in skills] == ["ok-skill"]
 
 
+def _manifest_with_escaping_skills(tmp_path, name, loading):
+    """One good skill plus four that must never be read: an absolute file, a
+    climbing one, a symlink inside the folder pointing outside, a directory."""
+    m = _manifest_with_skills(tmp_path, name, [
+        {"id": "ok-skill", "file": "skills/ok.md", "content": "OK body.",
+         "loading": loading},
+    ])
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=leak\n")
+    (m.mcp_dir / "skills" / "link.md").symlink_to(secret)
+    (m.mcp_dir / "skills" / "dir.md").mkdir()
+    for sid, f in (("abs-skill", str(secret)), ("climb-skill", "../config.env"),
+                   ("link-skill", "skills/link.md"), ("dir-skill", "skills/dir.md")):
+        m.skills.append(mcp_registry.SkillDef(id=sid, file=f, loading=loading))
+    return m
+
+
+def test_inline_reader_never_reads_outside_the_mcp_folder(temp_db, tmp_path):
+    """The inline reader confines every skills[].file to its MCP folder,
+    symlinks judged by their target, directories skipped."""
+    m = _manifest_with_escaping_skills(tmp_path, "m4", "always")
+    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+        skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
+    assert [s[0] for s in skills] == ["ok-skill"]
+    assert not any("leak" in body for _sid, body, _l in skills)
+
+
+def test_on_demand_reader_never_hands_out_a_source_outside_the_mcp_folder(temp_db, tmp_path):
+    m = _manifest_with_escaping_skills(tmp_path, "m5", "on_demand")
+    with patch.object(mcp_registry, "get_agent_mcps_all_placements", return_value=[m]):
+        out = mcp_registry.get_on_demand_skills_for_materialization("pa")
+    assert [o[0] for o in out] == ["ok-skill"]
+    for _sid, source, *_ in out:
+        assert source.resolve().is_relative_to(m.mcp_dir.resolve())
+        assert source.is_file()
+
+
+def test_every_shipped_skill_file_is_confined():
+    """Every skills[].file the platform ships passes the rule and resolves
+    inside its own folder (the rule is a tightening, never a regression)."""
+    import json
+    from tests._paths import PROXY_DIR
+    from services.mcp.mcp_manifest_parse import resolve_skill_file, skill_file_error
+    mcps = PROXY_DIR.parent / "mcps"
+    seen = 0
+    for manifest in sorted(mcps.glob("*/*/manifest.json")):
+        data = json.loads(manifest.read_text())
+        for sk in data.get("skills") or []:
+            assert skill_file_error(sk["file"]) is None, (manifest, sk)
+            assert resolve_skill_file(manifest.parent, sk["file"]) is not None, (manifest, sk)
+            seen += 1
+    assert seen > 0
+
+
 def test_skill_catalog_lists_on_demand_skills_with_the_same_filters(temp_db, tmp_path):
     """The Direct-LLM ``# Skills`` catalog: on-demand skills only (always
     skills are inlined), sorted by id, DB-disable and exclude_from applied

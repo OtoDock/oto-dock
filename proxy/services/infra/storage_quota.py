@@ -30,6 +30,7 @@ from pathlib import Path
 
 import config
 from storage.pg import get_conn
+from core import layout
 
 logger = logging.getLogger(__name__)
 
@@ -72,13 +73,28 @@ def user_scope_key(agent_slug: str, username: str) -> str:
 
 
 def shared_scope_dirs(agent_slug: str) -> list[Path]:
-    """The three directories the shared bucket spans (one project ID covers all)."""
+    """The directories the shared bucket spans (one project ID covers all):
+    the three workspace roots plus the shared apps' release copies and
+    databases (APPS.md: both live outside the workspace)."""
     base = config.get_agent_dir(agent_slug)
-    return [base / "workspace", base / "knowledge", base / "config"]
+    return [base / layout.WORKSPACE, base / layout.KNOWLEDGE, base / layout.CONFIG,
+            base / "app-releases" / "shared", base / "app-data" / "shared"]
 
 
 def user_scope_dir(agent_slug: str, username: str) -> Path:
-    return config.get_agent_dir(agent_slug) / "users" / username
+    return layout.user_dir(config.get_agent_dir(agent_slug), username)
+
+
+def user_scope_dirs(agent_slug: str, username: str) -> list[Path]:
+    """One user's bucket: their tree, their apps' release copies and
+    databases, and their chat snapshots (the siblings live outside
+    ``users/`` so the files API and the sync never see them, and are
+    metered here)."""
+    base = config.get_agent_dir(agent_slug)
+    return [user_scope_dir(agent_slug, username),
+            base / "app-releases" / layout.USERS / username,
+            base / "app-data" / layout.USERS / username,
+            base / "shares" / layout.USERS / username]
 
 
 def external_scope_key(agent_slug: str) -> str:
@@ -146,7 +162,7 @@ def iter_scopes() -> list[QuotaScope]:
                 scope_type="user",
                 agent_slug=slug,
                 username=uname,
-                dirs=(user_scope_dir(slug, uname),),
+                dirs=tuple(user_scope_dirs(slug, uname)),
                 owner_sub=u.get("sub") or None,
             ))
     return scopes
@@ -306,7 +322,7 @@ def ensure_scope(agent_slug: str, scope_type: str, username: str | None = None) 
         if not username:
             return None
         scope_key = user_scope_key(agent_slug, username)
-        dirs = [user_scope_dir(agent_slug, username)]
+        dirs = user_scope_dirs(agent_slug, username)
     elif scope_type == "external":
         scope_key = external_scope_key(agent_slug)
         dirs = [external_scope_dir(agent_slug)]

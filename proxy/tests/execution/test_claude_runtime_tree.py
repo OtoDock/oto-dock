@@ -23,6 +23,7 @@ from services.path_policy_v2 import (
     context_from_security,
     resolve_path_for_session,
 )
+from core import placement
 
 SID = "76fe15d2-9b5b-495c-9c6c-42e6626f88f6"
 OTHER_SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -30,19 +31,19 @@ ROOT = "/tmp/claude-1000"
 TREE = f"{ROOT}/-home-dave/{SID}"
 
 
+_PLACEMENT = placement.PlacementCapabilities(
+    kind=placement.KIND_USER_REMOTE, machine_id="m1", home_dir="/home/dave",
+    os_user="dave", allow_full_fs=False, agents_dir="/home/dave/.oto-dock/agents",
+    os="linux", claude_runtime_root=ROOT,
+)
+
+
 def _ctx(**over):
     kwargs = dict(
-        target_kind="user_remote",
-        machine_id="m1",
-        home_dir="/home/dave",
-        os_user="dave",
-        allow_full_fs=False,
-        target_agents_dir="/home/dave/.oto-dock/agents",
-        target_os="linux",
         agent_slug="demo",
         role="manager",
-        claude_runtime_root=ROOT,
         cli_session_id=SID,
+        placement=_PLACEMENT,
     )
     kwargs.update(over)
     return PathPolicyContext(**kwargs)
@@ -60,10 +61,10 @@ def test_matcher_linux_tree_and_sid_dir_itself():
 
 
 def test_matcher_windows_root_case_insensitive():
-    ctx = _ctx(
-        target_os="windows",
+    ctx = _ctx(placement=dataclasses.replace(
+        _PLACEMENT, os="windows",
         claude_runtime_root="c:/Users/f/AppData/Local/Temp/claude",
-    )
+    ))
     assert _is_session_runtime_path(
         f"c:/Users/f/AppData/Local/Temp/Claude/-c-proj/{SID}/scratchpad/x", ctx,
     )
@@ -77,7 +78,7 @@ def test_matcher_rejects_wrong_or_missing_sid():
 
 
 def test_matcher_disabled_without_root_or_sid():
-    assert not _is_session_runtime_path(f"{TREE}/x", _ctx(claude_runtime_root=""))
+    assert not _is_session_runtime_path(f"{TREE}/x", _ctx(placement=dataclasses.replace(_PLACEMENT, claude_runtime_root="")))
     assert not _is_session_runtime_path(f"{TREE}/x", _ctx(cli_session_id=""))
 
 
@@ -140,7 +141,7 @@ def test_gate_traversal_collapses_before_matching():
 def test_gate_bg_output_read_survives_with_carve_disabled():
     # Regression guard: contexts without a cli_session_id (phone, synthetic,
     # pre-upgrade rehydrations) keep the read-only bg-output carve.
-    ctx = _ctx(claude_runtime_root="", cli_session_id="")
+    ctx = _ctx(cli_session_id="", placement=dataclasses.replace(_PLACEMENT, claude_runtime_root=""))
     r = resolve_path_for_session(
         ctx, f"/tmp/claude-1000/-home-dave/{SID}/tasks/t1.output", writing=False)
     assert r.allowed and r.is_remote_pull
@@ -156,12 +157,8 @@ def _security_ctx(**over):
         username="dave",
         agent="demo",
         is_admin_agent=False,
-        target_kind="user_remote",
-        target_agents_dir="/home/dave/.oto-dock/agents",
-        target_home_dir="/home/dave",
-        target_allow_full_fs=False,
-        target_claude_runtime_root=ROOT,
         cli_session_id=SID,
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, agents_dir="/home/dave/.oto-dock/agents", home_dir="/home/dave", allow_full_fs=False, claude_runtime_root=ROOT),
     )
     kwargs.update(over)
     return SecurityContext(**kwargs)
@@ -169,7 +166,7 @@ def _security_ctx(**over):
 
 def test_context_from_security_copies_carve_fields():
     ctx = context_from_security(_security_ctx())
-    assert ctx.claude_runtime_root == ROOT
+    assert ctx.placement.claude_runtime_root == ROOT
     assert ctx.cli_session_id == SID
 
 
@@ -213,14 +210,14 @@ def test_security_ctx_serialization_roundtrip():
     data = session_state._serialize_security_ctx(sc)
     back = session_state._deserialize_security_ctx(data)
     assert back.cli_session_id == SID
-    assert back.target_claude_runtime_root == ROOT
+    assert back.placement.claude_runtime_root == ROOT
 
 
 def test_live_refresh_replace_preserves_carve_fields():
     sc = _security_ctx()
-    replaced = dataclasses.replace(sc, target_allow_full_fs=True)
+    replaced = dataclasses.replace(sc, placement=dataclasses.replace(sc.placement, allow_full_fs=True))
     assert replaced.cli_session_id == SID
-    assert replaced.target_claude_runtime_root == ROOT
+    assert replaced.placement.claude_runtime_root == ROOT
 
 
 if __name__ == "__main__":

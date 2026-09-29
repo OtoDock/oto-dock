@@ -16,4 +16,4 @@
 - [ ] Docs that describe the changed behaviour are updated.
 - [ ] No secrets, no `config.env`, no personal data in the diff.
 - [ ] If AI-assisted: I have read and stand behind every line (CONTRIBUTING.md).
-- [ ] I agree the contribution is licensed under the repository licence, FSL-1.1-Apache-2.0 (CONTRIBUTING.md, "Licensing of contributions").
+- [ ] I agree the contribution is licensed under the repository licence, FSL-1.1-Apache-2.0, and may be relicensed under Apache 2.0 at any time (CONTRIBUTING.md, "Licensing of contributions").

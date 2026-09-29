@@ -1,9 +1,14 @@
+import type { AttachedFileMeta, AttachedImageMeta, QueuedMessage } from '../../store/types'
+
 /** Per-page adapter for the queued-messages store (chatStore for AgentChat,
  * local useState elsewhere). The hook only writes the queue; the page
  * owns the read model + the cancel/edit handlers. */
 export interface ChatStreamQueueAdapter {
-  addQueued: (index: number, text: string) => void
+  addQueued: (index: number, item: QueuedMessage) => void
   clearQueued: () => void
+  /** A cancelled queued message hands its attachments back to the composer
+   * (chat page only; a task view has no composer attachments). */
+  restoreAttachments?: (images: AttachedImageMeta[], files: AttachedFileMeta[]) => void
 }
 
 export interface UseChatStreamOptions {

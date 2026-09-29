@@ -4,6 +4,8 @@ import { useAgents } from '../../api/agents'
 import { useActiveChats, type ActiveChatRow } from '../../hooks/useActiveChats'
 import { useCollapsePref } from '../../hooks/useCollapsePref'
 import { useChatStore } from '../../store/chatStore'
+import { SOURCE_TYPE } from '../../lib/session/kind'
+import { CHAT_PHASE } from '../../lib/status/chat'
 
 interface Props {
   currentAgent?: string
@@ -57,7 +59,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
   const { data: agents } = useAgents()
   const agentMeta = useMemo(() => new Map((agents || []).map((a) => [a.name, a])), [agents])
   const keepOrphan = (r: ActiveChatRow) => {
-    if (tasksMode || r.sourceType === 'task' || !r.ownerIsShared) return false
+    if (tasksMode || r.sourceType === SOURCE_TYPE.TASK || !r.ownerIsShared) return false
     const a = agentMeta.get(r.agent)
     // Meta missing OR fields missing → suppress. The widest-mode soft-fall
     // of lib/visibility's modeOfAgent is the WRONG default here (it would
@@ -69,7 +71,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
   const rows = useActiveChats().filter((r) =>
     r.id !== activeChatId &&
     (variant !== 'sidebar' || r.agent !== currentAgent ||
-      (tasksMode ? r.sourceType !== 'task' : r.sourceType === 'task') ||
+      (tasksMode ? r.sourceType !== SOURCE_TYPE.TASK : r.sourceType === SOURCE_TYPE.TASK) ||
       keepOrphan(r)))
   // Persisted per surface and SHARED across mounted copies (the sidebar
   // renders twice inside ResponsiveDrawer). Home starts collapsed — the
@@ -81,13 +83,13 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
 
   if (rows.length === 0) return null
 
-  const anyLive = rows.some((r) => r.phase === 'streaming')
+  const anyLive = rows.some((r) => r.phase === CHAT_PHASE.STREAMING)
 
   const openRow = (row: ActiveChatRow) => {
     // Clicking IS seeing: retire the finished-unread row immediately (the
     // chat page confirms via chat_read).
     useChatStore.getState().setUnread(row.id, false)
-    if (row.sourceType === 'task') {
+    if (row.sourceType === SOURCE_TYPE.TASK) {
       // Task runs render on the chat page — open it with task mode on.
       navigate(`/chat/${row.agent}/${row.id}?tasks=1`)
     } else if (row.agent === currentAgent) {
@@ -131,31 +133,31 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
       >
       {rows.map((row) => {
         const meta = agentMeta.get(row.agent)
-        const isTask = row.sourceType === 'task'
+        const isTask = row.sourceType === SOURCE_TYPE.TASK
         // Unified live language (operator ask, 2026-07-11 — same as the chat
         // history rows): GENERATING = pulsing surface tint only, no dot;
         // FINISHED-UNREAD = the same tint held steady + a dot. The dot means
         // exactly one thing everywhere: "a result you haven't opened".
         // Task rows keep their purple identity, chats the brand blue.
         const phaseClass =
-          row.phase === 'streaming'
+          row.phase === CHAT_PHASE.STREAMING
             ? isTask
               ? 'oto-row-live-purple motion-reduce:animate-none bg-p-accent-purple/10 ring-1 ring-inset ring-p-accent-purple/40'
               : 'oto-row-live motion-reduce:animate-none bg-brand-surface ring-1 ring-inset ring-brand/35'
-            : row.phase === 'warming'
+            : row.phase === CHAT_PHASE.WARMING
               ? 'ring-1 ring-inset ring-amber-400/40'
               : isTask
                 ? 'bg-p-accent-purple/10 ring-1 ring-inset ring-p-accent-purple/30'
                 : 'bg-brand-surface ring-1 ring-inset ring-brand/30'
         const phaseTitle =
-          row.phase === 'streaming'
+          row.phase === CHAT_PHASE.STREAMING
             ? isTask ? 'Task running…' : 'Generating response…'
-            : row.phase === 'warming'
+            : row.phase === CHAT_PHASE.WARMING
               ? 'Preparing session…'
               : isTask ? 'Task finished' : 'Finished — not opened yet'
         // Tasks never carry the unread dot (fire-and-forget — notifications
         // cover completion); the row itself lingers briefly, dot-free.
-        const showDot = row.phase === 'warming' || (row.phase === 'finished' && !isTask)
+        const showDot = row.phase === CHAT_PHASE.WARMING || (row.phase === CHAT_PHASE.FINISHED && !isTask)
         return (
           <div
             key={row.id}
@@ -167,11 +169,11 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
             {showDot && (
               <span
                 className={`inline-block w-2 h-2 rounded-full shrink-0 ${
-                  row.phase === 'warming'
+                  row.phase === CHAT_PHASE.WARMING
                     ? 'bg-amber-400 animate-pulse motion-reduce:animate-none'
                     : ''
                 }`}
-                style={row.phase === 'warming' ? undefined : { backgroundColor: meta?.color || 'var(--color-brand)' }}
+                style={row.phase === CHAT_PHASE.WARMING ? undefined : { backgroundColor: meta?.color || 'var(--color-brand)' }}
               />
             )}
             <div className="min-w-0 flex-1">
@@ -192,7 +194,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
     return (
       <div className="px-2 pt-14 shrink-0" data-testid="active-chats-home">
         {/* Flat px-2 matches the AppsOverlay frame inset (p-2) below, so the
-            platform panel and the full-width mini app read as one page. */}
+            platform panel and the full-width app read as one page. */}
         <div className="mt-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface px-2 pt-1.5 pb-1">
           {body}
         </div>

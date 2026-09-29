@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { roleBadge, type AgentRole } from '../lib/permissions'
 import { useMyRemoteMachines, usePairMyMachine, useDeleteMyMachine, useSetMyRemoteTarget, useRemoveMyRemoteTarget, useSetMyAllowFullFs, useSetMyDeviceGrants, DEVICE_CAPABILITY_INFO, type PairResult } from '../api/remoteMachines'
+import { PAIRING_SCOPE } from '../lib/placement'
 import RemoteBadge from '../components/RemoteBadge'
 import PairInstallCommand from '../components/PairInstallCommand'
 import {
@@ -48,8 +50,8 @@ export function MyMachinesSection() {
     if (t.agent_slug) targetByAgent.set(t.agent_slug, t.machine_id)
   }
   // User's agents (intersect user_agents). Sorted for stable UI ordering.
-  const userAgentEntries: [string, 'manager' | 'editor' | 'viewer'][] = Object.entries(user?.agent_roles ?? {})
-    .sort((a, b) => a[0].localeCompare(b[0])) as [string, 'manager' | 'editor' | 'viewer'][]
+  const userAgentEntries: [string, AgentRole][] = Object.entries(user?.agent_roles ?? {})
+    .sort((a, b) => a[0].localeCompare(b[0])) as [string, AgentRole][]
 
   const handlePair = async () => {
     setPairError('')
@@ -100,7 +102,7 @@ export function MyMachinesSection() {
       ) : (
         <div className="space-y-3">
           {machines.map(m => {
-            const isAdminPaired = m.pairing_scope === 'admin'
+            const isAdminPaired = m.pairing_scope === PAIRING_SCOPE.ADMIN
             const expanded = expandedIds.has(m.id)
             return (
             <div key={m.id} className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
@@ -113,7 +115,7 @@ export function MyMachinesSection() {
               >
                 <div className="flex items-center gap-3 min-w-0">
                   <RemoteBadge
-                    state={(m.status as any) ?? null}
+                    state={m.status ?? null}
                     machineName={m.name}
                     lastSeenIso={m.last_seen}
                     heartbeatAgeS={m.last_heartbeat_age_s ?? null}
@@ -176,8 +178,8 @@ export function MyMachinesSection() {
                       </p>
                       <p className="text-xs text-p-text">
                         {(m.allow_full_fs ?? false)
-                          ? 'Full filesystem access — agents can read/write any path your OS user can reach.'
-                          : 'Home-only — agents are limited to the agent tree and your OS home directory.'}
+                          ? "Full filesystem access. Agents can read and write any path your OS user can reach, except the machine's own OtoDock folder."
+                          : 'Home folder only. Agents are limited to the agent tree and your OS home folder, a guardrail, not a sandbox.'}
                       </p>
                     </div>
                     <label className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer">
@@ -289,11 +291,7 @@ export function MyMachinesSection() {
                             className="h-4 w-4 rounded-sm text-brand focus:ring-brand"
                           />
                           <span className="font-mono text-xs">{slug}</span>
-                          <span className={`text-xs px-1.5 py-0.5 rounded-sm ${
-                            role === 'manager' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' :
-                            role === 'editor' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' :
-                            'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400'
-                          }`}>
+                          <span className={`text-xs px-1.5 py-0.5 rounded-sm ${roleBadge(role)}`}>
                             {role}
                           </span>
                           {onOtherMachine && (
@@ -347,12 +345,13 @@ export function MyMachinesSection() {
                   <span>
                     <span className="font-medium">Allow full filesystem access</span>
                     <span className="block text-xs text-p-text-light">
-                      By default agents on your machine can only read/write files under your
-                      home directory. Enable this if you want agents to manage system services
-                      or edit files outside your home — they'll be able to touch any path your
-                      OS account can reach. Agents run natively as your OS user (this is a scope
-                      guardrail, not a kernel sandbox), so only pair machines you trust. You can
-                      change this later.
+                      By default agents on your machine can only read and write files under
+                      your home folder. Enable this if you want agents to manage system
+                      services or edit files outside your home: they will be able to touch any
+                      path your OS account can reach, except the machine's own OtoDock folder.
+                      Agents run natively as your OS user either way (the home folder setting
+                      is a guardrail, not a kernel sandbox), so only pair machines you trust.
+                      You can change this later.
                     </span>
                   </span>
                 </label>

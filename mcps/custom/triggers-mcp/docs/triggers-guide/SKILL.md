@@ -34,6 +34,55 @@ To run a real LLM task on webhook (not just a notification), pair the trigger wi
 
 The trigger and task **MUST** match on scope, agent, and creator (cross-scope linkage is rejected). User-scoped triggers can only fire user-scoped tasks; agent triggers only agent tasks.
 
+A trigger has no model of its own — the linked task's pin or its agent's default decides what a fire runs on. `list_triggers` shows it per row as `task=<name> model=<id> [pinned|agent default|layer default, tier N]`; `get_trigger` returns it as `task_effective_model` / `task_effective_model_source` / `task_effective_model_tier`. To change it, `edit_task(task_id, model=…)` in schedules-mcp (ask the user first); nothing on the trigger changes it.
+
+## The trigger ↔ app handler pattern
+
+An app with a server (a folder app the agent deploys with `deploy_app`)
+can be woken by a webhook directly: no task, no LLM turn, no tokens. The
+app's own code runs, and a wake that fails is retried for you. (An app
+that came with a community agent template may carry its triggers already:
+the template's `blueprint.json` names them and the platform seeded one per
+copy at install — `list_triggers` shows them; nothing below is needed by
+hand for those.)
+
+1. The app declares the handler in its `app.json` and is deployed and
+   approved:
+   ```json
+   {"title": "Deploy board", "handlers": {"on_trigger": ["github"]}}
+   ```
+   Its server answers `POST /_handler/github` (only the platform can reach
+   that path) within 60 s.
+2. Aim a trigger at it:
+   ```
+   create_trigger(
+     name="GitHub pushes",
+     scope="agent",            # a shared app takes agent scope (editor+);
+                               # a personal app takes its owner's user scope
+     app_slug="deploy-board",
+     handler="github",
+   )
+   ```
+   `app_slug` never combines with `task_id` (one or the other; an inline
+   `notify` may join either), and `debounce_seconds` must stay 0 — a
+   debounced fire is dropped, and a wake must not be.
+3. The external system POSTs the webhook URL exactly as for a task
+   trigger. The whole body reaches the handler as the delivery's payload.
+   A caller that may retry can send `X-OtoDock-Event-Id: <its own id>`;
+   the same id twice is a no-op that answers `{"status": "ok", "actions":
+   ["duplicate"]}` with the first delivery's id. An event the app refused
+   (`errors: ["app: queue full"]`) is not remembered, so resending it with
+   the same id is taken as a new event.
+
+Refusals worth recognising: **404** "no app … in this scope" (wrong scope,
+or the slug is not an app of this agent), **400** with the declared
+handler names (the handler is not in the app's `on_trigger` list),
+**409** "approve the app first" (the app's card is still waiting), and on
+an older platform **400** "at least one action" (app handlers are not
+there yet). A wake that dies (the handler answered 4xx, or five attempts
+failed) writes the reason to the trigger's `last_error`, and the app's
+own `deploy_status` lists its last wakes.
+
 ## The trigger ↔ notification pattern
 
 For lightweight alerts that don't need an LLM (server down, payment received, etc.), use the inline `notify` block on the trigger directly — much cheaper than spinning up a task:
@@ -51,13 +100,15 @@ create_trigger(
 )
 ```
 
+An agent trigger's notify goes to all of this agent's users when it names no target (`target_scope="agent"` is the default), or to one of them (`target_scope="user"`, `target=<username>`). Every user on the platform (`target_scope="global"`), another agent, or someone outside this agent needs a platform admin; the create or edit is refused otherwise.
+
 You can combine both: a trigger with `task_id` AND `notify` enabled fires both on every webhook call.
 
 ## Vendor-subscribed triggers (OAuth: GitHub / Linear / Slack / Microsoft / Zoom)
 
 For vendors connected via OAuth you do NOT configure a raw webhook URL + API key — the platform auto-registers the webhook. Workflow:
 
-1. The user subscribes to events in the dashboard (Connected Accounts → expand the account → **Subscribe to events**). Subscriptions are read-only from this tool.
+1. The user subscribes to events in the dashboard (Connected Accounts → expand the account → **Subscribe to events**, choosing **Subscribe as: Me** for a personal subscription or an agent for one the agent's triggers can use; the agent option also lives in Agent Settings → MCPs → **Subscribe to events for this agent**). Subscriptions are read-only from this tool. A subscription's scope must match the trigger's: `[personal]` rows link to user-scope triggers, `[agent <name>]` rows to that agent's agent-scope triggers (a shared app is woken by an agent-scope trigger, so it needs the agent's subscription); the server refuses any other pairing and its message names the surface to use.
 2. `list_subscriptions()` → each row shows `events=<…>`. **Those are the valid `event_type` values** for that subscription (the manifest event_catalog keys) — e.g. Linear `events=Issue, Comment, Project, Cycle, Reaction`; GitHub `events=push, pull_request, issue_comment, …`.
 3. `create_trigger(subscription_id=<id from list_subscriptions>, event_filter={…}, notify={…} or task_id=…)`.
 
@@ -94,7 +145,7 @@ After `create_trigger` succeeds, the response includes the webhook URL (path). T
    Content-Type: application/json
    ```
 
-3. **Test it** with `fire_trigger(id, body={...sample payload...})` from the chat. This bypasses the Bearer check (uses session auth) and exercises the full task / notification path.
+3. **Test it** with `fire_trigger(id, body={...sample payload...})` from the chat. This bypasses the Bearer check (uses session auth) and exercises the full task / notification path. It takes the right to edit the trigger: a user who may only view it cannot test-fire it.
 
 Common external systems:
 
@@ -134,7 +185,7 @@ Common external systems:
 4. User configures GitHub webhook (or relay) for `pull_request` event.
 ```
 
-**Agent-wide server-down alert (manager only):**
+**Agent-wide server-down alert (editor or above):**
 ```
 create_trigger(
   name="Service down",

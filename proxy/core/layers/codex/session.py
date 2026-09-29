@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator
 
 import config as app_config
+from core import layout
 from core.events.bg_command_state import (
     get_bg_command_registry, reset_bg_command_registry,
 )
@@ -31,7 +32,8 @@ from core.layers.codex.app_server_client import (
     AppServerClient, AppServerError, wait_for_mcp_startup,
 )
 from core.layers.codex.codex_approvals import (
-    approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
+    UNTRUSTED_POLICY, approval_for_sandbox, build_sandbox_policy,
+    is_untrusted_policy_rejection, make_server_request_handler,
 )
 from core.session.session_state import (
     clear_session_liveness, get_session_user_tz, has_pending_question,
@@ -103,11 +105,16 @@ class CodexAppServerSession:
         mcp_server_names: list[str] | None = None,
         local_model: bool = False,
         hooks_floor: bool = False,
+        plan_mode: bool = False,
     ):
         self.session_id = session_id
         self.agent_name = agent_name
         self.model = model
         self.sandbox_mode = sandbox_mode          # SandboxMode enum string
+        # The platform ``plan`` mode: the Codex plan collaboration mode. Kept
+        # apart from the sandbox: a judge (CHECKS.md) is read-only and NOT
+        # planning.
+        self.plan_mode = bool(plan_mode)
         self.working_dir = working_dir
         self.config_dir = config_dir              # host path to .codex/ (CODEX_HOME)
         self.extra_env = extra_env or {}
@@ -139,9 +146,14 @@ class CodexAppServerSession:
         # Thread persistence: pre-populated for resume; captured on thread/start.
         self.thread_id: str | None = thread_id
         # Approval policy is derived from the sandbox mode (the gating matrix):
-        # danger-full-access (dontAsk/auto) → never; everything else → on-request,
-        # so a sandbox escape fires an approval we route through decide_tool_permission.
-        self.approval_policy: str = approval_for_sandbox(sandbox_mode)
+        # danger-full-access (dontAsk/auto) → never; an ATTENDED chat (no hook
+        # floor — a person answers the bridge) → "untrusted", so every
+        # command and patch reaches decide_tool_permission like Claude's hook
+        # (HOOKS.md "Attended Codex chats"); unattended → on-request, the
+        # floor gates. A daemon that rejects "untrusted" (a future Codex)
+        # drops this session to on-request once, logged (_untrusted_rejected).
+        self._untrusted_rejected = False
+        self.approval_policy: str = self._policy_for(sandbox_mode)
 
         self.last_activity: float = time.monotonic()
         self.lock = asyncio.Lock()
@@ -237,13 +249,24 @@ class CodexAppServerSession:
                 })
                 logger.info(f"Codex [{self.session_id[:8]}] resumed thread {self.thread_id}")
             except AppServerError as e:
-                # Rollout gone (CODEX_HOME wiped / fresh machine) → start fresh.
-                logger.warning(
-                    f"Codex [{self.session_id[:8]}] resume failed ({e}); starting new thread"
-                )
-                self.thread_id = None
+                if self._note_untrusted_rejection(e):
+                    overrides = self._thread_overrides()
+                    await self._client.request("thread/resume", {
+                        "threadId": self.thread_id, **overrides,
+                    })
+                else:
+                    # Rollout gone (CODEX_HOME wiped / fresh machine) → start fresh.
+                    logger.warning(
+                        f"Codex [{self.session_id[:8]}] resume failed ({e}); starting new thread"
+                    )
+                    self.thread_id = None
         if not self.thread_id:
-            res = await self._client.request("thread/start", overrides)
+            try:
+                res = await self._client.request("thread/start", overrides)
+            except AppServerError as e:
+                if not self._note_untrusted_rejection(e):
+                    raise
+                res = await self._client.request("thread/start", self._thread_overrides())
             self.thread_id = (res.get("thread") or {}).get("id") or ""
             logger.info(f"Codex [{self.session_id[:8]}] started thread {self.thread_id}")
 
@@ -319,7 +342,13 @@ class CodexAppServerSession:
             turn_params["effort"] = self.effort
         # Fresh turn → drop the prior turn's fileChange path correlations.
         self._item_paths.clear()
-        res = await self._client.request("turn/start", turn_params)
+        try:
+            res = await self._client.request("turn/start", turn_params)
+        except AppServerError as e:
+            if not self._note_untrusted_rejection(e):
+                raise
+            turn_params["approvalPolicy"] = self.approval_policy
+            res = await self._client.request("turn/start", turn_params)
         self._current_turn_id = (res.get("turn") or {}).get("id")
         self.last_activity = time.monotonic()
 
@@ -336,8 +365,6 @@ class CodexAppServerSession:
                         "message": "Codex app-server exited unexpectedly",
                     })
                     return
-                if method == "item/started":
-                    self._track_item_paths(params)
                 yield CodexEvent(type=method, data=params)
                 # The router only feeds this consumer the MAIN thread's (and any
                 # untagged) notifications — a spawned sub-agent's events go to its
@@ -584,18 +611,43 @@ class CodexAppServerSession:
         if self.translator is not None:
             self.translator._model = model
 
-    def set_sandbox_mode(self, sandbox_mode: str) -> None:
+    def set_sandbox_mode(self, sandbox_mode: str, plan_mode: bool | None = None) -> None:
         self.sandbox_mode = sandbox_mode
+        if plan_mode is not None:
+            self.plan_mode = bool(plan_mode)
         # Keep the approval policy in lock-step with the sandbox mode.
-        self.approval_policy = approval_for_sandbox(sandbox_mode)
+        self.approval_policy = self._policy_for(sandbox_mode)
+
+    def _policy_for(self, sandbox_mode: str) -> str:
+        """The approval policy for this session's mode: attended (no hook
+        floor) chats ask for every command and patch, unless the daemon
+        rejected that policy once (then on-request for the session)."""
+        attended = not self.hooks_floor and not self._untrusted_rejected
+        return approval_for_sandbox(sandbox_mode, attended=attended)
+
+    def _note_untrusted_rejection(self, error: Exception) -> bool:
+        """The daemon refused the ``untrusted`` approval policy: log once,
+        fall back to on-request for the rest of the session, and tell the
+        caller to retry. False when the error is something else."""
+        if self.approval_policy != UNTRUSTED_POLICY or not is_untrusted_policy_rejection(error):
+            return False
+        self._untrusted_rejected = True
+        self.approval_policy = self._policy_for(self.sandbox_mode)
+        logger.warning(
+            f"Codex [{self.session_id[:8]}] rejected approvalPolicy 'untrusted' "
+            f"({error}); this attended chat falls back to '{self.approval_policy}' — "
+            "in-workspace commands will not be prompted (HOOKS.md \"Attended Codex chats\")"
+        )
+        return True
 
     def _collaboration_mode(self) -> dict:
         """The Codex collaboration mode for this turn, derived from the platform
-        mode. ``plan`` is the ONLY platform mode that maps codex to a read-only
-        sandbox, so read-only ⟺ plan. Returns the MINIMAL ``{"mode": ...}`` — NOT
-        the full ``collaborationMode/list`` preset, whose ``reasoning_effort``
+        mode: ``plan`` iff the platform mode is plan (``plan_mode``) — a judge
+        session (CHECKS.md) runs the same read-only sandbox in the default
+        collaboration mode. Returns the MINIMAL ``{"mode": ...}`` — NOT the
+        full ``collaborationMode/list`` preset, whose ``reasoning_effort``
         would override the user's selected effort."""
-        return {"mode": "plan"} if self.sandbox_mode == "read-only" else {"mode": "default"}
+        return {"mode": "plan"} if self.plan_mode else {"mode": "default"}
 
     async def _decide_permission(self, tool_name: str, tool_input: dict) -> dict:
         """The injected decision authority for the approval bridge — runs the
@@ -607,7 +659,9 @@ class CodexAppServerSession:
         """The injected question authority for request_user_input — surfaces the
         dashboard card and blocks for the human answer in-process (local Codex)."""
         from api.hooks.permission import ask_user_question
-        return await ask_user_question(self.session_id, questions)
+        from core.layers.codex import tool_names
+        return await ask_user_question(
+            self.session_id, questions, tool_name=tool_names.canonical("request_user_input"))
 
     def _track_item_paths(self, params: dict) -> None:
         """Record a fileChange item's target paths (from ``item/started``) so a
@@ -666,12 +720,17 @@ class CodexAppServerSession:
         (rollouts in ``sessions/`` survive) and retry once.
         """
         last_err: Exception | None = None
+        # The daemon and every MCP it starts run below the proxy's CPU
+        # priority. A local list: self.sandbox_cmd_prefix picks the cwd.
+        from core.sandbox import pty_relay
+        spawn_prefix = pty_relay.niced(self.sandbox_cmd_prefix)
         for attempt in (1, 2):
             self._client = AppServerClient(
                 env=env, cwd=cwd,
-                sandbox_cmd_prefix=self.sandbox_cmd_prefix,
+                sandbox_cmd_prefix=spawn_prefix,
                 codex_bin=getattr(app_config, "CODEX_BIN", "codex"),
                 label=f"codex[{self.session_id[:8]}]",
+                spawn=_spawn_app_server,
             )
             try:
                 await self._client.start({
@@ -733,6 +792,12 @@ class CodexAppServerSession:
             # Any daemon traffic (incl. a still-running bg sub-agent) is activity —
             # keep the session from being reaped while bg work is in flight.
             self.last_activity = time.monotonic()
+            if method == "item/started" and isinstance(params, dict):
+                # Here, not in the turn stream: a lean fileChange approval sent
+                # in the same stdout chunk is handled in its own task, which
+                # runs before the turn stream reads this item, and would reach
+                # the path policy naming no file.
+                self._track_item_paths(params)
             if method == "__daemon_exit__":
                 # Fan the death out to the active turn + every supervisor so none
                 # hang waiting for a terminal that will never come.
@@ -956,10 +1021,7 @@ class CodexAppServerSession:
     def _build_env(self) -> dict[str, str]:
         """Environment for the app-server daemon (mirrors the old exec path)."""
         from core.sandbox.env_builder import build_session_env
-        username = ""
-        if self.working_dir.startswith("/users/"):
-            parts = self.working_dir.split("/")
-            username = parts[2] if len(parts) >= 3 else ""
+        username = layout.user_of(self.working_dir)
         env = build_session_env(
             self.session_id, self.agent_name,
             username=username, user_role=self.user_role,
@@ -1016,6 +1078,7 @@ async def create_codex_session(
     mcp_server_names: list[str] | None = None,
     local_model: bool = False,
     hooks_floor: bool = False,
+    plan_mode: bool = False,
 ) -> CodexAppServerSession:
     """Create, register, and **start** a Codex app-server session."""
     session = CodexAppServerSession(
@@ -1034,6 +1097,7 @@ async def create_codex_session(
         mcp_server_names=mcp_server_names,
         local_model=local_model,
         hooks_floor=hooks_floor,
+        plan_mode=plan_mode,
     )
     async with _codex_sessions_lock:
         _codex_sessions[session_id] = session
@@ -1101,17 +1165,31 @@ def _codex_reap_candidates(now: float, idle_timeout: float) -> list[str]:
         if (has_pending_question(sid)
                 and idle < _QUESTION_PARK_TIMEOUT_MULT * idle_timeout):
             continue
+        # Background terminals and background subagents feed the same
+        # registries the CLI layer keeps; a running one keeps the daemon.
+        from core.session import background_leash
+        if background_leash.spare_reason(sid, idle):
+            continue
         reap.append(sid)
     return reap
 
 
+async def _spawn_app_server(argv, *, cwd, env, limit):
+    """The daemon starts off the loop inside a spawn slot; the slot covers
+    the process creation only (the handshake after it may take a while)."""
+    from core.sandbox import pty_relay
+    async with pty_relay.spawn_slot():
+        return await pty_relay.spawn_piped(argv, cwd=cwd, env=env, limit=limit)
+
+
 async def reap_idle_codex_sessions() -> None:
     """Background task: reap idle Codex sessions every 60 s."""
+    from core.session import session_state as _state
     while True:
         await asyncio.sleep(60)
         try:
             now = time.monotonic()
-            idle_timeout = app_config.get_idle_timeout()
+            idle_timeout = await _state.cached_idle_timeout()
             to_reap = _codex_reap_candidates(now, idle_timeout)
             for sid in to_reap:
                 logger.info(f"Reaping idle Codex session {sid[:8]}")

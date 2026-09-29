@@ -5,7 +5,7 @@
  *
  * Colour depends on state AND `scope`:
  *   online                      → green
- *   stale / fell-back-to-local  → amber
+ *   stale / paused / fell-back  → amber
  *   disconnected/never (user)   → amber  — the caller's OWN machine soft-falls
  *                                          back to local, so it's not critical
  *   disconnected     (admin)    → red    — blocks everyone on the agent
@@ -18,19 +18,19 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
+import { PAIRING_SCOPE, type PairingScope } from '../lib/placement'
+import { MACHINE_STATE, isReachableMachine, type MachineState } from '../lib/status/machine'
 
-type BadgeState =
-  | 'online'
-  | 'stale'
-  | 'disconnected'
-  | 'never_connected'
-  | 'fellback_local'
-  | null
+// The machine's live state (lib/status/machine.ts) plus the badge's own
+// word for a chat that fell back to the sandbox while its machine is away.
+// Exported for the callers that derive a badge state (TopBar).
+export const FELLBACK_LOCAL = 'fellback_local'
+export type BadgeState = MachineState | typeof FELLBACK_LOCAL | null
 
 // Which kind of target the dot represents. Drives severity colour: a user's
 // own machine going offline is a soft fallback (amber), an admin/platform
 // target going offline blocks everyone on the agent (red).
-type BadgeScope = 'admin' | 'user'
+type BadgeScope = PairingScope
 
 interface Props {
   state: BadgeState
@@ -49,6 +49,7 @@ interface Props {
 const LABELS: Record<Exclude<BadgeState, null>, string> = {
   online: 'Connected',
   stale: 'Connection slow',
+  paused: 'Paused',
   disconnected: 'Disconnected',
   never_connected: 'Never connected',
   fellback_local: 'Running locally (remote offline)',
@@ -60,11 +61,11 @@ const TIP_WIDTH = 224
 const TIP_MARGIN = 8
 
 function dotColorClass(state: Exclude<BadgeState, null>, scope?: BadgeScope): string {
-  if (state === 'online') return 'bg-green-500'
-  if (state === 'stale' || state === 'fellback_local') return 'bg-amber-400'
+  if (state === MACHINE_STATE.ONLINE) return 'bg-green-500'
+  if (state === MACHINE_STATE.STALE || state === MACHINE_STATE.PAUSED || state === FELLBACK_LOCAL) return 'bg-amber-400'
   // disconnected | never_connected
-  if (scope === 'user') return 'bg-amber-400' // own machine → soft fallback
-  if (state === 'never_connected') return 'bg-gray-400'
+  if (scope === PAIRING_SCOPE.USER) return 'bg-amber-400' // own machine → soft fallback
+  if (state === MACHINE_STATE.NEVER_CONNECTED) return 'bg-gray-400'
   return 'bg-red-500' // admin/platform target offline → blocks everyone
 }
 
@@ -140,20 +141,21 @@ export default function RemoteBadge({
   }
 
   // --- Tooltip content -----------------------------------------------------
-  const reachable = state === 'online' || state === 'stale'
+  const reachable = isReachableMachine(state)
   const label = LABELS[state]
   const parts: string[] = [machineName ? `${machineName} — ${label}` : label]
-  if (state === 'online' && heartbeatAgeS != null) {
+  if (state === MACHINE_STATE.ONLINE && heartbeatAgeS != null) {
     parts.push(`Last ping: ${formatAge(heartbeatAgeS)}`)
-  } else if (state === 'stale' && heartbeatAgeS != null) {
+  } else if (state === MACHINE_STATE.STALE && heartbeatAgeS != null) {
     parts.push(`Last ping: ${formatAge(heartbeatAgeS)} — likely disconnecting`)
-  } else if ((state === 'disconnected' || state === 'never_connected') && lastSeenIso) {
+  } else if ((state === MACHINE_STATE.DISCONNECTED || state === MACHINE_STATE.NEVER_CONNECTED
+              || state === MACHINE_STATE.PAUSED) && lastSeenIso) {
     parts.push(`Last seen: ${formatIso(lastSeenIso)}`)
   }
   // Scope-aware consequence line so the dot explains what it MEANS.
-  if (!reachable && state !== 'fellback_local') {
-    if (scope === 'user') parts.push('Running locally until it reconnects')
-    else if (scope === 'admin') parts.push("Agents here can't run until it reconnects")
+  if (!reachable && state !== FELLBACK_LOCAL) {
+    if (scope === PAIRING_SCOPE.USER) parts.push('Running locally until it reconnects')
+    else if (scope === PAIRING_SCOPE.ADMIN) parts.push("Agents here can't run until it reconnects")
   }
   // Session fallback hints (when the dot is fed a resolved-session reason).
   if (fallbackReason === 'user-override-offline') {
@@ -161,7 +163,7 @@ export default function RemoteBadge({
   } else if (fallbackReason === 'agent-default-offline') {
     parts.push("The agent's remote target is offline")
   } else if (fallbackReason === 'viewer-on-admin-remote') {
-    parts.push('Viewer sessions run locally')
+    parts.push('Sessions below manager run locally')
   }
   const tipText = parts.join(' · ')
 

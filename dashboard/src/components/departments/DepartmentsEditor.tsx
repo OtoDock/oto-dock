@@ -22,13 +22,188 @@ import {
   type DepartmentMember,
 } from '../../api/departments'
 import { useAuth } from '../../contexts/AuthContext'
-import { Toggle } from '../../pages/agent/AgentConfig.parts'
+import { isCreatorOrAbove } from '../../lib/permissions'
+import {
+  DEFAULT_MODE,
+  DEFAULT_REACH,
+  DEPARTMENT_MODES,
+  DEPARTMENT_REACHES,
+  MODE_HINT,
+  MODE_LABEL,
+  REACH_HINT,
+  REACH_LABEL,
+  wiringSummary,
+  type DepartmentMode,
+  type DepartmentReach,
+} from '../../lib/kinds/department'
+import { ModeDiagram, ReachDiagram } from './WiringDiagrams'
 
 const MAX_LEVELS = 8
 
-const REACH_HINT: Record<'adjacent' | 'subtree', string> = {
-  adjacent: 'Agents can automatically delegate work within their own level and one level up or down.',
-  subtree: 'Every agent in the department can automatically delegate work to every other.',
+// ---------------------------------------------------------------------------
+// Delegation wiring pickers — radio cards with a diagram each (the agent
+// visibility-mode idiom), shared by the create card and every department
+// card. `name` keeps each card's radios in their own group.
+// ---------------------------------------------------------------------------
+
+function WiringCard<T extends string>({
+  name,
+  value,
+  selected,
+  disabled,
+  label,
+  hint,
+  diagram,
+  onPick,
+}: {
+  name: string
+  value: T
+  selected: boolean
+  disabled: boolean
+  label: string
+  hint: string
+  diagram: (cls: string) => React.ReactNode
+  onPick: (v: T) => void
+}) {
+  return (
+    <label
+      className={`flex flex-col gap-1.5 rounded-lg border px-2.5 py-2 transition-colors ${
+        selected ? 'border-brand bg-brand-surface' : 'border-p-border-light'
+      } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'} ${
+        !selected && !disabled ? 'hover:bg-p-surface-hover' : ''
+      }`}
+    >
+      <span className="flex items-start gap-2 min-w-0">
+        <input
+          type="radio"
+          name={name}
+          value={value}
+          checked={selected}
+          disabled={disabled}
+          onChange={() => onPick(value)}
+          aria-label={label}
+          className="accent-brand shrink-0 mt-0.5"
+        />
+        <span className="text-sm font-medium leading-tight text-p-text">{label}</span>
+      </span>
+      {diagram(selected ? 'text-brand' : 'text-p-text-secondary')}
+      <span className="text-xs text-p-text-light">{hint}</span>
+    </label>
+  )
+}
+
+function ModeSelector({
+  name,
+  groupLabel,
+  value,
+  disabled = false,
+  onChange,
+}: {
+  name: string
+  groupLabel: string
+  value: DepartmentMode
+  disabled?: boolean
+  onChange: (m: DepartmentMode) => void
+}) {
+  return (
+    <div role="radiogroup" aria-label={groupLabel} className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {DEPARTMENT_MODES.map(m => (
+        <WiringCard
+          key={m}
+          name={name}
+          value={m}
+          selected={value === m}
+          disabled={disabled}
+          label={MODE_LABEL[m]}
+          hint={MODE_HINT[m]}
+          diagram={cls => <ModeDiagram mode={m} className={cls} />}
+          onPick={onChange}
+        />
+      ))}
+    </div>
+  )
+}
+
+function ReachSelector({
+  name,
+  groupLabel,
+  value,
+  disabled = false,
+  onChange,
+}: {
+  name: string
+  groupLabel: string
+  value: DepartmentReach
+  disabled?: boolean
+  onChange: (r: DepartmentReach) => void
+}) {
+  return (
+    <div role="radiogroup" aria-label={groupLabel} className="grid grid-cols-2 gap-2 sm:max-w-md">
+      {DEPARTMENT_REACHES.map(r => (
+        <WiringCard
+          key={r}
+          name={name}
+          value={r}
+          selected={value === r}
+          disabled={disabled}
+          label={REACH_LABEL[r]}
+          hint={REACH_HINT[r]}
+          diagram={cls => <ReachDiagram reach={r} className={cls} />}
+          onPick={onChange}
+        />
+      ))}
+    </div>
+  )
+}
+
+/** The two wiring rows a card shows: the mode, then the reach. */
+function WiringRows({
+  idPrefix,
+  groupPrefix,
+  mode,
+  reach,
+  disabled = false,
+  onMode,
+  onReach,
+}: {
+  idPrefix: string
+  groupPrefix: string
+  mode: DepartmentMode
+  reach: DepartmentReach
+  disabled?: boolean
+  onMode: (m: DepartmentMode) => void
+  onReach: (r: DepartmentReach) => void
+}) {
+  return (
+    <>
+      <div className="flex flex-col gap-2">
+        <div>
+          <p className="text-sm font-medium text-p-text">Delegation</p>
+          <p className="text-xs text-p-text-light">Which way agents delegate work between the levels of this department.</p>
+        </div>
+        <ModeSelector
+          name={`${idPrefix}-mode`}
+          groupLabel={`${groupPrefix}delegation mode`}
+          value={mode}
+          disabled={disabled}
+          onChange={onMode}
+        />
+      </div>
+      <div className="flex flex-col gap-2">
+        <div>
+          <p className="text-sm font-medium text-p-text">Reach</p>
+          <p className="text-xs text-p-text-light">How far that delegation reaches across the levels.</p>
+        </div>
+        <ReachSelector
+          name={`${idPrefix}-reach`}
+          groupLabel={`${groupPrefix}reach`}
+          value={reach}
+          disabled={disabled}
+          onChange={onReach}
+        />
+      </div>
+    </>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +258,8 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
   const create = useCreateDepartment()
   const [name, setName] = useState('')
   const [levels, setLevels] = useState<string[]>(['Head', 'Senior', 'Junior'])
-  const [reach, setReach] = useState<'adjacent' | 'subtree'>('adjacent')
-  const [autoDelegation, setAutoDelegation] = useState(true)
+  const [mode, setMode] = useState<DepartmentMode>(DEFAULT_MODE)
+  const [reach, setReach] = useState<DepartmentReach>(DEFAULT_REACH)
 
   const valid = !!name.trim() && levels.length >= 1 && levels.every(l => l.trim())
 
@@ -93,7 +268,7 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
     create.mutate(
       {
         name: name.trim(),
-        auto_delegation: autoDelegation,
+        mode,
         reach,
         levels: levels.map(l => l.trim()),
       },
@@ -101,8 +276,8 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
         onSuccess: () => {
           setName('')
           setLevels(['Head', 'Senior', 'Junior'])
-          setReach('adjacent')
-          setAutoDelegation(true)
+          setMode(DEFAULT_MODE)
+          setReach(DEFAULT_REACH)
           onDone()
         },
       },
@@ -190,34 +365,15 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
           </div>
         </div>
 
-        {/* Reach */}
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-          <div>
-            <p className="text-sm font-medium text-p-text">Reach</p>
-            <p className="text-xs text-p-text-light">{REACH_HINT[reach]}</p>
-          </div>
-          <select
-            value={reach}
-            onChange={e => setReach(e.target.value as 'adjacent' | 'subtree')}
-            aria-label="New department reach"
-            className={`${INPUT} w-full sm:w-56`}
-          >
-            <option value="adjacent">Adjacent — one level up &amp; down</option>
-            <option value="subtree">Subtree — the whole department</option>
-          </select>
-        </div>
-
-        {/* Auto-delegation */}
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <p className="text-sm font-medium text-p-text">Auto-delegation</p>
-            <p className="text-xs text-p-text-light">
-              Automatically enable agents to delegate work to other agents
-              of the department
-            </p>
-          </div>
-          <Toggle checked={autoDelegation} onChange={setAutoDelegation} />
-        </div>
+        {/* Delegation mode + reach */}
+        <WiringRows
+          idPrefix="new-dept"
+          groupPrefix="New department "
+          mode={mode}
+          reach={reach}
+          onMode={setMode}
+          onReach={setReach}
+        />
 
         {/* Create */}
         <div className="flex items-center justify-between gap-3">
@@ -545,11 +701,11 @@ function DepartmentCard({
   // the header row is the summary, expanding reveals the full editor.
   const [expanded, setExpanded] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  // Local mirrors so the toggle/select respond instantly; re-synced from the
+  // Local mirrors so the pickers respond instantly; re-synced from the
   // server snapshot after the mutation invalidates + refetches.
-  const [autoDelegation, setAutoDelegation] = useState(department.auto_delegation)
-  const [reach, setReach] = useState<'adjacent' | 'subtree'>(department.reach)
-  useEffect(() => setAutoDelegation(department.auto_delegation), [department.auto_delegation])
+  const [mode, setMode] = useState<DepartmentMode>(department.mode)
+  const [reach, setReach] = useState<DepartmentReach>(department.reach)
+  useEffect(() => setMode(department.mode), [department.mode])
   useEffect(() => setReach(department.reach), [department.reach])
 
   const canEdit = department.can_edit
@@ -582,8 +738,7 @@ function DepartmentCard({
           </div>
           <div className="text-sm text-p-text-secondary">
             {memberCount} {memberCount === 1 ? 'agent' : 'agents'} · {levelCount}{' '}
-            {levelCount === 1 ? 'level' : 'levels'} ·{' '}
-            {department.reach === 'adjacent' ? 'adjacent reach' : 'subtree reach'}
+            {levelCount === 1 ? 'level' : 'levels'} · {wiringSummary(department.mode, department.reach)}
           </div>
         </div>
         <svg
@@ -635,46 +790,23 @@ function DepartmentCard({
       {del.error && <p className={`${ERROR_TEXT} mb-3`}>{del.error.message}</p>}
 
       <div className="divide-y divide-p-border-light [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
-        {/* Auto-delegation */}
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <p className="text-sm font-medium text-p-text">Auto-delegation</p>
-            <p className="text-xs text-p-text-light">
-              Automatically enable agents to delegate work to other agents
-              of the department
-            </p>
-          </div>
-          <Toggle
-            checked={autoDelegation}
-            disabled={!canEdit}
-            onChange={v => {
-              setAutoDelegation(v)
-              update.mutate({ id: department.id, auto_delegation: v })
-            }}
-          />
-        </div>
-
-        {/* Reach */}
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-          <div>
-            <p className="text-sm font-medium text-p-text">Reach</p>
-            <p className="text-xs text-p-text-light">{REACH_HINT[reach]}</p>
-          </div>
-          <select
-            value={reach}
-            disabled={!canEdit}
-            onChange={e => {
-              const v = e.target.value as 'adjacent' | 'subtree'
-              setReach(v)
-              update.mutate({ id: department.id, reach: v })
-            }}
-            aria-label="Delegation reach"
-            className={`${INPUT} w-full sm:w-56 disabled:opacity-40 disabled:cursor-not-allowed`}
-          >
-            <option value="adjacent">Adjacent — one level up &amp; down</option>
-            <option value="subtree">Subtree — the whole department</option>
-          </select>
-        </div>
+        {/* Delegation mode + reach, autosaved per pick */}
+        <WiringRows
+          idPrefix={department.id}
+          groupPrefix=""
+          mode={mode}
+          reach={reach}
+          disabled={!canEdit}
+          onMode={v => {
+            setMode(v)
+            update.mutate({ id: department.id, mode: v })
+          }}
+          onReach={v => {
+            setReach(v)
+            update.mutate({ id: department.id, reach: v })
+          }}
+        />
+        {update.error && <p className={ERROR_TEXT}>{update.error.message}</p>}
 
         {/* Levels */}
         <div>
@@ -714,8 +846,7 @@ function DepartmentCard({
 
 export default function DepartmentsEditor() {
   const { user } = useAuth()
-  const role = user?.role || 'member'
-  const canCreate = role === 'admin' || role === 'creator'
+  const canCreate = isCreatorOrAbove(user)
   const { data: departments, isLoading } = useDepartments()
   // Transient banner after a department delete that dropped agents.
   const [deletedUnassigned, setDeletedUnassigned] = useState<string[]>([])

@@ -6,8 +6,11 @@ import McpInstanceManager, { ApiKeyRelayInfo } from '../../components/admin/McpI
 import McpIcon from '../../components/McpIcon'
 import { useAuth } from '../../contexts/AuthContext'
 import { safeHref } from '../../lib/safeUrl'
+import { isContainerRuntime } from '../../lib/kinds/mcpRuntime'
+import { DOCKER_STATUS as DOCKER, ENABLE_DOCKER, type DockerStatus } from '../../lib/status/docker'
 
-const DOCKER_STATUS: Record<string, { label: string; color: string }> = {
+// A label and a colour per container status (lib/status/docker.ts).
+const DOCKER_STATUS: Record<DockerStatus, { label: string; color: string }> = {
   running: { label: 'Running', color: 'text-green-600 dark:text-green-400' },
   // Container is up but failing its healthcheck (e.g. a wedged camoufox) — amber,
   // not green. The proxy never auto-restarts Docker MCPs, so it's operator-visible.
@@ -67,10 +70,10 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
   // the platform's own compose stack (core file-tools on containerized
   // installs) — the proxy can't report or drive it, so the status pill and
   // start/stop/restart controls are hidden rather than showing "Not Found".
-  const isDocker = mcp.runtime === 'docker' && mcp.docker_managed !== false
+  const isDocker = isContainerRuntime(mcp.runtime) && mcp.docker_managed !== false
   const hasConfig = mcp.config_fields.length > 0
   const hasSkills = mcp.skills.length > 0
-  const dockerInfo = isDocker ? DOCKER_STATUS[mcp.docker_status || 'not_checked'] : null
+  const dockerInfo = isDocker ? DOCKER_STATUS[mcp.docker_status || DOCKER.NOT_CHECKED] : null
 
   const handleToggle = () => {
     if (lockedOn) return
@@ -84,7 +87,7 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
           // success; "failed" with ``docker_error`` when the compose call
           // exited non-zero (Docker daemon down, image build failed, port
           // conflict, etc.).
-          if (result?.docker_status === 'failed') {
+          if (result?.docker_status === ENABLE_DOCKER.FAILED) {
             const msg = result.docker_error || 'Docker container failed to start.'
             window.alert(
               `MCP "${mcp.name}" was enabled in the platform but the Docker ` +
@@ -299,14 +302,14 @@ export function McpRow({ mcp, updateInfo }: { mcp: McpServer; updateInfo?: McpUp
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'start' })}
-                      disabled={dockerAction.isPending || mcp.docker_status === 'running'}
+                      disabled={dockerAction.isPending || mcp.docker_status === DOCKER.RUNNING}
                       className="text-xs px-3 py-1.5 rounded-md bg-green-600 text-white hover:bg-green-700 disabled:opacity-40 transition-colors"
                     >
                       Start
                     </button>
                     <button
                       onClick={() => dockerAction.mutate({ name: mcp.name, action: 'stop' })}
-                      disabled={dockerAction.isPending || mcp.docker_status === 'stopped'}
+                      disabled={dockerAction.isPending || mcp.docker_status === DOCKER.STOPPED}
                       className="text-xs px-3 py-1.5 rounded-md bg-red-600 text-white hover:bg-red-700 disabled:opacity-40 transition-colors"
                     >
                       Stop

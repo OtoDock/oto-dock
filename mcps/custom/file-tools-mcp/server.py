@@ -20,6 +20,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+import render
 from shared import (
     MCP_PORT,
     _push_preview,
@@ -835,7 +836,9 @@ async def mcp_asgi_app(scope, receive, send):
 
 
 async def handle_health(request):
-    return JSONResponse({"status": "ok"})
+    # `render` says whether the app checks' headless browser is in this
+    # image (render.py); the proxy reads it before asking for a render.
+    return JSONResponse({"status": "ok", "render": render.render_available()})
 
 
 @asynccontextmanager
@@ -853,6 +856,9 @@ starlette_app = Starlette(
         Mount("/mcp", app=mcp_asgi_app),
         # Health check
         Route("/health", endpoint=handle_health),
+        # The app checks' render (APPS.md "Deploy pipeline"): the proxy
+        # alone calls it, with the render token it minted as the bearer.
+        Route("/render", endpoint=render.handle_render, methods=["POST"]),
     ],
     lifespan=lifespan,
 )

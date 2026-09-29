@@ -1,0 +1,11 @@
+{
+  "name": "private-review",
+  "description": "A private check: one round, a short rubric on every answer of my own sessions",
+  "applies": ["chats"],
+  "condition": {"always": true},
+  "rounds": 1,
+  "judge": {
+    "rubric": "Did the answer do what I asked, completely, and say what it did not do? Pass when yes. Otherwise one finding per gap, in one sentence each.",
+    "timeout": 300
+  }
+}

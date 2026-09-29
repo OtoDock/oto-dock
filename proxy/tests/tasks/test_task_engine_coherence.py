@@ -33,7 +33,7 @@ def _seed_models():
         {"value": "claude-sonnet-5", "label": "Sonnet 5", "provider": "anthropic"},
     ])
     subscription_store.sync_builtin_models("codex-cli", [
-        {"value": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "provider": "openai"},
+        {"value": "gpt-6-sol", "label": "GPT-6 Sol", "provider": "openai"},
     ])
 
 
@@ -56,7 +56,7 @@ def test_layer_override_skips_foreign_default_model(temp_db):
     assert config.resolve_agent_model(slug, layer="claude-code-cli") == "claude-sonnet-5"
     # FOREIGN layer → the default is skipped, the layer's own first enabled
     # model is used (the W1-B1 fix — never a claude model on a codex turn):
-    assert config.resolve_agent_model(slug, layer="codex-cli") == "gpt-5.6-sol"
+    assert config.resolve_agent_model(slug, layer="codex-cli") == "gpt-6-sol"
 
 
 def test_scheduler_chat_stamp_is_layer_aware(temp_db):
@@ -64,7 +64,7 @@ def test_scheduler_chat_stamp_is_layer_aware(temp_db):
     # match the wire resolution for an overridden run.
     _seed_models()
     slug = _make_agent("coherence-agent-2")
-    assert config.get_cli_model(slug, layer="codex-cli") == "gpt-5.6-sol"
+    assert config.get_cli_model(slug, layer="codex-cli") == "gpt-6-sol"
     assert config.get_cli_model(slug, layer=None) == "claude-sonnet-5"
 
 

@@ -14,7 +14,7 @@ import pytest
 
 from core.events import chat_writer, stream_pump
 from core.events.common_events import (
-    CommonEvent, DONE, PRODUCER_DONE, QUEUE_TURN, SYSTEM, TEXT,
+    CommonEvent, DONE, PRODUCER_DONE, QUEUE_TURN, SYSTEM, TEXT, TOOL_RESULT, TOOL_USE,
 )
 from core.events.stream_pump import ChatStreamPump
 from storage import database as task_store
@@ -73,7 +73,15 @@ def store_calls(monkeypatch):
         calls.append(("update_chat", threading.get_ident(), tuple(sorted(k))))
         return real_upd(chat_id, **k)
 
+    real_batch = task_store.add_chat_messages_batch
+
+    def rec_batch(chat_id, rows):
+        for role, *_rest in rows:
+            calls.append(("add_chat_message", threading.get_ident(), role))
+        return real_batch(chat_id, rows)
+
     monkeypatch.setattr(stream_pump.task_store, "add_chat_message", rec_add)
+    monkeypatch.setattr(stream_pump.task_store, "add_chat_messages_batch", rec_batch)
     monkeypatch.setattr(stream_pump.task_store, "update_chat", rec_upd)
     return calls
 
@@ -152,12 +160,12 @@ async def test_superseding_pump_cutoff_observes_predecessor_rows(temp_db):
 async def test_live_blocks_trim_only_when_the_save_lands(temp_db, monkeypatch):
     temp_db.create_chat("po4", "user-admin", "a1")
     gate = threading.Event()
-    real_add = task_store.add_chat_message
+    real_batch = task_store.add_chat_messages_batch
 
-    def slow_add(*a, **k):
+    def slow_batch(*a, **k):
         gate.wait(5)
-        return real_add(*a, **k)
-    monkeypatch.setattr(stream_pump.task_store, "add_chat_message", slow_add)
+        return real_batch(*a, **k)
+    monkeypatch.setattr(stream_pump.task_store, "add_chat_messages_batch", slow_batch)
 
     pump = _idle_pump("po4")
     live = {"live_blocks": [], "session_id": pump.session_id}
@@ -226,3 +234,71 @@ async def test_recovery_suppress_skips_the_save(temp_db):
     finally:
         stream_pump._recovery_suppress_flush.discard("po6")
         pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_rebuilds_the_search_row_once(temp_db, monkeypatch):
+    """A turn's text segments land in one batch with ONE
+    rebuild of the chat's search row, not one per segment."""
+    from storage.chat import db_chats
+    rebuilds = []
+    real = db_chats._rebuild_chat_search_row
+
+    def counting(conn, chat_id):
+        rebuilds.append(chat_id)
+        return real(conn, chat_id)
+
+    monkeypatch.setattr(db_chats, "_rebuild_chat_search_row", counting)
+    temp_db.create_chat("po-seg", "user-admin", "a1")
+    events = []
+    for i in range(6):
+        events += [
+            CommonEvent(type=TEXT, data={"content": f"segment {i}"}),
+            CommonEvent(type=TOOL_USE, data={"name": "Bash", "tool_id": f"t{i}"}),
+            CommonEvent(type=TOOL_RESULT, data={"tool_id": f"t{i}", "content": "ok"}),
+        ]
+    pump = _scripted_pump("po-seg", events, chat_owner="user-admin", chat_agent="a1")
+    try:
+        await pump.start()
+        texts = [m["content"] for m in task_store.get_chat_messages("po-seg")
+                 if m["role"] == "assistant"]
+        assert texts == [f"segment {i}" for i in range(6)]
+        assert rebuilds == ["po-seg"]
+        assert task_store.search_chats("user-admin", "a1", "segment")
+    finally:
+        stream_pump._chat_streaming_state.pop("po-seg", None)
+        pump.producer.cancel()
+
+
+def test_a_bad_row_in_a_batch_costs_only_itself(temp_db):
+    """One row the database refuses (a NUL byte) no longer takes the rest of
+    the turn with it: the batch falls back to row by row."""
+    temp_db.create_chat("po-bad", "user-admin", "a1")
+    last = task_store.add_chat_messages_batch("po-bad", [
+        ("assistant", "before", "", ""),
+        ("assistant", "bad\x00row", "", ""),
+        ("event", "", "tool", "{}"),
+        ("assistant", "after", "", ""),
+    ])
+    rows = task_store.get_chat_messages("po-bad")
+    assert [r["content"] for r in rows if r["role"] == "assistant"] == ["before", "after"]
+    assert [r["event_type"] for r in rows if r["role"] == "event"] == ["tool"]
+    assert last == rows[-1]["id"]
+
+
+def test_a_failed_search_rebuild_keeps_the_rows_and_warns(temp_db, monkeypatch, caplog):
+    from storage.chat import db_chats
+
+    def boom(conn, chat_id):
+        raise RuntimeError("tsvector too long")
+
+    monkeypatch.setattr(db_chats, "_rebuild_chat_search_row", boom)
+    monkeypatch.setattr(db_chats, "_rebuild_warned_at", 0.0)
+    temp_db.create_chat("po-warn", "user-admin", "a1")
+    with caplog.at_level("WARNING", logger="db_chats"):
+        task_store.add_chat_messages_batch("po-warn", [("assistant", "kept", "", "")])
+        task_store.add_chat_message("po-warn", "user", "also kept")
+    assert [m["content"] for m in task_store.get_chat_messages("po-warn")] == [
+        "kept", "also kept"]
+    warnings = [r for r in caplog.records if "chat_search rebuild failed" in r.getMessage()]
+    assert len(warnings) == 1          # rate-limited

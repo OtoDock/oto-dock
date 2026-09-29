@@ -64,7 +64,7 @@ def _store_two_subs(mock_store, cons_a=500.0, cons_b=5.0):
     return rows
 
 
-def _fan_out_lands(sids, *, claude_blob=None, codex_auth=None,
+def _fan_out_lands(sids, *, layer=None, payload=None,
                    on_written=None, expected_sub_id=None):
     for s in sids:
         on_written(s)
@@ -73,7 +73,7 @@ def _fan_out_lands(sids, *, claude_blob=None, codex_auth=None,
 class TestDriftRebalance:
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_hammered_scope_moves_to_cold_account(self, mock_store, _t, mock_fan):
         _reset()
@@ -88,7 +88,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_below_floor_stays(self, mock_store, _t, mock_fan):
         _reset()
@@ -100,7 +100,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_within_ratio_stays(self, mock_store, _t, mock_fan):
         # 300 vs 150: above the floor but not 3× apart — roughly even, no move.
@@ -112,7 +112,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_cooldown_suppresses_second_move(self, mock_store, _t, mock_fan):
         _reset()
@@ -128,7 +128,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_recent_spawn_claim_defers_move(self, mock_store, _t, mock_fan):
         # A spawn just claimed the scope (acquire→bind window): the move is
@@ -146,7 +146,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_sole_account_never_moves(self, mock_store, _t, mock_fan):
         _reset()
@@ -161,7 +161,7 @@ class TestDriftRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_fileless_and_unstamped_sessions_never_move(self, mock_store, _t, mock_fan):
         _reset()
@@ -178,7 +178,7 @@ class TestDriftRebalance:
 class TestReactiveRebalance:
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_hard_limit_moves_even_below_floor(self, mock_store, _t, mock_fan):
         _reset()
@@ -191,7 +191,7 @@ class TestReactiveRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_overload_nudge_does_not_move(self, mock_store, _t, mock_fan):
         _reset()
@@ -205,7 +205,7 @@ class TestReactiveRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_replacement_must_not_be_throttled(self, mock_store, _t, mock_fan):
         # Both accounts resting on real limits: moving A→B is pure churn.
@@ -220,7 +220,7 @@ class TestReactiveRebalance:
 
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_user_scope_respects_platform_auth_off(self, mock_store, _t, mock_fan):
         # User-scope group, hard-limited own account, Platform Auth OFF and no
@@ -346,7 +346,7 @@ class TestWindowExhaustionRebalance:
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_window_exhausted_scope_moves(self, mock_store, _t, mock_fan, _on):
         """The vendor's own reading (no error text needed) moves the scope."""
@@ -362,7 +362,7 @@ class TestWindowExhaustionRebalance:
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_replacement_must_not_be_window_exhausted(self, mock_store, _t, mock_fan, _on):
         # Every account out of window: hopping A→B is churn, the scope stays.
@@ -395,7 +395,7 @@ class TestModelAwareRebalance:
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_full_model_window_moves_the_scope_running_that_model(self, mock_store, _t, mock_fan, _on):
         _reset()
@@ -419,7 +419,7 @@ class TestModelAwareRebalance:
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_replacement_must_serve_the_scopes_model(self, mock_store, _t, mock_fan, _on):
         _reset()
@@ -445,7 +445,7 @@ class TestModelAwareRebalance:
     @patch("services.engines.subscription_windows.is_enabled", return_value=True)
     @patch.object(tf, "fan_out", side_effect=_fan_out_lands)
     @patch.object(tf, "session_target",
-                  return_value=tf.CredentialFileTarget(kind="claude", host_dir="/x"))
+                  return_value=tf.CredentialFileTarget(layer="claude-code-cli", host_dir="/x"))
     @patch("services.engines.subscription_pool.subscription_store")
     def test_recent_claim_on_another_account_does_not_defer(self, mock_store, _t, mock_fan, _on):
         # A sticky pin that yielded to exhaustion claimed the scope on sub-b:

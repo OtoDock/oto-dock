@@ -12,7 +12,7 @@ import config
 from services.engines import subscription_pool
 from storage.billing import subscription_store
 import ws.dashboard  # noqa: F401  — the chat module is imported through the WS package
-from ws.dashboard_chat import _codex_provider_switch_blocker
+from ws.dashboard_chat import _provider_switch_blocker
 
 
 def _wire(monkeypatch, bound_provider, sub_id="sub-1"):
@@ -27,18 +27,18 @@ def _wire(monkeypatch, bound_provider, sub_id="sub-1"):
 
 def test_cross_provider_switch_is_refused(monkeypatch):
     _wire(monkeypatch, "openai")
-    reason = _codex_provider_switch_blocker("s1", "qwen3.6-35b-a3b")
+    reason = _provider_switch_blocker("s1", "qwen3.6-35b-a3b", layer="codex-cli")
     assert "Start a new chat" in reason
-    assert "OpenAI" in reason and "local OpenAI-compatible endpoint" in reason
+    assert "OpenAI" in reason and "OpenAI-compatible endpoint" in reason  # the descriptor's labels
 
 
 def test_same_provider_switch_is_allowed(monkeypatch):
     _wire(monkeypatch, "openai_compatible")
-    assert _codex_provider_switch_blocker("s1", "qwen3.6-35b-a3b") == ""
+    assert _provider_switch_blocker("s1", "qwen3.6-35b-a3b", layer="codex-cli") == ""
 
 
 def test_unbound_session_is_not_guarded(monkeypatch):
     _wire(monkeypatch, "openai", sub_id=None)
-    assert _codex_provider_switch_blocker("s1", "qwen3.6-35b-a3b") == ""
+    assert _provider_switch_blocker("s1", "qwen3.6-35b-a3b", layer="codex-cli") == ""
     _wire(monkeypatch, "openai", sub_id="default")
-    assert _codex_provider_switch_blocker("s1", "qwen3.6-35b-a3b") == ""
+    assert _provider_switch_blocker("s1", "qwen3.6-35b-a3b", layer="codex-cli") == ""

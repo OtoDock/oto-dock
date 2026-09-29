@@ -55,7 +55,9 @@ from services.community.community_installer import (
     _is_safe_name,
     _rollback_extracted_files,
 )
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
 from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_types as _mt
 from services.mcp.mcp_manifest_types import SKILL_ID_MAX_LEN, SKILL_ID_RE
 from storage.mcp import mcp_store
 
@@ -87,8 +89,10 @@ def _validate_skill_package(data: dict, pkg_root: Path) -> list[str]:
         )
     server = data.get("server") or {}
     # Tested invariant: anything else would gain code execution under a
-    # lower-risk label (plan §3).
-    if server.get("runtime") != "none" or server.get("transport") != "none":
+    # lower-risk label (plan §3). A skill package has no server process
+    # (the runtime's ``process`` fact) and no transport.
+    rt = _mt.runtime_of(server.get("runtime"))
+    if rt is None or rt.process or server.get("transport") != "none":
         errors.append("skill packages must declare server.runtime and "
                       "server.transport as 'none'")
 
@@ -104,12 +108,13 @@ def _validate_skill_package(data: dict, pkg_root: Path) -> list[str]:
         # Must stay a RELATIVE path resolving inside the package — an
         # absolute value survives the join (`pkg_root / "/etc/x"` IS
         # "/etc/x") and the scrub step would rewrite that file in place.
-        f = (pkg_root / rel) if rel and not Path(rel).is_absolute() else None
-        try:
-            inside = bool(f) and f.resolve().is_relative_to(pkg_root.resolve())
-        except OSError:
-            inside = False
-        if f is None or not inside or not f.is_file() or ".." in Path(rel).parts:
+        f = None
+        if rel and not Path(rel).is_absolute():
+            try:
+                f = resolve_under(pkg_root / rel, pkg_root)
+            except (PathOutsideRoot, OSError, ValueError):
+                f = None
+        if f is None or not f.is_file():
             errors.append(f"skill {sid}: file {rel!r} not found in package")
 
     if any(p.is_file() for p in pkg_root.rglob(".env")):

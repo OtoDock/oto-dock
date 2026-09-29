@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 import config
 from storage import database as task_store
-from api.sessions.sessions import verify_api_key, verify_session_match
+from api.sessions.sessions import verify_api_key_async, verify_session_match_async
 from core.session.session_state import (
     _sessions,
     _dashboard_notify_queues,
@@ -32,6 +32,7 @@ from core.session.session_state import (
 )
 import contextlib
 from api.hooks import routing
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -52,12 +53,19 @@ class HookToolResultRequest(BaseModel):
     # Interactive TUI mcp__ calls: feed the session allow-memory only, no
     # chat rendering (the terminal already rendered the result).
     memory_only: bool = False
+    # The paths the call's input named (file_path / path / notebook_path) —
+    # the turn's record (session_events.post_tool). Empty on older scripts.
+    tool_paths: list[str] = []
+    # A shell tool's command text (capped by the script) — the record's
+    # ``command``, from which a check reads a commit, a push, a build.
+    # Empty on older scripts and for every other tool.
+    tool_command: str = ""
 
 
 @router.post("/v1/hooks/tool-result")
 async def hook_tool_result(req: HookToolResultRequest, authorization: str | None = Header(None)):
     """Called by PostToolUse hook to push a tool result summary to the chat."""
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
 
     # (Removed: the interactive allow-memory inference. It seeded
     # remember_session_tool_allow for any mcp__ tool that RAN in an
@@ -68,11 +76,21 @@ async def hook_tool_result(req: HookToolResultRequest, authorization: str | None
     # call and suppress the CLI's own re-prompt. The CLI's own allow-memory
     # ("don't ask again") now owns interactive persistence.)
     if req.memory_only:
+        # A terminal's transcript tailer records the call (one source per
+        # placement — HOOKS.md).
         return {"status": "ok"}
+
+    # The headless Claude placement's ONE post_tool source is this forwarder.
+    from core.session import session_events
+    session_events.post_tool(
+        req.session_id, req.tool_name, tool_use_id=req.tool_use_id,
+        tool_input={"_paths": list(req.tool_paths)} if req.tool_paths else None,
+        is_error=req.is_error, source="forwarder", command=req.tool_command,
+    )
 
     queue = get_permission_queue(routing.resolve_hook_route(req.session_id).queue_session_id)
     await queue.put({
-        "event_type": "tool_result",
+        "event_type": wire.ITEM_TOOL_RESULT,
         "tool_name": req.tool_name,
         "tool_use_id": req.tool_use_id,
         "summary": req.summary,
@@ -86,33 +104,60 @@ class HookStopRequest(BaseModel):
     session_id: str
     transcript_path: str = ""
     hook_event_name: str = "Stop"
+    # Both CLIs set this once a continue verdict was delivered this turn.
+    stop_hook_active: bool = False
+    # The agent's final message (capped by the script) — for a turn_end
+    # handler that judges the answer, not only the files.
+    last_assistant_message: str = ""
 
 
 @router.post("/v1/hooks/stop")
 async def hook_stop(req: HookStopRequest, authorization: str | None = Header(None)):
-    """Called by the Stop hook at turn end.
+    """Called by the Stop hook at turn end, on both engines.
 
-    For an INTERACTIVE session (PTY-backed, no pump) this is the only turn-end
-    signal + transcript pointer, so the proxy reads the JSONL at
-    ``transcript_path`` and appends new user/assistant messages to chat_messages.
-    Headless ``-p`` sessions are persisted by the
-    pump, so this no-ops for them. Never blocks the agent (fire-and-forget hook).
+    Two jobs (HOOKS.md "Shapes per event"):
+
+    * A Claude INTERACTIVE session (PTY-backed, no pump) has no other
+      turn-end signal + transcript pointer, so the proxy reads the JSONL at
+      ``transcript_path`` and appends new user/assistant messages to
+      chat_messages. A Codex terminal's rollout tailer does its own reading;
+      headless sessions are persisted by the pump.
+    * The platform's ``turn_end`` verdict: for a TERMINAL session (the CLI
+      drives the turn) the hook is the one point that can hold the turn
+      open, so the verdict is answered here as ``{"decision": "block",
+      "reason": …}`` and the script prints it; for a proxy-driven session
+      the hook is an observation and the layer's loop delivers the verdict.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     record_hook_activity(req.session_id)
 
-    from core.session import interactive_session
+    from core.session import interactive_session, session_events
     sess = interactive_session.get(req.session_id)
-    if sess is None:
-        return {"status": "ok", "interactive": False}
+    stats: dict = {}
+    # The session's own tailer (the engine's ``transcript_tailer()``) says
+    # whether the hook's transcript pointer is for it: Claude's tailer takes
+    # the CLI's session JSONL here (``tail_transcript``); Codex's rollout
+    # tailer reads on its own and has no such entry point.
+    tail = getattr(sess._tailer(), "tail_transcript", None) if sess is not None else None
+    if tail is not None:
+        # Blocking file read + DB writes → off the event loop.
+        stats = await asyncio.to_thread(
+            tail, req.session_id, sess.chat_id, req.transcript_path,
+        )
 
-    # Blocking file read + DB writes → off the event loop.
-    from core.session import transcript_tailer
-    stats = await asyncio.to_thread(
-        transcript_tailer.tail_transcript,
-        req.session_id, sess.chat_id, req.transcript_path,
+    engine = getattr(sess, "transcript_kind", "") if sess is not None else ""
+    verdict = await session_events.turn_end(
+        req.session_id, source="hook", engine=engine or "",
+        driven_by="cli" if sess is not None else "proxy",
+        transcript_path=req.transcript_path,
+        last_message=req.last_assistant_message,
+        stop_hook_active=req.stop_hook_active,
     )
-    return {"status": "ok", "interactive": True, **stats}
+    out: dict = {"status": "ok", "interactive": sess is not None, **stats}
+    if verdict.should_continue:
+        out["decision"] = "block"
+        out["reason"] = verdict.continue_reason
+    return out
 
 
 class HookSubagentRequest(BaseModel):
@@ -134,15 +179,17 @@ async def hook_subagent(req: HookSubagentRequest, authorization: str | None = He
     _bg_agent_monitor (awaiting the registry's event) fires the nudge — this
     handler never blocks on delivery.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     # SubagentStop counts as hook activity (settle's lost-Stop safety net).
     record_hook_activity(req.session_id)
 
+    from core.session import session_events
     reg = get_subagent_registry(req.session_id)
-    # buffer=True parks a Stop that raced ahead of its task_started; mark_done
-    # returns True only on the transition to completed (dedups vs the stdout
-    # task_notification backup, which may also fire for the same agent).
-    if not reg.mark_done(req.agent_id, buffer=True):
+    # session_events.subagent_stop marks the registry with buffer=True (a
+    # Stop that raced ahead of its spawn is parked) and returns True only on
+    # the transition to completed — dedups against the stdout
+    # task_notification backup and, on Codex, the thread router.
+    if not session_events.subagent_stop(req.session_id, req.agent_id, req.agent_type):
         return {"status": "ok", "duplicate": True}
 
     tool_use_id = reg.tuid_for(req.agent_id)
@@ -157,13 +204,13 @@ async def hook_subagent(req: HookSubagentRequest, authorization: str | None = He
 
     # Per-agent WS completion. Pump path (turn still streaming → fg agents)
     # first, else the session notify queue (turn ended → bg agents, no pump).
-    event = {"type": "bg_agent_done", "tool_use_id": tool_use_id}
+    event = {"type": wire.BG_AGENT_DONE, "tool_use_id": tool_use_id}
     pushed = push_pump_event(chat_id, event) if chat_id else False
     if not pushed:
         nq = _dashboard_notify_queues.get(req.session_id)
         if nq:
             with contextlib.suppress(Exception):
-                nq.put_nowait({"type": "bg_agent_done", "tool_use_id": tool_use_id})
+                nq.put_nowait({"type": wire.BG_AGENT_DONE, "tool_use_id": tool_use_id})
     return {"status": "ok"}
 
 
@@ -188,7 +235,7 @@ async def hook_file_written(
     Docker MCPs should log but not fail on a False result — the write has
     already happened on the platform side.
     """
-    verify_session_match(authorization, req.session_id)
+    await verify_session_match_async(authorization, req.session_id)
     from core.remote import remote_file_flow
     if not remote_file_flow.is_remote_session(req.session_id):
         return {"ok": True, "local": True}
@@ -233,7 +280,7 @@ async def permission_response(
     authorization: str | None = Header(None),
 ):
     """Called by the pipe function when the user responds to a permission dialog."""
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
 
     # The session JWT authorizes THIS session only — it must not resolve
     # another session's pending request. (404, not 403, so a guessed
@@ -266,7 +313,7 @@ async def request_user_location(
     session sid) falls back to the explicit X-Agent-Name lookup. Then pushes a
     location_request event to that session's WS and blocks for the response.
     """
-    verify_api_key(authorization)
+    await verify_api_key_async(authorization)
 
     # Resolve the caller's OWN session id from its session token. Empty for a
     # master-key caller (trusted s2s — may use the agent-name fallback below).
@@ -301,21 +348,21 @@ async def request_user_location(
 
     # Generate request ID and push to dashboard
     request_id = str(uuid.uuid4())
-    location_event = {"type": "location_request", "request_id": request_id}
+    location_event = {"type": wire.LOCATION_REQUEST, "request_id": request_id}
 
     # Try pump first (works during streaming), fallback to notify queue
     pushed = push_pump_event(chat_id, location_event) if chat_id else False
     if not pushed:
         notify_queue = _dashboard_notify_queues.get(latest_sid)
         if notify_queue:
-            await notify_queue.put({"type": "location_request", "data": location_event})
+            await notify_queue.put({"type": wire.LOCATION_REQUEST, "data": location_event})
         else:
             return {"error": "No active dashboard session -- user may not be online"}
 
     logger.info(f"Location request: session={latest_sid[:8]}, request_id={request_id}")
 
     # Block waiting for dashboard response
-    result = await wait_for_location(request_id, timeout=30.0)
+    result = await wait_for_location(request_id, timeout=30.0, session_id=latest_sid)
 
     # Optional: reverse geocode for address hint
     if result.get("lat") and not result.get("error"):

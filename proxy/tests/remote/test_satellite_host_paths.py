@@ -13,6 +13,10 @@ import json
 import sys
 from unittest.mock import AsyncMock, patch
 
+
+async def _pass_async(*a, **kw):
+    return None
+
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
@@ -25,6 +29,7 @@ if str(_REPO_ROOT) not in sys.path:
 from auth.path_policy import SecurityContext  # noqa: E402
 from core.remote import remote_file_flow as rff # noqa: E402
 from satellite.sessions.session_manager import _validate_satellite_host_path  # noqa: E402
+from core import placement
 
 
 # ---------------------------------------------------------------------------
@@ -251,12 +256,8 @@ def _make_remote_ctx(*, allow_full_fs=False) -> SecurityContext:
     return SecurityContext(
         role="manager", username="alice", agent="my-agent",
         is_admin_agent=False,
-        target_kind="user_remote",
-        target_machine_id="m1",
-        target_agents_dir="/home/dave/.oto-dock/agents",
-        target_home_dir="/home/dave",
-        target_allow_full_fs=allow_full_fs,
-    )
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1", agents_dir="/home/dave/.oto-dock/agents", home_dir="/home/dave", allow_full_fs=allow_full_fs),
+        )
 
 
 class TestResolvePathHookSatelliteHost:
@@ -269,7 +270,7 @@ class TestResolvePathHookSatelliteHost:
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            paths, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match_async", AsyncMock(return_value=None),
         )
         return TestClient(app)
 
@@ -538,7 +539,7 @@ class TestFileWrittenHookDispatch:
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            lifecycle, "verify_session_match", lambda *a, **kw: None,
+            lifecycle, "verify_session_match_async", _pass_async,
         )
         return TestClient(app)
 
@@ -761,7 +762,7 @@ class TestResolvePathWriteRbac:
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            paths, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match_async", AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
             "core.remote.remote_file_flow.is_remote_session", lambda sid: False,
@@ -941,7 +942,7 @@ class TestHostCachePreviewEditMint:
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            preview, "verify_session_match", lambda *a, **kw: None,
+            preview, "verify_session_match_async", _pass_async,
         )
         return TestClient(app)
 
@@ -1037,7 +1038,7 @@ class TestResolvePathDisplayPathCarveOut:
         app = FastAPI()
         app.include_router(hooks_mod.router)
         monkeypatch.setattr(
-            paths, "verify_session_match", lambda *a, **kw: None,
+            paths, "verify_session_match_async", AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
             "api.hooks.paths.get_session_security",
@@ -1103,3 +1104,35 @@ class TestResolvePathDisplayPathCarveOut:
         # Fall-through behavior for writes (today's): whatever happens, the
         # carve-out must not hand back the direct file as a WRITE target.
         assert r.status_code != 200 or r.json()["host_path"] != str(direct)
+
+    def test_the_answer_names_the_session_agent(self, client, tree):
+        """Every answer carries the agent whose tree the host path sits in,
+        from the session, never from the caller's string: the consumer
+        confines its writes to that folder."""
+        r = self._resolve(client, "my-agent/users/alice/workspace/shots/page_001.png")
+        assert r.status_code == 200, r.text
+        assert r.json()["agent"] == "my-agent"
+        r = self._resolve(client, "/workspace/out.txt", writing=True)
+        assert r.status_code == 200, r.text
+        assert r.json()["agent"] == "my-agent"
+
+    def test_the_answer_names_the_host_cache_for_a_satellite_host_path(
+        self, client, tree, monkeypatch,
+    ):
+        import config as _cfg
+        cache_file = _cfg.AGENTS_DIR / ".remote-host-cache" / "s1" / "etc" / "hosts"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_bytes(b"x")
+
+        async def fake_pull(session_id, abs_path):
+            return cache_file
+        monkeypatch.setattr(
+            "api.hooks.paths.get_session_security",
+            lambda sid: _make_remote_ctx(allow_full_fs=True),
+        )
+        monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: True)
+        monkeypatch.setattr("core.remote.remote_file_flow.pull_through_host_path", fake_pull)
+        r = self._resolve(client, "/etc/hosts")
+        assert r.status_code == 200, r.text
+        assert r.json()["host_path"] == str(cache_file)
+        assert r.json()["agent"] == ".remote-host-cache"

@@ -13,20 +13,32 @@ Covered:
    the supervisor resolves it (registry mark_done) when its thread terminates —
    reusing the shared resolve_bg_subagent + SubagentRegistry, so the cohort nudge
    + the delegation wait fire identically to local.
-3. The version gate (satellite_supports_bg): only satellites >= 0.5.18 forward
-   bg-thread events, so older ones leave supervision off (no spurious nudge).
+3. Supervision is always on: every satellite that can connect forwards
+   bg-thread events past the main turn (that landed in 0.5.18, far below
+   MIN_SATELLITE_VERSION), so the Codex remote adapter's router is the sole
+   consumer of the session's event queue.
+
+The router, the handoff and the teardown are the Codex engine's
+(``core/layers/codex/remote.py`` — ``RemoteEngineAdapter``); the remote layer
+reaches them through the adapter, never by engine id.
 """
 import asyncio
 import contextlib
 
 from core.layers.codex.layer import CodexEventTranslator
+from core.layers.codex.remote import CodexRemoteState
 from core.layers.codex.session import CodexEvent
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
 from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+from core.session.session_manager import get_layer_by_path
 from core.session.session_state import get_subagent_registry, _subagent_registries
 
 MAIN = "thread-MAIN"
 SUB = "thread-SUB-agent"
+
+
+def _adapter():
+    return get_layer_by_path("codex-cli").remote_adapter()
 
 
 def _ev(method, tid, **item):
@@ -37,13 +49,17 @@ def _ev(method, tid, **item):
     return {"method": method, "params": params}
 
 
-def _make_layer_info(translator=None, *, bg=True):
+def _make_layer_info(translator=None):
     cm = SatelliteConnectionManager()
     layer = RemoteExecutionLayer(cm)
     info = RemoteSessionInfo(
         session_id="s1", machine_id="m1", agent_name="a",
         execution_path="codex-cli", event_queue=asyncio.Queue(),
-        codex_translator=translator, codex_thread_id=MAIN, bg_supervised=bg,
+        resume_handle=MAIN,
+    )
+    # The engine's per-session record, as init_session would build it.
+    info.engine_state = CodexRemoteState(
+        translator=translator or CodexEventTranslator(model="m", supervised_bg=True),
     )
     layer._sessions["s1"] = info
     return layer, info
@@ -56,8 +72,8 @@ def _make_layer_info(translator=None, *, bg=True):
 def test_router_demuxes_main_and_sub_threads():
     async def run():
         layer, info = _make_layer_info()
-        info.default_consumer = asyncio.Queue()
-        router = asyncio.create_task(layer._route_remote_notifications(info))
+        info.engine_state.default_consumer = asyncio.Queue()
+        router = asyncio.create_task(_adapter()._route_notifications(info))
         try:
             info.event_queue.put_nowait(_ev("item/started", MAIN, type="agentMessage"))
             info.event_queue.put_nowait(_ev("item/started", SUB, type="agentMessage"))
@@ -65,10 +81,10 @@ def test_router_demuxes_main_and_sub_threads():
             info.event_queue.put_nowait({"type": "_turn_ended", "command_id": "c1"})
             await asyncio.sleep(0.05)
             # MAIN event + the marker went to the active turn's consumer.
-            assert info.default_consumer.qsize() == 2
+            assert info.engine_state.default_consumer.qsize() == 2
             # The SUB event was siphoned into its own (lazily created) buffer.
-            assert SUB in info.thread_consumers
-            assert info.thread_consumers[SUB].qsize() == 1
+            assert SUB in info.engine_state.thread_consumers
+            assert info.engine_state.thread_consumers[SUB].qsize() == 1
         finally:
             router.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -83,17 +99,17 @@ def test_router_captures_codex_thread_id_marker():
     # forward it to a None consumer and drop it (which would disable demux).
     async def run():
         layer, info = _make_layer_info()
-        info.codex_thread_id = ""       # fresh session — unknown until the marker
-        info.default_consumer = None    # no active turn yet
-        router = asyncio.create_task(layer._route_remote_notifications(info))
+        info.resume_handle = ""         # fresh session — unknown until the marker
+        info.engine_state.default_consumer = None    # no active turn yet
+        router = asyncio.create_task(_adapter()._route_notifications(info))
         try:
-            info.event_queue.put_nowait({"type": "_codex_thread_id", "thread_id": MAIN})
+            info.event_queue.put_nowait({"type": "_resume_handle", "handle": MAIN})
             await asyncio.sleep(0.05)
-            assert info.codex_thread_id == MAIN
+            assert info.resume_handle == MAIN
             # With the key learned, a sub-thread event now demuxes to its buffer.
             info.event_queue.put_nowait(_ev("item/started", SUB, type="agentMessage"))
             await asyncio.sleep(0.05)
-            assert SUB in info.thread_consumers
+            assert SUB in info.engine_state.thread_consumers
         finally:
             router.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -105,15 +121,15 @@ def test_router_captures_codex_thread_id_marker():
 def test_router_fans_out_session_ended_sentinel():
     async def run():
         layer, info = _make_layer_info()
-        info.default_consumer = asyncio.Queue()
-        info.thread_consumers[SUB] = asyncio.Queue()
-        router = asyncio.create_task(layer._route_remote_notifications(info))
+        info.engine_state.default_consumer = asyncio.Queue()
+        info.engine_state.thread_consumers[SUB] = asyncio.Queue()
+        router = asyncio.create_task(_adapter()._route_notifications(info))
         info.event_queue.put_nowait(None)  # satellite session_ended sentinel
         await asyncio.wait_for(router, timeout=2)  # router returns after fan-out
         # Every waiter gets the sentinel so none hang on a terminal that never comes.
-        default_sentinel = info.default_consumer.get_nowait()
+        default_sentinel = info.engine_state.default_consumer.get_nowait()
         assert default_sentinel is None
-        thread_sentinel = info.thread_consumers[SUB].get_nowait()
+        thread_sentinel = info.engine_state.thread_consumers[SUB].get_nowait()
         assert thread_sentinel is None
 
     asyncio.run(run())
@@ -136,13 +152,13 @@ def test_remote_bg_subagent_registered_supervised_and_resolved():
         reg.reset()
         try:
             # Main turn ended → hand the still-running bg sub to a supervisor.
-            layer._handoff_remote_bg_subagents(info)
+            _adapter()._handoff_bg_subagents(info)
             assert SUB in reg.spawned
-            sup = info.bg_supervisors.get(SUB)
+            sup = info.engine_state.bg_supervisors.get(SUB)
             assert sup is not None
 
             # Feed the sub's terminal to its buffer → the supervisor resolves it.
-            info.thread_consumers[SUB].put_nowait(
+            info.engine_state.thread_consumers[SUB].put_nowait(
                 {"method": "turn/completed", "params": {"threadId": SUB}}
             )
             await asyncio.wait_for(sup, timeout=5)
@@ -151,7 +167,7 @@ def test_remote_bg_subagent_registered_supervised_and_resolved():
             # The translator was tombstoned so a later collab snapshot can't reopen it.
             assert tr.subagent_end_event(SUB) == []
         finally:
-            await layer._teardown_remote_bg(info)
+            await _adapter().close_state(info)
             _subagent_registries.pop("s1", None)
 
     asyncio.run(run())
@@ -165,10 +181,10 @@ def test_remote_handoff_no_pending_arms_nothing():
     reg = get_subagent_registry("s1")
     reg.reset()
     try:
-        layer._handoff_remote_bg_subagents(info)
-        assert info.bg_supervisors == {}
+        _adapter()._handoff_bg_subagents(info)
+        assert info.engine_state.bg_supervisors == {}
         assert not reg.has_pending
-        assert info.default_consumer is None  # main-turn consumer cleared
+        assert info.engine_state.default_consumer is None  # main-turn consumer cleared
     finally:
         _subagent_registries.pop("s1", None)
 
@@ -186,13 +202,13 @@ def test_remote_supervisor_resolves_on_session_ended():
         reg = get_subagent_registry("s1")
         reg.reset()
         try:
-            layer._handoff_remote_bg_subagents(info)
-            sup = info.bg_supervisors[SUB]
-            info.thread_consumers[SUB].put_nowait(None)  # session ended
+            _adapter()._handoff_bg_subagents(info)
+            sup = info.engine_state.bg_supervisors[SUB]
+            info.engine_state.thread_consumers[SUB].put_nowait(None)  # session ended
             await asyncio.wait_for(sup, timeout=5)
             assert SUB in reg.completed
         finally:
-            await layer._teardown_remote_bg(info)
+            await _adapter().close_state(info)
             _subagent_registries.pop("s1", None)
 
     asyncio.run(run())
@@ -201,20 +217,6 @@ def test_remote_supervisor_resolves_on_session_ended():
 # ---------------------------------------------------------------------------
 # 3. Version gate
 # ---------------------------------------------------------------------------
-
-def test_satellite_supports_bg_version_gate():
-    cm = SatelliteConnectionManager()
-    for mid, ver in [("new", "0.5.18"), ("old", "0.5.17"),
-                     ("future", "0.6.0"), ("blank", "")]:
-        cm._connections[mid] = SatelliteConnection(
-            machine_id=mid, ws=None, satellite_version=ver,
-        )
-    assert cm.satellite_supports_bg("new") is True
-    assert cm.satellite_supports_bg("future") is True
-    assert cm.satellite_supports_bg("old") is False      # below the gate
-    assert cm.satellite_supports_bg("blank") is False     # unknown version
-    assert cm.satellite_supports_bg("absent") is False    # no connection
-
 
 def test_satellite_supports_pty_inject_version_gate():
     cm = SatelliteConnectionManager()
@@ -240,17 +242,19 @@ from core.events.common_events import PLAN_MODE, DONE
 
 
 def _drain_codex_turn(info, layer, raws):
-    """Feed forwarded notifications, run one _stream_codex_turn, collect events."""
+    """Feed forwarded notifications to the turn's consumer (what the router
+    does), run one engine turn stream, collect events."""
     async def run():
+        info.engine_state.default_consumer = asyncio.Queue()
         for r in raws:
-            info.event_queue.put_nowait(r)
-        return [ev async for ev in layer._stream_codex_turn(info)]
+            info.engine_state.default_consumer.put_nowait(r)
+        return [ev async for ev in _adapter().stream_turn(info, layer._cm)]
     return asyncio.run(run())
 
 
 def test_remote_plan_mode_synthesizes_implement_card():
     tr = CodexEventTranslator(model="gpt-5.5")
-    layer, info = _make_layer_info(tr, bg=False)
+    layer, info = _make_layer_info(tr)
     info.mode = "plan"  # read-only plan mode
     events = _drain_codex_turn(info, layer, [
         _ev("item/completed", MAIN, type="agentMessage",
@@ -270,7 +274,7 @@ def test_remote_plan_mode_synthesizes_implement_card():
 
 def test_remote_default_mode_emits_no_plan_card():
     tr = CodexEventTranslator(model="gpt-5.5")
-    layer, info = _make_layer_info(tr, bg=False)
+    layer, info = _make_layer_info(tr)
     info.mode = "default"  # not a plan turn
     events = _drain_codex_turn(info, layer, [
         _ev("item/completed", MAIN, type="agentMessage", text="some answer"),
@@ -281,7 +285,7 @@ def test_remote_default_mode_emits_no_plan_card():
 
 def test_remote_interrupted_plan_turn_emits_no_card():
     tr = CodexEventTranslator(model="gpt-5.5")
-    layer, info = _make_layer_info(tr, bg=False)
+    layer, info = _make_layer_info(tr)
     info.mode = "plan"
     events = _drain_codex_turn(info, layer, [
         _ev("item/completed", MAIN, type="agentMessage", text="- partial plan"),
@@ -335,7 +339,7 @@ def test_router_oob_resolves_tracked_bg_command_completion():
         tr = _bg_cmd_tr()
         _swept_bg_candidate(tr)
         layer, info = _make_layer_info(tr)
-        router = asyncio.create_task(layer._route_remote_notifications(info))
+        router = asyncio.create_task(_adapter()._route_notifications(info))
         try:
             assert get_bg_command_registry("s1").has_pending
             # Idle (no default_consumer): the exit's item/completed lands on
@@ -351,8 +355,8 @@ def test_router_oob_resolves_tracked_bg_command_completion():
             assert get_bg_command_registry("s1").completed == {"i1"}
             assert tr.pending_bg_commands() == []
             # The translated events were discarded, not routed anywhere.
-            assert info.thread_consumers == {}
-            assert info.default_consumer is None
+            assert info.engine_state.thread_consumers == {}
+            assert info.engine_state.default_consumer is None
             assert not router.done()  # a guarded apply never kills the router
         finally:
             router.cancel()
@@ -369,7 +373,7 @@ def test_router_untracked_item_completed_still_dropped():
     async def run():
         tr = _bg_cmd_tr()
         layer, info = _make_layer_info(tr)
-        router = asyncio.create_task(layer._route_remote_notifications(info))
+        router = asyncio.create_task(_adapter()._route_notifications(info))
         try:
             # Between turns, a completion for an item the translator never
             # tracked is a plain main-thread straggler — dropped.
@@ -378,7 +382,7 @@ def test_router_untracked_item_completed_still_dropped():
                 status="completed", exitCode=0))
             await asyncio.sleep(0.05)
             assert get_bg_command_registry("s1").spawned == set()
-            assert info.thread_consumers == {}
+            assert info.engine_state.thread_consumers == {}
             assert not router.done()
         finally:
             router.cancel()
@@ -396,7 +400,7 @@ def test_remote_teardown_sweeps_pending_terminals_as_killed():
         tr = _bg_cmd_tr()
         _swept_bg_candidate(tr)
         layer, info = _make_layer_info(tr)
-        await layer._teardown_remote_bg(info)
+        await _adapter().close_state(info)
         assert get_bg_command_registry("s1").completed == {"i1"}
         assert tr.pending_bg_commands() == []
 
@@ -418,9 +422,15 @@ def test_codex_send_message_prunes_registry_preserving_pending():
         info = RemoteSessionInfo(
             session_id="s1", machine_id="m1", agent_name="a",
             execution_path="codex-cli", event_queue=asyncio.Queue(),
-            codex_thread_id=MAIN, bg_supervised=False,
+            resume_handle=MAIN,
+        )
+        info.engine_state = CodexRemoteState(
+            translator=CodexEventTranslator(model="m", supervised_bg=True),
         )
         layer._sessions = {"s1": info}
+        # The router is the queue's sole consumer — the satellite's turn_ended
+        # lands on event_queue and reaches the turn through it.
+        router = asyncio.create_task(_adapter()._route_notifications(info))
 
         async def _send(machine_id, msg, **kw):
             if msg.get("type") == "send_message":
@@ -434,7 +444,12 @@ def test_codex_send_message_prunes_registry_preserving_pending():
         reg.register_spawn("done-i", "done-i")
         reg.mark_done("done-i", surfaced=False)
 
-        events = [e async for e in layer.send_message("s1", "hi")]
+        try:
+            events = [e async for e in layer.send_message("s1", "hi")]
+        finally:
+            router.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await router
         assert events[-1].type == DONE
         assert reg.spawned == {"pending-i"}   # still-running preserved
         assert reg.completed == set()
@@ -459,8 +474,9 @@ def _drain_layer(sid, *, version="0.5.105", translator=None):
     info = RemoteSessionInfo(
         session_id=sid, machine_id="m1", agent_name="a",
         execution_path="codex-cli", event_queue=asyncio.Queue(),
-        codex_translator=translator, codex_thread_id=MAIN, bg_supervised=True,
+        resume_handle=MAIN,
     )
+    info.engine_state = CodexRemoteState(translator=translator)
     layer._sessions[sid] = info
     return layer, info, cm
 

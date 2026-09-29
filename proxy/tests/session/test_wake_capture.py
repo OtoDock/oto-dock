@@ -183,6 +183,43 @@ async def test_capture_never_displaces_an_active_pump(temp_db):
 
 
 @pytest.mark.asyncio
+async def test_capture_bills_the_drivers_kind(temp_db, monkeypatch):
+    """The wake pump's ``source_type`` is the SESSION's kind, never the row's
+    (core-seams phase 4): the scheduler's own session on a task row says
+    ``task``; a dashboard session on the same row says ``chat`` (and flips
+    the finished run around the turn as before); a session nobody classified
+    says ``chat`` unless the row is externally driven."""
+    from core.events import stream_pump
+    from core.session import session_state
+    from storage import database as task_store
+    seen: list[str] = []
+    real = stream_pump.ChatStreamPump
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.append(kw.get("source_type"))
+            super().__init__(*a, **kw)
+    monkeypatch.setattr(stream_pump, "ChatStreamPump", Spy)
+    cases = (("s-wake-t", "task-run-w1", "task", "task"),
+             ("s-wake-d", "task-run-w2", "dashboard", "chat"),
+             ("s-wake-u", "task-run-w3", "", "chat"),
+             ("s-wake-p", "phone-w4", "", "phone"))
+    for sid, cid, client_type, _expected in cases:
+        task_store.create_chat(cid, "task::test-agent", "test-agent", "auto",
+                               model="claude-sonnet-5", execution_path="claude-code-cli",
+                               source_type="phone" if cid.startswith("phone-") else "task")
+        task_store.update_chat(cid, session_id=sid)
+        session_state._sessions[sid] = {"created": True, "message_count": 0, "client_type": client_type}
+        try:
+            bracket = _wake_bracket(_frames("bash"))
+            assert await wake_capture.capture_wake_turn(
+                sid, bracket[0], _scripted_reader(bracket[1:]), source="test")
+        finally:
+            session_state._sessions.pop(sid, None)
+    assert seen == [expected for _sid, _cid, _ct, expected in cases]
+
+
+@pytest.mark.asyncio
 async def test_capture_without_chat_row_consumes_frames_only(temp_db):
     sid = "s-wake-cap-3"
     bracket = _wake_bracket(_frames("bash"))

@@ -24,6 +24,10 @@ ExecStart=/opt/otodock/proxy/venv/bin/python app.py
 # -----------------------------------------
 Restart=on-failure
 RestartSec=10
+# Open files, soft:hard. The default soft limit (1024) runs out long before
+# 100 sessions (sockets, pipes, WebSockets); the proxy also raises its soft
+# limit itself at boot, so this line matters most for what it starts.
+LimitNOFILE=65536:524288
 
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 Environment="NODE_PATH=/usr/lib/node_modules"

@@ -141,6 +141,34 @@ class TestVisibilityHelpers:
         })
         assert mcp_store.is_agent_authorized_for_mcp("image-gen", "alice") is False
 
+    def test_bulk_visibility_equals_the_per_agent_read(self, temp_db):
+        """The agents listing builds every agent's badge from ONE instances
+        scan: the bulk map must answer exactly what the per-agent read does,
+        for agents on an explicit list, under assigned_to_all, and with
+        nothing at all."""
+        from storage.mcp import mcp_store
+        _make_instance("image-gen", "gen-a", agents=["alice", "carol"])
+        _make_instance("ssh-server", "ssh-all", assigned_to_all=True)
+        _make_instance("browser", "b-bob", agents=["bob"])
+        agents = ["alice", "bob", "carol", "dave", "alice"]
+        bulk = mcp_store.get_visible_explicit_mcps_by_agent(agents)
+        assert set(bulk) == {"alice", "bob", "carol", "dave"}
+        for a in set(agents):
+            assert bulk[a] == mcp_store.get_visible_explicit_mcps(a), a
+        assert bulk["dave"] == {"ssh-server"}
+        assert bulk["alice"] == {"image-gen", "ssh-server"}
+
+    def test_bulk_visibility_skips_a_bad_agents_column(self, temp_db):
+        from storage.pg import get_conn
+        from storage.mcp import mcp_store
+        _make_instance("image-gen", "gen-a", agents=["alice"])
+        with get_conn() as conn:
+            conn.execute("UPDATE mcp_instances SET agents='not json' "
+                         "WHERE instance_name='gen-a'")
+            conn.commit()
+        assert mcp_store.get_visible_explicit_mcps_by_agent(["alice"]) == {"alice": set()}
+        assert mcp_store.get_visible_explicit_mcps_by_agent([]) == {}
+
     def test_visibility_isolated_per_mcp(self, temp_db):
         """Two MCPs, only one authorizes alice."""
         from storage.mcp import mcp_store

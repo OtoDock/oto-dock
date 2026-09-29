@@ -8,6 +8,7 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 
 import asyncio
 import logging
+from core.events import tool_roles
 from dataclasses import dataclass
 
 from fastapi import APIRouter
@@ -153,7 +154,7 @@ def _meeting_turn_end_backstop(
         return None
     if not route.routed_tool:
         return None
-    if tool_name == "ToolSearch" and "meeting" in str(tool_input.get("query", "")).lower():
+    if tool_roles.role_of(tool_name) == tool_roles.DISCOVERY and "meeting" in str(tool_input.get("query", "")).lower():
         return None  # loading end_meeting's schema after direct_to
     if tool_name.startswith("mcp__memory-mcp__"):
         # Persisting what the meeting taught is quick, harmless and often

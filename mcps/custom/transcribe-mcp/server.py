@@ -18,18 +18,18 @@ paths against the workspace but never add a second allowlist.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
 import re
-import socket
 from urllib.parse import urlparse
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+
+from _url_guard import validate_outbound_url
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcribe-mcp")
@@ -153,38 +153,14 @@ async def resolve_and_transcribe(
     return resp.json()
 
 
-def _url_blocked(url: str) -> str | None:
-    """SSRF guard: this sidecar runs platform-side, so agent-supplied URLs
-    must not reach loopback/private/link-local hosts (proxy API, docker
-    peers, cloud metadata). Resolves the hostname and checks EVERY address;
-    re-checked per redirect hop. Returns a reason, or None when allowed."""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return f"unsupported URL scheme: {parsed.scheme!r}"
-        host = parsed.hostname or ""
-        if not host:
-            return "URL has no host"
-        infos = socket.getaddrinfo(host, None)
-        for info in infos:
-            ip = ipaddress.ip_address(info[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_reserved or ip.is_unspecified):
-                return f"host {host} resolves to a private/internal address"
-    except socket.gaierror:
-        return "host does not resolve"
-    except ValueError:
-        return "invalid URL"
-    return None
-
-
 async def _download(url: str, max_mb: int) -> tuple[bytes, str, str | None]:
     """Stream ``url`` to memory with a size cap. Returns (data, filename, error).
     Redirects are followed manually (≤5 hops) so each hop passes the SSRF
-    guard — `follow_redirects=True` would let a public URL bounce the fetch
-    into the internal network."""
+    guard (``_url_guard``, the platform's outbound-URL validator: every
+    address the host resolves to must be public) — `follow_redirects=True`
+    would let a public URL bounce the fetch into the internal network."""
     max_bytes = max_mb * 1024 * 1024
-    if reason := _url_blocked(url):
+    if reason := validate_outbound_url(url):
         return b"", "", reason
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=15.0, read=120.0, write=15.0, pool=15.0),
@@ -195,7 +171,7 @@ async def _download(url: str, max_mb: int) -> tuple[bytes, str, str | None]:
                 if resp.status_code in (301, 302, 303, 307, 308):
                     nxt = resp.headers.get("location", "")
                     url = str(httpx.URL(url).join(nxt))
-                    if reason := _url_blocked(url):
+                    if reason := validate_outbound_url(url):
                         return b"", "", reason
                     continue
                 if resp.status_code != 200:

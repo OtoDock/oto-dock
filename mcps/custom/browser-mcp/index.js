@@ -49,8 +49,35 @@ function sanitizeAgent(name) {
   return s;
 }
 
-function computeProfileDir(home, agent) {
-  return path.join(home, ".oto-dock", "browser-profiles", sanitizeAgent(agent));
+// The platform's per-user state folder: ".oto-dock" on Linux and macOS,
+// "OtoDock" on Windows (the satellite's own root there), so the machine's
+// path policy covers the profiles with the one rule it has for that folder.
+function platformStateDirname(plat) {
+  return plat === "win32" ? "OtoDock" : ".oto-dock";
+}
+
+function computeProfileDir(home, agent, plat) {
+  const dirname = platformStateDirname(plat === undefined ? process.platform : plat);
+  return path.join(home, dirname, "browser-profiles", sanitizeAgent(agent));
+}
+
+// Profiles made by earlier releases on Windows sat under ".oto-dock"; the
+// first start after the change moves them so the signed-in logins survive.
+function migrateLegacyProfileDir(home, agent, plat) {
+  if ((plat === undefined ? process.platform : plat) !== "win32") return false;
+  const legacy = path.join(home, ".oto-dock", "browser-profiles", sanitizeAgent(agent));
+  const current = computeProfileDir(home, agent, "win32");
+  if (legacy === current || !fs.existsSync(legacy) || fs.existsSync(current)) return false;
+  try {
+    fs.mkdirSync(path.dirname(current), { recursive: true });
+    fs.renameSync(legacy, current);
+    return true;
+  } catch (e) {
+    process.stderr.write(
+      `[browser-control] Could not move the browser profile from ${legacy} to ${current}: ${e.message}\n`
+    );
+    return false;
+  }
 }
 
 // npm installs @playwright/mcp into THIS MCP dir's node_modules (a single
@@ -787,6 +814,7 @@ async function main() {
     );
   }
 
+  migrateLegacyProfileDir(home, process.env.OTO_AGENT_NAME);
   const profileDir = computeProfileDir(home, process.env.OTO_AGENT_NAME);
   try {
     fs.mkdirSync(profileDir, { recursive: true });
@@ -1538,7 +1566,8 @@ if (require.main === module) {
   });
 } else {
   module.exports = {
-    sanitizeAgent, computeProfileDir, resolveCliPath, detectBrowser,
+    sanitizeAgent, computeProfileDir, platformStateDirname, migrateLegacyProfileDir,
+    resolveCliPath, detectBrowser,
     resolveBrowserConfig, isChromiumFamily, channelExecutable,
     profileLooksLocked, findOrphanHolders, readDevtoolsPort, agentDisplayName,
     seedProfileDisplayName,

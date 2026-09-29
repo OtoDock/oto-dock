@@ -8,6 +8,21 @@ lives in ``auth.path_policy``.
 
 from auth.path_policy import SecurityContext
 from core.session.external_identity import external_home_of, is_external_ctx
+from auth import roles
+from core import layout
+
+
+def _behaviour_of(execution_path: str):
+    """The engine's ``BehaviourProfile`` for the prompt's permission section.
+    FUNCTION-LOCAL imports on purpose: ``session_manager`` → the CLI layer →
+    ``auth.path_policy`` → this module is a real cycle at import time. An
+    empty or unregistered id gets the defaults (no shell, no plans dir, no
+    builtin file tools) — the same lines the literal checks produced.
+    """
+    from core.execution_layer import BehaviourProfile
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(execution_path or "")
+    return caps.behaviour if caps else BehaviourProfile()
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +44,7 @@ def _build_identity_section(ctx: SecurityContext) -> str:
         return ""
     name = ctx.display_name or ctx.username
     email_part = f" ({ctx.email})" if ctx.email else ""
-    role_label = ctx.role if ctx.role in ("admin", "manager", "editor", "viewer") else "viewer"
+    role_label = roles.label(ctx.role)
     admin_suffix = " — this is an admin-only agent" if ctx.is_admin_agent else ""
     return (
         "\n\n---\n\n"
@@ -174,7 +189,11 @@ def _build_execution_scope_section(
                 "per-caller memory or files. "
             )
         codex_note = ""
-        if execution_path == "codex-cli":
+        _eb = _behaviour_of(execution_path)
+        # Only an engine that normally HAS a shell and loses it on the external
+        # route gets this note; an engine with no shell at all (Direct LLM)
+        # gets its own file-tools line further down.
+        if _eb.supports_bash and not _eb.has_shell_on_external_route:
             # No exec_command on an external Codex session (the shell is
             # what could read credentials); files are read through the
             # file-tools MCP and written with apply_patch inside /caller.
@@ -209,7 +228,7 @@ def _build_execution_scope_section(
     # identity + role), but everything lives in the agent's single SHARED space:
     # no personal space, and one chat history shared with every assigned user.
     if ctx.session_scope == "agent":
-        if ctx.role == "viewer":
+        if ctx.role == roles.VIEWER:
             return (
                 "# Execution Scope\n\n"
                 f"You are assisting {name} (viewer) in this agent's **shared "
@@ -217,7 +236,22 @@ def _build_execution_scope_section(
                 "every user of this agent. Your access is read-only; you cannot "
                 "change shared state.\n\n"
             )
-        role_tag = f" ({ctx.role})" if ctx.role == "editor" else ""
+        if ctx.role == roles.CONTRIBUTOR:
+            mcp_line = (
+                f"{capitalised} are not available to your role here: they would "
+                "be shared with every user of this agent, which needs editor "
+                "role, and this agent has no personal scope.\n"
+            ) if joined else ""
+            return (
+                "# Execution Scope\n\n"
+                f"You are assisting {name} (contributor) in this agent's **shared "
+                "space** — its workspace, knowledge, and memory are shared with "
+                "every user of this agent. You may write the shared workspace; "
+                "knowledge and the shared memory are read-only for your role. "
+                f"{mcp_line}"
+                "\n"
+            )
+        role_tag = f" ({ctx.role})" if ctx.role == roles.EDITOR else ""
         mcp_line = (
             f"{capitalised} you create are **shared** with every user of this "
             "agent.\n"
@@ -235,7 +269,7 @@ def _build_execution_scope_section(
     # Personal-only (visibility-modes) — fully private to this user. No shared
     # space exists: all work, context, and memory stay with this user alone.
     if not collaborative and default_scope == "user":
-        role_tag = f" ({ctx.role})" if ctx.role in ("editor", "viewer") else ""
+        role_tag = f" ({ctx.role})" if ctx.role in (roles.EDITOR, roles.CONTRIBUTOR, roles.VIEWER) else ""
         mcp_line = (
             f"{capitalised} you create are **private to {name}** — this agent "
             "has no shared space.\n"
@@ -249,23 +283,24 @@ def _build_execution_scope_section(
             "\n"
         )
 
-    if ctx.role == "viewer":
-        # Block E — viewer (always user-scope; read-only collaborator).
-        # Viewers cannot create agent-scope items at all, so no override note.
+    if ctx.role in (roles.VIEWER, roles.CONTRIBUTOR):
+        # Block E — viewer or contributor (always user-scope; below the
+        # editor tier nobody creates agent-scope items, so no override note).
+        plural = "viewers" if ctx.role == roles.VIEWER else "contributors"
         mcp_line = (
-            f"{capitalised} you create default to **user scope** — viewers "
+            f"{capitalised} you create default to **user scope** — {plural} "
             f"cannot create agent-scope items.\n"
         ) if joined else (
-            "Viewers cannot create agent-scope items — only personal ones.\n"
+            f"{plural.capitalize()} cannot create agent-scope items — only personal ones.\n"
         )
         return (
             "# Execution Scope\n\n"
-            f"You are in **user scope** for {name} (viewer). "
+            f"You are in **user scope** for {name} ({ctx.role}). "
             f"{mcp_line}"
             "\n"
         )
 
-    role_tag = f" ({ctx.role})" if ctx.role == "editor" else ""
+    role_tag = f" ({ctx.role})" if ctx.role == roles.EDITOR else ""
 
     if default_scope == "agent":
         # Blocks B (manager/admin) and D (editor) — operational agent.
@@ -317,9 +352,9 @@ def _build_execution_environment_section(
     - **admin_remote, allow_full_fs=False** (rare opt-out) — home-only
       even on an admin-paired machine.
     """
-    if ctx.target_kind == "admin_remote":
+    if ctx.placement.admin_paired:
         return _admin_remote_env_section(ctx)
-    if ctx.target_kind == "user_remote":
+    if ctx.placement.user_paired:
         return _user_remote_env_section(ctx)
     return _local_env_section(has_file_tools=has_file_tools)
 
@@ -379,16 +414,16 @@ def _remote_mcp_paths_section() -> str:
 
 
 def _user_remote_env_section(ctx: SecurityContext) -> str:
-    label = ctx.target_label or "the user's machine"
-    home_dir = ctx.target_home_dir
-    allow_full_fs = ctx.target_allow_full_fs
-    folders_listing = _format_user_dirs(ctx.target_user_dirs)
+    label = ctx.placement.label or "the user's machine"
+    home_dir = ctx.placement.home_dir
+    allow_full_fs = ctx.placement.allow_full_fs
+    folders_listing = _format_user_dirs(ctx.placement.user_dirs)
     home_block = ""
     if home_dir:
         home_block = (
             f"\n**OS user's home directory** is `{home_dir}`"
             + (
-                f" (OS user: `{ctx.target_os_user}`)" if ctx.target_os_user else ""
+                f" (OS user: `{ctx.placement.os_user}`)" if ctx.placement.os_user else ""
             )
             + ". Common shortcuts you can use directly:\n"
             + folders_listing
@@ -426,15 +461,15 @@ def _user_remote_env_section(ctx: SecurityContext) -> str:
 
 
 def _admin_remote_env_section(ctx: SecurityContext) -> str:
-    label = ctx.target_label or "an admin-paired machine"
-    home_dir = ctx.target_home_dir
-    allow_full_fs = ctx.target_allow_full_fs
+    label = ctx.placement.label or "an admin-paired machine"
+    home_dir = ctx.placement.home_dir
+    allow_full_fs = ctx.placement.allow_full_fs
     home_block = ""
     if home_dir:
         home_block = (
             f"\n**OS user's home directory** is `{home_dir}`"
             + (
-                f" (OS user: `{ctx.target_os_user}`)" if ctx.target_os_user else ""
+                f" (OS user: `{ctx.placement.os_user}`)" if ctx.placement.os_user else ""
             )
             + ".\n\n"
         )
@@ -518,8 +553,8 @@ def _library_rows(ctx: SecurityContext, *, session_writes_knowledge: bool) -> li
     rows: list[str] = []
     for entry in (ctx.knowledge_libraries or ()):
         src, subdir, writable = entry[0], entry[1] or "", bool(entry[2])
-        mount = (f"/knowledge/shared/{src}/{subdir}/" if subdir
-                 else f"/knowledge/shared/{src}/")
+        mount = (f"{layout.V_KNOWLEDGE}/shared/{src}/{subdir}/" if subdir
+                 else f"{layout.V_KNOWLEDGE}/shared/{src}/")
         if writable and session_writes_knowledge:
             rows.append(
                 f"- `{mount}` (RW) — Shared knowledge "
@@ -577,7 +612,7 @@ def _build_folders_section(
                 "- `/caller/context/` (RW) — Notes about this caller that "
                 "auto-load on their next call.\n"
             )
-        if ctx.role == "viewer":
+        if ctx.role == roles.VIEWER:
             erows.append(
                 "- `/workspace/` (RO) — The agent's shared workspace. You can "
                 "read but not edit.\n"
@@ -600,7 +635,7 @@ def _build_folders_section(
         erows.extend(_library_rows(ctx, session_writes_knowledge=ctx.knowledge_rw))
         if external_home_of(ctx):
             erows.append("\nDefault writes for this session go to `/caller/workspace/`.\n\n")
-        elif ctx.role != "viewer":
+        elif ctx.role != roles.VIEWER:
             erows.append("\nDefault writes for this session go to `/workspace/`.\n\n")
         else:
             erows.append("\nThis session has no writable folder.\n\n")
@@ -642,7 +677,7 @@ def _build_folders_section(
             "# Folders\n\n",
             "You have access to the following folders in this session:\n\n",
         ]
-        if ctx.role == "viewer":
+        if not roles.can_write_workspace(ctx.role):
             srows.append(
                 "- `/workspace/` (RO) — The agent's shared workspace. You can "
                 "read but not edit.\n"
@@ -680,27 +715,27 @@ def _build_folders_section(
     rows: list[str] = [
         "# Folders\n\n",
         "You have access to the following folders in this session:\n\n",
-        f"- `/users/{u}/workspace/` (RW) — Your personal workspace. Day-to-day "
+        f"- `{layout.virtual_workspace(u)}/` (RW) — Your personal workspace. Day-to-day "
         "work, files saved here are yours alone.\n",
-        f"- `/users/{u}/context/` (RW) — Your personal context docs. Markdown "
+        f"- `{layout.virtual_user_root(u)}/{layout.CONTEXT}/` (RW) — Your personal context docs. Markdown "
         "files here auto-load into your sessions on this agent only.\n",
     ]
 
     # Shared workspace + knowledge — only when the agent's mode offers them
     # (Personal-only omits both: it is fully private, no shared collaboration).
     if ctx.mount_shared:
-        if ctx.role == "viewer":
+        if not roles.can_write_workspace(ctx.role):
             rows.append(
-                "- `/workspace/` (RO) — The agent's shared workspace. You can "
+                f"- `{layout.V_WORKSPACE}/` (RO) — The agent's shared workspace. You can "
                 "read but not edit; personal output goes to "
-                f"`/users/{u}/workspace/`.\n"
+                f"`{layout.virtual_workspace(u)}/`.\n"
             )
         else:
             rows.append(
                 "- `/workspace/` (RW) — The agent's **shared workspace**. "
                 "Collaborative output visible to every user of this agent.\n"
             )
-        if ctx.role in ("manager", "admin"):
+        if roles.can_manage(ctx.role):
             rows.append(
                 "- `/knowledge/` (RW) — The agent's **reference library**. "
                 "Manager-curated docs / templates. Not auto-loaded — read on "
@@ -712,7 +747,7 @@ def _build_folders_section(
                 "library. Read on demand when relevant.\n"
             )
         rows.extend(
-            _library_rows(ctx, session_writes_knowledge=ctx.role in ("manager", "admin")))
+            _library_rows(ctx, session_writes_knowledge=roles.can_manage(ctx.role)))
     else:
         # Personal-only: no shared knowledge folder, but attached libraries
         # still mount (always read-only in this mode).
@@ -720,7 +755,7 @@ def _build_folders_section(
 
     # Agent config — only manager/admin see it at all (incl. Personal-only:
     # managers still curate the persona even with no shared space).
-    if ctx.role in ("manager", "admin"):
+    if roles.can_manage(ctx.role):
         rows.append(
             "- `/config/` (RW) — The agent's configuration. Holds "
             "`agent.md` (the agent persona) and `context/` (files that "
@@ -731,29 +766,29 @@ def _build_folders_section(
     # Upload paths and default-workspace pointer.
     rows.append(
         f"\nFiles uploaded to chat are saved under "
-        f"`/users/{u}/workspace/uploads/photos/` (images) and "
-        f"`/users/{u}/workspace/uploads/files/` (other files).\n"
+        f"`{layout.virtual_workspace(u)}/uploads/photos/` (images) and "
+        f"`{layout.virtual_workspace(u)}/uploads/files/` (other files).\n"
     )
 
     if not ctx.mount_shared:
         # Personal-only — there is no shared workspace to point at.
         rows.append(
-            f"\nDefault writes for this session go to `/users/{u}/workspace/`. "
+            f"\nDefault writes for this session go to `{layout.virtual_workspace(u)}/`. "
             "This agent is **personal only** — it has no shared space; "
             "everything you do stays private to you.\n\n"
         )
     elif default_scope == "agent":
         rows.append(
-            "\nDefault writes for this session go to `/workspace/` (this is "
+            f"\nDefault writes for this session go to `{layout.V_WORKSPACE}/` (this is "
             "an operational agent — outputs there are visible to every "
-            f"user of this agent). Use `/users/{u}/workspace/` for personal "
+            f"user of this agent). Use `{layout.virtual_workspace(u)}/` for personal "
             "drafts, private notes, or anything the user wants to keep to "
             "themselves.\n\n"
         )
     else:
         rows.append(
             f"\nDefault writes for this session go to "
-            f"`/users/{u}/workspace/`. The agent's `/workspace/` is its "
+            f"`{layout.virtual_workspace(u)}/`. The agent's `{layout.V_WORKSPACE}/` is its "
             "shared workspace — write there when the work is collaborative "
             "or the user wants to share it with other users of this "
             "agent.\n\n"
@@ -783,7 +818,7 @@ def _build_building_agents_section(
     """
     if not ctx.username:
         return ""
-    if ctx.role not in ("manager", "admin"):
+    if not roles.can_manage(ctx.role):
         return ""
 
     enabled = set(assigned_mcp_names or ())
@@ -965,13 +1000,14 @@ def build_permission_context(
     default_scope = _get_default_scope(ctx.agent)
     # Used in multiple branches below — hoist so it's defined for any
     # combination of execution_path / bash-layer.
-    is_remote = ctx.target_kind in ("admin_remote", "user_remote")
+    is_remote = ctx.placement.is_remote
     # Layer capability gates. Direct LLM sessions never have Bash (it's a
     # built-in tool on Claude Code CLI / Codex CLI). Plans dir is a Claude
     # Code feature — Codex uses update_plan natively, Direct LLM has no
     # plan tooling.
-    layer_supports_bash = execution_path in ("claude-code-cli", "codex-cli")
-    layer_supports_plans = execution_path == "claude-code-cli"
+    _b = _behaviour_of(execution_path)
+    layer_supports_bash = _b.supports_bash
+    layer_supports_plans = _b.supports_plans_dir
 
     sections: list[str] = []
 
@@ -1055,13 +1091,13 @@ def build_permission_context(
         #     pairing = trust delegation)
         #   - manager/editor on local sandbox: not available
         #   - viewer: never available
-        if ctx.role == "admin":
+        if roles.is_admin(ctx.role):
             perm_lines.append(
                 "- Host-touching commands (`docker`, `docker compose`, "
                 "`systemctl`, `journalctl`, `ssh`, `scp`, `apt`): "
                 "available to you as platform admin.\n"
             )
-        elif is_remote and ctx.role in ("manager", "editor"):
+        elif is_remote and roles.can_edit(ctx.role):
             perm_lines.append(
                 "- Host-touching commands (`docker`, `docker compose`, "
                 "`systemctl`, `journalctl`, `ssh`, `scp`, `apt`): "
@@ -1069,10 +1105,10 @@ def build_permission_context(
                 "and you're an ops-capable role. Their effect depends on "
                 "the satellite user's OS permissions on the host.\n"
             )
-        elif ctx.role == "viewer":
+        elif not roles.can_edit(ctx.role):
             perm_lines.append(
                 "- Host-touching commands (`docker`, `systemctl`, `ssh`, "
-                "`apt`): not available to viewers in any environment.\n"
+                "`apt`): not available to your role in any environment.\n"
             )
         else:
             perm_lines.append(
@@ -1098,6 +1134,12 @@ def build_permission_context(
             "running. So use the tool you need; you'll be asked if it's "
             "unusual, rather than blocked.\n\n"
         )
+        if not is_remote:
+            perm_lines.append(
+                "- `/tmp` is yours: a private tmpfs that lives as long as this "
+                "session, fine for scratch files and downloads. Keep anything "
+                "that must outlive the session in your workspace.\n\n"
+            )
         perm_lines.append(
             "- Backgrounding a multi-statement shell loop (a `while`/`for` "
             "one-liner via `run_in_background`) can be rejected by the CLI's OWN "
@@ -1116,7 +1158,7 @@ def build_permission_context(
         # allow_full_fs pairing flag — mirror the Execution Environment
         # section above so the prompt never promises more than the path
         # gate actually admits.
-        if ctx.target_allow_full_fs:
+        if ctx.placement.allow_full_fs:
             perm_lines.append(
                 "- **Glob / Grep / Read / Write**: free across the entire "
                 "satellite host filesystem (subject to OS permissions of "
@@ -1138,8 +1180,8 @@ def build_permission_context(
         perm_lines.append(
             "- Writes outside the folders listed in `# Folders` above are denied\n"
         )
-    if execution_path == "direct-llm":
-        # The direct layer's client-side file tools (no shell here).
+    if _behaviour_of(execution_path).builtin_file_tools:
+        # The platform's own client-side file tools (no shell here).
         perm_lines.append(
             "- **File tools** (`Read`, `Write`, `Edit`, `Glob`, `Delete`) are "
             "built into this session and bound to the folders in `# Folders` "
@@ -1151,7 +1193,7 @@ def build_permission_context(
         )
     if layer_supports_plans and ctx.username:
         perm_lines.append(
-            f"- Plan files live under `/users/{ctx.username}/.claude/plans/` "
+            f"- Plan files live under `{layout.virtual_user_root(ctx.username)}/.claude/plans/` "
             "and are managed by the plan mode tool — you don't need to "
             "edit them directly\n"
         )

@@ -150,6 +150,13 @@ class PtySession(BasePtySession):
         env = self._base_env()
         env.update(await self._materialize_session_files())
         env["CLAUDE_CONFIG_DIR"] = str(self._claude_dir)
+        # The interactive flag the local Claude TUI spawn sets (satellite
+        # 0.5.121 — parity with cli/session.py): the PostToolUse forwarder and
+        # the SubagentStop tracker stand down (the transcript the satellite
+        # forwards feeds the proxy's rows and registry), the permission gate
+        # reports the CLI's live mode. Without it the forwarder posted every
+        # full tool result to a session with no pump.
+        env["OTO_INTERACTIVE"] = "1"
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         env["DISABLE_AUTOUPDATER"] = "1"  # version pin/freeze (see VERSIONS.md)
         # Platform is the only skill source (mirrors proxy env_builder).
@@ -173,7 +180,7 @@ class PtySession(BasePtySession):
         # --- build the INTERACTIVE command -----------------------------------
         from ..host.cli_versions import resolve_spawn_bin_async
         claude_bin = await resolve_spawn_bin_async(
-            "claude", self.sat_config.claude_bin, for_pty=True,
+            "claude", self.sat_config.bin_hint("claude"), for_pty=True,
         )
         cmd = [claude_bin]  # NO "-p" — render the native TUI
         model = self.config.get("model", "")
@@ -195,8 +202,13 @@ class PtySession(BasePtySession):
         _is_resume = bool(
             self.config.get("resume") and self.config.get("session_id_for_resume")
         )
-        if not _is_resume:
-            cmd += ["--append-system-prompt-file", str(prompt_file)]
+        # The prompt file on fresh AND --resume starts, as the local TUI (which
+        # reuses the -p argv) always did: transcripts persist messages only.
+        # Claude Code ≥ 2.1.267 would otherwise re-send the prompt it recorded
+        # on the conversation's first request on every resume — recording off
+        # (the flag exists on the previous pin 2.1.263 too).
+        cmd += ["--append-system-prompt-file", str(prompt_file)]
+        cmd += ["--system-prompt-snapshot", "off"]
         # NO --output-format/--input-format/--verbose: that's the -p pump's wire.
         if _is_resume:
             cmd += ["--resume", self.config["session_id_for_resume"]]

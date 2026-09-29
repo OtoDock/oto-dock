@@ -11,8 +11,11 @@ import base64
 import logging
 import time
 from services.notifications import notification_manager
+from core import placement
 from core.session import interactive_session
 from core.events.artifact_events import artifact_event_from_perm_item
+from auth import roles
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -39,7 +42,7 @@ class PtyViewerController:
             return
         self._read_only_notice_at = now
         await self._send({
-            "type": "pty_status", "chat_id": sess.chat_id,
+            "type": wire.PTY_STATUS, "chat_id": sess.chat_id,
             "session_id": sess.session_id, "state": "read_only",
             "controller": sess.username or "",
         })
@@ -60,15 +63,20 @@ class PtyViewerController:
             return
         if sess.may_drive(self.user_sub):
             return  # already the controller — nothing to take
+        # Closing a colleague's session is driving the chat: a chat that runs
+        # as the agent takes the editor tier (the drive gate; the re-warm the
+        # take-over leads to is refused below that tier anyway).
+        if await self._deny_task_continue(sess.chat_id):
+            return
         # A viewer may watch a shared terminal but never drive one. The
         # PER-AGENT role is what governs (a platform member can be an editor on
         # one agent and a viewer on another), read live so a just-revoked role
         # takes effect immediately.
         from storage.pg import run_db
-        from ws.dashboard import _effective_agent_role
-        if await run_db(
-            _effective_agent_role, self.user_sub, sess.agent_name, fallback_user=self.user,
-        ) == "viewer":
+        from auth.providers import acting_role_of
+        if not roles.can_write_workspace(await run_db(
+            acting_role_of, self.user_sub, sess.agent_name, fallback_user=self.user,
+        )):
             await self._send_error("Viewers cannot take over a terminal session")
             return
         logger.info(
@@ -85,7 +93,9 @@ class PtyViewerController:
         base64 ``pty_output`` frames (replaying the scrollback first), forward the
         session's permission queue (drained by the drainer) as ``pty_permission``
         frames, and announce exit. One viewer per socket — re-attach detaches the
-        prior. on_perm_event/on_close are single-slot (last viewer wins);
+        prior. The controller takes the session's single-slot prompt, close
+        and status callbacks; a read-only mirror registers only an output
+        listener and its own close notice. on_perm_event is single-slot;
         single-viewer for now, multi-viewer is a future extension."""
         self._detach_pty_viewer()
         vsid = sess.session_id
@@ -107,7 +117,7 @@ class PtyViewerController:
 
         async def _on_pty_output(data: bytes) -> None:
             await self._send({
-                "type": "pty_output", "chat_id": vcid, "session_id": vsid,
+                "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
                 "data": base64.b64encode(data).decode("ascii"),
             })
 
@@ -118,9 +128,9 @@ class PtyViewerController:
             # ``pty_artifact`` (floating windows) carrying
             # the same event the -p pump would emit (shared mapper, no drift).
             et = item.get("event_type", "")
-            if et == "permission_prompt":
+            if et == wire.ITEM_PERMISSION_PROMPT:
                 frame = {
-                    "type": "pty_permission", "kind": "permission",
+                    "type": wire.PTY_PERMISSION, "kind": "permission",
                     "chat_id": vcid, "session_id": vsid,
                     "request_id": item.get("request_id"),
                     "tool_name": item.get("tool_name", ""),
@@ -129,13 +139,13 @@ class PtyViewerController:
                 if item.get("meeting_agent"):
                     frame["meeting_agent"] = item["meeting_agent"]
                 await self._send(frame)
-            elif et in ("plan_review", "question"):
+            elif et in (wire.ITEM_PLAN_REVIEW, wire.ITEM_QUESTION):
                 # Neither reaches a human-driven interactive session any
                 # more: the hook lets AskUserQuestion run natively and
                 # defers ExitPlanMode to the CLI's own plan dialog
                 # (2026-09-10). Kept for the queue's other producers.
                 await self._send({
-                    "type": "pty_permission", "kind": et,
+                    "type": wire.PTY_PERMISSION, "kind": et,
                     "chat_id": vcid, "session_id": vsid,
                     "request_id": item.get("request_id"),
                     "tool_name": item.get("tool_name", ""),
@@ -156,13 +166,13 @@ class PtyViewerController:
                     if item.get("db_message_id") is not None:
                         event["db_message_id"] = item["db_message_id"]
                     await self._send({
-                        "type": "pty_artifact", "chat_id": vcid,
+                        "type": wire.PTY_ARTIFACT, "chat_id": vcid,
                         "session_id": vsid, "event": event,
                     })
 
         async def _on_pty_close(_s, reason: str) -> None:
             await self._send({
-                "type": "pty_exit", "chat_id": vcid, "session_id": vsid,
+                "type": wire.PTY_EXIT, "chat_id": vcid, "session_id": vsid,
                 "reason": reason,
                 # Non-zero on an abnormal child death (reason "exited") — the
                 # terminal renders it so an instant CLI crash is never a
@@ -182,7 +192,7 @@ class PtyViewerController:
             self._pty_viewer_sid = None
             self._pty_listener = None
             await self._send({
-                "type": "pty_exit", "chat_id": vcid, "session_id": vsid,
+                "type": wire.PTY_EXIT, "chat_id": vcid, "session_id": vsid,
                 "reason": reason,
             })
 
@@ -197,7 +207,7 @@ class PtyViewerController:
             if state == "reconnected" and sess.pty is not None:
                 from core.terminal_queries import strip_clipboard_writes
                 await self._send({
-                    "type": "pty_output", "chat_id": vcid, "session_id": vsid,
+                    "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
                     # Replay boundary: a buffered OSC 52 copy must not re-fire
                     # into the viewer's clipboard on re-render.
                     "data": base64.b64encode(
@@ -206,23 +216,32 @@ class PtyViewerController:
                     "replay": True, "reset": True,
                 })
             await self._send({
-                "type": "pty_status", "chat_id": vcid, "session_id": vsid,
+                "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
                 "state": state,
             })
 
-        sess.on_perm_event = _on_pty_perm
-        sess.on_close = _on_pty_close
-        sess.on_status = _on_pty_status
         # Register the listener BEFORE replaying scrollback so no bytes are lost
-        # in the gap; there is no await between the two, so ordering holds. The
-        # evict callback makes this single-viewer: a new attach kicks the prior.
-        scrollback = sess.add_output_listener(_on_pty_output, on_evict=_evict_this_viewer)
+        # in the gap; there is no await between the two, so ordering holds.
+        # The CONTROLLER's socket is the viewer: its evict callback makes the
+        # attach single-viewer (a new attach kicks the prior), and it takes
+        # the session's prompt, close and status slots. A socket that may
+        # not drive the session mirrors its output only: it evicts nobody,
+        # and the controller keeps its prompts (delivered once, they must
+        # reach the one who may answer them), its exit notice and its
+        # transport status.
+        if can_drive:
+            sess.on_perm_event = _on_pty_perm
+            sess.on_close = _on_pty_close
+            sess.on_status = _on_pty_status
+            scrollback = sess.add_output_listener(_on_pty_output, on_evict=_evict_this_viewer)
+        else:
+            scrollback = sess.add_output_listener(_on_pty_output, on_close=_on_pty_close)
         self._pty_viewer_sid = vsid
         self._pty_listener = _on_pty_output
         # The session's baked TUI theme — the viewer renders its xterm with THIS
         # theme (a dark-seeded TUI in a light xterm paints white-on-white).
         await self._send({
-            "type": "pty_status", "chat_id": vcid, "session_id": vsid,
+            "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
             "state": "attached", "tui_theme": sess.tui_theme,
         })
         if not can_drive:
@@ -233,18 +252,18 @@ class PtyViewerController:
             await self._send_pty_read_only(sess)
         if scrollback:
             await self._send({
-                "type": "pty_output", "chat_id": vcid, "session_id": vsid,
+                "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
                 "data": base64.b64encode(scrollback).decode("ascii"),
                 "replay": True,
             })
         # If the satellite is mid-reconnect right now, tell the freshly-attached
         # viewer so it shows the reconnecting banner — after
         # the scrollback replay so the banner sits over the current screen.
-        if sess.target != "local":
+        if not placement.is_local(sess.target):
             from core.remote.satellite_connection import get_connection_manager
             if get_connection_manager().is_pty_in_grace(sess.target):
                 await self._send({
-                    "type": "pty_status", "chat_id": vcid, "session_id": vsid,
+                    "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
                     "state": "reconnecting",
                 })
         # dual-control: this dashboard viewer is CLAIMING a session a local
@@ -255,8 +274,9 @@ class PtyViewerController:
         # flip control only when the satellite CONFIRMS the detach (or a short
         # fallback timer fires if it's unreachable) — so the two never drive the one
         # PTY at once. The confirm path (detach_local_session) fires "reconnected"
-        # → a clean re-render at the dashboard's size.
-        if sess.otodock_attached and sess.target != "local":
+        # → a clean re-render at the dashboard's size. A read-only mirror
+        # claims nothing.
+        if can_drive and sess.otodock_attached and not placement.is_local(sess.target):
             from core.remote.satellite_connection import get_connection_manager
             from core.session import otodock_session as _otodock
             sess.notify_status("reconnecting")

@@ -36,13 +36,15 @@ import contextlib
 import fcntl
 import os
 import re
-import shutil
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services.infra.path_confinement import join_under
+import config
+from services.infra import safe_fs
+from services.infra.path_confinement import PathOutsideRoot, join_under, normalize_rel_path
+from core import layout
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -101,11 +103,11 @@ def scope_root(agent_dir: Path, scope: str, username: str | None = None) -> Path
     would leave the agent tree is refused (ValueError, like the other
     contract violations here)."""
     if scope == "agent":
-        return join_under(agent_dir, "knowledge", "memory")
+        return join_under(agent_dir, layout.KNOWLEDGE, "memory")
     if scope == "user":
         if not username:
             raise ValueError("username required for user-scope memory")
-        return join_under(agent_dir, "users", username, "context", "memory")
+        return join_under(agent_dir, layout.USERS, username, layout.CONTEXT, "memory")
     raise ValueError(f"unknown scope: {scope!r}")
 
 
@@ -116,11 +118,11 @@ def git_repo_root(agent_dir: Path, scope: str, username: str | None = None) -> P
     user scope:  ``agents/{a}/users/{u}/context/`` (existing per-user repo).
     """
     if scope == "agent":
-        return join_under(agent_dir, "knowledge")
+        return join_under(agent_dir, layout.KNOWLEDGE)
     if scope == "user":
         if not username:
             raise ValueError("username required for user-scope memory")
-        return join_under(agent_dir, "users", username, "context")
+        return join_under(agent_dir, layout.USERS, username, layout.CONTEXT)
     raise ValueError(f"unknown scope: {scope!r}")
 
 
@@ -163,19 +165,26 @@ def validate_rel(rel: str, *, mutating: bool = False, require_ext: bool = False)
     """
     if rel in ("", "."):
         return ""
-    parts = []
-    for seg in rel.split("/"):
-        if seg in ("", "."):
-            continue
-        if seg == ".." or seg.startswith("."):
+    # ``.`` and empty segments are dropped (a lenient input), then the
+    # helper refuses a ``..`` segment or a NUL, and every hidden segment is
+    # refused here.
+    parts = [seg for seg in rel.split("/") if seg not in ("", ".")]
+    norm = "/".join(parts)
+    if not norm:
+        return ""
+    try:
+        normalize_rel_path(norm)
+    except PathOutsideRoot:
+        raise MemoryOpError(
+            f"The path contains an invalid segment ({rel!r}). "
+            "Please provide a valid path."
+        )
+    for seg in parts:
+        if seg.startswith("."):
             raise MemoryOpError(
                 f"The path contains an invalid segment ({seg!r}). "
                 "Please provide a valid path."
             )
-        parts.append(seg)
-    norm = "/".join(parts)
-    if not norm:
-        return ""
     leaf = parts[-1]
     if mutating:
         if leaf == INDEX_FILENAME:
@@ -211,6 +220,19 @@ def _resolve_strict(root: Path, rel: str) -> Path:
     return resolved
 
 
+def _agents_rel(path: Path) -> str:
+    """The rel of a scope-root path or a resolved answer beneath
+    ``config.AGENTS_DIR``, the root every memory write opens: a memory root
+    outside the agents tree is refused (every real scope root, an agent's,
+    a person's or an external caller's, sits under it)."""
+    try:
+        return safe_fs.rel_under(path, config.AGENTS_DIR)
+    except OSError:
+        raise MemoryOpError(
+            "Error: the memory scope is outside the agents tree."
+        ) from None
+
+
 # ---------------------------------------------------------------------------
 # Locking + atomic write (per scope root)
 # ---------------------------------------------------------------------------
@@ -241,8 +263,15 @@ class _scope_lock:
 
     def __enter__(self):
         self._tlock.acquire()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.root / LOCK_FILENAME, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            root_rel = _agents_rel(self.root)
+            safe_fs.mkdirs_beneath(config.AGENTS_DIR, root_rel)
+            self._fd = safe_fs.open_beneath(
+                config.AGENTS_DIR, f"{root_rel}/{LOCK_FILENAME}", os.O_RDWR | os.O_CREAT, 0o644,
+            )
+        except BaseException:
+            self._tlock.release()
+            raise
         fcntl.flock(self._fd, fcntl.LOCK_EX)
         return self
 
@@ -256,13 +285,14 @@ class _scope_lock:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """tmp + fsync + rename — readers see old or new, never partial. The
-    ``.tmp`` suffix is gitignored by the per-repo template."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    with open(tmp, "rb") as f:
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Replace ``path`` (a resolved answer under a scope root) with
+    ``content`` beneath the agents root: a ``.partial`` temp created in the
+    parent's handle, fsynced, renamed onto the name with no component
+    followed; readers see old or new, never partial. The dotted temp is
+    hidden from the listings and never staged."""
+    safe_fs.atomic_write_beneath(
+        config.AGENTS_DIR, _agents_rel(path), content.encode("utf-8"), mkdirs=True, fsync=True,
+    )
 
 
 def _sanitize(text: str) -> str:
@@ -519,7 +549,6 @@ def op_create(root: Path, rel: str, file_text: str) -> OpResult:
         warnings = _check_caps_for_write(
             root, rel, len(content.encode("utf-8")), creating=True,
         )
-        target.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(target, content)
         changed = [rel]
         if regenerate_index(root):
@@ -618,13 +647,13 @@ def op_delete(root: Path, rel: str) -> OpResult:
         deleted: list[str] = []
         if target.is_file():
             deleted = [rel]
-            target.unlink()
+            safe_fs.unlink_beneath(config.AGENTS_DIR, _agents_rel(target))
         elif target.is_dir():
             deleted = [
                 (Path(rel) / f.relative_to(target)).as_posix()
                 for f in target.rglob("*") if f.is_file() and not f.is_symlink()
             ]
-            shutil.rmtree(target)
+            safe_fs.rmtree_beneath(config.AGENTS_DIR, _agents_rel(target))
         else:
             raise MemoryOpError(
                 f"The path {rel} does not exist. Please provide a valid path."
@@ -655,18 +684,21 @@ def op_rename(root: Path, old_rel: str, new_rel: str) -> OpResult:
                 f"Error: {dst.name} has an unsupported extension. Memory "
                 "files must be .md or .txt"
             )
-        dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
             # Enumerate per-file so git + fan-out + tombstones stay per-path.
             moved = [
                 f.relative_to(src).as_posix()
                 for f in src.rglob("*") if f.is_file() and not f.is_symlink()
             ]
-            src.rename(dst)
+            safe_fs.rename_beneath(
+                config.AGENTS_DIR, _agents_rel(src), _agents_rel(dst), mkdirs=True,
+            )
             changed = [(Path(new_rel) / m).as_posix() for m in moved]
             deleted = [(Path(old_rel) / m).as_posix() for m in moved]
         else:
-            src.rename(dst)
+            safe_fs.rename_beneath(
+                config.AGENTS_DIR, _agents_rel(src), _agents_rel(dst), mkdirs=True,
+            )
             changed = [new_rel]
             deleted = [old_rel]
         if regenerate_index(root):

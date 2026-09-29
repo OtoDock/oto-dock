@@ -629,6 +629,30 @@ class TestInteractiveSession:
         assert "ready" in statuses
         assert s.question_parked is True
 
+    async def test_close_for_a_deleted_chat_broadcasts_no_ready(self, monkeypatch):
+        # DELETE /v1/chats/{id} closes the live terminal before the row goes:
+        # the close-side ready frame and unread stamp would outlive the chat.
+        from services.notifications import notification_manager as nm
+        statuses = []
+        monkeypatch.setattr(nm, "broadcast_chat_status",
+                            lambda owner, cid, status, agent="": statuses.append(status))
+        s = await _register("sid-deleted")
+        s._set_turn_open(True)
+        assert statuses == ["streaming"]
+        await s.close(reason="chat_deleted")
+        assert statuses == ["streaming"]
+        assert s._turn_open is False
+
+    async def test_close_for_any_other_reason_still_clears_the_dot(self, monkeypatch):
+        from services.notifications import notification_manager as nm
+        statuses = []
+        monkeypatch.setattr(nm, "broadcast_chat_status",
+                            lambda owner, cid, status, agent="": statuses.append(status))
+        s = await _register("sid-reaped")
+        s._set_turn_open(True)
+        await s.close(reason="idle")
+        assert statuses == ["streaming", "ready"]
+
     # -- self-resume detection -------------------------------------------------
     # Output while the turn is CLOSED arms one short-fuse resume-check tail
     # (promptless self-resume / in-TUI question answer); an open turn or a
@@ -824,7 +848,11 @@ class TestPostBatchEffects:
         s._post_batch_effects({"persisted": 0})
         assert len(calls) == 1
 
-    async def test_meeting_chats_never_nudge(self, monkeypatch):
+    async def test_every_chat_id_shape_nudges(self, monkeypatch):
+        """The rows nudge keys on the chat id being set, never on its shape —
+        an interactive session's chat is always a real chat (a meeting spawns
+        headless participants; core-seams phase 4 dropped the dead ``meeting-``
+        guard)."""
         from services.notifications import notification_manager as nm
         calls = []
         monkeypatch.setattr(nm, "broadcast_chat_rows",
@@ -832,7 +860,7 @@ class TestPostBatchEffects:
         s = isess.InteractiveSession(session_id="pb-2", chat_id="meeting-x",
                                      agent_name="agent", user_sub="u1")
         s._post_batch_effects({"persisted": 2})
-        assert calls == []
+        assert len(calls) == 1
 
     async def test_compaction_while_idle_runs_turn_end(self, monkeypatch):
         s = isess.InteractiveSession(session_id="pb-3", chat_id="c-pb3",
@@ -1029,6 +1057,9 @@ class TestSpawnCollisionGuard:
             conn.chat_id = "chat-deliver"
             conn.agent_name = "agent"
             conn.session_id = "sid-deliver"
+            # The connection's own default (``DashboardConnection``): this
+            # sender drives the chat.
+            conn._view_only = False
             sent = []
 
             async def _send(frame):
@@ -1051,3 +1082,96 @@ class TestSpawnCollisionGuard:
                        and r["author_sub"] == "user-d" for r in rows)
         finally:
             await live.close()
+
+    async def test_chat_send_refused_attachments_answers_with_error(self, temp_db):
+        """A photo the shared-workspace gate refuses never reaches the PTY:
+        the error frame answers the send, nothing is typed, no row lands."""
+        import ws.dashboard  # noqa: F401  (assembles the controller mixins first)
+        from storage import database as task_store
+        from ws.dashboard_chat import ChatController
+        from ws.dashboard_chat_support import AttachmentsRefused
+
+        task_store.create_chat("chat-refuse", "user-v", "agent",
+                               model="test-model")
+        live = await _register("sid-refuse", chat_id="chat-refuse")
+        try:
+            conn = ChatController()
+            conn.user_sub = "user-v"
+            conn.user = {"username": "vuser", "role": "member"}
+            conn.chat_id = "chat-refuse"
+            conn.agent_name = "agent"
+            conn.session_id = "sid-refuse"
+            sent = []
+
+            async def _send(frame):
+                sent.append(frame)
+
+            async def _send_error(text):
+                sent.append({"type": "error", "message": text})
+
+            async def _refuse(*a, **k):
+                raise AttachmentsRefused(
+                    "Photos in this chat land in the agent's shared workspace")
+
+            conn._send = _send
+            conn._send_error = _send_error
+            conn._process_attachments = _refuse
+            handled = await conn._deliver_chat_to_live_interactive(
+                {"text": "look", "images": [{"data": "x", "name": "a.png"}]})
+            assert handled is True
+            assert [f["type"] for f in sent] == ["error"]
+            assert "shared workspace" in sent[0]["message"]
+            assert b"".join(live._input_buffer) == b""
+            assert task_store.get_chat_messages("chat-refuse") == []
+        finally:
+            await live.close()
+
+
+@pytest.mark.asyncio
+async def test_register_records_the_owner_and_takes_a_spawn_slot(monkeypatch):
+    """A terminal's registration names its owner for the
+    per-person count (never refused on the cap: the person asked for this
+    chat) and the local spawn runs inside a spawn slot."""
+    import contextlib
+    from core.sandbox import pty_relay
+
+    seen: dict = {}
+
+    async def _acq(sid, **kw):
+        seen.update(kw)
+        return concurrency.Admission(True)
+    monkeypatch.setattr(concurrency, "acquire_chat_slot", _acq)
+    monkeypatch.setattr(concurrency, "release_chat_slot", lambda sid: None)
+    slot_events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def _slot():
+        slot_events.append("in")
+        yield
+        slot_events.append("out")
+    monkeypatch.setattr(pty_relay, "spawn_slot", _slot)
+
+    s = await isess.register(
+        session_id="sid-owner", chat_id="chat-owner", agent_name="agent",
+        argv=["cat"], env=dict(_ENV), user_sub="user-owner",
+    )
+    try:
+        assert seen["user_sub"] == "user-owner"
+        assert seen["per_user_cap"] is False
+        assert slot_events == ["in", "out"]
+    finally:
+        await s.close()
+
+
+@pytest.mark.asyncio
+async def test_reap_idle_reads_the_cached_timeout(monkeypatch):
+    """The reaper's default timeout comes from the cached, off-loop
+    read; the setting is never read on the loop per tick."""
+    from unittest.mock import AsyncMock
+    from core.session import session_state
+    monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=1))
+    s = await _register("sid-cached-timeout")
+    s.last_activity = time.monotonic() - 10_000
+    assert await isess.reap_idle() == 1
+    assert isess.get("sid-cached-timeout") is None
+    session_state.cached_idle_timeout.assert_awaited_once()

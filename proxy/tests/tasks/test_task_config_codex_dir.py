@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 
 from core.config import task_config_builder as tcb
+from core import placement
 
 
 def _stub(monkeypatch, *, execution_path: str):
@@ -22,20 +23,21 @@ def _stub(monkeypatch, *, execution_path: str):
     spy on BOTH persistent-dir factories. Returns the spy-call record."""
     calls = {"claude": 0, "codex": 0}
 
-    def _claude_dir(agent_name, *, username="", scope="user"):
+    def _claude_dir(agent_name, *, username="", scope="user", **kw):
         calls["claude"] += 1
         return Path("/tmp/agents/x/users/u/.claude")
 
-    def _codex_dir(agent_name, *, username="", scope="user"):
+    def _codex_dir(agent_name, *, username="", scope="user", **kw):
         calls["codex"] += 1
         return Path("/tmp/agents/x/users/u/.codex")
 
-    # The builders call ensure_persistent_agent_dir, which dispatches to these
-    # two — patch them at their definition site (core.sandbox.session_config_dir) so the
-    # in-module dispatch hits the spies.
-    import core.sandbox.session_config_dir as scd
-    monkeypatch.setattr(scd, "ensure_persistent_claude_dir", _claude_dir)
-    monkeypatch.setattr(scd, "ensure_persistent_codex_dir", _codex_dir)
+    # The builders call ensure_persistent_agent_dir, which dispatches to the
+    # engines' builders — patch them at their definition sites (the engine
+    # packages' config_dir modules) so the layers' call-time reads hit the spies.
+    import core.layers.cli.config_dir as cli_cd
+    import core.layers.codex.config_dir as codex_cd
+    monkeypatch.setattr(cli_cd, "ensure_persistent_claude_dir", _claude_dir)
+    monkeypatch.setattr(codex_cd, "ensure_persistent_codex_dir", _codex_dir)
 
     monkeypatch.setattr(
         tcb, "resolve_task_identity",
@@ -53,9 +55,7 @@ def _stub(monkeypatch, *, execution_path: str):
     monkeypatch.setattr(tcb.asyncio, "to_thread", _to_thread)
 
     monkeypatch.setattr(tcb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
-    monkeypatch.setattr(tcb.remote_store, "get_target_metadata", lambda *a, **k: ("local", "Local"))
-    monkeypatch.setattr(tcb.remote_store, "get_target_has_display", lambda *a, **k: False)
-    monkeypatch.setattr(tcb.remote_store, "get_target_device_grants", lambda *a, **k: set())
+    monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
 
     def _build_mcp(*a, **k):
         calls["mcp_format"] = k.get("mcp_config_format")

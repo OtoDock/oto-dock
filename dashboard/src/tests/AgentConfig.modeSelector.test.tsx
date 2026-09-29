@@ -14,12 +14,14 @@ const h = vi.hoisted(() => ({
     collaborative: true,
     default_scope: 'user' as 'user' | 'agent',
     default_model: '',
+    default_effort: '',
+    default_execution_mode: '',
+    execution_path: 'claude-code-cli',
+    execution_paths: ['claude-code-cli'],
   },
   // Execution-layers payload for the effort-gating tests. undefined = not
   // loaded, which is what the mode-selector tests run with.
-  layers: undefined as
-    | Record<string, { models: { value: string; label: string; provider?: string; supports_xhigh?: boolean }[] }>
-    | undefined,
+  layers: undefined as Record<string, import('@/api/agents').LayerCapabilities> | undefined,
 }))
 
 vi.mock('@/api/agents', () => ({
@@ -56,6 +58,7 @@ vi.mock('@/contexts/AuthContext', () => ({
 }))
 
 import AgentConfig from '@/pages/agent/AgentConfig'
+import { claudeLike, codexLike, directLike } from './fixtures/engines'
 
 function renderConfig() {
   // AgentConfig calls useQueryClient (department-save invalidation), so the
@@ -143,24 +146,57 @@ describe('AgentConfig — XHigh effort gating', () => {
     h.agentInfo.collaborative = true
     h.agentInfo.default_scope = 'user'
     h.agentInfo.default_model = ''
+    h.agentInfo.default_effort = ''
+    h.agentInfo.default_execution_mode = ''
+    h.agentInfo.execution_path = 'claude-code-cli'
+    h.agentInfo.execution_paths = ['claude-code-cli']
     h.layers = {
-      'claude-code-cli': {
+      'claude-code-cli': claudeLike({
         models: [
           { value: '', label: 'System Default' },
           { value: 'claude-fable-5', label: 'Fable 5 (1M context)', provider: 'anthropic', supports_xhigh: true },
           { value: 'claude-haiku-4-5', label: 'Haiku 4.5 (200K)', provider: 'anthropic' },
         ],
-      },
+        // What the SERVER says Auto resolves to on this engine.
+        auto_model: 'claude-fable-5', auto_model_label: 'Fable 5 (1M context)',
+      }),
     }
   })
 
   const xhighOption = () => screen.queryByRole('option', { name: 'XHigh' })
+  const autoOption = () => screen.getByRole('option', { name: /^Auto/ })
 
-  it('offers XHigh on Auto when the auto-resolved model supports it', () => {
-    // Auto ('') resolves to the first real model of the first engine — Fable 5
-    // here — so the flagless "System Default" placeholder must not hide XHigh.
+  it('offers XHigh on Auto when the model the server resolves supports it', () => {
+    // Auto ('') is whatever the catalog's auto_model says — Fable 5 here — so
+    // the flagless "System Default" placeholder must not hide XHigh.
     renderConfig()
     expect(xhighOption()).toBeInTheDocument()
+    expect(autoOption()).toHaveTextContent('Auto — Fable 5 (1M context)')
+  })
+
+  it('names the model Auto resolves to as the server says, not the first in the list', () => {
+    h.layers!['claude-code-cli'].auto_model = 'claude-haiku-4-5'
+    h.layers!['claude-code-cli'].auto_model_label = 'Haiku 4.5 (200K)'
+    renderConfig()
+    expect(autoOption()).toHaveTextContent('Auto — Haiku 4.5 (200K)')
+    // Haiku has no xhigh flag, so Auto offers none — the list's first model is not consulted.
+    expect(xhighOption()).not.toBeInTheDocument()
+  })
+
+  it('a resolved model the served list filtered out is still named, with no flags', () => {
+    h.layers!['claude-code-cli'].auto_model = 'claude-ghost-1'
+    h.layers!['claude-code-cli'].auto_model_label = 'Ghost 1'
+    renderConfig()
+    expect(autoOption()).toHaveTextContent('Auto — Ghost 1')
+    expect(xhighOption()).not.toBeInTheDocument()
+  })
+
+  it('plain "Auto" when the server resolves nothing', () => {
+    h.layers!['claude-code-cli'].auto_model = ''
+    h.layers!['claude-code-cli'].auto_model_label = ''
+    renderConfig()
+    expect(autoOption()).toHaveTextContent(/^Auto$/)
+    expect(xhighOption()).not.toBeInTheDocument()
   })
 
   it('offers XHigh when the selected model supports it', () => {
@@ -173,5 +209,99 @@ describe('AgentConfig — XHigh effort gating', () => {
     h.agentInfo.default_model = 'claude-haiku-4-5'
     renderConfig()
     expect(xhighOption()).not.toBeInTheDocument()
+  })
+
+  it('writes a stored effort the model no longer offers back as what the select shows', () => {
+    h.agentInfo.default_model = 'claude-haiku-4-5'
+    h.agentInfo.default_effort = 'xhigh'
+    renderConfig()
+    expect(screen.getByRole('option', { name: 'High' })).toBeInTheDocument()
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'high' }, expect.anything())
+  })
+})
+
+describe('AgentConfig — the effort ladder follows the engines and the provider', () => {
+  const option = (name: string) => screen.queryByRole('option', { name })
+
+  beforeEach(() => {
+    h.updateMock.mockClear()
+    h.agentInfo.collaborative = true
+    h.agentInfo.default_scope = 'user'
+    h.agentInfo.default_model = ''
+    h.agentInfo.default_effort = ''
+    h.agentInfo.default_execution_mode = ''
+  })
+
+  it('a provider whose ladder tops at xhigh offers no Max, and a stored Max becomes XHigh', () => {
+    h.agentInfo.execution_path = 'direct-llm'
+    h.agentInfo.execution_paths = ['direct-llm']
+    h.agentInfo.default_model = 'gpt-6-luna'
+    h.agentInfo.default_effort = 'max'
+    h.layers = {
+      'direct-llm': directLike({
+        models: [
+          { value: '', label: 'System Default' },
+          { value: 'gpt-6-luna', label: 'GPT-6 Luna', provider: 'openai', supports_xhigh: true },
+          { value: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B', provider: 'groq' },
+        ],
+        auto_model: 'gpt-6-luna', auto_model_label: 'GPT-6 Luna',
+      }),
+    }
+    renderConfig()
+    expect(option('XHigh')).toBeInTheDocument()
+    expect(option('Max')).not.toBeInTheDocument()
+    expect(option('Ultra')).not.toBeInTheDocument()
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'xhigh' }, expect.anything())
+  })
+
+  it('a Groq model offers Low, Medium and High only', () => {
+    h.agentInfo.execution_path = 'direct-llm'
+    h.agentInfo.execution_paths = ['direct-llm']
+    h.agentInfo.default_model = 'openai/gpt-oss-120b'
+    h.layers = {
+      'direct-llm': directLike({
+        models: [
+          { value: 'openai/gpt-oss-120b', label: 'GPT-OSS 120B', provider: 'groq', supports_xhigh: true },
+        ],
+      }),
+    }
+    renderConfig()
+    expect(option('High')).toBeInTheDocument()
+    expect(option('XHigh')).not.toBeInTheDocument()
+    expect(option('Max')).not.toBeInTheDocument()
+    expect(h.updateMock).not.toHaveBeenCalled()
+  })
+
+  it('a Codex-only agent whose Auto resolves nothing offers XHigh and Max, never Ultra', () => {
+    h.agentInfo.execution_path = 'codex-cli'
+    h.agentInfo.execution_paths = ['codex-cli']
+    h.layers = {
+      'codex-cli': codexLike({
+        models: [
+          { value: 'gpt-6-sol', label: 'GPT-6 Sol', provider: 'openai', supports_xhigh: true, supports_ultra: true },
+        ],
+        auto_model: '', auto_model_label: '',
+      }),
+    }
+    const first = renderConfig()
+    expect(option('XHigh')).toBeInTheDocument()
+    expect(option('Max')).toBeInTheDocument()
+    expect(option('Ultra')).not.toBeInTheDocument()
+    first.unmount()
+    h.agentInfo.default_model = 'gpt-6-sol'
+    renderConfig()
+    expect(option('Ultra')).toBeInTheDocument()
+  })
+
+  it('reconciles nothing before the catalog has answered', () => {
+    // A pinned model with a stored xhigh and an interactive default used to be
+    // reset and SAVED when the agent row arrived before the catalog.
+    h.agentInfo.default_model = 'claude-fable-5'
+    h.agentInfo.default_effort = 'xhigh'
+    h.agentInfo.default_execution_mode = 'interactive'
+    h.layers = undefined
+    renderConfig()
+    expect(screen.queryByText('Default Effort')).not.toBeInTheDocument()
+    expect(h.updateMock).not.toHaveBeenCalled()
   })
 })

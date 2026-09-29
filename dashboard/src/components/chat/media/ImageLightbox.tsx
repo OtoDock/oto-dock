@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { safeHref } from '../../../lib/safeUrl'
 import { pushEscHandler } from '../../../lib/escStack'
 import { useSwipeGesture } from '../../../hooks/useSwipeGesture'
+import { saveNativeFile } from '../../../lib/nativeBridge'
 
 export interface LightboxImage {
   /** Either url (external) or imageData+mimeType (base64) must be set. */
@@ -56,17 +57,9 @@ function downloadFilename(img: LightboxImage, index: number): string {
 async function triggerDownload(img: LightboxImage, index: number) {
   const filename = downloadFilename(img, index)
 
-  // Native Android: route base64 through the JS bridge if available.
+  // Native Android: route base64 through the app's channel if available.
   if (img.imageData) {
-    const android = (window as any).Android
-    if (android && typeof android.saveImageFromBase64 === 'function') {
-      try {
-        android.saveImageFromBase64(img.imageData, filename, img.mimeType || 'image/jpeg')
-        return
-      } catch {
-        // Fall through to blob path
-      }
-    }
+    if (saveNativeFile(img.imageData, filename, img.mimeType || 'image/jpeg')) return
     const byteChars = atob(img.imageData)
     const byteArr = new Uint8Array(byteChars.length)
     for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i)

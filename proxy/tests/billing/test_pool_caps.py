@@ -24,6 +24,15 @@ NOW = datetime(2026, 9, 11, 12, 0, tzinfo=timezone.utc)
 RESET = "2026-09-16T06:00:00+00:00"
 
 
+class _FixedNow(datetime):
+    """``datetime`` whose ``now`` is NOW, for the paths that do not take a
+    ``now`` argument (the cached evaluate)."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW if tz is None else NOW.astimezone(tz)
+
+
 @pytest.fixture(autouse=True)
 def _fresh_setting(temp_db):
     sw.invalidate_setting_cache()
@@ -261,10 +270,13 @@ class TestThresholds:
 # ---------------------------------------------------------------------------
 
 class TestCache:
-    def test_cached_until_invalidated(self, temp_db):
+    def test_cached_until_invalidated(self, temp_db, monkeypatch):
+        # The cached path reads the wall clock; pin it to NOW so the sample's
+        # fixed reset instant never falls into the past.
+        monkeypatch.setattr(pool_caps, "datetime", _FixedNow)
         a = _oauth("user-admin")
         assert pool_caps.evaluate("platform", "", "claude-code-cli").allowed
-        _sample(a, datetime.now(timezone.utc).isoformat(), 99.0)
+        _sample(a, NOW.isoformat(), 99.0)
         _cap(week_pct=50)
         # Still the cached verdict.
         assert pool_caps.evaluate("platform", "", "claude-code-cli").allowed

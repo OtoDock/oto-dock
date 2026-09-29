@@ -174,7 +174,7 @@ async def test_can_resume_session_codex_uses_thread_id_no_rpc():
     itself stats .codex/sessions/<thread>.jsonl at spawn time). No RPC."""
     layer = _make_layer()
     info = _make_info(execution_path="codex-cli")
-    info.codex_thread_id = "thr-123"
+    info.resume_handle = "thr-123"
     layer._sessions[info.session_id] = info
 
     result = await layer.can_resume_session(
@@ -189,7 +189,7 @@ async def test_can_resume_session_codex_without_thread_id_returns_false():
     """Codex with no thread_id captured yet → not resumable."""
     layer = _make_layer()
     info = _make_info(execution_path="codex-cli")
-    info.codex_thread_id = ""
+    info.resume_handle = ""
     layer._sessions[info.session_id] = info
 
     result = await layer.can_resume_session(info.session_id)

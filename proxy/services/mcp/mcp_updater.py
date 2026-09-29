@@ -30,6 +30,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_registry
 from storage import database as task_store
 from storage.mcp import mcp_store
@@ -355,7 +356,7 @@ async def detect_available_updates() -> dict:
     # catalog entry must never produce a converge offer for it).
     docker_targets = [
         (name, m) for name, m in manifests.items()
-        if m.category == "community" and m.server.runtime == "docker"
+        if m.category == "community" and _mt.is_container(m.server)
     ]
 
     def _docker_hashes() -> dict:
@@ -485,7 +486,7 @@ async def _update_docker_mcp(name: str) -> dict:
     refreshed = mcp_registry.get_manifest(name)
     if (
         refreshed
-        and refreshed.server.runtime == "docker"
+        and _mt.is_container(refreshed.server)
         and deployment.current_mode() == deployment.MANAGED_LOCAL
     ):
         states = await asyncio.to_thread(mcp_store.get_all_mcp_states)
@@ -599,7 +600,7 @@ async def update_one(name: str) -> dict:
             # generic runtime-none path below would 400 on "no source").
             from services.community import skills_installer
             return await skills_installer.install_skill_package_from_catalog(name)
-        if manifest.server.runtime == "docker":
+        if _mt.is_container(manifest.server):
             return await _update_docker_mcp(name)
         return await _update_node_python_mcp(name, manifest)
 
@@ -628,7 +629,7 @@ def community_targets() -> list:
             continue
         if m.category != "community":
             continue
-        if cloud and m.server.runtime == "docker":
+        if cloud and _mt.is_container(m.server):
             continue
         out.append(m)
     return out

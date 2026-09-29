@@ -117,6 +117,7 @@ export function AccountCard({
         <SubscriptionsPanel
           mcpName={integration.mcp_name}
           accountLabel={account.account_label}
+          serviceBindings={account.service_bindings ?? []}
         />
       </div>
 

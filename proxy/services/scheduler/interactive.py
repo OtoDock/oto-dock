@@ -92,6 +92,108 @@ async def _run_interactive_task(
                 )
 
 
+# Per-chat terminal holds: the rounds that drive a chat's interactive
+# terminal (a fresh interactive round, a borrowed round) serialize on one
+# lock per chat, so a continue for another caller waits for the round in
+# flight instead of steering into its turn and reporting its output twice.
+_terminal_locks: dict[str, asyncio.Lock] = {}
+_TERMINAL_HOLD_CEILING_S = 1800.0
+
+
+class TerminalHold:
+    """A held per-chat terminal lock; ``release`` is idempotent. The lock
+    stays in the table: a waiter already holds a reference to it, so
+    dropping the entry on release would let a third round take a fresh one."""
+
+    def __init__(self, chat_id: str, lock: asyncio.Lock) -> None:
+        self.chat_id = chat_id
+        self._lock = lock
+
+    def release(self) -> None:
+        lock, self._lock = self._lock, None
+        if lock is not None and lock.locked():
+            lock.release()
+
+
+async def hold_terminal(chat_id: str) -> TerminalHold:
+    """Take the chat's terminal hold, waiting out a round in flight (bounded
+    like the lane quiescence wait: past the ceiling the round proceeds)."""
+    lock = _terminal_locks.setdefault(chat_id, asyncio.Lock())
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_TERMINAL_HOLD_CEILING_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Terminal hold ceiling reached for chat {chat_id[:8]} "
+            f"({int(_TERMINAL_HOLD_CEILING_S)}s) — proceeding"
+        )
+        return TerminalHold(chat_id, asyncio.Lock())
+    return TerminalHold(chat_id, lock)
+
+
+def borrow_terminal(chat_id: str):
+    """The live interactive session on ``chat_id`` a continue round drives
+    instead of spawning — the person's terminal is the lane — or None."""
+    from core.session import interactive_session
+    live = interactive_session.find_live_for_chat(chat_id)
+    if live is None or not live.alive:
+        return None
+    return live
+
+
+async def _run_borrowed_terminal_turn(isess, prompt: str) -> None:
+    """Drive a delegated follow-up through a LIVE interactive terminal the
+    round did not spawn: queue the prompt for injection (steered into an
+    open turn, pasted at quiescence otherwise) and wait for the first turn
+    end AFTER it was injected — the person's own in-flight turn cannot
+    satisfy it, since the waiter is armed by the injection hook, which the
+    drain calls right after the paste with no yield in between. The tailer
+    persists the turn, so the caller's output collection and delivery work
+    unchanged. A cancel drops the prompt if it is still queued and leaves
+    the terminal alone."""
+    injected = asyncio.Event()
+    done = asyncio.Event()
+
+    def _on_turn_end(_last_message: str) -> None:
+        done.set()
+
+    def _on_injected() -> None:
+        injected.set()
+        isess.add_turn_end_waiter(_on_turn_end)
+
+    item = isess.queue_prompt(
+        prompt, "delegate_continue", steer=True, chat_id=isess.chat_id,
+        on_injected=_on_injected,
+    )
+    if item is None:
+        raise _InteractiveSessionDied(
+            "the terminal closed before the follow-up could be queued",
+            had_viewer=isess.had_viewer,
+        )
+    waited = 0.0
+    _STEP = 5.0
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(done.wait(), timeout=_STEP)
+                return
+            except asyncio.TimeoutError:
+                if not isess.alive:
+                    raise _InteractiveSessionDied(
+                        "the terminal closed before the follow-up's turn ended",
+                        had_viewer=isess.had_viewer,
+                    )
+                waited += _STEP
+                if waited >= INTERACTIVE_TASK_MAX_S:
+                    raise RuntimeError(
+                        f"The follow-up's turn did not end within "
+                        f"{int(INTERACTIVE_TASK_MAX_S)}s (no turn-end signal)"
+                    )
+    finally:
+        if not injected.is_set():
+            isess.cancel_prompt(item)
+        isess.remove_turn_end_waiter(_on_turn_end)
+
+
 async def _close_interactive_task_session(session_id: str) -> None:
     """Tear down an interactive task's PTY session (no-op if it wasn't one).
 

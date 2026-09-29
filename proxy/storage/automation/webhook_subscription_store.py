@@ -26,22 +26,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Status enum + allowed transitions. Enforced by ``update_subscription_status``.
-_VALID_STATUSES = {
-    "creating",      # vendor API call in flight
-    "active",        # vendor confirmed registration; receiving events
-    "failed",        # vendor create call failed; user must delete + recreate
-    "renew_failed",  # renew vendor call failed; vendor may still send events
-    "expired",       # vendor TTL passed without successful renew
-    "disabled",      # user paused
-}
+# The status vocabulary (``webhook_subscriptions.status``, named once —
+# core-seams phase 8; the dashboard mirror is ``lib/status/webhookSubscription.ts``)
+# and the allowed transitions, enforced by ``update_subscription_status``.
+CREATING = "creating"          # vendor API call in flight
+ACTIVE = "active"              # vendor confirmed registration; receiving events
+FAILED = "failed"              # vendor create call failed; user must delete + recreate
+RENEW_FAILED = "renew_failed"  # renew vendor call failed; vendor may still send events
+EXPIRED = "expired"            # vendor TTL passed without successful renew
+DISABLED = "disabled"          # user paused
+
+STATUSES: frozenset[str] = frozenset({CREATING, ACTIVE, FAILED, RENEW_FAILED, EXPIRED, DISABLED})
+#: The dispatcher accepts an inbound event (a row still being created
+#: may already receive its first delivery).
+RECEIVING: frozenset[str] = frozenset({ACTIVE, RENEW_FAILED, CREATING})
+#: The relay fan-out delivers to these rows.
+DELIVERING: frozenset[str] = frozenset({ACTIVE, RENEW_FAILED})
+
+_VALID_STATUSES = STATUSES
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "creating":     {"active", "failed"},
-    "active":       {"renew_failed", "disabled"},
-    "renew_failed": {"active", "expired", "disabled"},
-    "expired":      {"active", "disabled"},
-    "disabled":     {"active"},
-    "failed":       set(),  # terminal — caller must DELETE + recreate
+    CREATING:     {ACTIVE, FAILED},
+    ACTIVE:       {RENEW_FAILED, DISABLED},
+    RENEW_FAILED: {ACTIVE, EXPIRED, DISABLED},
+    EXPIRED:      {ACTIVE, DISABLED},
+    DISABLED:     {ACTIVE},
+    FAILED:       set(),  # terminal — caller must DELETE + recreate
 }
 
 
@@ -84,8 +93,13 @@ def create_subscription(
     expires_at: str | None = None,
     subscription_id: str | None = None,
     delivery_mode: str = "vendor",
+    target_kind: str = "",
 ) -> dict:
     """Insert a new subscription row in 'creating' state.
+
+    ``target_kind`` is the manifest's ``vendor_target_spec.target_kinds``
+    key the row registers as; ``""`` is the default kind (every row created
+    before kinds existed).
 
     ``signing_secret`` is the plaintext secret; this function Fernet-encrypts
     it before storage. The plaintext is never returned again — call
@@ -117,13 +131,13 @@ def create_subscription(
                (id, scope, owner, agent, mcp_name, provider_id, account_label,
                 vendor_target, selected_events, selected_subevents,
                 signing_secret_enc, status, expires_at,
-                created_by, created_at, updated_at, delivery_mode)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'creating',%s,%s,%s,%s,%s)""",
+                created_by, created_at, updated_at, delivery_mode, target_kind)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (sid, scope, owner, agent, mcp_name, provider_id, account_label,
              vendor_target,
              json.dumps(list(selected_events or [])),
              json.dumps(dict(selected_subevents or {})),
-             enc, expires_at, created_by, now, now, delivery_mode),
+             enc, CREATING, expires_at, created_by, now, now, delivery_mode, target_kind or ""),
         )
         row = conn.execute(
             "SELECT * FROM webhook_subscriptions WHERE id=%s", (sid,)
@@ -290,6 +304,21 @@ def update_subscription_status(
         return cur.rowcount > 0
 
 
+def note_last_error(subscription_id: str, text: str) -> bool:
+    """Record ``text`` as the row's ``last_error`` without touching its
+    status: one statement, so a status transition committed meanwhile is
+    never reverted. A row still ``creating`` (its first delivery may land
+    before the vendor confirms) and a missing id take no note. The receive
+    path's signature note goes through here."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE webhook_subscriptions SET last_error=%s, updated_at=%s "
+            "WHERE id=%s AND status <> %s",
+            (text, _now(), subscription_id, CREATING),
+        )
+        return cur.rowcount > 0
+
+
 def record_event_received(subscription_id: str) -> None:
     """Increment event_count + update last_event_at. Best-effort, no return."""
     now = _now()
@@ -330,12 +359,12 @@ def list_due_for_renewal(now_iso: str, lead_seconds: int) -> list[dict]:
         # timestamps on both sides.
         rows = conn.execute(
             """SELECT * FROM webhook_subscriptions
-               WHERE status = 'active'
+               WHERE status = %s
                  AND expires_at IS NOT NULL
                  AND expires_at::timestamptz
                      < (%s::timestamptz + (%s || ' seconds')::interval)
                ORDER BY expires_at ASC""",
-            (now_iso, str(lead_seconds)),
+            (ACTIVE, now_iso, str(lead_seconds)),
         ).fetchall()
         return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 

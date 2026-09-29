@@ -42,16 +42,19 @@ class TestBetweenTurnsFrames:
                     ws.client_send({"type": "chat_read", "chat_id": chat_id})
                     await ws.expect({"type": "chat_read", "chat_id": chat_id})
 
-                    ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
+                    ws.client_send({"type": "mode_change", "mode": "acceptEdits",
+                                    "chat_id": chat_id})
                     await ws.expect({"type": "mode_changed", "mode": "acceptEdits"})
 
-                    ws.client_send({"type": "model_change", "model": TEST_MODEL})
+                    ws.client_send({"type": "model_change", "model": TEST_MODEL,
+                                    "chat_id": chat_id})
                     await ws.expect({"type": "model_changed", "model": TEST_MODEL})
 
                     # A model foreign to the chat's layer is refused and the
                     # selector re-synced — the read → validate → (no) write
                     # ran as one lane job.
-                    ws.client_send({"type": "model_change", "model": "not-a-real-model"})
+                    ws.client_send({"type": "model_change", "model": "not-a-real-model",
+                                    "chat_id": chat_id})
                     await ws.expect({"type": "model_changed", "model": TEST_MODEL,
                                      "chat_id": chat_id})
                     await sync_dispatch(ws)
@@ -148,4 +151,64 @@ class TestSendPath:
                 assert temp_db.get_chat(chat_id)["title"] == "Say hello"
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+
+def _task_chat_with_sibling(temp_db, slug: str) -> tuple[str, str]:
+    """A task chat whose session also ran a later turn in its own chat (a
+    continue_session task): the resume aggregates the sibling's rows."""
+    import uuid
+    first, second = (f"run-{uuid.uuid4().hex[:10]}" for _ in range(2))
+    sid = str(uuid.uuid4())
+    for rid in (first, second):
+        temp_db.create_run(rid, "dyn-x", slug, "schedule", None, "go",
+                           "recurring", "agent", "user-admin")
+        temp_db.create_chat(f"task-{rid}", "user-admin", slug, source_type="task")
+        temp_db.update_run(rid, session_id=sid, chat_id=f"task-{rid}",
+                           started_at=f"2026-09-27T10:0{0 if rid == first else 1}:00+00:00")
+    temp_db.add_chat_message(f"task-{first}", "user", "first turn")
+    temp_db.add_chat_message(f"task-{second}", "user", "second turn")
+    return f"task-{first}", f"task-{second}"
+
+
+class TestTaskChatReads:
+    def test_task_pump_poll_runs_off_loop(self, temp_db, monkeypatch, loop_db_guard):
+        """The idle poll of a task chat looks up a related turn's pump
+        without reading the database on the loop."""
+        import asyncio
+        from ws.dashboard import DashboardConnection
+        slug = make_test_agent()
+        cid, _ = _task_chat_with_sibling(temp_db, slug)
+        conn = DashboardConnection.__new__(DashboardConnection)
+        conn.chat_id = cid
+        conn.streaming = False
+
+        async def scenario():
+            with loop_db_guard.active():
+                return await conn._task_pump_poll()
+
+        assert asyncio.run(scenario()) is False
+
+    def test_resume_of_a_task_chat_reads_related_runs_off_loop(
+            self, temp_db, monkeypatch, loop_db_guard):
+        """The related-run reads of a task chat's resume run off
+        the loop, and the sibling turn's rows still ride the history."""
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        cid, _ = _task_chat_with_sibling(temp_db, slug)
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                with loop_db_guard.active():
+                    ws.client_send({"type": "resume_chat", "chat_id": cid})
+                    while True:
+                        frame = await ws.next_frame()
+                        if frame["type"] == "chat_history":
+                            break
+                assert [m["content"] for m in frame["messages"]] == [
+                    "first turn", "second turn"]
+                ws.client_send({"type": "close"})
         run_ws_scenario(scenario)

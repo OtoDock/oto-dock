@@ -101,8 +101,14 @@ export function computeMapLayout(
   const memberSet = opts?.memberOf ?? accessible
   const bySlug = new Map(agents.map((a) => [a.name, a]))
 
+  // "Mine only" keeps a department with one of my agents in it — and a
+  // department with NO members at all (the feed's `members` is the server's
+  // truth: it flags inaccessible members, never drops them), so a freshly
+  // created one has a dais to move an agent onto. A department whose
+  // members are all someone else's stays hidden.
   const depts = departments.filter(
-    (d) => !hide || d.members.some((m) => memberSet.has(m.name)),
+    (d) => !hide || d.members.length === 0
+      || d.members.some((m) => memberSet.has(m.name)),
   )
   const visibleDeptIds = new Set(depts.map((d) => d.id))
   const standalone = agents.filter(

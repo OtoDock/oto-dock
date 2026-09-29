@@ -92,6 +92,23 @@ def _server_tool_result_preview(block) -> str:
 class AnthropicAdapter(ProviderAdapter):
     """Anthropic Claude API adapter."""
 
+    # The provider's own server-run tools, appended to session.tools for
+    # models with server_tools=True. The BASIC tool versions on purpose
+    # (decided 2026-09-07): the 2026 versions add "dynamic filtering" — the
+    # model writes code that filters the results inside a code-execution
+    # sandbox before reading them — which on a chat assistant showed as a
+    # pile of code_execution rows (a weather question ran 3 searches + 2
+    # fetches through 6 code executions, 41 s, and still answered without
+    # live data because fetched weather pages carry no readable forecast).
+    # Direct search hands the result snippets straight to the model, the way
+    # OpenAI's built-in search does, and needs one step for the same question.
+    # Lived in config.py as EXECUTION_PATH_BUILTIN_TOOLS["direct-llm"] until
+    # 2026-09-20 — vendor tool ids are the adapter's business, not an engine's.
+    SERVER_TOOLS: tuple[dict, ...] = (
+        {"type": "web_search_20250305", "name": "web_search"},
+        {"type": "web_fetch_20250910", "name": "web_fetch"},
+    )
+
     @property
     def provider_name(self) -> str:
         return "anthropic"
@@ -330,7 +347,7 @@ class AnthropicAdapter(ProviderAdapter):
         """
         if model and not app_config.model_supports_server_tools(model):
             return []
-        return app_config.EXECUTION_PATH_BUILTIN_TOOLS.get("direct-llm", [])
+        return list(self.SERVER_TOOLS)
 
     def format_image_content_block(
         self,

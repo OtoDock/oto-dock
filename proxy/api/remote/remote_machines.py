@@ -26,8 +26,11 @@ from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user, require_auth
 from services.remote.remote_status import get_live_machine_status
+from core import placement
+from core import host_os
 from storage import remote_store
 from storage.agents import agent_store
+from auth import roles
 
 
 def _merge_live_status(machine: dict) -> dict:
@@ -47,6 +50,18 @@ def _merge_live_status(machine: dict) -> dict:
 
 logger = logging.getLogger("claude-proxy.remote-machines")
 router = APIRouter()
+
+
+def _cli_pins_by_binary() -> dict[str, str]:
+    """``{binary: pinned version}`` for every engine with a CLI — the machine
+    cards judge ``capabilities.cli_status`` (keyed by binary name) against
+    these. Read at call time, never frozen at import."""
+    from core.session.session_manager import get_all_layers
+    return {
+        layer.capabilities.runtime.binary: layer.pinned_cli_version()
+        for layer in get_all_layers().values()
+        if layer.capabilities.runtime.binary
+    }
 
 
 def _kick_presync(machine_id: str, agent_slug: str) -> None:
@@ -228,13 +243,6 @@ def _require_satellite_source() -> None:
         )
 
 
-# Supported `?os=` values. `linux` and `macos` both produce a bash
-# bootstrap (install.sh auto-detects via uname). `windows` produces a
-# PowerShell bootstrap that runs install.ps1.
-_BOOTSTRAP_OS_BASH = ("linux", "macos", "unix")
-_BOOTSTRAP_OS_WINDOWS = ("windows", "win", "win32")
-
-
 @router.get("/v1/satellite/bootstrap")
 async def serve_bootstrap(request: Request):
     """Single-shot satellite bootstrap endpoint.
@@ -273,12 +281,13 @@ async def serve_bootstrap(request: Request):
             detail="Missing X-Pairing-Token header",
         )
 
+    # The ``?os=`` word names the install flavour (``core/host_os.py``
+    # folds every accepted spelling to a family): ``linux`` and ``macos``
+    # both get the bash bootstrap (install.sh detects the host with uname),
+    # ``windows`` the PowerShell one.
     os_hint = request.query_params.get("os", "linux").lower()
-    if os_hint in _BOOTSTRAP_OS_WINDOWS:
-        os_hint = "windows"
-    elif os_hint in _BOOTSTRAP_OS_BASH:
-        os_hint = "linux"
-    else:
+    family = host_os.bootstrap_family(os_hint)
+    if not family:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported os: {os_hint!r}. Expected linux, macos, or windows.",
@@ -321,11 +330,11 @@ async def serve_bootstrap(request: Request):
 
     body = await __import__("asyncio").to_thread(
         _build_bootstrap_script,
-        machine_id, machine_secret, platform_url, os_hint,
+        machine_id, machine_secret, platform_url, family,
     )
     media_type = (
         "text/plain"
-        if os_hint == "windows"
+        if host_os.ROWS[family].powershell
         else "text/x-shellscript"
     )
     return Response(
@@ -337,17 +346,18 @@ async def serve_bootstrap(request: Request):
 
 def _build_bootstrap_script(
     machine_id: str, machine_secret: str, platform_url: str,
-    os_hint: str = "linux",
+    family: str = host_os.LINUX,
 ) -> bytes:
-    """Generate the self-extracting bootstrap script body for the given OS.
+    """Generate the self-extracting bootstrap script body for a host family.
 
     Layout (both flavors):
       1. Shebang + env-var exports (MACHINE_ID, MACHINE_SECRET, PLATFORM_URL)
       2. Two base64 payloads: baseline-tools script + satellite tarball
       3. The static install template body (install.sh or install.ps1)
 
-    ``os_hint`` is either ``"linux"`` (covers macOS too — install.sh
-    auto-detects via uname) or ``"windows"``.
+    ``family`` is a word of ``host_os.FAMILIES``; the row's ``powershell``
+    fact picks the PowerShell template and header (Windows) over the bash
+    ones (Linux and macOS alike — install.sh detects the host with uname).
     """
     import base64 as _b64
 
@@ -355,8 +365,9 @@ def _build_bootstrap_script(
     tarball_b64 = _b64.b64encode(tarball).decode("ascii")
 
     scripts_dir = _SATELLITE_DIR.parent / "scripts"
+    row = host_os.ROWS[family]
 
-    if os_hint == "windows":
+    if row.powershell:
         baseline_path = scripts_dir / "install-baseline-tools.ps1"
         template_path = _SATELLITE_DIR / "install.ps1"
     else:
@@ -373,7 +384,7 @@ def _build_bootstrap_script(
     if install_template.startswith("#!"):
         install_template = install_template.split("\n", 1)[1]
 
-    if os_hint == "windows":
+    if row.powershell:
         return _build_powershell_header(
             machine_id, machine_secret, platform_url,
             baseline_b64, tarball_b64,
@@ -396,29 +407,38 @@ def _build_bootstrap_script(
     ).encode() + install_template.encode()
 
 
+def _cli_pin_env_exports() -> list[tuple[str, str]]:
+    """``[(env name, pinned version)]`` for every engine with a CLI, in
+    registry order, skipping an empty pin. The env name is the engine's
+    ``pin_key`` upper-cased plus ``_VERSION`` — ``CLAUDE_CODE_VERSION`` /
+    ``CODEX_VERSION``: the row ``VERSIONS.md`` carries and the name
+    ``install-baseline-tools.{sh,ps1}`` read (a contract test pins the
+    spelling to the pin key). Read at call time, never frozen at import."""
+    from core.session.session_manager import get_all_layers
+    out: list[tuple[str, str]] = []
+    for layer in get_all_layers().values():
+        pin_key = layer.capabilities.runtime.pin_key
+        version = layer.pinned_cli_version()
+        if pin_key and version:
+            out.append((f"{pin_key.upper()}_VERSION", version))
+    return out
+
+
 def _build_bash_header(
     machine_id: str, machine_secret: str, platform_url: str,
     baseline_b64: str, tarball_b64: str, helper_b64: str = "",
 ) -> str:
-    import config as app_config
-
     def _esc(v: str) -> str:
         return v.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
 
     # CLI pins ride along (exported — the baseline script runs as a CHILD
     # bash, unlike the payload vars below) so pairing-time installs use THIS
     # proxy's pinned versions rather than the script's baked defaults. Tiny
-    # values, so MAX_ARG_STRLEN is no concern; empty pins are fine — the
+    # values, so MAX_ARG_STRLEN is no concern; empty pins are skipped — the
     # baseline script's ${VAR:-default} treats empty as unset.
-    pin_exports = ""
-    if app_config.PINNED_CLAUDE_CODE_VERSION:
-        pin_exports += (
-            f'export CLAUDE_CODE_VERSION="{_esc(app_config.PINNED_CLAUDE_CODE_VERSION)}"\n'
-        )
-    if app_config.PINNED_CODEX_VERSION:
-        pin_exports += (
-            f'export CODEX_VERSION="{_esc(app_config.PINNED_CODEX_VERSION)}"\n'
-        )
+    pin_exports = "".join(
+        f'export {name}="{_esc(version)}"\n' for name, version in _cli_pin_env_exports()
+    )
     return (
         "#!/bin/bash\n"
         "# Auto-generated by /v1/satellite/bootstrap. Do not edit.\n"
@@ -485,9 +505,9 @@ def _build_install_commands(
         f'powershell -ExecutionPolicy Bypass -Command "& {{ {ps_inner} }}"'
     )
     return {
-        "linux": bash_cmd,
-        "macos": bash_cmd,
-        "windows": windows_cmd,
+        host_os.BOOTSTRAP_LINUX: bash_cmd,
+        host_os.BOOTSTRAP_MACOS: bash_cmd,
+        host_os.BOOTSTRAP_WINDOWS: windows_cmd,
     }
 
 
@@ -505,8 +525,6 @@ def _build_powershell_header(
     # Script vars (the bootstrap is `iex`-evaluated as one big script,
     # so vars set in this header are visible to install.ps1 below) are
     # RAM-bound with no such limit.
-    import config as app_config
-
     def _esc(v: str) -> str:
         return v.replace("'", "''")
 
@@ -514,15 +532,9 @@ def _build_powershell_header(
     # pairing-time installs use THIS proxy's pinned versions rather than the
     # script's baked defaults. Only set when non-empty: the .ps1 default falls
     # back on falsy $env: values.
-    pin_lines = ""
-    if app_config.PINNED_CLAUDE_CODE_VERSION:
-        pin_lines += (
-            f"$env:CLAUDE_CODE_VERSION = '{_esc(app_config.PINNED_CLAUDE_CODE_VERSION)}'\n"
-        )
-    if app_config.PINNED_CODEX_VERSION:
-        pin_lines += (
-            f"$env:CODEX_VERSION = '{_esc(app_config.PINNED_CODEX_VERSION)}'\n"
-        )
+    pin_lines = "".join(
+        f"$env:{name} = '{_esc(version)}'\n" for name, version in _cli_pin_env_exports()
+    )
     return (
         "# Auto-generated by /v1/satellite/bootstrap?os=windows.\n"
         "# Do not edit — runs via `iex` in a normal (non-admin) PowerShell.\n"
@@ -605,7 +617,7 @@ class AssignAgentRequest(BaseModel):
 
 def _require_admin(user: UserContext | None) -> UserContext:
     u = require_auth(user)
-    if u.role != "admin":
+    if not u.is_admin:
         raise HTTPException(status_code=403, detail="Admin required")
     return u
 
@@ -685,14 +697,10 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
     # Parse capabilities JSON + merge live WS status for frontend
     import json
 
-    import config as app_config
     # Per-machine (not top-level): the dashboard's useRemoteMachines hook
     # returns data.machines and would drop an envelope key. Lets the cards
     # judge capabilities.cli_status against the platform's pinned versions.
-    cli_pins = {
-        "claude": app_config.PINNED_CLAUDE_CODE_VERSION,
-        "codex": app_config.PINNED_CODEX_VERSION,
-    }
+    cli_pins = _cli_pins_by_binary()
     for m in machines:
         try:
             m["capabilities"] = json.loads(m.get("capabilities", "{}") or "{}")
@@ -700,7 +708,7 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
             m["capabilities"] = {}
         # device_grants is a TEXT JSON-array column → parse to a list so the
         # dashboard receives string[].
-        m["device_grants"] = sorted(remote_store._parse_device_grants(m.get("device_grants")))
+        m["device_grants"] = sorted(placement.parse_device_grants(m.get("device_grants")))
         _shape_browser_fields(m)
         m["cli_pins"] = cli_pins
         _merge_live_status(m)
@@ -723,16 +731,36 @@ async def get_machine(
     except (json.JSONDecodeError, TypeError):
         machine["capabilities"] = {}
     # device_grants TEXT JSON-array → list for the dashboard.
-    machine["device_grants"] = sorted(remote_store._parse_device_grants(machine.get("device_grants")))
+    machine["device_grants"] = sorted(placement.parse_device_grants(machine.get("device_grants")))
     _shape_browser_fields(machine)
     machine["assigned_agents"] = remote_store.get_agents_for_machine(machine_id)
-    import config as app_config
-    machine["cli_pins"] = {
-        "claude": app_config.PINNED_CLAUDE_CODE_VERSION,
-        "codex": app_config.PINNED_CODEX_VERSION,
-    }
+    machine["cli_pins"] = _cli_pins_by_binary()
     _merge_live_status(machine)
     return machine
+
+
+async def _notify_owner_machine_removed(machine: dict, owner_sub: str) -> None:
+    """Tell the owner of a user-paired machine that an admin removed it — the
+    notification path the admin offline alerts use. A delivery failure never
+    fails the delete (the row is already gone)."""
+    from services.notifications import notification_manager
+
+    name = machine.get("name") or str(machine.get("id") or "")[:8]
+    try:
+        await notification_manager.fire_notification(
+            title=f"Remote machine removed: {name}",
+            body=(
+                f"An admin removed your remote machine '{name}'. The satellite "
+                "will uninstall itself from it; your agents run where they run "
+                "by default until you pair a machine again."
+            ),
+            severity="warning", scope="user", target=owner_sub,
+            source="satellite", source_id=str(machine.get("id") or ""),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to notify %s that their machine was removed", owner_sub[:16],
+        )
 
 
 @router.delete("/v1/admin/remote-machines/{machine_id}")
@@ -740,19 +768,24 @@ async def delete_machine(
     machine_id: str,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Delete a remote machine. Resets affected agents to local execution.
+    """Delete a remote machine — admin- or user-paired. Resets affected
+    agents to local execution.
 
     Also fires the self-uninstall flow on the satellite — sends
     an ``uninstall`` WS message if connected, then deletes the DB row.
     Offline satellites self-uninstall the next time they try to reconnect
     (auth handler rejects with close code 4006 ``machine_deleted``).
+    A user-paired machine's owner (when it is not the caller) is notified.
     """
-    _require_admin(user)
+    u = _require_admin(user)
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     await _trigger_self_uninstall(machine_id)
     remote_store.delete_remote_machine(machine_id)
+    owner = machine.get("registered_by") or ""
+    if machine.get("pairing_scope") == placement.PAIRING_USER and owner and owner != u.sub:
+        await _notify_owner_machine_removed(machine, owner)
     return {"ok": True}
 
 
@@ -942,7 +975,7 @@ async def user_set_allow_full_fs(
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != "user":
+    if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1019,7 +1052,7 @@ async def user_set_device_grants(
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != "user":
+    if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1081,7 +1114,7 @@ def _browser_machine_for_admin(machine_id: str, user: UserContext | None) -> dic
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") == "user":
+    if machine.get("pairing_scope") == placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1097,7 +1130,7 @@ def _browser_machine_for_owner(machine_id: str, user: UserContext | None) -> dic
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != "user":
+    if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1112,7 +1145,7 @@ def _browser_machine_for_owner(machine_id: str, user: UserContext | None) -> dic
 
 def _apply_browser_mode(machine: dict, mode: str) -> dict:
     mode = _validate_browser_mode(mode)
-    granted = remote_store._parse_device_grants(machine.get("device_grants"))
+    granted = placement.parse_device_grants(machine.get("device_grants"))
     if mode == "own" and "browser" not in granted:
         raise HTTPException(
             status_code=422, detail="Grant browser control on this machine first.",
@@ -1235,7 +1268,7 @@ async def _push_policy_update(machine_id: str) -> None:
     """
     machine = remote_store.get_remote_machine(machine_id) or {}
     allow_full_fs = bool(machine.get("allow_full_fs") or False)
-    device_grants = sorted(remote_store._parse_device_grants(machine.get("device_grants")))
+    device_grants = sorted(placement.parse_device_grants(machine.get("device_grants")))
     try:
         from core.session import session_state
         n_fs = session_state.refresh_target_allow_full_fs(machine_id, allow_full_fs)
@@ -1353,7 +1386,7 @@ async def assign_agent(
     # user's personal sessions only; allowing them as an agent default
     # would let any session on that agent expose data to a user-owned
     # satellite the rest of the agent's users can't see.
-    if machine.get("pairing_scope") != "admin":
+    if not placement.machine_is_admin_paired(machine):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1367,12 +1400,14 @@ async def assign_agent(
     if not agent_store.agent_exists(body.agent_slug):
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Direct LLM agents cannot run remotely
+    # An engine that cannot run on a satellite cannot be assigned one
     agent = agent_store.get_agent(body.agent_slug)
-    if agent and agent.get("execution_path") == "direct-llm":
+    from core.session.session_manager import get_layer_capabilities
+    _ac = get_layer_capabilities((agent or {}).get("execution_path") or "") if agent else None
+    if _ac is not None and not _ac.runtime.supports_remote_execution:
         raise HTTPException(
             status_code=400,
-            detail="Direct LLM agents always run locally (API calls, no subprocess)",
+            detail=f"{_ac.display_name} agents always run locally (API calls, no subprocess)",
         )
 
     remote_store.set_agent_remote_target(
@@ -1408,7 +1443,7 @@ def _require_creator(user: UserContext | None) -> UserContext:
     u = require_auth(user)
     if getattr(u, "is_api_key", False):
         raise HTTPException(status_code=403, detail="User authentication required (not API key)")
-    if u.role not in ("admin", "creator"):
+    if not roles.is_creator_or_above(u.role):
         raise HTTPException(status_code=403, detail="Creator role required")
     return u
 
@@ -1444,7 +1479,7 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
     """
     u = _require_user_authenticated(user)
     machines = remote_store.get_visible_machines_for_user(
-        u.sub, include_admin_paired=(u.role == "admin"),
+        u.sub, include_admin_paired=u.is_admin,
     )
     import json
     for m in machines:
@@ -1454,7 +1489,7 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
             m["capabilities"] = {}
         # device_grants is a TEXT JSON-array column → parse to a list so the
         # dashboard receives string[].
-        m["device_grants"] = sorted(remote_store._parse_device_grants(m.get("device_grants")))
+        m["device_grants"] = sorted(placement.parse_device_grants(m.get("device_grants")))
         _shape_browser_fields(m)
         _merge_live_status(m)
     targets = remote_store.get_user_remote_targets(u.sub)
@@ -1537,7 +1572,7 @@ async def delete_my_machine(
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine.get("pairing_scope") != "user":
+    if machine.get("pairing_scope") != placement.PAIRING_USER:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1565,7 +1600,7 @@ async def set_my_machine_auto_update(
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine["registered_by"] != u.sub and u.role != "admin":
+    if machine["registered_by"] != u.sub and not u.is_admin:
         raise HTTPException(status_code=403, detail="Not your machine")
     remote_store.set_auto_update_enabled(machine_id, body.enabled)
     return {"ok": True, "auto_update_enabled": body.enabled}
@@ -1582,7 +1617,7 @@ async def trigger_my_machine_update_now(
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
-    if machine["registered_by"] != u.sub and u.role != "admin":
+    if machine["registered_by"] != u.sub and not u.is_admin:
         raise HTTPException(status_code=403, detail="Not your machine")
     return await _do_trigger_update_now(machine_id, machine)
 
@@ -1666,7 +1701,7 @@ async def set_my_per_agent_target(
 
     # Access gate: user must be assigned to the agent.
     from storage import database as _db
-    if u.role != "admin":
+    if not u.is_admin:
         roles = _db.get_user_agent_roles(u.sub)
         if agent_slug not in roles:
             raise HTTPException(
@@ -1678,7 +1713,7 @@ async def set_my_per_agent_target(
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     # Ownership gate: non-admins can only target machines they paired.
-    if u.role != "admin" and machine.get("registered_by") != u.sub:
+    if not u.is_admin and machine.get("registered_by") != u.sub:
         raise HTTPException(status_code=403, detail="Not your machine")
 
     # Shared-only (agent-scoped) agents have ONE shared chat history across ALL
@@ -1686,7 +1721,7 @@ async def set_my_per_agent_target(
     # must hold only that user's own scoped chats. They run on admin machines
     # only. (If the agent later leaves shared-only mode, personal overrides are
     # allowed again; switching INTO shared-only purges existing ones.)
-    if (machine.get("pairing_scope") or "") == "user":
+    if (machine.get("pairing_scope") or "") == placement.PAIRING_USER:
         from core.session import visibility
         if visibility.is_shared_only(agent_slug):
             raise HTTPException(

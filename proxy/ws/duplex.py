@@ -55,6 +55,7 @@ from websockets.exceptions import ConnectionClosed
 
 import config
 from services.media import audio_service, duplex_service, ws_audio_token
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -172,7 +173,7 @@ async def ws_duplex_handler(websocket: WebSocket):
         str(init.get("token") or ""), purpose=ws_audio_token.PURPOSE_DUPLEX,
     ) if init.get("type") == "init" else None
     if not claims or not ws_audio_token.consume_jti(claims.get("jti", "")):
-        await _send_json(websocket, {"type": "error", "reason": "bad_token"})
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "bad_token"})
         await _close_ws(websocket, 4401)
         return
 
@@ -183,17 +184,16 @@ async def ws_duplex_handler(websocket: WebSocket):
     # admin flip or a role change by up to its TTL).
     cap = await asyncio.to_thread(audio_service.duplex_capability)
     if not cap.get("available"):
-        await _send_json(websocket, {"type": "error", "reason": "engine_offline"})
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "engine_offline"})
         await _close_ws(websocket, 4503)
         return
-    user_row = await asyncio.to_thread(_get_user, sub)
+    from auth.providers import user_context_for_sub
+    viewer = await asyncio.to_thread(user_context_for_sub, sub)
     denial = await asyncio.to_thread(
-        duplex_service.chat_access_denied_reason, chat_id,
-        user_sub=sub, user_role=(user_row or {}).get("role") or "",
-        user_agents=(user_row or {}).get("agents") or [],
+        duplex_service.chat_access_denied_reason, chat_id, viewer,
     )
     if denial:
-        await _send_json(websocket, {"type": "error", "reason": "access_denied"})
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "access_denied"})
         await _close_ws(websocket, 4403)
         return
 
@@ -210,7 +210,7 @@ async def ws_duplex_handler(websocket: WebSocket):
     mgmt_ws = phone_config.pick_duplex_client()
     if mgmt_ws is None:
         _pending.pop(bridge.duplex_id, None)
-        await _send_json(websocket, {"type": "error", "reason": "engine_offline"})
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "engine_offline"})
         await _close_ws(websocket, 4503)
         return
     session_config = await asyncio.to_thread(
@@ -225,7 +225,7 @@ async def ws_duplex_handler(websocket: WebSocket):
         })
     except Exception:
         _pending.pop(bridge.duplex_id, None)
-        await _send_json(websocket, {"type": "error", "reason": "engine_offline"})
+        await _send_json(websocket, {"type": wire.ERROR, "reason": "engine_offline"})
         await _close_ws(websocket, 4503)
         return
 
@@ -306,18 +306,6 @@ async def ws_duplex_handler(websocket: WebSocket):
         pass
     finally:
         await _teardown(bridge, "browser_closed")
-
-
-def _get_user(sub: str) -> dict | None:
-    """User row + assigned agents for the access re-check."""
-    from storage import database as task_store
-    user = task_store.get_user(sub)
-    if not user:
-        return None
-    return {
-        "role": user.get("role") or "",
-        "agents": list(task_store.get_user_agent_roles(sub).keys()),
-    }
 
 
 # ---------------------------------------------------------------------------

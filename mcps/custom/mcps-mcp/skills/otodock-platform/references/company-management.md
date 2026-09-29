@@ -10,15 +10,21 @@ suggest Head/Senior/Junior; up to 8, renameable). Each agent gets a department +
 in **Agent Settings → Configuration → Department** *(platform admin/creator with
 manager access on the agent)*.
 
-Levels drive **auto-wired delegation**: same level ↔ same level; each level ↔ one level
-above and below (*Adjacent*, the default) — or every agent ↔ every agent in the
-department (*Subtree* reach). Wired links work in BOTH directions, so a junior can hand
-work or files up to its manager. Cycles are refused at spawn time (an agent already in
-the delegation chain 403s) and chains cap at 4 hops by default. Per-department
-**Auto-delegation** toggle turns the wiring off entirely. Auto-wired edges show locked
-("via <Department>") in the agent's Delegation Targets and retract cleanly when an agent
-leaves; hand-checked targets are never touched. Every agent's prompt states its
-department, level, and reachable teammates.
+Levels drive **auto-wired delegation**, and each department picks a **mode**: *Off* (no
+automatic wiring), *Down only* (the default for a new department: each level delegates to
+the level below it and nothing goes up or across, so a head reaches its team and the team
+reaches neither the head nor each other), *Down and across* (the same, plus agents on the
+same level delegating to each other) or *All directions* (each level delegates up and down
+and the same level to each other, so a junior can hand work or files up to its manager).
+The **reach** is independent of the mode and applies to whatever it wires: *One level up or
+down* (only the level directly above or below) or *Whole department* (every level, however
+far apart), so with all directions and the whole department a bottom-level agent reaches the
+head and back. Departments that existed before 1.7 keep the wiring they had (one with
+auto-delegation off became *Off*). Cycles are refused at spawn time (an agent already in
+the delegation chain 403s) and chains cap at 4 hops by default. Auto-wired edges show locked ("via
+<Department>") in the agent's Delegation Targets and retract cleanly when an agent leaves;
+hand-checked targets are never touched. Every agent's prompt states its department, level,
+and reachable teammates.
 
 Managing: **admins** manage all departments, **creators** the ones they created — from
 the Agents page's **Departments** tab or the map's ⋯ menu. Everyone sees only
@@ -33,17 +39,22 @@ devices.
 ## Delegation
 
 An agent hands work to another agent on its **Delegation Targets** roster (Agent
-Settings → Configuration, *manager*; departments auto-wire it). Workers are visible,
-first-class sessions — a chat lane the user can watch and steer, or a background task —
-and results report back to the delegating chat. Multi-lane jobs turn the delegating chat
-into an **orchestrator** with a dock of live lane cards and a board file. Agents can
-also pass real files: deliverables copy into the target's `workspace/inbox/<sender>/`
-(passive — delegate with a prompt to make the target act). Admin caps live on the
-Delegation MCP row.
+Settings → Configuration). A session's delegation targets are that roster: the edges its
+department wires (locked, "via <Department>") plus the targets a manager ticks by hand
+*(manager)*; the agent's prompt lists them. A worker that runs as the target agent
+(agent scope) needs the person behind the chat to be an **editor+** there; a personal
+worker runs as that person and needs only access. Workers are visible, first-class
+sessions — a chat lane the user can watch and steer, or a background task — and results
+report back to the delegating chat. Multi-lane jobs turn the delegating chat into an
+**orchestrator** with a dock of live lane cards and a board file. Agents can also pass
+real files: deliverables copy into the target's `workspace/inbox/<sender>/` (passive —
+delegate with a prompt to make the target act). Admin caps live on the Delegation MCP
+row.
 
-**Cross-agent reads**: in a user's chat, an agent can read whatever that user could see
-on other agents (schedules, task history, sessions, triggers, notifications) — reads
-only, writes never cross agents. An agent's *scheduled* (no-user) runs read the shared
+**Visibility is not delegation.** In a user's chat, an agent can read whatever that user
+could see on other agents (schedules, task history, sessions, triggers, notifications),
+but it hands work or files (`delegate`, `send_files`) only to its own targets — reads
+cross agents, writes never do. An agent's *scheduled* (no-user) runs read the shared
 activity of its delegation roster — the mechanism behind a CEO agent's morning briefing
 that summarizes what the team's agents did overnight.
 
@@ -102,5 +113,7 @@ in Setup → System Settings *(admin)*.
    to whoever needs it; put the "what matters now" in its bulletin.
 3. Department heads get a scheduled morning briefing that reads the roster's overnight
    activity.
-4. Shared dashboards (mini-apps pinned "for the whole team") give each team an
-   at-a-glance board, refreshed by a scheduled task.
+4. A shared app on each team's lead agent gives the team an at-a-glance board, kept
+   fresh by a scheduled task. A shared app can call the shared apps of the agents its
+   agent delegates to (approved on both cards), so a head's board can read its teams'
+   boards; under *Down only* the teams' apps cannot call the head's.

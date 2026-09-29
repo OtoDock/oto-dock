@@ -9,6 +9,7 @@ tests there) and are imported lazily.
 """
 
 import logging
+from core import placement
 
 logger = logging.getLogger("claude-proxy.satellite")
 
@@ -52,11 +53,11 @@ class SatelliteAdminAlertsMixin:
         )
         from storage import remote_store
         from storage.pg import run_db
-        from services.remote.remote_status import get_live_machine_status
+        from services.remote import remote_status
 
         machines = await run_db(remote_store.get_all_remote_machines)
         for m in machines:
-            if (m.get("pairing_scope") or "") != "admin":
+            if not placement.machine_is_admin_paired(m):
                 continue
             # A deliberately paused machine (tray Pause) is offline by
             # intent — skip it so we never page admins. The flag clears on
@@ -67,7 +68,7 @@ class SatelliteAdminAlertsMixin:
             alerted = bool(m.get("offline_alerted"))
             # Pass the row we already hold: the evaluator runs on the loop
             # every 30 s and must not re-read every machine from the DB.
-            live = get_live_machine_status(machine_id, machine=m)
+            live = remote_status.get_live_machine_status(machine_id, machine=m)
 
             if live["reachable"]:
                 if alerted:
@@ -78,7 +79,7 @@ class SatelliteAdminAlertsMixin:
                 continue
 
             # Not reachable. Alert only once, and only past the grace window.
-            if alerted or live["state"] == "never_connected":
+            if alerted or live["state"] == remote_status.NEVER_CONNECTED:
                 continue
             downtime = _seconds_since_iso(m.get("last_seen"))
             if downtime is not None and downtime > _OFFLINE_ALERT_GRACE_S:

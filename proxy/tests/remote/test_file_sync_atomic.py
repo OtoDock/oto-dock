@@ -96,3 +96,116 @@ def test_apply_incoming_rejects_traversal(tmp_path: Path):
     )
     # Parent dir must NOT have the file
     assert not (tmp_path.parent / "escaped.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# The applier opens beneath the agent root; a component swapped after
+# the check never redirects a write, a delete or a directory creation
+# ---------------------------------------------------------------------------
+
+
+def _swap_on_open(monkeypatch, agent_dir, victim):
+    import contextlib
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @contextlib.contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            d = agent_dir / "workspace" / "sub"
+            for child in d.iterdir():
+                child.unlink()
+            d.rmdir()
+            os.symlink(victim, d)
+        with real(root, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+
+
+def _tree(tmp_path):
+    agent = tmp_path / "agents" / "a1"
+    (agent / "workspace" / "sub").mkdir(parents=True)
+    (agent / "workspace" / "sub" / "f.txt").write_bytes(b"mine")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "f.txt").write_bytes(b"ORIGINAL")
+    return agent, victim
+
+
+def test_apply_incoming_write_refuses_a_swapped_component(tmp_path, monkeypatch):
+    from core.remote.file_sync import apply_incoming_file
+    agent, victim = _tree(tmp_path)
+    _swap_on_open(monkeypatch, agent, victim)
+    import pytest
+    with pytest.raises(OSError):
+        apply_incoming_file(agent, "workspace/sub/f.txt", "write", base64.b64encode(b"NEW").decode())
+    assert (victim / "f.txt").read_bytes() == b"ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["f.txt"]
+
+
+def test_apply_incoming_delete_and_mkdir_refuse_a_swapped_component(tmp_path, monkeypatch):
+    from core.remote.file_sync import apply_incoming_file
+    agent, victim = _tree(tmp_path)
+    _swap_on_open(monkeypatch, agent, victim)
+    import pytest
+    with pytest.raises(OSError):
+        apply_incoming_file(agent, "workspace/sub/f.txt", "delete")
+    assert (victim / "f.txt").read_bytes() == b"ORIGINAL"
+    with pytest.raises(OSError):
+        apply_incoming_file(agent, "workspace/sub/newdir", "mkdir")
+    assert sorted(p.name for p in victim.iterdir()) == ["f.txt"]
+
+
+def test_apply_incoming_chunks_stage_beneath_the_root(tmp_path):
+    """The chunk partial is created and committed beneath the root; a link at
+    the partial's name is replaced, never written through."""
+    from core.remote.file_sync import apply_incoming_file
+    agent = tmp_path / "agents" / "a1"
+    (agent / "workspace").mkdir(parents=True)
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"ORIGINAL")
+    (agent / "workspace" / "big.bin.partial").symlink_to(victim)
+    apply_incoming_file(agent, "workspace/big.bin", "write_chunk",
+                        base64.b64encode(b"A" * 8).decode(), final_chunk=False)
+    apply_incoming_file(agent, "workspace/big.bin", "write_chunk",
+                        base64.b64encode(b"B" * 8).decode(), final_chunk=True)
+    assert victim.read_bytes() == b"ORIGINAL"
+    assert (agent / "workspace" / "big.bin").read_bytes() == b"A" * 8 + b"B" * 8
+
+
+def test_prepare_outgoing_refuses_a_link_component(tmp_path):
+    from core.remote.file_sync import prepare_outgoing_files
+    agent = tmp_path / "agents" / "a1"
+    (agent / "workspace").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s.txt").write_bytes(b"SECRET")
+    (agent / "workspace" / "sub").symlink_to(outside)
+    (agent / "workspace" / "ok.txt").write_bytes(b"ok")
+    msgs = prepare_outgoing_files(agent, ["workspace/sub/s.txt", "workspace/ok.txt"])
+    assert [m["path"] for m in msgs] == ["workspace/ok.txt"]
+
+
+def test_hash_cache_stores_the_raw_digest_and_primes_tolerantly(tmp_path, monkeypatch):
+    from core.remote import file_sync
+    f = tmp_path / "f.bin"
+    f.write_bytes(b"content")
+    st = os.stat(f)
+    st_old = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                             st.st_size, st.st_atime, st.st_mtime - 10, st.st_ctime))
+    # An entry the cache keeps is the 32-byte digest, not the 71-char string.
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", type(file_sync._HASH_CACHE)())
+    file_sync.prime_hash_cache(f, "sha256:" + "ab" * 32)
+    entry = file_sync._HASH_CACHE[str(f)]
+    assert isinstance(entry[2], bytes) and len(entry[2]) == 32
+    # A malformed prime never raises and never poisons the cache.
+    file_sync.prime_hash_cache(f, "not-a-hash")
+    assert file_sync._HASH_CACHE[str(f)][2] == bytes.fromhex("ab" * 32) or str(f) not in file_sync._HASH_CACHE
+    # A hit answers the string form; a miss hashes the file.
+    file_sync._HASH_CACHE.clear()
+    h = file_sync._hash_file_cached(f, st_old)
+    assert h == file_sync._hash_file(f)
+    assert file_sync._HASH_CACHE_MAX >= 200_000

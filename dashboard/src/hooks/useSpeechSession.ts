@@ -10,6 +10,7 @@ import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
 import { acquireMic, releaseMic } from '../audio/micCoordinator'
 import { setDictationActive, stopActivePlayback } from '../audio/speechActivity'
+import { browserSttLang } from '../audio/lang'
 import { resolveSttBackend } from '../audio/resolver'
 import { platformStt } from '../audio/backends/platformStt'
 import { type STTBackend, type STTSession } from '../audio/types'
@@ -18,15 +19,6 @@ export type SpeechStatus = 'idle' | 'connecting' | 'recording'
 
 const MIN_CONNECTING_MS = 500    // floor so the spinner doesn't flicker + gives the user a beat
 const CONNECT_TIMEOUT_MS = 8000  // give up if the recognizer never signals ready
-
-// Default STT language from the browser/OS when the user hasn't picked one — the
-// closest the web exposes to "keyboard language" (no API gives the active layout).
-function browserSttLang(): string {
-  try {
-    const base = (navigator.language || 'en').slice(0, 2).toLowerCase()
-    return ['en', 'el', 'de', 'es', 'fr', 'it'].includes(base) ? base : 'en'
-  } catch { return 'en' }
-}
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -82,7 +74,6 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     // for the same every-path coverage as the mic arbiter.
     setDictationActive(status !== 'idle')
   }, [status])
-  useEffect(() => () => { releaseMic('dictation'); setDictationActive(false) }, [])
 
   const stop = useCallback((discardTail = false) => {
     if (discardTail) killRef.current?.()
@@ -92,6 +83,11 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     hRef.current.onActive?.(false)
     s?.stop().catch(() => {})
   }, [])
+
+  // Unmount stops a running session too (a plain stop: its tail still lands
+  // through the handlers in the draft it was dictated into; a user-stopped
+  // attempt has already cleared sessionRef and is untouched).
+  useEffect(() => () => { stop(); releaseMic('dictation'); setDictationActive(false) }, [stop])
 
   const start = useCallback(async () => {
     if (sessionRef.current) return

@@ -15,3 +15,11 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolation_inline(monkeypatch):
     monkeypatch.setenv("FILETOOLS_ISOLATION_INLINE", "1")
+
+
+@pytest.fixture(autouse=True)
+def _write_root(monkeypatch, tmp_path):
+    """Every output opens beneath the write root (the mount in the
+    container); the suite writes under ``tmp_path``, and a spawn child
+    inherits the variable."""
+    monkeypatch.setenv("FILETOOLS_WRITE_ROOT", str(tmp_path))

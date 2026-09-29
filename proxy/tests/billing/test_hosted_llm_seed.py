@@ -21,15 +21,19 @@ def _relay_providers() -> set[str]:
     }
 
 
+# What startup resolves from the descriptors: every relay-backed provider of
+# the engine that takes ``relay`` rows.
+_RELAY_ROWS = [("direct-llm", "anthropic"), ("direct-llm", "openai"), ("direct-llm", "groq")]
+
 def test_seed_creates_three_relay_subs():
-    ss.seed_hosted_llm_subscriptions()
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)
     assert _relay_providers() == {"anthropic", "openai", "groq"}
     assert db.get_platform_setting("hosted_llm_seeded") == "1"
 
 
 def test_seed_is_idempotent():
-    ss.seed_hosted_llm_subscriptions()
-    ss.seed_hosted_llm_subscriptions()  # second call → no-op
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)  # second call → no-op
     subs = [
         s for s in ss.list_subscriptions(
             layer="direct-llm", contribute_platform=True, include_disabled=True,
@@ -40,7 +44,7 @@ def test_seed_is_idempotent():
 
 
 def test_seed_respects_admin_disable():
-    ss.seed_hosted_llm_subscriptions()
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)
     # Admin disables OpenAI hosted by removing its relay sub.
     openai_sub = next(
         s for s in ss.list_subscriptions(
@@ -51,14 +55,14 @@ def test_seed_respects_admin_disable():
     ss.delete_subscription(openai_sub["id"])
     assert _relay_providers() == {"anthropic", "groq"}
     # Re-seed (e.g. on restart) must NOT bring OpenAI back — the flag guards it.
-    ss.seed_hosted_llm_subscriptions()
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)
     assert _relay_providers() == {"anthropic", "groq"}
 
 
 def test_seeded_relay_sub_is_acquirable():
     from services.engines import subscription_pool
     subscription_pool._session_subscriptions.clear()
-    ss.seed_hosted_llm_subscriptions()
+    ss.seed_hosted_llm_subscriptions(_RELAY_ROWS)
 
     handle = subscription_pool.acquire_subscription(
         "direct-llm", None, provider="anthropic",

@@ -36,34 +36,27 @@ class RemoteAbortMixin:
     # --- ExecutionLayer interface: abort ---
 
     async def abort(self, session_id: str) -> bool:
-        """Abort the in-flight turn — graceful-first for both engines.
+        """Abort the in-flight turn — graceful-first for every engine.
 
-        Graceful path (live turn, satellite ≥ 0.5.89):
-        - claude-code-cli: send ``interrupt_turn`` — the satellite writes the
-          same ``control_request {interrupt}`` frame the local layer uses into
-          the CLI's stdin, the CLI closes the turn with a normal result event
-          that flows back through the event stream, and the process + MCP
-          sidecars SURVIVE for the next prompt (no re-warm).
-        - codex-cli: send the regular ``abort`` frame — the satellite's codex
-          twin handles it softly (``turn/interrupt``; the warm daemon
-          survives) and its persistent forwarder keeps relaying events, so
-          the daemon's terminal turn event reaches the kept-alive producer
-          just like the LOCAL graceful codex abort (same app-server binary,
-          same shared translator; 2026-07-09 live drill closed the turn in
-          ~100ms). Codex reuses ``abort`` because the deployed satellites'
-          ``interrupt_turn`` handler is CLI-only (requires a ``proc``); the
-          ``session_aborted`` ack the satellite sends back no longer drains
-          the event queue unless a HARD abort armed it (see
-          satellite_connection), so it can't steal the closing turn's tail.
-
-        Either way the producer/pump keep running to persist the partial
-        turn, and a watchdog falls back to the hard path if the turn doesn't
-        close.
+        Graceful path (live turn, satellite ≥ 0.5.89): send the engine's
+        soft-interrupt frame (``RemoteEngineAdapter.soft_interrupt_frame`` —
+        Claude's ``interrupt_turn`` writes the same ``control_request
+        {interrupt}`` the local layer uses into the CLI's stdin and the
+        process + MCP sidecars SURVIVE for the next prompt; Codex's is the
+        regular ``abort``, which its satellite twin handles softly with
+        ``turn/interrupt`` while its persistent forwarder keeps relaying the
+        closing turn's tail — the deployed satellites' ``interrupt_turn``
+        handler is CLI-only). The ``session_aborted`` ack the satellite
+        sends back drains the event queue only when a HARD abort armed it
+        (see satellite_connection), so it can't steal the closing turn's
+        tail. Either way the producer/pump keep running to persist the
+        partial turn, and a watchdog falls back to the hard path if the turn
+        doesn't close.
 
         Hard path (no live turn, older satellite, send failure, or watchdog
-        escalation): the satellite kills the CLI subprocess (its codex twin
-        soft-interrupts the daemon turn instead), and the caller keeps the
-        producer-cancel + cancelled-context injection.
+        escalation): the satellite kills the process (an engine whose hard
+        abort leaves its daemon warm soft-interrupts instead), and the caller
+        keeps the producer-cancel + cancelled-context injection.
         """
         info = self._sessions.get(session_id)
         if not info:
@@ -75,11 +68,7 @@ class RemoteAbortMixin:
             # Same release as the hard path: a pending hook/native permission
             # waiter must not strand the turn we just asked to close.
             resolve_session_permissions(session_id, approved=False)
-            frame = (
-                "interrupt_turn"
-                if info.execution_path == "claude-code-cli"
-                else "abort"
-            )
+            frame = self._adapter(info).soft_interrupt_frame()
             try:
                 await self._cm.send_fire_and_forget(info.machine_id, {
                     "type": frame,
@@ -133,41 +122,42 @@ class RemoteAbortMixin:
         except Exception as e:
             logger.warning("Remote abort send failed for session %s: %s",
                            session_id[:8], e)
-        # CLI persistent subprocess on the satellite exits as part of the
-        # abort. The dashboard's auto-resume path needs ``is_session_process_dead``
-        # to return True on the next user message so it spawns a fresh
-        # session — without this flag, the satellite would respond to the
-        # next ``send_message`` with ``RuntimeError: CLI process not running``.
-        # The codex daemon soft-interrupts its turn and stays alive, so this
-        # flag only applies to claude-code-cli.
-        if info.execution_path == "claude-code-cli":
+        # An engine whose hard abort kills its process (Claude: the persistent
+        # subprocess exits as part of the abort) is flagged dead so the
+        # dashboard's auto-resume path (``is_session_process_dead``) spawns a
+        # fresh session on the next user message — without this flag, the
+        # satellite would answer the next ``send_message`` with ``RuntimeError:
+        # CLI process not running``. An engine whose daemon soft-interrupts
+        # its turn and stays warm (Codex) is not.
+        if self.capabilities_for(session_id).runtime.hard_abort_kills_process:
             info.cli_dead = True
         return False
 
     async def interrupt_for_queued(self, session_id: str) -> bool:
-        """Stop-and-send for a REMOTE Claude CLI session — the graceful arm
-        of ``abort`` only: relay ``interrupt_turn`` (the satellite writes the
-        same ``control_request {interrupt}`` into the CLI's stdin; process +
-        MCP sidecars + background tasks survive). NO ``_soft_interrupt_
-        watchdog``, NO ``_hard_abort`` — an ignored interrupt degrades to
-        the queued message draining at the natural turn end. Send-THEN-
-        resolve (opposite of ``abort``): ``send_fire_and_forget`` silently
-        no-ops on a disconnected machine, and a failed send must never deny
-        a parked permission blind — that would un-park the turn with no
-        interrupt delivered.
+        """Stop-and-send for a REMOTE session of an engine that supports it
+        (``behaviour.supports_interrupt_for_queued`` — Claude) — the graceful
+        arm of ``abort`` only: relay the engine's soft-interrupt frame (the
+        satellite writes the same ``control_request {interrupt}`` into the
+        CLI's stdin; process + MCP sidecars + background tasks survive). NO
+        ``_soft_interrupt_watchdog``, NO ``_hard_abort`` — an ignored
+        interrupt degrades to the queued message draining at the natural turn
+        end. Send-THEN-resolve (opposite of ``abort``): ``send_fire_and_forget``
+        silently no-ops on a disconnected machine, and a failed send must
+        never deny a parked permission blind — that would un-park the turn
+        with no interrupt delivered.
         """
         info = self._sessions.get(session_id)
         if (
             info is None
             or not info.turn_active
-            or info.execution_path != "claude-code-cli"
+            or not self.capabilities_for(session_id).behaviour.supports_interrupt_for_queued
             or not self._cm.is_connected(info.machine_id)
             or not self._cm.satellite_supports_soft_interrupt(info.machine_id)
         ):
             return False
         try:
             await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "interrupt_turn",
+                "type": self._adapter(info).soft_interrupt_frame(),
                 "session_id": session_id,
             })
         except Exception as e:

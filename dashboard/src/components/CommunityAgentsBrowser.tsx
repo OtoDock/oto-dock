@@ -16,6 +16,7 @@ import {
 } from '../api/communityAgents'
 import { safeHref } from '../lib/safeUrl'
 import AgentInstallModal from './AgentInstallModal'
+import AgentUpdateModal from './AgentUpdateModal'
 
 interface Props {
   open: boolean
@@ -28,6 +29,7 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [selectedTemplate, setSelectedTemplate] = useState<CommunityAgentRegistryEntry | null>(null)
+  const [updateSlug, setUpdateSlug] = useState<string | null>(null)
 
   const filtered = useMemo(() => {
     const agents = data?.agents ?? []
@@ -136,6 +138,7 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
                   key={agent.slug}
                   agent={agent}
                   onInstall={() => setSelectedTemplate(agent)}
+                  onUpdate={slug => setUpdateSlug(slug)}
                 />
               ))}
             </div>
@@ -173,6 +176,9 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
         template={selectedTemplate}
         onClose={() => setSelectedTemplate(null)}
       />
+      {updateSlug && (
+        <AgentUpdateModal open agentSlug={updateSlug} onClose={() => setUpdateSlug(null)} />
+      )}
     </>
   )
 }
@@ -185,12 +191,15 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
 function AgentCard({
   agent,
   onInstall,
+  onUpdate,
 }: {
   agent: CommunityAgentRegistryEntry
   onInstall: () => void
+  onUpdate: (agentSlug: string) => void
 }) {
   const installedAs = agent.installed_as ?? []
   const installed = installedAs.length > 0
+  const updatable = (agent.installed ?? []).filter(i => i.update_available)
   const [expanded, setExpanded] = useState(false)
 
   // Heuristic: ~150 chars or two lines is roughly when "Show details" becomes
@@ -258,6 +267,9 @@ function AgentCard({
         {agent.has_tasks && <span>· seeded tasks</span>}
         {agent.has_triggers && <span>· seeded triggers</span>}
         {agent.has_notifications && <span>· seeded notifications</span>}
+        {agent.has_apps && <span>· shared apps</span>}
+        {agent.has_user_apps && <span>· a personal app for each member</span>}
+        {agent.has_checks && <span>· checks</span>}
         {agent.has_context && <span>· auto-context files</span>}
       </div>
 
@@ -305,6 +317,19 @@ function AgentCard({
           ✓ Installed as: {installedAs.join(', ')}
         </div>
       )}
+      {updatable.map(i => (
+        <div key={i.agent_slug} className="flex items-center justify-between gap-2 text-[11px]" data-testid={`update-row-${i.agent_slug}`}>
+          <span className="text-p-text-secondary truncate">
+            <span className="font-mono">{i.agent_slug}</span>: {i.version || 'unknown'} → {agent.version}
+          </span>
+          <button
+            onClick={() => onUpdate(i.agent_slug)}
+            className="px-2 py-1 rounded-sm border border-brand/40 text-brand hover:bg-brand/10 transition-colors whitespace-nowrap"
+          >
+            Update
+          </button>
+        </div>
+      ))}
 
       <div className="flex items-center gap-2 mt-auto">
         {hasMoreContent && (

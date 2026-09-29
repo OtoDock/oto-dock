@@ -1,17 +1,14 @@
 import { useState } from 'react'
-import {
-  detectSatelliteOs,
-  type PairResult,
-  type SatelliteOs,
-} from '../api/remoteMachines'
+import { type PairResult } from '../api/remoteMachines'
+import { BOOTSTRAP_OS, detectBootstrapOs, type BootstrapOs } from '../lib/hostOs/os'
 
-const OS_LABEL: Record<SatelliteOs, string> = {
+const OS_LABEL: Record<BootstrapOs, string> = {
   linux: 'Linux',
   macos: 'macOS',
   windows: 'Windows',
 }
 
-const OS_HELPER: Record<SatelliteOs, string> = {
+const OS_HELPER: Record<BootstrapOs, string> = {
   linux: 'Run in a terminal on the remote machine.',
   macos: 'Run in Terminal.app on the remote machine.',
   windows: 'Run in a normal PowerShell on the remote machine — no administrator rights needed (Windows may prompt once to install missing tools).',
@@ -29,7 +26,7 @@ interface Props {
  * admin RemoteMachinesPage and the user UserSettings pair modals.
  */
 export default function PairInstallCommand({ pairResult, introText }: Props) {
-  const [os, setOs] = useState<SatelliteOs>(detectSatelliteOs())
+  const [os, setOs] = useState<BootstrapOs>(detectBootstrapOs())
   const cmd = pairResult.install_commands[os]
 
   return (
@@ -38,7 +35,7 @@ export default function PairInstallCommand({ pairResult, introText }: Props) {
         <p className="text-sm text-p-text-light">{introText}</p>
       )}
       <div className="inline-flex rounded-lg border border-p-border-light p-0.5 bg-p-surface">
-        {(['linux', 'macos', 'windows'] as const).map(o => (
+        {BOOTSTRAP_OS.map(o => (
           <button
             key={o}
             type="button"

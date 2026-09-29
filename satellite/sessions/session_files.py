@@ -39,7 +39,8 @@ import urllib.request
 from pathlib import Path
 
 from ..config import otodock_dir
-from ..host import path_translator
+from ..host import auth_paths, path_translator
+from .._vendored import layout
 import contextlib
 
 logger = logging.getLogger("satellite.session_files")
@@ -107,7 +108,7 @@ def materialize(
     if not files:
         return {}
 
-    username = path_translator.derive_username_from_cwd_relative(
+    username = layout.user_of(
         config.get("cwd_relative", ""),
     )
     base = _session_dir(session_id)
@@ -118,21 +119,21 @@ def materialize(
         if relpath.startswith("/"):
             # Sandbox-virtual target (OAuth credentials_dir token file):
             # translate into the agent tree. An unknown prefix passes
-            # through translate_path unchanged and then fails the
+            # through the vendored rule unchanged and then fails the
             # inside-agent-dir check — refused, like traversal.
             if agent_dir is None:
                 logger.warning(
                     "session-files: no agent_dir, skipping %r", relpath,
                 )
                 continue
-            dest = Path(path_translator.translate_path(
-                relpath, agent_dir, username,
+            dest = Path(layout.host_of_virtual(
+                relpath, agent_dir, username, path_translator.STATE_DIRS,
             )).resolve()
             root = agent_dir.resolve()
         else:
             dest = (base / relpath).resolve()
             root = base.resolve()
-        if not str(dest).startswith(str(root) + os.sep):
+        if dest == root or not auth_paths.is_path_under_root(dest, root):
             logger.warning("session-files: refusing path %r", relpath)
             continue
         try:
@@ -210,7 +211,8 @@ def purge_agent_tree_credentials(agents_dir: Path | None) -> None:
     if not agents_dir or not agents_dir.is_dir():
         return
     removed = 0
-    for pattern in ("*/knowledge/.credentials", "*/users/*/.credentials"):
+    for pattern in (f"*/{layout.KNOWLEDGE}/{layout.CREDENTIALS_DIR}",
+                    f"*/{layout.USERS}/*/{layout.CREDENTIALS_DIR}"):
         for d in agents_dir.glob(pattern):
             shutil.rmtree(d, ignore_errors=True)
             removed += 1

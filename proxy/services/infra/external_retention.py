@@ -39,6 +39,7 @@ from typing import Iterator
 
 import config
 from core.session import external_identity
+from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
 from storage.files import file_author_store
 from storage.files import file_tombstones_store
@@ -89,8 +90,8 @@ def _agent_dirs() -> Iterator[tuple[str, Path]]:
     agents_dir = Path(config.AGENTS_DIR)
     if not agents_dir.is_dir():
         return
-    for agent_dir in sorted(agents_dir.iterdir()):
-        if agent_dir.is_dir() and (agent_dir / external_identity.EXTERNALS_DIRNAME).is_dir():
+    for agent_dir in sorted(agent_dirs(agents_dir)):
+        if (agent_dir / external_identity.EXTERNALS_DIRNAME).is_dir():
             yield agent_dir.name, agent_dir
 
 
@@ -210,22 +211,16 @@ def remove_home(agent: str, home: Path, stats: dict, dry_run: bool) -> bool:
 
 def _session_files(agent: str, sid: str, tid: str) -> list[Path]:
     """The on-disk CLI state of one phone chat: under the agent's shared
-    workspace home (shared / user-tied calls) or any caller tree."""
-    base = config.get_agent_dir(agent)
-    ext = base / external_identity.EXTERNALS_DIRNAME
+    workspace home, a user's home (a user-tied call) or any caller tree —
+    every engine names its own files under each home
+    (``ExecutionLayer.chat_session_files``)."""
+    from core.session.session_manager import get_all_layers
+    from services.infra.retention import iter_local_homes
+    layers = list(get_all_layers().values())
     files: list[Path] = []
-    if sid:
-        for pattern in (f"workspace/.claude/projects/*/{sid}.jsonl",
-                        f"users/*/.claude/projects/*/{sid}.jsonl"):
-            files.extend(base.glob(pattern))
-        for pattern in (f"*/*/.claude/projects/*/{sid}.jsonl",
-                        f"*/{external_identity.EPHEMERAL_DIRNAME}/*/.claude/projects/*/{sid}.jsonl"):
-            files.extend(ext.glob(pattern))
-    if tid:
-        for pattern in (f"workspace/.codex/sessions/**/*{tid}.jsonl",
-                        f"users/*/.codex/sessions/**/*{tid}.jsonl"):
-            files.extend(base.glob(pattern))
-        files.extend(ext.glob(f"*/*/.codex/sessions/**/*{tid}.jsonl"))
+    for _agent, _username, home in iter_local_homes(agent=agent):
+        for layer in layers:
+            files.extend(layer.chat_session_files(home, sid, tid))
     return files
 
 

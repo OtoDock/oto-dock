@@ -10,10 +10,12 @@ sessions and machines.
 """
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from core import placement
 
 
 class _FakeInfo:
@@ -384,14 +386,18 @@ async def test_global_lock_serializes_two_sessions_one_file(temp_db, reset_flow)
 # ---------------------------------------------------------------------------
 
 
+_PLACEMENT = placement.PlacementCapabilities(
+    kind=placement.KIND_ADMIN_REMOTE, machine_id="m-1",
+    agents_dir="/home/alice/.oto-dock/agents", home_dir="/home/alice",
+)
+
+
 def _remote_ctx(**over):
     """A persisted-shape SecurityContext for a satellite-parented session."""
     from auth.path_policy import SecurityContext
     base = dict(
         role="admin", username="alice", agent="agent-1", is_admin_agent=False,
-        target_kind="admin_remote", target_machine_id="m-1",
-        target_agents_dir="/home/alice/.oto-dock/agents",
-        target_home_dir="/home/alice",
+        placement=_PLACEMENT,
     )
     base.update(over)
     return SecurityContext(**base)
@@ -425,7 +431,7 @@ def test_registry_miss_falls_back_to_persisted_ctx(iso_security):
     from core.session import session_state
 
     session_state.set_session_security(
-        "surv-1", _remote_ctx(target_machine_id="m-9", agent="agent-9"),
+        "surv-1", _remote_ctx(agent="agent-9", placement=dataclasses.replace(_PLACEMENT, machine_id="m-9")),
     )
     with patch(
         "core.session.session_manager._get_remote_layer",
@@ -446,10 +452,7 @@ def test_registry_miss_without_machine_id_stays_local(iso_security):
 
     session_state.set_session_security(
         "loc-1",
-        _remote_ctx(
-            target_kind="local", target_machine_id="",
-            target_agents_dir="", target_home_dir="",
-        ),
+        _remote_ctx(placement=placement.LOCAL_PLACEMENT),
     )
     with patch(
         "core.session.session_manager._get_remote_layer",
@@ -512,7 +515,7 @@ async def test_pull_through_via_fallback_after_restart(
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     session_state.set_session_security(
-        "surv-2", _remote_ctx(target_machine_id="m-7", agent="agent-1"),
+        "surv-2", _remote_ctx(agent="agent-1", placement=dataclasses.replace(_PLACEMENT, machine_id="m-7")),
     )
 
     mock_cm = MagicMock()
@@ -733,3 +736,77 @@ async def test_probe_stat_type_gates_non_dict_replies(reset_flow):
     # A genuine dict still passes through untouched.
     cm = _mock_cm(supports_stat=True, stat=_STAT_V1)
     assert await remote_file_flow._probe_stat(cm, "m-1", object()) == _STAT_V1
+
+
+# ---------------------------------------------------------------------------
+# The per-(agent, path) lock map: bounded, never evicting a lock in use
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_lock_map_is_bounded_and_keeps_locks_in_use(reset_flow):
+    from core.remote import remote_file_flow as rff
+    held = await rff._acquire_global_path_lock("a", "held.txt")
+    await held.acquire()
+    waited = await rff._acquire_global_path_lock("a", "waited.txt")
+    await waited.acquire()
+    waiter = asyncio.create_task(waited.acquire())
+    await asyncio.sleep(0)
+    shared_a = await rff._acquire_global_path_lock("a", "shared.txt")
+    for i in range(rff._PATH_LOCKS_MAX + 2000):
+        await rff._acquire_global_path_lock("a", f"f{i}.txt")
+    assert len(rff._global_path_locks) <= rff._PATH_LOCKS_MAX
+    # A lock that is held or awaited is never evicted; a re-acquire hands
+    # back the same object.
+    assert await rff._acquire_global_path_lock("a", "held.txt") is held
+    assert await rff._acquire_global_path_lock("a", "waited.txt") is waited
+    # An idle lock that survived the churn is still the same object; one that
+    # was evicted comes back fresh, which is safe because nobody was about to
+    # enter it.
+    again = await rff._acquire_global_path_lock("a", "shared.txt")
+    assert again is shared_a or again.idle()
+    held.release()
+    waited.release()
+    await waiter
+    waited.release()
+
+
+@pytest.mark.asyncio
+async def test_two_acquirers_of_one_key_share_one_lock(reset_flow):
+    from core.remote import remote_file_flow as rff
+    a = await rff._acquire_global_path_lock("agent", "x.txt")
+    b = await rff._acquire_global_path_lock("agent", "x.txt")
+    assert a is b
+    fa = await rff.acquire_fanout_lock("agent", "x.txt")
+    fb = await rff.acquire_fanout_lock("agent", "x.txt")
+    assert fa is fb and fa is not a
+
+
+def test_every_caller_enters_the_lock_it_was_handed_at_once():
+    """The eviction rule leans on this shape: no await between receiving the
+    lock and entering it, so an idle lock has no holder about to enter."""
+    import re
+    from tests._paths import PROXY_DIR
+    files = [
+        "core/remote/remote_file_flow.py", "core/remote/remote_workspace_sync.py",
+        "services/remote/workspace_fanout.py", "core/remote/satellite_file_transfer.py",
+    ]
+    pattern = re.compile(r"^\s*(\w+) = await (?:remote_file_flow\.)?_acquire_global_path_lock\(")
+    seen = 0
+    for rel in files:
+        lines = (PROXY_DIR / rel).read_text().splitlines()
+        for idx, line in enumerate(lines):
+            m = pattern.match(line)
+            if not m:
+                continue
+            seen += 1
+            name = m.group(1)
+            window = lines[idx + 1: idx + 6]
+            entered = False
+            for follow in window:
+                if f"async with {name}" in follow:
+                    entered = True
+                    break
+                assert "await" not in follow, f"{rel}:{idx + 1}: an await before entering {name}"
+            assert entered, f"{rel}:{idx + 1}: {name} is not entered within five lines"
+    assert seen >= 6

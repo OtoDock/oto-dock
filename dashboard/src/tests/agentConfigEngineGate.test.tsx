@@ -21,11 +21,7 @@ const h = vi.hoisted(() => ({
     execution_path: 'claude-code-cli',
     execution_paths: ['claude-code-cli'],
   },
-  layers: undefined as Record<string, {
-    display_name?: string
-    configured?: boolean
-    models: { value: string; label: string }[]
-  }> | undefined,
+  layers: undefined as Record<string, import('@/api/agents').LayerCapabilities> | undefined,
   user: { role: 'member', sub: 'u1', agent_roles: { demo: 'manager' } } as {
     role: string; sub: string; agent_roles: Record<string, string>
   },
@@ -64,6 +60,7 @@ vi.mock('@/contexts/AuthContext', () => ({
 }))
 
 import AgentConfig from '@/pages/agent/AgentConfig'
+import { claudeLike, codexLike } from './fixtures/engines'
 
 function renderConfig() {
   // AgentConfig calls useQueryClient (department-save invalidation), so the
@@ -81,21 +78,21 @@ function renderConfig() {
 }
 
 const LAYERS = {
-  'claude-code-cli': {
-    display_name: 'Claude Code CLI', configured: true,
+  'claude-code-cli': claudeLike({
+    configured: true,
     models: [{ value: 'claude-sonnet-5', label: 'Sonnet 5' }],
-  },
-  'codex-cli': {
-    display_name: 'OpenAI Codex', configured: false,
+  }),
+  'codex-cli': codexLike({
+    configured: false,
     models: [{ value: 'gpt-5', label: 'GPT-5' }],
-  },
+  }),
 }
 
 // The engine cards are <button>s whose text includes the engine label.
+const engineCards = () =>
+  screen.queryAllByRole('button').filter(b => b.className.includes('items-start')) as HTMLButtonElement[]
 const engineCard = (label: string) =>
-  screen.getAllByRole('button').find(b =>
-    b.textContent?.includes(label)
-    && b.className.includes('items-start')) as HTMLButtonElement
+  engineCards().find(b => b.textContent?.includes(label)) as HTMLButtonElement
 
 describe('AgentConfig — engine enable gate', () => {
   beforeEach(() => {
@@ -135,9 +132,28 @@ describe('AgentConfig — engine enable gate', () => {
     expect(codex.textContent).toContain('Platform → AI Engines')
   })
 
-  it('loading catalog (no configured field) never flashes a locked card', () => {
+  it('a loading catalog renders no engine card at all (nothing to flash locked)', () => {
+    // The cards come from the descriptors; before the catalog loads there is
+    // no engine to show, so no card can appear locked (or unlocked) by guess.
     h.layers = undefined
     renderConfig()
+    expect(engineCards()).toHaveLength(0)
+  })
+
+  it('an older proxy without the configured field never shows a locked card', () => {
+    h.layers = {
+      'claude-code-cli': claudeLike({ configured: undefined, models: [{ value: 'claude-sonnet-5', label: 'Sonnet 5' }] }),
+    }
+    renderConfig()
     expect(engineCard('Claude Code').disabled).toBe(false)
+  })
+
+  it('cards carry the vendor chip and the engine order from the descriptors', () => {
+    renderConfig()
+    const cards = engineCards()
+    expect(cards.map(c => c.textContent?.includes('Claude Code CLI'))).toEqual([true, false])
+    expect(cards[0].textContent).toContain('Anthropic')
+    expect(cards[1].textContent).toContain('OpenAI')
+    expect(cards[1].textContent).toContain('Codex')
   })
 })

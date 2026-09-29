@@ -191,7 +191,7 @@ class OpenAIAdapter(ProviderAdapter):
         """Base URL for the API. Override in subclasses for compat providers."""
         return endpoint_url  # None = OpenAI default
 
-    def _get_default_api_key(self) -> str | None:
+    def default_api_key(self) -> str | None:
         """Default API key when none provided. Override for local providers."""
         return None
 
@@ -430,7 +430,7 @@ class OpenAIAdapter(ProviderAdapter):
     ) -> AsyncIterator[ProviderStreamEvent]:
         from openai import AsyncOpenAI
 
-        effective_key = api_key or self._get_default_api_key() or ""
+        effective_key = api_key or self.default_api_key() or ""
         base_url = self._get_base_url(endpoint_url)
 
         client_kwargs: dict = {"api_key": effective_key}

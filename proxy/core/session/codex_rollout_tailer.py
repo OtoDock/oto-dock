@@ -67,6 +67,7 @@ from core.session.transcript_tool_events import (
     TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
     persist_event, record_batch_usage,
 )
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.codex_rollout_tailer")
 
@@ -74,9 +75,9 @@ logger = logging.getLogger("claude-proxy.codex_rollout_tailer")
 def _record_rate_limits(session_id: str, snapshot: dict, timestamp) -> None:
     """A ``token_count`` line's ``rate_limits``: the account's window state,
     for the pool (synchronous: the tailer runs in a thread)."""
-    from services.engines import subscription_windows as _sw
+    from core.layers.codex.usage import record_snapshot
     try:
-        _sw.record_codex_snapshot(
+        record_snapshot(
             session_id, snapshot, timestamp if isinstance(timestamp, str) else None)
     except Exception:
         logger.debug("rollout tailer: window record failed", exc_info=True)
@@ -292,9 +293,12 @@ def _extract_text(content) -> str:
     return ""
 
 
-# Injected `[Current time: ...]` stamp line(s) — twin of
-# ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored exact shape only).
-_TIME_PRELUDE_RE = re.compile(r"^\[Current time: [^\]\n]{1,160}\][ \t]*(?:\r?\n+|$)")
+# Injected prelude line(s): the `[Current time: ...]` stamp and the viewer
+# focus line — twin of ``transcript_tailer._TIME_PRELUDE_RE`` (start-anchored
+# exact shapes only).
+_TIME_PRELUDE_RE = re.compile(
+    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\][ \t]*(?:\r?\n+|$)"
+)
 
 
 def _title_from_prompt(text: str) -> str:
@@ -322,13 +326,53 @@ def _title_from_prompt(text: str) -> str:
     return title + ("…" if cut else "")
 
 
+# The prelude shapes as the prefix merge strips them: a satellite single-lines
+# the launch-argument prompt, so a prelude there is followed by a space and
+# the next line's words, not by a newline — hence ``\s*`` where the title
+# regex above demands the line end.
+_ROW_PRELUDE_RE = re.compile(
+    r"^\[(?:Current time: |The user is looking at the app )[^\]\n]{1,200}\]\s*"
+)
+
+
+def _user_row_key(text: str) -> str:
+    """A user row as the prefix merge compares it: every leading prelude
+    dropped, whitespace folded. The DB holds the RAW prompt where the
+    dashboard persisted it at send time (the cold first prompt, a composer
+    send) and the STAMPED one where this tailer persisted it (a line typed
+    straight into the PTY); the rollout holds the stamped line, single-lined
+    on a satellite. All of those are one row."""
+    out = text or ""
+    while True:
+        stripped = _ROW_PRELUDE_RE.sub("", out, count=1)
+        if stripped == out:
+            break
+        out = stripped
+    return " ".join(out.split())
+
+
+def _same_persisted_row(persisted: tuple[str, str], role: str, text: str) -> bool:
+    """Whether a rollout line is the persisted row the merge expects next.
+    Assistant rows compare as bytes; user rows through ``_user_row_key``.
+    The compare is sequential, so a genuinely new user row can be taken for
+    a persisted one only when the DB holds a row the rollout lacks AND the
+    next rollout line repeats its words — the byte compare failed the same
+    case by re-inserting the whole history instead."""
+    p_role, p_text = persisted
+    if p_role != role:
+        return False
+    if role == "user":
+        return _user_row_key(p_text) == _user_row_key(text)
+    return p_text == text
+
+
 def _persisted_prefix(chat_id: str) -> tuple[list[tuple[str, str]], set[str]]:
     """Already-persisted history for this chat — what a resumed/restarted tail
     must skip so it doesn't double-insert. Two parts from one row fetch: the
     chronological (role, content) TEXT prefix (consumed sequentially by the
-    merge), and the EVENT keys — ``tool:<tool_id>`` / ``thinking:<content>`` —
-    matched by membership (tool ids are unique; a rollout re-read revisits each
-    exactly once)."""
+    merge through ``_same_persisted_row``), and the EVENT keys —
+    ``tool:<tool_id>`` / ``thinking:<content>`` — matched by membership (tool
+    ids are unique; a rollout re-read revisits each exactly once)."""
     from storage import database as task_store
     try:
         rows = task_store.get_chat_messages(chat_id, limit=_PREFIX_LIMIT)  # newest-first
@@ -346,7 +390,7 @@ def _persisted_prefix(chat_id: str) -> tuple[list[tuple[str, str]], set[str]]:
                 evt = json.loads(r["event_data"])
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
-            if r.get("event_type") == "thinking":
+            if r.get("event_type") == wire.THINKING:
                 event_keys.add("thinking:" + (evt.get("content") or ""))
             else:
                 tid = evt.get("tool_id") or evt.get("tool_use_id") or ""
@@ -447,6 +491,16 @@ def _patch_summary(patch: str) -> str:
     return ", ".join(names[:3]) + suffix
 
 
+def _patch_paths(patch) -> list[str]:
+    """apply_patch input → the files it changes, as the headless translator's
+    ``_codex_paths`` (a fileChange's per-file ``path``: Add / Update / Delete,
+    a move keyed by its source)."""
+    if not isinstance(patch, str):
+        return []
+    return list(dict.fromkeys(
+        p for p in (m.group(1).strip() for m in _PATCH_FILE_RE.finditer(patch)) if p))
+
+
 # Multi-agent v2 tool surface (codex 0.144 — what an "ultra" turn calls to
 # orchestrate its sub-agents). Rendered as regular tool cards with a
 # task/message summary; the sub-agents themselves run on their own threads
@@ -485,7 +539,7 @@ def _persist_block(task_store, chat_id: str, block: dict, known_events) -> int:
     """Persist one event block unless the first-tail backstop says it already
     is (post-restart re-read from line 0). Returns rows written (0/1)."""
     if known_events:
-        if block["type"] == "thinking":
+        if block["type"] == wire.THINKING:
             key = "thinking:" + (block.get("content") or "")
         else:
             key = "tool:" + (block.get("tool_id") or "")
@@ -511,6 +565,7 @@ def _on_rollout_tool_call(buf: ToolEventBuffer, task_store, chat_id: str,
     bottom-pane picker, so a call still unanswered at batch end folds the
     batch to a turn CLOSE (see ``_process_rollout_lines``) — mirroring the
     Claude tailer's ``AskUserQuestion`` handling."""
+    from core.layers.codex import tool_names
     name = payload.get("name", "")
     call_id = payload.get("call_id") or payload.get("id") or ""
 
@@ -520,9 +575,11 @@ def _on_rollout_tool_call(buf: ToolEventBuffer, task_store, chat_id: str,
         if name == "apply_patch":
             summary = _patch_summary(raw)
         else:
+            # The code-mode ``exec`` custom tool is a shell only when its
+            # input parses as one; the platform name is the table's.
             cmd = _code_mode_bash(raw) if name == "exec" else None
             if cmd:
-                name = "Bash"
+                name = tool_names.canonical(name)
                 summary = cmd[:100] + "..." if len(cmd) > 100 else cmd
             else:
                 summary = raw[:100] + "..." if len(raw) > 100 else raw
@@ -547,19 +604,19 @@ def _on_rollout_tool_call(buf: ToolEventBuffer, task_store, chat_id: str,
                     return 0
                 open_questions.add(call_id)
             return _persist_block(task_store, chat_id, {
-                "type": "question", "tool_name": name,
+                "type": wire.QUESTION, "tool_name": name,
                 "tool_input": args, "tool_id": call_id,
             }, known_events)
         if name == "update_plan":
             if call_id and not buf.claim(call_id):
                 return 0
             return _persist_block(task_store, chat_id, {
-                "type": "tool", "name": "TodoWrite", "tool_id": call_id,
+                "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(name), "tool_id": call_id,
                 "tool_input": {"todos": _plan_todos(args)},
             }, known_events)
         if name == "exec_command":
             cmd = str(args.get("cmd") or "")
-            name = "Bash"
+            name = tool_names.canonical(name)
             summary = cmd[:100] + "..." if len(cmd) > 100 else cmd
         elif name in _MULTI_AGENT_TOOLS:
             # Multi-agent v2 (ultra / proactive orchestration): keep the wire
@@ -573,7 +630,7 @@ def _on_rollout_tool_call(buf: ToolEventBuffer, task_store, chat_id: str,
             from core.layers.cli.helpers import _extract_tool_summary
             summary = _extract_tool_summary(name, args)
 
-    block = {"type": "tool", "name": name, "tool_id": call_id or name,
+    block = {"type": wire.PERSISTED_TOOL, "name": name, "tool_id": call_id or name,
              "summary": summary, "active": False, "tool_input": args}
     if not call_id:
         # No id to pair the output with — persist input-only rather than lose it.
@@ -584,8 +641,11 @@ def _on_rollout_tool_call(buf: ToolEventBuffer, task_store, chat_id: str,
 
 
 def _on_rollout_tool_output(buf: ToolEventBuffer, task_store, chat_id: str,
-                            call_id: str, output, known_events) -> int:
-    """Pair a ``*_output`` item with its pending block and persist the pair."""
+                            call_id: str, output, known_events,
+                            session_id: str = "") -> int:
+    """Pair a ``*_output`` item with its pending block and persist the pair.
+    Also the Codex terminal's ONE ``post_tool`` source (session_events /
+    HOOKS.md): the forwarder stands down under ``OTO_INTERACTIVE``."""
     blk = buf.close(call_id) if call_id else None
     if blk is None:
         return 0  # pre-buffer call, or a deliberately skipped tool's output
@@ -595,6 +655,19 @@ def _on_rollout_tool_output(buf: ToolEventBuffer, task_store, chat_id: str,
         except (TypeError, ValueError):
             output = str(output)
     attach_result(blk, output)
+    if session_id:
+        from core.session import session_events
+        tool_input = blk.get("tool_input") if isinstance(blk.get("tool_input"), dict) else {}
+        if blk.get("name") == "apply_patch":
+            # The patch's files only in the record (the persisted row keeps
+            # the raw input): the checks' changed set reads written paths.
+            paths = _patch_paths(tool_input.get("input"))
+            if paths:
+                tool_input = {**tool_input, "_codex_paths": paths}
+        session_events.post_tool(
+            session_id, blk.get("name") or "", tool_use_id=call_id,
+            tool_input=tool_input, is_error=bool(blk.get("is_error")), source="tailer",
+        )
     return _persist_block(task_store, chat_id, blk, known_events)
 
 
@@ -634,6 +707,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     buf = _tool_events.setdefault(session_id, ToolEventBuffer())
     ptr = 0
     persisted = 0
+    message_rows = 0
     # Early-title counters (interactive_session accumulates them across
     # batches and fires the LLM title upgrade mid-turn at char/tool
     # thresholds). Incremented ONLY at actual persist sites, after the
@@ -761,8 +835,8 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # surface a history row + flag the batch so an IDLE session runs
             # turn-end effects; a mid-turn auto-compact keeps its open turn.
             persist_event(task_store, chat_id, {
-                "type": "system",
-                "subtype": "context_compressed",
+                "type": wire.SYSTEM,
+                "subtype": wire.SUBTYPE_CONTEXT_COMPRESSED,
                 "message": "Conversation compacted",
             })
             persisted += 1
@@ -791,7 +865,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             open_questions.discard(payload.get("call_id") or "")
             rows = _on_rollout_tool_output(
                 buf, task_store, chat_id, payload.get("call_id") or "",
-                payload.get("output"), known_events)
+                payload.get("output"), known_events, session_id=session_id)
             persisted += rows
             tool_rows += rows
             continue
@@ -800,8 +874,9 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 if isinstance(payload.get("arguments"), dict) else {}
             call_id = payload.get("call_id") or payload.get("id") or ""
             if call_id and buf.claim(call_id):
+                from core.layers.codex import tool_names
                 buf.pending[call_id] = {
-                    "type": "tool", "name": "ToolSearch", "tool_id": call_id,
+                    "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": call_id,
                     "summary": args.get("query", ""), "active": False,
                     "tool_input": args,
                 }
@@ -809,7 +884,8 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         if ptype == "tool_search_output":
             rows = _on_rollout_tool_output(
                 buf, task_store, chat_id, payload.get("call_id") or "",
-                json.dumps(payload.get("tools") or []), known_events)
+                json.dumps(payload.get("tools") or []), known_events,
+                session_id=session_id)
             persisted += rows
             tool_rows += rows
             continue
@@ -821,8 +897,9 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             query = (action.get("query") or "") if isinstance(action, dict) else ""
             if wid and not buf.claim(wid):
                 continue
+            from core.layers.codex import tool_names
             rows = _persist_block(task_store, chat_id, {
-                "type": "tool", "name": "web_search", "tool_id": wid or "web_search",
+                "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": wid or tool_names.canonical(ptype),
                 "summary": query, "active": False,
                 "tool_input": {"query": query} if query else None,
             }, known_events)
@@ -844,7 +921,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             if rid and not buf.claim(rid):
                 continue
             persisted += _persist_block(task_store, chat_id, {
-                "type": "thinking", "content": content_text,
+                "type": wire.THINKING, "content": content_text,
             }, known_events)
             continue
         if ptype != "message":
@@ -870,7 +947,7 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
         last_signal = "user" if role == "user" else "tool_use"
 
         # Prefix-merge: already persisted (resume/restart) → consume + skip.
-        if ptr < len(prefix) and prefix[ptr] == (role, text):
+        if ptr < len(prefix) and _same_persisted_row(prefix[ptr], role, text):
             ptr += 1
             continue
 
@@ -885,8 +962,10 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
             # Attribution is a property of the HUMAN turn (twin of the Claude
             # tailer's author_sub stamp); assistant rows carry none.
             author_sub=(author_sub_for(session_id) if role == "user" else ""),
+            sync_search=False,
         )
         persisted += 1
+        message_rows += 1
         if role == "assistant":
             assistant_chars += len(text)
 
@@ -899,6 +978,10 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     question_pending = bool(open_questions) and last_signal in ("tool_use", None)
     if question_pending:
         last_signal = "end_turn"
+
+    # The message rows skipped the per-row search rebuild: one per batch.
+    if message_rows and chat_id:
+        task_store.rebuild_chat_search(chat_id)
 
     title_set = _maybe_backfill_title(session_id, chat_id, first_user_text)
 

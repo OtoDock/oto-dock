@@ -29,6 +29,7 @@ def _cfg(slug):
     return SimpleNamespace(
         execution_target="local", execution_path="claude-code-cli",
         user_sub="", security_context=SimpleNamespace(role="manager"),
+        mcp_config_path="",
     )
 
 
@@ -52,6 +53,7 @@ async def test_partial_spawn_failure_closes_spawned_and_releases_all():
     with patch.object(MO.task_store, "get_meeting", return_value=_meeting_row()), \
          patch.object(MO.task_store, "get_chat", return_value={}), \
          patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
          patch.object(MO, "build_meeting_agent_config",
                       new=AsyncMock(side_effect=lambda slug, m, sid: _cfg(slug))), \
          patch.object(MO, "get_execution_layer", side_effect=get_layer), \

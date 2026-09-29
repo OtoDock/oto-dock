@@ -1,4 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
+import { focusPreludeLine } from '../lib/focus'
+import type { WireImage } from './useDashboardWs'
 
 // Shared interactive-CLI state + send/warmup routing for the chat surfaces
 // (AgentChat, task chats included). The native TUI runs under a PTY on the backend and
@@ -33,16 +35,19 @@ export function ptyPasteB64(text: string): string {
   return utf8ToB64('\x1b[200~' + text + '\x1b[201~\r')
 }
 
-// Prepend the browser user's current time + timezone to an interactive prompt,
-// mirroring the `-p` path's `[Current time: …]` injection (proxy
-// `config.format_current_time` → core/layers/cli/session.py). The `-p` pump adds this on the
-// backend from the per-session browser tz; interactive prompts are typed straight
-// into the PTY (no pump), so the dashboard — which holds the real browser
-// time/zone — stamps them here. Format is matched to the backend (date + 24h +
-// 12h AM/PM gloss + IANA name + UTC offset) so the agent gets the same
-// unambiguous, schedule-safe time on every layer/target. Applied to every
-// ChatInput-sent prompt (NOT raw terminal keystrokes — those aren't platform
-// prompts). en-US for the date so it's stable regardless of browser locale.
+// Prepend the browser user's current time + timezone to a prompt typed into a
+// LIVE terminal, mirroring the `-p` path's `[Current time: …]` injection
+// (proxy `config.format_current_time` → core/layers/cli/session.py). The `-p`
+// pump adds this on the backend from the per-session browser tz; a line
+// written straight into a live PTY (no pump) is stamped here by the dashboard,
+// which holds the real browser time/zone. The COLD first prompt is not: it
+// rides the warmup raw and the backend stamps it at delivery on every engine
+// (`ws/dashboard_chat_text.interactive_prelude`). Format is matched to the
+// backend (date + 24h + 12h AM/PM gloss + IANA name + UTC offset) so the agent
+// gets the same unambiguous, schedule-safe time on every layer/target. Applied
+// to every ChatInput-sent live prompt (NOT raw terminal keystrokes — those
+// aren't platform prompts). en-US for the date so it's stable regardless of
+// browser locale.
 export function withInteractiveTime(text: string): string {
   const now = new Date()
   let tzName = 'UTC'
@@ -61,19 +66,24 @@ export function withInteractiveTime(text: string): string {
   const sign = offMin >= 0 ? '+' : '-'
   const abs = Math.abs(offMin)
   const offset = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`
-  return `[Current time: ${date} ${h24} (${h12}) ${tzName} (UTC${offset})]\n\n${text}`
+  // The viewer-focus line rides as a second prelude when an app is on
+  // screen (APPS.md "Live apps"); the prelude matchers strip both.
+  const focus = focusPreludeLine()
+  return `[Current time: ${date} ${h24} (${h12}) ${tzName} (UTC${offset})]\n\n`
+    + (focus ? `${focus}\n\n` : '')
+    + text
 }
 
 // The slice of the dashboard WS this hook drives (kept minimal so it composes
 // with the full useDashboardWs object both pages already hold).
 interface InteractiveWs {
-  changeExecutionMode: (executionMode: string, chatId?: string) => void
+  changeExecutionMode: (executionMode: string, chatId: string) => void
   switchExecutionMode: (executionMode: string, chatId: string, theme?: string) => void
   sendPtyInput: (chatId: string, dataB64: string, composer?: boolean) => void
   sendPtyAttachments: (
     chatId: string,
     text: string,
-    images?: Array<{ base64: string; name: string }>,
+    images?: WireImage[],
     files?: Array<{ path: string; name: string }>,
   ) => void
   warmup: (
@@ -82,7 +92,7 @@ interface InteractiveWs {
     permissionMode?: string,
     model?: string,
     executionPath?: string,
-    prompt?: { text: string; images?: Array<{ base64: string; name: string }>; files?: Array<{ path: string; name: string }> },
+    prompt?: { text: string; images?: WireImage[]; files?: Array<{ path: string; name: string }> },
     executionMode?: string,
     theme?: string,
   ) => void
@@ -94,6 +104,8 @@ export interface InteractiveWarmupParams {
   chatId?: string
   mode: string
   model: string
+  /** The layer the warmup frame names (committed → selected → none, in which
+   *  case the server resolves it). */
   layer?: string
 }
 
@@ -108,7 +120,7 @@ export interface RouteSendCtx {
   /** Chat-attached photos (base64) + already-uploaded files. When present
    * the live send goes through `sendPtyAttachments` (the backend saves the
    * photos + types the Read-tool paths into the PTY) instead of plain text. */
-  images?: Array<{ base64: string; name: string }>
+  images?: WireImage[]
   files?: Array<{ path: string; name: string }>
 }
 
@@ -123,7 +135,10 @@ export type RouteSendResult = 'pty' | 'cold' | null
  * the rest of warmup_ready (e.g. server-kick adoption). */
 export type WarmupReadyResult = 'interactive' | 'declined' | 'none'
 
-export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string = '') {
+export function useInteractiveChat(
+  ws: InteractiveWs,
+  agentDefaultMode: string = '',
+) {
   // The per-chat execution-mode OVERRIDE (tri-state): '' = unset (follow the
   // agent default), 'interactive' / '-p' = an explicit per-chat choice. Sent as
   // execution_mode on warmup; restored from the chat's stored mode on open.
@@ -153,7 +168,7 @@ export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string =
   // Photos/files attached on a cold-start send; flushed via
   // sendPtyAttachments on warmup_ready (the backend saves + types the paths).
   const pendingPtyAttachmentsRef = useRef<{
-    images?: Array<{ base64: string; name: string }>
+    images?: WireImage[]
     files?: Array<{ path: string; name: string }>
   } | null>(null)
   // A live switch (kill+rewarm) is in flight — locks the toggle until
@@ -163,15 +178,17 @@ export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string =
   // Toggle the per-chat intent + persist it. Callers
   // only invoke this when no session is live (the switch is locked
   // otherwise), so there's nothing to kill+rewarm — the chosen mode is spawned
-  // on the next send. chatId is null on a brand-new chat (local only; the
-  // warmup carries execution_mode on the first send).
+  // on the next send. chatId is null on a brand-new chat: then the choice is
+  // LOCAL ONLY (the warmup carries execution_mode on the first send) and no
+  // frame is sent — a frame without a chat used to be written onto the
+  // connection's previously bound chat (found on T1, 2026-09-20).
   const toggle = useCallback((next: boolean, chatId: string | null) => {
     // Write an EXPLICIT mode both ways: turning OFF must persist '-p' (not ''),
     // so it overrides an interactive AGENT default — '' would resolve back to
     // the agent default and the chat could never be turned off (precedence).
     const next_mode = next ? 'interactive' : '-p'
     setChatExecMode(next_mode)
-    ws.changeExecutionMode(next_mode, chatId || undefined)
+    if (chatId) ws.changeExecutionMode(next_mode, chatId)
   }, [ws])
 
   // A switch requested while a -p turn is streaming, deferred to turn-end so we
@@ -259,32 +276,24 @@ export function useInteractiveChat(ws: InteractiveWs, agentDefaultMode: string =
     if (interactiveMode && !ctx.sessionId && !ctx.warmingUp) {
       ctx.onColdStart()
       const p = ctx.warmupParams
-      // Codex: deliver the first prompt as the launch arg via warmup — the
-      // backend puts it in the `codex` argv and the TUI auto-runs it after MCP
-      // warm. This is the deterministic first-turn submit; the PTY type-then-Enter
-      // race is unreliable during Codex's warm. Claude keeps the PTY flush below.
-      // (Attachments need the Read-tool path pipeline → fall back to the flush.)
-      if (p.layer === 'codex-cli' && !hasAttachments) {
-        // Stamp the argv prompt (parity with -p inject_time); the TUI auto-runs it.
-        ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, { text: withInteractiveTime(text) }, 'interactive', currentDashboardTheme())
-        return 'cold'
-      }
       if (!hasAttachments) {
-        // Claude text-only cold start: the RAW prompt rides the warmup and the
-        // BACKEND delivers it — interactive via submit_prompt at spawn
-        // completion (the server stamps the time), declined-to-headless via
-        // the server kick (that path injects time itself, which is why the
-        // text must go up un-stamped). Server-owned delivery survives
-        // switching chats / reloading mid-warmup; the client-held stash below
-        // does not (resetSession nulls it on switch, and warmup_ready for a
-        // non-viewed chat is dropped by the staleness guard).
+        // Text-only cold start, every engine: the RAW prompt rides the warmup
+        // and the BACKEND delivers it — as the TUI's launch argument or via
+        // submit_prompt at spawn completion, whichever the engine's descriptor
+        // says, stamped there with the time and the viewer-focus line; a
+        // declined-to-headless spawn runs it as the server kick (that path
+        // injects the time itself, which is why the text must go up
+        // un-stamped). Server-owned delivery survives switching chats /
+        // reloading mid-warmup; the client-held stash below does not
+        // (resetSession nulls it on switch, and warmup_ready for a non-viewed
+        // chat is dropped by the staleness guard).
         ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, { text }, 'interactive', currentDashboardTheme())
         return 'cold'
       }
       // Attachments keep the stash + warmup_ready flush (the base64 photos
       // ride a separate pty_attachments message the backend saves + types as
-      // Read paths) — mirroring Codex's attachment fallback above. Known
-      // residual: switching away mid-warmup still drops an attachments send.
+      // Read paths — the Read-tool path pipeline). Known residual: switching
+      // away mid-warmup still drops an attachments send.
       pendingPtyTextRef.current = text
       pendingPtyAttachmentsRef.current = { images: ctx.images, files: ctx.files }
       ws.warmup(p.agentName, p.chatId, p.mode, p.model, p.layer, undefined, 'interactive', currentDashboardTheme())

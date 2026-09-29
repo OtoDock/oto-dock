@@ -12,7 +12,8 @@ The engine lives in the pieces this module assembles:
 * ``interactive.py`` — interactive (PTY) task runs
 * ``delivery.py``    — delegate result delivery and continuation wakes
 * ``firing.py``      — spawn spacing and the self-continuation fire
-* ``runner.py``      — _fire_task, _execute_task, _run_task, the admission slot
+* ``runner.py``      — _fire_task, _execute_task, _run_task (the frame) and
+  _run_task_body (the admitted run), _end_run (the stamp, then the stream's done)
 
 Consumers keep reading everything through this module (``from
 services.scheduler import scheduler``); the names below are re-exported for
@@ -23,6 +24,7 @@ pieces read their globals from their own module.
 
 import asyncio
 import contextlib
+import json
 import logging
 import zoneinfo
 from datetime import datetime, timedelta, timezone
@@ -86,15 +88,17 @@ from services.scheduler.firing import (  # noqa: F401
     _spawn_slot_lock,
     _spawn_spacing_gate,
 )
+from services.scheduler import task_kinds
 from services.scheduler.runner import (  # noqa: F401
-    _admitted_slot,
     _broadcast,
     _create_task_chat_row,
-    _determine_task_type,
+    _end_run,
+    _end_unstamped,
     _execute_task,
     _fire_task,
     _is_valid_session_uuid,
     _run_task,
+    _run_task_body,
 )
 
 logger = logging.getLogger("claude-proxy.scheduler")
@@ -221,7 +225,7 @@ def _register_task(task: shared.TaskDefinition) -> None:
     # Trigger-only tasks don't get an APScheduler entry — they're fired by
     # the trigger fire path (services/scheduler/trigger_manager.py). Storing them
     # without an APScheduler job is the correct end state.
-    if task.task_type == "trigger":
+    if not task_kinds.of(task).clocked:
         logger.debug(f"Skipping APScheduler registration for trigger-only task: {task.id}")
         return
 
@@ -287,13 +291,13 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         id=row["id"],
         name=row["name"],
         agent=row["agent"],
-        llm_mode=row.get("llm_mode", "cli"),
+        llm_mode=_col(row, "llm_mode", "cli"),
         prompt=row["prompt"],
         schedule=row.get("schedule") or "",
         run_at=row.get("run_at"),
         delay_seconds=row.get("delay_seconds"),
         interval_seconds=row.get("interval_seconds"),
-        timeout_seconds=row.get("timeout_seconds", 600),
+        timeout_seconds=_col(row, "timeout_seconds", 600),
         enabled=bool(row.get("enabled", 1)),
         created_by=row.get("created_by"),
         created_at=created_at,
@@ -303,8 +307,8 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         continue_session=row.get("continue_session"),
         use_persistent=bool(row.get("use_persistent", 0)),
         notification_mode=row.get("notification_mode") or "manual",
-        notify_severity=row.get("notify_severity", "info"),
-        scope=row.get("scope", "user"),
+        notify_severity=_col(row, "notify_severity", "info"),
+        scope=_col(row, "scope", "user"),
         user_tz=row.get("user_tz"),
         task_type=row.get("task_type", ""),
         target_chat_id=row.get("target_chat_id"),
@@ -314,7 +318,30 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         # `override or default` consumer reads the same way.
         override_model=row.get("override_model") or None,
         override_execution_path=row.get("override_execution_path") or None,
+        app_id=row.get("app_id") or None,
+        app_handler=row.get("app_handler") or None,
+        checks=_checks_of(row.get("checks")),
+        transferred_from=row.get("transferred_from") or "",
     )
+
+
+def _col(row: dict, key: str, default):
+    """A column a TaskDefinition field requires, ``default`` when NULL:
+    ``row.get(key, default)`` reads a NULL as None, which the model refuses
+    — one such row failed every task listing and the scheduler's start."""
+    val = row.get(key)
+    return default if val is None else val
+
+
+def _checks_of(raw) -> list[str]:
+    """The ``checks`` column (a JSON list of refs, '' = none) as a list."""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return []
+    return [r for r in val if isinstance(r, str)] if isinstance(val, list) else []
 
 
 def get_scheduled_jobs() -> list[dict]:
@@ -347,6 +374,41 @@ def get_scheduled_jobs() -> list[dict]:
             "next_run_time": next_run.isoformat() if next_run else None,
         })
     return jobs
+
+
+def next_run_times() -> dict[str, str | None]:
+    """Every scheduled task's next fire as ISO, keyed by task id, built
+    ONCE: the in-memory jobs in embedded mode (no DB), one computation over
+    the definitions in standalone mode. The listing reads this instead of
+    ``get_scheduled_jobs`` (a second full read of the table) or one
+    ``next_run_time`` per task (a full computation each, standalone)."""
+    if config.SCHEDULER_MODE == "standalone":
+        return {j["task_id"]: j["next_run_time"] for j in _compute_next_run_times()}
+    out: dict[str, str | None] = {}
+    for job in _scheduler.get_jobs():
+        if not job.id.startswith("task_"):
+            continue
+        next_run = getattr(job, "next_run_time", None)
+        out[job.id.removeprefix("task_")] = next_run.isoformat() if next_run else None
+    return out
+
+
+def next_run_time(task_id: str) -> str | None:
+    """One task's next fire as ISO, None when no job is scheduled for it.
+
+    Embedded mode reads the job straight from APScheduler (no DB, so it is
+    safe from the writer thread that finishes a run and from the event
+    loop); standalone mode computes it from the definitions like
+    ``get_scheduled_jobs`` does.
+    """
+    if config.SCHEDULER_MODE == "standalone":
+        for job in _compute_next_run_times():
+            if job["task_id"] == task_id:
+                return job["next_run_time"]
+        return None
+    job = _scheduler.get_job(f"task_{task_id}")
+    next_run = getattr(job, "next_run_time", None) if job else None
+    return next_run.isoformat() if next_run else None
 
 
 def _compute_next_run_times() -> list[dict]:
@@ -432,11 +494,7 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
     """Persist to DB + register with APScheduler live. Returns task.id."""
     # Resolve task_type: explicit value wins; otherwise auto-derive.
     # Recurring = cron schedule OR interval_seconds. One-time = run_at/delay.
-    task_type = task.task_type or (
-        "scheduled"
-        if (task.schedule or task.interval_seconds is not None)
-        else "one_time"
-    )
+    task_type = task.task_type or task_kinds.derive(task.schedule, task.interval_seconds)
     await asyncio.to_thread(
         task_store.create_dynamic_task,
         task.id, task.agent, task.name, task.prompt, task.llm_mode,
@@ -466,6 +524,9 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
         until_at=task.until_at,
         override_model=task.override_model,
         override_execution_path=task.override_execution_path,
+        app_id=task.app_id,
+        app_handler=task.app_handler,
+        checks=json.dumps(list(task.checks)) if task.checks else "",
     )
     shared._dynamic_task_ids.add(task.id)
     # Hydrate the in-memory task with the DB-side timestamp so _register_task
@@ -480,7 +541,7 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
             task.created_at = ca
     # Trigger-only tasks: skip APScheduler registration (no schedule, no run_at).
     # They fire only via the trigger system.
-    if config.SCHEDULER_MODE != "standalone" and task_type != "trigger":
+    if config.SCHEDULER_MODE != "standalone" and (task_kinds.of_word(task_type) or task_kinds.of(task)).clocked:
         # Update the in-memory task with the resolved task_type so _register_task
         # sees it (rare path: TaskDefinition created without task_type set).
         if not task.task_type:
@@ -579,6 +640,12 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
     dyn = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
     if not dyn:
         return False, None  # caller maps to 404
+    # An app handler's row is kept in step with its manifest at every
+    # go-live (APPS.md "Handlers"); an edit here would turn it back into a
+    # prompt task on its next fire. Pause and resume stay open.
+    if dyn.get("app_id"):
+        return False, ("this schedule comes from the app's manifest — change app.json "
+                       "and redeploy")
 
     payload = dict(fields)  # don't mutate caller's dict
 
@@ -623,15 +690,15 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
     if payload.get("schedule"):
         payload["interval_seconds"] = None
         payload["run_at"] = None
-        payload["task_type"] = "scheduled"
+        payload["task_type"] = task_kinds.SCHEDULED
     elif payload.get("interval_seconds"):
         payload["schedule"] = None
         payload["run_at"] = None
-        payload["task_type"] = "scheduled"
+        payload["task_type"] = task_kinds.SCHEDULED
     elif payload.get("run_at"):
         payload["schedule"] = None
         payload["interval_seconds"] = None
-        payload["task_type"] = "one_time"
+        payload["task_type"] = task_kinds.ONE_TIME
 
     timing_changed = any(k in payload for k in _TIMING_FIELDS)
 

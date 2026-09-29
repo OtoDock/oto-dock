@@ -1,18 +1,23 @@
 """Shared module-level state and accessor functions for the CLI session system.
 
 This file is THE HUB — all module-level dicts/sets/vars live here.
-Other core/ modules import from here; this file only imports config (+ stdlib).
+Other core/ modules import from here; this file only imports config, the
+stdlib leaves (the wire catalogue, the run vocabulary) and the stdlib.
 """
 
 import asyncio
 import dataclasses
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import config
+from storage.automation import run_status
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -324,6 +329,12 @@ def get_subagent_registry(session_id: str) -> SubagentRegistry:
     return reg
 
 
+def peek_subagent_registry(session_id: str) -> SubagentRegistry | None:
+    """The registry if the session ever tracked a subagent, else None: a read
+    for the reapers and the evictor, which must never create an entry."""
+    return _subagent_registries.get(session_id)
+
+
 def reset_subagent_registry(session_id: str) -> None:
     """Reset a session's subagent registry at the start of a new turn."""
     reg = _subagent_registries.get(session_id)
@@ -377,11 +388,12 @@ def queue_pump_prompt(chat_id: str, text: str, system: bool = False) -> bool:
 
 
 def mark_delegate_completed(chat_id: str, task_name: str, task_id: str = "",
-                            status: str = "completed"):
+                            status: str = run_status.COMPLETED):
     """Update live state when a delegate task reaches a terminal. Matches by task_id
     (the stable correlation key) when present, else falls back to task_name. Records
-    the terminal ``status`` (completed/failed/cancelled) so the badge resolves to the
-    right icon instead of a misleading green check. Mutates in-place so the shared
+    the terminal ``status`` (a ``run_status.DELEGATE_RESULTS`` word: completed /
+    failed / cancelled / user_interrupted) so the badge resolves to the right icon
+    instead of a misleading green check. Mutates in-place so the shared
     dict ref in live_blocks also updates.
     """
     live = _chat_streaming_state.get(chat_id)
@@ -427,7 +439,7 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
     translator so a later ``collabAgentToolCall`` snapshot can't re-open a phantom
     badge. The single source of truth shared by BOTH Codex bg supervisors — the
     local session's ``notif_queue`` supervisor (``core/layers/codex/session.py``)
-    and the remote layer's WS-forwarded supervisor (``core/remote/remote_bg_subagent.py``)
+    and the remote adapter's WS-forwarded supervisor (``core/layers/codex/remote.py``)
     — so completion behaves identically on local and satellite agents.
 
     Idempotent: ``reg.mark_done`` returns True only on the resolving transition,
@@ -440,7 +452,7 @@ def resolve_bg_subagent(session_id: str, sub_tid: str, translator=None) -> bool:
     chat_id = reg.chat_id
     if chat_id:
         mark_subagent_done(chat_id, sub_tid)
-        push_pump_event(chat_id, {"type": "bg_agent_done", "tool_use_id": sub_tid})
+        push_pump_event(chat_id, {"type": wire.BG_AGENT_DONE, "tool_use_id": sub_tid})
     if translator is not None:
         with contextlib.suppress(Exception):
             translator.subagent_end_event(sub_tid)
@@ -483,7 +495,7 @@ def resolve_bg_command(session_id: str, task_id: str, status: str = "completed")
     if chat_id:
         mark_command_done(chat_id, tuid)
         push_pump_event(chat_id, {
-            "type": "bg_command_done", "tool_use_id": tuid, "status": status,
+            "type": wire.BG_COMMAND_DONE, "tool_use_id": tuid, "status": status,
         })
     return True
 
@@ -599,7 +611,7 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
         for cid in chats:
             with contextlib.suppress(Exception):
                 queue.put_nowait({
-                    "type": "liveness_clear",
+                    "type": wire.NOTIFY_LIVENESS_CLEAR,
                     "chat_id": cid,
                     "session_id": session_id,
                     "reason": reason,
@@ -626,7 +638,7 @@ def broadcast_chat_frame(chat_id: str, frame: dict) -> None:
         seen.add(id(queue))
         with contextlib.suppress(Exception):
             queue.put_nowait({
-                "type": "chat_ui_frame",
+                "type": wire.NOTIFY_CHAT_UI_FRAME,
                 "chat_id": chat_id,
                 "frame": frame,
             })
@@ -737,12 +749,125 @@ def _load_sessions() -> None:
             _save_sessions()
 
 
-def _save_sessions() -> None:
-    """Persist session index to disk."""
+def _atomic_write(path, blob: str, *, fsync: bool) -> bool:
+    """Replace ``path`` with ``blob`` through a sibling temp file, so a crash
+    mid-write leaves the old file, never a truncated one. False on failure
+    (logged; the temp file is removed)."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        _SESSION_INDEX.write_text(json.dumps(_sessions, indent=2))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(blob)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
     except OSError as e:
-        logger.error(f"Failed to save session index: {e}")
+        logger.error(f"Failed to save {path.name}: {e}")
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
+
+
+class _IndexWriter:
+    """The session index, written behind ``_sessions``: at most one write per
+    ``config.SESSION_INDEX_FLUSH_S``, the encode on the owner loop (the C
+    encoder holds the GIL anyway, and on the loop nothing can mutate the dict
+    mid-encode), the write in a thread. With no owner loop (import, sync
+    tests, scripts) the write is synchronous; a call from another thread is
+    handed to the owner loop. Every write carries a generation and only a
+    newer one is installed, so a slow thread write never lands over a later
+    synchronous one (the shutdown flush)."""
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._handle: asyncio.TimerHandle | None = None
+        self._task: asyncio.Task | None = None
+        self._dirty = False
+        self._gen = 0
+        self._installed_gen = 0
+        self._lock = threading.Lock()
+
+    def mark_dirty(self) -> None:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        owner = self._loop
+        if owner is not None and (owner.is_closed() or (
+                owner is not running and not owner.is_running())):
+            self._loop = owner = None
+            self._handle = self._task = None
+        if owner is not None and owner is not running:
+            try:
+                owner.call_soon_threadsafe(self.mark_dirty)
+                return
+            except RuntimeError:  # the owner closed in between
+                self._loop = None
+                self._handle = self._task = None
+        self._dirty = True
+        if running is None:
+            self.flush_sync()
+            return
+        self._loop = running
+        if self._handle is None and self._task is None:
+            self._handle = running.call_later(
+                max(0.0, config.SESSION_INDEX_FLUSH_S), self._start_flush)
+
+    def _encode(self) -> tuple[str, int]:
+        self._dirty = False
+        self._gen += 1
+        return json.dumps(_sessions, separators=(",", ":")), self._gen
+
+    def _install(self, blob: str, gen: int) -> None:
+        with self._lock:
+            if gen <= self._installed_gen:
+                return
+            if _atomic_write(_SESSION_INDEX, blob, fsync=True):
+                self._installed_gen = gen
+
+    def _start_flush(self) -> None:
+        self._handle = None
+        if not self._dirty or self._loop is None:
+            return
+        blob, gen = self._encode()
+        self._task = self._loop.create_task(self._write(blob, gen))
+
+    async def _write(self, blob: str, gen: int) -> None:
+        try:
+            await asyncio.to_thread(self._install, blob, gen)
+        except Exception:
+            logger.exception("session index write failed")
+        finally:
+            self._task = None
+            loop = self._loop
+            if self._dirty and loop is not None and not loop.is_closed():
+                self._handle = loop.call_later(
+                    max(0.0, config.SESSION_INDEX_FLUSH_S), self._start_flush)
+
+    def flush_sync(self) -> None:
+        """Write the current state now, on the calling thread, when dirty."""
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        if not self._dirty:
+            return
+        blob, gen = self._encode()
+        self._install(blob, gen)
+
+
+_index_writer = _IndexWriter()
+
+
+def _save_sessions() -> None:
+    """Persist the session index (written behind; see ``_IndexWriter``)."""
+    _index_writer.mark_dirty()
+
+
+def flush_session_index() -> None:
+    """Write any pending index change now, synchronously (graceful shutdown:
+    the write must not depend on a free executor thread)."""
+    _index_writer.flush_sync()
 
 
 # Load on import
@@ -785,6 +910,51 @@ def _record_session_use(session_id: str, client_type: str = "", agent: str = "")
     _save_sessions()
 
 
+# ---------------------------------------------------------------------------
+# The reapers' idle timeout: one read per tick, off the loop, cached
+# ---------------------------------------------------------------------------
+
+_IDLE_TIMEOUT_TTL_S = 60.0
+_STOCK_GET_IDLE_TIMEOUT = config.get_idle_timeout
+# (getter, value, monotonic time): the getter is kept so a replaced
+# config.get_idle_timeout (tests) never sees a value cached for another.
+_idle_timeout_cache: tuple | None = None
+
+
+def _read_idle_timeout_strict() -> int:
+    """``config.get_idle_timeout`` without its error fallback: a database
+    error raises, so it is never cached as the setting."""
+    from storage import database as _db
+    val = _db.get_platform_setting("session_idle_timeout")
+    try:
+        return int(val) if val else config.PERSISTENT_SESSION_TIMEOUT
+    except (TypeError, ValueError):
+        return config.PERSISTENT_SESSION_TIMEOUT
+
+
+async def cached_idle_timeout() -> int:
+    """The unified idle timeout for a reaper tick, read on the DB executor
+    and cached for ``_IDLE_TIMEOUT_TTL_S``. A failed read serves the last good
+    value (the env fallback when there is none yet) and is not cached."""
+    global _idle_timeout_cache
+    getter = config.get_idle_timeout
+    hit = _idle_timeout_cache
+    now = time.monotonic()
+    if hit is not None and hit[0] is getter and now - hit[2] < _IDLE_TIMEOUT_TTL_S:
+        return hit[1]
+    from storage.pg import run_db
+    try:
+        value = await run_db(
+            _read_idle_timeout_strict if getter is _STOCK_GET_IDLE_TIMEOUT else getter)
+    except Exception:
+        logger.warning("idle timeout read failed; using the last known value", exc_info=True)
+        if hit is not None and hit[0] is getter:
+            return hit[1]
+        return config.PERSISTENT_SESSION_TIMEOUT
+    _idle_timeout_cache = (getter, value, now)
+    return value
+
+
 def get_session_client_type(session_id: str) -> str:
     """Get the client_type stored for a session (e.g. 'dashboard', 'phone')."""
     return _sessions.get(session_id, {}).get("client_type", "")
@@ -812,6 +982,8 @@ def set_session_user_tz(session_id: str, tz: str) -> None:
         return
     if session_id not in _sessions:
         _sessions[session_id] = {"created": True, "message_count": 0}
+    elif _sessions[session_id].get("user_tz") == tz:
+        return
     _sessions[session_id]["user_tz"] = tz
     _save_sessions()
 
@@ -878,12 +1050,40 @@ def is_session_tool_allowed(session_id: str, tool_name: str) -> bool:
     return tool_name in _session_tool_allows.get(session_id, ())
 
 
+# The security index's keys for the placement (FROZEN — a pre-upgrade file
+# still loads): index key → ``PlacementCapabilities`` field. The index
+# flattens the object into them and rebuilds it from them; ``target_os``
+# joined in core-seams phase 7 (absent in an older file → the family is
+# inferred from the paths, as it always was).
+_PLACEMENT_KEYS = {
+    "target_kind": "kind",
+    "target_label": "label",
+    "target_agents_dir": "agents_dir",
+    "target_machine_id": "machine_id",
+    "target_home_dir": "home_dir",
+    "target_allow_full_fs": "allow_full_fs",
+    "target_claude_runtime_root": "claude_runtime_root",
+    "target_os_user": "os_user",
+    "target_os": "os",
+    "target_user_dirs": "user_dirs",
+    "target_device_grants": "device_grants",
+    "target_otodock_dir": "reported_otodock_dir",
+    "target_mcps_dir": "mcps_dir",
+    "target_unresolved_home_dir": "unresolved_home_dir",
+    "target_unresolved_otodock_dir": "unresolved_otodock_dir",
+}
+
+
 def _serialize_security_ctx(ctx) -> dict:
     """Serialize a SecurityContext to a JSON-safe dict. No secrets in it (see
-    _session_security). ``target_device_grants`` is a set → emit a sorted list."""
+    _session_security). The placement is flattened into the index's own
+    ``target_*`` keys; ``target_device_grants`` is a set → a sorted list."""
     import dataclasses
     d = dataclasses.asdict(ctx)
-    d["target_device_grants"] = sorted(ctx.target_device_grants or ())
+    d.pop("placement", None)
+    for key, name in _PLACEMENT_KEYS.items():
+        d[key] = getattr(ctx.placement, name)
+    d["target_device_grants"] = sorted(ctx.placement.device_grants or ())
     return d
 
 
@@ -892,11 +1092,19 @@ def _deserialize_security_ctx(d: dict):
     (unknown keys dropped, missing keys default)."""
     import dataclasses
     from auth.path_policy import SecurityContext
+    from core.placement import PlacementCapabilities
     fields = {f.name for f in dataclasses.fields(SecurityContext)}
-    kw = {k: v for k, v in d.items() if k in fields}
-    kw["target_device_grants"] = set(kw.get("target_device_grants") or ())
-    if kw.get("target_user_dirs") is None:
-        kw["target_user_dirs"] = {}
+    kw = {k: v for k, v in d.items() if k in fields and k != "placement"}
+    pkw = {name: d[key] for key, name in _PLACEMENT_KEYS.items() if key in d}
+    pkw["device_grants"] = set(pkw.get("device_grants") or ())
+    if pkw.get("user_dirs") is None:
+        pkw["user_dirs"] = {}
+    for name in ("kind", "label", "agents_dir", "machine_id", "home_dir",
+                 "claude_runtime_root", "os_user", "os", "reported_otodock_dir", "mcps_dir",
+                 "unresolved_home_dir", "unresolved_otodock_dir"):
+        if pkw.get(name) is None and name in pkw:
+            pkw[name] = ""
+    kw["placement"] = PlacementCapabilities(**pkw) if pkw else PlacementCapabilities()
     # JSON has no tuple type — restore the tuple-typed fields so a reloaded
     # context compares equal to a freshly-built one.
     for _tup in ("session_allowed_roots", "available_scopes"):
@@ -917,9 +1125,11 @@ def _deserialize_security_ctx(d: dict):
 
 def _save_session_security() -> None:
     """Persist the session security index for crash recovery. Whole-file
-    rewrite from memory (mirrors ``_save_sessions``); the live set is small
-    (idle-reaped at 15min). Best-effort — a write failure must never break a
-    warmup/close, so it only logs."""
+    rewrite from memory, synchronous on purpose: a close's removal must be on
+    disk when the close returns (it keeps a replayed session token dead
+    across a crash). The live set is small (idle-reaped at 15min).
+    Best-effort: a write failure must never break a warmup/close, so it
+    only logs."""
     now = time.time()
     data = {}
     for sid, ctx in _session_security.items():
@@ -930,10 +1140,7 @@ def _save_session_security() -> None:
             }
         except Exception:
             continue  # a non-serializable entry must not block the rest
-    try:
-        _SECURITY_INDEX.write_text(json.dumps(data, indent=2))
-    except OSError as e:
-        logger.error(f"Failed to save session security index: {e}")
+    _atomic_write(_SECURITY_INDEX, json.dumps(data, separators=(",", ":")), fsync=False)
 
 
 def load_session_security() -> None:
@@ -1028,13 +1235,14 @@ def refresh_target_allow_full_fs(machine_id: str, allow_full_fs: bool) -> int:
     import dataclasses
     updated = 0
     for sid, ctx in list(_session_security.items()):
-        if getattr(ctx, "target_machine_id", "") != machine_id:
+        if ctx.placement.machine_id != machine_id:
             continue
-        if bool(getattr(ctx, "target_allow_full_fs", False)) == bool(allow_full_fs):
+        if bool(ctx.placement.allow_full_fs) == bool(allow_full_fs):
             continue
         try:
             _session_security[sid] = dataclasses.replace(
-                ctx, target_allow_full_fs=bool(allow_full_fs),
+                ctx, placement=dataclasses.replace(
+                    ctx.placement, allow_full_fs=bool(allow_full_fs)),
             )
             updated += 1
         except Exception:
@@ -1064,13 +1272,14 @@ def refresh_target_device_grants(machine_id: str, device_grants: set) -> int:
     grants = set(device_grants or set())
     updated = 0
     for sid, ctx in list(_session_security.items()):
-        if getattr(ctx, "target_machine_id", "") != machine_id:
+        if ctx.placement.machine_id != machine_id:
             continue
-        if set(getattr(ctx, "target_device_grants", set())) == grants:
+        if set(ctx.placement.device_grants) == grants:
             continue
         try:
             _session_security[sid] = dataclasses.replace(
-                ctx, target_device_grants=set(grants),
+                ctx, placement=dataclasses.replace(
+                    ctx.placement, device_grants=set(grants)),
             )
             updated += 1
         except Exception:
@@ -1342,6 +1551,9 @@ def cleanup_session_permission_state(session_id: str) -> None:
     _session_codex_dirs.pop(session_id, None)
     _meeting_session_info.pop(session_id, None)
     _subagent_registries.pop(session_id, None)
+    # The session's tool records and turn-end rounds (core/session/session_events).
+    from core.session import session_events
+    session_events.cleanup_session(session_id)
     # Drop the session's brokered MCP secrets (in-memory only) so a
     # replayed capability token finds nothing after close. Late import keeps this
     # hub module free of core-package deps at load time.

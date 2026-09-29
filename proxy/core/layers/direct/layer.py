@@ -12,13 +12,17 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import config as app_config
+from core import placement
 
 from core.events.common_events import (
     CommonEvent,
     TEXT, THINKING, TOOL_USE, TOOL_RESULT, DONE, ERROR, SYSTEM, METADATA,
     CONTEXT_COMPACT,
 )
-from core.execution_layer import ExecutionLayer, AgentConfig, LayerCapabilities
+from core.execution_layer import (
+    AgentConfig, AuthProfile, BehaviourProfile, EngineIdentity, ExecutionLayer,
+    LayerCapabilities, ModelPolicy, RuntimeProfile, SubscriptionHandle, UsageProfile,
+)
 from core.session.session_state import (
     _record_session_use, cleanup_session_permission_state, register_session_state,
     set_session_mode,
@@ -28,6 +32,7 @@ from core.layers.direct.session import (
     create_direct_session, get_direct_session,
     close_direct_session, run_direct_stream,
 )
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy")
 
@@ -115,16 +120,97 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
     mcp_delivery="proxy_managed",
     mcp_config_format=None,
     providers=[
-        {"id": "anthropic", "label": "Anthropic", "requires_key": True},
-        {"id": "openai", "label": "OpenAI", "requires_key": True},
-        {"id": "groq", "label": "Groq", "requires_key": True},
+        # The ladders are what each provider's API takes (DIRECT-LLM.md
+        # "Effort / Reasoning Mapping"): Anthropic's output_config.effort
+        # keeps xhigh and max apart and rejects xhigh on older models (the
+        # row flag, anthropic_adapter); the OpenAI family tops at xhigh, so
+        # the adapter folds max and ultra onto it; Groq documents low /
+        # medium / high (gpt-oss) and pins qwen to no thinking.
+        # The hosted relay fronts the three vendors (relay_path is where the
+        # install-side SDK points: the provider SDK appends its own route —
+        # /v1/messages, /chat/completions — so the base differs per vendor).
+        {"id": "anthropic", "label": "Anthropic", "requires_key": True,
+         "kind": "vendor", "relay_path": "/v1/relay/anthropic", "api_path": "",
+         "effort_scale": ["low", "medium", "high", "xhigh", "max"],
+         "effort_per_model": ["xhigh"]},
+        {"id": "openai", "label": "OpenAI", "requires_key": True,
+         "kind": "vendor", "relay_path": "/v1/relay/openai/v1", "api_path": "",
+         "effort_scale": ["low", "medium", "high", "xhigh"],
+         "effort_per_model": []},
+        {"id": "groq", "label": "Groq", "requires_key": True,
+         "kind": "vendor", "relay_path": "/v1/relay/groq/v1", "api_path": "",
+         "effort_scale": ["low", "medium", "high"],
+         "effort_per_model": []},
         # Local providers reach the operator's own network — unavailable on
         # hosted OtoDock (no operator LAN). Gated off at import on cloud.
         *([] if app_config.OTODOCK_CLOUD else [
-            {"id": "ollama", "label": "Ollama", "requires_key": False},
-            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False},
+            {"id": "ollama", "label": "Ollama", "requires_key": False,
+             "kind": "local", "relay_path": "", "api_path": "/v1",
+             "effort_scale": ["low", "medium", "high", "xhigh"],
+             "effort_per_model": []},
+            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False,
+             "kind": "local", "relay_path": "", "api_path": "",
+             "effort_scale": ["low", "medium", "high", "xhigh"],
+             "effort_per_model": []},
         ]),
     ],
+    identity=EngineIdentity(
+        short_name="direct",
+        vendor_id="",                         # multi-provider: no single vendor
+        vendor_label="",
+        account_label="",
+        role="supporting",                    # the low-latency phone path, not a coding engine
+        sort_order=30,
+    ),
+    runtime=RuntimeProfile(
+        has_os_process=False,                 # the tool loop runs in-process
+        hard_abort_kills_process=False,
+        supports_remote_execution=False,      # nothing to relocate to a satellite
+        supports_interactive_pty=False,
+        interactive_first_prompt_via_argv=False,
+        supports_reattach_after_restart=False,
+        binary="",
+        pin_key="",
+        config_dir_name="",                   # no CLI config dir of its own
+        self_wakes=False,
+        event_queue_depth=0,                  # never runs on a satellite
+        interactive_submit_backstop=False,
+    ),
+    behaviour=BehaviourProfile(
+        rebuilds_history_from_db=True,        # every turn rebuilds from chat_messages
+        attach_images_inline=True,            # native vision content blocks
+        phone_http_mcps=False,                # a call stays on stdio MCPs (60 s cap, no sidecars)
+        skills_delivery="prompt_catalog",     # the prompt lists skills its Skill builtin loads
+        supports_bash=False,
+        supports_plans_dir=False,
+        builtin_file_tools=True,              # the platform's own Read/Write/Edit/Delete
+        has_shell_on_external_route=False,
+        provider_pinned_per_session=False,    # change_model re-acquires across providers
+        supports_steer=False,
+        supports_compact=False,
+        supports_interrupt_for_queued=False,
+        # The platform's own builtins (builtins.py) — canonical names already;
+        # the vendors' server tools (web search) are the provider's, not this
+        # engine's, and arrive under the provider's name.
+        tools={
+            "read": ("Read",),
+            "glob": ("Glob",),
+            "write": ("Write", "Edit"),
+            "delete": ("Delete",),
+            "skill": ("Skill",),
+            "discovery": ("tool_search",),
+        },
+        question_tool_holds_turn=False,       # no question tool
+    ),
+    model_policy=ModelPolicy(
+        default_model="claude-sonnet-5",      # tier 3 — the first usable tier for real work
+        model_filter_policy="all",            # every provider filtered to active subscriptions
+        pricing_editable=True,                # BYO keys are metered per model
+    ),
+    auth=AuthProfile(
+        auth_types=("api_key", "local_endpoint", "relay"),  # vendor keys, local servers, the hosted relay; no login
+    ),
+    usage=UsageProfile(windows=()),           # keys are metered per token, never capped by a window
 )
 
 
@@ -281,7 +367,7 @@ def direct_mcp_policy(client_type: str) -> tuple[bool, int]:
     stays stdio-only with the short cap — a document render behind a 300 s
     timeout must never hang a caller."""
     from core.layers.direct.mcp import TOOL_CALL_TIMEOUT, TOOL_CALL_TIMEOUT_CHAT
-    if client_type == "phone":
+    if client_type == session_kind.PHONE.name:
         return False, TOOL_CALL_TIMEOUT
     return True, TOOL_CALL_TIMEOUT_CHAT
 
@@ -326,7 +412,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 f"'{config.agent_name}' without a sandbox dir — local agents "
                 f"must run sandboxed + network-isolated."
             )
-        phone_mode = config.client_type == "phone"
+        phone_mode = config.client_type == session_kind.PHONE.name
         # An EXTERNAL session (a phone caller who is not a platform user):
         # the MCP set is filtered by the same rule the builder applied
         # (mcp_registry.session_exclusion_reason), here for the per-MCP dir
@@ -354,7 +440,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             # is_remote=False (fail-closed default, explicit here): LOCAL bwrap
             # mount path — satellite_only device MCPs never mount locally.
             mcp_mounts: list[SandboxMount] = []
-            assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, is_remote=False) or []
+            assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []
             for manifest in assigned_mcps:
                 for m in getattr(manifest, "sandbox_mounts", []):
                     # Host is allowlisted to the agent / mcps tree in the sandbox
@@ -394,6 +480,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 mcp_dir_binds=stdio_dirs,
                 external=external,
                 external_home=external_home_of(ctx),
+                read_only=bool(getattr(ctx, "read_only", False)),
             )
             sandbox_builder = SandboxBuilder(sandbox_cfg)
 
@@ -443,10 +530,12 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 layer="direct-llm", user_sub=config.subscription_user_sub,
             )
 
-    async def send_message(
+
+    async def _send_turn(
         self, session_id: str, message: str, **kwargs,
     ) -> AsyncIterator[CommonEvent]:
-        """Send message and yield CommonEvents translated from SSE dicts.
+        """One turn: send the message and yield CommonEvents translated from
+        SSE dicts (``send_message`` on the base wraps the turn-end loop).
 
         Kwargs:
             barge_in_chars: int — for phone barge-in annotation
@@ -510,9 +599,6 @@ class DirectLLMExecutionLayer(ExecutionLayer):
 
     async def close_session(self, session_id: str) -> None:
         """Close the direct session and its MCP servers."""
-        # Writeback refreshed OAuth tokens before closing MCPs
-        from core.credentials.credential_writeback import writeback_credential_dirs
-        await writeback_credential_dirs(session_id)
         await close_direct_session(session_id)
         # A closed session must not keep a live permission context (see the
         # CLI layer).
@@ -558,7 +644,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                     # Hosted relay: the token is provider-agnostic but the endpoint
                     # is per-provider — mint + re-point for the new provider.
                     creds = subscription_pool.relay_llm_credentials(
-                        sub_handle.provider, session.user_sub,
+                        sub_handle.layer, sub_handle.provider, session.user_sub,
                     )
                     session.api_key = creds[0] if creds else None
                     session.endpoint_url = creds[1] if creds else None
@@ -615,6 +701,56 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         return _DIRECT_CAPABILITIES
 
     # --- Session access ---
+
+    def owns_session(self, session_id: str) -> bool:
+        from .session import _direct_sessions
+        return session_id in _direct_sessions
+
+    def local_session_ids(self) -> list[str]:
+        from .session import _direct_sessions
+        return list(_direct_sessions)
+
+    def prepare_config_dir(
+        self, agent_name: str, *, username: str = "", scope: str = "user",
+        external_home=None, no_shell: bool = False, read_only: bool = False,
+    ) -> Path:
+        """Direct LLM has no CLI config of its own (``config_dir_name`` is
+        ""), but a session's plans dir and its in-process MCP config home
+        live in the ``.claude`` tree the sandbox mounts
+        (``sandbox_host_claude_dir``), so it asks the Claude engine's
+        builder for that tree by name — the coupling the old
+        ``execution_path`` branch hid behind its default arm, declared here.
+        ``no_shell`` / ``read_only`` are this engine's builtin gate's
+        business (``builtins.gate``), not a settings file's: the deny list
+        the builder writes is read by no CLI here. Reached through the
+        builder's module at call time (tests patch it there)."""
+        from core.layers.cli import config_dir as _cd
+        extra: dict = {}
+        if external_home:
+            extra["external_home"] = external_home
+        return _cd.ensure_persistent_claude_dir(
+            agent_name, username=username, scope=scope, **extra)
+
+    async def on_subscriptions_changed(self) -> None:
+        """The phone's Groq turn classifier reuses this engine's Groq key
+        (``services.phone.phone_config.direct_llm_groq_credentials``), so a
+        change to its subscriptions is pushed to the phone servers at once
+        — no phone restart to pick up a connected or removed key."""
+        from services.phone.phone_config import notify_phone_config_changed
+        await notify_phone_config_changed()
+
+    def subscription_env(self, handle: SubscriptionHandle) -> dict[str, str]:
+        """Provider-generic env: the key (a BYO vendor key, or the relay
+        token the pool minted) and the endpoint (a local server, or the
+        relay's per-provider base URL). Nothing on disk — a Direct LLM
+        session holds its credential in memory, so there is no file to
+        rotate under it and no sticky scope."""
+        env = {"_PROVIDER": handle.provider}
+        if handle.api_key:
+            env["_API_KEY"] = handle.api_key
+        if handle.endpoint_url:
+            env["_ENDPOINT_URL"] = handle.endpoint_url
+        return env
 
     async def get_session(self, session_id: str) -> DirectSession | None:
         """Return the underlying DirectSession."""

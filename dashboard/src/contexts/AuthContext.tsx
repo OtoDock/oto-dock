@@ -4,6 +4,7 @@ import { useChatStore } from '../store/chatStore'
 import { useAgentPrefsStore, migrateAgentPrefsToUser } from '../store/agentPrefsStore'
 import { migrateAudioPrefsToUser } from '../store/audioPrefsStore'
 import { setWakeDiag } from '../audio/wakeDiag'
+import { clearShareConfirm } from '../lib/shareConfirm'
 
 interface AuthContextValue {
   user: User | null
@@ -79,6 +80,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // The wake-word diagnostics recorder is a per-tab switch: it ends with
     // the session, never with the next user's sign-in.
     try { setWakeDiag(false) } catch { /* ignore */ }
+    // A share waiting on an identity-provider confirm belongs to this
+    // account alone.
+    clearShareConfirm()
     doLogout()
   }, [])
 

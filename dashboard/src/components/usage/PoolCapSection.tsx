@@ -3,6 +3,8 @@ import {
   PoolCapResponse, PoolCapStatus, PoolCapUpdate, PoolCapFields, PoolCapField,
   useMyPoolCap, useSetMyPoolCap, useAdminPoolCap, useSetAdminPoolCap,
 } from '@/api/usage'
+import { useExecutionLayers } from '@/api/agents'
+import { engineLabels } from '@/lib/engines'
 import {
   CAP_FIELDS, engineName, fieldShort, formatCap, formatReading, readingTone,
 } from './poolCap'
@@ -21,10 +23,13 @@ const TONE_CLASS = {
 // reading (two per row on a phone, four on a desktop) — a run-on line of
 // numbers wrapped unreadably on a narrow screen.
 function EngineLine({ status }: { status: PoolCapStatus }) {
+  // The engine's name comes from the catalog's descriptor (its id when the
+  // catalog has not loaded or does not know the engine).
+  const { data: layers } = useExecutionLayers()
   return (
     <div data-testid="pool-engine" className="space-y-1.5">
       <div className="flex items-baseline gap-2 text-sm">
-        <span className="font-medium text-p-text">{engineName(status.layer)}</span>
+        <span className="font-medium text-p-text">{engineName(status.layer, engineLabels(layers))}</span>
         <span className="text-xs text-p-text-light">
           {status.accounts} {status.accounts === 1 ? 'account' : 'accounts'}
         </span>

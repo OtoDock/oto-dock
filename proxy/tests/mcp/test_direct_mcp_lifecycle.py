@@ -171,3 +171,128 @@ async def test_http_servers_gated_to_opted_in_managers(tmp_path, monkeypatch):
         enable_http_transport=True)
     await mgr2._start_impl()
     assert set(mgr2.servers) == {"sidecar", "local"}
+
+
+@pytest.mark.asyncio
+async def test_a_tool_error_answered_by_the_server_does_not_mark_it_dead():
+    """The github sidecar reports a tool's own failure as a JSON-RPC error
+    (an McpError) instead of result.isError: a 404 for a repo with no
+    releases marked the whole server dead on the internal install every ten
+    minutes and cost the headless executor a rebuild per wake. A server that
+    answered is alive; only transport trouble marks it dead."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    class _Answered:
+        async def call_tool(self, name, arguments):
+            raise McpError(ErrorData(code=-32603, message="failed to get latest release: 404 Not Found"))
+
+    class _Gone:
+        async def call_tool(self, name, arguments):
+            raise RuntimeError("")  # a closed stream, empty message
+
+    conn = mcpmod.MCPServerConnection("github-mcp", {"type": "http", "url": "http://x/mcp"})
+    conn.session = _Answered()
+    out = await conn.call_tool("get_latest_release", {"repo": "r"})
+    assert "404 Not Found" in out and out.startswith("Error calling tool 'get_latest_release'")
+    assert conn.dead is False
+    conn.session = _Gone()
+    await conn.call_tool("get_latest_release", {"repo": "r"})
+    assert conn.dead is True
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_forgot_the_session_is_dead():
+    """"Session terminated" is the HTTP client's own McpError for a 404: the
+    sidecar evicted the idle session, and every later call on it fails —
+    a dead server, so the pooled executor rebuilds instead of erroring on
+    every wake (seen on the internal install: the hourly sync after a
+    quiet stretch)."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    class _Forgot:
+        async def call_tool(self, name, arguments):
+            raise McpError(ErrorData(code=32600, message="Session terminated"))
+
+    conn = mcpmod.MCPServerConnection("github-mcp", {"type": "http", "url": "http://x/mcp"})
+    conn.session = _Forgot()
+    out = await conn.call_tool("search_issues", {"query": "q"})
+    assert "Session terminated" in out and conn.dead is True
+    assert mcpmod.session_gone(RuntimeError("Session not found"))
+    assert not mcpmod.session_gone(RuntimeError("failed to get latest release: 404 Not Found"))
+
+
+@pytest.mark.asyncio
+async def test_stdio_servers_start_below_the_proxys_priority(monkeypatch):
+    """A Direct-LLM session's stdio MCPs run at the session priority,
+    like every session process, so a busy MCP never starves the proxy."""
+    from core.sandbox import pty_relay, env_builder
+    from core.credentials import mcp_broker
+    captured = {}
+    streams_cm = _RecordingCM((object(), object()))
+    session_cm = _RecordingCM(_FakeSession())
+
+    def _stdio(params):
+        captured["params"] = params
+        return streams_cm
+    monkeypatch.setattr(mcpmod, "stdio_client", _stdio)
+    monkeypatch.setattr(mcpmod, "ClientSession", lambda *a, **k: session_cm)
+    monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {"PATH": "/bin"})
+    monkeypatch.setattr(mcp_broker, "get", lambda sid, name: None)
+    monkeypatch.setattr(pty_relay, "nice_prefix", lambda: ["nice", "-n", "10"])
+
+    conn = mcpmod.MCPServerConnection(
+        "srv", {"type": "stdio", "command": "srv-bin", "args": ["--x"]},
+        session_id="s1", agent_name="a",
+    )
+    await conn.start()
+    params = captured["params"]
+    assert params.command == "nice"
+    assert params.args == ["-n", "10", "srv-bin", "--x"]
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_the_direct_builder_delivers_the_agent_scope_token_files(monkeypatch, tmp_path):
+    """A Direct-LLM session provisions its bundles itself: the OAuth stdio
+    MCPs' token files ride the bundle like on the Claude and Codex layers
+    for the agent scope the Direct build runs as."""
+    from core.credentials import credential_files as cf, mcp_broker
+    seen: list = []
+    monkeypatch.setattr(cf, "token_file_env",
+                        lambda agent, **kw: seen.append((agent, kw)) or
+                        {"gws": {cf.CREDENTIAL_FILES_ENV: "{}"}})
+    provisioned: list = []
+    monkeypatch.setattr(mcp_broker, "provision",
+                        lambda sid, bundles: provisioned.append((sid, dict(bundles))))
+    monkeypatch.setattr("services.mcp.mcp_registry.build_session_mcp_config",
+                        lambda *a, **kw: (tmp_path / "absent.json", None, None, {}, None))
+    mgr = mcpmod.AgentMCPManager("dev-agent")
+    mgr.session_id = "s-direct"
+    await mgr._start_impl()
+    assert seen == [("dev-agent", {"user_sub": "", "session_scope": "agent"})]
+    [(sid, bundles)] = provisioned
+    assert sid == "s-direct" and set(bundles) == {"gws"}
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_bundles_keep_the_builder_identity_files(monkeypatch, tmp_path):
+    """An app button builds its bundles for the app's identity (a personal
+    owner's files); the manager must not re-deliver the agent scope over
+    them."""
+    from core.credentials import credential_files as cf, mcp_broker
+    from core.credentials.mcp_broker import SecretBundle
+    monkeypatch.setattr(cf, "token_file_env",
+                        lambda agent, **kw: {"gws": {cf.CREDENTIAL_FILES_ENV: "AGENT-SCOPE"}})
+    provisioned: list = []
+    monkeypatch.setattr(mcp_broker, "provision",
+                        lambda sid, bundles: provisioned.append(dict(bundles)))
+    owner = SecretBundle()
+    owner.env[cf.CREDENTIAL_FILES_ENV] = "OWNER-SCOPE"
+    mgr = mcpmod.AgentMCPManager("dev-agent")
+    mgr.session_id = "s-button"
+    mgr.prebuilt_config = (tmp_path / "absent.json", {"gws": owner})
+    await mgr._start_impl()
+    [bundles] = provisioned
+    assert bundles["gws"].env[cf.CREDENTIAL_FILES_ENV] == "OWNER-SCOPE"

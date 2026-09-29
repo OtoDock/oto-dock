@@ -8,6 +8,7 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { openTerminalLink } from '../lib/openExternal'
 import { createPtyBrandFilter } from '../lib/ptyBrandColors'
 import { applyCtrlHold } from '../lib/terminalCtrlHold'
+import { WIRE, type WireType } from '../api/wireEvents'
 
 /**
  * Drives the dashboard side of an interactive CLI (PTY) session:
@@ -25,7 +26,7 @@ import { applyCtrlHold } from '../lib/terminalCtrlHold'
 
 // The interactive surface of the useDashboardWs bundle this hook needs.
 export interface InteractiveWs {
-  subscribe: (frameType: string, fn: (msg: any) => void) => () => void
+  subscribe: (frameType: WireType, fn: (msg: any) => void) => () => void
   sendPtyAttach: (chatId: string) => void
   sendPtyInput: (chatId: string, dataB64: string, composer?: boolean) => void
   sendPtyResize: (chatId: string, rows: number, cols: number) => void
@@ -363,7 +364,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // baked TUI theme (pty_status "attached" below).
     let appliedMode = mode
     let brand = createPtyBrandFilter(mode)
-    const unsubOut = subscribe('pty_output', (m: any) => {
+    const unsubOut = subscribe(WIRE.PTY_OUTPUT, (m: any) => {
       if (m.chat_id && m.chat_id !== chatId) return
       try {
         // Refresh-on-reconnect: a reset replay clears the mis-aligned
@@ -394,7 +395,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       if (rewarmTimer) { clearInterval(rewarmTimer); rewarmTimer = null }
     }
 
-    const unsubExit = subscribe('pty_exit', (m: any) => {
+    const unsubExit = subscribe(WIRE.PTY_EXIT, (m: any) => {
       if (m.chat_id && m.chat_id !== chatId) return
       const reason = m.reason || ''
       if (reason === 'rewarmed') {
@@ -427,6 +428,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       // ("superseded_otodock", dual-control) claimed it. Anything else = the
       // CLI process actually ended.
       const isTakeover = reason === 'superseded' || reason === 'superseded_otodock'
+      // The chat was deleted (its row goes right after the close): nothing
+      // to resume, so the exit is final and the page never re-resumes it.
+      const isDeleted = reason === 'chat_deleted'
       // Abnormal child death (non-zero exit) gets an explicit, visible line —
       // an instant CLI crash used to read as a blank/ambiguous "session ended".
       const exitCode = typeof m.code === 'number' ? m.code : null
@@ -440,6 +444,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
             // same conversation. A real exit — onExit fires and drives that.
             : reason === 'taken_over'
             ? '\r\n\x1b[2m[control taken — send a message to continue this conversation]\x1b[0m\r\n'
+            : isDeleted
+            ? '\r\n\x1b[2m[chat deleted]\x1b[0m\r\n'
             : exitCode !== null && exitCode !== 0
               ? `\r\n\x1b[31m[process exited unexpectedly (code ${exitCode}) — any error output is above]\x1b[0m\r\n`
               : '\r\n\x1b[2m[session ended]\x1b[0m\r\n'
@@ -449,9 +455,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       // for the DB rich view and let the next send re-warm + RESUME the session.
       // A take-over is skipped — the session is alive
       // on another device/terminal, not dead.
-      if (!isTakeover) onExitRef.current?.()
+      if (!isTakeover && !isDeleted) onExitRef.current?.()
     })
-    const unsubPerm = subscribe('pty_permission', (m: any) => {
+    const unsubPerm = subscribe(WIRE.PTY_PERMISSION, (m: any) => {
       if (m.chat_id && m.chat_id !== chatId) return
       setPendingPermission({
         kind: m.kind || 'permission',
@@ -462,7 +468,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       })
     })
 
-    const unsubStatus = subscribe('pty_status', (m: any) => {
+    const unsubStatus = subscribe(WIRE.PTY_STATUS, (m: any) => {
       // The REMOTE PTY transport is reconnecting/reconnected (a
       // satellite WS blip). The proxy held the session in grace, so the terminal
       // is alive — just frozen. Show a banner + pause input until it returns.

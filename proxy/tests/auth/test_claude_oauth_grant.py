@@ -17,7 +17,7 @@ from fastapi import HTTPException
 
 from api.auth import claude_oauth as claude_api
 from api.auth.claude_oauth import OAuthExchangeRequest
-from auth.claude_oauth import INFERENCE_SCOPE, grant_refusal
+from core.layers.cli.oauth import INFERENCE_SCOPE, grant_refusal
 
 
 # The exact grant from the issue report.
@@ -67,7 +67,7 @@ def _exchange(token_response, existing_rows=()):
     with patch.object(claude_api, "subscription_store", store), \
          patch.object(claude_api, "subscription_pool", pool), \
          patch.object(claude_api, "_consume_state", return_value=meta), \
-         patch.object(claude_api, "require_auth", lambda u: u), \
+         patch.object(claude_api, "require_human", lambda u: u), \
          patch.object(claude_api.claude_oauth, "exchange_code",
                       return_value=token_response):
         asyncio.run(claude_api.oauth_exchange(req, user=user))
@@ -103,7 +103,7 @@ class TestExchangeRefusesConsoleGrant:
         with patch.object(claude_api, "subscription_store", store), \
              patch.object(claude_api, "subscription_pool", pool), \
              patch.object(claude_api, "_consume_state", return_value=meta), \
-             patch.object(claude_api, "require_auth", lambda u: u), \
+             patch.object(claude_api, "require_human", lambda u: u), \
              patch.object(claude_api.claude_oauth, "exchange_code",
                           return_value=_console_token()):
             with pytest.raises(HTTPException):
@@ -129,7 +129,7 @@ class TestExchangeRefusesConsoleGrant:
         with patch.object(claude_api, "subscription_store", store), \
              patch.object(claude_api, "subscription_pool", MagicMock()), \
              patch.object(claude_api, "_consume_state", return_value=meta), \
-             patch.object(claude_api, "require_auth", lambda u: u), \
+             patch.object(claude_api, "require_human", lambda u: u), \
              patch.object(claude_api.claude_oauth, "exchange_code",
                           return_value=_console_token()):
             with pytest.raises(HTTPException):

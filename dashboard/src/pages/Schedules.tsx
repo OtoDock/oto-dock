@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useTasks, useRunTaskNow, useDeleteTask, usePauseTask, useResumeTask } from '../api/tasks'
 import { useAgents } from '../api/agents'
 import { useAdminUsers } from '../api/runs'
-import { formatNextRun, formatCronDescription, formatIntervalDescription } from '../lib/format'
+import { formatNextRun, describeSchedule, browserTimeZone } from '../lib/format'
 import { TaskModelChip } from '../components/common/TaskModelChip'
 
 export default function Schedules() {
@@ -11,6 +11,9 @@ export default function Schedules() {
   const [userFilter, setUserFilter] = useState('')
   // Admin audit page: full-audit view (every user's tasks); agent/user are filters.
   const { data: tasks, isLoading } = useTasks(agentFilter || undefined, { audit: true })
+  // "Next" is the browser's clock; the schedule names its own zone when
+  // that differs (see AgentSchedules).
+  const browserTz = browserTimeZone()
   const { data: agents } = useAgents({ all: true })
   const { data: users } = useAdminUsers()
   const runNow = useRunTaskNow()
@@ -126,7 +129,7 @@ export default function Schedules() {
                   </td>
                   <td className="px-4 py-3 text-p-text-secondary">{task.agent}</td>
                   <td className="px-4 py-3 text-xs text-p-text-secondary">
-                    <div>{formatIntervalDescription(task.interval_seconds) || formatCronDescription(task.schedule) || task.run_at || (task.delay_seconds != null ? `in ${task.delay_seconds}s` : '\u2014')}</div>
+                    <div>{describeSchedule(task, browserTz)}</div>
                     {task.schedule && <div className="font-mono text-p-text-light mt-0.5">{task.schedule}</div>}
                     {task.interval_seconds != null && <div className="font-mono text-p-text-light mt-0.5">interval {task.interval_seconds}s</div>}
                   </td>
@@ -189,12 +192,12 @@ export default function Schedules() {
         {filteredTasks.length === 0 && <p className="text-sm text-p-text-secondary py-4">No tasks found.</p>}
         {filteredTasks.map((task) => (
           <div key={task.id} className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-2">
-            <div className="flex items-start justify-between">
-              <div>
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-p-text">{task.name}</p>
                 <p className="text-xs text-p-text-secondary">{task.agent}</p>
                 <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
-                  <span className="text-xs text-p-text-light font-mono">{task.id}</span>
+                  <span className="text-xs text-p-text-light font-mono break-all">{task.id}</span>
                   <TaskModelChip task={task} />
                 </div>
               </div>
@@ -205,8 +208,8 @@ export default function Schedules() {
               </div>
             </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-p-text-secondary">
-              <span><span className="text-p-text-light">Schedule:</span> {formatIntervalDescription(task.interval_seconds) || formatCronDescription(task.schedule) || task.run_at || '\u2014'}</span>
-              <span><span className="text-p-text-light">Next:</span> {formatNextRun(task.next_run_time)}</span>
+              <span className="min-w-0 break-words"><span className="text-p-text-light">Schedule:</span> {describeSchedule(task, browserTz)}</span>
+              <span className="min-w-0 break-words"><span className="text-p-text-light">Next:</span> {formatNextRun(task.next_run_time)}</span>
             </div>
             {(task.can_run || task.can_pause || task.can_resume || task.can_delete) && (
               <div className="flex flex-wrap items-center gap-2 pt-3 border-t border-p-border-light">

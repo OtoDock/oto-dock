@@ -15,6 +15,7 @@ from core.events.common_events import (
     SUBAGENT_START, SUBAGENT_END, BG_COMMAND_START, BG_COMMAND_END,
     METADATA, DONE, ERROR, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
 )
+from core.layers.codex import tool_names
 from core.layers.codex.session import CodexEvent
 
 logger = logging.getLogger("codex-layer")
@@ -36,14 +37,6 @@ def _codex_tool_summary(item_type: str, item: dict) -> str:
         q = item.get("query", "")
         return q if isinstance(q, str) else ""
     return ""
-
-
-# Codex ThreadItem.type → platform tool display name (matches the CLI's names).
-_TOOL_NAME_BY_ITEM_TYPE: dict[str, str] = {
-    "commandExecution": "Bash",
-    "fileChange": "apply_patch",
-    "webSearch": "web_search",
-}
 
 
 def _completed_tool_output(item_type: str, item: dict) -> "tuple[str, bool] | None":
@@ -341,9 +334,9 @@ class CodexEventTranslator:
     def _record_rate_limits(self, params) -> None:
         if not self._session_id or not isinstance(params, dict):
             return
-        from services.engines import subscription_windows as _sw
+        from core.layers.codex.usage import record_snapshot_async
         snapshot = params.get("rateLimits")
-        _sw.record_codex_snapshot_async(
+        record_snapshot_async(
             self._session_id, snapshot if isinstance(snapshot, dict) else params)
 
     def _on_goal_updated(self, params) -> list[CommonEvent]:
@@ -401,8 +394,8 @@ class CodexEventTranslator:
         if item_type == "reasoning":
             return [CommonEvent(type=THINKING, data={"phase": "start"})]
 
-        if item_type in ("commandExecution", "fileChange", "webSearch"):
-            tool_name = _TOOL_NAME_BY_ITEM_TYPE[item_type]
+        if item_type in tool_names.TOOL_ITEM_TYPES:
+            tool_name = tool_names.canonical(item_type)
             events = [CommonEvent(type=TOOL_USE, data={"name": tool_name, "tool_id": item_id})]
             summary = _codex_tool_summary(item_type, item)
             if summary:
@@ -493,11 +486,12 @@ class CodexEventTranslator:
             self._streamed_reasoning.discard(item_id)
             return [CommonEvent(type=THINKING, data={"phase": "end", "text": ""})]
 
-        if item_type in ("commandExecution", "fileChange", "webSearch"):
-            data = {"name": _TOOL_NAME_BY_ITEM_TYPE[item_type], "tool_id": item_id}
+        if item_type in tool_names.TOOL_ITEM_TYPES:
+            data = {"name": tool_names.canonical(item_type), "tool_id": item_id}
             output = _completed_tool_output(item_type, item)
             if output is not None:
                 data["result_content"], data["is_error"] = output
+            self._record_tool(data["name"], item_id, item, bool(data.get("is_error")))
             events = [CommonEvent(type=TOOL_RESULT, data=data)]
             rec = (self._bg_commands.pop(item_id, None)
                    if item_type == "commandExecution" else None)
@@ -525,6 +519,7 @@ class CodexEventTranslator:
             output = _completed_tool_output("mcpToolCall", item)
             if output is not None:
                 data["result_content"], data["is_error"] = output
+            self._record_tool(tool_name, item_id, item, bool(data.get("is_error")))
             return [CommonEvent(type=TOOL_RESULT, data=data)]
 
         # Collab sub-agents: the spawnAgent/completed item carries the new
@@ -547,6 +542,31 @@ class CodexEventTranslator:
 
         logger.debug(f"Codex translator: unhandled item.completed type={item_type!r}")
         return []
+
+    def _record_tool(self, tool_name: str, item_id: str, item: dict, is_error: bool) -> None:
+        """The Codex app-server placement's ONE ``post_tool`` source
+        (session_events / HOOKS.md): every completed command, patch, web
+        search and MCP call, with a patch's paths. No session id (a
+        translator built without one) → nothing to record."""
+        if not self._session_id:
+            return
+        tool_input: dict = {}
+        if item.get("type") == "fileChange":
+            paths = [c.get("path") for c in (item.get("changes") or [])
+                     if isinstance(c, dict) and c.get("path")]
+            if paths:
+                tool_input["_codex_paths"] = paths
+        elif item.get("type") == "mcpToolCall" and isinstance(item.get("arguments"), dict):
+            tool_input = item["arguments"]
+        elif item.get("type") == "commandExecution" and isinstance(item.get("command"), str):
+            # The record keeps the command (capped there): a check reads a
+            # commit, a push or a build from it.
+            tool_input = {"command": item["command"]}
+        from core.session import session_events
+        session_events.post_tool(
+            self._session_id, tool_name, tool_use_id=item_id,
+            tool_input=tool_input, is_error=is_error, source="codex-stream",
+        )
 
     def _handle_collab(self, item: dict) -> list[CommonEvent]:
         """Map a ``collabAgentToolCall`` item to SUBAGENT_START / SUBAGENT_END.

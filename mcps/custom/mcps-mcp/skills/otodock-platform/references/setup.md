@@ -33,9 +33,18 @@ Two places, same platform:
   (popup + paste authorization code) or **ChatGPT** (device-code sign-in) subscription.
   Multiple accounts per provider are fine; each row has a **Personal use** toggle, and
   admins additionally get **Agent pool** (contribute the account to the platform pool).
+  The popup signs in with the browser's platform.claude.com session, so to add a second
+  Claude account sign out there first or use a private window — a code for an account
+  already connected only refreshes it and the form says so; a refused paste offers Try
+  again.
 - **Setup → AI Engines** *(admin)* — platform-level subscriptions, **API keys**
   (Anthropic, OpenAI, Groq), and **local models** (Ollama or any OpenAI-compatible
   endpoint by URL), plus per-provider model lists and pricing.
+
+Each engine has its own default model, chosen by tier, which an agent on **Auto** runs:
+Claude Opus 5.5 on Claude Code, GPT-6 Sol on Codex, Sonnet 5 on Direct LLM. Every model
+list shows its tier. Since 1.7 Claude Opus 5.5 replaces Opus 5, and GPT-6 Sol and GPT-6
+Luna replace their GPT-5.6 versions; pins on the old ids move over at the next start.
 
 Routing rule: a user's own chats/tasks run on **their own** connections first; anything
 that belongs to an *agent* (agent-scope tasks, shared agents, meetings, triggers, phone
@@ -75,6 +84,8 @@ The `otodock-phone` service ships as a compose overlay
   Caller Data** (90 days by default; **Forget all caller data now** is permanent).
 - Wake word ("Hey OtoDock") is per-user opt-in: **User Settings → General → Wake word**,
   off by default, on-device detection.
+- Dictation language: hold the chat's microphone button to pick it, or set it under
+  **User Settings → Audio**.
 
 ## Remote machines
 
@@ -103,7 +114,8 @@ the same dashboard. Pairing is outbound-only (no open ports) and needs
   show live status, sessions/capacity, and the CLI versions the machine runs
   (highlighted on drift).
 - Kill switch: **Setup → System Settings → "Allow users to pair their own remote
-  machines"** *(admin)*; offline-fallback behavior lives next to it.
+  machines"** *(admin)*; offline-fallback behavior lives next to it. An admin can also
+  remove any one user's machine from **Admin → Remote Machines**; its owner is told.
 
 ## When something's missing
 

@@ -26,7 +26,7 @@ from satellite.terminal.otodock_cli import (
     _PosixTerminal,
     _relay,
 )
-from satellite.terminal.terminal_queries import (
+from satellite._vendored.terminal_queries import (
     TERMINAL_MODE_RESET,
     split_trailing_partial,
 )

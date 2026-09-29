@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from calendar import monthrange
 
 from storage import database as task_store
+from storage import db_apps
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +326,27 @@ def get_admin_overview(days: int = 30) -> dict:
             "breakdown": agent_breakdown_by_name.get(a["agent"], []),
         })
 
+    # Unattended spend per app (APPS.md "Handlers"): runs a handler fired,
+    # named by the app's title while the row exists.
+    apps_usage = []
+    for a in task_store.get_usage_by_app(m_start, m_end):
+        app_row = task_store.get_app(a.get("app_id") or "")
+        apps_usage.append({
+            **a,
+            "total_cost": round(float(a.get("total_cost") or 0), 4),
+            "title": (app_row or {}).get("title") or (app_row or {}).get("slug") or a.get("app_id"),
+            "slug": (app_row or {}).get("slug") or "",
+            "agent": (app_row or {}).get("agent") or "",
+            "scope": db_apps.app_scope(app_row.get("username")) if app_row else "gone",
+        })
+
+    # Judge spend per check (CHECKS.md "Spend"): the judge runs a check
+    # started, grouped by agent and check.
+    checks_usage = [
+        {**c, "total_cost": round(float(c.get("total_cost") or 0), 4)}
+        for c in task_store.get_usage_by_check(m_start, m_end)
+    ]
+
     daily_chart = task_store.get_usage_daily(days=days)
 
     # Platform-wide rollups for the prominent "Costs by Provider" /
@@ -353,4 +375,6 @@ def get_admin_overview(days: int = 30) -> dict:
         "model_totals": model_totals,
         "users": users_with_limits,
         "agents": agents_with_limits,
+        "apps": apps_usage,
+        "checks": checks_usage,
     }

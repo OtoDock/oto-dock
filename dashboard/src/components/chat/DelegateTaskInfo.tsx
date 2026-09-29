@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
+import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../../lib/status/run'
 
 interface Props {
   taskName: string
   agent: string
   promptPreview: string
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'user_interrupted'
+  status: DelegateBlockStatus
   /** Full delegated prompt — enables the expanded view (older rows only
    * carry the 100-char preview). */
   prompt?: string
@@ -39,13 +40,13 @@ export default function DelegateTaskInfo({ taskName, agent, promptPreview, statu
             </span>
           )}
           <span className="shrink-0">
-            {status === 'running' ? (
+            {status === RUN_STATUS.RUNNING ? (
               <span className="inline-block w-3 h-3 border-2 border-p-accent-teal border-t-transparent rounded-full animate-spin" />
-            ) : status === 'completed' ? (
+            ) : status === DELEGATE_RESULT.COMPLETED ? (
               <span className="text-p-accent-teal">&#10003;</span>
-            ) : status === 'cancelled' ? (
+            ) : status === DELEGATE_RESULT.CANCELLED ? (
               <span className="text-p-text-light">&#10005;</span>
-            ) : status === 'user_interrupted' ? (
+            ) : status === DELEGATE_RESULT.USER_INTERRUPTED ? (
               <span className="text-amber-500" title="The user stopped or redirected this lane">&#9208;</span>
             ) : (
               <span className="text-red-500">&#10007;</span>
@@ -53,7 +54,7 @@ export default function DelegateTaskInfo({ taskName, agent, promptPreview, statu
           </span>
           {agentBadge('hidden sm:inline-block')}
           <span className="truncate font-medium">{taskName}</span>
-          {status === 'user_interrupted' && (
+          {status === DELEGATE_RESULT.USER_INTERRUPTED && (
             <span className="shrink-0 px-1.5 py-0.5 rounded-sm text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
               interrupted by user
             </span>

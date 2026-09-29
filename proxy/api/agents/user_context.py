@@ -14,6 +14,7 @@ from auth.providers import UserContext, get_current_user, require_agent_access, 
 from api.agents._common import _get_agent_dir
 from api.agents._router import router
 from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from core import layout
 
 
 CONTEXT_ALLOWED_EXTENSIONS = {".md", ".txt"}
@@ -32,7 +33,7 @@ def _get_user_context_dir(agent_name: str, user: UserContext) -> Path:
         raise HTTPException(400, "User has no username slug")
     agent_dir = _get_agent_dir(agent_name)
     try:
-        ctx_dir = resolve_under(agent_dir / "users" / username / "context", agent_dir)
+        ctx_dir = resolve_under(layout.context_dir(agent_dir, username), agent_dir)
     except PathOutsideRoot:
         raise HTTPException(403, "Path traversal not allowed")
     ctx_dir.mkdir(parents=True, exist_ok=True)

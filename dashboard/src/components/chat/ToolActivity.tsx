@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { PAYLOAD, PAYLOAD_KEYS, ROLE, toolPayload, toolRole, payloadText, payloadValue } from '../../lib/tools/roles'
 
 interface Props {
   name: string
@@ -12,47 +13,81 @@ interface Props {
   resultSummary?: string
 }
 
+// The cards key on what a call CARRIES (lib/tools/roles: its payload kind and
+// the input keys that kind is read from) and on its role — never on the tool's
+// name, so an engine that maps its own tools into the platform's vocabulary
+// renders like every other.
+
+/** A patch's file paths: the app-server item's `changes[].path`, else the
+ *  `*** Add|Update|Delete File:` headers of the patch text. */
+function patchPaths(input: any): string[] {
+  const changes = Array.isArray(input?.changes) ? input.changes : []
+  const fromItem = changes.map((c: any) => (c && typeof c.path === 'string' ? c.path : '')).filter(Boolean)
+  if (fromItem.length) return fromItem
+  const text = payloadText('apply_patch', input)
+  const out: string[] = []
+  for (const m of text.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) out.push(m[1].trim())
+  return out
+}
+
+/** A patch's body: the diffs of the item's changes, else the patch text. */
+function patchBody(input: any): string {
+  const changes = Array.isArray(input?.changes) ? input.changes : []
+  const diffs = changes
+    .map((c: any) => {
+      const kind = (c?.kind && typeof c.kind === 'object' && c.kind.type) || 'update'
+      const head = `${kind} ${c?.path || ''}`
+      return c?.diff ? `${head}\n${c.diff}` : head
+    })
+    .filter(Boolean)
+  return diffs.length ? diffs.join('\n') : payloadText('apply_patch', input)
+}
+
+/** A skill or workflow's name: the input's `name`, else the meta block of an
+ *  inline workflow script ("Workflow review-changes"). */
+function nameOf(name: string, input: any): string {
+  const direct = payloadText(name, input)
+  if (direct) return direct
+  return typeof input?.script === 'string'
+    ? (input.script.match(/name:\s*['"]([^'"]+)['"]/)?.[1] ?? '')
+    : ''
+}
+
 export function getToolDetail(name: string, summary: string | undefined, toolInput: any): string {
-  // Bash: the model-written description says WHAT the command does — that's
-  // the collapsed title (the command itself is the expanded detail). Wins
-  // over `summary`, which older rows carry as the raw command. Generous cap:
-  // collapsed rendering clips to one line via CSS, and the expanded pill
-  // un-truncates this same text (see ToolActivity), so keep the full sentence.
-  if (name === 'Bash' && toolInput?.description) {
+  // A shell: the model-written description says WHAT the command does —
+  // that's the collapsed title (the command itself is the expanded detail).
+  // Wins over `summary`, which older rows carry as the raw command. Generous
+  // cap: collapsed rendering clips to one line via CSS, and the expanded
+  // pill un-truncates this same text (see ToolActivity), so keep the full
+  // sentence.
+  const role = toolRole(name)
+  if (role === ROLE.SHELL && toolInput?.description) {
     return truncate(toolInput.description, 300)
   }
   if (summary) return summary
   if (!toolInput) return ''
-  switch (name) {
-    case 'Bash':
-      return toolInput.command ? truncate(toolInput.command, 120) : ''
-    case 'Read':
-    case 'Write':
-    case 'Edit':
-    case 'Delete':
-      return toolInput.file_path || ''
-    // Direct-LLM client-side builtins: the skill loaded / the search query.
-    case 'Skill':
-      return toolInput.name || ''
-    case 'tool_search':
-      return toolInput.query || ''
-    case 'Grep':
-      return [toolInput.pattern, toolInput.path].filter(Boolean).join(' in ')
-    case 'Glob':
-      return toolInput.pattern || ''
-    case 'WebSearch':
-      return toolInput.query || ''
-    case 'WebFetch':
-      return toolInput.url ? truncate(toolInput.url, 100) : ''
-    case 'Agent':
-      return toolInput.description || ''
-    case 'Workflow':
-      // Saved workflows carry `name`; inline scripts carry it in the meta
-      // block — fish it out so the pill reads "Workflow review-changes".
-      return toolInput.name
-        || (typeof toolInput.script === 'string'
-            ? (toolInput.script.match(/name:\s*['"]([^'"]+)['"]/)?.[1] ?? '')
-            : '')
+  switch (toolPayload(name)) {
+    case PAYLOAD.COMMAND:
+      return truncate(payloadText(name, toolInput), 120)
+    case PAYLOAD.FILE_PATH:
+      return payloadText(name, toolInput)
+    case PAYLOAD.PATCH: {
+      const paths = patchPaths(toolInput)
+      return paths.length ? paths.map((p) => p.split('/').pop() || p).join(', ') : ''
+    }
+    case PAYLOAD.SEARCH_PATH:
+      // A content search reads "pattern in path"; a glob is its pattern.
+      return role === ROLE.SEARCH
+        ? [toolInput.pattern, payloadText(name, toolInput)].filter(Boolean).join(' in ')
+        : toolInput.pattern || ''
+    case PAYLOAD.QUERY:
+      return payloadText(name, toolInput)
+    case PAYLOAD.URL:
+      return truncate(payloadText(name, toolInput), 100)
+    case PAYLOAD.DESCRIPTION:
+      return payloadText(name, toolInput)
+    case PAYLOAD.NAME:
+      return nameOf(name, toolInput)
     default:
       return ''
   }
@@ -68,75 +103,107 @@ function truncateLines(s: string, maxLines: number): { text: string; truncated: 
   return { text: lines.slice(0, maxLines).join('\n'), truncated: lines.length - maxLines }
 }
 
+function Pre({ children, tone }: { children: React.ReactNode; tone?: 'removed' | 'added' }) {
+  const cls = tone === 'removed'
+    ? 'bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 max-h-60'
+    : tone === 'added'
+      ? 'bg-green-50 dark:bg-green-900/20 text-green-800 dark:text-green-300 max-h-60'
+      : 'bg-p-surface dark:bg-p-bg max-h-80'
+  return <pre className={`whitespace-pre-wrap rounded-sm px-2 py-1.5 overflow-y-auto ${cls}`}>{children}</pre>
+}
+
+/** The input carries keys a branch does not render (a notebook cell, a
+ *  multi-edit's edits, a workflow's script): the JSON body shows them all. */
+function carriesMore(input: any, shown: string[]): boolean {
+  return Object.keys(input).some((k) => !shown.includes(k))
+}
+
 function ToolDetail({ name, toolInput }: { name: string; toolInput: any }) {
   if (!toolInput) return null
+  const payload = toolPayload(name)
+  const role = toolRole(name)
 
-  if (name === 'Edit') {
-    const fp = toolInput.file_path || ''
-    const oldStr = toolInput.old_string || ''
-    const newStr = toolInput.new_string || ''
-    return (
-      <div className="space-y-1.5">
-        {fp && <div className="text-p-text-secondary font-mono">{fp}</div>}
-        {oldStr && (
-          <pre className="whitespace-pre-wrap bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-300 rounded-sm px-2 py-1.5 max-h-60 overflow-y-auto">
-            {oldStr.split('\n').map((line: string, i: number) => (
-              <span key={i}>{`- ${line}\n`}</span>
-            ))}
-          </pre>
-        )}
-        {newStr && (
-          <pre className="whitespace-pre-wrap bg-green-50 dark:bg-green-900/20 text-green-800 dark:text-green-300 rounded-sm px-2 py-1.5 max-h-60 overflow-y-auto">
-            {newStr.split('\n').map((line: string, i: number) => (
-              <span key={i}>{`+ ${line}\n`}</span>
-            ))}
-          </pre>
-        )}
-      </div>
-    )
+  if (payload === PAYLOAD.FILE_PATH) {
+    const fp = payloadText(name, toolInput)
+    // An edit carries the old and new text; a write its content; a read
+    // its window; a delete (or an edit without text) the path alone.
+    if (typeof toolInput.old_string === 'string' || typeof toolInput.new_string === 'string') {
+      const oldStr = toolInput.old_string || ''
+      const newStr = toolInput.new_string || ''
+      return (
+        <div className="space-y-1.5">
+          {fp && <div className="text-p-text-secondary font-mono">{fp}</div>}
+          {oldStr && (
+            <Pre tone="removed">
+              {oldStr.split('\n').map((line: string, i: number) => (
+                <span key={i}>{`- ${line}\n`}</span>
+              ))}
+            </Pre>
+          )}
+          {newStr && (
+            <Pre tone="added">
+              {newStr.split('\n').map((line: string, i: number) => (
+                <span key={i}>{`+ ${line}\n`}</span>
+              ))}
+            </Pre>
+          )}
+        </div>
+      )
+    }
+    if (role === ROLE.WRITE && typeof toolInput.content === 'string') {
+      const { text, truncated } = truncateLines(toolInput.content, 200)
+      return (
+        <div className="space-y-1.5">
+          {fp && <div className="text-p-text-secondary font-mono">{fp}</div>}
+          <Pre>
+            {text}
+            {truncated > 0 && <span className="text-p-text-light">{`\n... (${truncated} more lines)`}</span>}
+          </Pre>
+        </div>
+      )
+    }
+    if (role === ROLE.READ) {
+      return (
+        <div className="space-y-0.5">
+          <div className="font-mono">{fp}</div>
+          {(toolInput.offset || toolInput.limit) && (
+            <div className="text-p-text-light">
+              {toolInput.offset ? `offset: ${toolInput.offset}` : ''}
+              {toolInput.offset && toolInput.limit ? ' · ' : ''}
+              {toolInput.limit ? `limit: ${toolInput.limit}` : ''}
+            </div>
+          )}
+        </div>
+      )
+    }
+    if (!carriesMore(toolInput, PAYLOAD_KEYS[PAYLOAD.FILE_PATH])) {
+      return <div className="font-mono">{fp}</div>
+    }
   }
 
-  if (name === 'Write') {
-    const fp = toolInput.file_path || ''
-    const content = toolInput.content || ''
-    const { text, truncated } = truncateLines(content, 200)
+  if (payload === PAYLOAD.PATCH) {
+    // A file change as a file change: its paths, then the diffs (the
+    // app-server item) or the patch text (the rollout, the hook wire).
+    const paths = patchPaths(toolInput)
+    const { text, truncated } = truncateLines(patchBody(toolInput), 200)
     return (
       <div className="space-y-1.5">
-        {fp && <div className="text-p-text-secondary font-mono">{fp}</div>}
-        <pre className="whitespace-pre-wrap bg-p-surface dark:bg-p-bg rounded-sm px-2 py-1.5 max-h-80 overflow-y-auto">
+        {paths.map((p) => <div key={p} className="text-p-text-secondary font-mono">{p}</div>)}
+        <Pre>
           {text}
           {truncated > 0 && <span className="text-p-text-light">{`\n... (${truncated} more lines)`}</span>}
-        </pre>
+        </Pre>
       </div>
     )
   }
 
-  if (name === 'Bash') {
+  if (payload === PAYLOAD.COMMAND) {
     // The description is the collapsed pill title (getToolDetail) — the
     // expanded body is the command itself.
-    return (
-      <pre className="whitespace-pre-wrap bg-p-surface dark:bg-p-bg rounded-sm px-2 py-1.5 max-h-60 overflow-y-auto">
-        {toolInput.command || ''}
-      </pre>
-    )
+    return <Pre>{payloadText(name, toolInput)}</Pre>
   }
 
-  if (name === 'Read') {
-    return (
-      <div className="space-y-0.5">
-        <div className="font-mono">{toolInput.file_path || ''}</div>
-        {(toolInput.offset || toolInput.limit) && (
-          <div className="text-p-text-light">
-            {toolInput.offset ? `offset: ${toolInput.offset}` : ''}
-            {toolInput.offset && toolInput.limit ? ' · ' : ''}
-            {toolInput.limit ? `limit: ${toolInput.limit}` : ''}
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  if (name === 'Grep') {
+  if (payload === PAYLOAD.SEARCH_PATH) {
     return (
       <div className="space-y-0.5">
         {toolInput.pattern && <div className="font-mono">pattern: {toolInput.pattern}</div>}
@@ -147,12 +214,11 @@ function ToolDetail({ name, toolInput }: { name: string; toolInput: any }) {
     )
   }
 
-  if (name === 'Delete' || name === 'Skill') {
-    // Direct-LLM builtins: one identifying line (the path / the skill name).
-    return <div className="font-mono">{toolInput.file_path || toolInput.name || ''}</div>
+  if (payload === PAYLOAD.NAME && !carriesMore(toolInput, PAYLOAD_KEYS[PAYLOAD.NAME])) {
+    return <div className="font-mono">{nameOf(name, toolInput)}</div>
   }
 
-  if (name === 'tool_search') {
+  if (payload === PAYLOAD.QUERY) {
     return (
       <div className="space-y-0.5">
         {toolInput.query && <div className="font-mono">query: {toolInput.query}</div>}
@@ -161,11 +227,12 @@ function ToolDetail({ name, toolInput }: { name: string; toolInput: any }) {
     )
   }
 
-  if (name === 'TodoWrite') {
-    const todos = Array.isArray(toolInput.todos) ? toolInput.todos : []
+  if (payload === PAYLOAD.TODOS) {
+    const todos = payloadValue(name, toolInput)
+    const list = Array.isArray(todos) ? todos : []
     return (
       <div className="space-y-0.5">
-        {todos.map((t: any, i: number) => (
+        {list.map((t: any, i: number) => (
           <div key={i} className="flex items-center gap-2">
             {t.status === 'completed' ? (
               <span className="text-p-success text-[10px]">&#10003;</span>
@@ -185,10 +252,10 @@ function ToolDetail({ name, toolInput }: { name: string; toolInput: any }) {
   const json = JSON.stringify(toolInput, null, 2)
   const { text, truncated } = truncateLines(json, 200)
   return (
-    <pre className="whitespace-pre-wrap bg-p-surface dark:bg-p-bg rounded-sm px-2 py-1.5 max-h-80 overflow-y-auto">
+    <Pre>
       {text}
       {truncated > 0 && <span className="text-p-text-light">{`\n... (${truncated} more lines)`}</span>}
-    </pre>
+    </Pre>
   )
 }
 
@@ -197,11 +264,11 @@ export default function ToolActivity({ name, summary, status, toolInput, toolRes
   const detail = getToolDetail(name, summary, toolInput)
   const expandable = !!toolInput || !!toolResult
 
-  // Expanding un-truncates the collapsed title when it's a Bash description:
+  // Expanding un-truncates the collapsed title when it's a shell description:
   // the full sentence wraps in place, reading above the command in the body.
   // The no-description fallback (title = the raw command, e.g. Codex) stays
   // clipped — the body already shows the command verbatim.
-  const wrapDetail = expanded && name === 'Bash' && !!toolInput?.description
+  const wrapDetail = expanded && toolRole(name) === ROLE.SHELL && !!toolInput?.description
 
   // Show result summary inline (e.g., "15 lines", "3 results", "ok")
   const inlineSummary = resultSummary || ''

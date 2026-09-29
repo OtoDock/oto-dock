@@ -54,3 +54,38 @@ async def test_conversations_gate_allows_manager_and_admin(monkeypatch):
     admin = UserContext(sub="a", email="a@t.com", name="a", role="admin")
     res2 = await agents.list_agent_conversations("acme", user=admin)
     assert res2["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/chats/{id}/detail — the by-id rule the dashboard's resume shares
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_detail_follows_the_chat_owner_and_phone_calls_open_for_managers(temp_db):
+    """On a Shared-only agent an assigned editor reads the ``agent::`` pool's
+    detail, not a colleague's per-user chat from before the switch, and not
+    a phone call; a manager reads the call. The agent's mode decides nothing
+    by itself — the REST ``can_access_chat`` rule plus the phone clause."""
+    import uuid
+    from core.session import session_kind
+    from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
+    from storage import database as task_store
+    from storage.agents import agent_store
+    slug = "so-detail"
+    agent_store.create_agent(slug, "SO", collaborative=False, default_scope="agent")
+    call, pre_switch, pool = (str(uuid.uuid4()) for _ in range(3))
+    task_store.create_chat(call, PHONE_CHAT_OWNER, slug, source_type=session_kind.PHONE.source_type)
+    task_store.create_chat(pre_switch, "user-admin", slug)
+    task_store.create_chat(pool, shared_chat_owner(slug), slug)
+    editor = _user("u-ed", slug, "editor")
+    manager = _user("u-mgr", slug, "manager")
+    assert (await agents.get_chat_detail(pool, user=editor))["id"] == pool
+    for cid in (call, pre_switch):
+        with pytest.raises(HTTPException) as exc:
+            await agents.get_chat_detail(cid, user=editor)
+        assert exc.value.status_code == 403, cid
+    assert (await agents.get_chat_detail(call, user=manager))["id"] == call
+    with pytest.raises(HTTPException) as exc:
+        await agents.get_chat_detail(pre_switch, user=manager)
+    assert exc.value.status_code == 403

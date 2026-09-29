@@ -1,12 +1,15 @@
 """Direct-LLM builtin file tools: the virtual-path resolver + text file ops.
 
-In-proxy tools have no bubblewrap under them, so the resolver IS the
-boundary. It consumes ``SandboxBuilder.workspace_mount_table`` — the same
-ordered ``Mount`` list bwrap renders for CLI / MCP processes — and refuses
-what the kernel would refuse: paths outside every mount, writes under a
-read-only mount, symlink escapes, and the runtime / secret subtrees
+In-proxy tools have no bubblewrap under them, so the resolver and the
+opens below it ARE the boundary. The resolver consumes
+``SandboxBuilder.workspace_mount_table`` (the same ordered ``Mount`` list
+bwrap renders for CLI / MCP processes) and refuses what the kernel would
+refuse: paths outside every mount, writes under a read-only mount, symlink
+escapes (a write never goes through a link at any component; a read judges
+an in-mount link by its target), and the runtime / secret subtrees
 (``.credentials`` / ``.claude`` / ``.codex`` / ``.git``) the CLI hook keeps
-closed as well. The role / RBAC / library rules stay in
+closed as well. Every open then runs beneath the mount root through
+``safe_fs``, so what the resolver admitted is what is read or written. The role / RBAC / library rules stay in
 ``auth.path_policy.check_tool_access`` (Pass-1 of the builtin gate in
 ``builtins.py``); this module only answers "where on disk, and may I write
 there", then performs the operation.
@@ -67,7 +70,14 @@ def session_cwd(cfg: SandboxConfig) -> str:
 
 
 def has_writable_mount(mounts: list[Mount]) -> bool:
-    return any(m.rw for m in mounts)
+    """Whether any TOOL-REACHABLE mount is writable: the CLI state dirs the
+    table stacks RW on a read-only root (a Shared-only viewer's
+    ``/workspace/.claude``) are refused above, so they do not make a
+    session writable for the person."""
+    return any(
+        m.rw and not any(p in REFUSED_COMPONENTS for p in m.sandbox.split("/"))
+        for m in mounts
+    )
 
 
 def normalize_virtual(raw: str, cwd: str) -> str:
@@ -149,6 +159,16 @@ def resolve(
     rel = vpath[len(dest):].lstrip("/")
     host_root = Path(mount.host)
     host = host_root / rel if rel else host_root
+    if writing:
+        # The mount table trusts its host paths by name (bwrap binds the
+        # same strings), and production builds them from the real agents
+        # dir: a mount root that resolves elsewhere was swapped underneath
+        # the session, so nothing is written through it.
+        if os.path.realpath(host_root) != str(host_root):
+            raise FileToolError("the session folder moved (symlink); refused")
+        # A link at the leaf, dangling or not, is never written through.
+        if host.is_symlink():
+            raise FileToolError(f"{vpath} is a symlink; write the real path instead")
     _check_no_symlink_escape(host, host_root)
     return Resolved(virtual=vpath, host=host, mount=mount)
 
@@ -158,11 +178,53 @@ def resolve(
 # ---------------------------------------------------------------------------
 
 def _fs_reason(e: OSError) -> str:
+    # The layer packages import no service at module level (the import-
+    # direction rule); safe_fs is reached function-locally.
+    from services.infra import safe_fs
+    if isinstance(e, safe_fs.SymlinkRefused):
+        return "a symlink is in the path; use the real path instead"
+    if isinstance(e, safe_fs.SafeFsError):
+        return e.strerror or "refused"
     if e.errno in (errno.EDQUOT, errno.ENOSPC):
         return "not enough storage in the agent's bucket for this write"
     if e.errno == errno.EACCES or e.errno == errno.EROFS:
         return "the file system refused the write (read-only or no permission)"
     return e.strerror or str(e)
+
+
+def _mount_rel(res: Resolved) -> tuple[Path, str]:
+    """``(mount root, rel)`` of a resolved path for the strict opens below."""
+    from services.infra import safe_fs
+    root = Path(res.mount.host)
+    return root, safe_fs.rel_under(res.host, root)
+
+
+def _read_beneath(res: Resolved, limit: int) -> bytes:
+    """Up to ``limit`` bytes of the file behind ``res``, judged where it
+    lands (an in-mount alias reads its target) and opened with no symlink
+    followed, so a swap after the resolve is refused at the open."""
+    from services.infra import safe_fs
+    root, rel = _mount_rel(res)
+    try:
+        canonical = safe_fs.canonical_rel(root, rel)
+    except safe_fs.EscapeRefused:
+        raise FileToolError("path leaves the session folder (symlink); refused")
+    fd, _st = safe_fs.open_regular_for_read(root, canonical)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(limit)
+
+
+def _write_beneath(res: Resolved, payload: bytes) -> None:
+    """Create or overwrite the file behind ``res`` in place (parents
+    created), never through a link at any component."""
+    from services.infra import safe_fs
+    root, rel = _mount_rel(res)
+    parent = posixpath.dirname(rel)
+    if parent:
+        safe_fs.mkdirs_beneath(root, parent)
+    fd = safe_fs.open_beneath(root, rel, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(payload)
 
 
 def read_numbered(res: Resolved, offset: int | None = None, limit: int | None = None) -> str:
@@ -175,8 +237,7 @@ def read_numbered(res: Resolved, offset: int | None = None, limit: int | None = 
     if host.is_dir():
         raise FileToolError(f"{res.virtual} is a folder — use Glob to list it")
     try:
-        with open(host, "rb") as fh:
-            data = fh.read(READ_MAX_BYTES + 1)
+        data = _read_beneath(res, READ_MAX_BYTES + 1)
     except OSError as e:
         raise FileToolError(f"cannot read {res.virtual}: {_fs_reason(e)}") from e
     truncated = len(data) > READ_MAX_BYTES
@@ -257,8 +318,7 @@ def write_text(res: Resolved, content: str) -> int:
     if res.host.is_dir():
         raise FileToolError(f"{res.virtual} is a folder")
     try:
-        res.host.parent.mkdir(parents=True, exist_ok=True)
-        res.host.write_bytes(payload)
+        _write_beneath(res, payload)
     except OSError as e:
         raise FileToolError(f"cannot write {res.virtual}: {_fs_reason(e)}") from e
     return len(payload)
@@ -277,16 +337,14 @@ def edit_text(res: Resolved, old: str, new: str, replace_all: bool = False) -> i
         raise FileToolError(f"File not found: {res.virtual}")
     if res.host.is_dir():
         raise FileToolError(f"{res.virtual} is a folder")
+    from services.infra import safe_fs
     try:
-        size = res.host.stat().st_size
-    except OSError as e:
-        raise FileToolError(f"cannot read {res.virtual}: {_fs_reason(e)}") from e
-    if size > WRITE_MAX_BYTES:
+        root, rel = _mount_rel(res)
+        data = safe_fs.read_bytes_beneath(root, rel, max_size=WRITE_MAX_BYTES)
+    except safe_fs.FileTooLarge:
         raise FileToolError(
             f"{res.virtual} is larger than {WRITE_MAX_BYTES // 1024} KB — Edit works on text files up to that size"
         )
-    try:
-        data = res.host.read_bytes()
     except OSError as e:
         raise FileToolError(f"cannot read {res.virtual}: {_fs_reason(e)}") from e
     if b"\x00" in data[:8192]:
@@ -305,7 +363,7 @@ def edit_text(res: Resolved, old: str, new: str, replace_all: bool = False) -> i
         )
     updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     try:
-        res.host.write_bytes(updated.encode("utf-8"))
+        _write_beneath(res, updated.encode("utf-8"))
     except OSError as e:
         raise FileToolError(f"cannot write {res.virtual}: {_fs_reason(e)}") from e
     return n if replace_all else 1

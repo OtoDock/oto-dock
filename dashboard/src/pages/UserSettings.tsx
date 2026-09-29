@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { AudioPrefsSection } from '../components/audio/AudioPrefsSection'
 import { ScrollableTabs } from '../components/ScrollableTabs'
-import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection, NotificationsSection } from './UserSettings.general'
+import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection, NotificationsSection, AppsSection } from './UserSettings.general'
 import { IntegrationsTab } from './UserSettings.integrations'
 import { MyMachinesSection } from './UserSettings.machines'
 import { ExecutionLayersSection } from './UserSettings.aiEngines'
@@ -90,6 +90,7 @@ export default function UserSettings() {
             {isLocal && <SecuritySection />}
             <AppearanceSection />
             <NotificationsSection />
+            <AppsSection />
             <WakeWordSection />
             <MyMemorySection />
           </>

@@ -22,6 +22,7 @@ if _proxy_root not in sys.path:
 import config  # noqa: E402
 from core.credentials import mcp_broker  # noqa: E402
 from core.credentials.mcp_broker import SessionFile  # noqa: E402
+from core import placement
 
 
 @pytest.fixture(autouse=True)
@@ -220,8 +221,10 @@ def _remote_cfg(scope="user", username="alice", user_sub="sub-1"):
     from core.execution_layer import AgentConfig
     return AgentConfig(
         agent_name="agent", user_sub=user_sub,
+        # A manager's session: the keys take the editor tier as well as the
+        # admin-paired machine these cases are about.
         security_context=SimpleNamespace(
-            session_scope=scope, username=username,
+            session_scope=scope, username=username, role="manager",
         ),
     )
 
@@ -253,6 +256,31 @@ def test_admin_paired_gets_ssh_and_tokens(stub_collectors):
     }
     import base64
     assert base64.b64decode(files["ssh/prod_key"].content_b64) == b"PRIVATE"
+
+
+def test_a_judge_is_never_handed_the_ssh_keys(stub_collectors):
+    """A check's judge (read_only) reads: on an admin-paired machine it gets
+    the token files its MCPs may need, never the agent's SSH keys."""
+    from types import SimpleNamespace
+    from core.remote.remote_execution import _collect_session_files
+    cfg = _remote_cfg()
+    cfg.security_context = SimpleNamespace(session_scope="user", username="alice", read_only=True)
+    files = _collect_session_files(cfg, {"pairing_scope": "admin"}, None)
+    assert set(files) == {"/users/alice/.credentials/google-tokens/a.json"}
+
+
+def test_session_takes_ssh_keys():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from core.sandbox.session_config_dir import session_takes_ssh_keys
+    # The editor tier, read off the context's role; anything else is no keys.
+    assert session_takes_ssh_keys(SimpleNamespace(role="editor", read_only=False)) is True
+    assert session_takes_ssh_keys(SimpleNamespace(role="manager", read_only=True)) is False
+    assert session_takes_ssh_keys(SimpleNamespace(role="manager", principal="external")) is False
+    assert session_takes_ssh_keys(SimpleNamespace(role="contributor")) is False
+    assert session_takes_ssh_keys(SimpleNamespace(read_only=False)) is False  # no role: no keys
+    assert session_takes_ssh_keys(None) is False
+    assert session_takes_ssh_keys(MagicMock()) is False  # a mock is not a role
 
 
 def test_user_paired_owner_gets_only_own_tokens(stub_collectors):
@@ -323,12 +351,12 @@ def test_context_only_mcp_allowed_on_admin_paired_remote(monkeypatch, tmp_path):
     )
 
     _p, _e, excluded, _b, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True, target_admin_paired=True,
+        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m"),
     )
     assert "ssh-hosts" not in excluded
 
     _p, _e, excluded, _b, _bash = mcp_registry.build_session_mcp_config(
-        "agent", None, is_remote=True, target_admin_paired=False,
+        "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
     )
     assert "ssh-hosts" in excluded
     assert "admin-paired" in excluded["ssh-hosts"]
@@ -343,8 +371,10 @@ def test_provider_renders_on_admin_paired_remote():
              "agents": ["agent"], "assigned_to_all": False}]
     with patch("storage.mcp.mcp_store.get_mcp_instances_for_agent", return_value=rows):
         assert _ssh_hosts_context(
-            "agent", is_remote=True, target_admin_paired=True,
+            "agent", placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m"),
+            user_role="manager",
         ) is not None
         assert _ssh_hosts_context(
-            "agent", is_remote=True, target_admin_paired=False,
+            "agent", placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
+            user_role="manager",
         ) is None

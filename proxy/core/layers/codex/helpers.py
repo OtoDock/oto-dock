@@ -8,10 +8,9 @@ identical inputs to the Codex CLI (the ``codex app-server`` daemon).
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
-from core.execution_layer import UNATTENDED_CLIENT_TYPES
+from core.session import session_kind
 
 
 # Child-env variable that carries a key-protected LOCAL endpoint's bearer into
@@ -104,8 +103,10 @@ def codex_hooks_floor(client_type: str, interactive: bool = False) -> bool:
     """Whether a Codex app-server session runs ``permission_gate.py`` as its
     PreToolUse hook (the command-level permission FLOOR).
 
-    True for every UNATTENDED client type (task / phone / meeting / trigger /
-    internal — nobody answers an approval, so under ``approvalPolicy: never``
+    True for every kind ``core/session/session_kind.py`` declares unattended
+    (task / phone / meeting / trigger / internal / app — ``session_kind.attended()``
+    answers; an unrecorded kind counts as attended): nobody answers an
+    approval, so under ``approvalPolicy: never``
     the JSON-RPC approval bridge never fires and the hook is the only gate);
     False for attended dashboard chats (the bridge alone gates — both would
     double-gate) and for the interactive TUI, which trusts its hook by CLI
@@ -113,7 +114,7 @@ def codex_hooks_floor(client_type: str, interactive: bool = False) -> bool:
     start payload (``codex_hooks_floor`` field, satellite >= 0.5.118) so a
     session is floored the same way wherever it runs.
     """
-    return client_type in UNATTENDED_CLIENT_TYPES and not interactive
+    return not session_kind.attended(client_type) and not interactive
 
 
 def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> str:
@@ -137,7 +138,9 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
     """
     if permission_mode in ("dontAsk", "auto"):
         return "danger-full-access"
-    if permission_mode == "plan":
+    if permission_mode in ("plan", "judge"):
+        # ``judge`` (CHECKS.md): the same read-only sandbox, without the
+        # plan collaboration mode — the session answers, it does not plan.
         return "read-only"
     return "danger-full-access" if allow_full_fs else "workspace-write"
 
@@ -163,7 +166,7 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
 # orchestration (the model proactively spawns parallel sub-agent workstreams;
 # codex-rs sends the API the model's multi-agent effort — "max" on Sol/Terra,
 # "xhigh" on Astra — and flips MultiAgentMode::Proactive). It is offered
-# per-model in the dashboard (supports_ultra — gpt-5.6 Sol/Terra and
+# per-model in the dashboard (supports_ultra — GPT-6 Sol, gpt-5.6 Terra and
 # gpt-6-astra; OpenAI's own manifest caps Luna at "max") and clamps to the
 # model's ceiling everywhere else, so a stored "ultra" can never reach a
 # model/CLI that rejects it. It complements the platform's own delegation
@@ -181,10 +184,13 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # stdlib-only (no MODEL_REGISTRY import — the module is satellite-vendorable).
 # NOTE: keep _ULTRA in sync with the ``supports_ultra`` flags in
 # config.MODEL_REGISTRY (the dashboard gate) — this is the wire-level truth.
-# "gpt-6-astra" exact rather than "gpt-6": a future GPT-6 tier without "max"
-# must not inherit the unlock.
-_MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra")
-_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra")
+# Exact GPT-6 ids rather than "gpt-6": a future GPT-6 tier without "max"
+# must not inherit the unlock. The retired 5.6 Sol / Luna prefixes stay: a
+# custom re-add, or a live session whose row remaps at the next boot, keeps
+# its ceiling (Codex 0.156.1 catalog: GPT-6 Sol low…max + ultra, GPT-6 Luna
+# low…max).
+_MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
+_ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol")
 
 
 def map_effort_to_codex(effort: str, model: str = "") -> str:
@@ -212,18 +218,14 @@ def map_effort_to_codex(effort: str, model: str = "") -> str:
 # Auth.json construction (ChatGPT OAuth)
 # ---------------------------------------------------------------------------
 
-def build_auth_json(
-    token: str,
-    *,
-    auth_blob: dict | None = None,
-) -> dict:
+def build_auth_json(token: str, *, auth_blob: dict) -> dict:
     """Build the ``auth.json`` payload Codex expects in ``CODEX_HOME``.
 
-    If ``auth_blob`` is provided (the original JSON stored in the subscription),
-    we preserve ``id_token`` and ``account_id`` and update ``access_token`` to
-    the current ``token``.  Otherwise we emit a minimal structure (may fail if
-    Codex requires id_token — the subscription pool should always provide an
-    auth_blob for OAuth subscriptions).
+    ``auth_blob`` is the login's own auth.json as the device-auth flow stored
+    it in the subscription: its ``id_token`` and ``account_id`` are preserved
+    (Codex needs them next to the access token) and ``access_token`` is
+    updated to the current ``token``. Without a blob there is no file to
+    build — ``CodexCLIExecutionLayer.credential_file_payload`` answers None.
 
     ``refresh_token`` is NEUTRALIZED (blank) in every session file: the pool is
     the platform's sole rotator — a CLI holding no refresh token physically
@@ -234,48 +236,10 @@ def build_auth_json(
     fails its refresh attempt while the fanned-out access token keeps working.
     The real refresh token only ever lives in the subscription store.
     """
-    if auth_blob:
-        auth_data = dict(auth_blob)
-        tokens = dict(auth_data.get("tokens", {}))
-        tokens["access_token"] = token
-        tokens["refresh_token"] = ""
-        auth_data["tokens"] = tokens
-        auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
-        return auth_data
-
-    return {
-        "auth_mode": "chatgpt",
-        "OPENAI_API_KEY": None,
-        "tokens": {
-            "access_token": token,
-            "id_token": "",
-            "refresh_token": "",
-            "account_id": "",
-        },
-        "last_refresh": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def build_auth_json_from_env(env: dict) -> dict | None:
-    """Extract the OAuth token + auth_blob from a session env and build auth.json.
-
-    Reads ``_CODEX_OAUTH_TOKEN`` and ``_CODEX_AUTH_BLOB`` (set by the
-    subscription pool) from the provided env dict. Returns None if no OAuth
-    token is present (API-key-only subscription uses ``CODEX_API_KEY``
-    instead).
-
-    Mutates `env` to pop the two consumed keys so the caller can pass the
-    remaining env to the subprocess/satellite payload without leaking the
-    blob.
-    """
-    token = env.pop("_CODEX_OAUTH_TOKEN", None)
-    blob_json = env.pop("_CODEX_AUTH_BLOB", None)
-    if not token:
-        return None
-    auth_blob = None
-    if blob_json:
-        try:
-            auth_blob = json.loads(blob_json)
-        except (json.JSONDecodeError, ValueError):
-            auth_blob = None
-    return build_auth_json(token, auth_blob=auth_blob)
+    auth_data = dict(auth_blob)
+    tokens = dict(auth_data.get("tokens", {}))
+    tokens["access_token"] = token
+    tokens["refresh_token"] = ""
+    auth_data["tokens"] = tokens
+    auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
+    return auth_data

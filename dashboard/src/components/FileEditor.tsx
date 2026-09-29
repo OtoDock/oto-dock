@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAgentFileContent, useSaveAgentFile } from '../api/agents'
+import { encodePathSegments } from '../lib/paths'
 
 interface FileEditorProps {
   agent: string
@@ -75,7 +76,19 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
   }, [handleSave, readOnly])
 
   if (isLoading) return <p className="text-sm text-gray-500 p-4">Loading...</p>
-  if (error) return <p className="text-sm text-red-500 p-4">Failed to load file.</p>
+  if (error) {
+    return (
+      <div className="text-sm p-4 space-y-2">
+        <p className="text-red-500">{(error as Error).message || 'Failed to load file.'}</p>
+        <a
+          href={`/v1/agents/${encodeURIComponent(agent)}/files/${encodePathSegments(path)}?download=true&fn=${encodeURIComponent(path.split('/').pop() ?? path)}`}
+          className="text-blue-600 hover:underline"
+        >
+          Download the file
+        </a>
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col h-full relative">

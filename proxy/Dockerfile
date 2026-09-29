@@ -166,8 +166,12 @@ RUN groupadd -g 1000 oto && useradd -u 1000 -g 1000 -m -s /bin/bash oto \
 WORKDIR /opt/otodock/proxy
 EXPOSE 8400
 
-# Liveness — the proxy serves /health once uvicorn + DB are up.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=40s --retries=6 \
+# Liveness — the proxy serves /health once uvicorn + DB are up. The start
+# period covers a release's first boot (the bundled MCP venvs are built and the
+# database migrated, minutes on a small host): compose stops waiting for the
+# proxy the moment Docker calls it unhealthy, so the period matches what
+# scripts/upgrade.sh itself waits. A success is still reported at once.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=300s --retries=6 \
   CMD curl -fsS http://localhost:8400/health || exit 1
 
 # Drop to the non-root runtime user for the proxy process (and thus the bwrap'd

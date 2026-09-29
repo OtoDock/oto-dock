@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -48,7 +47,13 @@ def conn(monkeypatch):
     calls: dict = {"warmups": 0, "closed": []}
 
     class _Layer:
-        capabilities = SimpleNamespace(name="codex-cli")
+        # The real Codex descriptor: the send path now asks it real questions
+        # (attach_images_inline, rebuilds_history_from_db), not just its name.
+        from core.layers.codex.layer import _CODEX_CAPABILITIES as capabilities
+
+        def capabilities_for(self, sid):
+            # A local engine's descriptor is the same for every session.
+            return self.capabilities
 
         async def is_session_alive(self, sid):
             return True
@@ -83,7 +88,7 @@ def conn(monkeypatch):
         async def _deliver_chat_to_live_interactive(self, msg):
             return False
 
-        async def _process_attachments(self, *a, **k):
+        async def _prepare_turn_input(self, *a, **k):
             # A stream after the gates is out of scope: stop there.
             raise _Stop()
 
@@ -99,7 +104,6 @@ def conn(monkeypatch):
     from services.billing import usage_service
     monkeypatch.setattr(usage_service, "check_user_limit",
                         lambda *a, **k: {"allowed": True, "warning": False, "periods": {}})
-    monkeypatch.setattr(mod.agent_store, "agent_exists", lambda name: True)
     return _Conn(), sent, calls
 
 
@@ -185,3 +189,19 @@ class TestGate:
                 await c._handle_chat({"text": "hi", "chat_id": "chat-1"})
         asyncio.run(run())
         assert sent == []
+
+    def test_refused_turn_input_ends_the_turn(self, conn):
+        """A send the attachment gate refuses (a viewer's photo into a
+        Shared-only chat) was answered with an error frame by the builder;
+        the client armed its streaming state on the send, so the handler
+        ends the turn it never started instead of leaving the chat busy."""
+        c, sent, calls = conn
+
+        async def _refused(*a, **k):
+            sent.append({"type": "error", "message": "refused"})
+            return None
+        c._prepare_turn_input = _refused
+        _drive(c, _status(allowed=True))
+        assert [f["type"] for f in sent] == ["error", "done"]
+        assert sent[-1]["chat_id"] == "chat-1"
+        assert calls["warmups"] == 0

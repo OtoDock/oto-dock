@@ -7,6 +7,7 @@ import { useNotifications } from './useNotifications'
 import { useNotificationSound } from './useNotificationSound'
 import { usePushSubscription } from './usePushSubscription'
 import { useAgents } from '../api/agents'
+import { isTaskChatId, runIdOfChat } from '../lib/session/kind'
 
 /**
  * Shared notification surface for the chat page (AgentChat).
@@ -39,19 +40,22 @@ export function useChatNotifications() {
     if (!hasDanger) notifSound.stopDangerAlarm()
   }, [notif.toasts])
 
-  // Navigate to the chat/task that originated a notification.
-  const handleNotifNavigate = useCallback((agentSlug: string, chatId: string) => {
+  // Navigate to the chat/task that originated a notification, or to the
+  // page a row names itself (a shared app or chat).
+  const handleNotifNavigate = useCallback((agentSlug: string, chatId: string, href?: string) => {
     notif.closePanel()
-    if (!chatId) {
+    if (href && href.startsWith('/') && !href.startsWith('//')) {
+      navigate(href)
+    } else if (!chatId) {
       // No chat_id (e.g. a file-conflict notification) → open the agent and the
       // workspace Recover bin via the ?recover deep-link.
       navigate(`/chat/${agentSlug}?recover=1`)
-    } else if (chatId.startsWith('task-')) {
+    } else if (isTaskChatId(chatId)) {
       // Task chats open on the chat page with task mode toggled on; without
       // an agent slug the /runs resolver redirect figures it out.
       navigate(agentSlug
         ? `/chat/${agentSlug}/${chatId}?tasks=1`
-        : `/runs/${chatId.slice(5)}`)
+        : `/runs/${runIdOfChat(chatId)}`)
     } else {
       navigate(`/chat/${agentSlug}/${chatId}`)
     }

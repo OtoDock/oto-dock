@@ -109,8 +109,9 @@ def is_proxy_local_mcp_host(host: str, manifest=None) -> bool:
     if host in _LOOPBACK_HOSTS:
         return True
     if manifest is not None and in_docker_compose():
+        from services.mcp import mcp_manifest_types as _mt  # a stdlib leaf; reached at call time
         srv = getattr(manifest, "server", None)
-        if getattr(srv, "runtime", "") == "docker" and host == docker_mcp_host(manifest):
+        if _mt.is_container(srv) and host == docker_mcp_host(manifest):
             return True
     return False
 

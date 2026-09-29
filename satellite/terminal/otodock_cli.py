@@ -45,7 +45,7 @@ try:  # package import (the normal case: python -m satellite.otodock_cli)
         socket_path, named_pipe_path, set_pipe_byte_mode,
         verify_pipe_server_identity,
     )
-    from .terminal_queries import TERMINAL_MODE_RESET
+    from .._vendored.terminal_queries import TERMINAL_MODE_RESET
 except ImportError:  # pragma: no cover - standalone fallback
     from otodock_proto import (  # type: ignore
         read_frame, encode, encode_json,
@@ -56,7 +56,10 @@ except ImportError:  # pragma: no cover - standalone fallback
         socket_path, named_pipe_path, set_pipe_byte_mode,
         verify_pipe_server_identity,
     )
-    from terminal_queries import TERMINAL_MODE_RESET  # type: ignore
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from _vendored.terminal_queries import TERMINAL_MODE_RESET  # type: ignore
 
 _GS = 0x1d  # Ctrl-] — the detach escape lead-in (then 'q')
 
@@ -166,7 +169,8 @@ async def _pick_resume_chat(agent: str, execution_path: str) -> "tuple[str, str]
         return None
     chats = (json.loads(payload or b"{}") or {}).get("chats", [])
     if not chats:
-        print(f"otodock: no resumable {execution_path.split('-')[0]} chats for "
+        subcommand = next((k for k, v in _EXEC_PATHS.items() if v == execution_path), execution_path)
+        print(f"otodock: no resumable {subcommand} chats for "
               f"agent '{agent or '(default)'}'.", file=sys.stderr)
         return None
     # Titles derive from session CONTENT (a prompt-injected agent names its

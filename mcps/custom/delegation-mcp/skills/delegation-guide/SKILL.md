@@ -11,10 +11,24 @@ lightweight). This guide is the reference behind them.
 
 ## The `delegate` tool
 
-`delegate(name, prompt, surface, agent?, continue_id?, output_dir?, project_id?)`
+`delegate(name, prompt, surface, agent?, continue_id?, output_dir?, project_id?, model?, layer?, mode?, checks?)`
 returns immediately; the worker runs in parallel and its result is delivered
 back into this session automatically when its turn completes. Never wait or
 poll — continue your own work.
+
+`checks` names the checks (the `checks` skill: named units that judge work at
+the end of a turn) to attach to the worker — the target agent's offered
+checks by name, your own by `user:<name>`. The worker's turn is judged when
+it ends; a verdict of that run that does not pass within the check's fix
+rounds comes back with the result as `verdict` (an earlier round's verdict on
+a continued worker never does), so read it before trusting the output.
+Mandatory checks of the target agent run whether or not you name them.
+
+`model`, `layer` and `mode` are per-lane overrides, each ignored with
+`continue_id`: `model` / `layer` pin what that one worker runs on (see
+"Choosing a model for a lane" below); `mode` = `interactive` (a terminal
+session, steerable mid-turn on local PTYs) or `non-interactive` (headless).
+Omit all three to inherit the target agent's defaults.
 
 **Choosing `surface` (required, no default):**
 
@@ -25,7 +39,10 @@ poll — continue your own work.
 previous worker in its own chat with full context — use it for follow-up
 questions or iterative refinement instead of starting fresh. Omit `agent` on
 continues: the continued worker's own agent is used automatically (works
-cross-agent).
+cross-agent). `continue_id` must name a worker this chat delegated or one of
+your own chats. When a `chat` lane has a live terminal someone other than
+your user opened, the follow-up fails with that reason instead of typing into
+it — tell your user.
 
 **Callbacks**: every worker terminal state reports back — `completed`,
 `failed` (with the error), `cancelled`, or `user_interrupted`. A worker's
@@ -40,6 +57,29 @@ write your final message as a report — what you did, what you produced (with
 paths), what is blocked on a single `Blocked on:` line — and never hand the
 caller a to-do list or questions to answer by delegation: it cannot delegate
 back up the chain and would have to reopen your lane just to reply.
+
+## Choosing a model for a lane
+
+A worker runs on **its agent's default model and execution layer** unless
+`delegate` says otherwise, and that default is right almost always: leave
+`model` and `layer` out. Pin one lane only when its work genuinely differs
+from the agent's everyday load, and ask the user first unless they asked
+for it (a lane's model is their spend).
+
+- **Valid ids come from the target's `layers:` line** in **Available
+  Agents**: its enabled engines, the model ids on each, the current default
+  marked `[default, tN]`. An id that is not on that line is rejected.
+- **Pick by tier, not by name.** Every id carries a capability tag, `[t1]`
+  (frontier: complex coding, the hardest reasoning, judgement calls, long
+  autonomous work) down to `[t4]` (fast: mechanical, high-volume routine
+  work); `[t?]` is a local or
+  custom model nobody rated. The **Model tiers** list under Available
+  Agents says what each model is good at. A code change on a real codebase,
+  a review, a decision or a plan belongs on tier 1; only a mechanical,
+  well-defined batch belongs on tier 3 or 4. A newer,
+  bigger-sounding or pricier-sounding id is not a stronger model.
+- `layer` picks the engine (`claude-code-cli`, `codex-cli`); `model` must
+  be served by that engine. Both are ignored with `continue_id`.
 
 ## Monitoring — `list_sessions` / `peek_session`
 

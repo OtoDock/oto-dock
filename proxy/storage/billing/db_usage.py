@@ -320,6 +320,52 @@ def get_agent_activity_counts(start: str, end: str) -> dict[str, dict]:
                 for r in rows}
 
 
+def get_usage_by_app(start: str, end: str) -> list[dict]:
+    """Unattended spend per app (APPS.md "Handlers", USAGE.md): the usage of
+    every run a handler fired (``task_runs.trigger_type='app_handler'``,
+    source ``app:<row id>:<handler>``), joined through the run's chat
+    (``usage_records.source_id`` is the chat id). Grouped by the row id;
+    the caller resolves it to a title. Button presses stay with the person
+    who pressed."""
+    from services.scheduler import task_kinds
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT split_part(tr.trigger_source, ':', 2) AS app_id,"
+            " COALESCE(SUM(ur.cost_usd),0) AS total_cost,"
+            " COUNT(DISTINCT tr.id) AS run_count,"
+            " COALESCE(SUM(ur.message_count),0) AS message_count"
+            " FROM task_runs tr"
+            " JOIN usage_records ur ON ur.source_id = tr.chat_id"
+            " WHERE tr.trigger_type=%s AND tr.trigger_source LIKE 'app:%%'"
+            " AND ur.created_at>=%s AND ur.created_at<%s"
+            " GROUP BY app_id ORDER BY total_cost DESC",
+            (task_kinds.TRIGGER_APP_HANDLER, start, end),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_usage_by_check(start: str, end: str) -> list[dict]:
+    """Judge spend per check (CHECKS.md "Spend", USAGE.md): the usage of
+    every judge run (``task_runs.task_type='check'``, source
+    ``check:<name>``), joined through the run's chat, grouped by agent and
+    check."""
+    from services.scheduler import task_kinds
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT tr.agent AS agent, split_part(tr.trigger_source, ':', 2) AS check_name,"
+            " COALESCE(SUM(ur.cost_usd),0) AS total_cost,"
+            " COUNT(DISTINCT tr.id) AS run_count,"
+            " COALESCE(SUM(ur.message_count),0) AS message_count"
+            " FROM task_runs tr"
+            " JOIN usage_records ur ON ur.source_id = tr.chat_id"
+            " WHERE tr.task_type=%s AND tr.trigger_source LIKE 'check:%%'"
+            " AND ur.created_at>=%s AND ur.created_at<%s"
+            " GROUP BY tr.agent, check_name ORDER BY total_cost DESC",
+            (task_kinds.RUN_CHECK, start, end),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_all_agents_usage(start: str, end: str) -> list[dict]:
     """Agent-scoped usage aggregated per agent."""
     with get_conn() as conn:

@@ -10,9 +10,12 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 
-import type { PendingImage, PendingFile } from './types'
+import { toQueuedMessage, type PendingImage, type PendingFile, type QueuedMessage } from './types'
+import { CHAT_PHASE, isLiveChatPhase, type ChatStreamPhase } from '../lib/status/chat'
 
-export type ChatStreamPhase = 'idle' | 'warming' | 'ready' | 'streaming' | 'failed'
+// The slice's phase is the mirror's union minus the widget's derived
+// `finished` (lib/status/chat.ts); re-exported for the slice's readers.
+export type { ChatStreamPhase }
 
 // Pin-vs-current execution-target mismatch, from warmup_ready's optional
 // pinned_*/resolved_* fields (attached for chat-owner/admin viewers only).
@@ -48,8 +51,8 @@ export interface ChatSlice {
   // for the next turn. Mirrors `pump.message_queue` on the proxy via
   // onQueued / onQueueRemoved / onQueueSent deltas + a queue_snapshot
   // emitted by the backend on resume_chat (reconciles against any
-  // localStorage drift). Persisted across reloads.
-  queuedMessages: string[]
+  // localStorage drift). Persisted across reloads (text + attachment meta).
+  queuedMessages: QueuedMessage[]
   // Pending attachments — in-memory only. Survive chat-to-chat nav (the
   // per-chat slice is keyed by chat_id) but NOT a full reload (base64
   // images are large; PendingFile carries non-serializable File +
@@ -101,8 +104,8 @@ interface ChatStoreState {
   setDraftInput: (chatId: string, text: string) => void
   clearDraft: (chatId: string) => void
   // Queue mutators — mirror backend pump deltas.
-  setQueuedMessages: (chatId: string, messages: string[]) => void
-  addQueuedMessage: (chatId: string, index: number, text: string) => void
+  setQueuedMessages: (chatId: string, messages: QueuedMessage[]) => void
+  addQueuedMessage: (chatId: string, index: number, item: QueuedMessage) => void
   removeQueuedMessageByIndex: (chatId: string, index: number) => void
   clearQueuedMessages: (chatId: string) => void
   // Pending image mutators.
@@ -127,7 +130,7 @@ interface ChatStoreState {
 
 const _emptySlice = (chatId: string): ChatSlice => ({
   chatId,
-  status: 'idle',
+  status: CHAT_PHASE.IDLE,
   agent: '',
   executionPath: '',
   executionTarget: '',
@@ -189,7 +192,7 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
           [chatId]: {
             ...prev,
             chatId,
-            status: prev.status === 'streaming' ? 'streaming' : 'warming',
+            status: prev.status === CHAT_PHASE.STREAMING ? CHAT_PHASE.STREAMING : CHAT_PHASE.WARMING,
             agent: data.agent,
             executionPath: data.execution_path ?? prev.executionPath,
             executionTarget: data.execution_target ?? prev.executionTarget,
@@ -227,12 +230,12 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
             // stale one).
             status:
               data.turn_open === true
-                ? 'streaming'
+                ? CHAT_PHASE.STREAMING
                 : data.turn_open === false
-                  ? 'ready'
-                  : prev.status === 'streaming'
-                    ? 'streaming'
-                    : 'ready',
+                  ? CHAT_PHASE.READY
+                  : prev.status === CHAT_PHASE.STREAMING
+                    ? CHAT_PHASE.STREAMING
+                    : CHAT_PHASE.READY,
             executionPath: data.execution_path ?? prev.executionPath,
             executionTarget: data.execution_target ?? prev.executionTarget,
             fallbackReason: data.fallback_reason ?? null,
@@ -251,7 +254,7 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
           ...s.byChat,
           [chatId]: {
             ...prev,
-            status: 'failed',
+            status: CHAT_PHASE.FAILED,
             warmupError: error,
             lastEventAt: Date.now(),
           },
@@ -263,7 +266,7 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
     set((s) => {
       const prev = s.byChat[chatId] ?? _emptySlice(chatId)
       return {
-        byChat: { ...s.byChat, [chatId]: { ...prev, status: 'streaming', lastEventAt: Date.now() } },
+        byChat: { ...s.byChat, [chatId]: { ...prev, status: CHAT_PHASE.STREAMING, lastEventAt: Date.now() } },
       }
     }),
 
@@ -272,7 +275,7 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
       const prev = s.byChat[chatId]
       if (!prev) return s
       return {
-        byChat: { ...s.byChat, [chatId]: { ...prev, status: 'ready', lastEventAt: Date.now() } },
+        byChat: { ...s.byChat, [chatId]: { ...prev, status: CHAT_PHASE.READY, lastEventAt: Date.now() } },
       }
     }),
 
@@ -312,14 +315,14 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
       }
     }),
 
-  addQueuedMessage: (chatId, index, text) =>
+  addQueuedMessage: (chatId, index, item) =>
     set((s) => {
       const prev = s.byChat[chatId] ?? _emptySlice(chatId)
-      // Backend sends a 0-based index; pad with empty strings if it arrives
+      // Backend sends a 0-based index; pad with empty items if it arrives
       // out of order (rare but possible across WS reconnect).
       const next = prev.queuedMessages.slice()
-      while (next.length <= index) next.push('')
-      next[index] = text
+      while (next.length <= index) next.push({ text: '' })
+      next[index] = item
       return {
         byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
       }
@@ -443,7 +446,10 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
           ...rest,
           [newChatId]: {
             ...existing,
-            draftInput: fromSlice.draftInput || existing.draftInput,
+            // A draft already under the minted id wins. Nothing creates that
+            // slice before the first warmup_started, so this only matters
+            // for a replay of the frame the dispatcher let through.
+            draftInput: existing.draftInput || fromSlice.draftInput,
             queuedMessages: fromSlice.queuedMessages.length
               ? fromSlice.queuedMessages
               : existing.queuedMessages,
@@ -467,7 +473,20 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
 }), {
   name: 'oto-dock-chat-store',
   storage: createJSONStorage(debouncedLocalStorage),
-  // Persist ONLY draftInput + queuedMessages (text-only, small). Live
+  // Version 1 persisted a queued message as its bare text; the item now
+  // carries the attachment meta too. The migration lifts old entries, and
+  // the queue_snapshot on resume reconciles either way.
+  version: 2,
+  migrate: (persisted) => {
+    const state = (persisted ?? {}) as { byChat?: Record<string, ChatSlice> }
+    for (const slice of Object.values(state.byChat ?? {})) {
+      if (Array.isArray(slice.queuedMessages)) {
+        slice.queuedMessages = slice.queuedMessages.map(toQueuedMessage)
+      }
+    }
+    return state as Partial<ChatStoreState>
+  },
+  // Persist ONLY draftInput + queuedMessages (text + attachment meta, small). Live
   // session metadata is in-memory; pending attachments contain
   // non-serializable File / AbortController refs and base64 blobs too
   // big for localStorage. Backend resends a queue_snapshot on resume_chat
@@ -500,8 +519,5 @@ export const useChatSlice = (chatId: string | null | undefined): ChatSlice | und
 // Non-hook accessor for WS dispatch callbacks.
 export const getActiveChatIds = (): string[] => {
   const byChat = useChatStore.getState().byChat
-  return Object.keys(byChat).filter((cid) => {
-    const status = byChat[cid]?.status
-    return status === 'warming' || status === 'streaming'
-  })
+  return Object.keys(byChat).filter((cid) => isLiveChatPhase(byChat[cid]?.status))
 }

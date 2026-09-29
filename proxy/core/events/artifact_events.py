@@ -14,31 +14,98 @@ dashboard renders (``lib/messageBlocks.ts::eventToBlock``):
 This module is the one place the **frame shape** is defined, so the two paths
 can never drift. It is pure (no I/O, no state) and unit-testable; callers own
 their own buffering / forwarding / placeholder-replacement around it.
+
+Since core-seams phase 9 it is also the one place the **behaviour per kind**
+is defined: ``KINDS`` carries a row per artifact kind — whether the frame is
+a renderable block or a removal signal, which placeholder it evicts, the
+identity a later push replaces by, whether the pump defers it to the turn's
+flush, persists it, and whether a share snapshot copies it — and every set
+below derives from the rows. The pump's one artifact arm, the interactive
+drainer, the snapshot and the dashboard mirror
+(``dashboard/src/lib/kinds/artifact.ts``, bound by
+``tests/core/test_kinds.py``) read the rows; nothing compares a kind's word.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from ws import wire_events as wire
+
+
+@dataclass(frozen=True)
+class ArtifactKind:
+    """One artifact kind and the behaviour the consumers apply to it."""
+    name: str
+    block: bool              # a renderable block appended to the turn and live lists; False = a removal signal
+    placeholder: bool        # a transient skeleton the real artifact replaces
+    evicts: str | None       # the placeholder kind this one removes (the latest of it, both lists)
+    identity: str | None     # the wire field a later push of the same artifact replaces by (when non-empty)
+    deferred: bool           # buffered by the pump to the turn's flush, replaced in place meanwhile
+    saved: bool              # the pump persists the block at the turn's save (= the catalogue's persisted)
+    shareable: bool          # a share snapshot copies it (bytes it can serve without a session)
+
+
+# ``saved``: ``image_generating`` is persisted though no history renderer
+# draws the row (only the live-state rebuild has an arm) while its media
+# twin is dropped at save — kept as the catalogue says until the operator
+# decides (core-seams phase 9, "Put to the operator"). ``shareable``: a
+# ``document_preview`` is a session-bound Collabora URL — the snapshot has
+# no bytes to copy and the share host no renderer for it — so it is
+# unshareable by design, not by omission.
+KINDS: dict[str, ArtifactKind] = {k.name: k for k in (
+    ArtifactKind(wire.IMAGES, block=True, placeholder=False, evicts=wire.IMAGE_GENERATING, identity=None,
+                 deferred=False, saved=True, shareable=True),
+    ArtifactKind(wire.IMAGE_GENERATING, block=True, placeholder=True, evicts=None, identity=None,
+                 deferred=False, saved=True, shareable=False),
+    ArtifactKind(wire.IMAGE_GEN_FAILED, block=False, placeholder=False, evicts=wire.IMAGE_GENERATING,
+                 identity=None, deferred=False, saved=False, shareable=False),
+    ArtifactKind(wire.URL, block=True, placeholder=False, evicts=None, identity=None,
+                 deferred=False, saved=True, shareable=True),
+    ArtifactKind(wire.FILE, block=True, placeholder=False, evicts=None, identity=None,
+                 deferred=False, saved=True, shareable=True),
+    ArtifactKind(wire.VIDEO, block=True, placeholder=False, evicts=wire.MEDIA_PROCESSING, identity=None,
+                 deferred=False, saved=True, shareable=True),
+    ArtifactKind(wire.AUDIO, block=True, placeholder=False, evicts=wire.MEDIA_PROCESSING, identity=None,
+                 deferred=False, saved=True, shareable=True),
+    ArtifactKind(wire.MEDIA_PROCESSING, block=True, placeholder=True, evicts=None, identity=None,
+                 deferred=False, saved=False, shareable=False),
+    ArtifactKind(wire.MEDIA_FAILED, block=False, placeholder=False, evicts=wire.MEDIA_PROCESSING,
+                 identity=None, deferred=False, saved=False, shareable=False),
+    ArtifactKind(wire.DOCUMENT_PREVIEW, block=True, placeholder=False, evicts=None, identity="file_id",
+                 deferred=True, saved=True, shareable=False),
+    ArtifactKind(wire.UI, block=True, placeholder=False, evicts=None, identity="path",
+                 deferred=False, saved=True, shareable=True),
+)}
+
 # event_types that carry a renderable display/file-tools artifact (as opposed to
 # the blocking prompts — permission_prompt / plan_review / question — and
 # tool_result, which each surface handles itself).
-ARTIFACT_EVENT_TYPES = frozenset({
-    "images", "image_generating", "image_gen_failed",
-    "url", "file",
-    "video", "audio", "media_processing", "media_failed",
-    "document_preview",
-    "ui",
-})
+ARTIFACT_EVENT_TYPES = frozenset(KINDS)
+
+# The kinds that render as a block in a message (the removal signals do not).
+BLOCK_KINDS = frozenset(k.name for k in KINDS.values() if k.block)
 
 # The REPLAYABLE subset: final renderables the interactive drainer persists as
 # chat_messages event rows (interactive_session.persist_drained_artifact), so a
 # later open can rebuild both the rich DB history and the PiP replay-on-open.
 # Placeholders (image_generating / media_processing) and their failure/removal
-# twins are transient by design — the pump's _save_turn_blocks drops
-# media_processing the same way — so persisting them would freeze a skeleton
-# into history.
-REPLAYABLE_ARTIFACT_EVENT_TYPES = frozenset({
-    "images", "url", "file", "video", "audio", "document_preview", "ui",
-})
+# twins are transient by design, so persisting them would freeze a skeleton
+# into history: a block that is not a placeholder.
+REPLAYABLE_ARTIFACT_EVENT_TYPES = frozenset(k.name for k in KINDS.values() if k.block and not k.placeholder)
+
+# The kinds the pump persists at the turn's save.
+SAVED = frozenset(k.name for k in KINDS.values() if k.saved)
+
+# The kinds a share snapshot copies (services/sharing/chat_snapshot.py).
+SHAREABLE = frozenset(k.name for k in KINDS.values() if k.shareable)
+
+
+def kind_of(event_type: str | None) -> ArtifactKind | None:
+    """The row for an event type, ``None`` for anything that is not an
+    artifact kind (a text or tool block, a blocking prompt) — total, so a
+    loop over every turn block can ask it."""
+    return KINDS.get(event_type or "")
 
 
 def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
@@ -50,25 +117,25 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
     """
     et = perm_data.get("event_type", "")
     if et == "images":
-        return {"type": "images", "images": perm_data["images"]}
+        return {"type": wire.IMAGES, "images": perm_data["images"]}
     if et == "image_generating":
         return {
-            "type": "image_generating",
+            "type": wire.IMAGE_GENERATING,
             "prompt_preview": perm_data.get("prompt_preview", ""),
             "model": perm_data.get("model", ""),
         }
     if et == "image_gen_failed":
-        return {"type": "image_gen_failed"}
+        return {"type": wire.IMAGE_GEN_FAILED}
     if et == "url":
         return {
-            "type": "url",
+            "type": wire.URL,
             "url": perm_data["url"],
             "title": perm_data["title"],
             "description": perm_data.get("description", ""),
         }
     if et == "file":
         return {
-            "type": "file",
+            "type": wire.FILE,
             "filename": perm_data["filename"],
             "download_url": perm_data["download_url"],
             "description": perm_data.get("description", ""),
@@ -87,15 +154,15 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
         }
     if et == "media_processing":
         return {
-            "type": "media_processing",
+            "type": wire.MEDIA_PROCESSING,
             "media_kind": perm_data.get("media_kind", "video"),
             "caption": perm_data.get("caption", ""),
         }
     if et == "media_failed":
-        return {"type": "media_failed", "error": perm_data.get("error", "")}
+        return {"type": wire.MEDIA_FAILED, "error": perm_data.get("error", "")}
     if et == "document_preview":
         return {
-            "type": "document_preview",
+            "type": wire.DOCUMENT_PREVIEW,
             "wopi_url": perm_data["wopi_url"],
             "filename": perm_data["filename"],
             "file_id": perm_data["file_id"],
@@ -110,7 +177,7 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
         # Every field rides along: this dict is json.dumps-persisted verbatim,
         # so a dropped key is silently lost on reload/reconnect.
         return {
-            "type": "ui",
+            "type": wire.UI,
             "token": perm_data["token"],
             "ui_url": perm_data["ui_url"],
             "title": perm_data.get("title", ""),

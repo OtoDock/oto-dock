@@ -1,4 +1,5 @@
 import type { FileNode } from '../../api/agents'
+import { HEAD } from '../../lib/layout/tree'
 
 export type ScopeKey =
   | 'my-workspace'
@@ -42,7 +43,7 @@ export function buildSections(
 ): WorkspaceSection[] {
   const sections: WorkspaceSection[] = []
 
-  const usersNode = tree.find((n) => n.name === 'users' && n.type === 'dir')
+  const usersNode = tree.find((n) => n.name === HEAD.USERS && n.type === 'dir')
   if (usersNode?.children?.length) {
     // The backend filters users/ to the caller's own folder, so a single
     // child is the norm — but never assume position: match the logged-in
@@ -51,8 +52,8 @@ export function buildSections(
       (username
         ? usersNode.children.find((c) => c.type === 'dir' && c.name === username)
         : undefined) ?? usersNode.children.find((c) => c.type === 'dir')
-    const userWorkspace = userDir?.children?.find((c) => c.name === 'workspace')
-    const userContext = userDir?.children?.find((c) => c.name === 'context')
+    const userWorkspace = userDir?.children?.find((c) => c.name === HEAD.WORKSPACE)
+    const userContext = userDir?.children?.find((c) => c.name === HEAD.CONTEXT)
 
     if (userWorkspace) {
       sections.push({
@@ -76,7 +77,7 @@ export function buildSections(
     }
   }
 
-  const workspaceNode = tree.find((n) => n.name === 'workspace' && n.type === 'dir')
+  const workspaceNode = tree.find((n) => n.name === HEAD.WORKSPACE && n.type === 'dir')
   if (workspaceNode) {
     sections.push({
       key: 'agent-workspace',
@@ -84,11 +85,11 @@ export function buildSections(
       pathPrefix: workspaceNode.path,
       virtualPrefix: '/' + workspaceNode.path,
       nodes: workspaceNode.children ?? [],
-      canWrite: canEdit,  // editor + manager + admin
+      canWrite: canEdit,  // the workspace tier: contributor + editor + manager + admin
     })
   }
 
-  const knowledgeNode = tree.find((n) => n.name === 'knowledge' && n.type === 'dir')
+  const knowledgeNode = tree.find((n) => n.name === HEAD.KNOWLEDGE && n.type === 'dir')
   if (knowledgeNode) {
     sections.push({
       key: 'agent-knowledge',
@@ -107,7 +108,7 @@ export function buildSections(
   // backend change ever leaks config in the tree, the UI still suppresses
   // the chip).
   if (canManage) {
-    const configNode = tree.find((n) => n.name === 'config' && n.type === 'dir')
+    const configNode = tree.find((n) => n.name === HEAD.CONFIG && n.type === 'dir')
     if (configNode) {
       sections.push({
         key: 'agent-config',

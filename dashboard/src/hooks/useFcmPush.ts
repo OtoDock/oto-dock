@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { Capacitor } from '@capacitor/core'
 import { PushNotifications } from '@capacitor/push-notifications'
 import { subscribePush } from '../api/notifications'
+import { askNative } from '../lib/nativeBridge'
 
 /** A click_url is only safe to navigate if it is a plain absolute path — a
  *  notification's source server is untrusted, so reject scheme/host/protocol-
@@ -11,6 +12,13 @@ function safeClickPath(u: unknown): string | null {
   if (!u.startsWith('/') || u.startsWith('//')) return null
   if (u.includes('://') || u.includes('\\')) return null
   return u
+}
+
+/** A notification about an app carries `{kind: 'app', id}` in its data
+ *  payload (FCM delivers data, not URLs); the route is built here. */
+export function appNotificationPath(data: Record<string, unknown>): string | null {
+  if (data.kind !== 'app' || typeof data.id !== 'string') return null
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(data.id) ? `/apps/${data.id}` : null
 }
 
 /**
@@ -74,22 +82,23 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
         })
 
         // User tapped a notification (app was in background)
-        PushNotifications.addListener('pushNotificationActionPerformed', (notification) => {
+        PushNotifications.addListener('pushNotificationActionPerformed', async (notification) => {
           const data = notification.notification.data || {}
-          const Android = (window as any).Android
           const sourceInstall = data.install_id
 
           // Hand the source install_id to native, which owns the install_id→install
           // binding. It switches to that installation and routes there, returning true
           // iff it actually switched (the source is a known, different install). This
           // works even when THIS (active) install isn't bound yet — only the source
-          // needs to be known. If it didn't switch, navigate here.
-          if (sourceInstall && Android?.switchToInstall
-              && Android.switchToInstall(sourceInstall, typeof data.click_url === 'string' ? data.click_url : '/')) {
+          // needs to be known. If it didn't switch (or did not answer), navigate
+          // here; a switch that lands late recreates the page anyway.
+          if (typeof sourceInstall === 'string' && sourceInstall && await askNative<boolean>(
+            'switchToInstall', [sourceInstall, typeof data.click_url === 'string' ? data.click_url : '/'],
+          )) {
             return
           }
 
-          const clickUrl = safeClickPath(data.click_url)
+          const clickUrl = appNotificationPath(data) ?? safeClickPath(data.click_url)
           if (clickUrl && clickUrl !== '/' && navigateRef.current) {
             navigateRef.current(clickUrl)
           }

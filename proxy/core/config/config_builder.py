@@ -10,6 +10,7 @@ import logging
 import config
 from storage.agents import agent_store
 from storage import database as task_store
+from core import placement
 from storage import remote_store
 from services.mcp import mcp_registry
 from services.mcp import dynamic_context
@@ -17,6 +18,9 @@ from services.engines import subscription_pool
 from auth.path_policy import SecurityContext, build_permission_context
 from core.execution_layer import AgentConfig
 from core.config.task_config_builder import TaskIdentity
+from core.execution_layer import DEFAULT_EXECUTION_PATH
+from core.session import session_kind
+from auth import roles
 
 
 def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> None:
@@ -43,7 +47,7 @@ def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> 
     subscription_pool.release_unbound_seat(
         sub_id,
         subscription_pool.credential_scope_key(
-            getattr(cfg, "execution_target", "") or "local",
+            getattr(cfg, "execution_target", "") or placement.LOCAL,
             getattr(cfg, "sandbox_host_claude_dir", "") or "",
         ),
     )
@@ -52,12 +56,11 @@ def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> 
 def _resolve_target_fields(resolved: tuple[str, str | None]) -> dict:
     """Unpack resolve_execution_target tuple for AgentConfig spread.
 
-    When the resolver returns the '__offline__:<machine_id>' sentinel (hard
-    fail because fallback is disabled and the target is unreachable), we
-    leave execution_target set to the sentinel. The warmup handler is
-    expected to detect a sentinel-formatted target (see
-    `is_hard_fail_target()`) and emit an error event to the client rather
-    than calling start_session.
+    When the resolver returns the offline sentinel (hard fail because
+    fallback is disabled and the target is unreachable), we leave
+    execution_target set to the sentinel. The warmup handler is expected to
+    detect it (``placement.is_offline_sentinel``) and emit an error event
+    to the client rather than calling start_session.
     """
     target, reason = resolved
     return {
@@ -65,15 +68,6 @@ def _resolve_target_fields(resolved: tuple[str, str | None]) -> dict:
         "fallback_reason": reason,
     }
 
-
-def is_hard_fail_target(target: str) -> bool:
-    """True iff execution_target is the offline sentinel from the resolver."""
-    return target.startswith("__offline__:")
-
-
-def extract_offline_machine(target: str) -> str:
-    """Extract the machine_id from the '__offline__:<id>' sentinel."""
-    return target.split(":", 1)[1] if ":" in target else ""
 
 logger = logging.getLogger("claude-proxy")
 
@@ -88,7 +82,7 @@ async def build_agent_config(
     resume: bool = False,
     model: str = "",
     execution_path: str = "",
-    codex_thread_id: str = "",
+    resume_handle: str = "",
     chat_id: str = "",
     session_id: str = "",
     task_identity: TaskIdentity | None = None,
@@ -119,7 +113,7 @@ async def build_agent_config(
         agent_name: Agent slug.
         user: User dict from DB (has username, display_name, email, role).
         user_sub: User sub (OAuth subject identifier).
-        user_role: User role string (admin, manager, viewer).
+        user_role: the effective per-agent role (auth/roles.EFFECTIVE_ROLES; acting_role_of on the WS side).
         permission_mode: Hook permission mode (auto, default, plan, acceptEdits).
         client_type: Client identifier (dashboard, phone, task, sse).
         resume: Whether to resume an existing CLI session.
@@ -173,7 +167,7 @@ async def build_agent_config(
             resolved_targets = [t for t in db_targets if t in user_agents]
         else:
             resolved_targets = db_targets
-    elif user_role == "admin":
+    elif roles.is_admin(user_role):
         resolved_targets = db_targets
     else:
         user_agents = set(task_store.get_user_agents(creds_sub))
@@ -189,8 +183,14 @@ async def build_agent_config(
 
     # Resolve sandbox + execution path early (needed for MCP config)
     _agent_info_early = agent_store.get_agent(agent_name) or {}
-    execution_path = execution_path or _agent_info_early.get("execution_path", "claude-code-cli")
-    mcp_format = "toml" if execution_path == "codex-cli" else "json"
+    execution_path = (execution_path
+                      or _agent_info_early.get("execution_path")
+                      or DEFAULT_EXECUTION_PATH)
+    # The engine's descriptor answers the engine questions below; a stored
+    # id no layer claims fails here, closed, with the registry's message.
+    from core.session.session_manager import capabilities_for_path
+    _caps = capabilities_for_path(execution_path)
+    mcp_format = _caps.mcp_config_format
 
     agent_info = _agent_info_early
     is_admin_only = agent_store.is_admin_only(agent_name)
@@ -209,15 +209,20 @@ async def build_agent_config(
         user_sub=creds_sub or "",
         scope_override=_scope_override,
     )
+    # Below the editor tier nobody runs from the agent's own CLI state (a
+    # Shared-only chat, a task re-warm, a phone call as that person):
+    # refused here, before a pool seat is taken, with the person's message.
+    from core.sandbox.session_config_dir import refuse_agent_state_below_editor
+    refuse_agent_state_below_editor(vis.mount_scope, user_role or "")
 
     # Resolve the execution target + its placement facts BEFORE building the
     # MCP config / prompt / skills / path_env below. Device-local MCPs
     # (computer / browser / app control) attach ONLY when the session runs on
     # a satellite, so every one of those builders needs to know whether this
     # session is remote and whether that machine has an interactive display.
-    # (target_kind/target_label also feed the SecurityContext + AgentConfig.)
-    if execution_path == "direct-llm":
-        # The Direct LLM engine never runs on a satellite (session_manager
+    # (The placement also feeds the SecurityContext.)
+    if not _caps.runtime.supports_remote_execution:
+        # An engine that cannot run on a satellite (Direct LLM: session_manager
         # routes it local, remote_session_start refuses it): neither a pin nor a
         # default machine may shape the placement prompt, the device-MCP set
         # or the security context. The resolver already answers local for a
@@ -225,12 +230,12 @@ async def build_agent_config(
         # picked the engine on an agent that defaults to another layer, and a
         # chat row that stored a machine pin before the fix (re-pinned local
         # on this warmup).
-        if pinned_target and pinned_target != "local":
+        if not placement.is_local(pinned_target):
             logger.info(
                 "build_agent_config: %s pinned to %s runs on the Direct LLM "
                 "engine — placed local", agent_name, pinned_target[:8],
             )
-        resolved_target = ("local", None)
+        resolved_target = (placement.LOCAL, None)
     elif pinned_target:
         # RESUME pins to the chat/run's ORIGIN target — never
         # re-resolve. Re-resolving would silently fall back to local when the
@@ -238,86 +243,35 @@ async def build_agent_config(
         # always stays local; a machine_id must be reachable, else emit the
         # offline sentinel so the warmup handler raises the tailored offline
         # error (no fallback) — recovers automatically when the machine returns.
-        if pinned_target == "local":
-            resolved_target = ("local", None)
+        if placement.is_local(pinned_target):
+            resolved_target = (placement.LOCAL, None)
         else:
             from services.remote.remote_status import is_reachable as _is_reachable
             reachable = await asyncio.to_thread(_is_reachable, pinned_target)
             resolved_target = (
                 (pinned_target, None) if reachable
-                else (f"__offline__:{pinned_target}", "pinned-target-offline")
+                else (placement.offline_sentinel(pinned_target), "pinned-target-offline")
             )
     else:
         resolved_target = await asyncio.to_thread(
             remote_store.resolve_execution_target, agent_name, creds_sub, user_role,
         )
     target_value = resolved_target[0]
-    target_kind, target_label = await asyncio.to_thread(
-        remote_store.get_target_metadata, target_value, creds_sub, agent_name,
+    # The resolved placement — the kind (local / admin-paired / user-paired)
+    # and the machine's facts (paths, OS, the pairing flag, the grants, the
+    # display), from one read of its row. It feeds the SecurityContext, the
+    # MCP placement / consent / display gates, the prompt and the dynamic
+    # contexts below.
+    target = await asyncio.to_thread(
+        remote_store.placement_of, target_value, creds_sub, agent_name,
     )
-    is_remote = target_kind in ("admin_remote", "user_remote")
-
-    # For remote targets, look up the satellite's last-reported capabilities:
-    #   - agents_dir / home_dir / os_user / user_dirs / allow_full_fs feed the
-    #     path-policy gate + SecurityContext.
-    #   - display.has_display gates requires_display device MCPs, read
-    #     inline from the same caps dict (task/meeting/phone, which don't read
-    #     caps, use remote_store.get_target_has_display instead).
-    target_agents_dir = ""
-    target_machine_id = ""
-    target_home_dir = ""
-    target_allow_full_fs = False
-    target_os_user = ""
-    target_claude_runtime_root = ""
-    target_user_dirs: dict = {}
-    target_has_display: bool | None = None
-    target_device_grants: set = set()
-    target_os = ""
-    if is_remote and target_value:
-        try:
-            machine = await asyncio.to_thread(
-                remote_store.get_remote_machine, target_value,
-            )
-            if machine:
-                import json as _json
-                caps_raw = machine.get("capabilities") or "{}"
-                caps = _json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-                target_agents_dir = caps.get("agents_dir", "") or ""
-                target_machine_id = machine.get("id", "") or ""
-                target_home_dir = caps.get("home_dir", "") or ""
-                target_allow_full_fs = bool(machine.get("allow_full_fs") or False)
-                target_os_user = caps.get("os_user", "") or ""
-                target_os = str(caps.get("os", "") or "")
-                target_claude_runtime_root = caps.get("claude_runtime_root", "") or ""
-                target_user_dirs = caps.get("user_dirs", {}) or {}
-                _display = caps.get("display")
-                if isinstance(_display, dict) and "has_display" in _display:
-                    target_has_display = bool(_display["has_display"])
-                # device_grants is a top-level JSON-array column (NOT in caps);
-                # parse it inline from the row we already read, via the store's
-                # own parser so the format lives in one place.
-                target_device_grants = remote_store._parse_device_grants(
-                    machine.get("device_grants")
-                )
-        except Exception:
-            # Best effort — empty target_agents_dir means the policy
-            # will treat ALL satellite paths as "outside synced tree".
-            # That combined with allow_full_fs=False (the
-            # default) and no home_dir produces a fail-closed reject.
-            target_agents_dir = ""
-            target_machine_id = ""
-            target_home_dir = ""
-            target_allow_full_fs = False
-            target_os_user = ""
-            target_os = ""
-            target_user_dirs = {}
-            target_has_display = None
-            target_device_grants = set()
+    is_remote = target.is_remote
     # Browser-control mode + extension token: a targeted read (the token
-    # column never rides the machine row), dedicated/no-token when local.
+    # column never rides the machine row nor the persisted context),
+    # dedicated/no-token when local.
     target_browser = await asyncio.to_thread(
-        remote_store.get_target_browser_settings, target_kind, target_value,
-    ) if is_remote and target_value else None
+        remote_store.get_target_browser_settings, target,
+    ) if is_remote else None
 
     # Resolve per-user MCP credentials + config.
     # For TOML (Codex), credential env is injected into the TOML env sections
@@ -340,10 +294,7 @@ async def build_agent_config(
             task_scope=vis.mount_scope,
             interactive_local=is_otodock,
             phone_mode=phone_mode,
-            is_remote=is_remote,
-            target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
-            target_admin_paired=(target_kind == "admin_remote"),
+            placement=target,
             target_browser=target_browser,
         )
     )
@@ -363,10 +314,7 @@ async def build_agent_config(
     multi_value_envs: dict[str, str] = {}
     if credential_env is None:
         credential_env = {}
-    for manifest in (mcp_registry.get_agent_mcps(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
-    ) or []):
+    for manifest in (mcp_registry.get_agent_mcps(agent_name, placement=target) or []):
         if not manifest.path_env:
             continue
         for env_var, decl in manifest.path_env.items():
@@ -438,10 +386,7 @@ async def build_agent_config(
     # Chat sessions never carry a trigger_payload; ``${trigger.*}`` tokens
     # resolve empty and any trigger-gated blocks skip naturally.
     assigned_mcp_names = [
-        m.name for m in (mcp_registry.get_agent_mcps(
-            agent_name, is_remote=is_remote, target_has_display=target_has_display,
-            target_device_grants=target_device_grants,
-        ) or [])
+        m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])
         # Only the MCPs that actually attach describe themselves (the phone
         # exclusions drop e.g. display-mcp on a call).
         if m.name not in (excluded_mcps or {})
@@ -462,9 +407,7 @@ async def build_agent_config(
         # the read grant) — user-backed sessions follow the user (the
         # server enforces from the token either way; this is prompt).
         nouser_reads=not creds_sub,
-        is_remote=is_remote,
-        target_admin_paired=(target_kind == "admin_remote"),
-        target_os=target_os,
+        placement=target,
     )
 
     # Build agent system prompt. MOUNT username drives the workspace tree +
@@ -476,21 +419,19 @@ async def build_agent_config(
         dynamic_contexts=dynamic_contexts or None,
         sandboxed=True,
         client_type=client_type or "",
-        is_remote=is_remote,
-        target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
+        placement=target,
         mount_shared=vis.mount_shared,
         execution_path=execution_path or "",
-        # A phone Direct-LLM session never connects the sidecar HTTP MCPs
-        # (core/layers/direct/layer.py::direct_mcp_policy).
-        skip_http_mcps=bool(phone_mode and execution_path == "direct-llm"),
+        # A phone session on an engine that keeps a call on stdio MCPs never
+        # connects the sidecar HTTP MCPs (Direct LLM's direct_mcp_policy).
+        skip_http_mcps=bool(phone_mode and not _caps.behaviour.phone_http_mcps),
     )
 
     # Append client-specific context (dashboard adapter injects file display
     # instructions, task delivery format, etc.). This builder serves dashboard
     # human chats only; a Shared-only agent chatted here renders the agent-scope
     # blocks via the visibility resolver below.
-    if client_type == "dashboard":
+    if client_type == session_kind.DASHBOARD.name:
         from adapters.dashboard import DashboardAdapter
         adapter = DashboardAdapter()
         client_context = adapter.build_client_context(mcp_config)
@@ -536,18 +477,9 @@ async def build_agent_config(
         is_admin_agent=is_admin_only,
         display_name=_display_name,
         email=_email,
-        target_kind=target_kind,
-        target_label=target_label,
-        target_agents_dir=target_agents_dir,
-        target_machine_id=target_machine_id,
-        target_home_dir=target_home_dir,
-        target_allow_full_fs=target_allow_full_fs,
+        placement=target,
         session_allowed_roots=session_allowed_roots,
         work_cwd=work_cwd or "",
-        target_claude_runtime_root=target_claude_runtime_root,
-        target_os_user=target_os_user,
-        target_user_dirs=target_user_dirs,
-        target_device_grants=target_device_grants,
         # Visibility-modes: mount scope (≠ the REAL username above), /config
         # gating, and the agent's mode scopes — drive the prompt's scope/folder
         # variants + the sandbox mount decouple.
@@ -675,7 +607,7 @@ async def build_agent_config(
         subscription_id=subscription_id,
         subscription_user_sub=creds_sub or "",
         sandbox_host_claude_dir=str(host_claude_dir),
-        codex_thread_id=codex_thread_id,
+        resume_handle=resume_handle,
         chat_id=chat_id,
         multi_value_envs=multi_value_envs,
         **_resolve_target_fields(resolved_target),

@@ -3,9 +3,9 @@
 Covers the display probe (``_detect_display``) and the device-grant policy
 cache (``satellite_policy``).
 """
-import platform
-
 import pytest
+
+from satellite import config as sat_config
 
 from satellite.sessions.session_manager import _detect_display
 from satellite.host import satellite_policy
@@ -15,16 +15,16 @@ from satellite.host import satellite_policy
 # _detect_display
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("system, env, server, has", [
-    ("Linux", {"WAYLAND_DISPLAY": "wayland-0"}, "wayland", True),
-    ("Linux", {"DISPLAY": ":0"}, "x11", True),
-    ("Linux", {}, "none", False),          # headless (systemd --user + linger)
-    ("Darwin", {}, "quartz", True),        # per-user LaunchAgent ⇒ GUI session
-    ("Windows", {}, "windows", True),      # interactive logon task
-    ("Plan9", {}, "none", False),          # unknown OS → fail to no-display
+@pytest.mark.parametrize("family, env, server, has", [
+    ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, "wayland", True),
+    ("linux", {"DISPLAY": ":0"}, "x11", True),
+    ("linux", {}, "none", False),          # headless (systemd --user + linger)
+    ("darwin", {}, "quartz", True),        # per-user LaunchAgent ⇒ GUI session
+    ("windows", {}, "windows", True),      # interactive logon task
+    ("", {}, "none", False),               # a host outside the three families (the OTHER row) → no display
 ])
-def test_detect_display(monkeypatch, system, env, server, has):
-    monkeypatch.setattr(platform, "system", lambda: system)
+def test_detect_display(monkeypatch, family, env, server, has):
+    monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[family])
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     for k, v in env.items():
@@ -38,7 +38,7 @@ def test_detect_display(monkeypatch, system, env, server, has):
 
 
 def test_detect_display_prefers_wayland_over_x11(monkeypatch):
-    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sat_config, "HOST", sat_config.ROWS[sat_config.LINUX])
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
     monkeypatch.setenv("DISPLAY", ":0")
     assert _detect_display()["server"] == "wayland"

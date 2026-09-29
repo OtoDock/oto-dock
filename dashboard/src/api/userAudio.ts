@@ -43,7 +43,7 @@ export function useMyAudioPrefs(enabled = true) {
 export function useUpdateMyAudioPrefs() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (data: AudioPrefsUpdate) => {
+    mutationFn: async (data: AudioPrefsUpdate): Promise<AudioPrefs> => {
       const res = await apiFetch('/v1/users/me/audio-prefs', {
         method: 'PUT',
         body: JSON.stringify(data),
@@ -51,6 +51,11 @@ export function useUpdateMyAudioPrefs() {
       if (!res.ok) throw new Error('Failed to save audio preferences')
       return res.json()
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['my-audio-prefs'] }) },
+    // The PUT returns the full row: write it at once so the very next
+    // dictation start reads the new language, then reconcile.
+    onSuccess: (data) => {
+      qc.setQueryData(['my-audio-prefs'], data)
+      qc.invalidateQueries({ queryKey: ['my-audio-prefs'] })
+    },
   })
 }

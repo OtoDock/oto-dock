@@ -11,6 +11,7 @@ that drives MCP filtering — see proxy/adapters/phone.py).
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import time
@@ -31,10 +32,15 @@ from core.session import external_identity
 from core.session.session_manager import get_execution_layer
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from core.config.phone_config_builder import build_phone_agent_config, resolve_phone_execution_target
+from core.execution_layer import DEFAULT_EXECUTION_PATH
 from services.phone.phone_identity import (
     RouteIdentity, resolve_route_identity,
     remember_call_identity, pop_call_identity,  # noqa: F401 — re-exported for the handler + tests
 )
+from core.session import session_kind
+from core.session.visibility import PHONE_CHAT_OWNER
+from ws import wire_events as wire
+from core.events import common_events as _ce
 
 logger = logging.getLogger("claude-proxy")
 
@@ -52,7 +58,7 @@ def _validated_reuse_sid(existing_sid, agent_name: str) -> str:
         logger.warning("WS warmup: ignoring non-UUID session_id in reuse request")
         return ""
     chat = task_store.get_chat_by_session(sid)
-    if not chat or chat.get("source_type") != "phone" or chat.get("agent") != agent_name:
+    if not chat or session_kind.of_chat(chat) is not session_kind.PHONE or chat.get("agent") != agent_name:
         logger.warning(
             "WS warmup: ignoring reuse of session %s — not a phone chat of agent %s",
             sid[:8], agent_name,
@@ -84,50 +90,51 @@ def _pump_item_to_phone_ws(item: dict, turn_id: int) -> dict | None:
     """
     pump_type = item.get("pump_type")
 
-    if pump_type == "ws_event":
+    if pump_type == wire.PUMP_WS_EVENT:
         event = item.get("event", {})
         etype = event.get("type", "")
 
-        if etype == "text":
+        if etype == wire.TEXT:
             content = event.get("content", "")
             if content:
-                return {"type": "text", "turn": turn_id, "data": {"content": content}}
+                return {"type": wire.TEXT, "turn": turn_id, "data": {"content": content}}
 
-        elif etype in ("tool_use", "tool_start"):
-            # The pump emits "tool_start" (stream_pump TOOL_USE handler);
-            # "tool_use" kept for any raw-event pusher. Matching only
-            # "tool_use" silently dropped EVERY tool_start — the phone
+        elif etype in (_ce.TOOL_USE, wire.TOOL_START):
+            # The pump emits the wire's tool_start (its TOOL_USE handler);
+            # the raw CommonEvent word is kept for any raw-event pusher —
+            # the dual matching is frozen. Matching only the raw word
+            # silently dropped EVERY tool_start — the phone
             # pipeline never got the early pre-tool TTS flush and callers
             # sat through silent tool runs before hearing the pre-tool
             # sentence (live-hit 2026-08-14, inbound home-assistant call:
             # 10 s of dead air, pre-tool text played only with the final).
-            return {"type": "tool_start", "turn": turn_id, "data": {
+            return {"type": wire.TOOL_START, "turn": turn_id, "data": {
                 "name": event.get("name", ""),
                 "tool_use_id": event.get("tool_id", ""),
             }}
 
-        elif etype in ("tool_result", "tool_end"):
-            # "tool_result" = the hook path's content-carrying frame;
-            # "tool_end" = the pump's TOOL_RESULT close frame. Both mark the
+        elif etype in (wire.TOOL_RESULT, wire.TOOL_END):
+            # tool_result = the hook path's content-carrying frame (live);
+            # tool_end = the pump's TOOL_RESULT close frame. Both mark the
             # boundary; downstream repeats are no-ops on an empty buffer.
-            return {"type": "tool_end", "turn": turn_id, "data": {
+            return {"type": wire.TOOL_END, "turn": turn_id, "data": {
                 "tool_use_id": event.get("tool_id", ""),
                 "result_preview": event.get("result_preview", ""),
             }}
 
-        elif etype == "session":
-            return {"type": "session", "turn": turn_id, "data": {
+        elif etype == wire.PHONE_SESSION:
+            return {"type": wire.PHONE_SESSION, "turn": turn_id, "data": {
                 "session_id": event.get("session_id", ""),
             }}
 
         # Skip: thinking, metadata, subagent, delegate, plan, todo, etc.
         return None
 
-    elif pump_type in ("all_done", "pump_ended"):
-        return {"type": "done", "turn": turn_id, "data": {}}
+    elif pump_type in (wire.PUMP_ALL_DONE, wire.PUMP_ENDED):
+        return {"type": wire.DONE, "turn": turn_id, "data": {}}
 
-    elif pump_type == "error":
-        return {"type": "error", "turn": turn_id, "data": {
+    elif pump_type == wire.PUMP_ERROR:
+        return {"type": wire.ERROR, "turn": turn_id, "data": {
             "message": item.get("message", "Unknown error"),
         }}
 
@@ -279,15 +286,22 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
         producer: asyncio.Task | None = None
         t_sent = time.monotonic()   # sent→first_text: the engine leg, proxy-side
         try:
-            # Save user message to DB
-            task_store.add_chat_message(chat_id, "user", prompt)
-
-            # Set title from first user message
+            # The user row and the first title land on the chat's writer
+            # lane, off the loop, before the turn runs (its rows follow them).
+            from core.events import chat_writer
+            await chat_writer.submit(
+                chat_id,
+                functools.partial(task_store.add_chat_message, chat_id, "user", prompt),
+                label="phone_user_row",
+            )
             if first_turn:
                 title = prompt[:50].strip()
                 if len(prompt) > 50:
                     title += "..."
-                task_store.update_chat(chat_id, title=title)
+                await chat_writer.submit(
+                    chat_id, functools.partial(task_store.update_chat, chat_id, title=title),
+                    label="phone_title",
+                )
                 first_turn = False
 
             # Dead-process heal (the dashboard turn chokepoint's twin, cf.
@@ -342,7 +356,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         release_config_seat(session_id, heal_cfg)
                         raise
                     if (not can_resume
-                            and layer.capabilities.name != "direct-llm"):
+                            and not layer.capabilities_for(session_id)
+                            .behaviour.rebuilds_history_from_db):
                         # History unrecoverable — seed the fresh session with
                         # the DB-transcript digest so the call keeps context.
                         from core.session.history_seed import (
@@ -354,14 +369,15 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             chat_id, prompt)
 
             # Interruption note for layers that can't rewrite their own
-            # history (CLI/Codex — Direct gets the precise annotation via the
-            # barge_in_chars kwarg). Same wording as the duplex chat attach.
-            # The DB row above keeps the RAW spoken words; only the dispatch
-            # carries the note.
+            # history (an engine that rebuilds it from the DB gets the precise
+            # annotation via the barge_in_chars kwarg instead). Same wording
+            # as the duplex chat attach. The DB row above keeps the RAW spoken
+            # words; only the dispatch carries the note.
             dispatch_prompt = prompt
-            _layer_kind = getattr(
-                getattr(layer, "capabilities", None), "name", "")
-            if (_layer_kind != "direct-llm"
+            _rebuilds = bool(getattr(
+                getattr(getattr(layer, "capabilities", None), "behaviour", None),
+                "rebuilds_history_from_db", False))
+            if (not _rebuilds
                     and (interrupted_last_turn or barge_in_chars)):
                 heard = (
                     f"; they heard only the first {barge_in_chars} characters"
@@ -407,7 +423,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 event_queue=event_queue,
                 perm_queue=None,  # phone uses auto mode — no permission prompts
                 scope="agent",
-                source_type="phone",
+                source_type=session_kind.PHONE.source_type,
             )
             _active_pumps[chat_id] = pump
             pump.start()
@@ -425,7 +441,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 phone_msg = _pump_item_to_phone_ws(item, turn_id)
                 if phone_msg:
                     if (not first_text_logged
-                            and phone_msg.get("type") == "text"):
+                            and phone_msg.get("type") == wire.TEXT):
                         first_text_logged = True
                         logger.info(
                             f"phone turn {turn_id}: sent→first_text "
@@ -435,7 +451,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
 
                 # Exit subscriber loop when pump is done
                 pt = item.get("pump_type", "")
-                if pt in ("all_done", "pump_ended", "error"):
+                if pt in wire.PUMP_TERMINAL:
                     break
 
         except (WebSocketDisconnect, ConnectionClosed):
@@ -446,7 +462,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
         except Exception as e:
             logger.error(f"WS chat error: {e}", exc_info=True)
             with contextlib.suppress(Exception):
-                await _send({"type": "error", "turn": turn_id,
+                await _send({"type": wire.ERROR, "turn": turn_id,
                              "data": {"message": str(e)}})
         finally:
             turn_producers.pop(turn_id, None)
@@ -457,16 +473,16 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await _send({"type": "error", "data": {"message": "Invalid JSON"}})
+                await _send({"type": wire.ERROR, "data": {"message": "Invalid JSON"}})
                 continue
 
             msg_type = msg.get("type", "")
 
-            if msg_type == "warmup":
+            if msg_type == wire.PHONE_IN_WARMUP:
                 t_warm = time.monotonic()
                 model_name = msg.get("model", "")
                 if not model_name:
-                    await _send({"type": "error", "data": {"message": "Agent name required in warmup 'model' field"}})
+                    await _send({"type": wire.ERROR, "data": {"message": "Agent name required in warmup 'model' field"}})
                     continue
                 llm_mode = msg.get("llm_mode", "proxy")  # echoed back for phone server compat
                 phone_mode = msg.get("phone_mode", False)
@@ -570,20 +586,22 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             release_config_seat(session_id, _cfg, keep_binding=True)
                             chat_id = str(uuid.uuid4())
                             first_turn = True
-                            task_store.create_chat(
-                                chat_id, "phone", model_name, "auto",
+                            _row = task_store.create_chat(
+                                chat_id, PHONE_CHAT_OWNER, model_name, "auto",
                                 model=config.get_cli_model(model_name),
-                                execution_path=_cfg.execution_path or "claude-code-cli",
-                                source_type="phone",
+                                execution_path=_cfg.execution_path or DEFAULT_EXECUTION_PATH,
+                                source_type=session_kind.PHONE.source_type,
                             )
                             task_store.update_chat(chat_id, session_id=session_id)
+                            from api.apps import catalog as _catalog
+                            _catalog.announce_new_chat(_row)
                         logger.info(
                             f"WS warmup: reusing pre-warmed session={session_id}, "
                             f"chat={chat_id}, identity={route_identity.label} "
                             f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                         )
                         await _send({
-                            "type": "warmup_ready",
+                            "type": wire.WARMUP_READY,
                             "data": {"session_id": session_id, "llm_mode": llm_mode},
                         })
                         continue
@@ -631,14 +649,22 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     # Check concurrency limit before spawning session. Phone can
                     # run on a remote satellite (phone_target) — pass it so a
                     # remote call doesn't consume a local-G slot (its satellite
-                    # enforces). Local calls take a unit of the local ceiling.
+                    # enforces). Local calls take a unit of the local ceiling,
+                    # of their own kind: never evicted and outside the
+                    # per-person cap; a user-mode route's call is owned by its
+                    # tied user for the count, and a Direct-LLM call reserves
+                    # for its stdio MCPs.
                     from core.concurrency import acquire_chat_slot
-                    adm = await acquire_chat_slot(session_id, target=phone_target,
-                                                  execution_path=agent_cfg.execution_path)
+                    adm = await acquire_chat_slot(
+                        session_id, kind="phone", target=phone_target,
+                        execution_path=agent_cfg.execution_path,
+                        user_sub=(route_identity.user or {}).get("sub") or None,
+                        mcp_config_path=agent_cfg.mcp_config_path or "",
+                    )
                     if not adm:
                         release_config_seat(session_id, agent_cfg)
                         await _send({
-                            "type": "error",
+                            "type": wire.ERROR,
                             "data": {"message": adm.user_message},
                         })
                         continue
@@ -656,13 +682,15 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     # Create chat row for persistence. ``"phone"`` is the
                     # sentinel owner (a call has no real user) + the source_type
                     # discriminator.
-                    execution_path = agent_cfg.execution_path or "claude-code-cli"
-                    task_store.create_chat(
-                        chat_id, "phone", model_name, "auto",
+                    execution_path = agent_cfg.execution_path or DEFAULT_EXECUTION_PATH
+                    _row = task_store.create_chat(
+                        chat_id, PHONE_CHAT_OWNER, model_name, "auto",
                         model=config.get_cli_model(model_name),
                         execution_path=execution_path,
-                        source_type="phone",
+                        source_type=session_kind.PHONE.source_type,
                     )
+                    from api.apps import catalog as _catalog
+                    _catalog.announce_new_chat(_row)
                     # Link session→chat so a later reconnect that reuses this
                     # pre-warmed session can recover its chat_id (the reuse
                     # branch above resolves session_id but not chat_id — without
@@ -680,7 +708,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     )
 
                     await _send({
-                        "type": "warmup_ready",
+                        "type": wire.WARMUP_READY,
                         "data": {"session_id": session_id, "llm_mode": llm_mode},
                     })
                 except Exception as e:
@@ -691,22 +719,22 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         # Built, then the spawn failed before binding.
                         release_config_seat(session_id, agent_cfg)
                     await _send({
-                        "type": "error",
+                        "type": wire.ERROR,
                         "data": {"message": f"Warmup failed: {e}"},
                     })
 
-            elif msg_type == "chat":
+            elif msg_type == wire.PHONE_IN_CHAT:
                 prompt = msg.get("prompt", "")
                 if not prompt:
                     await _send({
-                        "type": "error",
+                        "type": wire.ERROR,
                         "data": {"message": "Empty prompt"},
                     })
                     continue
 
                 if not session_id or not layer or not chat_id:
                     await _send({
-                        "type": "error",
+                        "type": wire.ERROR,
                         "data": {"message": "No session — send warmup first"},
                     })
                     continue
@@ -718,7 +746,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 turn_tasks.add(t)
                 t.add_done_callback(turn_tasks.discard)
 
-            elif msg_type == "abort":
+            elif msg_type == wire.PHONE_IN_ABORT:
                 # Barge-in: graceful-first, per layer — the same shape as the
                 # duplex chat attach. layer.abort() sends the CLI's stdin
                 # interrupt / Codex interrupt; the turn CLOSES normally with
@@ -751,13 +779,13 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 else:
                     logger.info(f"WS abort: turn {turn_id} not in flight")
 
-            elif msg_type == "close":
+            elif msg_type == wire.PHONE_IN_CLOSE:
                 logger.info(f"WS close requested: session={session_id}")
                 break
 
             else:
                 await _send({
-                    "type": "error",
+                    "type": wire.ERROR,
                     "data": {"message": f"Unknown message type: {msg_type}"},
                 })
 

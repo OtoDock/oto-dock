@@ -1,4 +1,5 @@
-"""PTY-backed process spawning for interactive CLI sessions.
+"""Session process spawning off the event loop: PTYs for interactive CLI
+sessions, pipes for the headless ones (:func:`spawn_piped`).
 
 Spawns a subprocess attached to a pseudo-terminal so it renders its native
 interactive TUI (Claude Code = inline/Ink; Codex = alt-screen/Ratatui) instead
@@ -13,11 +14,19 @@ spawn minus ``-p``/stream-json, plus ``TERM``) and the session registry / lease
 runs interactive TUIs on this host).
 
 Host quirks handled here:
-  * The controlling terminal is established BY HAND in the forked child
-    (``setsid`` + ``ioctl(TIOCSCTTY)`` + dup to 0/1/2) — ``os.login_tty`` is
-    Python 3.11+, the proxy host is 3.13.
+  * No ``preexec_fn`` anywhere: it forces a real ``fork()`` of the whole proxy
+    with the GIL held (a loop stall that grows with RSS, and a child that
+    deadlocks before exec freezes the loop for good). ``Popen`` without it
+    takes CPython's vfork path. The PTY's controlling terminal is taken by a
+    small exec shim instead (``_PTY_EXEC_SHIM``); ``start_new_session`` makes
+    the child a session leader first, and Popen dups the slave onto 0/1/2.
   * ``TERM`` must be present in the child env; callers include it (the sandbox
     env overrides don't set it — ``sandbox.get_env_overrides``).
+  * Session trees run below the proxy (``SESSION_NICE``, plus the session's
+    autogroup nice where the kernel groups by session), so a spawn wave's
+    interpreter and MCP starts never take the event loop's core, and at most
+    ``config.SESSION_SPAWN_CONCURRENCY`` sessions start at once
+    (:func:`spawn_slot`).
 
 Today this ships a bare PTY + a server-side scrollback ring. tmux-backed
 persistence (survives a proxy restart) + multi-viewer is a future enhancement;
@@ -32,14 +41,52 @@ import fcntl
 import logging
 import os
 import pty
+import shutil
 import signal
 import struct
 import subprocess
+import sys
 import termios
+import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Awaitable, Callable, Optional, Sequence
 
+import config
+
 logger = logging.getLogger("claude-proxy.pty_relay")
+
+# Session trees run at this nice value, below the proxy.
+SESSION_NICE = 10
+# A spawn slot also covers the child's first second after exec, when its
+# interpreter and MCP starts burn the most CPU.
+_SPAWN_SETTLE_S = 1.0
+# How often wait() polls where the kernel or the Python build has no pidfd.
+_WAIT_POLL_S = 0.05
+
+# The PTY child's first program (``python -I -S -c``, stdlib only): every
+# signal back to its default and an empty mask (Python ignores SIGPIPE and
+# SIGXFSZ at startup, and an ignored signal survives exec), the terminal on
+# fd 0 taken as the controlling tty (Popen already made the child a session
+# leader), the priority lowered, then the session's argv exec'd.
+_PTY_EXEC_SHIM = """
+import fcntl, os, signal, sys, termios
+for s in signal.valid_signals():
+    if s not in (signal.SIGKILL, signal.SIGSTOP):
+        try:
+            signal.signal(s, signal.SIG_DFL)
+        except (OSError, RuntimeError, ValueError):
+            pass
+signal.pthread_sigmask(signal.SIG_SETMASK, ())
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+os.nice(int(sys.argv[1]))
+try:
+    with open("/proc/self/autogroup", "w") as f:
+        f.write(sys.argv[1])
+except OSError:
+    pass
+os.execvp(sys.argv[2], sys.argv[2:])
+"""
 
 DEFAULT_SCROLLBACK_BYTES = 256 * 1024
 DEFAULT_ROWS, DEFAULT_COLS = 24, 80
@@ -232,7 +279,7 @@ class PtyProcess:
         self._loop.create_task(self._reap_and_notify())
 
     def _signal_group(self, sig: "signal.Signals") -> None:
-        # The child is its own session/group leader (setsid in the preexec), so
+        # The child is its own session/group leader (start_new_session), so
         # its pgid == pid; signal the whole group to take down the TUI and
         # anything it spawned. bwrap's --die-with-parent is the backstop.
         try:
@@ -297,32 +344,23 @@ def spawn_pty(
         logger.warning("spawn_pty: TERM missing from env; defaulting to xterm-256color")
         env = {**env, "TERM": "xterm-256color"}
 
+    # The shim execs argv; a missing binary must still fail here, not in
+    # the terminal.
+    _require_executable(argv, env)
     master_fd, slave_fd = pty.openpty()
     with contextlib.suppress(OSError):
         _set_winsize(master_fd, rows, cols)
 
-    def _preexec() -> None:
-        # Forked child, pre-exec. Establish the controlling tty by hand
-        # (os.login_tty is 3.11+; host is 3.13). ONLY async-signal-safe syscalls
-        # here — no allocation/logging (fork-in-a-threaded-process rule). The
-        # slave fd survives the close_fds sweep via pass_fds below.
-        os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-        for target in (0, 1, 2):
-            os.dup2(slave_fd, target)
-        if slave_fd > 2:
-            os.close(slave_fd)
-
     try:
         popen = subprocess.Popen(
-            list(argv),
+            [sys.executable or "python3", "-I", "-S", "-c", _PTY_EXEC_SHIM,
+             str(SESSION_NICE), *argv],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             cwd=cwd,
             env=env,
-            preexec_fn=_preexec,
-            pass_fds=(slave_fd,),
+            start_new_session=True,
             close_fds=True,
         )
     except BaseException:
@@ -349,3 +387,231 @@ def spawn_pty(
         popen.pid, cols, rows, argv[0] if argv else "?",
     )
     return proc
+
+
+# ---------------------------------------------------------------------------
+# Headless session processes (pipes), the spawn slots, the priority
+# ---------------------------------------------------------------------------
+
+_nice_prefix: list[str] | None = None
+
+
+def nice_prefix() -> list[str]:
+    """``["nice", "-n", "10"]`` (resolved once), or ``[]`` with one WARNING
+    where ``nice`` is missing."""
+    global _nice_prefix
+    if _nice_prefix is None:
+        nice = shutil.which("nice")
+        if nice is None:
+            logger.warning("nice not found: session processes start at the proxy's priority")
+        _nice_prefix = [nice, "-n", str(SESSION_NICE)] if nice else []
+    return _nice_prefix
+
+
+def niced(argv: Sequence[str]) -> list[str]:
+    """``argv`` run below the proxy's CPU priority; its children inherit it."""
+    return [*nice_prefix(), *argv]
+
+
+def _require_executable(argv: Sequence[str], env: dict) -> None:
+    if not argv or shutil.which(argv[0], path=env.get("PATH", os.defpath)) is None:
+        name = argv[0] if argv else ""
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+
+def _set_autogroup_nice(pid: int) -> None:
+    """Lower the new session's autogroup too: where the proxy sits in the
+    root CPU group with autogroup on, each setsid'd tree is its own group and
+    a task nice alone changes nothing between groups. A no-op elsewhere."""
+    with contextlib.suppress(OSError):
+        with open(f"/proc/{pid}/autogroup", "w") as f:
+            f.write(str(SESSION_NICE))
+
+
+_spawn_slots: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+def _spawn_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _spawn_slots.get(loop)
+    if sem is None:
+        for stale in [lp for lp in _spawn_slots if lp.is_closed()]:
+            _spawn_slots.pop(stale, None)
+        sem = _spawn_slots[loop] = asyncio.Semaphore(
+            max(1, int(config.SESSION_SPAWN_CONCURRENCY)))
+    return sem
+
+
+@contextlib.asynccontextmanager
+async def spawn_slot():
+    """At most ``config.SESSION_SPAWN_CONCURRENCY`` session starts at once.
+    A slot is held through the body and ``_SPAWN_SETTLE_S`` after it (the
+    child's startup burst); a body that raised frees it at once."""
+    sem = _spawn_semaphore()
+    if sem.locked():
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        await sem.acquire()
+        logger.info("session spawn waited %.1fs for a slot (%d at once)",
+                    loop.time() - queued_at, int(config.SESSION_SPAWN_CONCURRENCY))
+    else:
+        await sem.acquire()
+    try:
+        yield
+    except BaseException:
+        sem.release()
+        raise
+    try:
+        asyncio.get_running_loop().call_later(_SPAWN_SETTLE_S, sem.release)
+    except RuntimeError:
+        sem.release()
+
+
+_spawn_executor: ThreadPoolExecutor | None = None
+_spawn_executor_lock = threading.Lock()
+
+
+def _executor() -> ThreadPoolExecutor:
+    """The threads that fork session processes. Never shut down while the
+    proxy runs: a child's parent-death signal (bwrap --die-with-parent, the
+    sandbox launcher) follows the THREAD that forked it, so that thread must
+    live as long as the process. A pool of its own also keeps spawns from
+    queueing behind slow jobs on the default executor."""
+    global _spawn_executor
+    with _spawn_executor_lock:
+        if _spawn_executor is None:
+            _spawn_executor = ThreadPoolExecutor(
+                max_workers=max(2, int(config.SESSION_SPAWN_CONCURRENCY)),
+                thread_name_prefix="session-spawn")
+        return _spawn_executor
+
+
+def _popen_piped(argv: list[str], cwd: Optional[str], env: dict):
+    popen = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True,
+    )
+    pidfd = None
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        try:
+            pidfd = opener(popen.pid)
+        except OSError:
+            pidfd = None
+    _set_autogroup_nice(popen.pid)
+    return popen, pidfd
+
+
+def _discard_child(popen: subprocess.Popen, pidfd: Optional[int]) -> None:
+    """Kill a child nobody will own (a cancelled or failed spawn) and reap it
+    on a daemon thread."""
+    with contextlib.suppress(OSError):
+        os.killpg(popen.pid, signal.SIGKILL)
+    for pipe in (popen.stdin, popen.stdout, popen.stderr):
+        with contextlib.suppress(OSError, ValueError):
+            if pipe is not None:
+                pipe.close()
+    if pidfd is not None:
+        with contextlib.suppress(OSError):
+            os.close(pidfd)
+    threading.Thread(target=popen.wait, daemon=True, name="spawn-reap").start()
+
+
+class PipedProcess:
+    """The part of ``asyncio.subprocess.Process`` the session layers use
+    (``pid``, ``returncode``, ``stdin``/``stdout``/``stderr``, ``wait``,
+    ``send_signal``/``terminate``/``kill``), over a ``Popen`` started off the
+    loop."""
+
+    def __init__(self, popen: subprocess.Popen, stdin: asyncio.StreamWriter,
+                 stdout: asyncio.StreamReader, stderr: asyncio.StreamReader,
+                 pidfd: Optional[int]) -> None:
+        self._popen = popen
+        self.pid = popen.pid
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self._pidfd = pidfd
+        self._exited: Optional[asyncio.Future] = None
+
+    @property
+    def returncode(self) -> Optional[int]:
+        rc = self._popen.poll()
+        if rc is not None:
+            self._close_pidfd()
+        return rc
+
+    def _close_pidfd(self) -> None:
+        if self._pidfd is not None:
+            fd, self._pidfd = self._pidfd, None
+            with contextlib.suppress(Exception):
+                asyncio.get_running_loop().remove_reader(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        # A ``returncode`` read that reaps the child before the pidfd reader
+        # ran removes that reader: the pending ``wait()`` is released here.
+        if self._exited is not None and not self._exited.done():
+            self._exited.set_result(None)
+
+    async def wait(self) -> int:
+        rc = self.returncode
+        if rc is not None:
+            return rc
+        if self._pidfd is not None:
+            if self._exited is None:
+                loop = asyncio.get_running_loop()
+                fut = self._exited = loop.create_future()
+                fd = self._pidfd
+
+                def _readable() -> None:
+                    with contextlib.suppress(Exception):
+                        loop.remove_reader(fd)
+                    if not fut.done():
+                        fut.set_result(None)
+
+                loop.add_reader(fd, _readable)
+            await asyncio.shield(self._exited)
+        while (rc := self.returncode) is None:
+            await asyncio.sleep(_WAIT_POLL_S)
+        return rc
+
+    def send_signal(self, sig: int) -> None:
+        self._popen.send_signal(sig)
+
+    def terminate(self) -> None:
+        self._popen.terminate()
+
+    def kill(self) -> None:
+        self._popen.kill()
+
+
+async def spawn_piped(argv: Sequence[str], *, cwd: Optional[str], env: dict,
+                      limit: int) -> PipedProcess:
+    """Start ``argv`` (a new session, pipes on 0/1/2) from the spawn thread
+    and wire its pipes to the running loop. A cancellation or a failure after
+    the fork kills the child. Raises what ``Popen`` raises (a missing binary:
+    ``FileNotFoundError``)."""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_executor(), _popen_piped, list(argv), cwd, env)
+    try:
+        popen, pidfd = await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        def _drop(f: asyncio.Future) -> None:
+            if not f.cancelled() and f.exception() is None:
+                _discard_child(*f.result())
+        fut.add_done_callback(_drop)
+        raise
+    try:
+        stdout = asyncio.StreamReader(limit=limit, loop=loop)
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(stdout, loop=loop), popen.stdout)
+        stderr = asyncio.StreamReader(limit=limit, loop=loop)
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(stderr, loop=loop), popen.stderr)
+        transport, protocol = await loop.connect_write_pipe(
+            lambda: asyncio.streams.FlowControlMixin(loop=loop), popen.stdin)
+        stdin = asyncio.StreamWriter(transport, protocol, None, loop)
+    except BaseException:
+        _discard_child(popen, pidfd)
+        raise
+    return PipedProcess(popen, stdin, stdout, stderr, pidfd)

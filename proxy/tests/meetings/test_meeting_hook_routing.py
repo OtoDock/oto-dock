@@ -12,7 +12,7 @@ never resolved. These tests lock the single-chokepoint rebinding.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -96,7 +96,7 @@ async def test_hook_chat_id_falls_back_to_session_chat_row(temp_db):
 
 
 def test_tool_result_hook_routes_to_meeting_pump_queue(meeting_participant):
-    with patch("api.hooks.lifecycle.verify_session_match"):
+    with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock):
         resp = client.post(
             "/v1/hooks/tool-result",
             json={"session_id": meeting_participant, "tool_name": "Bash",
@@ -112,7 +112,7 @@ def test_tool_result_hook_routes_to_meeting_pump_queue(meeting_participant):
 
 
 def test_images_hook_routes_to_meeting_pump_queue(meeting_participant):
-    with patch("api.hooks.artifacts.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match_async"):
         resp = client.post(
             "/v1/hooks/images",
             json={"session_id": meeting_participant,
@@ -126,7 +126,7 @@ def test_images_hook_routes_to_meeting_pump_queue(meeting_participant):
 
 
 def test_url_hook_identity_for_normal_session():
-    with patch("api.hooks.artifacts.verify_session_match"):
+    with patch("api.hooks.artifacts.verify_session_match_async"):
         resp = client.post(
             "/v1/hooks/url",
             json={"session_id": "plain-sess-url", "url": "https://x", "title": "t"},
@@ -149,7 +149,7 @@ def test_subagent_stop_resolves_to_parent_chat(meeting_participant, temp_db):
         "session_id": "meeting-m1",
         "active_agents": [{"tool_use_id": "tu-ag1", "active": True}],
     }
-    with patch("api.hooks.lifecycle.verify_session_match"), \
+    with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock), \
          patch("api.hooks.lifecycle.push_pump_event", return_value=True) as push:
         resp = client.post(
             "/v1/hooks/subagent",
@@ -445,10 +445,14 @@ async def test_non_meeting_sessions_are_untouched():
 @pytest.mark.asyncio
 async def test_codex_named_meeting_tool_marks_the_turn(moderator_session, monkeypatch):
     # Codex's hook sanitizes the server key: mcp__meetings_mcp__direct_to.
-    # The decision path canonicalizes it, so the backstop (and the
-    # manifest's open tier) see the same name Claude sends.
+    # The Codex layer's canonical_tool_name restores it on the way into the
+    # authority, so the backstop (and the manifest's open tier) see the
+    # same name Claude sends.
     from pathlib import Path
     import config as app_config
+    from core.session.session_manager import get_layer_by_path
+    monkeypatch.setattr("core.session.session_manager.engine_layer_for_session",
+                        lambda sid: get_layer_by_path("codex-cli"))
     from services.mcp import mcp_registry as reg
     from services.mcp.mcp_manifest_types import (
         CredentialConfig, McpManifest, ServerConfig,

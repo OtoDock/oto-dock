@@ -23,7 +23,7 @@ CORE_SPLIT = [
     ("notifications-mcp", "notification-instructions", "notifications-guide"),
     ("meetings-mcp", "meetings", "meetings-guide"),
     ("memory-mcp", "memory-usage", "memory-guide"),
-    ("display-mcp", "display-tools", "miniapp-authoring"),
+    ("display-mcp", "display-tools", "app-authoring"),
 ]
 CARD_MAX_BYTES = 4500
 CARDS_TOTAL_MAX_BYTES = 30_000

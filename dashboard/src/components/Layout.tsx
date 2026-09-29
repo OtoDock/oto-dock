@@ -1,17 +1,12 @@
 import { Suspense, useState, useRef } from 'react'
 import { Outlet, NavLink, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin as isPlatformAdmin, roleBadge } from '../lib/permissions'
 import { useSwipeGesture } from '../hooks/useSwipeGesture'
 import ResponsiveDrawer from './ui/ResponsiveDrawer'
 import NavGroup from './ui/NavGroup'
 import { SetupBanner } from './PlatformSetupGuard'
 import { useAdminMcpRequests } from '../api/community'
-
-const ROLE_BADGE: Record<string, string> = {
-  admin: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  manager: 'bg-brand-100 text-brand',
-  viewer: 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary',
-}
 
 const navItems = [
   { path: '/admin', label: 'Overview', exact: true },
@@ -21,6 +16,7 @@ const navItems = [
   { path: '/admin/skills', label: 'Skills' },
   { path: '/admin/mcp-requests', label: 'MCP Requests', badge: 'pendingMcpRequests' as const },
   { path: '/admin/remote-machines', label: 'Remote Machines' },
+  { path: '/admin/shares', label: 'Shares' },
 ]
 
 // Monitoring = the admin-audit operational views (all agents, all users),
@@ -38,7 +34,7 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768)
   // Pending-count badge for the MCP Requests nav item. Only admins poll;
   // managers reach the queue via their own agent pages.
-  const isAdmin = user?.role === 'admin'
+  const isAdmin = isPlatformAdmin(user)
   const { data: mcpRequestsData } = useAdminMcpRequests(true)
   const pendingMcpRequests = isAdmin ? (mcpRequestsData?.pending_count ?? 0) : 0
   const badgeCounts = { pendingMcpRequests }
@@ -123,7 +119,7 @@ export default function Layout() {
             <div className="p-3 border-t border-p-border-light">
               <p className="text-xs text-p-text-secondary truncate">{user.name}</p>
               <div className="flex items-center gap-2 mt-1">
-                <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${ROLE_BADGE[user.role] || ''}`}>
+                <span className={`px-1.5 py-0.5 rounded-sm text-xs font-medium ${roleBadge(user.role)}`}>
                   {user.role}
                 </span>
                 <button onClick={logout} className="text-xs text-p-text-light hover:text-p-text-secondary">

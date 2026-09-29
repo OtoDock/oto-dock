@@ -8,18 +8,15 @@ export interface CliChipInfo {
   title?: string
 }
 
-// capabilities.installed_clis names → cli_status/cli_pins keys (bin names).
-const CLI_KEY: Record<string, string> = {
-  'claude-code': 'claude',
-  codex: 'codex',
-}
-
 export function cliChipInfo(
   cliName: string,
   cliStatus?: Record<string, { version?: string | null; path?: string | null }>,
   pins?: Record<string, string>,
+  // capabilities.installed_clis names → cli_status/cli_pins keys (bin names),
+  // from the engine descriptors (lib/engines installedCliBinaries).
+  binaries: Record<string, string> = {},
 ): CliChipInfo {
-  const key = CLI_KEY[cliName]
+  const key = binaries[cliName]
   const version = (key && cliStatus?.[key]?.version) || null
   if (!version) {
     // Old satellite / pre-reconcile window / unknown CLI name — plain chip.

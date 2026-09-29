@@ -1,4 +1,5 @@
 import type { GalleryImage } from './media/ImageGallery'
+import type { DelegateBlockStatus } from '../../lib/status/run'
 
 // --- Types ---
 
@@ -7,8 +8,10 @@ export type MessageBlock =
   | { type: 'thinking'; content: string; collapsed: boolean; done?: boolean; tokens?: number }
   | { type: 'tool'; name: string; toolId: string; summary: string; status: 'running' | 'done' | 'failed'; toolInput?: any; toolResult?: string; resultSummary?: string }
   | { type: 'subagent'; description: string; subagentType: string; isActive?: boolean; failed?: boolean; _toolId?: string | null; _background?: boolean; toolInput?: any; toolResult?: string }
-  | { type: 'delegate'; taskName: string; agent: string; promptPreview: string; status: 'running' | 'completed' | 'failed' | 'cancelled' | 'user_interrupted'; _taskId?: string; prompt?: string; workerChatId?: string }
+  | { type: 'delegate'; taskName: string; agent: string; promptPreview: string; status: DelegateBlockStatus; _taskId?: string; prompt?: string; workerChatId?: string }
   | { type: 'schedulewake'; prompt: string }
+  // A check's verdict on this turn (CHECKS.md): the compact card.
+  | { type: 'checkverdict'; check: string; status: 'pass' | 'fail' | 'error' | 'skipped'; pass: boolean; score?: number | null; summary: string; findings: Array<{ location: string; severity: string; text: string }>; findingsTotal: number; round: number; rounds: number; ranOn: string; costUsd: number; verdictId?: string }
   | { type: 'bgcommand'; command: string; description?: string; isActive?: boolean; failed?: boolean; _toolId?: string | null }
   | {
       type: 'permission'

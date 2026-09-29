@@ -120,3 +120,23 @@ class TaskDefinition(BaseModel):
     # bound and/or stop time — a chat must never wake itself forever.
     max_runs: int | None = None
     until_at: str | None = None
+    # An app handler's schedule (task_type='app', APPS.md "Handlers"): the
+    # app row and the handler; the runner writes a delivery, never a session.
+    app_id: str | None = None
+    app_handler: str | None = None
+    # Checks (CHECKS.md): the refs attached to this task's runs (persisted
+    # on dynamic_tasks.checks; copied onto each run's chat row at start).
+    checks: list[str] = []
+    # The first creator of a row the offboarding transfer moved (the
+    # prompt's author); "" for a row that never changed hands. A transferred
+    # row runs without the knowledge-write grant until a manager adopts it.
+    transferred_from: str = ""
+    # A check's judge run (task_type='check', in-memory only): the judge
+    # profile — ``{"check": name, "mcps": [...], "judge_on": auto|platform,
+    # "for_chat": the judged chat}``. A run with it is read-only, gets only
+    # the listed MCPs, never runs interactive and is never judged itself.
+    judge: dict | None = None
+    # Where the run goes when the caller already knows (a judge mirrors the
+    # judged session's machine; ``judge_on: platform`` pins "local"). Empty
+    # = resolve_execution_target as usual.
+    execution_target_override: str = ""

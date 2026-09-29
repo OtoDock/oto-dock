@@ -9,9 +9,14 @@ Covers the agents-map backend:
   (cookie admin/creator only — a manager reaches the endpoint and is
   rejected only on this field).
 - The edge compiler: same-level mutual + one-level-down (adjacent),
-  subtree reach, auto_delegation off, retraction on leave/delete — and the
+  subtree reach, mode off, retraction on leave/delete — and the
   source-scoping regression: a manual checkbox save must NEVER wipe
   department-compiled edges, and vice versa.
+- The delegation mode: 'down' compiles a strict hierarchy (no same-level,
+  no upward edges), 'down_across' adds the same level, 'both' the symmetric
+  wiring, 'off' nothing; the default on create, the value gate, the switch
+  with manual edges coexisting, the fold of the two older columns on a
+  pre-existing table, the prompt line.
 
 Run: cd proxy && venv/bin/pytest tests/agents/test_departments.py -v
 """
@@ -56,10 +61,12 @@ def _assign_user(sub: str, agents: dict[str, str]) -> None:
 
 
 def _mk_dept(client, name="Engineering", levels=None, **extra):
+    # 'both' pins the symmetric shapes the older tests assert; the API's
+    # own default ('down') has its own test in TestDelegationDirection.
     r = client.post(
         "/v1/departments",
         json={"name": name, "levels": levels or ["Head", "Senior", "Junior"],
-              **extra},
+              "mode": "both", **extra},
         headers=ADMIN_H(),
     )
     assert r.status_code == 200, r.text
@@ -93,7 +100,7 @@ class TestDepartmentCrud:
         assert [lv["name"] for lv in dept["levels"]] == ["Head", "Senior", "Junior"]
         assert [lv["rank"] for lv in dept["levels"]] == [0, 1, 2]
         assert dept["reach"] == "adjacent"
-        assert dept["auto_delegation"] is True
+        assert dept["mode"] == "both"
         assert dept["can_edit"] is True
 
     def test_member_cannot_create(self, client):
@@ -134,10 +141,10 @@ class TestDepartmentCrud:
         ).json()
         r = client.patch(
             f"/v1/departments/{own['id']}",
-            json={"auto_delegation": False}, headers=ADMIN_H(),
+            json={"mode": "off"}, headers=ADMIN_H(),
         )
         assert r.status_code == 200
-        assert r.json()["auto_delegation"] is False
+        assert r.json()["mode"] == "off"
 
     def test_validation(self, client):
         assert client.post(
@@ -339,8 +346,8 @@ class TestEdgeCompiler:
         expected = {(a, b) for a in members for b in members if a != b}
         assert expected <= dept_edges
 
-    def test_auto_delegation_off_compiles_nothing(self, client):
-        dept = _mk_dept(client, name="Silent", auto_delegation=False)
+    def test_mode_off_compiles_nothing(self, client):
+        dept = _mk_dept(client, name="Silent", mode="off")
         _mk_agent("sil-a")
         _mk_agent("sil-b")
         _assign_dept("sil-a", dept, "Head")
@@ -446,6 +453,340 @@ class TestManualCompiledCoexistence:
         assert body["compiled"][0]["department_name"] == "Engineering"
         # effective set (what sessions/spawn-authz see) is the union
         assert agent_store.get_delegation_targets("gs-a") == ["gs-b", "gs-solo"]
+
+
+class TestDelegationMode:
+    """mode='down' is a strict hierarchy, 'down_across' adds the same level,
+    'both' is the symmetric wiring every department created before the
+    column existed keeps, 'off' compiles nothing; reach applies to whatever
+    the mode wires."""
+
+    def test_new_department_defaults_to_down(self, client):
+        r = client.post(
+            "/v1/departments", json={"name": "Site"}, headers=ADMIN_H(),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["mode"] == "down"
+        both = _mk_dept(client, name="Both", mode="both")
+        assert both["mode"] == "both"
+        listed = {d["name"]: d for d in client.get(
+            "/v1/departments", headers=ADMIN_H()
+        ).json()["departments"]}
+        assert listed["Site"]["mode"] == "down"
+        assert listed["Both"]["mode"] == "both"
+
+    def test_other_values_are_refused(self, client):
+        assert client.post(
+            "/v1/departments",
+            json={"name": "X", "mode": "up"},
+            headers=ADMIN_H(),
+        ).status_code == 400
+        dept = _mk_dept(client)
+        for word in ("sideways", "", "DOWN"):
+            r = client.patch(
+                f"/v1/departments/{dept['id']}",
+                json={"mode": word}, headers=ADMIN_H(),
+            )
+            assert r.status_code == 400, word
+        assert client.get(
+            "/v1/departments", headers=ADMIN_H()
+        ).json()["departments"][0]["mode"] == "both"
+
+    def test_down_adjacent_is_a_strict_hierarchy(self, client):
+        dept = _mk_dept(client, name="Site", mode="down")
+        agents = {
+            "Head": ["dh-head"],
+            "Senior": ["ds-1", "ds-2"],
+            "Junior": ["dj-1", "dj-2", "dj-3"],
+        }
+        for level, slugs in agents.items():
+            for s in slugs:
+                _mk_agent(s)
+                _assign_dept(s, dept, level)
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        expected = {("dh-head", s) for s in agents["Senior"]} | {
+            (s, j) for s in agents["Senior"] for j in agents["Junior"]
+        }
+        # exactly the downward adjacent edges: no same-level, no upward, no
+        # head-to-junior
+        assert compiled == expected
+
+    def test_down_subtree_reaches_every_level_below(self, client):
+        dept = _mk_dept(client, name="Site", reach="subtree", mode="down")
+        agents = {
+            "Head": ["sh-head"],
+            "Senior": ["ss-1", "ss-2"],
+            "Junior": ["sj-1", "sj-2", "sj-3"],
+        }
+        for level, slugs in agents.items():
+            for s in slugs:
+                _mk_agent(s)
+                _assign_dept(s, dept, level)
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        below_head = agents["Senior"] + agents["Junior"]
+        expected = {("sh-head", s) for s in below_head} | {
+            (s, j) for s in agents["Senior"] for j in agents["Junior"]
+        }
+        assert compiled == expected
+
+    def test_down_across_adjacent_adds_the_peers_only(self, client):
+        dept = _mk_dept(client, name="Site", mode="down_across")
+        agents = {
+            "Head": ["xh-head"],
+            "Senior": ["xs-1", "xs-2"],
+            "Junior": ["xj-1", "xj-2"],
+        }
+        for level, slugs in agents.items():
+            for s in slugs:
+                _mk_agent(s)
+                _assign_dept(s, dept, level)
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        downward = {("xh-head", s) for s in agents["Senior"]} | {
+            (s, j) for s in agents["Senior"] for j in agents["Junior"]
+        }
+        peers = {
+            ("xs-1", "xs-2"), ("xs-2", "xs-1"),
+            ("xj-1", "xj-2"), ("xj-2", "xj-1"),
+        }
+        # the strict hierarchy plus each level's members both ways: still
+        # nothing upward, still no head-to-junior
+        assert compiled == downward | peers
+
+    def test_down_across_subtree_reaches_every_level_below(self, client):
+        dept = _mk_dept(
+            client, name="Site", mode="down_across", reach="subtree",
+        )
+        agents = {
+            "Head": ["yh-head"],
+            "Senior": ["ys-1", "ys-2"],
+            "Junior": ["yj-1"],
+        }
+        for level, slugs in agents.items():
+            for s in slugs:
+                _mk_agent(s)
+                _assign_dept(s, dept, level)
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        expected = (
+            {("yh-head", s) for s in agents["Senior"] + agents["Junior"]}
+            | {(s, "yj-1") for s in agents["Senior"]}
+            | {("ys-1", "ys-2"), ("ys-2", "ys-1")}
+        )
+        assert compiled == expected
+
+    def test_both_subtree_reaches_two_levels_up_and_down(self, client):
+        # reach is independent of the mode: the whole department both ways
+        # lets the bottom level reach the head and back
+        dept = _mk_dept(client, name="Site", mode="both", reach="subtree")
+        for s in ("bs-head", "bs-sen", "bs-jun"):
+            _mk_agent(s)
+        _assign_dept("bs-head", dept, "Head")
+        _assign_dept("bs-sen", dept, "Senior")
+        _assign_dept("bs-jun", dept, "Junior")
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        members = ("bs-head", "bs-sen", "bs-jun")
+        assert compiled == {(a, b) for a in members for b in members if a != b}
+
+    def test_single_level_under_every_mode(self, client):
+        dept = _mk_dept(client, name="Flat", levels=["Crew"], mode="down")
+        members = ("one-a", "one-b", "one-c")
+        for s in members:
+            _mk_agent(s)
+            _assign_dept(s, dept, "Crew")
+        mutual = {(a, b) for a in members for b in members if a != b}
+        assert not {t for t in _edges() if t[2] == "department"}
+        for mode, expected in (
+            ("both", mutual), ("off", set()), ("down_across", mutual),
+            ("down", set()),
+        ):
+            r = client.patch(
+                f"/v1/departments/{dept['id']}",
+                json={"mode": mode}, headers=ADMIN_H(),
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["mode"] == mode
+            compiled = {
+                (a, b) for a, b, src in _edges() if src == "department"
+            }
+            assert compiled == expected, mode
+
+    def test_mode_switch_keeps_manual_edges(self, client):
+        from storage.agents import agent_store
+        dept = _mk_dept(client, name="Site", levels=["Head", "Team"])
+        for s in ("sw-head", "sw-a", "sw-b"):
+            _mk_agent(s)
+        # the team member asked for the upward edge by hand FIRST, so the
+        # compiler's row for it never existed (manual wins the conflict)
+        agent_store.set_delegation_targets("sw-a", ["sw-head"])
+        _assign_dept("sw-head", dept, "Head")
+        _assign_dept("sw-a", dept, "Team")
+        _assign_dept("sw-b", dept, "Team")
+        e = _edges()
+        assert ("sw-a", "sw-head", "manual") in e
+        assert ("sw-b", "sw-head", "department") in e
+        assert ("sw-a", "sw-b", "department") in e
+
+        # the PATCH itself recompiles: peer and upward compiled rows go, the
+        # manual row stays, the head keeps its team
+        r = client.patch(
+            f"/v1/departments/{dept['id']}",
+            json={"mode": "down"}, headers=ADMIN_H(),
+        )
+        assert r.status_code == 200, r.text
+        e = _edges()
+        assert ("sw-a", "sw-head", "manual") in e
+        assert ("sw-b", "sw-head", "department") not in e
+        assert ("sw-a", "sw-b", "department") not in e
+        assert ("sw-b", "sw-a", "department") not in e
+        assert ("sw-head", "sw-a", "department") in e
+        assert ("sw-head", "sw-b", "department") in e
+
+        # and back: the symmetric rows return, the manual row still owns its
+        # pair
+        client.patch(
+            f"/v1/departments/{dept['id']}",
+            json={"mode": "both"}, headers=ADMIN_H(),
+        )
+        e = _edges()
+        assert ("sw-a", "sw-head", "manual") in e
+        assert ("sw-b", "sw-head", "department") in e
+        assert ("sw-a", "sw-b", "department") in e
+
+    def test_agent_moved_between_levels(self, client):
+        dept = _mk_dept(client, name="Site", levels=["Head", "Team"],
+                        mode="down")
+        for s in ("mv-head", "mv-a"):
+            _mk_agent(s)
+        _assign_dept("mv-head", dept, "Head")
+        _assign_dept("mv-a", dept, "Team")
+        assert ("mv-head", "mv-a", "department") in _edges()
+        # swap the two: the demoted head loses its edge, the promoted agent
+        # gains the edge to it
+        _assign_dept("mv-head", dept, "Team")
+        _assign_dept("mv-a", dept, "Head")
+        compiled = {(a, b) for a, b, src in _edges() if src == "department"}
+        assert compiled == {("mv-a", "mv-head")}
+
+    def test_edge_feed_is_one_way(self, client):
+        dept = _mk_dept(client, name="Site", levels=["Head", "Team"],
+                        mode="down")
+        for s in ("fd-head", "fd-a"):
+            _mk_agent(s)
+        _assign_dept("fd-head", dept, "Head")
+        _assign_dept("fd-a", dept, "Team")
+        r = client.get("/v1/agents/delegation-edges", headers=ADMIN_H())
+        edges = {(e["from"], e["to"]) for e in r.json()["edges"]}
+        assert ("fd-head", "fd-a") in edges
+        assert ("fd-a", "fd-head") not in edges
+        # the config UI's locked rows follow: the head has one, the team none
+        head = client.get(
+            "/v1/agents/fd-head/delegation-targets", headers=ADMIN_H()
+        ).json()
+        assert [c["target"] for c in head["compiled"]] == ["fd-a"]
+        team = client.get(
+            "/v1/agents/fd-a/delegation-targets", headers=ADMIN_H()
+        ).json()
+        assert team["compiled"] == []
+
+
+class TestModeMigration:
+    """The fold of the 1.6.x auto_delegation toggle and the never-released
+    direction column into mode, on both shapes a live install can have."""
+
+    @staticmethod
+    def _legacy_table(with_direction: bool) -> None:
+        from storage.pg import get_conn
+        # Simulate a pre-upgrade install: the table exists in the older
+        # shape (the column CHECK goes with the dropped column).
+        with get_conn() as conn:
+            conn.execute("ALTER TABLE departments DROP COLUMN mode")
+            conn.execute(
+                "ALTER TABLE departments ADD COLUMN auto_delegation "
+                "BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+            if with_direction:
+                conn.execute(
+                    "ALTER TABLE departments ADD COLUMN direction "
+                    "TEXT NOT NULL DEFAULT 'both'"
+                )
+            conn.commit()
+
+    @staticmethod
+    def _migrate_twice() -> None:
+        from storage import pg
+        from storage import schema as pg_schema
+        from storage.pg import get_conn
+        # Fresh pool: a pooled connection may hold a prepared ``SELECT *``
+        # plan whose result type the DDL changes.
+        pg.close_pool()
+        for _ in range(2):  # idempotent: safe on every startup
+            with get_conn() as conn:
+                pg_schema.run_migrations(conn)
+                conn.commit()
+        pg.close_pool()
+
+    @staticmethod
+    def _columns() -> set[str]:
+        from storage.pg import get_conn
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'departments'"
+            ).fetchall()
+        return {r["column_name"] for r in rows}
+
+    def test_a_1_6_install_folds_the_toggle(self, temp_db):
+        from storage import schema as pg_schema
+        from storage.agents import db_departments
+        from storage.pg import get_conn
+        self._legacy_table(with_direction=False)
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO departments "
+                "(id, name, auto_delegation, created_at, updated_at) VALUES "
+                "('dept-on', 'On', TRUE, 'then', 'then'), "
+                "('dept-off', 'Off', FALSE, 'then', 'then')"
+            )
+            conn.commit()
+        self._migrate_twice()
+        # the symmetric wiring it had, or off
+        assert db_departments.get_department("dept-on")["mode"] == "both"
+        assert db_departments.get_department("dept-off")["mode"] == "off"
+        cols = self._columns()
+        assert "mode" in cols
+        assert not cols & {"auto_delegation", "direction"}
+        # the store's default for a NEW department is unchanged by the
+        # column default
+        fresh = db_departments.create_department("Fresh", ADMIN)
+        assert fresh["mode"] == "down"
+        with get_conn() as conn:
+            assert pg_schema.check_schema_drift(conn) == []
+
+    def test_an_install_with_the_direction_column_folds_both(self, temp_db):
+        from storage import schema as pg_schema
+        from storage.agents import db_departments
+        from storage.pg import get_conn
+        self._legacy_table(with_direction=True)
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO departments "
+                "(id, name, auto_delegation, direction, created_at, updated_at) "
+                "VALUES "
+                "('dept-both', 'Both', TRUE, 'both', 'then', 'then'), "
+                "('dept-down', 'Down', TRUE, 'down', 'then', 'then'), "
+                "('dept-silent', 'Silent', FALSE, 'down', 'then', 'then')"
+            )
+            conn.commit()
+        self._migrate_twice()
+        assert db_departments.get_department("dept-both")["mode"] == "both"
+        assert db_departments.get_department("dept-down")["mode"] == "down"
+        # off wins over the direction it had
+        assert db_departments.get_department("dept-silent")["mode"] == "off"
+        cols = self._columns()
+        assert "mode" in cols
+        assert not cols & {"auto_delegation", "direction"}
+        with get_conn() as conn:
+            assert pg_schema.check_schema_drift(conn) == []
 
 
 class TestActivityEndpoint:
@@ -568,6 +909,52 @@ class TestPromptDepartmentLine:
         jun_text = _delegation_mcp_context("pr-jun", delegation_targets=jun_targets)
         assert "level(s) above" in jun_text
         assert "`pr-head`" in jun_text
+
+    def test_down_only_line(self, client):
+        from services.mcp.dynamic_context import _delegation_mcp_context
+        from storage.agents import agent_store
+        dept = _mk_dept(client, name="Site", mode="down")
+        for s in ("dl-head", "dl-sen", "dl-peer", "dl-jun", "dl-out"):
+            _mk_agent(s)
+        _assign_dept("dl-head", dept, "Head")
+        _assign_dept("dl-sen", dept, "Senior")
+        _assign_dept("dl-peer", dept, "Senior")
+        _assign_dept("dl-jun", dept, "Junior")
+        # the middle level: only the level below is listed, and the clause
+        # says why nothing else is
+        targets = agent_store.get_delegation_targets("dl-sen")
+        text = _delegation_mcp_context("dl-sen", delegation_targets=targets)
+        assert "**Site** department" in text
+        assert "runs downward only" in text
+        assert "level(s) below" in text and "`dl-jun`" in text
+        assert "same-level" not in text and "`dl-peer`" not in text
+        assert "level(s) above" not in text and "`dl-head`" not in text
+        # the bottom level with a manual target elsewhere: the department
+        # line still appears, with the clause and no buckets
+        agent_store.set_delegation_targets("dl-jun", ["dl-out"])
+        jun_text = _delegation_mcp_context(
+            "dl-jun", delegation_targets=["dl-out"]
+        )
+        assert "level **Junior**" in jun_text
+        assert "runs downward only" in jun_text
+        assert "Department delegation" not in jun_text
+
+    def test_down_across_line(self, client):
+        from services.mcp.dynamic_context import _delegation_mcp_context
+        from storage.agents import agent_store
+        dept = _mk_dept(client, name="Site", mode="down_across")
+        for s in ("da-head", "da-sen", "da-peer", "da-jun"):
+            _mk_agent(s)
+        _assign_dept("da-head", dept, "Head")
+        _assign_dept("da-sen", dept, "Senior")
+        _assign_dept("da-peer", dept, "Senior")
+        _assign_dept("da-jun", dept, "Junior")
+        targets = agent_store.get_delegation_targets("da-sen")
+        text = _delegation_mcp_context("da-sen", delegation_targets=targets)
+        assert "downward and across your own level, never upward" in text
+        assert "same-level" in text and "`da-peer`" in text
+        assert "level(s) below" in text and "`da-jun`" in text
+        assert "level(s) above" not in text and "`da-head`" not in text
 
     def test_unassigned_agent_has_no_line(self, client):
         from services.mcp.dynamic_context import _delegation_mcp_context

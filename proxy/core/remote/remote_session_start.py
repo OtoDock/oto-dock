@@ -14,20 +14,16 @@ import logging
 import time
 
 from core.execution_layer import AgentConfig
-from core.layers.codex.layer import CodexEventTranslator
-from core.remote.remote_mcp_rewrite import _strip_toml_mcp_sections
+from core import placement
 from core.remote.remote_session_info import RemoteSessionInfo
+from core.session import session_state as _state
 from core.session.session_state import (
     _record_session_use, set_session_security, set_session_mode,
 )
+from auth.roles import row_role
+from ws import wire_events as wire
 
 logger = logging.getLogger("remote-layer")
-
-# start_session ack budget for a Codex session on a LOCAL model: the satellite
-# acks after its pre-turn MCP warm gate, which waits for every server with a
-# 90 s cap on a local model (a changed tool list re-prefills for minutes
-# there), on top of the daemon spawn. Hosted sessions keep the 60 s budget.
-_LOCAL_MODEL_START_TIMEOUT_S = 180.0
 
 
 def _machine_sync_role(
@@ -47,12 +43,12 @@ def _machine_sync_role(
     everywhere else. Missing owner / role ⇒ ``""`` (fail-closed: syncs
     like a viewer — personal dirs only).
     """
-    if not machine or machine.get("pairing_scope", "") == "admin":
-        return session_role
     from storage import database as _db
+    if not machine or placement.machine_is_admin_paired(machine):
+        return session_role
     owner_sub = machine.get("registered_by", "") or ""
-    roles = _db.get_user_agent_roles(owner_sub) if owner_sub else {}
-    return (roles or {}).get(agent_slug, "")
+    # The owner's row alone — never their platform role (the docstring says why).
+    return row_role(_db.get_user_agent_roles(owner_sub) if owner_sub else {}, agent_slug)
 
 
 def _collect_session_files(
@@ -79,13 +75,15 @@ def _collect_session_files(
     import base64
 
     from core.credentials import mcp_broker
-    from core.sandbox.session_config_dir import collect_authorized_ssh_keys
+    from core.sandbox.session_config_dir import (
+        collect_authorized_ssh_keys, session_takes_ssh_keys,
+    )
     from services.oauth import credential_resolver
 
-    admin_paired = bool(machine) and machine.get("pairing_scope", "") == "admin"
+    admin_paired = placement.machine_is_admin_paired(machine)
     files: dict[str, mcp_broker.SessionFile] = {}
 
-    if admin_paired:
+    if admin_paired and session_takes_ssh_keys(config.security_context):
         for name, src in collect_authorized_ssh_keys(config.agent_name).items():
             files[f"ssh/{name}"] = mcp_broker.SessionFile(
                 content_b64=base64.b64encode(src.read_bytes()).decode(),
@@ -124,8 +122,12 @@ class RemoteSessionStartMixin:
 
     async def start_session(self, session_id: str, config: AgentConfig) -> None:
         machine_id = config.execution_target
-        if machine_id == "local":
+        if placement.is_local(machine_id):
             raise RuntimeError("RemoteExecutionLayer called with local target")
+        # A machine has no mount to mask the agent's CLI state with: below
+        # the editor tier the session is refused as it is locally.
+        from core.sandbox.session_config_dir import refuse_session_on_agent_state
+        refuse_session_on_agent_state(config.security_context)
 
         if not self._cm.is_connected(machine_id):
             raise RuntimeError(
@@ -149,19 +151,35 @@ class RemoteSessionStartMixin:
                 f"Remote machine {machine_id[:8]} is at capacity — too many active sessions"
             )
 
-        # Determine the actual execution path from the config (set by config builders)
-        from storage.agents import agent_store
-        execution_path = config.execution_path
-        if not execution_path:
-            agent = agent_store.get_agent(config.agent_name)
-            execution_path = (agent or {}).get("execution_path", "claude-code-cli")
-        if execution_path == "direct-llm":
-            raise RuntimeError("Direct LLM cannot run remotely")
+        # The engine this session runs: the config's (set by the builders from
+        # the chat / dashboard selection), else the agent's default — the same
+        # resolution every other spawn path uses.
+        from core.session.session_manager import (
+            capabilities_for_path, get_layer_by_path, resolve_execution_path,
+        )
+        execution_path = resolve_execution_path(config.agent_name, config.execution_path)
+        _rcaps = capabilities_for_path(execution_path)
+        if not _rcaps.runtime.supports_remote_execution:
+            raise RuntimeError(f"{_rcaps.display_name} cannot run remotely")
+        # The satellite must have said it can run this engine: no frame
+        # reaches a machine whose code cannot dispatch it (a fielded satellite
+        # that reports no ``engines`` runs the two it always has).
+        engines = self._cm.satellite_engines(machine_id)
+        if execution_path not in engines:
+            raise RuntimeError(
+                f"{_rcaps.display_name} is not available on "
+                f"{self._cm.satellite_name(machine_id) or machine_id[:8]} — its satellite "
+                f"({self._cm.satellite_version(machine_id) or 'unknown version'}) runs "
+                f"{', '.join(sorted(engines)) or 'no engine'}. Update the satellite or "
+                "run this agent on the server."
+            )
+        adapter = get_layer_by_path(execution_path).remote_adapter()
+        if adapter is None:
+            raise RuntimeError(f"{_rcaps.display_name} has no remote adapter")
 
         # Build layer-specific config payload for satellite
-        payload = await self._build_start_payload(
-            session_id, config, execution_path
-        )
+        plan = await self._build_start_payload(session_id, config, execution_path)
+        payload = plan.payload
 
         # Credential broker: provision THIS session's per-MCP secrets so
         # the satellite's stdio interceptor can fetch them over the tunnel at MCP
@@ -172,11 +190,11 @@ class RemoteSessionStartMixin:
         from core.credentials import mcp_broker
         mcp_broker.provision(session_id, config.mcp_secret_bundles or {})
 
-        # Derive the set of MCP names the CLI/Codex will try to launch on
-        # the satellite. mcp_sync reconciles this against what's already
-        # installed so missing/out-of-date MCPs are shipped + installed
-        # before the CLI starts.
-        assigned_mcps = self._extract_assigned_mcps(payload, execution_path)
+        # Derive the set of MCP names the engine will try to launch on the
+        # satellite (its adapter reads its own config format). mcp_sync
+        # reconciles this against what's already installed so missing /
+        # out-of-date MCPs are shipped + installed before the CLI starts.
+        assigned_mcps = adapter.mcp_names(payload)
 
         # Initial workspace sync: push platform-side files (workspace,
         # config/, .claude/, .codex/, users/) to the satellite before the
@@ -194,7 +212,7 @@ class RemoteSessionStartMixin:
         from storage import database as _db
         target_username: str | None = None
         machine = _rs.get_remote_machine(machine_id)
-        if machine and machine.get("pairing_scope", "") != "admin":
+        if machine and not placement.machine_is_admin_paired(machine):
             # User-paired (or orphaned-owner) machine. Resolve the owner's
             # username so the sync filter scopes data to that one user;
             # coerce to empty string when the user record has been deleted
@@ -279,7 +297,7 @@ class RemoteSessionStartMixin:
                 return
             install_started_flag["v"] = True
             await install_registry.emit(machine_id, config.agent_name, {
-                "type": "install_started",
+                "type": wire.INSTALL_STARTED,
                 "machine_id": machine_id,
                 "agent": config.agent_name,
             })
@@ -299,7 +317,7 @@ class RemoteSessionStartMixin:
                         if time.monotonic() - rec.last_emit_ts >= 15:
                             await install_registry.emit(
                                 machine_id, config.agent_name, {
-                                    "type": "install_heartbeat",
+                                    "type": wire.INSTALL_HEARTBEAT,
                                     "machine_id": machine_id,
                                     "agent": config.agent_name,
                                 },
@@ -312,7 +330,7 @@ class RemoteSessionStartMixin:
         async def _on_plan(ev: dict) -> None:
             await _emit_install_started_once()
             await install_registry.emit(machine_id, config.agent_name, {
-                "type": "install_mcp_plan",
+                "type": wire.INSTALL_MCP_PLAN,
                 "machine_id": machine_id,
                 "agent": config.agent_name,
                 "mcps_to_install": ev.get("mcps_to_install", []),
@@ -327,14 +345,14 @@ class RemoteSessionStartMixin:
             # "Checking MCPs…" without polluting per-MCP progress rows.
             if ev.get("phase") == "verifying":
                 await install_registry.emit(machine_id, config.agent_name, {
-                    "type": "install_verifying",
+                    "type": wire.INSTALL_VERIFYING,
                     "machine_id": machine_id,
                     "agent": config.agent_name,
                     "message": ev.get("message", "Checking MCPs…"),
                 })
                 return
             await install_registry.emit(machine_id, config.agent_name, {
-                "type": "install_progress",
+                "type": wire.INSTALL_PROGRESS,
                 "machine_id": machine_id,
                 "agent": config.agent_name,
                 "mcp": ev.get("mcp", ""),
@@ -350,7 +368,7 @@ class RemoteSessionStartMixin:
             # already-synced tree bar-free (no 100% flash).
             await _emit_install_started_once()
             await install_registry.emit(machine_id, config.agent_name, {
-                "type": "install_progress",
+                "type": wire.INSTALL_PROGRESS,
                 "machine_id": machine_id,
                 "agent": config.agent_name,
                 "mcp": "workspace files",
@@ -382,9 +400,7 @@ class RemoteSessionStartMixin:
                 )
                 if sync_result.excluded_names:
                     # Filter out failed MCPs from the config the CLI will read.
-                    payload = self._strip_excluded_mcps_from_payload(
-                        payload, execution_path, sync_result.excluded_names,
-                    )
+                    payload = adapter.without_mcps(payload, sync_result.excluded_names)
                     assigned_mcps -= sync_result.excluded_names
                     logger.warning(
                         "sync_mcps excluded %d MCP(s) from session %s: %s",
@@ -403,7 +419,7 @@ class RemoteSessionStartMixin:
                         if failed_name in sync_result.memoized:
                             continue
                         await install_registry.emit(machine_id, config.agent_name, {
-                            "type": "mcp_install_failed",
+                            "type": wire.MCP_INSTALL_FAILED,
                             "machine_id": machine_id,
                             "agent": config.agent_name,
                             "mcp": failed_name,
@@ -421,7 +437,7 @@ class RemoteSessionStartMixin:
                 # An empty diff emits nothing — no bar, no 100%-flicker.
                 if install_started_flag["v"]:
                     await install_registry.emit(machine_id, config.agent_name, {
-                        "type": "install_done",
+                        "type": wire.INSTALL_DONE,
                         "machine_id": machine_id,
                         "agent": config.agent_name,
                         "warmup_failures": warmup_failures,
@@ -433,7 +449,7 @@ class RemoteSessionStartMixin:
                 logger.warning("mcp_sync_for_session failed: %s", e)
                 await _emit_install_started_once()
                 await install_registry.emit(machine_id, config.agent_name, {
-                    "type": "install_failed",
+                    "type": wire.INSTALL_FAILED,
                     "machine_id": machine_id,
                     "agent": config.agent_name,
                     "error": str(e),
@@ -455,6 +471,8 @@ class RemoteSessionStartMixin:
         if config.interactive:
             await self._start_interactive_remote(
                 session_id, config, execution_path, payload, machine_id,
+                first_prompt_via_argv=_rcaps.runtime.interactive_first_prompt_via_argv,
+                credential_file_delivered=plan.credential_file_delivered,
             )
             return
 
@@ -464,13 +482,8 @@ class RemoteSessionStartMixin:
         )
 
         # Send start_session command to satellite. The satellite acks AFTER the
-        # session started, which for Codex includes the pre-turn MCP warm gate;
-        # a local-model session waits for every server (its gate cap is 90 s,
-        # satellite ``_WARM_CAP_LOCAL_MODEL_S``), so its ack budget covers the
-        # cap on top of the spawn.
-        start_timeout = 60.0
-        if execution_path == "codex-cli" and payload.get("local_model_provider"):
-            start_timeout = _LOCAL_MODEL_START_TIMEOUT_S
+        # session started; the engine's plan says how long that may take (a
+        # Codex session on a local model waits out its MCP warm gate first).
         try:
             await self._cm.send_command(machine_id, {
                 "type": "start_session",
@@ -478,7 +491,7 @@ class RemoteSessionStartMixin:
                 "agent_slug": config.agent_name,
                 "execution_path": execution_path,
                 "config": payload,
-            }, timeout=start_timeout)
+            }, timeout=plan.start_timeout_s)
         except Exception:
             self._cm.remove_session_queue(machine_id, session_id)
             raise
@@ -492,42 +505,18 @@ class RemoteSessionStartMixin:
             event_queue=queue,
             use_native_permissions=config.use_native_permissions,
             allow_full_fs=bool(
-                getattr(config.security_context, "target_allow_full_fs", False)
+                config.security_context is not None
+                and config.security_context.placement.allow_full_fs
             ),
             model=config.model,
             mode=config.permission_mode,
             used_mcps=set(assigned_mcps),
             fallback_reason=getattr(config, "fallback_reason", None),
+            resume_handle=config.resume_handle,
         )
-        if execution_path == "codex-cli":
-            # Enable remote bg-sub-agent supervision only when the satellite is
-            # new enough to forward bg-thread events past the main turn. On an
-            # old satellite those events never arrive, so a supervisor would spin
-            # to its 600 s ceiling and fire a spurious nudge — instead we leave
-            # supervised_bg off and the translator sweeps bg subs at turn end
-            # (today's behavior, no regression). Mirrors the LOCAL layer's
-            # supervised_bg=True; the only difference is the version gate.
-            bg_on = self._cm.satellite_supports_bg(machine_id)
-            info.bg_supervised = bg_on
-            # supervised_bg_commands rides the SAME >=0.5.18 gate: that version
-            # means exactly "the forwarder streams past main-turn end", which is
-            # all live cross-turn terminal completion needs — the router's OOB
-            # hook resolves a between-turns item/completed; the 0.5.105-gated
-            # codex_bg_terminals drain is only the loss-window backstop. Older
-            # satellites keep the turn-end sweep (badge resolves at turn end).
-            info.codex_translator = CodexEventTranslator(
-                model=config.model, supervised_bg=bg_on,
-                session_id=session_id, supervised_bg_commands=bg_on,
-            )
-            info.codex_thread_id = config.codex_thread_id
-            if bg_on:
-                # The router becomes the SOLE consumer of info.event_queue,
-                # demuxing main-thread events to the active turn and bg-thread
-                # events to per-thread buffers (see _route_remote_notifications).
-                info.router_task = asyncio.create_task(
-                    self._route_remote_notifications(info),
-                    name=f"remote-codex-router-{session_id[:8]}",
-                )
+        # The engine's own per-session state (a translator, a router that
+        # consumes the event queue — whatever the engine keeps across turns).
+        adapter.init_session(info, config, self._cm)
 
         self._sessions[session_id] = info
 
@@ -536,7 +525,9 @@ class RemoteSessionStartMixin:
         if config.security_context:
             set_session_security(session_id, config.security_context)
         set_session_mode(session_id, config.permission_mode)
-        self._bind_subscription(session_id, config, execution_path, payload)
+        self._bind_subscription(
+            session_id, config, execution_path, plan.credential_file_delivered,
+        )
 
         logger.info(
             "Remote session %s started on satellite %s (path=%s)",
@@ -545,14 +536,17 @@ class RemoteSessionStartMixin:
 
     @staticmethod
     def _bind_subscription(
-        session_id: str, config: AgentConfig, execution_path: str, payload: dict,
+        session_id: str, config: AgentConfig, execution_path: str,
+        credential_file_delivered: bool,
     ) -> None:
         """Bind the acquired subscription + register the session's satellite
         credential file for rotation fan-out. Mirrors the local layers' bind at
         the end of ``start_session`` — without it a remote session leaked its
         pool seat (acquire incremented ``active_sessions``; release found no
         binding to decrement) and was invisible to the turn-start guard and
-        the freshness fan-out."""
+        the freshness fan-out. ``credential_file_delivered`` is the payload
+        builder's word (``RemoteStartPlan``) that the engine wrote its login
+        into the start payload — the file the satellite now holds."""
         if not config.subscription_id:
             return
         from services.engines.subscription_pool import (
@@ -562,28 +556,33 @@ class RemoteSessionStartMixin:
             session_id, config.subscription_id,
             layer=execution_path, user_sub=config.subscription_user_sub,
             scope_key=credential_scope_key(
-                config.execution_target or "local",
+                config.execution_target or placement.LOCAL,
                 config.sandbox_host_claude_dir,
             ),
         )
-        if execution_path == "codex-cli":
-            kind = "codex"
-            dir_relative = payload.get("codex_dir_relative", "")
-            wrote_file = "auth_json" in payload
-        else:
-            kind = "claude"
-            dir_relative = payload.get("claude_dir_relative", "")
-            wrote_file = "credentials_json" in payload
-        if not (wrote_file and dir_relative):
-            return  # API-key session — no credential file to rewrite
+        # The engine's credential-file declaration says where the file lives
+        # on the satellite — the scope root the payload builder used + the
+        # declared dirname, the same tree the satellite clamps the file to;
+        # the builder said whether this session has one to rewrite.
+        if not credential_file_delivered:
+            return  # env-delivered credentials or an API-key session — nothing to rewrite
+        from core.session.session_manager import capabilities_for_path
+        spec = capabilities_for_path(execution_path).auth.credential_file
+        if spec is None:
+            return
+        from core import layout
         from services.engines import token_fanout
+        mount_username = (
+            getattr(config.security_context, "mount_username", "")
+            if config.security_context else ""
+        )
         token_fanout.register_session_target(
             session_id,
             token_fanout.CredentialFileTarget(
-                kind=kind,
+                layer=execution_path,
                 machine_id=config.execution_target,
                 agent_name=config.agent_name,
-                dir_relative=dir_relative,
+                dir_relative=f"{layout.scope_root(mount_username)}/{spec.dirname}",
             ),
         )
 
@@ -599,7 +598,7 @@ class RemoteSessionStartMixin:
         authoritative backstop."""
         import config as app_config
         floor_age = min(
-            app_config.SESSION_EVICT_FLOOR_S, app_config.get_idle_timeout(),
+            app_config.SESSION_EVICT_FLOOR_S, await _state.cached_idle_timeout(),
         )
         evicted = 0
         while self._cm.machine_at_capacity(machine_id):
@@ -632,12 +631,19 @@ class RemoteSessionStartMixin:
         execution_path: str,
         payload: dict,
         machine_id: str,
+        *,
+        first_prompt_via_argv: bool,
+        credential_file_delivered: bool,
     ) -> None:
         """Remote interactive spawn: register an InteractiveSession whose
         PTY runs on the satellite (``pty_open``), reusing the already-built
         ``payload`` + the workspace/MCP sync from ``start_session``. The proxy
         keeps all interactive intelligence; the satellite is a dumb PTY pipe.
         No -p pump, no ``RemoteSessionInfo`` / event queue.
+        ``first_prompt_via_argv`` is the engine's
+        ``runtime.interactive_first_prompt_via_argv`` and
+        ``credential_file_delivered`` the payload plan's word (both resolved
+        by the caller).
         """
         from core.session import interactive_session
         # Proxy-side identity BEFORE the PTY starts so the PreToolUse hook resolves
@@ -656,7 +662,7 @@ class RemoteSessionStartMixin:
         # composer (the remote "cursor bouncing" bug). Claude (+ Codex resume)
         # keep the readiness gate (their first prompt rides a PTY flush).
         prompt_in_argv = (
-            execution_path == "codex-cli"
+            first_prompt_via_argv
             and bool((getattr(config, "interactive_first_prompt", "") or "").strip())
         )
         await interactive_session.register_remote(
@@ -669,80 +675,16 @@ class RemoteSessionStartMixin:
             user_sub=getattr(config, "user_sub", "") or "",
             role=(getattr(ctx, "role", "") or ""),
             username=(getattr(ctx, "username", "") or ""),
-            transcript_kind=("codex" if execution_path == "codex-cli" else "claude"),
             prompt_in_argv=prompt_in_argv,
             tui_theme=getattr(config, "interactive_theme", "") or "dark",
         )
         # Subscription binding + fan-out target (InteractiveSession.close()
         # releases the seat, mirroring the local interactive branches).
-        self._bind_subscription(session_id, config, execution_path, payload)
+        self._bind_subscription(
+            session_id, config, execution_path, credential_file_delivered,
+        )
         logger.info(
             "Remote INTERACTIVE session %s started on satellite %s (path=%s)",
             session_id[:8], machine_id[:8], execution_path,
         )
 
-    def _extract_assigned_mcps(self, payload: dict, execution_path: str) -> set[str]:
-        """Extract MCP names from the built start_session payload.
-
-        CLI payloads carry the JSON mcpServers dict in `mcp_config`; Codex
-        payloads embed them as TOML `[mcp_servers.*]` sections in
-        `mcp_config_toml`. We return the *manifest* name for each active
-        entry, which is what `mcp_sync` expects.
-        """
-        names: set[str] = set()
-        if execution_path == "claude-code-cli":
-            mcp_config = payload.get("mcp_config") or {}
-            servers = mcp_config.get("mcpServers") or {}
-            # Keys in mcpServers are `server_name` (from manifest) — map back
-            # to `name` via registry.
-            from services.mcp import mcp_registry
-            server_to_name = {}
-            for n, m in mcp_registry.get_all_manifests().items():
-                server_to_name[m.server_name or m.name] = n
-            for key in servers.keys():
-                mapped = server_to_name.get(key, key)
-                names.add(mapped)
-        elif execution_path == "codex-cli":
-            toml = payload.get("mcp_config_toml") or ""
-            import re
-            # [mcp_servers.<server_name>]
-            for m in re.finditer(r"\[mcp_servers\.([A-Za-z0-9_\-]+)\]", toml):
-                key = m.group(1)
-                from services.mcp import mcp_registry
-                server_to_name = {}
-                for n, mf in mcp_registry.get_all_manifests().items():
-                    server_to_name[mf.server_name or mf.name] = n
-                names.add(server_to_name.get(key, key))
-        return names
-
-    def _strip_excluded_mcps_from_payload(
-        self, payload: dict, execution_path: str, excluded: set[str],
-    ) -> dict:
-        """Return a payload with excluded MCPs removed from mcpServers.
-
-        Used when mcp_sync couldn't install an MCP — we drop it from the
-        session's config so the CLI doesn't error trying to spawn a
-        non-existent stdio binary.
-        """
-        from services.mcp import mcp_registry
-        server_to_name = {}
-        for n, m in mcp_registry.get_all_manifests().items():
-            server_to_name[m.server_name or m.name] = n
-
-        if execution_path == "claude-code-cli":
-            mcp_config = payload.get("mcp_config")
-            if mcp_config and "mcpServers" in mcp_config:
-                keep: dict = {}
-                for key, val in mcp_config["mcpServers"].items():
-                    manifest_name = server_to_name.get(key, key)
-                    if manifest_name not in excluded:
-                        keep[key] = val
-                payload["mcp_config"] = {"mcpServers": keep}
-        elif execution_path == "codex-cli":
-            toml = payload.get("mcp_config_toml") or ""
-            drop_keys = {
-                key for key, name in server_to_name.items() if name in excluded
-            }
-            if drop_keys and toml:
-                payload["mcp_config_toml"] = _strip_toml_mcp_sections(toml, drop_keys)
-        return payload

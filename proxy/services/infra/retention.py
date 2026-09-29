@@ -14,7 +14,9 @@ Four passes:
      untouched for N days lose their session files and are flagged
      ``pending_history_seed='retention'`` — the next turn transparently
      reseeds from DB history (core/session/history_seed.py). Remote/
-     satellite chats and direct-LLM are never candidates.
+     satellite chats and direct-LLM are never candidates. Under the same
+     knob and window, check verdicts (CHECKS.md) older than N days are
+     deleted (``_pass_check_verdicts``).
   B. Orphans — fixed 7-day grace, always on: session files no DB row points
      at (deleted chats, CLI subagent sidechains, meeting agent sessions).
      Nothing can ever resume them.
@@ -50,7 +52,9 @@ import config
 from core.session import external_identity
 from core.session.external_identity import external_home_of
 from services.infra import external_retention
+from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
+from core import layout
 
 logger = logging.getLogger("claude-proxy")
 
@@ -166,8 +170,9 @@ def _build_live_snapshot() -> LiveSnapshot:
 # Filesystem helpers
 # ---------------------------------------------------------------------------
 
-def iter_local_homes() -> Iterator[tuple[str, str, Path]]:
-    """Yield (agent, username, home) for every local agent home.
+def iter_local_homes(agent: str = "") -> Iterator[tuple[str, str, Path]]:
+    """Yield (agent, username, home) for every local agent home — one
+    agent's when ``agent`` is given.
 
     Bounded iteration over the known shapes
     ``AGENTS_DIR/<agent>/users/<username>``, ``AGENTS_DIR/<agent>/workspace``
@@ -179,15 +184,15 @@ def iter_local_homes() -> Iterator[tuple[str, str, Path]]:
     agents_dir = Path(config.AGENTS_DIR)
     if not agents_dir.is_dir():
         return
-    for agent_dir in sorted(agents_dir.iterdir()):
-        if not agent_dir.is_dir():
+    for agent_dir in sorted(agent_dirs(agents_dir)):
+        if agent and agent_dir.name != agent:
             continue
-        users_dir = agent_dir / "users"
+        users_dir = agent_dir / layout.USERS
         if users_dir.is_dir():
             for user_home in sorted(users_dir.iterdir()):
                 if user_home.is_dir():
                     yield agent_dir.name, user_home.name, user_home
-        ws = agent_dir / "workspace"
+        ws = agent_dir / layout.WORKSPACE
         if ws.is_dir():
             yield agent_dir.name, "", ws
         ext = agent_dir / external_identity.EXTERNALS_DIRNAME
@@ -212,7 +217,7 @@ def _home_for_chat(agent: str, user_sub: str) -> Path:
     have no users row -> agent-scope workspace home."""
     username = task_store.get_username_by_sub(user_sub) or "" if user_sub else ""
     base = config.get_agent_dir(agent)
-    return (base / "users" / username) if username else (base / "workspace")
+    return layout.user_dir(base, username) if username else (base / layout.WORKSPACE)
 
 
 def _unlink(path: Path, stats: dict, count_key: str, bytes_key: str,
@@ -246,14 +251,22 @@ def _mtime_older_than(path: Path, age_s: float, now: float) -> bool:
 def _pass_aged_chats(days: int, live: LiveSnapshot, stats: dict,
                      dry_run: bool) -> None:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    candidates = task_store.get_retention_candidate_chats(cutoff)
+    # An engine that rebuilds every turn from chat_messages keeps no session
+    # files, so its chats are never candidates — the registry says which
+    # (reached function-locally: services reach the registry that way).
+    from core.session.session_manager import get_all_layers
+    fileless = [
+        path for path, layer in get_all_layers().items()
+        if layer.capabilities.behaviour.rebuilds_history_from_db
+    ]
+    candidates = task_store.get_retention_candidate_chats(cutoff, fileless_paths=fileless)
     if not candidates:
         return
     # Session files are shared across chat rows (continue_session delegation
     # reuses one session id on a fresh chat per round) — protect any id a
     # FRESH chat still references.
     prot_sids, prot_tids = task_store.get_protected_session_refs(cutoff)
-    flag_ids: list[str] = []
+    planned: list[tuple[str, list[Path]]] = []
     for chat in candidates:
         sid = chat.get("session_id") or ""
         tid = chat.get("codex_thread_id") or ""
@@ -264,44 +277,62 @@ def _pass_aged_chats(days: int, live: LiveSnapshot, stats: dict,
         if chat["id"] in live.pump_chat_ids:
             continue
         home = _home_for_chat(chat["agent"], chat.get("user_sub") or "")
-        if sid and _UUID_RE.match(sid):
-            # All project dirs — the munged-cwd dir name varies (and
-            # satellite-migrated copies exist inside local homes too).
-            for f in (home / ".claude" / "projects").glob(f"*/{sid}.jsonl"):
-                _unlink(f, stats, "session_files_deleted", "bytes_freed", dry_run)
-            # Legacy pre-sandbox location under the proxy's own home.
-            legacy = (Path.home() / ".claude" / "projects"
-                      / str(config.AGENTS_DIR).replace("/", "-")
-                      / f"{sid}.jsonl")
-            if legacy.is_file():
-                _unlink(legacy, stats, "session_files_deleted", "bytes_freed", dry_run)
-        if tid and _UUID_RE.match(tid):
-            for f in (home / ".codex" / "sessions").rglob(f"*{tid}.jsonl"):
-                _unlink(f, stats, "session_files_deleted", "bytes_freed", dry_run)
-        # Flag even when files were already missing — the chat can't resume
+        # Each engine names the files of one chat under a home
+        # (``ExecutionLayer.chat_session_files``; the id-shape guard is the
+        # sweep's).
+        sid_ok = sid if sid and _UUID_RE.match(sid) else ""
+        tid_ok = tid if tid and _UUID_RE.match(tid) else ""
+        files = [f for layer in get_all_layers().values()
+                 for f in layer.chat_session_files(home, sid_ok, tid_ok)]
+        # Planned even when files are already missing: the chat can't resume
         # either way, and the digest is the right outcome on next open.
-        flag_ids.append(chat["id"])
-    if flag_ids and not dry_run:
-        task_store.flag_chats_for_retention(flag_ids)
-    stats["chats_flagged"] += len(flag_ids)
+        planned.append((chat["id"], files))
+    if not planned:
+        return
+    # The flag goes FIRST, with the candidate cutoff: a chat resumed since the
+    # candidate query is not flagged and keeps its files; only a flagged
+    # chat's files are removed, so no chat ends up with a session id and no
+    # session behind it.
+    if dry_run:
+        flagged = {cid for cid, _ in planned}
+    else:
+        flagged = set(task_store.flag_chats_for_retention(
+            [cid for cid, _ in planned], cutoff))
+    for cid, files in planned:
+        if cid not in flagged:
+            continue
+        for f in files:
+            _unlink(f, stats, "session_files_deleted", "bytes_freed", dry_run)
+    stats["chats_flagged"] += len(flagged)
+
+
+def _pass_check_verdicts(days: int, stats: dict, dry_run: bool) -> None:
+    """Check verdicts (CHECKS.md) older than the same window: the evidence
+    of turns whose session files just went; small rows, but a list that
+    never ends otherwise. Same knob as Pass A, so an install that keeps
+    every chat keeps every verdict."""
+    from storage.checks import db_checks
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    stats["check_verdicts_deleted"] += db_checks.delete_verdicts_before(cutoff, dry_run=dry_run)
 
 
 def _pass_orphans(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
+    """Session files no chat row and no live session references — each
+    engine enumerates its own under a home with the id it belongs to
+    (``ExecutionLayer.iter_session_files``); the id-shape, reference and
+    grace guards are the sweep's."""
+    from core.session.session_manager import get_all_layers
     refs = task_store.get_all_session_refs()
     refs |= live.session_ids | live.codex_thread_ids
     now = time.time()
+    layers = list(get_all_layers().values())
     for _agent, _username, home in iter_local_homes():
-        for f in (home / ".claude" / "projects").glob("*/*.jsonl"):
-            if not _UUID_RE.match(f.stem) or f.stem in refs:
-                continue
-            if _mtime_older_than(f, ORPHAN_GRACE_S, now):
-                _unlink(f, stats, "orphans_deleted", "orphan_bytes", dry_run)
-        for f in (home / ".codex" / "sessions").rglob("rollout-*.jsonl"):
-            tid = f.stem[-36:]
-            if not _UUID_RE.match(tid) or tid in refs:
-                continue
-            if _mtime_older_than(f, ORPHAN_GRACE_S, now):
-                _unlink(f, stats, "orphans_deleted", "orphan_bytes", dry_run)
+        for layer in layers:
+            for f, ref in layer.iter_session_files(home):
+                if not _UUID_RE.match(ref) or ref in refs:
+                    continue
+                if _mtime_older_than(f, ORPHAN_GRACE_S, now):
+                    _unlink(f, stats, "orphans_deleted", "orphan_bytes", dry_run)
 
 
 def _pass_codex_junk(live: LiveSnapshot, stats: dict, dry_run: bool) -> None:
@@ -395,6 +426,23 @@ def _pass_orphan_quota_projects(stats: dict, dry_run: bool) -> None:
 # Sweep entry points
 # ---------------------------------------------------------------------------
 
+def _pass_share_snapshots(stats: dict, dry_run: bool) -> None:
+    """Chat snapshots (SHARING.md): a revoked share's copy goes seven days
+    after the revoke; a directory with no share row at all goes at once."""
+    from datetime import timedelta
+    from services.sharing import chat_snapshot
+    from storage.sharing import share_store
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    for share in share_store.list_revoked_before(cutoff):
+        if not dry_run:
+            chat_snapshot.remove(share)
+            share_store.clear_snapshot_ref(share["id"])
+        stats["share_snapshots_deleted"] = stats.get("share_snapshots_deleted", 0) + 1
+    if not dry_run:
+        n = chat_snapshot.sweep_orphans(share_store.list_all_share_ids())
+        stats["share_snapshots_deleted"] = stats.get("share_snapshots_deleted", 0) + n
+
+
 def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
                     dry_run: bool) -> dict:
     started = time.monotonic()
@@ -404,6 +452,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "retention_days": days,
         "retention_pass_skipped": not enabled,
         "chats_flagged": 0,
+        "check_verdicts_deleted": 0,
         "session_files_deleted": 0,
         "bytes_freed": 0,
         "orphans_deleted": 0,
@@ -435,6 +484,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
     ]
     if enabled:
         passes.append(("aged-chats", lambda: _pass_aged_chats(days, live, stats, dry_run)))
+        passes.append(("check-verdicts", lambda: _pass_check_verdicts(days, stats, dry_run)))
     passes.extend([
         ("orphans", lambda: _pass_orphans(live, stats, dry_run)),
         ("codex-junk", lambda: _pass_codex_junk(live, stats, dry_run)),
@@ -442,6 +492,7 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         ("orphan-partials", lambda: _pass_orphan_partials(stats, dry_run)),
         ("orphan-quota-projects", lambda: _pass_orphan_quota_projects(stats, dry_run)),
         ("mcp-autoupdate-log", lambda: _pass_mcp_autoupdate_log(stats, dry_run)),
+        ("share-snapshots", lambda: _pass_share_snapshots(stats, dry_run)),
     ])
     for name, fn in passes:
         try:
@@ -467,14 +518,19 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
     return stats
 
 
+def _read_settings() -> tuple[bool, int]:
+    return settings_enabled(), settings_days()
+
+
 async def run_sweep(*, dry_run: bool = False) -> dict:
     """Run one full sweep (the run-now endpoint + the daily tick). The live
-    snapshot is built on the event loop; the file/DB work runs in a thread.
-    The lock serializes run-now against the daily tick."""
+    snapshot is built on the event loop; the settings read, the file/DB work
+    and the stats write run off it. The lock serializes run-now against the
+    daily tick."""
+    from storage.pg import run_db
     global _last_run
     async with _sweep_lock:
-        enabled = settings_enabled()
-        days = settings_days()
+        enabled, days = await run_db(_read_settings)
         snapshot = _build_live_snapshot()
         stats = await asyncio.to_thread(
             _run_sweep_sync, days, enabled, snapshot, dry_run,
@@ -482,7 +538,8 @@ async def run_sweep(*, dry_run: bool = False) -> dict:
         if not dry_run:
             _last_run = time.monotonic()
             try:
-                task_store.set_platform_setting(
+                await run_db(
+                    task_store.set_platform_setting,
                     "session_retention_last_sweep", json.dumps(stats),
                 )
             except Exception:
@@ -552,12 +609,17 @@ def compute_storage_usage() -> dict:
         except (ValueError, TypeError):
             last_sweep = None
 
+    # Chunked uploads in flight sit outside every agent tree (and every
+    # quota) until they complete: shown here so an admin sees the disk they hold.
+    from api.media import uploads
+
     return {
         "agents_bytes": _tree_bytes(Path(config.AGENTS_DIR)),
         "session_files_bytes": session_files,
         "codex_junk_bytes": codex_junk,
         "recover_bin_bytes": _tree_bytes(Path(config.RECOVER_BIN_DIR)),
         "sessions_dir_bytes": _tree_bytes(Path(config.SESSIONS_DIR)),
+        "upload_staging_bytes": uploads.staged_bytes_total(),
         "logs_bytes": logs,
         "retention": {
             "enabled": settings_enabled(),

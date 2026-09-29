@@ -28,11 +28,22 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from core.execution_layer import DEFAULT_EXECUTION_PATH
+from core import placement
+from core.session import session_kind
+from auth.providers import effective_role_of
 
 logger = logging.getLogger(__name__)
 
-# Only the interactive CLIs make sense for an otodock TUI session.
-_ALLOWED_PATHS = ("claude-code-cli", "codex-cli")
+
+
+def _allows_otodock_tui(execution_path: str) -> bool:
+    """Only an engine with a native TUI makes sense for an otodock session —
+    a capability question, not a valid-id one (an in-process engine is a
+    perfectly valid id that has nothing to put under a PTY)."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(execution_path)
+    return bool(caps and caps.runtime.supports_interactive_pty)
 
 
 class OtodockSessionError(Exception):
@@ -86,14 +97,10 @@ def _model_for_path(agent: str, execution_path: str, requested: str) -> str:
 
 async def _owner_role_for_agent(owner_sub: str, owner: dict, agent: str) -> str:
     """The owner's effective role on ``agent`` (admins → 'admin'); '' = no access."""
-    from storage import database as db
     from storage.agents import agent_store
     if not await asyncio.to_thread(agent_store.get_agent, agent):
         raise OtodockSessionError(f"agent '{agent}' not found")
-    if owner.get("role") == "admin":
-        return "admin"
-    roles = await asyncio.to_thread(db.get_user_agent_roles, owner_sub)
-    return (roles or {}).get(agent, "")
+    return await asyncio.to_thread(effective_role_of, owner_sub, agent, fallback_user=owner)
 
 
 def _chat_ids_with_messages(chat_ids: list) -> set:
@@ -139,7 +146,7 @@ async def list_local_sessions(machine_id: str, args: dict) -> dict:
     #  - matches the requested CLI.
     candidates = [
         c for c in chats
-        if (c.get("execution_target") or "local") == machine_id
+        if placement.runs_on(c.get("execution_target"), machine_id)
         and c.get("session_id")
         and (not execution_path or (c.get("execution_path") or "") == execution_path)
     ]
@@ -224,15 +231,15 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
         # Its CLI session files must live on THIS machine — otherwise pinning the
         # resume here would force-spawn elsewhere's session on this satellite (and
         # `--resume` would 404). Resume an off-machine chat from the dashboard.
-        if (chat.get("execution_target") or "local") != machine_id:
+        if not placement.runs_on(chat.get("execution_target"), machine_id):
             raise OtodockSessionError(
                 "that chat did not run on this machine — resume it from the dashboard"
             )
         agent = chat.get("agent") or ""
-        execution_path = chat.get("execution_path") or "claude-code-cli"
+        execution_path = chat.get("execution_path") or DEFAULT_EXECUTION_PATH
         chat_id = resume_chat_id
         session_id = chat.get("session_id") or str(uuid.uuid4())
-        codex_thread_id = chat.get("codex_thread_id") or ""
+        resume_handle = chat.get("codex_thread_id") or ""
         model = chat.get("model") or model  # continue with the chat's model
         resume = True
         work_cwd_for_build = ""  # build_agent_config recovers it from the chat row
@@ -240,20 +247,20 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     else:
         # --- FRESH session in the given folder -------------------------------
         agent = (args.get("agent") or "").strip()
-        execution_path = (args.get("execution_path") or "claude-code-cli").strip()
+        execution_path = (args.get("execution_path") or DEFAULT_EXECUTION_PATH).strip()
         work_cwd = (args.get("cwd") or "").strip()
         if not work_cwd:
             raise OtodockSessionError("no working directory provided")
         chat_id = str(uuid.uuid4())
         session_id = str(uuid.uuid4())
-        codex_thread_id = ""
+        resume_handle = ""
         resume = False
         work_cwd_for_build = work_cwd
         created_chat = False
 
     if not agent:
         raise OtodockSessionError("no agent specified")
-    if execution_path not in _ALLOWED_PATHS:
+    if not _allows_otodock_tui(execution_path):
         raise OtodockSessionError(f"unsupported execution path: {execution_path}")
 
     role = await _owner_role_for_agent(owner_sub, owner, agent)
@@ -265,7 +272,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     # must hold only that user's own scoped chats). Block them on user-paired
     # machines (assignment is blocked too — this is defense-in-depth + a clearer
     # message than the generic not-assigned-to-this-machine error below).
-    if (_machine.get("pairing_scope") or "") == "user":
+    if (_machine.get("pairing_scope") or "") == placement.PAIRING_USER:
         from core.session import visibility
         if await asyncio.to_thread(visibility.is_shared_only, agent):
             raise OtodockSessionError(
@@ -286,7 +293,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
         nat_target, _reason = await asyncio.to_thread(
             remote_store.resolve_execution_target, agent, owner_sub, role,
         )
-        if (nat_target or "local") != machine_id:
+        if not placement.runs_on(nat_target, machine_id):
             raise OtodockSessionError(
                 f"agent '{agent}' is not set to run on this machine — assign it to "
                 f"this machine in the agent's execution settings to use it here"
@@ -352,9 +359,9 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     try:
         agent_cfg = await build_agent_config(
             agent_name=agent, user=owner, user_sub=owner_sub, user_role=role,
-            permission_mode=perm_mode, client_type="dashboard",
+            permission_mode=perm_mode, client_type=session_kind.DASHBOARD.name,
             model=model, execution_path=execution_path, resume=resume,
-            codex_thread_id=codex_thread_id, chat_id=chat_id, session_id=session_id,
+            resume_handle=resume_handle, chat_id=chat_id, session_id=session_id,
             pinned_target=machine_id, work_cwd=work_cwd_for_build, is_otodock=True,
             term=term,
         )
@@ -364,7 +371,7 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
 
     # Must run on THIS machine — refuse rather than silently spawn elsewhere.
     # (Each refusal below also returns the pool seat the build acquired.)
-    if (agent_cfg.execution_target or "local") != machine_id:
+    if not placement.runs_on(agent_cfg.execution_target, machine_id):
         release_config_seat(session_id, agent_cfg)
         await _cleanup_chat()
         raise OtodockSessionError(

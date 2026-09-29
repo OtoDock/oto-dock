@@ -3,6 +3,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { AgentRole } from '../lib/permissions'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,19 +49,23 @@ export interface PhoneRoute {
   // Server echo of a column kept for compatibility: an external caller
   // always runs as viewer (the per-route role selector was removed
   // 2026-09-08); the API ignores whatever a client sends.
-  role: 'viewer' | 'editor' | 'manager'
+  role: AgentRole
   remember_callers: boolean
   // Server-computed mask flag — the PIN value itself never leaves the proxy
-  // (write-only sub-resource, useSetRoutePin/useDeleteRoutePin).
+  // (set with the route save as `pin`, removed through useDeleteRoutePin).
   pin_configured: boolean
   // Server-computed advisories for this route (a user-tied line without a
-  // PIN, a Codex agent on an external route, a tied user that lost access).
+  // PIN, a tied user that lost access).
   warnings: string[]
   created_at: string
   updated_at: string
 }
 
-export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured' | 'warnings' | 'role'>
+// Request-only fields on a route save: a PIN set with the route (never
+// echoed back) and the acknowledgement a user-mode inbound route needs to
+// save without one (the server refuses the save otherwise).
+export type PhoneRouteSaveExtras = { pin?: string; acknowledge_no_pin?: boolean }
+export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured' | 'warnings' | 'role'> & PhoneRouteSaveExtras
 export type PhoneRouteUpdate = Partial<PhoneRouteCreate>
 
 export interface PhoneCallLogEntry {
@@ -178,27 +183,14 @@ export function useDeletePhoneRoute() {
   })
 }
 
-// Route PIN — write-only secret pair (twilio-auth-token shape).
-export function useSetRoutePin() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: async ({ id, value }: { id: string; value: string }) => {
-      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin`, {
-        method: 'PUT',
-        body: JSON.stringify({ value }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to set the PIN')
-      return res.json()
-    },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
-  })
-}
-
+// Route PIN removal (the write-only sub-resource; a PIN is SET with the route
+// save). On a user-mode inbound route the server needs the acknowledgement.
 export function useDeleteRoutePin() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin`, { method: 'DELETE' })
+    mutationFn: async ({ id, acknowledgeNoPin }: { id: string; acknowledgeNoPin?: boolean }) => {
+      const query = acknowledgeNoPin ? '?acknowledge_no_pin=true' : ''
+      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin${query}`, { method: 'DELETE' })
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to remove the PIN')
       return res.json()
     },

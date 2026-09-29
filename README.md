@@ -12,17 +12,20 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-Apache-2.0" src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.6.1-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.7.0-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
 </p>
 
 <p align="center">
-  <a href="https://docs.otodock.io">Docs</a> ·
   <a href="#quick-start">Install</a> ·
+  <a href="#the-two-minute-video">Video</a> ·
+  <a href="https://docs.otodock.io">Docs</a> ·
   <a href="https://otodock.io/features">Features</a> ·
-  <a href="https://github.com/OtoDock/oto-dock/discussions">Discussions</a>
+  <a href="https://github.com/OtoDock/oto-dock/discussions">Discussions</a> ·
+  <a href="https://x.com/otodock">X</a> ·
+  <a href="https://www.linkedin.com/company/otodock">LinkedIn</a>
 </p>
 
 <br/>
@@ -35,7 +38,7 @@
 <br/>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/3a050b1b-0af3-42f5-abe5-0e4c95a26d6e" alt="Seven faces of the OtoDock dashboard: the company map, an agent's dashboard, an Excel file in the chat, an artifact, the tools page, a meeting and the terminal" width="100%" />
+  <img src="https://github.com/user-attachments/assets/3a050b1b-0af3-42f5-abe5-0e4c95a26d6e" alt="Seven faces of the OtoDock dashboard: the company map, an agent's home, an Excel file in the chat, an artifact, the tools page, a meeting and the terminal" width="100%" />
 </p>
 
 <p align="center"><em>Dashboard highlights. <a href="#the-two-minute-video">The two-minute video</a> tells the whole story.</em></p>
@@ -48,12 +51,52 @@
 
 OtoDock acts as the brain of your company. You create powerful agents that
 connect to the tools your company runs on, work in departments, delegate to
-each other, and keep working on their own when no one is watching. It is
-multi-tenant by design. Many people work with the same agents, and there
-are four modes that decide how an agent is shared and where its work lands.
-You work with your agents on your self-hosted dashboard, or you can even
-give them a phone line and talk to them. All of it runs on your own
-Anthropic and OpenAI subscriptions, and on local models.
+each other, and keep working on their own when no one is watching. Your
+agents can build and deploy internal apps for your team, or even public ones
+you share with your customers.
+
+OtoDock is multi-tenant by design. Many people work with the same agents,
+and four modes decide how an agent is shared and where its work lands. You
+work with your agents on your self-hosted dashboard, or you can even give
+them a phone line and talk to them. All of it runs on your own Anthropic and
+OpenAI subscriptions, and on local models.
+
+## Quick start
+
+You need a Linux server with Docker, x86-64 or arm64, and at least 4 GB of RAM
+(see the [sizing guide](https://docs.otodock.io/getting-started/installation#how-much-ram)).
+A Mac with Apple silicon, such as a Mac mini, can run it too with Docker
+Desktop. Create a folder for the install, then run the script in it:
+
+```bash
+mkdir otodock && cd otodock
+curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/install.sh
+bash install.sh
+```
+
+The script checks Docker, writes a `.env` with a generated database password,
+downloads the release-pinned compose files and starts the stack. It performs
+fresh installs only. To upgrade later, download `scripts/upgrade.sh` into the
+install folder the same way and run it
+([upgrading](https://docs.otodock.io/administration/upgrading)).
+
+The [installation guide](https://docs.otodock.io/getting-started/installation)
+covers the server's address, HTTPS behind a reverse proxy, the phone service
+and building from source, and the
+[configuration reference](https://docs.otodock.io/administration/configuration)
+documents every option.
+
+### The first five minutes
+
+Open **http://localhost:8400**, or your server's address on port 8400, and
+the setup wizard greets you. Create the owner account, and OtoDock installs
+the Personal Assistant for you, with the tools it needs. Connect your Claude
+or ChatGPT subscription under Setup, AI Engines. Then open the Personal
+Assistant from the Agents page and send it your first message. Its reply
+streams in live, with every tool call and every file it creates
+([First run](https://docs.otodock.io/getting-started/first-run)). From there
+you add agents from the community catalog or build your own, and you add the
+people who will work with them.
 
 ## Build your own AI agents
 
@@ -90,13 +133,18 @@ Every agent has a mode that decides how people share it.
 
 Admins add each person to the agents they need.
 
-| Three platform roles | Three roles on every agent |
+| Three platform roles | Four roles on every agent |
 |---|---|
 | An **Admin** runs the platform. | A **Manager** has full control of the agent. |
-| A **Creator** creates agents. | An **Editor** edits the shared files. |
-| A **Member** uses the agents they are given. | A **Viewer** chats and reads the shared files. |
+| A **Creator** creates agents. | An **Editor** edits the shared files and automates as the agent. |
+| A **Member** uses the agents they are given. | A **Contributor** adds files to the shared workspace, nothing more. |
+| | A **Viewer** chats and reads the shared files. |
 
-## Claude Code or Codex. Your subscription.
+<p align="center">
+  <img src=".github/media/story-roles.jpg" alt="The three platform roles beside the four roles on every agent: manager, editor, contributor and viewer" />
+</p>
+
+## Claude Code or Codex on your subscription, or local models.
 
 Claude Code runs on your Anthropic subscription, and Codex runs on your
 ChatGPT subscription. Every user connects their own subscription. Local
@@ -104,7 +152,7 @@ models on your own hardware work as well. You pick the engine per agent,
 and you can switch it per chat.
 
 <p align="center">
-  <img src=".github/media/story-engines.jpg" alt="Claude Code and Codex plugged into one agent, each with a your-subscription tag" />
+  <img src=".github/media/story-engines.jpg" alt="One agent over three cards: Claude Code and Codex on your subscription, and local models on your hardware" />
 </p>
 
 ## They work while you are away
@@ -116,9 +164,34 @@ come in four severities, from a quiet chime to a persistent danger alarm.
 Every run is a full chat you can open, read and continue, so no one has to
 be watching.
 
+Checks hold that work to your standard. A check judges what the agent did at
+the end of a turn, in a chat, a task run or a delegation. If the work falls
+short, the agent gets the findings and fixes them in another round.
+
 <p align="center">
   <img src=".github/media/story-automation.jpg" alt="Three triggers feeding an agent that works in the workspace and sends notifications" />
 </p>
+
+## Build and deploy full apps, just by asking your agent.
+
+An agent can build and deploy its own apps. An app is a page with its own
+address, so you can bookmark it and come back to it any time. It can have
+buttons that put the agent to work, show live data from the platform and,
+when it needs one, run its own server and database.
+
+- **Apps for you or your team.** They live inside OtoDock, on the agent. A
+  developer agent can keep an app that shows your GitHub issues, pull
+  requests and builds at a glance, or a project board where a button on a
+  card hands the work to the agent.
+- **Apps for your customers.** A public link opens the app for anyone, with
+  no OtoDock account. Think of a hairdresser's booking page: clients open
+  the link, pick a time and pay.
+
+<p align="center">
+  <img src=".github/media/story-apps.jpg" alt="A team board with the team's avatars, its own database, platform tools, schedules and notifications, beside a booking page shared by link and opened on a customer's phone" />
+</p>
+
+You can share an app or a chat with a teammate, or with anyone by a link.
 
 ## Give an agent a phone number
 
@@ -147,7 +220,7 @@ dashboard, anywhere. If the machine goes offline, your server takes over.
 
 ## The two-minute video
 
-https://github.com/user-attachments/assets/2d829ee3-2d4c-4001-8b40-73c2eb90c661
+https://github.com/user-attachments/assets/743de1c6-e582-42f6-9996-cde277befbf2
 
 <p align="center"><em>This entire video was directed, captured and edited by an OtoDock agent.
 <a href="https://otodock.io">Watch it in full quality on otodock.io</a>.</em></p>
@@ -157,14 +230,14 @@ https://github.com/user-attachments/assets/2d829ee3-2d4c-4001-8b40-73c2eb90c661
 <table>
   <tr>
     <td width="50%"><img src=".github/media/screen-map.jpg" alt="The 3D company map: the Engineering, Marketing and Independent stages with their agents and the delegation lines between them" /></td>
-    <td width="50%"><img src=".github/media/screen-dashboard.jpg" alt="The CEO agent's dashboard: the company graph and the day's numbers, kept fresh by the agent" /></td>
+    <td width="50%"><img src=".github/media/screen-dashboard.jpg" alt="The CEO agent's home: an app with the company graph and the day's numbers, kept fresh by the agent" /></td>
   </tr>
   <tr>
-    <td><b>Departments.</b> Organize your agents into departments, decide who can delegate to whom, or put them in a meeting together.</td>
-    <td><b>Live dashboards.</b> Every agent gets live dashboards, so you can manage them effortlessly.</td>
+    <td><b>Departments.</b> Organize your agents into departments, or put them in a meeting together. A department's delegation mode decides who can hand work to whom: <b>Down only</b>, <b>Down and across</b>, <b>All directions</b> or <b>Off</b>.</td>
+    <td><b>Apps.</b> Your agents build and deploy apps inside OtoDock from a single prompt, for your team or for your customers.</td>
   </tr>
   <tr>
-    <td><img src=".github/media/screen-tools.jpg" alt="The home agent's control panel: alarm, climate, scenes and light sliders, run by the agent" /></td>
+    <td><img src=".github/media/screen-tools.jpg" alt="The tools page: the tool servers assigned to an agent, each one switched on or off" /></td>
     <td><img src=".github/media/tour-documents.jpg" alt="An Excel workbook opened and edited inside the chat, sheets and charts included" /></td>
   </tr>
   <tr>
@@ -223,13 +296,14 @@ One platform, the whole toolkit.
   into text and subtitles, and produce speech and music of their own.
 - **Web browsing.** The browser tool from the community catalog lets agents
   research the live web.
-- **Built-in tools.** Schedules, triggers, notifications, meetings,
+- **Built-in tools.** Schedules, triggers, notifications, checks, meetings,
   delegation, phone calls, file transfer between agents, live charts and
-  mini-apps, SSH hosts, and browser and computer control on paired machines
+  apps, SSH hosts, and browser and computer control on paired machines
   all ship with the platform.
 - **Community catalog.** Ready-made agents, tools and skills install in one
   click, with GitHub, Notion, Home Assistant, Nextcloud, Prometheus, UniFi
-  and Uptime Kuma among them, and more landing regularly.
+  and Uptime Kuma among them, and more landing regularly. Agent templates
+  arrive with their apps and checks, and follow new versions.
 - **Extensible by design.** Any MCP tool server installs from a manifest,
   and tools are assigned per agent.
 - **Usage and budgets.** Costs are tracked per user and per agent, with
@@ -239,83 +313,59 @@ One platform, the whole toolkit.
 
 See all features at [otodock.io/features](https://otodock.io/features).
 
-## Quick start
-
-A Linux server with Docker is all you need (x86-64 or arm64, 4 GB RAM minimum,
-see the [sizing guide](https://docs.otodock.io/getting-started/installation#how-much-ram)).
-Create a folder for the install, then run the script in it:
-
-```bash
-mkdir otodock && cd otodock
-curl -fsSLO https://raw.githubusercontent.com/OtoDock/oto-dock/main/scripts/install.sh
-bash install.sh
-```
-
-The installer checks Docker, writes a `.env` with a generated database
-password, handles the Ubuntu 24.04+ host step automatically when the host
-needs it, downloads the release-pinned `docker-compose.yml` plus the
-phone-service overlay, and starts the stack. Everything lands in the folder
-you run it from. The script performs fresh installs only, and stops rather
-than touch an existing install.
-
-If your users browse to the server by name or IP, set `DASHBOARD_PUBLIC_URL`
-in the generated `.env`. Behind a reverse proxy, also set `TRUSTED_PROXY` to
-your proxy's IP
-([reverse proxy & HTTPS](https://docs.otodock.io/getting-started/installation#put-it-behind-https)).
-Every optional knob is documented in the
-[Configuration reference](https://docs.otodock.io/administration/configuration),
-and the [installation guide](https://docs.otodock.io/getting-started/installation)
-also covers building from source, bare-metal development, and running
-behind a reverse proxy with HTTPS.
-
-## The first five minutes
-
-Open **http://localhost:8400** and the setup wizard greets you. Create the
-owner account, and OtoDock installs the Personal Assistant for you, with the
-tools it needs. Connect your Claude or ChatGPT subscription under Setup,
-AI Engines, and the banner that reminds you goes away. Open the Personal
-Assistant from the Agents page and send it your first message. Its reply
-streams in live, with every tool call and every file it creates
-([First run](https://docs.otodock.io/getting-started/first-run)). From there
-you add agents from the community catalog or build your own, and you add
-the people who will work with them.
-
 ## How it fits together
 
 ```
- dashboard/   React dashboard — chat, agents, tasks, files, admin
- proxy/       Platform core (FastAPI) — sessions, security, scheduling,
+ dashboard/   React dashboard: chat, agents, apps, tasks, files, admin
+ proxy/       Platform core (FastAPI): sessions, security, scheduling,
               the agent sandbox, and the WebSocket hub the dashboard talks to
  mcps/        MCP tool servers: OtoDock's custom set (files, memory, tasks,
-              meetings, notifications, …) + community mirrors
- audio/       Speech package — STT / TTS / voice activity, provider-agnostic
- phone/       Telephony daemon — live calls over Twilio or FreePBX/Asterisk
- satellite/   Remote-machine agent — pairs your own hardware to the platform
+              meetings, notifications, …) plus community mirrors
+ audio/       Speech package: STT, TTS and voice activity, provider-agnostic
+ phone/       Telephony daemon: live calls over Twilio or FreePBX/Asterisk
+ satellite/   Remote-machine agent: pairs your own hardware to the platform
  scripts/     Install, compose, backup/restore, and maintainer tooling
 ```
 
-Agents run as Claude Code / Codex processes inside per-session kernel
+Agents run as Claude Code or Codex processes inside per-session kernel
 sandboxes, talk to their tools over MCP, and stream every step back to the
 dashboard. PostgreSQL holds the platform state.
 
 ## Community
 
-- **Docs:** [docs.otodock.io](https://docs.otodock.io)
-- **Website:** [otodock.io](https://otodock.io)
-- **Community agents:** [OtoDock/community-agents](https://github.com/OtoDock/community-agents)
-- **Community MCPs:** [OtoDock/community-mcps](https://github.com/OtoDock/community-mcps)
-- **Community skills:** [OtoDock/community-skills](https://github.com/OtoDock/community-skills)
-<!-- COMMUNITY: Discord invite lands here at launch (Phase 8) -->
+- **Questions and ideas** go to
+  [Discussions](https://github.com/OtoDock/oto-dock/discussions), and so do
+  the things you build, in
+  [Show and tell](https://github.com/OtoDock/oto-dock/discussions/categories/show-and-tell).
+- **Bugs** go to [issues](https://github.com/OtoDock/oto-dock/issues), where
+  the forms ask for what a maintainer needs first.
+- **Security reports** go privately through [SECURITY.md](SECURITY.md),
+  never into a public issue.
+- **The docs** at [docs.otodock.io](https://docs.otodock.io) cover
+  installing, running and extending OtoDock, and
+  [otodock.io](https://otodock.io) tells the whole story.
 
-Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Security
-reports: [SECURITY.md](SECURITY.md).
+Watch this repository's releases to hear about each new version. Every
+release carries its notes, and the [CHANGELOG](CHANGELOG.md) keeps them all.
+For news, follow OtoDock on [X](https://x.com/otodock) and
+[LinkedIn](https://www.linkedin.com/company/otodock).
+
+## Contributing
+
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) takes you from
+a clone to green tests and explains how a pull request gets merged.
+Ready-made agents, tools and skills live in their own catalogs, and new
+entries go there:
+[community-agents](https://github.com/OtoDock/community-agents),
+[community-mcps](https://github.com/OtoDock/community-mcps) and
+[community-skills](https://github.com/OtoDock/community-skills).
 
 ## License
 
 OtoDock is **fair source**: licensed under the
 [Functional Source License, v1.1, with Apache 2.0 future grant](LICENSE)
 (FSL-1.1-Apache-2.0). You can use, run, modify, and redistribute it for
-anything except competing with OtoDock commercially — and each version
+anything except competing with OtoDock commercially, and each version
 automatically becomes plain **Apache 2.0 two years** after its release.
 
 Self-hosting is free for up to 5 users. Growing teams

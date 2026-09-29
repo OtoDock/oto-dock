@@ -27,7 +27,11 @@ def snap_root(tmp_path, monkeypatch):
 
 
 def _seed_source(tmp_path, content=b"xlsx bytes"):
-    src = tmp_path / "source.xlsx"
+    # The pushed file lives in an agent tree (the hook resolved it there).
+    import config
+    ws = config.AGENTS_DIR / "test-agent" / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    src = ws / "source.xlsx"
     src.write_bytes(content)
     return src
 
@@ -61,8 +65,24 @@ def test_create_and_resolve_roundtrip(temp_db, tmp_path, snap_root):
     src.write_bytes(b"mutated afterwards")
     p = ps.snapshot_path("chat-1", sid)
     assert p is not None and p.read_bytes() == b"as-delivered"
-    # No .tmp residue from the atomic copy.
-    assert list((snap_root / "chat-1").glob("*.tmp")) == []
+    # No temp residue from the atomic copy.
+    assert [x.name for x in (snap_root / "chat-1").iterdir()] == [sid]
+
+
+def test_snapshot_refuses_symlinked_source(temp_db, tmp_path, snap_root):
+    """A file swapped for a link before the push copies it is not pinned:
+    the preview degrades to no pinned version instead of a copy of
+    whatever the link points at."""
+    from services.media import preview_snapshots as ps
+    src = _seed_source(tmp_path, b"real")
+    secret = tmp_path / "config.env"
+    secret.write_text("JWT_SECRET=1\n")
+    src.unlink()
+    src.symlink_to(secret)
+    assert ps.create_snapshot("chat-1", src) is None
+    assert not (snap_root / "chat-1").exists()
+    # A source outside every agent tree is refused the same way.
+    assert ps.create_snapshot("chat-1", secret) is None
 
 
 def test_malformed_ids_never_resolve(temp_db, tmp_path, snap_root):

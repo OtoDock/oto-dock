@@ -23,8 +23,12 @@ from services.memory.memory_file import MemoryOpError
 
 
 @pytest.fixture
-def root():
+def root(monkeypatch):
+    """A scope root under the agents root (every memory write opens beneath
+    ``config.AGENTS_DIR``; a root outside it is refused)."""
+    import config
     with tempfile.TemporaryDirectory() as d:
+        monkeypatch.setattr(config, "AGENTS_DIR", Path(d))
         yield Path(d) / "memory"
 
 
@@ -411,3 +415,70 @@ def test_scope_roots_refuse_a_username_that_leaves_the_agent(tmp_path):
             scope_root(agent_dir, "user", bad)
         with pytest.raises(ValueError):
             git_repo_root(agent_dir, "user", bad)
+
+
+# ---------------------------------------------------------------------------
+# The memory writes open beneath the agents root
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def agents_root(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    return tmp_path
+
+
+def _swap_on_open(monkeypatch, root, victim):
+    import contextlib
+    import os
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @contextlib.contextmanager
+    def _patched(r, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            d = root / "topics"
+            for child in d.iterdir():
+                child.unlink()
+            d.rmdir()
+            os.symlink(victim, d)
+        with real(r, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+
+
+def test_memory_write_refuses_a_swapped_component(agents_root, monkeypatch):
+    root = agents_root / "memory"
+    memory_file.op_create(root, "topics/a.md", "# a\nfirst")
+    victim = agents_root.parent / f"victim-{agents_root.name}"
+    victim.mkdir(exist_ok=True)
+    (victim / "a.md").write_text("ORIGINAL")
+    _swap_on_open(monkeypatch, root, victim)
+    with pytest.raises((MemoryOpError, OSError)):
+        memory_file.op_str_replace(root, "topics/a.md", "first", "second")
+    assert (victim / "a.md").read_text() == "ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["a.md"]
+
+
+def test_memory_root_outside_the_agents_tree_is_refused(tmp_path, monkeypatch):
+    import config
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    (tmp_path / "agents").mkdir()
+    with pytest.raises(MemoryOpError):
+        memory_file.op_create(tmp_path / "elsewhere" / "memory", "a.md", "# a")
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_memory_delete_and_rename_open_beneath_the_root(agents_root):
+    root = agents_root / "memory"
+    memory_file.op_create(root, "topics/a.md", "# a\nx")
+    memory_file.op_rename(root, "topics/a.md", "moved/b.md")
+    assert (root / "moved" / "b.md").read_text().startswith("# a")
+    memory_file.op_delete(root, "moved")
+    assert not (root / "moved").exists()
+    # The index was written beneath the root too.
+    assert (root / memory_file.INDEX_FILENAME).exists()

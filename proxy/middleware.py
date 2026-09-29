@@ -1,15 +1,25 @@
-"""HTTP middleware stack, registered by ``register_middlewares(app)``.
+"""HTTP middleware: one pure-ASGI layer, registered by ``register_middlewares(app)``.
 
-Extracted from ``app.py``. Registration order is preserved: Starlette inserts
-each new middleware at the top of the stack, so calling these in source order
-reproduces the exact processing order the inline ``@app.middleware`` decorators
-had (outermost first: refresh_session_cookie -> ... -> security_headers).
+Every HTTP request passes one ``PlatformHttpMiddleware``, which judges in
+this order, outermost first: the sliding session refresh and the security
+headers on the way out, the 500 guard with timing, the render,
+external-session and service-key confinements, then the request body cap
+and the body deadline of a request without a valid credential. It is one
+pure-ASGI layer, never a stack of ``BaseHTTPMiddleware`` wrappers: each of
+those builds a task group and a memory stream per request and per streamed
+chunk, on the loop. ``app.install_db_unavailable_guards`` is registered after it and
+stays outermost. WebSocket and lifespan scopes pass straight through.
 """
 
+import asyncio
 import logging
+import re
 import time
 
-from fastapi import Request
+import psycopg
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.requests import Request, cookie_parser
+from starlette.responses import JSONResponse, Response
 
 import config
 
@@ -23,84 +33,162 @@ _STATIC_EXTS = {
     "woff", "woff2", "ttf", "webp", "json", "txt",
 }
 
+# Paths whose unhandled exceptions are logged with their timing and answered
+# with a JSON 500 (the dashboard and task APIs).
+_LOGGED_PREFIXES = ("/dashboard", "/v1/tasks", "/v1/schedules", "/v1/triggers",
+                    "/v1/agents", "/v1/admin", "/v1/chats", "/auth/")
 
-async def security_headers(request: Request, call_next):
-    """Attach defensive response headers.
-
-    ``nosniff`` + ``Referrer-Policy`` go on everything; HSTS only when the
-    deployment is HTTPS (``COOKIE_SECURE``). Clickjacking protection
-    (``X-Frame-Options`` + CSP ``frame-ancestors``) is applied everywhere
-    EXCEPT ``/collabora/*`` — the dashboard embeds the Collabora editor in an
-    iframe, so framing that subtree must stay allowed. ``setdefault`` so a
-    handler that already chose a value (e.g. a file response's own nosniff)
-    isn't clobbered.
-    """
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "same-origin")
-    if config.COOKIE_SECURE:
-        response.headers.setdefault(
-            "Strict-Transport-Security", "max-age=31536000; includeSubDomains",
-        )
-    if not request.url.path.startswith("/collabora/"):
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
-    return response
+_KB = 1024
+_MB = 1024 * 1024
 
 
-async def limit_request_body_size(request: Request, call_next):
-    """Backstop cap on request body size via ``Content-Length`` → 413.
+# --- the request body caps ---------------------------------------------------
+#
+# The cap is chosen from the path (``/auth/``, the webhook receivers, the
+# per-route caps below, else the default), then narrowed to
+# ``MAX_UNAUTH_BODY_BYTES`` for a request that carries no platform credential.
+# It counts the streamed bytes, so a chunked body with no Content-Length is
+# capped like any other. A tier set to 0 is off; nothing exceeds the
+# backstop ``MAX_REQUEST_BODY_BYTES``.
 
-    A declared length over ``config.MAX_REQUEST_BODY_BYTES`` is rejected before
-    the body is read, so an abusive oversized payload can't exhaust memory.
-    Per-endpoint caps (uploads, WOPI, MCP zip) still apply underneath.
-    """
-    cl = request.headers.get("content-length")
-    if cl:
-        try:
-            if int(cl) > config.MAX_REQUEST_BODY_BYTES:
-                from starlette.responses import JSONResponse
-                return JSONResponse({"detail": "Request body too large"}, status_code=413)
-        except ValueError:
-            pass
-    return await call_next(request)
+def _backstop() -> int:
+    return config.MAX_REQUEST_BODY_BYTES
 
 
-async def service_key_confinement(request: Request, call_next):
-    """Confine the master ``PROXY_API_KEY`` to its service-to-service allowlist.
-
-    A request presenting the master key on a non-allowlisted endpoint is
-    rejected (403), so a leaked key cannot drive arbitrary user/admin routes.
-    See ``auth/service_endpoints.py`` for the allowlist + contributor contract.
-    """
-    from auth.service_endpoints import (
-        extract_master_key,
-        is_service_endpoint_allowed,
-    )
-    if extract_master_key(request) is not None:
-        if not is_service_endpoint_allowed(request.method, request.url.path):
-            logger.warning(
-                "Master key blocked from non-S2S endpoint: %s %s",
-                request.method, request.url.path,
-            )
-            from starlette.responses import JSONResponse
-            return JSONResponse(
-                {"detail": "This endpoint is not available to the service key"},
-                status_code=403,
-            )
-    return await call_next(request)
+def _file_save_cap() -> int:
+    # The editor saves, as JSON, a file it opened inline, so the body is
+    # bounded by INLINE_TEXT_MAX_BYTES; escaping a control character takes
+    # six bytes. 0 = no inline limit, so no bound here either.
+    inline = config.INLINE_TEXT_MAX_BYTES
+    return 6 * inline + 64 * _KB if inline > 0 else _backstop()
 
 
-async def external_session_confinement(request: Request, call_next):
-    """Liveness + confinement for session tokens minted on external routes.
+# The routes that take large bodies, each with its own bound (the route's own
+# limit plus framing): only these reach past the default, since a credentialed
+# caller may send up to the cap into memory or a JSON parse on the loop. The
+# app import, release and seed hooks take a path, not the bytes.
+_ROUTE_CAPS = (
+    # multipart, spooled to disk by the parser; the dashboard sends up to
+    # 32 MB in one request
+    ("POST", re.compile(r"^/v1/upload$"), _backstop),
+    ("PUT", re.compile(r"^/v1/upload/chunked/[A-Za-z0-9_-]+/[0-9]+$"),
+     lambda: config.UPLOAD_CHUNK_BYTES + 64 * _KB),
+    # the zip installs' own 100 MB cap (``api/mcp/mcps.py``); the multipart
+    # is parsed before the admin check
+    ("POST", re.compile(r"^/v1/admin/(mcps|skills)/install$"), lambda: 101 * _MB),
+    # multipart spooled to disk; its cap is an admin setting
+    ("POST", re.compile(r"^/v1/audio/transcribe$"), _backstop),
+    # base64 images in JSON, parsed on the loop
+    ("POST", re.compile(r"^/v1/hooks/images$"), lambda: 64 * _MB),
+    # WOPI PutFile / PutRelativeFile: the token is checked before the read
+    ("POST", re.compile(r"^/wopi/files/[^/]+(/contents)?$"), _backstop),
+    # Collabora's insert-file upload, held in memory and forwarded
+    ("POST", re.compile(r"^/collabora/.+"), lambda: 100 * _MB),
+    ("PUT", re.compile(r"^/v1/agents/[^/]+/files/.+$"), _file_save_cap),
+)
+# Routes authenticated by their own app or link tokens: the unauthenticated
+# tier does not apply. These read the body themselves after their token
+# check, under the app proxy's own 1 MB cap.
+_OWN_TOKEN_ROUTES = (
+    re.compile(r"^/v1/apps/[^/]+/(api|platform|egress|bindings)/"),
+    re.compile(r"^/v1/apps/[^/]+/(push|state|events)$"),
+    re.compile(r"^/s/[^/]+/api/"),
+)
+# The action routes (an app's launch token or a step claim, a share link)
+# parse a small JSON body before their own token check: 1 MB for anyone.
+_ACTION_ROUTES = (
+    re.compile(r"^/v1/apps/[^/]+/actions/"),
+    re.compile(r"^/s/[^/]+/actions/"),
+)
+_ACTION_CAP = 1 * _MB
 
-    A session JWT carrying an ``ext`` claim (every phone-minted token) is
-    accepted only while its session is live in a layer registry — so a token
-    lifted from a call dies at hangup. When the token also carries no real
-    user (an external principal: a caller who is not a platform user) it may
-    reach only the endpoints its tools use. See ``auth/external_endpoints.py``
-    for the allowlist + contributor contract.
-    """
+
+def _tier(value: int) -> int:
+    return min(value, _backstop()) if value > 0 else _backstop()
+
+
+def body_cap(method: str, path: str) -> tuple[int, bool]:
+    """The body cap for ``method path`` (the routed path) and whether the
+    unauthenticated tier may narrow it."""
+    if path.startswith("/auth/"):
+        return _tier(config.MAX_AUTH_BODY_BYTES), True
+    if path.startswith("/v1/webhooks/"):
+        return _tier(config.MAX_WEBHOOK_BODY_BYTES), False
+    for m, rx, cap in _ROUTE_CAPS:
+        if method == m and rx.match(path):
+            return min(cap(), _backstop()), True
+    if any(rx.match(path) for rx in _ACTION_ROUTES):
+        return min(_ACTION_CAP, _backstop()), False
+    return _tier(config.MAX_JSON_BODY_BYTES), not any(rx.match(path) for rx in _OWN_TOKEN_ROUTES)
+
+
+def credential_state(request: Request, cookies: dict, path: str) -> str:
+    """``valid`` when the request carries a platform credential that verifies
+    without the database, ``invalid`` when it presents one that does not,
+    else ``none``. Pinned to the validators, not to the signature (the same
+    secret signs the 2FA step, reset, invite and link tokens): a dashboard
+    session cookie, the master key or a session token as the bearer, and on
+    WOPI and Collabora paths a WOPI ``access_token``."""
+    from auth.external_endpoints import session_token_claims
+    from auth.service_endpoints import extract_master_key
+    presented = request.headers.get("authorization", "") != ""
+    if extract_master_key(request) is not None or session_token_claims(request) is not None:
+        return "valid"
+    session = cookies.get("session")
+    if session:
+        presented = True
+        from auth.providers import validate_session_jwt
+        if validate_session_jwt(session) is not None:
+            return "valid"
+    if path.startswith(("/wopi/", "/collabora/")):
+        token = request.query_params.get("access_token", "")
+        if token:
+            presented = True
+            from api.media.wopi import validate_wopi_token
+            if validate_wopi_token(token) is not None:
+                return "valid"
+    return "invalid" if presented else "none"
+
+
+# --- the confinements --------------------------------------------------------
+
+
+def routed_path(request: Request) -> str:
+    """The path the router matches (``scope["path"]``) with a decoded ``?``
+    or ``#`` put back in its encoded form. ``request.url.path`` re-parses
+    the decoded path and cuts it at either, so an allowlist judging it saw
+    a shorter path than the one routed (``/v1/sessions/warmup%3F/abort``
+    read as the allowed ``/v1/sessions/warmup``)."""
+    return scope_routed_path(request.scope)
+
+
+def scope_routed_path(scope) -> str:
+    """``routed_path`` read straight from an ASGI scope."""
+    path = scope.get("path") or ""
+    return path.replace("?", "%3F").replace("#", "%23")
+
+
+def _service_key_refusal(request: Request) -> Response | None:
+    """The master ``PROXY_API_KEY`` reaches only its service-to-service
+    allowlist (``auth/service_endpoints.py``): 403 elsewhere, so a leaked
+    key cannot drive arbitrary user or admin routes."""
+    from auth.service_endpoints import extract_master_key, is_service_endpoint_allowed
+    if extract_master_key(request) is None:
+        return None
+    if is_service_endpoint_allowed(request.method, routed_path(request)):
+        return None
+    logger.warning("Master key blocked from non-S2S endpoint: %s %s",
+                   request.method, request.url.path)
+    return JSONResponse({"detail": "This endpoint is not available to the service key"},
+                        status_code=403)
+
+
+def _external_session_refusal(request: Request) -> Response | None:
+    """A session token carrying an ``ext`` claim (every phone-minted token)
+    is accepted only while its session is live in a layer registry, so a
+    token lifted from a call dies at hangup; one with no real user (an
+    external caller) reaches only ``auth/external_endpoints.py``'s
+    allowlist."""
     from auth.external_endpoints import (
         EXTERNAL_BLOCKED_DETAIL,
         SESSION_DEAD_DETAIL,
@@ -108,115 +196,391 @@ async def external_session_confinement(request: Request, call_next):
         session_token_claims,
     )
     claims = session_token_claims(request)
-    if claims and claims.get("ext"):
-        from starlette.responses import JSONResponse
-        from core.session.session_manager import is_session_registered
-        sid = claims.get("sid") or ""
-        if not is_session_registered(sid):
-            logger.info(
-                "External session token rejected (session not live): %s %s sid=%s",
-                request.method, request.url.path, sid[:8],
-            )
-            return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
-        if not claims.get("user_sub") and not is_external_endpoint_allowed(
-            request.method, request.url.path,
-        ):
-            logger.warning(
-                "External session blocked from endpoint: %s %s sid=%s",
-                request.method, request.url.path, sid[:8],
-            )
-            return JSONResponse({"detail": EXTERNAL_BLOCKED_DETAIL}, status_code=403)
-    return await call_next(request)
+    if not claims or not claims.get("ext"):
+        return None
+    from core.session.session_manager import is_session_registered
+    sid = claims.get("sid") or ""
+    if not is_session_registered(sid):
+        logger.info("External session token rejected (session not live): %s %s sid=%s",
+                    request.method, request.url.path, sid[:8])
+        return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
+    if not claims.get("user_sub") and not is_external_endpoint_allowed(
+            request.method, routed_path(request)):
+        logger.warning("External session blocked from endpoint: %s %s sid=%s",
+                       request.method, request.url.path, sid[:8])
+        return JSONResponse({"detail": EXTERNAL_BLOCKED_DETAIL}, status_code=403)
+    return None
 
 
-async def log_dashboard_requests(request: Request, call_next):
-    """Log dashboard/task API requests with timing (DEBUG; errors at ERROR).
+def _render_refusal(request: Request) -> Response | None:
+    """The platform's own headless render (``auth/render_principal.py``)
+    reaches the app it was minted for and the shell that shows it, nothing
+    else. Judged on the render cookie alone, when no session cookie and no
+    bearer ride with it (those principals are judged as themselves), and
+    answered with 403, never 401: the dashboard turns a 401 into a page
+    redirect, which would end the render."""
+    from auth import render_principal as rp
+    token = request.cookies.get(rp.COOKIE_NAME)
+    if not token or request.cookies.get("session") or request.headers.get("authorization"):
+        return None
+    path = routed_path(request)
+    if not path.startswith(rp._JUDGED_PREFIXES):
+        return None
+    claims = rp.verify(token)
+    if claims is None or not rp.is_allowed(request.method, path, str(claims.get("app") or "")):
+        return JSONResponse({"detail": rp.BLOCKED_DETAIL}, status_code=403)
+    return None
 
-    The per-request success line duplicates uvicorn's access log, so it sits
-    at DEBUG — enable it when chasing a hang; the timing is the point.
+
+# --- the response side -------------------------------------------------------
+
+# Connection-level database failures, answered 503 by the outermost guard.
+# The same predicate as ``app._db_unavailable`` (a test keeps the two in
+# step): the 500 guard re-raises these and keeps every other error its own.
+_DB_DOWN_SQLSTATES = frozenset({"57P01", "57P02", "57P03", "53300"})
+
+
+def db_unavailable(exc: BaseException) -> bool:
+    while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        exc = exc.exceptions[0]
+    if not isinstance(exc, psycopg.OperationalError):
+        return False
+    state = exc.sqlstate
+    return state is None or state.startswith("08") or state in _DB_DOWN_SQLSTATES
+
+
+def _security_headers(headers: MutableHeaders, path: str) -> None:
+    """``nosniff`` + ``Referrer-Policy`` on everything; HSTS only when the
+    deployment is HTTPS (``COOKIE_SECURE``). Framing is denied everywhere
+    except ``/collabora/*`` (the dashboard embeds the editor in an iframe).
+    ``setdefault``: a handler's own choice (a file response's nosniff)
+    wins."""
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("Referrer-Policy", "same-origin")
+    if config.COOKIE_SECURE:
+        headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if not path.startswith("/collabora/"):
+        headers.setdefault("X-Frame-Options", "DENY")
+        headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+
+
+# The session lifetime setting, read strictly (a failure raises, where
+# ``config.get_jwt_expiry_hours`` falls back to the default) and kept a
+# minute: the refresh runs for every request past a cookie's half-life.
+_EXPIRY_TTL_S = 60.0
+_REFRESH_READ_TIMEOUT_S = 1.0
+_expiry_cache: tuple[int, float] = (0, 0.0)
+
+
+def _read_expiry_hours() -> int:
+    from storage import database as task_store
+    value = task_store.get_platform_setting("jwt_expiry_hours")
+    return int(value) if value else config.JWT_EXPIRY_HOURS
+
+
+async def _expiry_hours() -> int:
+    global _expiry_cache
+    hours, until = _expiry_cache
+    now = time.monotonic()
+    if until > now:
+        return hours
+    from storage.pg import run_db_fast
+    hours = await asyncio.wait_for(run_db_fast(_read_expiry_hours), _REFRESH_READ_TIMEOUT_S)
+    _expiry_cache = (hours, now + _EXPIRY_TTL_S)
+    return hours
+
+
+async def _refresh_session_cookie(scope, headers: MutableHeaders, cookie: str) -> None:
+    """Sliding session: re-issue the ``session`` cookie once it is past the
+    halfway point of its lifetime, so an actively-used session never
+    expires: the configured duration is a max-INACTIVITY window rather than
+    a hard cap from login.
+
+    Skipped for cacheable static assets, share pages (``/s/``: a link opened
+    in a signed-in browser stays a link), a response whose handler set or
+    deleted ``session`` itself (login, 2FA, SSO, and logout's delete: a
+    logged-out session is never resurrected), an invalid or expired cookie,
+    one still in the first half of its life, a deleted user's, and one that
+    predates the user's last password change (this also runs on 401s, so it
+    must never launder a dead cookie into a fresh one). Re-mint preserves
+    identity from the decoded token; authz is unaffected because
+    ``get_current_user`` resolves role and identity from the DB live.
     """
-    path = request.url.path
-    if path.startswith(("/dashboard", "/v1/tasks", "/v1/schedules", "/v1/triggers",
-                        "/v1/agents", "/v1/admin", "/v1/chats", "/auth/")):
-        client = request.client.host if request.client else "?"
-        start = time.monotonic()
-        try:
-            response = await call_next(request)
-        except Exception as exc:
-            elapsed = time.monotonic() - start
-            logger.error(
-                f"DASH {request.method} {path} → 500 EXCEPTION "
-                f"({elapsed:.3f}s) from {client}: {exc}",
-                exc_info=True,
-            )
-            from starlette.responses import JSONResponse
-            return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
-        elapsed = time.monotonic() - start
-        logger.debug(
-            f"DASH {request.method} {path} → {response.status_code} "
-            f"({elapsed:.3f}s) from {client}"
-        )
-        return response
-    return await call_next(request)
-
-
-async def refresh_session_cookie(request: Request, call_next):
-    """Sliding session: re-issue the ``session`` cookie on activity once it is
-    past the halfway point of its lifetime, so an actively-used session never
-    expires — the configured duration becomes a max-INACTIVITY window rather
-    than a hard cap from login.
-
-    Skips re-issue when: there is no session cookie (bearer / API-key / agent
-    session / anonymous); the path is a cacheable static asset; the handler
-    already set OR deleted a ``session`` cookie this response (login / 2FA / SSO
-    re-issue, and crucially logout's delete — we must never resurrect a
-    just-logged-out session); the cookie is invalid/expired (force a re-login);
-    or the cookie is still in the first half of its life (avoids a Set-Cookie on
-    every response). Re-mint preserves identity from the decoded token; authz is
-    unaffected because get_current_user resolves role/identity from the DB live.
-    """
-    cookie = request.cookies.get("session")
-    response = await call_next(request)
-    if not cookie:
-        return response
-    path = request.url.path
-    if path.startswith("/assets/") or path.rsplit(".", 1)[-1].lower() in _STATIC_EXTS:
-        return response
-    # The handler owns the session cookie this round — leave it authoritative.
-    if any(sc.startswith("session=") for sc in response.headers.getlist("set-cookie")):
-        return response
+    path = scope.get("path") or ""
+    if path.startswith(("/assets/", "/s/")) or path.rsplit(".", 1)[-1].lower() in _STATIC_EXTS:
+        return
+    if any(v.startswith("session=") for v in headers.getlist("set-cookie")):
+        return
     from auth.providers import (
-        validate_session_jwt, create_session_jwt, apply_session_cookie,
-        session_iat_after_password_change,
+        apply_session_cookie, create_session_jwt, session_iat_after_password_change,
+        validate_session_jwt,
     )
     payload = validate_session_jwt(cookie)
     if not payload:
-        return response
+        return
     iat, exp, now = payload.get("iat"), payload.get("exp"), int(time.time())
     if (isinstance(iat, int) and isinstance(exp, int) and exp > iat
             and (now - iat) < (exp - iat) / 2):
-        return response  # still fresh — no re-issue yet
-    # Never LAUNDER a cookie that predates the user's last password change into
-    # a fresh-iat one — that would make a stolen pre-change cookie immortal.
-    # (This runs even on 401 responses, so the check is load-bearing here.)
-    from storage import database as _task_store
-    _u = _task_store.get_user(payload.get("sub", ""))
-    if _u and not session_iat_after_password_change(_u, payload):
-        return response
+        return
+    # The route resolved this exact cookie: it passed the password-change
+    # check there, no second read.
+    if (scope.get("state") or {}).get("otodock_session_cookie") != cookie:
+        from storage import database as task_store
+        from storage.pg import run_db_fast
+        user = await asyncio.wait_for(run_db_fast(task_store.get_user, payload.get("sub", "")),
+                                      _REFRESH_READ_TIMEOUT_S)
+        if not user or not session_iat_after_password_change(user, payload):
+            return
+    hours = await _expiry_hours()
     token = create_session_jwt(
         payload["sub"], payload.get("email", ""), payload.get("name", ""),
         payload.get("role", "member"),
-        auth_provider=payload.get("auth_provider", "local"),
+        auth_provider=payload.get("auth_provider", "local"), expiry_hours=hours,
     )
-    apply_session_cookie(response, token)
-    return response
+    carrier = Response()
+    apply_session_cookie(carrier, token, expiry_hours=hours)
+    for key, value in carrier.raw_headers:
+        if key == b"set-cookie":
+            headers.append("set-cookie", value.decode("latin-1"))
+
+
+# --- the middleware ------------------------------------------------------------
+
+# The ASGI scope type of a plain HTTP request (WebSocket and lifespan scopes
+# pass straight through).
+_HTTP_SCOPE = "http"
+_TOO_LARGE = b'{"detail":"Request body too large"}'
+_BODY_TIMEOUT = b'{"detail":"Request body timeout"}'
+_UNAUTHENTICATED = b'{"detail":"Authentication required"}'
+_SERVER_ERROR = b'{"detail":"Internal Server Error"}'
+
+# The body deadline of a request with no valid credential: the longest wait
+# for one body chunk, and for the whole body from the first read. uvicorn
+# waits for body bytes with no bound and the header deadline ends at the
+# headers, so without it a body sent a byte at a time holds its connection
+# (and a place in ``limit_concurrency``) for as long as the sender likes.
+# The credential is tested only when a wait runs out: a signed-in upload on
+# a slow link is never timed.
+_BODY_GAP_S = 10.0
+_BODY_WHOLE_S = 30.0
+# The webhook receivers bound their own read (``api/events/webhooks.py``)
+# and answer a slow body in their own shape.
+_SELF_TIMED_PREFIXES = ("/v1/webhooks/",)
+
+
+def _times_body(path: str) -> bool:
+    """Whether the middleware bounds the body read of ``path`` in time."""
+    return not path.startswith(_SELF_TIMED_PREFIXES)
+
+
+class _Exchange:
+    """One request's state across the wrapped ``receive`` and ``send``."""
+
+    __slots__ = ("scope", "send", "cookie", "started", "status", "answered", "cut")
+
+    def __init__(self, scope, send, cookie: str):
+        self.scope = scope
+        self.send = send
+        self.cookie = cookie
+        self.started = False
+        self.status = 0
+        self.answered = False   # the middleware answered itself: the app's messages are dropped
+        self.cut = False        # the body cap or the body deadline cut the request
+
+    async def forward(self, message, *, own: bool = False) -> None:
+        if message["type"] == "http.response.start":
+            self.started = True
+            self.status = message["status"]
+            headers = MutableHeaders(scope=message)
+            _security_headers(headers, self.scope.get("path") or "")
+            if self.cookie and not own:
+                try:
+                    await _refresh_session_cookie(self.scope, headers, self.cookie)
+                except Exception:
+                    # The route's answer goes out as it is (a database
+                    # outage, a timeout, shutdown).
+                    logger.debug("session refresh skipped", exc_info=True)
+        await self.send(message)
+
+    async def app_send(self, message) -> None:
+        if not self.answered:
+            await self.forward(message)
+
+    async def answer(self, status: int, body: bytes, *, close: bool = False) -> None:
+        """The middleware's own JSON answer; the app's later messages are
+        dropped. ``close``: uvicorn otherwise keeps the connection and
+        drains the rest of a refused body with no timeout."""
+        self.answered = True
+        headers = [(b"content-type", b"application/json"),
+                   (b"content-length", str(len(body)).encode())]
+        if close:
+            headers.append((b"connection", b"close"))
+        await self.forward({"type": "http.response.start", "status": status, "headers": headers},
+                           own=True)
+        await self.forward({"type": "http.response.body", "body": body}, own=True)
+
+
+class _BodyCap:
+    """The request's body cap: the path's tier, provisionally narrowed to
+    the unauthenticated tier until a credential is proven (checked at most
+    once, and only when the body would pass the narrow cap or a body read
+    outlasts the body deadline)."""
+
+    __slots__ = ("cap", "full", "check", "credential", "received")
+
+    def __init__(self, cap: int, full: int, check):
+        self.cap = cap
+        self.full = full
+        self.check = check
+        self.credential = ""
+        self.received = 0
+
+    def proven(self) -> bool:
+        """Whether the request carries a valid credential; a proven one
+        lifts the narrow cap."""
+        if not self.credential:
+            self.credential = self.check()
+            if self.credential == "valid":
+                self.cap = self.full
+        return self.credential == "valid"
+
+    def exceeded(self, size: int) -> bool:
+        if size <= self.cap:
+            return False
+        if self.cap < self.full:
+            self.proven()
+        return size > self.cap
+
+    def refusal(self) -> tuple[int, bytes]:
+        # A presented credential that does not verify (an expired cookie on
+        # an upload) is a sign-in problem, not a size problem.
+        if self.credential == "invalid":
+            return 401, _UNAUTHENTICATED
+        return 413, _TOO_LARGE
+
+
+class _BodyDeadline:
+    """The body deadline of one request (``_BODY_GAP_S``, ``_BODY_WHOLE_S``):
+    armed until the body is complete, a wait runs out or the request proves
+    a credential."""
+
+    __slots__ = ("timed", "due")
+
+    def __init__(self, timed: bool):
+        self.timed = timed
+        self.due = 0.0
+
+    def wait_s(self) -> float:
+        """The longest the next body read may wait; the whole-body clock
+        starts at the first read."""
+        now = asyncio.get_running_loop().time()
+        if not self.due:
+            self.due = now + _BODY_WHOLE_S
+        return min(_BODY_GAP_S, max(self.due - now, 0.0))
+
+
+class PlatformHttpMiddleware:
+    """The platform's HTTP middleware (see the module docstring)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != _HTTP_SCOPE:
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        raw_cookie = headers.get("cookie")
+        cookies = cookie_parser(raw_cookie) if raw_cookie else {}
+        x = _Exchange(scope, send, cookies.get("session", ""))
+        path = scope.get("path") or ""
+        logged = path.startswith(_LOGGED_PREFIXES)
+        started_at = time.monotonic() if logged else 0.0
+        try:
+            await self._handle(scope, receive, x, headers, cookies)
+        except Exception as exc:
+            if x.cut:
+                # The app saw the disconnect that followed the cut.
+                logger.debug("request body cut: %s after the cut on %s", type(exc).__name__, path)
+                return
+            if not logged or x.started or db_unavailable(exc):
+                raise
+            client = scope.get("client")
+            logger.error("DASH %s %s → 500 EXCEPTION (%.3fs) from %s: %s",
+                         scope.get("method"), path, time.monotonic() - started_at,
+                         client[0] if client else "?", exc, exc_info=True)
+            await x.answer(500, _SERVER_ERROR)
+            return
+        if logged and logger.isEnabledFor(logging.DEBUG):
+            client = scope.get("client")
+            logger.debug("DASH %s %s → %s (%.3fs) from %s", scope.get("method"), path,
+                         x.status, time.monotonic() - started_at, client[0] if client else "?")
+
+    async def _handle(self, scope, receive, x: _Exchange, headers: Headers, cookies: dict):
+        request = Request(scope)
+        for judge in (_render_refusal, _external_session_refusal, _service_key_refusal):
+            refusal = judge(request)
+            if refusal is not None:
+                x.answered = True
+                await refusal(scope, receive, lambda m: x.forward(m, own=True))
+                return
+
+        routed = scope_routed_path(scope)
+        full, narrowable = body_cap(scope.get("method", ""), routed)
+        unauth = config.MAX_UNAUTH_BODY_BYTES
+        cap = _BodyCap(
+            min(unauth, full) if narrowable and unauth > 0 else full, full,
+            lambda: credential_state(request, cookies, routed),
+        )
+
+        declared = headers.get("content-length")
+        if declared is not None:
+            try:
+                size = int(declared)
+            except ValueError:
+                size = -1
+            if cap.exceeded(size):
+                await x.answer(*cap.refusal(), close=True)
+                return
+
+        deadline = _BodyDeadline(_times_body(routed))
+
+        async def timed_receive():
+            if not deadline.timed:
+                return await receive()
+            try:
+                async with asyncio.timeout(deadline.wait_s()):
+                    return await receive()
+            except TimeoutError:
+                deadline.timed = False
+                if cap.proven():
+                    return await receive()
+                x.cut = True
+                if not x.started:
+                    await x.answer(408, _BODY_TIMEOUT, close=True)
+                return {"type": "http.disconnect"}
+
+        async def capped_receive():
+            if x.cut:
+                return {"type": "http.disconnect"}
+            message = await timed_receive()
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                # The body is complete: a later read waits for the
+                # disconnect, which is never timed.
+                deadline.timed = False
+            if message["type"] == "http.request":
+                cap.received += len(message.get("body", b""))
+                if cap.exceeded(cap.received):
+                    x.cut = True
+                    if not x.started:
+                        await x.answer(*cap.refusal(), close=True)
+                    return {"type": "http.disconnect"}
+            return message
+
+        await self.app(scope, capped_receive, x.app_send)
 
 
 def register_middlewares(app):
-    """Attach the HTTP middleware stack in the original order."""
-    app.middleware("http")(security_headers)
-    app.middleware("http")(limit_request_body_size)
-    app.middleware("http")(service_key_confinement)
-    app.middleware("http")(external_session_confinement)
-    app.middleware("http")(log_dashboard_requests)
-    app.middleware("http")(refresh_session_cookie)
+    """Attach the platform middleware. ``app.install_db_unavailable_guards``
+    runs after this and stays outermost."""
+    app.add_middleware(PlatformHttpMiddleware)

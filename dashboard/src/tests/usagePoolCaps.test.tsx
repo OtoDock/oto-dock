@@ -13,6 +13,16 @@ const { saved, mutation, capRef, limitsRef, myLimitSaves } = vi.hoisted(() => ({
   limitsRef: { current: { limits: [] as unknown[] } },
 }))
 
+// The engine names on the Usage pages come from the catalog's descriptors.
+vi.mock('@/api/agents', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('@/api/agents')>()
+  const { claudeLike, codexLike } = await import('./fixtures/engines')
+  return {
+    ...mod,
+    useExecutionLayers: () => ({ data: { 'claude-code-cli': claudeLike(), 'codex-cli': codexLike() } }),
+  }
+})
+
 vi.mock('@/api/usage', async (importOriginal) => {
   const mod = await importOriginal<typeof import('@/api/usage')>()
   return {
@@ -63,7 +73,8 @@ describe('pool cap section', () => {
     expect(screen.getByTestId('pool-cap-info')).toHaveTextContent('all the enabled subscriptions')
     const lines = screen.getAllByTestId('pool-engine')
     expect(lines).toHaveLength(2)
-    expect(lines[0]).toHaveTextContent('Claude Code')
+    expect(lines[0]).toHaveTextContent('Claude Code CLI')  // the engine's own name, from the catalog
+    expect(lines[1]).toHaveTextContent('Codex')
     expect(lines[0]).toHaveTextContent('2 accounts')
     // One labelled cell per reading; the rolling periods are named as such.
     const week = lines[0].querySelector('[data-testid="pool-reading-week_pct"]')!
@@ -117,13 +128,17 @@ describe('my API keys', () => {
   })
 })
 
+// The page passes the catalog's id → label map; without one the id is used.
+const LABELS = { 'claude-code-cli': 'Claude Code CLI' }
+
 describe('the composer names the budget', () => {
   it('pool cap, own key budget, platform budget', () => {
     expect(hitText(status())).toBe('the week is at 52% of the 50% cap')
-    const pool = describeLimitReached({ pool: status() })
+    const pool = describeLimitReached({ pool: status() }, LABELS)
     expect(pool.title).toBe('Subscription cap reached.')
-    expect(pool.body).toContain('Claude Code: the week is at 52% of the 50% cap')
+    expect(pool.body).toContain('Claude Code CLI: the week is at 52% of the 50% cap')
     expect(pool.body).toContain('User Settings → Usage')
+    expect(describeLimitReached({ pool: status() }).body).toContain('claude-code-cli: the week')
     const own = describeLimitReached({ self: { monthly: { limit: 10, used: 10.5, percent: 105, start: '', end: '' } } })
     expect(own.title).toBe('Your API-key budget is reached.')
     expect(own.body).toContain('$10.50 of $10.00')
@@ -135,8 +150,8 @@ describe('the composer names the budget', () => {
   it('warning text: continuing on a key, a near cap, an own-key budget, the platform budget', () => {
     expect(describeLimitWarning({ pool: status({ on_reached: 'continue' }) }))
       .toBe('Subscription cap reached (the week is at 52% of the 50% cap); continuing on an API key.')
-    expect(describeLimitWarning({ pool: status({ hits: [], allowed: true, readings: { week_pct: 42, day_pct: 1, week_usd: 1, day_usd: 0 } }) }))
-      .toBe('Subscription cap: the week is at 42% of the 50% cap on Claude Code.')
+    expect(describeLimitWarning({ pool: status({ hits: [], allowed: true, readings: { week_pct: 42, day_pct: 1, week_usd: 1, day_usd: 0 } }) }, LABELS))
+      .toBe('Subscription cap: the week is at 42% of the 50% cap on Claude Code CLI.')
     expect(describeLimitWarning({ self: { weekly: { limit: 5, used: 4.2, percent: 84, start: '', end: '' } } }))
       .toBe("You've used 84% of your weekly API-key budget ($4.20 / $5.00).")
     expect(describeLimitWarning({ weekly: { limit: 50, used: 45, percent: 90, start: '', end: '' } }))

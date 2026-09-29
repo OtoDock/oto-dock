@@ -136,7 +136,11 @@ class TestConfigDirs:
         )
         assert claude_dir == home / ".claude"
         settings = json.loads((claude_dir / "settings.json").read_text())
-        deny = settings["permissions"]["deny"]
+        # A session's own denials ride its argv and the hook floor, never the
+        # settings file (a scope's file is shared and reloaded live).
+        assert not {"Bash", "Monitor", "PowerShell"} & set(settings["permissions"]["deny"])
+        from core.layers.cli.layer import CLIExecutionLayer
+        deny = CLIExecutionLayer().session_denied_tools(external=True, read_only=False)
         assert {"Bash", "Monitor", "PowerShell"} <= set(deny)
         # The web tools are deliberately not denied (2026-09-08).
         assert not {"WebFetch", "WebSearch"} & set(deny)
@@ -148,7 +152,7 @@ class TestConfigDirs:
         assert "/caller/.codex/" in (codex_dir / "hooks.json").read_text()
 
     def test_symlinked_home_is_refused(self, agent_tree, tmp_path):
-        from core.sandbox.session_config_dir import ensure_persistent_claude_dir
+        from core.layers.cli.config_dir import ensure_persistent_claude_dir
         agent_dir, _home = agent_tree
         outside = tmp_path / "elsewhere"
         outside.mkdir()

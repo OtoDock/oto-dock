@@ -28,6 +28,7 @@ from core.layers.cli.helpers import (
     _build_client_context,
 )
 from core.layers.cli.translator import ClaudeCLIEventTranslator
+from core.sandbox import pty_relay
 from core.layers.cli.settle import (
     FOREIGN_SKIP_SILENCE_S,
     ForeignSkipGate,
@@ -42,8 +43,8 @@ logger = logging.getLogger("claude-proxy")
 
 def _record_rate_limit(session_id: str, info: dict) -> None:
     """A ``rate_limit`` chunk: the account's window state, for the pool."""
-    from services.engines import subscription_windows as _sw
-    _sw.record_claude_event_async(session_id, info)
+    from core.layers.cli.usage import record_event_async
+    record_event_async(session_id, info)
 
 _PROMPT_FILENAME = "system-prompt.md"
 
@@ -106,7 +107,7 @@ class PersistentSession:
     ):
         self.session_id = session_id
         # Built-in tools this session must never see (external routes: no
-        # shell — auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS).
+        # shell — the layer's session_denied_tools, from its descriptor).
         self.disallowed_tools = list(disallowed_tools or [])
         self.agent_prompt = agent_prompt
         self.mcp_config_path = mcp_config_path
@@ -130,6 +131,9 @@ class PersistentSession:
         self._created = time.monotonic()  # reaper startup-grace anchor
         self._started = False
         self._closed = False
+        # Set when start() returns or raises: a second get-or-create waits on
+        # it instead of replacing a session still waiting for its spawn slot.
+        self._start_done = asyncio.Event()
         self._init_done = False  # True after MCP init event received
         self._prompt_file: Path | None = None  # temp file for system prompt
         # Graceful-interrupt bookkeeping: `_turn_active` spans a send_message
@@ -140,6 +144,11 @@ class PersistentSession:
         self._turn_active = False
         self._turn_seq = 0
         self._post_interrupt_watch = False
+        # Native steering: a user frame written into the live turn. The
+        # CLI consumes it at its next tool boundary, or starts the next
+        # turn with it by itself; both flags are per turn.
+        self._result_seen = False
+        self._steer_written = False
 
     @staticmethod
     def _strip_session_id(url: str) -> str:
@@ -314,6 +323,16 @@ class PersistentSession:
         if self.disallowed_tools:
             cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
+        # Claude Code ≥ 2.1.267 records the system prompt on a conversation's
+        # first request and re-sends the record on every later request AND on
+        # --resume "even when a later launch passes different text, until the
+        # conversation is compacted". The platform re-sends the prompt file on
+        # every resume ON PURPOSE (fresh persona, memory topics, skills, the
+        # client context — see the --append-system-prompt-file note below), so
+        # the recording is switched off. The flag exists on the previous pin
+        # (2.1.263) too, so a host mid-reconcile accepts it.
+        cmd.extend(["--system-prompt-snapshot", "off"])
+
         if self.mcp_config_path:
             if self.sandbox_builder:
                 # Sandbox: mcp_config_path is the sandbox-internal path
@@ -445,7 +464,17 @@ class PersistentSession:
         """
         if self._started:
             return
+        try:
+            await self._spawn()
+        finally:
+            self._start_done.set()
 
+    @property
+    def is_starting(self) -> bool:
+        """Registered, not spawned yet (waiting for a spawn slot), not closed."""
+        return not self._started and not self._closed
+
+    async def _spawn(self) -> None:
         cmd, proc_env, cwd = self.build_spawn_command()
         logger.info(
             f"Starting persistent session {self.session_id} "
@@ -459,16 +488,18 @@ class PersistentSession:
         # ends without emitting `done`, and the UI freezes with a
         # spinning tool-call icon that never resolves. Satellite-side
         # cli_session.py + codex_session.py carry the same bump.
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=proc_env,
-            start_new_session=True,
-            limit=200 * 1024 * 1024,
-        )
+        # The fork runs on a spawn thread (never on the loop), inside a
+        # spawn slot, below the proxy's CPU priority.
+        async with pty_relay.spawn_slot():
+            if self._closed:
+                # Closed (abort/shutdown) while waiting for the slot.
+                raise RuntimeError(
+                    f"Persistent session {self.session_id} closed during start"
+                )
+            self.proc = await pty_relay.spawn_piped(
+                pty_relay.niced(cmd), cwd=cwd, env=proc_env,
+                limit=200 * 1024 * 1024,
+            )
         self._started = True
         self.last_activity = time.monotonic()
 
@@ -814,6 +845,39 @@ class PersistentSession:
         )
         return True
 
+    async def steer(self, text: str) -> bool:
+        """Inject a user frame into the RUNNING turn (native steering).
+
+        The CLI consumes a stdin user frame at its next tool boundary; when
+        the turn has no further request the frame becomes the next turn on
+        its own (a second init and result), which ``_drive_turn`` reads
+        through as part of this stream. Nothing is interrupted, so
+        background bash and subagents keep running. Refused once the turn's
+        result was read (the frame would start a turn nobody reads: the
+        caller queues it instead), and without a live turn or a live pipe.
+        The CLI never echoes the frame, so the caller persists the row.
+        """
+        if (self._closed or self.proc is None or self.proc.stdin is None
+                or self.proc.returncode is not None or not self._turn_active
+                or self._result_seen or not text):
+            return False
+        msg = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": text},
+        })
+        try:
+            self.proc.stdin.write((msg + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError):
+            return False
+        self._steer_written = True
+        self.last_activity = time.monotonic()
+        logger.info(
+            f"Persistent session {self.session_id}: steered the live turn "
+            f"({len(text)} chars, turn_seq={self._turn_seq})"
+        )
+        return True
+
     async def send_message(
         self, prompt: str, settle_after_result: float = 0,
         inject_time: bool = False,
@@ -841,6 +905,8 @@ class PersistentSession:
         # covers every exit (result, EOF, cancellation via GeneratorExit).
         self._turn_seq += 1
         self._turn_active = True
+        self._result_seen = False
+        self._steer_written = False
         try:
             async for _chunk in self._drive_turn(
                 prompt, settle_after_result, inject_time,
@@ -939,8 +1005,14 @@ class PersistentSession:
                         )
                         return
                     continue
-                # In settle: decide whether to exit or keep waiting for hooks
+                # In settle: decide whether to exit or keep waiting for hooks.
+                # The result was seen, so the turn ended: DONE, as the
+                # remote twin says, or the turn-end loop judges nothing.
                 if settle.should_exit_on_silence(timeout):
+                    yield ClaudeStreamChunk(
+                        is_done=True,
+                        session_id=translator.actual_session_id,
+                    )
                     return
                 continue
 
@@ -958,6 +1030,10 @@ class PersistentSession:
                     logger.info(
                         f"Persistent session {self.session_id}: EOF during settle "
                         f"(rc={rc}, agents_spawned={translator.agents_spawned})"
+                    )
+                    yield ClaudeStreamChunk(
+                        is_done=True,
+                        session_id=translator.actual_session_id,
                     )
                 else:
                     logger.error(
@@ -1082,7 +1158,28 @@ class PersistentSession:
                     elif not is_error:
                         self._post_interrupt_watch = False
 
+                self._result_seen = True
                 if settle.is_interactive_done():
+                    if self._steer_written:
+                        # A steer the turn did not consume becomes the CLI's
+                        # next turn by itself: its init follows the result
+                        # at once, and this stream reads that turn through.
+                        from core.events import wake_capture
+                        nxt = await self._read_parsed_frame(_STEER_INIT_GRACE_S)
+                        self._steer_written = False
+                        if nxt is not None and wake_capture.is_wake_init(nxt):
+                            self._result_seen = False
+                            translator.reset_for_foreign_skip()
+                            # Its result is the driven one even when empty.
+                            gate.note_content()
+                            logger.info(
+                                f"Persistent session {self.session_id}: the "
+                                f"steer became the next turn — reading it through"
+                            )
+                            continue
+                        if nxt is not None:
+                            resolve_bg_command_frame(self.session_id, nxt)
+                            reconcile_background_snapshot(self.session_id, nxt)
                     yield ClaudeStreamChunk(
                         is_done=True,
                         session_id=translator.actual_session_id,
@@ -1150,7 +1247,7 @@ async def get_persistent_session(session_id: str) -> PersistentSession | None:
         session = _persistent_sessions.get(session_id)
         if session and session.is_alive:
             return session
-        if session:
+        if session and not session.is_starting:
             _persistent_sessions.pop(session_id, None)
         return None
 
@@ -1186,30 +1283,58 @@ async def get_or_create_persistent_session(
     ``--dangerously-skip-permissions``.  Permission prompts come via the
     control channel on stdout rather than through the hook system.
     """
+    starting: PersistentSession | None = None
     async with _persistent_sessions_lock:
         session = _persistent_sessions.get(session_id)
         if session and session.is_alive:
             logger.info(f"Reusing persistent session {session_id}")
             return session
+        if session and session.is_starting:
+            # Still waiting for its spawn slot: the same session, not a
+            # second process for it.
+            starting = session
+        else:
+            # Clean up dead session if exists
+            if session:
+                _persistent_sessions.pop(session_id, None)
 
-        # Clean up dead session if exists
-        if session:
-            _persistent_sessions.pop(session_id, None)
-
-        # If this session was used before (has message history on disk),
-        # don't create a fresh persistent process — it would fail because
-        # Claude CLI rejects --session-id for already-used IDs.
-        # Instead, let the caller fall back to one-shot --resume.
-        if session_exists(session_id):
-            if allow_resume:
-                # Task sessions: recreate with --resume (MCPs restart, context preserved)
+            # If this session was used before (has message history on disk),
+            # don't create a fresh persistent process: it would fail because
+            # Claude CLI rejects --session-id for already-used IDs.
+            # Instead, let the caller fall back to one-shot --resume.
+            if session_exists(session_id):
+                if allow_resume:
+                    # Task sessions: recreate with --resume (MCPs restart, context preserved)
+                    session = PersistentSession(
+                        session_id=session_id,
+                        agent_prompt=agent_prompt,
+                        mcp_config_path=mcp_config_path,
+                        permission_mode=permission_mode,
+                        client_type=client_type,
+                        resume=True,
+                        use_native_permissions=use_native_permissions,
+                        model=model,
+                        effort=effort,
+                        extra_env=extra_env,
+                        credential_env=credential_env,
+                        sandbox_builder=sandbox_builder,
+                        agent_name=agent_name,
+                        disallowed_tools=disallowed_tools,
+                    )
+                    _persistent_sessions[session_id] = session
+                else:
+                    raise RuntimeError(
+                        f"Persistent session {session_id} was reaped; "
+                        f"falling back to one-shot --resume"
+                    )
+            else:
+                # Create new (truly new session, never used before)
                 session = PersistentSession(
                     session_id=session_id,
                     agent_prompt=agent_prompt,
                     mcp_config_path=mcp_config_path,
                     permission_mode=permission_mode,
                     client_type=client_type,
-                    resume=True,
                     use_native_permissions=use_native_permissions,
                     model=model,
                     effort=effort,
@@ -1220,29 +1345,13 @@ async def get_or_create_persistent_session(
                     disallowed_tools=disallowed_tools,
                 )
                 _persistent_sessions[session_id] = session
-            else:
-                raise RuntimeError(
-                    f"Persistent session {session_id} was reaped; "
-                    f"falling back to one-shot --resume"
-                )
-        else:
-            # Create new (truly new session, never used before)
-            session = PersistentSession(
-                session_id=session_id,
-                agent_prompt=agent_prompt,
-                mcp_config_path=mcp_config_path,
-                permission_mode=permission_mode,
-                client_type=client_type,
-                use_native_permissions=use_native_permissions,
-                model=model,
-                effort=effort,
-                extra_env=extra_env,
-                credential_env=credential_env,
-                sandbox_builder=sandbox_builder,
-                agent_name=agent_name,
-                disallowed_tools=disallowed_tools,
-            )
-            _persistent_sessions[session_id] = session
+
+    if starting is not None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(starting._start_done.wait(), _STARTUP_REAP_GRACE_S)
+        if starting.is_alive:
+            return starting
+        raise RuntimeError(f"Persistent session {session_id} failed to start")
 
     # Start outside the pool lock (slow: MCP init)
     try:
@@ -1281,6 +1390,10 @@ async def abort_persistent_session(session_id: str) -> bool:
     """Kill a persistent session's process (abort). Returns True if found."""
     async with _persistent_sessions_lock:
         session = _persistent_sessions.pop(session_id, None)
+    if session and session.is_starting:
+        # Still waiting for its spawn slot: its start ends without spawning.
+        session._closed = True
+        return True
     if session and session.proc and session.proc.returncode is None:
         _aborted_sessions.add(session_id)
         logger.info(f"Aborting persistent session {session_id} (pid={session.proc.pid})")
@@ -1315,19 +1428,29 @@ async def interrupt_persistent_session(session_id: str) -> bool:
 # cron whose fire aligned with the reaper tick). Grace-cap the skip so an
 # entry stranded by a crashed start() still gets collected eventually.
 _STARTUP_REAP_GRACE_S = 600
+# After a steered turn's result: how long to wait for the init of the turn
+# the CLI starts by itself from a frame it did not consume mid-turn.
+_STEER_INIT_GRACE_S = 3.0
 
 
 async def _reap_idle_pass() -> None:
     """One reaper scan: collect + close idle/dead sessions."""
+    from core.session.session_state import cached_idle_timeout
+    idle_timeout = await cached_idle_timeout()  # once per tick, before the lock
     now = time.monotonic()
     to_reap: list[str] = []
 
+    from core.session import background_leash
+    spared: list[tuple[str, str]] = []
     async with _persistent_sessions_lock:
         for sid, session in _persistent_sessions.items():
             if not session._started:
                 if now - session._created > _STARTUP_REAP_GRACE_S:
                     to_reap.append(sid)  # start() died without cleanup
                 continue  # still starting — never reap mid-start
+            if not session.is_alive:
+                to_reap.append(sid)
+                continue
             idle = now - session.last_activity
             # Also check hook activity — background agents may be
             # working without producing stdout events or send_message
@@ -1336,12 +1459,25 @@ async def _reap_idle_pass() -> None:
             if last_hook:
                 hook_idle = now - last_hook
                 idle = min(idle, hook_idle)
-            if idle > config.get_idle_timeout():
-                to_reap.append(sid)
-            elif not session.is_alive:
+            if idle > idle_timeout:
+                # A running background command or subagent keeps the
+                # session, up to the ceiling (its completion lands on this
+                # process's stdout; killing the process loses the job).
+                reason = background_leash.spare_reason(sid, idle)
+                if reason:
+                    spared.append((sid, reason))
+                    continue
                 to_reap.append(sid)
 
+    for sid, reason in spared:
+        logger.debug(f"Idle reaper: keeping session {sid[:8]} for {reason}")
     for sid in to_reap:
+        still_running = background_leash.pending_summary(sid)
+        if still_running:
+            logger.warning(
+                f"Reaping idle persistent session {sid[:8]} at the background-"
+                f"work ceiling with {still_running} still running"
+            )
         logger.info(f"Reaping idle persistent session {sid}")
         await close_persistent_session(sid)
         # Release concurrency slot + subscription (bypasses layer.close_session)

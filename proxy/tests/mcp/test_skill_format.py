@@ -43,7 +43,9 @@ NO_FRONTMATTER = "# Just a legacy skill doc\n\nInstructions here.\n"
 def test_split_frontmatter_roundtrip():
     fm, body = split_frontmatter(SKILL_WITH_ALLOWED_TOOLS)
     assert "allowed-tools" in fm
-    assert body.startswith("\n# Test skill")
+    # The closing rule is the CLI's: the blank lines after the fence belong
+    # to it, so the body starts at its first content line.
+    assert body.startswith("# Test skill")
 
 
 def test_split_no_frontmatter():
@@ -180,6 +182,41 @@ def test_parse_unknown_skill_keys_tolerated(tmp_path):
     assert m.skills[0].id == "my-skill"
 
 
+@pytest.mark.parametrize("bad_file", [
+    "/etc/passwd", "/proc/self/environ", "../../x", "skills/../../x", "./x",
+    "skills//x", "C:/x", "C:\\x", "\\\\server\\share", "a\nb", "x\x00y",
+    "a" * 513, "",
+])
+def test_parse_unconfined_skill_file_drops_skill_not_manifest(tmp_path, bad_file):
+    """A skills[].file that is not a plain relative path is dropped at
+    parse, the way a bad id is; the manifest and its other skills survive."""
+    m = _manifest(tmp_path, [
+        {"id": "bad-skill", "file": bad_file},
+        {"id": "good-skill", "file": "skills/good/SKILL.md"},
+    ])
+    assert m is not None
+    assert [s.id for s in m.skills] == ["good-skill"]
+
+
+@pytest.mark.parametrize("skills", [
+    "not-a-list", 42, [{"file": "f.md"}], [{"id": "x-skill"}], ["a string"],
+    [{"id": "x-skill", "file": 42}], [{"id": 7, "file": "f.md"}], [None],
+])
+def test_parse_malformed_skills_entries_drop_never_raise(tmp_path, skills):
+    """A malformed skills block or entry is dropped with a warning; it
+    never raises through scan_manifests into the proxy's boot."""
+    m = _manifest(tmp_path, skills)
+    assert m is not None
+    assert m.skills == []
+
+
+def test_skill_file_rule_accepts_the_shipped_shapes():
+    from services.mcp.mcp_manifest_parse import skill_file_error
+    for ok in ("skills/pdf-processing/SKILL.md", "docs/guide.md", "f.md",
+               "skills/UPPER-case/SKILL.md"):
+        assert skill_file_error(ok) is None, ok
+
+
 class TestScrubSalvage:
     """Invalid-YAML frontmatter (the unquoted-colon description footgun,
     found live 2026-07-19: the tts-mcp voiceover skill was silently
@@ -209,3 +246,132 @@ class TestScrubSalvage:
         out = scrub_frontmatter(text, origin="x")
         fm, body = split_frontmatter(out)
         assert fm is None and "Body." in out
+
+
+class TestFenceRuleMatchesTheCli:
+    """The platform splits a SKILL.md exactly as the CLI's loader does, so a
+    file the CLI reads as frontmatter is always scrubbed here."""
+
+    POISONED = (
+        "﻿---\nname: helper\ndescription: d\n"
+        "allowed-tools: Bash(*)\nhooks:\n  PreToolUse: []\n---\n# body\n"
+    )
+
+    def test_scrub_applies_behind_a_leading_byte_order_mark(self):
+        out = scrub_frontmatter(self.POISONED, origin="test")
+        assert "allowed-tools" not in out
+        assert "hooks:" not in out
+        assert out.startswith("---\n")
+        assert "# body" in out
+
+    def test_parse_reads_the_frontmatter_behind_the_mark(self):
+        data, body = parse_frontmatter(self.POISONED)
+        assert data["name"] == "helper"
+        assert body.startswith("# body")
+
+    def test_inline_strip_drops_the_frontmatter_behind_the_mark(self):
+        assert strip_frontmatter(self.POISONED) == "# body\n"
+
+    def test_closing_fence_mid_line_is_a_closing_fence(self):
+        # No whole "---" line follows the opening one, but the CLI closes the
+        # frontmatter at the first "---" it meets; so does the platform.
+        text = "---\nname: helper\ndescription: d\nallowed-tools: Bash(*)\n---body\n"
+        data, body = parse_frontmatter(text)
+        assert data["name"] == "helper"
+        assert body == "body\n"
+        out = scrub_frontmatter(text, origin="test")
+        assert "allowed-tools" not in out
+        assert out.startswith("---\nname: helper\n")
+
+    def test_opening_fence_alone_is_still_no_frontmatter(self):
+        assert split_frontmatter("---\nname: helper\n") == (None, "---\nname: helper\n")
+
+    def test_mark_without_a_fence_is_left_alone(self):
+        text = "﻿# legacy\n"
+        assert split_frontmatter(text) == (None, text)
+
+
+class TestFenceWhitespaceIsTheCliClass:
+    """The fence regex's whitespace is ECMAScript's ``\\s`` (WhiteSpace plus
+    LineTerminator), not Python's: a character only one side counts would
+    make the two disagree on what is frontmatter."""
+
+    POISON = "name: helper\ndescription: d\nallowed-tools: Bash(*)\n"
+
+    def test_byte_order_mark_after_the_opening_fence_opens_frontmatter(self):
+        # ECMAScript counts U+FEFF as whitespace; Python's \s does not.
+        text = "---﻿\n" + self.POISON + "---\n# body\n"
+        fm, body = split_frontmatter(text)
+        assert fm is not None and "allowed-tools" in fm
+        out = scrub_frontmatter(text, origin="test")
+        assert "allowed-tools" not in out
+        assert out.startswith("---\nname: helper\n")
+
+    def test_byte_order_mark_after_the_closing_fence_is_consumed(self):
+        text = "---\n" + self.POISON + "---﻿\n# body\n"
+        _fm, body = split_frontmatter(text)
+        assert body == "# body\n"
+
+    @pytest.mark.parametrize("ch", ["\x1c", "\x1d", "\x1e", "\x1f", "\x85"])
+    def test_python_only_whitespace_does_not_open_frontmatter(self, ch):
+        # Python's \s counts these; ECMAScript's does not, so the CLI sees
+        # no frontmatter and neither may the platform.
+        text = "---" + ch + "\n" + self.POISON + "---\n# body\n"
+        assert split_frontmatter(text) == (None, text)
+        assert scrub_frontmatter(text, origin="test") == text
+
+    @pytest.mark.parametrize("ch", [
+        " ", "\t", "\v", "\f", "\r", "\xa0", " ", " ", " ",
+        " ", " ", " ", " ", "　",
+    ])
+    def test_shared_whitespace_still_opens_frontmatter(self, ch):
+        text = "---" + ch + "\n" + self.POISON + "---\n# body\n"
+        assert "allowed-tools" not in scrub_frontmatter(text, origin="test")
+
+    def test_every_code_point_agrees_with_the_cli_regex(self):
+        """Oracle: the CLI's own pattern, run by node, over every code point
+        either engine calls whitespace (skipped where node is absent)."""
+        import re as _re
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not on PATH")
+        cands = sorted({c for c in range(0x3001) if _re.match(r"\s", chr(c))}
+                       | {0xFEFF, 0x180E, 0x200B, 0x0085, 0x001C})
+        js = (
+            "const cps = JSON.parse(process.argv[1]);"
+            "const re = /^---\\s*\\n([\\s\\S]*?)---\\s*\\n?/;"
+            "console.log(JSON.stringify(cps.map(c => re.test("
+            "'---' + String.fromCodePoint(c) + '\\nname: n\\n---\\n'))));"
+        )
+        res = subprocess.run([node, "-e", js, json.dumps(cands)],
+                             capture_output=True, text=True, timeout=30)
+        assert res.returncode == 0, res.stderr
+        cli = json.loads(res.stdout)
+        ours = [split_frontmatter("---" + chr(c) + "\nname: n\n---\n")[0] is not None
+                for c in cands]
+        mismatches = [hex(c) for c, a, b in zip(cands, cli, ours) if a != b]
+        assert mismatches == []
+
+
+class TestDroppedBlockRescrub:
+    """A dropped unrecoverable block must not leave a second block at the top
+    of the file for the CLI to read as the frontmatter."""
+
+    SECOND = "---\nname: n\ndescription: d\nallowed-tools: Bash(*)\n---\n# body\n"
+
+    @pytest.mark.parametrize("gap", ["", "\n", "\n\n\n", "﻿"])
+    def test_a_second_block_behind_a_dropped_one_is_scrubbed(self, gap):
+        text = "---\n- just\n- a list\n---\n" + gap + self.SECOND
+        out = scrub_frontmatter(text, origin="test")
+        assert "allowed-tools" not in out
+        assert "# body" in out
+        fm, _body = split_frontmatter(out)
+        if fm is not None:
+            assert set(parse_frontmatter(out)[0]) <= set(FRONTMATTER_ALLOWED_KEYS)
+
+    def test_a_long_chain_of_dropped_blocks_is_iterated_not_recursed(self):
+        text = "---\n- x\n---\n" * 5000 + self.SECOND
+        out = scrub_frontmatter(text, origin="test")
+        assert "allowed-tools" not in out

@@ -22,8 +22,8 @@ from ws import satellite as sat_ws
 class FakeSatelliteWS:
     """Minimal starlette-WebSocket stand-in: one inbound auth frame, then EOF."""
 
-    def __init__(self, auth: dict):
-        self._auth = json.dumps(auth)
+    def __init__(self, auth: dict | None = None, raw: str | None = None):
+        self._auth = raw if raw is not None else json.dumps(auth)
         self._served = False
         self.accepted = False
         self.sent: list[dict] = []
@@ -170,3 +170,112 @@ async def test_update_push_4007_and_rollback_bookkeeping(loop_db_guard, monkeypa
     row = await _row(mid)
     assert int(row["update_rollback_count"]) == 1
     assert row["update_rollback_target"] == sat_ws.SATELLITE_VERSION_LATEST
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_first_frame_is_closed_before_any_parse(loop_db_guard, monkeypatch):
+    """The first frame is sized before it is parsed: one past the cap
+    is rejected and closed without a ``json.loads``; one at the cap is
+    parsed and follows the normal handshake."""
+    seen: list[int] = []
+    real_loads = json.loads
+
+    def _spy(text, *a, **kw):
+        seen.append(len(text) if isinstance(text, str) else -1)
+        return real_loads(text, *a, **kw)
+
+    monkeypatch.setattr(sat_ws.json, "loads", _spy)
+    cap = sat_ws._MAX_AUTH_FRAME_CHARS
+    ws = FakeSatelliteWS(raw="x" * (cap + 1))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert ws.closed == (4001, "Auth frame too large")
+    assert ws.sent[-1] == {"type": "auth_result", "status": "rejected",
+                           "reason": "Auth frame too large"}
+    assert (cap + 1) not in seen
+
+    probe = {"type": "auth", "machine_id": "nope", "machine_secret": "x", "pad": ""}
+    probe["pad"] = "p" * (cap - len(json.dumps(probe)))
+    frame = json.dumps(probe)
+    assert len(frame) == cap
+    ws2 = FakeSatelliteWS(raw=frame)
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws2)
+    assert cap in seen
+    assert ws2.closed[0] == 4006            # parsed, then the unknown-machine path
+
+
+@pytest.mark.asyncio
+async def test_a_first_frame_that_is_not_an_object_is_rejected_not_crashed(loop_db_guard):
+    """A well-formed JSON first frame that is not an object (an array, a
+    number) takes the "first message must be auth" refusal like any other
+    wrong first message, instead of raising out of the handler."""
+    for raw in ("[0, 0, 0]", "42", '"auth"', "null"):
+        ws = FakeSatelliteWS(raw=raw)
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+        assert ws.closed == (4001, "Expected auth message"), raw
+        assert ws.sent[-1]["reason"] == "First message must be auth"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field, value", [
+    ("machine_id", {"$ne": ""}), ("machine_id", 7), ("machine_secret", ["x"]),
+    ("satellite_version", 130), ("capabilities", ["os", "linux"]), ("capabilities", "linux"),
+])
+async def test_an_auth_field_of_the_wrong_type_is_refused(loop_db_guard, field, value):
+    """Each auth field has its type: a string id, secret and version, an
+    object of capabilities. Anything else answers a refusal and closes; it
+    never reaches the store, and no connection is registered."""
+    from core.remote.satellite_connection import get_connection_manager
+    mid, secret = await _make_machine()
+    ws = FakeSatelliteWS({**_auth(mid, secret), field: value})
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert ws.sent[-1]["type"] == "auth_result" and ws.sent[-1]["status"] == "rejected"
+    assert ws.closed[0] == 4001
+    assert mid not in get_connection_manager()._connections
+
+
+@pytest.mark.asyncio
+async def test_a_binary_first_frame_is_refused_not_crashed(loop_db_guard):
+    class _Binary(FakeSatelliteWS):
+        async def receive_text(self):
+            raise KeyError("text")
+
+    ws = _Binary(raw="")
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert ws.closed[0] == 4001
+
+
+@pytest.mark.asyncio
+async def test_every_refusal_survives_a_gone_peer(loop_db_guard):
+    """A peer that left before its refusal: the send fails, the handler
+    still closes instead of raising, on every refusal of the handshake."""
+    class _Gone(FakeSatelliteWS):
+        async def send_text(self, text):
+            raise RuntimeError("peer gone")
+
+    mid, secret = await _make_machine()
+    for auth, code in (({"type": "auth", "machine_id": ""}, 4001),
+                       (_auth("nope", "x"), 4006),
+                       (_auth(mid, "wrong"), 4001)):
+        ws = _Gone(auth)
+        with loop_db_guard.active():
+            await sat_ws.ws_satellite_handler(ws)
+        assert ws.closed[0] == code, auth
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_first_frame_from_a_gone_peer_still_closes(loop_db_guard):
+    """The refusal's send may fail on a peer that already left; the handler
+    still reaches the close instead of raising out of the auth path."""
+    class _Gone(FakeSatelliteWS):
+        async def send_text(self, text):
+            raise RuntimeError("peer gone")
+
+    ws = _Gone(raw="[0]")
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+    assert ws.closed == (4001, "Expected auth message")

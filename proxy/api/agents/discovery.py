@@ -11,19 +11,20 @@ from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel
 
 import config
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from core import placement
+from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_human
 from storage.agents import agent_store
 from storage import database as task_store
 from storage.automation import trigger_store
+from storage.pg import run_db
 
 from api.agents._common import _get_agent_dir, _get_execution_paths
 from api.agents._router import router
+from core.execution_layer import DEFAULT_EXECUTION_PATH, PROVIDER_LOCAL
+from core import layout
 
 logger = logging.getLogger("claude-proxy.agents")
 
-# Self-hosted OpenAI-compatible providers — their models exist only while an
-# endpoint row is active on that layer (see list_execution_layers).
-_LOCAL_PROVIDERS = {"ollama", "openai_compatible"}
 
 
 def _get_mcp_info(name: str) -> tuple[int, list[str]]:
@@ -40,6 +41,42 @@ def _get_mcp_info(name: str) -> tuple[int, list[str]]:
     # (discovery cards + delegation surfaces) — they carry no tools.
     names = sorted(m.name for m in manifests if m.category != "skill")
     return len(names), names
+
+
+def _mcp_names_by_agent(slugs: list[str]) -> dict[str, list[str]]:
+    """``_get_mcp_info``'s names for many agents from bulk reads: the
+    manager-enabled sets, the platform state and the explicit-instance
+    visibility once each, the manifests from the registry's in-memory map,
+    and every capability probe once per capability token. The rule mirrors
+    ``mcp_registry._agent_base_manifests`` drop for drop (not manager-enabled,
+    not platform-enabled, unknown manifest, explicit and not visible,
+    capability unavailable) plus the skill filter of ``_get_mcp_info``;
+    the listing's parity test holds the two together."""
+    from services.mcp import mcp_registry
+    from storage.mcp import mcp_store
+    enabled = mcp_store.get_all_manager_enabled_mcps()
+    state = mcp_store.get_all_mcp_states()
+    visible = mcp_store.get_visible_explicit_mcps_by_agent(slugs)
+    available: dict[str, bool] = {}
+    out: dict[str, list[str]] = {}
+    for slug in slugs:
+        names: list[str] = []
+        for name in enabled.get(slug, ()):
+            if not state.get(name, False):
+                continue
+            manifest = mcp_registry.get_manifest(name)
+            if not manifest:
+                continue
+            if manifest.assignment_mode == "explicit" and name not in visible.get(slug, ()):
+                continue
+            cap = manifest.requires_capability or ""
+            if cap not in available:
+                available[cap] = mcp_registry.manifest_capability_available(manifest)
+            if not available[cap] or manifest.category == "skill":
+                continue
+            names.append(name)
+        out[slug] = sorted(names)
+    return out
 
 
 def _safe_model(name: str) -> str:
@@ -88,9 +125,17 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
     credentials, so nothing legitimate is anonymous here.
     """
     require_auth(user)
+    return await run_db(_execution_layers_sync)
+
+
+def _execution_layers_sync() -> dict:
+    """The catalog as ONE executor job. It only reads: the builtin model
+    rows are synced at boot (startup.py) and by the admin execution-layer
+    pages, never by this page-load GET (the sync's writes and commit held
+    the loop on every new-chat page)."""
     from core.session.session_manager import get_all_capabilities
     from services.engines import subscription_pool
-    from storage.billing import subscription_store
+    from storage.billing import subscription_status, subscription_store
 
     caps = get_all_capabilities()
     result = {}
@@ -100,7 +145,6 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
         # enable gate (mirror of the PATCH /v1/agents server gate).
         layer["configured"] = subscription_pool.layer_platform_configured(path)
         # Merge enabled custom models from admin DB
-        subscription_store.sync_builtin_models(path, layer.get("models", []))
         db_models = subscription_store.list_models(layer=path)
 
         # Determine which providers are available platform-wide (the agent pool).
@@ -108,7 +152,8 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
         # user execution-layers endpoint; here we reflect contribute_platform subs
         # so one user's personal-only provider doesn't advertise models to everyone.
         active_subs = subscription_store.list_subscriptions(layer=path, contribute_platform=True)
-        active_providers = {s["provider"] for s in active_subs if s.get("status") == "active"}
+        active_providers = {s["provider"] for s in active_subs
+                            if s.get("status") == subscription_status.ACTIVE}
 
         # Build merged model list: builtin models + enabled custom models
         builtin_ids = {m["value"] for m in layer.get("models", [])}
@@ -123,31 +168,58 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
                     # dropdown can hide the "XHigh" option on custom models
                     # that the admin hasn't explicitly flagged.
                     "supports_xhigh": bool(m.get("supports_xhigh", False)),
+                    # An admin-tagged tier reaches the pickers the same way
+                    # a builtin's registry tier does.
+                    "tier": m.get("tier"),
+                    "tier_label": config.MODEL_TIER_LABELS.get(m.get("tier") or 0, ""),
+                    "good_at": m.get("good_at") or "",
                 })
             # Respect admin disable on builtin models
             if m["is_builtin"] and not m["enabled"]:
                 merged = [x for x in merged if x["value"] != m["model_id"]]
 
         # Filter: only show models whose provider has an active subscription.
-        # "System Default" (value="") always passes. direct-llm filters every
-        # provider; codex-cli filters only its LOCAL providers (a user on a
-        # personal ChatGPT account must keep seeing the OpenAI builtins even
-        # when the platform pool has no OpenAI row); Claude Code never filters.
-        if path == "direct-llm" and active_providers:
+        # "System Default" (value="") always passes. The engine's
+        # model_filter_policy says how: "all" filters every provider,
+        # "local_providers" hides only the local endpoints without a row (a
+        # user on a personal vendor account must keep seeing the vendor's
+        # builtins even when the platform pool has no vendor row), "none"
+        # never filters.
+        policy = (layer.get("model_policy") or {}).get("model_filter_policy", "none")
+        if policy == "all" and active_providers:
             merged = [
                 m for m in merged
                 if not m.get("value")  # "System Default"
                 or m.get("provider", "anthropic") in active_providers
             ]
-        elif path == "codex-cli":
+        elif policy == "local_providers":
+            # Self-hosted providers (the descriptor's local kind) — their
+            # models exist only while an endpoint row is active on the layer.
+            local_ids = {p["id"] for p in (layer.get("providers") or []) if p.get("kind") == PROVIDER_LOCAL}
             merged = [
                 m for m in merged
                 if not m.get("value")
-                or m.get("provider", "openai") not in _LOCAL_PROVIDERS
+                or m.get("provider", "openai") not in local_ids
                 or m.get("provider") in active_providers
             ]
 
         layer["models"] = merged
+        # What "Auto" runs on this engine right now: the resolver's own answer
+        # for an unpinned agent (declared default → fall-down, restricted to
+        # what the platform pool serves), with the row's display name so the
+        # dashboard never has to find it in ``models`` — whose provider filter
+        # is NOT the resolver's (it counts every active contribute_platform
+        # row; the resolver counts the pool's, i.e. owner-less or admin-owned).
+        # "" when nothing is enabled on the engine.
+        try:
+            auto = config.resolve_layer_default_model(path)
+        except RuntimeError:
+            auto = ""
+        layer["auto_model"] = auto
+        layer["auto_model_label"] = next(
+            ((m.get("display_name") or auto) for m in db_models if m.get("model_id") == auto),
+            auto,
+        ) if auto else ""
         result[path] = layer
     return result
 
@@ -163,7 +235,13 @@ async def list_agents(
     Pass ?all=true to skip admin checkbox filtering (for admin pages).
     """
     u = require_auth(user)
+    return await run_db(_list_agents_sync, u, all)
 
+
+def _list_agents_sync(u: UserContext, all: bool) -> dict:
+    """The listing as ONE executor job: the counts, the bulk MCP view and
+    one model resolution per engine, so its cost no longer grows with the
+    agent count on the loop (every visible dashboard polls it)."""
     # Bulk DB counts (avoids N queries-per-agent in the loop below). The
     # schedule/trigger numbers must reflect what THIS caller can see — agent-scoped
     # (shared) + their OWN user-scoped — and never leak other users' private items,
@@ -176,7 +254,7 @@ async def list_agents(
         task_counts = task_store.count_user_visible_dynamic_tasks_by_agent(u.sub)
         trigger_counts = trigger_store.count_user_visible_triggers_by_agent(u.sub)
 
-    agents = []
+    visible: list[str] = []
     for name in sorted(agent_store.get_agent_slugs()):
         # Admin: respect agent checkboxes for UI (show only assigned agents)
         # unless ?all=true is passed (admin pages need platform-wide view).
@@ -185,29 +263,49 @@ async def list_agents(
                 continue
         elif not u.can_access_agent(name):
             continue
+        visible.append(name)
+    mcp_names_by_agent = _mcp_names_by_agent(visible)
+    # What "Auto" runs on an engine is the same for every unpinned agent on
+    # it: resolved once per engine per request. Display-only: an engine with
+    # nothing enabled shows an empty model cell instead of a 500 (the
+    # _safe_model contract); a pinned agent shows its pin, unchecked, as
+    # resolve_agent_model answers with no layer argument.
+    layer_default: dict[str, str] = {}
+
+    def _model(agent_data: dict | None) -> str:
+        pinned = (agent_data or {}).get("default_model") or ""
+        if pinned:
+            return pinned
+        path = (agent_data or {}).get("execution_path") or DEFAULT_EXECUTION_PATH
+        if path not in layer_default:
+            try:
+                layer_default[path] = config.resolve_layer_default_model(path)
+            except RuntimeError:
+                layer_default[path] = ""
+        return layer_default[path]
+
+    agents = []
+    for name in visible:
         agent_dir = config.get_agent_dir(name)
-        mcp_count, mcp_names = _get_mcp_info(name)
+        mcp_names = mcp_names_by_agent.get(name, [])
         schedule_count = task_counts.get(name, 0)
         trigger_count = trigger_counts.get(name, 0)
-        has_workspace = (agent_dir / "workspace").is_dir()
+        has_workspace = (agent_dir / layout.WORKSPACE).is_dir()
         agent_data = agent_store.get_agent(name)
 
         agents.append({
             "name": name,
             "display_name": agent_data["display_name"] if agent_data else name,
-            "execution_path": agent_data["execution_path"] if agent_data else "claude-code-cli",
+            "execution_path": agent_data["execution_path"] if agent_data else DEFAULT_EXECUTION_PATH,
             "execution_paths": _get_execution_paths(agent_data),
-            "execution_target": agent_data.get("execution_target", "local") if agent_data else "local",
-            # Display-only: swallow "no model available" exceptions so the
-            # agent grid still renders. Frontend shows empty model text when
-            # admin hasn't enabled any models yet for this agent's layer.
-            "default_model": _safe_model(name),
+            "execution_target": (agent_data.get("execution_target") or placement.LOCAL) if agent_data else placement.LOCAL,
+            "default_model": _model(agent_data),
             "default_scope": (agent_data.get("default_scope") if agent_data else "user") or "user",
             "default_execution_mode": (agent_data.get("default_execution_mode", "") if agent_data else ""),
             "collaborative": bool(agent_data.get("collaborative", True)) if agent_data else True,
             "color": agent_data.get("color", "") if agent_data else "",
             "description": agent_data.get("description", "") if agent_data else "",
-            "mcp_count": mcp_count,
+            "mcp_count": len(mcp_names),
             "mcp_names": mcp_names,
             "schedule_count": schedule_count,
             "trigger_count": trigger_count,
@@ -225,18 +323,38 @@ async def get_agent_info(name: str, user: UserContext | None = Depends(get_curre
     u = require_auth(user)
     require_agent_access(u, name)
 
-    agent_dir = _get_agent_dir(name)
-    _, mcp_names = _get_mcp_info(name)
-    has_workspace = (agent_dir / "workspace").is_dir()
-    agent_data = agent_store.get_agent(name)
+    def _read() -> tuple[list[str], bool, dict | None, bool, list[str]]:
+        agent_dir = _get_agent_dir(name)
+        _, mcp_names = _get_mcp_info(name)
+        return (mcp_names, (agent_dir / layout.WORKSPACE).is_dir(),
+                agent_store.get_agent(name), agent_store.is_admin_only(name),
+                agent_store.get_delegation_targets(name))
+
+    # The store reads as one executor job; the registry fetch below is an
+    # awaited HTTP call and stays on the loop.
+    mcp_names, has_workspace, agent_data, admin_only, delegation_targets = await run_db(_read)
+
+    # A template install's catalog state for the Config tab's banner
+    # (COMMUNITY-AGENTS-REGISTRY.md "Updates"); the registry is cached, an
+    # unreachable one leaves the field out rather than slowing the page.
+    template_update = None
+    provenance = str((agent_data or {}).get("community_template") or "")
+    if provenance and not provenance.startswith("local:"):
+        try:
+            from services.community import community_agent_updater, community_agents_catalog
+            registry = await community_agents_catalog.fetch_registry()
+            entry = next((e for e in registry.get("agents", []) if e.get("slug") == provenance), None)
+            template_update = community_agent_updater.detect(agent_data, entry)
+        except Exception:
+            template_update = None
 
     return {
         "name": name,
         "display_name": agent_data["display_name"] if agent_data else name,
-        "admin_only": agent_store.is_admin_only(name),
-        "execution_path": agent_data["execution_path"] if agent_data else "claude-code-cli",
+        "admin_only": admin_only,
+        "execution_path": agent_data["execution_path"] if agent_data else DEFAULT_EXECUTION_PATH,
         "execution_paths": _get_execution_paths(agent_data),
-        "execution_target": agent_data.get("execution_target", "local") if agent_data else "local",
+        "execution_target": (agent_data.get("execution_target") or placement.LOCAL) if agent_data else placement.LOCAL,
         "default_model": agent_data["default_model"] if agent_data else "",
         "default_effort": agent_data["default_effort"] if agent_data else "",
         "default_scope": (agent_data.get("default_scope") if agent_data else "user") or "user",
@@ -245,9 +363,10 @@ async def get_agent_info(name: str, user: UserContext | None = Depends(get_curre
         "description": agent_data.get("description", "") if agent_data else "",
         "mcps": mcp_names,
         "has_workspace": has_workspace,
-        "delegation_targets": agent_store.get_delegation_targets(name),
+        "delegation_targets": delegation_targets,
         "community_template": agent_data.get("community_template") if agent_data else None,
         "community_template_version": agent_data.get("community_template_version") if agent_data else None,
+        "template_update": template_update,
         "setup_completed_at": agent_data.get("setup_completed_at") if agent_data else None,
         "default_for_new_users_role": (
             agent_data.get("default_for_new_users_role", "") if agent_data else ""
@@ -277,7 +396,7 @@ async def get_agent_target_status(
 
     Response (200) shapes:
         {"state": null} — agent runs locally for this caller.
-        {"state": "online"|"stale"|"disconnected"|"never_connected",
+        {"state": "online"|"stale"|"paused"|"disconnected"|"never_connected",
          "scope": "admin"|"user", "machine_name": str,
          "last_heartbeat_age_s": int|null, "last_seen_iso": str}
 
@@ -316,63 +435,15 @@ async def get_agent_target_status(
     # Priority 2: the agent's admin-paired default target. Shown to every
     # user on the agent — when it's offline it blocks all of them.
     agent_data = agent_store.get_agent(name) or {}
-    target = agent_data.get("execution_target", "local") or "local"
-    if not target or target == "local":
+    target = agent_data.get("execution_target") or placement.LOCAL
+    if placement.is_local(target):
         return {"state": None}
     machine = remote_store.get_remote_machine(target) or {}
-    if (machine.get("pairing_scope") or "") != "admin":
+    if not placement.machine_is_admin_paired(machine):
         # A user-paired machine set as an agent default shouldn't happen
         # (the admin assign endpoint refuses it), but guard anyway.
         return {"state": None}
     return _status_payload(target, "admin")
-
-
-async def _remove_synced_setup_file(
-    agent_slug: str, abs_path, rel_path: str, repo_dir,
-) -> bool:
-    """Delete a setup file WITH the sync + audit bookkeeping every
-    platform-side delete needs: tombstone (an idle satellite APPLIES the
-    delete at next merge instead of resurrecting its copy — user context and
-    owner-tier config write back), author clear, live-delete fan-out, and a
-    commit in the owning git repo when the file is tracked (so the dashboard
-    revert button can't silently resurrect a completed setup)."""
-    if abs_path is None or not abs_path.is_file():
-        return False
-    try:
-        await asyncio.to_thread(abs_path.unlink)
-    except Exception:
-        logger.exception(
-            "complete-setup: failed to remove %s for %s", rel_path, agent_slug,
-        )
-        return False
-    import time as _time
-    from storage.files import file_author_store
-    from storage.files import file_tombstones_store
-    await asyncio.to_thread(
-        file_tombstones_store.record, agent_slug, rel_path, _time.time(),
-        origin="complete-setup",
-    )
-    await asyncio.to_thread(file_author_store.clear, agent_slug, rel_path)
-    try:
-        from services.remote import workspace_fanout
-        await workspace_fanout.fan_out_delete(
-            agent_slug, rel_path, include_idle=True,
-        )
-    except Exception:
-        logger.exception(
-            "complete-setup: delete fan-out failed for %s", rel_path,
-        )
-    try:
-        from services.infra import git_writer
-        rel_in_repo = str(abs_path.relative_to(repo_dir))
-        if git_writer.is_tracked(repo_dir, rel_in_repo):
-            await asyncio.to_thread(
-                git_writer.commit_paths, repo_dir, [abs_path],
-                f"Complete setup: remove {abs_path.name}",
-            )
-    except Exception:
-        logger.exception("complete-setup: git commit failed for %s", rel_path)
-    return True
 
 
 @router.post("/v1/agents/{name}/complete-setup")
@@ -401,8 +472,11 @@ async def complete_agent_setup(
     absent → idempotent success.
 
     All file deletes carry tombstone + git + fan-out bookkeeping — a bare
-    unlink would be resurrected by the next satellite sync.
+    unlink would be resurrected by the next satellite sync. The work is
+    ``services/agents/setup_state.py``, which the platform methods an app
+    declares (``setup.status`` / ``setup.complete``) share.
     """
+    from services.agents import setup_state
     u = require_auth(user)
     require_agent_access(u, name)
     agent = agent_store.get_agent(name)
@@ -411,21 +485,15 @@ async def complete_agent_setup(
     if body.scope not in (None, "agent", "user"):
         raise HTTPException(400, "scope must be 'agent' or 'user'")
 
-    agent_dir = _get_agent_dir(name)
     username = ""
     if u.acting_sub is not None:
         username = task_store.get_username_by_sub(u.sub) or ""
 
-    setup_path = agent_dir / "config" / "context" / "setup.md"
-    user_setup_path = (
-        agent_dir / "users" / username / "context" / "user-setup.md"
-        if username else None
-    )
-
     scope = body.scope
     if scope is None:
-        agent_file = setup_path.is_file()
-        user_file = user_setup_path is not None and user_setup_path.is_file()
+        agent_file = setup_state.agent_setup_path(name).is_file()
+        own = setup_state.user_setup_path(name, username)
+        user_file = own is not None and own.is_file()
         if agent_file and user_file:
             raise HTTPException(
                 400,
@@ -442,15 +510,7 @@ async def complete_agent_setup(
                 "scope='user' requires a user session (agent-scoped sessions "
                 "have no per-user setup).",
             )
-        removed = await _remove_synced_setup_file(
-            name, user_setup_path,
-            f"users/{username}/context/user-setup.md",
-            agent_dir / "users" / username / "context",
-        )
-        return {
-            "status": "user_setup_complete",
-            "user_setup_removed": removed,
-        }
+        return await setup_state.complete_user_setup(name, username, u.sub)
 
     # scope == "agent" — completing setup FOR THE WHOLE AGENT is a
     # config-level act: manager/admin, or the agent principal (agent-scoped
@@ -460,69 +520,7 @@ async def complete_agent_setup(
         raise HTTPException(
             403, "Completing agent-wide setup requires manager access.",
         )
-
-    # File delete — runs whether or not the stamp is already set, so the
-    # tool stays useful for cleaning up a leftover setup.md on a stale agent.
-    setup_md_removed = await _remove_synced_setup_file(
-        name, setup_path, "config/context/setup.md", agent_dir / "config",
-    )
-
-    if agent.get("setup_completed_at"):
-        return {
-            "status": "already_complete",
-            "setup_completed_at": agent["setup_completed_at"],
-            "setup_md_removed": setup_md_removed,
-        }
-
-    updated = await asyncio.to_thread(agent_store.mark_setup_completed, name)
-    # Notify the installer (created_by) if present. If the installer's user
-    # account no longer exists (deleted long after the install, edge case),
-    # fall back to fanning out to every admin so the notification doesn't
-    # become an orphan in the deliveries table.
-    try:
-        from services.notifications import notification_manager
-        display = agent.get("display_name") or name
-        body_text = f"`{name}` has confirmed post-install setup is complete."
-        if (body.summary or "").strip():
-            body_text += f"\n\nSummary: {body.summary.strip()}"
-
-        installer_sub = agent.get("created_by") or ""
-        targets: list[str] = []
-        if installer_sub:
-            installer_user = await asyncio.to_thread(task_store.get_user, installer_sub)
-            if installer_user:
-                targets = [installer_sub]
-        if not targets:
-            # Fallback: every admin. Rare path — only fires when the
-            # installer user has been deleted since the agent install.
-            from storage.pg import get_conn
-
-            def _admin_subs() -> list[str]:
-                with get_conn() as conn:
-                    rows = conn.execute(
-                        "SELECT sub FROM users WHERE role='admin'",
-                    ).fetchall()
-                    return [r["sub"] for r in rows]
-
-            targets = await asyncio.to_thread(_admin_subs)
-
-        for target in targets:
-            await notification_manager.fire_notification(
-                title=f"Setup complete for {display}",
-                body=body_text,
-                severity="info",
-                scope="user",
-                target=target,
-                source="community_agent",
-                source_id=name,
-            )
-    except Exception:
-        logger.exception("complete-setup notification failed for %s", name)
-    return {
-        "status": "completed",
-        "agent": updated,
-        "setup_md_removed": setup_md_removed,
-    }
+    return await setup_state.complete_agent_setup(name, agent, summary=body.summary or "")
 
 
 @router.get("/v1/agents/{name}/delegation-targets")
@@ -614,9 +612,12 @@ async def set_delegation_targets(
     A wired edge also grants this agent's NO-USER sessions read visibility
     into the target's agent-scope activity (merged observe semantics), so
     the per-target reach check below doubles as the read-grant authority —
-    a manager never grants more than they can see themselves.
+    a manager never grants more than they can see themselves. Human-only
+    (``require_human``): an edge also lets the agent's apps call the
+    target agent's apps (APPS.md "Bindings"), so a prompt in a manager's
+    session must not be able to wire one.
     """
-    u = require_auth(user)
+    u = require_human(user)
     require_agent_access(u, name)
     if not u.can_manage_agent(name):
         raise HTTPException(403, "Manager role required for this agent")

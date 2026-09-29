@@ -187,6 +187,12 @@ def get_bg_command_registry(session_id: str) -> "BackgroundCommandRegistry":
     return reg
 
 
+def peek_bg_command_registry(session_id: str) -> "BackgroundCommandRegistry | None":
+    """The registry if the session ever tracked a command, else None: a read
+    for the reapers and the evictor, which must never create an entry."""
+    return _bg_command_registries.get(session_id)
+
+
 def reset_bg_command_registry(session_id: str) -> None:
     """Reset a session's background-command registry at the start of a new turn."""
     reg = _bg_command_registries.get(session_id)

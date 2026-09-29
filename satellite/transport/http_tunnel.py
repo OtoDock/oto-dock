@@ -53,12 +53,25 @@ _ALLOWLIST_REGEXES = [
         r"^/v1/hooks/(resolve-path|resolve-tool-arg-paths|permission|"
         r"mcp-credentials|session-files|"
         r"images|image-generating|image-gen-failed|url|file|media|ui|"
-        r"document-preview|tool-result|file-written|subagent)$"
+        r"document-preview|tool-result|file-written|subagent|"
+        # The Stop hook (turn end, both engines) and the Codex question
+        # bridge (request_user_input → the dashboard card), 0.5.121; both
+        # session-JWT gated proxy-side like every hook.
+        r"stop|codex-question)$"
     ),
-    # display-mcp pinned mini-apps (pin/unpin/list) — session-JWT gated
+    # display-mcp pinned apps (pin/unpin/list) — session-JWT gated
     # proxy-side like every hook (verify_session_match + scope from the
     # session ctx); the artifact hook itself is the `ui` entry above.
-    re.compile(r"^/v1/hooks/apps/(pin|unpin|list)$"),
+    re.compile(r"^/v1/hooks/apps/(pin|unpin|list|push|state|open|rollback|"
+               r"deploy|check|status|preview|logs|restart|purge|describe|export|import|screenshot)$"),
+    # Agents calling apps (APPS.md "Agents call apps"): an app's own API,
+    # its platform methods and the push/state twins, judged proxy-side by
+    # the session JWT as basis `agent`. Mirrored in the proxy's list.
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/(api|platform|push|state)(/.*)?$"),
+    # An app step's script pressing one of its app's buttons (APPS.md
+    # "Steps", 0.5.122): the route accepts only the step's own in-flight
+    # claim as the bearer; never the batch route. Mirrored in the proxy.
+    re.compile(r"^/v1/apps/[0-9a-f-]{36}/actions/[A-Za-z0-9_-]{1,64}$"),
     # display-mcp Dock file pins — same session-JWT gating; content is read
     # dashboard-side via the files API (the platform mirror for remotes).
     re.compile(r"^/v1/hooks/files/(pin|unpin)$"),
@@ -89,6 +102,9 @@ _ALLOWLIST_REGEXES = [
     re.compile(r"^/v1/continuations(/.*)?$"),
     re.compile(r"^/v1/meetings(/.*)?$"),
     re.compile(r"^/v1/triggers(/.*)?$"),
+    # checks-mcp (CHECKS.md): what is attached to this session's chat, attach,
+    # detach, run by hand — all session-JWT gated proxy-side (0.5.123).
+    re.compile(r"^/v1/checks/(attached|attach|detach|run)$"),
     re.compile(r"^/v1/subscriptions$"),
     re.compile(r"^/v1/internal/memory(/.*)?$"),
     re.compile(r"^/v1/agents/[a-zA-Z0-9_-]+(/.*)?$"),
@@ -107,13 +123,15 @@ _RESPONSE_QUEUE_SIZE = 64
 
 
 def _has_traversal(base: str) -> bool:
-    """True if ``base`` has a dot-segment or encoded separator. Rejected before
-    allowlist matching so a `../`-style path can't match an allowlisted prefix
-    and then be normalized onto a different endpoint upstream. Mirrors the
-    platform side (``core/remote/satellite_http_tunnel.py``) — keep both identical.
+    """True if ``base`` has a dot segment, an encoded separator, a backslash
+    or a NUL. Rejected before allowlist matching so a `../`-style path can't
+    match an allowlisted prefix and then be normalized onto a different
+    endpoint upstream. A byte twin of the platform's authority
+    (``proxy/auth/request_path.py``), pinned by the release gate's twin rule
+    — keep the body identical.
     """
     low = base.lower()
-    if "%2e" in low or "%2f" in low or "%5c" in low or "\\" in base:
+    if "%2e" in low or "%2f" in low or "%5c" in low or "%00" in low or "\\" in base or "\x00" in base:
         return True
     return any(seg in (".", "..") for seg in base.split("/"))
 

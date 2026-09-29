@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import logging
 import time
 from datetime import datetime
@@ -25,6 +26,10 @@ from auth.webhook_providers.base import (
     VerifyResult,
     WebhookProvider,
 )
+
+# Zoom's url_validation plainToken shape (22 url-safe characters in
+# practice); the handshake signs nothing outside it.
+_ZOOM_PLAIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-+/=]{1,256}")
 
 logger = logging.getLogger("claude-proxy.webhook-providers.generic")
 
@@ -60,6 +65,15 @@ class GenericWebhookProvider(WebhookProvider):
         algo = _ALGORITHMS.get(algo_name)
         if algo is None:
             return VerifyResult(False, reason="unsupported_algorithm")
+
+        # Everything that needs no body is refused first: a request that
+        # cannot verify never costs a pass over its body.
+        secret_bytes = (signing_secret or "").encode("utf-8")
+        if not secret_bytes:
+            # Empty signing secret is a config error (manifest or admin oversight).
+            # We reject rather than accept (a vendor that signs with "" would let
+            # anyone forge requests).
+            return VerifyResult(False, reason="signature_mismatch")
 
         sig_header_name = manifest_sig_block.get("header", "").lower()
         if not sig_header_name:
@@ -98,28 +112,19 @@ class GenericWebhookProvider(WebhookProvider):
             if max_age > 0 and abs(time.time() - ts_unix) > max_age:
                 return VerifyResult(False, reason="timestamp_too_old")
 
-        # Build the signed payload per manifest template.
-        # Default template = body only (GitHub). Slack: `v0:{timestamp}:{body}`.
+        # The signed payload per manifest template, over the body's raw bytes
+        # (default template = body only, GitHub; Slack: `v0:{timestamp}:{body}`).
+        # `{timestamp}` is substituted in the template's own text only: a body
+        # is signed exactly as it arrived.
         payload_template = manifest_sig_block.get("signed_payload_template", "{body}")
-        body_str = raw_body.decode("utf-8", errors="replace")
-        signed_payload = (
-            payload_template
-            .replace("{body}", body_str)
-            .replace("{timestamp}", timestamp)
-        )
-
-        # Compute HMAC and compare.
-        secret_bytes = (signing_secret or "").encode("utf-8")
-        if not secret_bytes:
-            # Empty signing secret is a config error (manifest or admin oversight).
-            # We reject rather than accept (a vendor that signs with "" would let
-            # anyone forge requests).
-            return VerifyResult(False, reason="signature_mismatch")
-        expected = hmac.new(
-            secret_bytes,
-            signed_payload.encode("utf-8"),
-            algo,
-        ).hexdigest()
+        mac = hmac.new(secret_bytes, digestmod=algo)
+        parts = payload_template.split("{body}")
+        for i, part in enumerate(parts):
+            if i:
+                mac.update(raw_body)
+            if part:
+                mac.update(part.replace("{timestamp}", timestamp).encode("utf-8"))
+        expected = mac.hexdigest()
 
         if not hmac.compare_digest(expected, sig_value):
             return VerifyResult(False, reason="signature_mismatch")
@@ -173,18 +178,23 @@ class GenericWebhookProvider(WebhookProvider):
             # Zoom: body shape `{"event": "endpoint.url_validation",
             # "payload": {"plainToken": "..."}}`. Respond with
             # `{plainToken, encryptedToken}` where encryptedToken =
-            # HMAC-SHA256(secret, plainToken).hex().
+            # HMAC-SHA256(secret, plainToken).hex(). The answer is a
+            # signature over a caller-supplied string, so the string is
+            # held to Zoom's own token alphabet: every body the dispatcher
+            # fires is a JSON object, and `{` is outside it. No secret, no
+            # answer.
             if not isinstance(request_body, dict):
                 return None
             if request_body.get("event") != "endpoint.url_validation":
                 return None
             payload = request_body.get("payload") or {}
-            plain = payload.get("plainToken", "")
-            if not plain:
+            plain = payload.get("plainToken", "") if isinstance(payload, dict) else ""
+            if not isinstance(plain, str) or not _ZOOM_PLAIN_TOKEN_RE.fullmatch(plain):
                 return None
-            secret_bytes = (signing_secret or "").encode("utf-8")
+            if not signing_secret:
+                return None
             encrypted = hmac.new(
-                secret_bytes,
+                signing_secret.encode("utf-8"),
                 plain.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()

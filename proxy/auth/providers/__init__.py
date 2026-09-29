@@ -14,10 +14,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import jwt
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
+from starlette.requests import HTTPConnection
 
 import config
 from storage import database as task_store
+from storage.pg import run_db_fast
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.auth")
 
@@ -64,12 +67,12 @@ class UserContext:
     sub: str
     email: str
     name: str
-    role: str  # "admin" | "creator" | "member" (platform-level role)
+    role: str  # the platform role (auth/roles.PLATFORM_ROLES); roles.SERVICE for a no-user session
     agents: list[str] = field(default_factory=list)
     default_agent: str = ""
     display_name: str = ""
     is_api_key: bool = False  # True when authenticated via API key
-    agent_roles: dict[str, str] = field(default_factory=dict)  # {agent: "manager"|"editor"|"viewer"}
+    agent_roles: dict[str, str] = field(default_factory=dict)  # {agent: a member of roles.AGENT_ROLES}
     auth_provider: str = "local"  # "local" | "oidc:authentik" | "oidc:authelia" etc.
     is_owner: bool = False  # True for the first admin created during setup
     # Session JWT id (``sid`` claim). Populated only when the caller
@@ -88,10 +91,19 @@ class UserContext:
     external_claim: str = ""
     external_channel: str = ""
     external_id: str = ""
+    # The platform's own headless render (``auth/render_principal.py``): the
+    # one app this principal may reach, and the live token's id. Empty for
+    # every other principal.
+    render_app: str = ""
+    render_jti: str = ""
+    # A browser session held by the forced password change or 2FA enrolment
+    # (``auth_gate``): ``must_change_password``, ``must_enroll_2fa`` or "".
+    # Only the cookie branch sets it.
+    auth_gate: str = ""
 
     @property
     def is_admin(self) -> bool:
-        return self.role == "admin"
+        return roles.is_admin(self.role)
 
     @property
     def is_external(self) -> bool:
@@ -179,11 +191,19 @@ class UserContext:
             or (self.is_session and bool(self.agent) and name == self.agent)
         )
 
-    def get_agent_role(self, agent: str) -> str:
-        """Effective role for a specific agent."""
-        if self.is_admin:
-            return "admin"
-        return self.agent_roles.get(agent, "viewer")
+    def effective_role(self, agent: str) -> str:
+        """This principal's role on ``agent``: ``roles.ADMIN`` for a platform
+        admin, else the per-agent row, else ``roles.NO_ACCESS`` — the
+        membership reading (``auth/roles.effective_role``)."""
+        return roles.effective_role(self.role, self.agent_roles, agent)
+
+    def acting_role(self, agent: str) -> str:
+        """The role this ADMITTED principal acts with on ``agent``:
+        ``effective_role`` or, holding no row, ``roles.VIEWER`` — a session
+        acting on the agent it was minted for, a share grantee. Every
+        caller sits behind an admission gate (``can_access_agent``, a
+        grant, a route check) that refused a stranger already."""
+        return roles.acting_role(self.role, self.agent_roles, agent)
 
     def can_manage_agent(self, agent: str) -> bool:
         """Owner-tier check: can this user CHANGE this agent's behavior
@@ -194,9 +214,7 @@ class UserContext:
         NO blanket bypass here: it resolves the real per-agent role, so a
         prompt-injected session cannot manage an agent it doesn't own.
         """
-        if self.is_admin:
-            return True
-        return self.agent_roles.get(agent) == "manager"
+        return roles.can_manage(self.effective_role(agent))
 
     def can_edit_agent(self, agent: str) -> bool:
         """Editor-tier check: can this user WRITE to this agent's
@@ -208,29 +226,46 @@ class UserContext:
         owner tier. The two tiers compose: every manager is also an
         editor.
         """
-        if self.is_admin:
-            return True
-        return self.agent_roles.get(agent) in ("manager", "editor")
+        return roles.can_edit(self.effective_role(agent))
+
+    def can_write_workspace(self, agent: str) -> bool:
+        """Workspace-tier check: may this user WRITE this agent's shared
+        workspace? True for admin + per-agent manager + editor +
+        contributor. The contributor's whole grant is files: never the
+        agent's identity (``can_edit_agent`` stays the automation tier).
+        """
+        return roles.can_write_workspace(self.effective_role(agent))
 
     def can_write_files(self) -> bool:
         """Platform-level: is this user a creator/admin for ANY agent?"""
-        return self.role in ("admin", "creator")
+        return roles.is_creator_or_above(self.role)
 
     def can_manage_tasks(self) -> bool:
         """Platform-level: is this user a creator/admin? Used for platform-level checks."""
-        return self.role in ("admin", "creator")
+        return roles.is_creator_or_above(self.role)
 
 
 # --- CSRF state ---
 
 
-def create_oauth_state(redirect_uri: str | None = None) -> str:
-    """Generate a random state parameter and store it with a TTL."""
+def create_oauth_state(redirect_uri: str | None = None, *, purpose: str = "login",
+                       sub: str = "", return_to: str = "") -> str:
+    """Generate a random state parameter and store it with a TTL.
+
+    ``purpose`` is what the callback may do with the state: ``login`` issues
+    a session; ``confirm`` (SHARING.md "The confirm") mints a one-shot
+    confirm token for ``sub`` and sends the page back to ``return_to``. A
+    state never serves the other purpose; ``created_at`` (wall clock) is the
+    instant a confirm's ``auth_time`` is judged against."""
     import secrets
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = {
         "expiry": time.monotonic() + _STATE_TTL,
         "redirect_uri": redirect_uri,
+        "purpose": purpose,
+        "sub": sub,
+        "return_to": return_to,
+        "created_at": time.time(),
     }
     # Purge expired states
     now = time.monotonic()
@@ -258,8 +293,12 @@ def validate_oauth_state(state: str) -> dict | None:
 
 
 def create_session_jwt(sub: str, email: str, name: str, role: str,
-                       auth_provider: str = "local") -> str:
-    """Create an HS256 JWT for the dashboard session cookie."""
+                       auth_provider: str = "local", *,
+                       expiry_hours: int | None = None) -> str:
+    """Create an HS256 JWT for the dashboard session cookie.
+    ``expiry_hours`` saves a caller that already read the setting a second
+    read (``config.get_jwt_expiry_hours``)."""
+    hours = expiry_hours if expiry_hours is not None else config.get_jwt_expiry_hours()
     payload = {
         # Discriminator: marks this as a dashboard session cookie. Required by
         # validate_session_jwt so that OTHER JWTs signed with the same
@@ -272,12 +311,12 @@ def create_session_jwt(sub: str, email: str, name: str, role: str,
         "role": role,
         "auth_provider": auth_provider,
         "iat": int(time.time()),
-        "exp": int(time.time()) + config.get_jwt_expiry_hours() * 3600,
+        "exp": int(time.time()) + hours * 3600,
     }
     return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
 
 
-def apply_session_cookie(response, token: str) -> None:
+def apply_session_cookie(response, token: str, *, expiry_hours: int | None = None) -> None:
     """Set the HttpOnly session cookie with the canonical attributes.
 
     Single source of truth for the cookie's shape — used by login
@@ -293,7 +332,7 @@ def apply_session_cookie(response, token: str) -> None:
         secure=config.COOKIE_SECURE,
         samesite="lax",
         path="/",
-        max_age=config.get_jwt_expiry_hours() * 3600,
+        max_age=(expiry_hours if expiry_hours is not None else config.get_jwt_expiry_hours()) * 3600,
     )
 
 
@@ -325,6 +364,146 @@ def session_iat_after_password_change(user: dict, payload: dict) -> bool:
     return iat >= changed_ts - 5
 
 
+def _iso_ts(value) -> float | None:
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def session_token_is_current(user: dict, payload: dict) -> bool:
+    """The credential timeline for an agent session token: refused when
+    minted before the user's last password change or before the users row
+    existed (a person deleted and re-created under the same sub). A token
+    minted before tokens carried ``iat`` is tolerated: it expires within its
+    24 h. The same 5 s grace as the cookie."""
+    iat = payload.get("iat")
+    if not isinstance(iat, int):
+        return True
+    created = _iso_ts(user.get("created_at"))
+    if created is not None and iat < created - 5:
+        return False
+    return session_iat_after_password_change(user, payload)
+
+
+def session_token_holder_ok(payload: dict) -> bool:
+    """For code that validates a session JWT itself instead of through
+    ``get_current_user`` (hooks, the app proxy, the phone relay): False when
+    the token names a user who is gone or whose credentials changed after it
+    was minted. A token with no user is not judged here. Synchronous: call
+    it on the DB executor."""
+    sub = payload.get("user_sub") or ""
+    if not sub:
+        return True
+    user = task_store.get_user(sub)
+    return bool(user) and session_token_is_current(user, payload)
+
+
+# --- The forced password change and 2FA enrolment ---
+
+GATE_CHANGE_PASSWORD = "must_change_password"
+GATE_ENROLL_2FA = "must_enroll_2fa"
+_GATE_DETAIL = {
+    GATE_CHANGE_PASSWORD: "Password change required",
+    GATE_ENROLL_2FA: "Two-factor enrolment required",
+}
+# What a browser session held by the gate still reaches: the change and
+# enrolment screens' own calls, the session routes, and the Android app's
+# push registration (it runs once per launch, before the redirect).
+_GATE_EXEMPT = frozenset({
+    ("PUT", "/v1/users/me/password"),
+    ("POST", "/v1/users/me/totp/setup"),
+    ("POST", "/v1/users/me/totp/verify"),
+    ("GET", "/v1/users/me/passkeys"),
+    ("POST", "/v1/users/me/passkeys/register/options"),
+    ("POST", "/v1/users/me/passkeys/register/verify"),
+    ("GET", "/auth/me"),
+    ("GET", "/auth/config"),
+    ("POST", "/auth/logout"),
+    ("POST", "/v1/push/subscribe"),
+})
+# Only the answers that cannot hold anyone wrongly are cached: the policy
+# off, a person who has a passkey. A stale entry delays the gate by these
+# seconds at most after the policy goes on or a last passkey goes; it never
+# imposes the gate or keeps it after an enrolment.
+# The auth provider of a password account; an SSO account's is "oidc:<name>".
+_LOCAL_AUTH_PROVIDER = "local"
+_POLICY_OFF_TTL_S = 10.0
+_PASSKEY_TTL_S = 60.0
+_PASSKEY_CACHE_MAX = 4096
+_policy_off_until = 0.0
+_passkey_until: dict[str, float] = {}
+
+
+def clear_auth_gate_caches() -> None:
+    global _policy_off_until
+    _policy_off_until = 0.0
+    _passkey_until.clear()
+
+
+def _has_passkey_cached(sub: str, now: float) -> bool:
+    until = _passkey_until.get(sub)
+    if until is None:
+        return False
+    if until > now:
+        return True
+    _passkey_until.pop(sub, None)
+    return False
+
+
+def auth_gate(user: dict | None) -> str:
+    """The gate that holds a browser session of ``user``: ``must_change_password``,
+    ``must_enroll_2fa`` or "". For a local account it is the rule ``/auth/me``
+    reports, so the server refuses where the dashboard redirects; an SSO
+    account is never held (its identity provider owns the password and the
+    MFA). Synchronous: call it on the DB executor."""
+    global _policy_off_until
+    if not user:
+        return ""
+    if not (user.get("auth_provider") or _LOCAL_AUTH_PROVIDER).startswith(_LOCAL_AUTH_PROVIDER):
+        return ""
+    if user.get("must_change_password"):
+        return GATE_CHANGE_PASSWORD
+    if user.get("totp_enabled"):
+        return ""
+    sub = user.get("sub") or ""
+    now = time.monotonic()
+    # A passkey is a second factor only while passkeys are enabled: without
+    # them the password login never offers one.
+    from api.auth.webauthn import passkeys_enabled
+    passkeys_on = passkeys_enabled()
+    if _policy_off_until > now or (passkeys_on and _has_passkey_cached(sub, now)):
+        return ""
+    if task_store.get_platform_setting("require_2fa") != "1":
+        _policy_off_until = now + _POLICY_OFF_TTL_S
+        return ""
+    from storage.identity import webauthn_store
+    if passkeys_on and webauthn_store.count_credentials(sub) > 0:
+        if len(_passkey_until) >= _PASSKEY_CACHE_MAX:
+            _passkey_until.clear()
+        _passkey_until[sub] = now + _PASSKEY_TTL_S
+        return ""
+    return GATE_ENROLL_2FA
+
+
+def _enforce_auth_gate(request, principal: "UserContext") -> None:
+    """Refuse a held browser session everything but its exempt routes: 403
+    with ``X-Auth-Gate``, never 401 (the dashboard reads a 401 as a lost
+    session). HTTP routes are refused here; the dashboard socket applies
+    the same ``auth_gate`` rule in ``ws/dashboard.py``, at the handshake and
+    at each revalidation (close 4403)."""
+    if not isinstance(request, Request):
+        return
+    scope = request.scope
+    if (scope.get("method", ""), scope.get("path", "")) in _GATE_EXEMPT:
+        return
+    raise HTTPException(status_code=403, detail=_GATE_DETAIL[principal.auth_gate],
+                        headers={"X-Auth-Gate": principal.auth_gate})
+
+
 def validate_session_jwt(token: str) -> dict | None:
     """Decode and validate a dashboard session-cookie JWT. Returns payload or None.
 
@@ -353,13 +532,95 @@ def validate_session_jwt(token: str) -> dict | None:
 # --- Unified auth dependency ---
 
 
+_PRINCIPAL_UNSET = object()
+
+
+def _load_user(sub: str, *, with_default: bool = True) -> tuple[dict | None, dict, str]:
+    """The reads a principal needs, in one executor hop: the users row, the
+    per-agent roles and (dashboard cookies only) the default agent."""
+    user = task_store.get_user(sub)
+    if not user:
+        return None, {}, ""
+    roles = task_store.get_user_agent_roles(sub)
+    default_agent = (task_store.get_user_default_agent(sub) or "") if with_default else ""
+    return user, roles, default_agent
+
+
+def _load_cookie_user(sub: str) -> tuple[dict | None, dict, str, str]:
+    """``_load_user`` for a dashboard cookie, plus the person's gate."""
+    user, agent_roles, default_agent = _load_user(sub)
+    return user, agent_roles, default_agent, auth_gate(user)
+
+
+def user_context_for_sub(sub: str) -> UserContext | None:
+    """The cookie-shaped principal of a known user, for code that must
+    apply an access rule to a user who is not the caller (an agent acting
+    on a viewer's screen, a fan-out deciding who may see a row).
+    Synchronous: call it on the DB executor."""
+    if not sub:
+        return None
+    user, agent_roles, _ = _load_user(sub, with_default=False)
+    if not user:
+        return None
+    return UserContext(
+        sub=user["sub"],
+        email=user["email"],
+        name=user["name"],
+        role=user["role"],
+        agents=list(agent_roles.keys()),
+        display_name=user.get("display_name", ""),
+        agent_roles=agent_roles,
+        is_owner=bool(user.get("is_owner")),
+    )
+
+
+def effective_role_of(sub: str, agent: str, *, fallback_user: dict | None = None) -> str:
+    """The store-backed resolver: the live users row (or ``fallback_user``,
+    the dict a socket kept from connect time, when the row is gone), the
+    per-agent map, then ``auth/roles.effective_role`` — ``roles.ADMIN`` for a
+    platform admin, the row, else ``roles.NO_ACCESS``. Synchronous: call it
+    on the DB executor."""
+    if not sub:
+        return roles.NO_ACCESS
+    user = task_store.get_user(sub) or fallback_user or {}
+    return roles.effective_role(user.get("role"), task_store.get_user_agent_roles(sub), agent)
+
+
+def acting_role_of(sub: str, agent: str, *, fallback_user: dict | None = None) -> str:
+    """``effective_role_of`` read for an ADMITTED principal: ``roles.VIEWER``
+    when the sub holds no row (the session builders, the fan-outs, a
+    task's run identity). Synchronous: call it on the DB executor."""
+    return effective_role_of(sub, agent, fallback_user=fallback_user) or roles.VIEWER
+
+
 async def get_current_user(request: Request) -> UserContext | None:
     """Extract user from API key header OR session cookie.
 
-    Returns UserContext or None (caller decides whether to 401).
+    Returns UserContext or None (caller decides whether to 401). Resolved
+    once per connection: the result is memoized on ``request.state`` so a
+    handler calling this directly after the dependency ran, or a WebSocket
+    handler asking twice, never repeats the reads — which run on the DB
+    executor, never on the event loop. A browser session held by the forced
+    password change or 2FA enrolment is refused here (403) on every HTTP
+    route but its exempt ones.
     """
-    req = request
+    state = request.state if isinstance(request, HTTPConnection) else None
+    if state is not None:
+        memo = getattr(state, "otodock_principal", _PRINCIPAL_UNSET)
+    else:
+        memo = _PRINCIPAL_UNSET
+    if memo is not _PRINCIPAL_UNSET:
+        principal = memo
+    else:
+        principal = await _resolve_principal(request)
+        if state is not None:
+            state.otodock_principal = principal
+    if principal is not None and principal.auth_gate:
+        _enforce_auth_gate(request, principal)
+    return principal
 
+
+async def _resolve_principal(req: Request) -> UserContext | None:
     # 1. API key / session token header → synthetic admin UserContext
     auth_header = req.headers.get("authorization", "")
     if auth_header:
@@ -372,7 +633,7 @@ async def get_current_user(request: Request) -> UserContext | None:
                     sub="api-key",
                     email="api@internal",
                     name="API Key",
-                    role="admin",
+                    role=roles.ADMIN,
                     agents=[],
                     is_api_key=True,
                 )
@@ -384,31 +645,36 @@ async def get_current_user(request: Request) -> UserContext | None:
                 # back to the actual users row so API-call attribution
                 # (e.g. mcp_assignment_requests.requested_by) records the
                 # real identity rather than a synthetic session string.
-                # Falls back to the legacy synthetic placeholder for old
-                # tokens minted before this contract bump and for
-                # agent-scope sessions with no human owner.
+                # Agent-scope sessions with no human owner get the
+                # synthetic no-user principal.
                 sid = session_payload.get("sid") or ""
                 agent_name = session_payload.get("agent") or ""
                 user_sub = session_payload.get("user_sub") or ""
                 ext = _parse_external_claim(session_payload.get("ext") or "")
                 if user_sub:
-                    user = task_store.get_user(user_sub)
-                    if user:
-                        agent_roles = task_store.get_user_agent_roles(user_sub)
-                        return UserContext(
-                            sub=user["sub"],
-                            email=user["email"],
-                            name=user["name"],
-                            role=user["role"],
-                            agents=list(agent_roles.keys()),
-                            display_name=user.get("display_name", ""),
-                            agent_roles=agent_roles,
-                            is_owner=bool(user.get("is_owner")),
-                            is_api_key=True,
-                            session_id=sid,
-                            agent=agent_name,
-                            **ext,
-                        )
+                    user, agent_roles, _ = await run_db_fast(
+                        _load_user, user_sub, with_default=False,
+                    )
+                    # A token that names a person is only as good as the
+                    # person: gone, or a password changed since the mint,
+                    # and it resolves to nobody, never to the broader
+                    # no-user agent principal below.
+                    if not user or not session_token_is_current(user, session_payload):
+                        return None
+                    return UserContext(
+                        sub=user["sub"],
+                        email=user["email"],
+                        name=user["name"],
+                        role=user["role"],
+                        agents=list(agent_roles.keys()),
+                        display_name=user.get("display_name", ""),
+                        agent_roles=agent_roles,
+                        is_owner=bool(user.get("is_owner")),
+                        is_api_key=True,
+                        session_id=sid,
+                        agent=agent_name,
+                        **ext,
+                    )
                 # No-user session (phone / trigger / scheduled agent-scope /
                 # meeting service): a low-privilege agent principal. NOT admin —
                 # it can act on its own agent (see can_access_agent) and create
@@ -419,7 +685,7 @@ async def get_current_user(request: Request) -> UserContext | None:
                     sub=f"{SESSION_SUB_PREFIX}{sid}",
                     email="session@internal",
                     name="Session Token",
-                    role="agent",
+                    role=roles.SERVICE,
                     agents=[],
                     is_api_key=True,
                     session_id=sid,
@@ -433,14 +699,16 @@ async def get_current_user(request: Request) -> UserContext | None:
         payload = validate_session_jwt(session_cookie)
         if payload:
             sub = payload["sub"]
-            user = task_store.get_user(sub)
+            user, agent_roles, default_agent, gate = await run_db_fast(_load_cookie_user, sub)
             if user and not session_iat_after_password_change(user, payload):
                 # Cookie predates the last password change → dead. (logout-all,
                 # admin reset, and self-service reset all invalidate here.)
                 return None
             if user:
-                agent_roles = task_store.get_user_agent_roles(sub)
-                default_agent = task_store.get_user_default_agent(sub) or ""
+                # The sliding refresh re-mints this exact cookie without a
+                # second read (``middleware``): it passed the check above.
+                if isinstance(req, HTTPConnection):
+                    req.state.otodock_session_cookie = session_cookie
                 # auth_provider: prefer DB value, then JWT claim, else "local"
                 auth_prov = user.get("auth_provider") or payload.get("auth_provider", "local")
                 return UserContext(
@@ -454,7 +722,16 @@ async def get_current_user(request: Request) -> UserContext | None:
                     agent_roles=agent_roles,
                     auth_provider=auth_prov,
                     is_owner=bool(user.get("is_owner")),
+                    auth_gate=gate,
                 )
+        return None
+
+    # 3. The platform's own headless render: its own cookie, never next to a
+    # session or a bearer (those were judged above).
+    render_cookie = req.cookies.get("otodock_render")
+    if render_cookie:
+        from auth import render_principal
+        return await render_principal.principal_from_cookie(req, render_cookie)
 
     return None
 
@@ -509,6 +786,25 @@ def require_admin(user: UserContext | None) -> UserContext:
     return u
 
 
+def require_human(user: UserContext | None) -> UserContext:
+    """Raise 401/403 unless a dashboard-cookie principal: a person at the
+    keyboard, whatever their role (the role check stays at the call site).
+
+    Every bearer principal is refused, the real-user-backed session JWT
+    included: that token resolves to the session OWNER's real role, so a
+    route gated on the role alone lets agent code running inside the
+    sandbox act as its owner. Approving an app manifest, sharing, confirming
+    a deploy are decisions a human takes on a card, never a request a
+    prompt can make — those routes use this gate.
+    """
+    u = require_auth(user)
+    if getattr(u, "is_api_key", False):
+        raise HTTPException(
+            status_code=403, detail="User authentication required (not API key)"
+        )
+    return u
+
+
 def require_creator(user: UserContext | None) -> UserContext:
     """Raise 401/403 unless a REAL user (not API key) with creator+ role.
 
@@ -522,7 +818,7 @@ def require_creator(user: UserContext | None) -> UserContext:
         raise HTTPException(
             status_code=403, detail="User authentication required (not API key)"
         )
-    if u.role not in ("admin", "creator"):
+    if not roles.is_creator_or_above(u.role):
         raise HTTPException(status_code=403, detail="Creator role required")
     return u
 
@@ -551,9 +847,26 @@ def require_creator_interactive(user: UserContext | None) -> UserContext:
             status_code=403,
             detail="User authentication required (not a service credential)",
         )
-    if u.role not in ("admin", "creator"):
+    if not roles.is_creator_or_above(u.role):
         raise HTTPException(status_code=403, detail="Creator role required")
     return u
+
+
+def session_bound_to(param: str):
+    """A route dependency: a session token acts only on the agent it was
+    started for. Refuses (403) a session-token principal whose ``agent``
+    claim (an empty one included) differs from the path parameter
+    ``param``; every other principal goes on to the route's own gate. For
+    the per-agent routes that change an agent's behaviour; the cross-agent
+    reach of delegation, meetings and the session lists stays with their
+    own routes, and the role map is untouched."""
+    async def _bound(request: Request, user: UserContext | None = Depends(get_current_user)) -> None:
+        if user is not None and user.is_session and user.agent != request.path_params.get(param, ""):
+            raise HTTPException(
+                status_code=403,
+                detail=f"A session acts only on the agent it was started for ('{user.agent}')",
+            )
+    return _bound
 
 
 def require_agent_access(user: UserContext, agent_name: str) -> None:

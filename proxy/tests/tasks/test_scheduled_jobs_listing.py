@@ -72,3 +72,37 @@ class TestScheduledJobsExcludeInternal:
             assert all(j["id"].startswith("task_") for j in jobs)
         finally:
             scheduler._scheduler.remove_job("_some_future_internal_job")
+
+
+class TestNextRunTimes:
+    """The listing's one next-fire map: the in-memory jobs in embedded mode,
+    one computation over the definitions in standalone mode, and internal
+    jobs in neither."""
+
+    def test_embedded_reads_the_jobs_once(self, temp_db):
+        from services.scheduler import scheduler
+        scheduler._scheduler.add_job(
+            scheduler._check_timezone_change, "interval", minutes=1,
+            id="_tz_sync", replace_existing=True,
+        )
+        try:
+            _create_cron_task("task-map-1")
+            scheduler._register_task(scheduler._row_to_task(temp_db.get_dynamic_task("task-map-1")))
+            fires = scheduler.next_run_times()
+            assert set(fires) >= {"task-map-1"} and "_tz_sync" not in fires
+            assert fires["task-map-1"] == scheduler.next_run_time("task-map-1")
+        finally:
+            scheduler._scheduler.remove_job("_tz_sync")
+            if scheduler._scheduler.get_job("task_task-map-1"):
+                scheduler._scheduler.remove_job("task_task-map-1")
+
+    def test_standalone_computes_from_the_definitions(self, temp_db, monkeypatch):
+        import config
+        from services.scheduler import scheduler
+        monkeypatch.setattr(config, "SCHEDULER_MODE", "standalone")
+        _create_cron_task("task-map-2")
+        _create_cron_task("task-map-off")
+        temp_db.set_dynamic_task_enabled("task-map-off", False)
+        fires = scheduler.next_run_times()
+        assert "task-map-2" in fires and fires["task-map-2"]
+        assert "task-map-off" not in fires

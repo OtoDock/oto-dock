@@ -1,5 +1,6 @@
-"""The producer/pump plumbing: starting a stream, streaming through the pump,
-entering the pump loop, task pumps and the background monitors.
+"""The producer/pump plumbing: starting a stream, streaming through the pump
+(the pump-item kinds ``wire.PUMP_*``), entering the pump loop, task pumps
+and the background monitors.
 
 ``ChatStreamMixin`` is one of the mixins ``ws/dashboard_chat.py`` assembles into
 ``ChatController``; methods run with the connection's full attribute state
@@ -15,41 +16,37 @@ from fastapi import WebSocketDisconnect
 from storage import database as task_store
 from storage.pg import run_db
 from core.events import chat_writer
-from services.notifications import notification_manager
 from core.session.session_state import (
     _chat_streaming_state,
-    set_session_mode,
     get_session_mode,
     get_permission_queue,
-    resolve_permission,
-    resolve_question,
-    resolve_location,
     get_subagent_registry,
-    clear_session_liveness,
 )
-from core.events.common_events import CommonEvent, ERROR, QUEUE_TURN, ARTIFACT_TURN, PRODUCER_DONE
+from core.events.common_events import (
+    CommonEvent, ERROR, QUEUE_TURN, ARTIFACT_TURN, PRODUCER_DONE, TurnInput,
+)
 from core.execution_layer import ExecutionLayer
-from core.session.session_manager import resolve_execution_path
 from core.session.history_seed import consume_pending_seed
 from core.events.stream_pump import (
+    PUMP_RESYNC,
     ChatStreamPump,
     _active_pumps,
-    _pending_permissions,
     _bg_agent_monitor,
     bg_monitor_running,
     _bg_command_monitor,
     bg_command_monitor_running,
 )
 from core.events.bg_command_state import get_bg_command_registry
-from core.session import visibility as _vis
-# Imported by ws/dashboard.py AFTER its helpers are defined —
-# safe intra-unit circularity (see the class assembly there).
-from ws.dashboard import (
-    _EXTERNAL_DRIVEN_SOURCES,
-)
+from core.session import session_kind, visibility as _vis
 from ws.dashboard_chat_text import _queued_outgoing
+from ws import chat_phase
+from ws import wire_events as wire
+from ws.dashboard_dispatch import StreamCtx
 
 logger = logging.getLogger("claude-proxy")
+
+# Pump items a viewer sends per wake before it yields to its next wait.
+_VIEWER_DRAIN_MAX = 256
 
 
 class ChatStreamMixin:
@@ -190,13 +187,13 @@ class ChatStreamMixin:
         # the one-time persisted notice. Single chokepoint: every turn (user
         # send, TaskRunView send, queue drain, server nudge) passes through
         # here, AFTER the alive checks so the flag is never burned on a turn
-        # that fails to start. Direct-LLM rebuilds full history from the DB
-        # on its own — never seeded.
-        if target_chat_id and target_layer.capabilities.name != "direct-llm":
+        # that fails to start. An engine that rebuilds full history from the
+        # DB on its own is never seeded.
+        if target_chat_id and not target_layer.capabilities_for(sid).behaviour.rebuilds_history_from_db:
             prompt, reseed_notice = await run_db(consume_pending_seed, target_chat_id, prompt)
             if reseed_notice and is_viewed:
                 await self._send({
-                    "type": "system", "subtype": "session_reseeded",
+                    "type": wire.SYSTEM, "subtype": wire.SUBTYPE_SESSION_RESEEDED,
                     "message": reseed_notice, "chat_id": target_chat_id,
                 })
 
@@ -219,7 +216,7 @@ class ChatStreamMixin:
         # pending user messages (they were queued against that chat). A server
         # turn for another chat starts with an empty queue.
         if is_viewed:
-            msg_queue: list[str] = list(self.message_queue)
+            msg_queue: list[TurnInput] = list(self.message_queue)
             self.message_queue.clear()
             art_queue: list[dict] = list(self.artifact_queue)
             self.artifact_queue.clear()
@@ -276,10 +273,10 @@ class ChatStreamMixin:
         async def _produce():
             try:
                 async with target_layer.session_lock(sid):
-                    # Images are attached only to the initial turn — queued
-                    # follow-up messages are plain text. CLI/Codex layers
-                    # ignore the kwarg; Direct LLM uses it to build vision
-                    # content blocks.
+                    # Vision blocks for an engine that takes photos inline
+                    # (Direct LLM); CLI/Codex ignore the kwarg and read the
+                    # paths in the text. The drained batches below pass
+                    # theirs the same way.
                     initial_kwargs = {"inject_time": True}
                     if images:
                         initial_kwargs["images"] = images
@@ -297,13 +294,21 @@ class ChatStreamMixin:
                         self.pending_control_requests.clear()
                     while msg_queue or art_queue or sys_queue:
                         if msg_queue:
-                            combined = "\n\n".join(msg_queue)
+                            batch = TurnInput.combine(msg_queue)
                             msg_queue.clear()
-                            await event_queue.put(CommonEvent(type=QUEUE_TURN, data={"text": combined}))
+                            await event_queue.put(CommonEvent(
+                                type=QUEUE_TURN,
+                                data={"text": batch.text, "event_data": batch.event_meta},
+                            ))
                             # Stop-and-send: the note rides the engine prompt
-                            # only — the QUEUE_TURN row above stays raw.
-                            outgoing = _queued_outgoing(stop_flags, combined)
-                            async for event in target_layer.send_message(sid, outgoing, inject_time=True):
+                            # only — the QUEUE_TURN row above stays raw. The
+                            # engine text carries the batch's attachment
+                            # paths; an inline-photo engine gets the blocks.
+                            outgoing = _queued_outgoing(stop_flags, batch.cli_text)
+                            drain_kwargs = {"inject_time": True}
+                            if batch.images:
+                                drain_kwargs["images"] = batch.images
+                            async for event in target_layer.send_message(sid, outgoing, **drain_kwargs):
                                 await event_queue.put(event)
                         # Artifact interactions drain AFTER user words (lower
                         # authority) as their own framed turn per batch; the
@@ -371,13 +376,24 @@ class ChatStreamMixin:
     async def _stream_via_pump(self, pump: ChatStreamPump) -> dict:
         """Attach to a pump and stream events to the WebSocket.
 
-        Handles client messages (permissions, queue, abort, chat switch).
-        Returns {"detached": bool, "resume_msg": dict|None}.
+        Client messages go through the one dispatcher table
+        (``wire.INBOUND``, the handlers in ws/dashboard_dispatch.py) with
+        the stream in hand. Returns {"detached": bool, "resume_msg": dict|None}.
+
+        Event-driven: the socket, the pump queue and the live-app queue are
+        awaited together (``asyncio.wait``), so a frame goes out as soon as
+        it is queued, whatever the client does; ready queue items are sent
+        in batches of up to ``_VIEWER_DRAIN_MAX``. Never
+        ``wait_for(receive_text(), 0)``: a zero timeout cancels the receive
+        before it runs and starves client messages (Stop included).
         """
 
         result = {"detached": False, "resume_msg": None}
         self.streaming = True
-        ws_queue = pump.attach()
+        # Attach, then snapshot with NO await in between: every event from
+        # here on is either in the snapshot or in the queue, never both. The
+        # snapshot is a copy (later deltas keep mutating the live dict).
+        ws_queue = pump.attach(bounded=True)
 
         # Viewed-chat tag for every frame this loop emits. Deliberately the
         # connection's current chat, NOT pump.chat_id: multi-turn task chats
@@ -385,23 +401,10 @@ class ChatStreamMixin:
         # and the frontend drops stream frames tagged for a chat it isn't
         # showing (background chats must not render into the wrong view).
         frame_chat_id = self.chat_id or pump.chat_id
+        stream = StreamCtx(pump, ws_queue, frame_chat_id)
 
-        # Tell the client the viewed chat is streaming, DIRECTLY on this
-        # socket. The pump broadcasts the same chat_status via the per-user
-        # notify queue, but that queue is drained only BETWEEN the viewed
-        # chat's turns — so for the turn THIS loop is about to stream, the
-        # broadcast can never land mid-turn. Without the direct send, the
-        # dead-session resend path (abort → send → auto-rewarm → turn) left
-        # the slice on warmup_ready's 'ready' for the whole turn: no stop
-        # button, no timer, until a refresh rebuilt from live_state. Ordered
-        # after warmup_started/warmup_ready (same socket), duplicate-safe
-        # (setStreaming is idempotent).
-        await self._send({"type": "chat_status", "chat_id": frame_chat_id,
-                     "status": "streaming"})
-
-        # Send live_state AFTER attach — no gap between snapshot and subscriber.
-        # Send if there's any content worth restoring.
         live = _chat_streaming_state.get(pump.chat_id)
+        snapshot = None
         if live and (live.get("streaming")
                      # ^ an active turn with NO output yet must still be
                      # announced — it restores the timer/stop/streaming state
@@ -415,465 +418,264 @@ class ChatStreamMixin:
                      # and the badge was lost on reconnect):
                      or live.get("active_agents")
                      or live.get("active_commands")):
-            await self._send({"type": "live_state", **live, "chat_id": frame_chat_id})
+            snapshot = json.loads(json.dumps(
+                {"type": wire.LIVE_STATE, **live, "chat_id": frame_chat_id}))
+
+        # Tell the client the viewed chat is streaming, DIRECTLY on this
+        # socket. The pump broadcasts the same chat_status via the per-user
+        # notify queue, but that queue is drained only BETWEEN the viewed
+        # chat's turns, so for the turn THIS loop is about to stream, the
+        # broadcast can never land mid-turn. Without the direct send, the
+        # dead-session resend path (abort → send → auto-rewarm → turn) left
+        # the slice on warmup_ready's 'ready' for the whole turn: no stop
+        # button, no timer, until a refresh rebuilt from live_state. Ordered
+        # after warmup_started/warmup_ready (same socket), duplicate-safe
+        # (setStreaming is idempotent).
+        await self._send({"type": wire.CHAT_STATUS, "chat_id": frame_chat_id,
+                     "status": chat_phase.STREAMING})
+        if snapshot is not None:
+            await self._send(snapshot)
             logger.info(f"WS dashboard: sent live_state after attach for chat={pump.chat_id}")
 
+        recv_task = get_task = live_task = None
         try:
             while True:
-                # Read client messages (non-blocking)
-                try:
-                    raw = await asyncio.wait_for(self.websocket.receive_text(), timeout=0.05)
-                    client_msg = json.loads(raw)
-                    cm_type = client_msg.get("type", "")
-
-                    if cm_type == "permission_response":
-                        if await self._may_resolve_permission(client_msg["request_id"]):
-                            resolve_permission(client_msg["request_id"], client_msg.get("approved", True))
-                            for sid, pd in list(_pending_permissions.items()):
-                                if pd.get("request_id") == client_msg["request_id"]:
-                                    del _pending_permissions[sid]
-                                    break
-                            await pump.resolve_active_permission()
-                    elif cm_type == "question_response":
-                        # Codex request_user_input answer — the held turn resumes.
-                        # Validate the answerer drives this session, resolve the
-                        # waiter with the answers map, then ADVANCE the pump's
-                        # permission slot (else a later prompt in the same held turn
-                        # buffers forever + a reconnect re-renders the answered card).
-                        if await self._may_resolve_permission(client_msg["request_id"]):
-                            resolve_question(
-                                client_msg["request_id"], client_msg.get("answers") or {},
-                            )
-                            for sid, pd in list(_pending_permissions.items()):
-                                if pd.get("request_id") == client_msg["request_id"]:
-                                    del _pending_permissions[sid]
-                                    break
-                            await pump.resolve_active_permission()
-                    elif cm_type == "location_response":
-                        resolve_location(client_msg["request_id"], {
-                            "lat": client_msg.get("lat"),
-                            "lng": client_msg.get("lng"),
-                            "accuracy": client_msg.get("accuracy"),
-                            "error": client_msg.get("error"),
-                        })
-                    elif cm_type == "plan_review_response":
-                        if not await self._may_resolve_permission(client_msg["request_id"]):
-                            continue
-                        action = client_msg.get("action", "")
-                        plan_fn = client_msg.get("filename", "")
-                        # Approve ExitPlanMode for implement AND reject (cancel).
-                        # For "edit", deny so Claude stays in plan mode for revisions.
-                        approved = action != "edit"
-                        # Set session mode BEFORE resolve_permission so the hook
-                        # endpoint sees the correct mode when it wakes up (prevents
-                        # race where hook checks stale "plan" mode).
-                        if approved and self.session_id:
-                            if action == "reject":
-                                set_session_mode(self.session_id, self.pre_plan_mode_holder[0])
-                            elif action == "implement_accept_edits":
-                                set_session_mode(self.session_id, "acceptEdits")
-                            elif action == "implement_default":
-                                set_session_mode(self.session_id, "default")
-                        resolve_permission(client_msg["request_id"], approved)
-                        for sid, pd in list(_pending_permissions.items()):
-                            if pd.get("request_id") == client_msg["request_id"]:
-                                del _pending_permissions[sid]
-                                break
-                        await pump.resolve_active_permission()
-                        # Save the user's action in the DB turn block
-                        req_id = client_msg.get("request_id", "")
-                        for tb in pump._turn_blocks:
-                            if tb.get("type") == "plan_review" and tb.get("request_id") == req_id:
-                                tb["action"] = action
-                                break
-                        # Mode/plan-status writes ride the chat lane so they
-                        # stay ordered with the pump's own plan-mode write.
-                        if self.chat_id and plan_fn and action == "reject":
-                            chat_writer.submit(
-                                self.chat_id,
-                                functools.partial(task_store.update_chat_plan_status,
-                                                  self.chat_id, plan_fn, "rejected"),
-                                label="plan_rejected",
-                            )
-                            restored_mode = self.pre_plan_mode_holder[0]
-                            chat_writer.submit(
-                                self.chat_id,
-                                functools.partial(task_store.update_chat, self.chat_id,
-                                                  permission_mode=restored_mode),
-                                label="plan_mode_restore",
-                            )
-                            await self._send({"type": "mode_changed", "mode": restored_mode})
-                        if action == "implement_accept_edits":
-                            self.pending_control_requests.append(("set_permission_mode", {"mode": "acceptEdits"}))
-                            chat_writer.submit(
-                                self.chat_id,
-                                functools.partial(task_store.update_chat, self.chat_id,
-                                                  permission_mode="acceptEdits"),
-                                label="plan_implement_mode",
-                            )
-                            await self._send({"type": "mode_changed", "mode": "acceptEdits"})
-                            pump.queue_message("Please implement the plan now.")
-                            pump.implementing_plan = plan_fn
-                        elif action == "implement_default":
-                            chat_writer.submit(
-                                self.chat_id,
-                                functools.partial(task_store.update_chat, self.chat_id,
-                                                  permission_mode="default"),
-                                label="plan_implement_mode",
-                            )
-                            await self._send({"type": "mode_changed", "mode": "default"})
-                            pump.queue_message("Please implement the plan now.")
-                            pump.implementing_plan = plan_fn
-                    elif cm_type == "chat":
-                        text = client_msg.get("text", "")
-                        # Same task continue-gate the between-turns/warmup/
-                        # permission paths enforce — WITHOUT it a viewer of a
-                        # shared-only agent's task chat could steer/queue into a
-                        # running task run they're not allowed to continue
-                        # (Codex steer injects into the live turn). Applies only
-                        # to task-{run} chats; a no-op for regular chats.
-                        if text and await self._deny_task_continue(pump.chat_id):
-                            text = ""
-                        if text:
-                            # Steer-first: engines that support it (Codex
-                            # turn/steer) take the message INTO the running
-                            # turn — delivered exactly-once on accept, so it
-                            # must never also enter the queue. The user row
-                            # persists immediately (it is part of this turn's
-                            # context; the pump's turn blocks save after it,
-                            # matching the interactive tailers' mid-turn user
-                            # rows). Plan-implement enqueues use the
-                            # plan_review branch above and never steer.
-                            steered = False
-                            if self.session_id and self.layer:
-                                steered = bool(await self.layer.steer(self.session_id, text))
-                            # Either way the message re-targets the end-of-turn
-                            # alert to this device.
-                            notification_manager.set_chat_turn_origin(
-                                self.user_sub, pump.chat_id, self.notify_connection_id,
-                            )
-                            if steered:
-                                await chat_writer.submit(
-                                    pump.chat_id,
-                                    functools.partial(task_store.add_chat_message,
-                                                      pump.chat_id, "user", text,
-                                                      author_sub=self.user_sub),
-                                    label="steered_row",
-                                )
-                                await self._send({"type": "steered", "text": text, "chat_id": frame_chat_id})
-                            else:
-                                idx = pump.queue_message(text)
-                                if idx < 0:
-                                    await self._send_error(
-                                        "Too many queued messages — wait for the "
-                                        "current turn to finish.")
-                                else:
-                                    await self._send({"type": "queued", "index": idx, "text": text, "chat_id": frame_chat_id})
-                                    # Stop-and-send (Claude CLI headless): fire a
-                                    # graceful-only interrupt so the producer's
-                                    # queue drain delivers this message as the
-                                    # next turn in seconds, not at turn end.
-                                    self._maybe_stop_and_send(pump)
-                    elif cm_type == "artifact_interaction":
-                        # display_ui backchannel mid-turn: QUEUE ONLY — page
-                        # events never steer a running turn (lower authority
-                        # than the user typing). Validation mirrors the
-                        # between-turns handler.
-                        from ws import artifact_interactions as _ai
-                        a_token = str(client_msg.get("token") or "")
-                        a_chat = str(client_msg.get("chat_id") or "")
-                        a_frame: dict = {"type": "artifact_ack", "token": a_token}
-                        if not a_chat or a_chat != pump.chat_id:
-                            a_frame.update(status="denied", reason="not the viewed chat")
-                        elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, a_chat):
-                            a_frame.update(status="unavailable", reason="meeting in progress")
-                        else:
-                            interaction, a_err = _ai.validate_interaction(
-                                a_chat, a_token,
-                                str(client_msg.get("title") or ""),
-                                client_msg.get("payload"),
-                            )
-                            if interaction is None:
-                                a_frame.update(status="denied", reason=a_err)
-                            elif not _ai.check_rate(a_chat, a_token):
-                                a_frame.update(status="denied", reason="rate limited")
-                            elif pump.queue_artifact(interaction):
-                                a_frame["status"] = "queued"
-                                notification_manager.set_chat_turn_origin(
-                                    self.user_sub, pump.chat_id, self.notify_connection_id,
-                                )
-                            else:
-                                a_frame.update(status="denied", reason="queue full")
-                        await self._send(a_frame)
-                    elif cm_type == "app_action":
-                        # Mini-app send_prompt mid-turn: QUEUE ONLY — same
-                        # never-steer rule as artifact interactions (the
-                        # approved template doesn't upgrade page events to
-                        # steering authority). Validation mirrors the
-                        # between-turns handler.
-                        from ws import artifact_interactions as _ai
-                        ap_id = str(client_msg.get("app_id") or "")
-                        ap_action = str(client_msg.get("action_id") or "")
-                        ap_chat = str(client_msg.get("chat_id") or "")
-                        ap_frame: dict = {"type": "app_action_ack", "app_id": ap_id,
-                                          "action_id": ap_action}
-                        if not ap_chat or ap_chat != pump.chat_id:
-                            ap_frame.update(status="denied", reason="not the viewed chat")
-                        elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, ap_chat):
-                            ap_frame.update(status="unavailable", reason="meeting in progress")
-                        else:
-                            interaction, ap_err = _ai.validate_app_action(
-                                ap_chat, self.agent_name or "", self.user_sub or "",
-                                ap_id, ap_action, client_msg.get("args"),
-                            )
-                            if interaction is None:
-                                ap_frame.update(status="denied", reason=ap_err)
-                            elif not _ai.check_rate(ap_chat, f"app:{ap_id}"):
-                                ap_frame.update(status="denied", reason="rate limited")
-                            elif pump.queue_artifact(interaction):
-                                ap_frame["status"] = "queued"
-                                notification_manager.set_chat_turn_origin(
-                                    self.user_sub, pump.chat_id, self.notify_connection_id,
-                                )
-                            else:
-                                ap_frame.update(status="denied", reason="queue full")
-                        await self._send(ap_frame)
-                    elif cm_type == "cancel_queued":
-                        idx = client_msg.get("index", -1)
-                        text = pump.cancel_queued(idx)
-                        if text is not None:
-                            await self._send({"type": "queue_removed", "index": idx, "text": text, "chat_id": frame_chat_id})
-                    elif cm_type == "cancel_all_queued":
-                        combined = pump.cancel_all_queued()
-                        await self._send({"type": "queue_cleared", "text": combined, "chat_id": frame_chat_id})
-                    elif cm_type == "abort":
-                        logger.info(f"WS dashboard: abort via pump, session={self.session_id}")
-                        # Layer abort FIRST: on the graceful path (Claude
-                        # control_request interrupt / Codex turn/interrupt) the
-                        # producer is the sole consumer of the closing turn's
-                        # tail events and must stay alive — the pump runs to
-                        # PRODUCER_DONE and persists the partial turn; the CLI
-                        # layer's watchdog falls back to killpg if the turn
-                        # doesn't close. Hard path keeps today's cancel order.
-                        graceful = False
-                        if self.session_id and self.layer:
-                            graceful = bool(await self.layer.abort(self.session_id))
-                        # Queued messages never survive an abort (the user asked
-                        # everything to stop): without the clear, the graceful
-                        # producer's post-turn drain would run them as new turns
-                        # and the hard path silently dropped them (pre-existing).
-                        _dropped_q = pump.cancel_all_queued()
-                        if _dropped_q:
-                            await self._send({"type": "queue_cleared",
-                                              "text": _dropped_q,
-                                              "chat_id": frame_chat_id})
-                        if not graceful:
-                            pump.abort()
-                        pump.detach(ws_queue)
-                        # Kill process but keep session entry for auto-resume.
-                        # Next send_message() detects dead process -> auto-resume.
-                        # Don't clear session_id — it stays set for the next message.
-                        if self.session_id:
-                            _pending_permissions.pop(self.session_id, None)
-                        self.implementing_plan = ""
-                        # Mark the cancelled turn: the scheduler/delegate layer
-                        # derives user_interrupted from last_turn_aborted on
-                        # EVERY abort path; the graceful flag additionally
-                        # suppresses the next turn's cancelled-context
-                        # injection (the engine's own history has the partial
-                        # turn).
-                        if self.chat_id:
-                            _abort_cid = self.chat_id
-
-                            def _abort_job(_g=graceful) -> dict | None:
-                                # Flag write then the row read, one lane job.
-                                task_store.update_chat(_abort_cid,
-                                                       last_turn_aborted=True,
-                                                       last_abort_graceful=_g)
-                                return task_store.get_chat(_abort_cid)
-
-                            _abort_chat = await chat_writer.submit(
-                                _abort_cid, _abort_job, label="abort_flags",
-                            )
-                            # A hard CLI Stop kills the whole process group —
-                            # any bg agents/commands died with it; clear their
-                            # badges. Graceful keeps the process (and its bg
-                            # work) alive; Codex keeps its daemon either way.
-                            if self.session_id and not graceful:
-                                _abort_path = resolve_execution_path(
-                                    self.agent_name,
-                                    (_abort_chat or {}).get("execution_path", ""),
-                                )
-                                if _abort_path == "claude-code-cli":
-                                    clear_session_liveness(self.session_id, reason="abort")
-                        await self._send({"type": "aborted", "chat_id": frame_chat_id})
-                        self.pending_control_requests.clear()
+                if recv_task is None:
+                    recv_task = asyncio.create_task(self._receive_client_text())
+                if get_task is None:
+                    get_task = asyncio.create_task(ws_queue.get())
+                if live_task is None:
+                    live_task = asyncio.create_task(self.live_queue.get())
+                done, _ = await asyncio.wait(
+                    {recv_task, get_task, live_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Live-app frames first: they must reach the screen during
+                # the turn.
+                if live_task in done:
+                    frame, live_task = live_task.result(), None
+                    await self._send(frame)
+                    await self._drain_live_queue()
+                if recv_task in done:
+                    task, recv_task = recv_task, None
+                    if await self._stream_client_message(task, pump, ws_queue, stream, result):
                         break
-                    elif cm_type == "resume_chat":
-                        logger.info(f"WS dashboard: resume_chat during pump streaming, detaching")
-                        pump.detach(ws_queue)
-                        self.pending_control_requests.clear()
-                        result["detached"] = True
-                        result["resume_msg"] = client_msg
+                if get_task in done:
+                    item, get_task = get_task.result(), None
+                    if await self._stream_pump_items(item, ws_queue, frame_chat_id, result):
                         break
-                    elif cm_type == "mode_change":
-                        await self._handle_mode_change(client_msg)
-                    elif cm_type == "model_change":
-                        await self._handle_model_change(client_msg)
-                    elif cm_type == "ping":
-                        await self._pong()
-                    elif cm_type == "close":
-                        pump.detach(ws_queue)
-                        result["detached"] = True
-                        break
-                    elif cm_type in ("warmup", "pre_warmup"):
-                        # Chat-switch intent for a DIFFERENT chat (e.g. the user
-                        # opened a new chat and sent its first message while this
-                        # chat is still generating). Detach — the pump keeps
-                        # running headless — and hand the message back to the
-                        # main loop for normal dispatch. These were previously
-                        # swallowed here: the new chat's first turn was lost and
-                        # this chat's frames kept rendering into the new view.
-                        logger.info(f"WS dashboard: {cm_type} during pump streaming — detach + dispatch")
-                        pump.detach(ws_queue)
-                        self.pending_control_requests.clear()
-                        result["detached"] = True
-                        result["resume_msg"] = client_msg
-                        break
-                    elif cm_type == "user_active":
-                        notification_manager.set_connection_active(self.user_sub, self.notify_connection_id, True)
-                    elif cm_type == "user_idle":
-                        notification_manager.set_connection_active(
-                            self.user_sub, self.notify_connection_id, False,
-                            away=bool(client_msg.get("away")),
-                        )
-                    elif cm_type == "chat_read":
-                        # Read receipts arrive mid-turn too (the client marks
-                        # the chat read on every history load) — same handler
-                        # as between turns; DB + fan-out only, stream-safe.
-                        await self._handle_chat_read(client_msg)
-                    else:
-                        logger.warning(
-                            f"WS dashboard: unhandled client message type={cm_type!r} during pump streaming — dropped"
-                        )
-                except asyncio.TimeoutError:
-                    pass
-                except (WebSocketDisconnect, RuntimeError):
-                    logger.info(f"WS dashboard: WS disconnected during pump streaming")
-                    pump.detach(ws_queue)
-                    result["detached"] = True
-                    break
-                except json.JSONDecodeError:
-                    pass
-
-                # Read from pump's event queue
-                try:
-                    item = await asyncio.wait_for(ws_queue.get(), timeout=0.15)
-                except asyncio.TimeoutError:
-                    continue
-
-                pt = item.get("pump_type", "")
-
-                if pt == "ws_event":
-                    event = item["event"]
-                    # Plan mode: track pre-plan mode for restoration
-                    if event.get("type") == "plan_mode":
-                        if event.get("action") == "enter":
-                            self.pre_plan_mode_holder[0] = get_session_mode(self.session_id) or "default"
-                        # session mode is already set by the pump
-                    await self._send({**event, "chat_id": frame_chat_id})
-
-                elif pt == "perm_permission_prompt":
-                    perm_data = item["perm_data"]
-                    event = {"type": "permission_prompt",
-                             "request_id": perm_data["request_id"],
-                             "tool_name": perm_data["tool_name"],
-                             "tool_input": perm_data.get("tool_input", {}),
-                             "chat_id": frame_chat_id}
-                    if item.get("meeting_agent"):
-                        event["meeting_agent"] = item["meeting_agent"]
-                    await self._send(event)
-
-                elif pt == "perm_plan_review":
-                    perm_data = item["perm_data"]
-                    await self._send({"type": "plan_review",
-                                 "request_id": perm_data["request_id"],
-                                 "plan": perm_data.get("plan", ""),
-                                 "tool_input": perm_data.get("tool_input", {}),
-                                 "filename": item.get("filename", ""),
-                                 "chat_id": frame_chat_id})
-
-                elif pt == "perm_question_prompt":
-                    # Codex request_user_input → the dashboard question card. Unlike
-                    # Claude's fire-and-forget `question` (answer = a fresh chat turn),
-                    # this carries a request_id: the held turn resumes only when the
-                    # FE answers via `question_response`.
-                    perm_data = item["perm_data"]
-                    await self._send({"type": "question",
-                                 "request_id": perm_data["request_id"],
-                                 "tool_name": perm_data.get("tool_name", "request_user_input"),
-                                 "tool_input": perm_data.get("tool_input", {}),
-                                 "chat_id": frame_chat_id})
-
-                elif pt == "perm_mode_restored":
-                    await self._send({"type": "mode_changed", "mode": item["mode"], "chat_id": frame_chat_id})
-
-                elif pt == "queue_turn":
-                    await self._send({"type": "queue_sent", "text": item["text"], "chat_id": frame_chat_id})
-
-                elif pt == "artifact_interaction":
-                    # Drained backchannel interaction — the transcript chip
-                    # renders at delivery time (the row is already persisted).
-                    await self._send({
-                        "type": "artifact_interaction",
-                        "token": item.get("token", ""),
-                        "title": item.get("title", ""),
-                        "payload": item.get("payload"),
-                        "chat_id": frame_chat_id,
-                    })
-
-                elif pt == "app_action":
-                    # Drained mini-app send_prompt action — same chip-at-
-                    # delivery contract as artifact_interaction.
-                    await self._send({
-                        "type": "app_action",
-                        "app_id": item.get("app_id", ""),
-                        "slug": item.get("slug", ""),
-                        "title": item.get("title", ""),
-                        "action_id": item.get("action_id", ""),
-                        "label": item.get("label", ""),
-                        "prompt": item.get("prompt", ""),
-                        "chat_id": frame_chat_id,
-                    })
-
-                elif pt == "is_done":
-                    pass  # Turn boundary — pump already saved to DB
-
-                elif pt == "all_done":
-                    await self._send({"type": "done", "chat_id": frame_chat_id})
-                    break
-
-                elif pt == "error":
-                    await self._send({"type": "error", "message": item["message"], "chat_id": frame_chat_id})
-                    break
-
-                elif pt in ("detached", "pump_ended"):
-                    # Another WS took over, or the pump finished/died. A
-                    # pump_ended seen HERE means this loop never consumed
-                    # all_done (it attached after the producer's final flush —
-                    # e.g. a mid-turn re-attach racing the turn's end), so the
-                    # client never got its `done`: always send it. A loop that
-                    # did see all_done broke at that branch and never reads
-                    # pump_ended, so this cannot double-send.
-                    if pt == "pump_ended":
-                        await self._send({"type": "done", "chat_id": frame_chat_id})
-                    result["detached"] = True
-                    break
-
         finally:
             self.streaming = False
+            pump.detach(ws_queue)
+            await self._settle_stream_tasks(recv_task, get_task, live_task)
 
         return result
+
+    async def _settle_stream_tasks(self, recv_task, get_task, live_task) -> None:
+        """Leave the viewer loop: cancel every pending task, await them
+        together, then keep what completed meanwhile: a client message goes
+        back to the connection (the multiplex reads it before the socket), a
+        live-app frame is sent. A pump item is dropped (the viewer is gone)."""
+        tasks = [t for t in (recv_task, get_task, live_task) if t is not None]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if (recv_task is not None and not recv_task.cancelled()
+                and recv_task.exception() is None):
+            self._client_pushback.append(recv_task.result())
+        if (live_task is not None and not live_task.cancelled()
+                and live_task.exception() is None):
+            await self._send(live_task.result())
+
+    async def _stream_client_message(self, task, pump, ws_queue, stream, result) -> bool:
+        """One client message during streaming; True ends the loop."""
+        try:
+            raw = task.result()
+            client_msg = json.loads(raw)
+            if not isinstance(client_msg, dict):
+                await self._send_error("Invalid message")
+                return False
+            # The between-turn multiplex's revalidation, here too: a turn
+            # can last as long as its viewer keeps it going.
+            if not await self._session_still_holds():
+                pump.detach(ws_queue)
+                result["detached"] = True
+                return True
+            cm_type = client_msg.get("type", "")
+            # The one dispatcher table (ws/wire_events.INBOUND): the
+            # policy says what a message does to a streaming turn.
+            spec = wire.INBOUND.get(cm_type)
+            if spec is None or spec.mid_stream == wire.MID_STREAM_DROP:
+                logger.warning(
+                    f"WS dashboard: unhandled client message type={cm_type!r} during pump streaming: dropped"
+                )
+            elif spec.mid_stream == wire.MID_STREAM_DETACH:
+                # Chat-switch intent (resume_chat) or a warmup for a
+                # DIFFERENT chat (the user opened a new chat and sent
+                # its first message while this one is still
+                # generating). Detach (the pump keeps running
+                # headless) and hand the message back to the main
+                # loop for normal dispatch. Swallowed here, the new
+                # chat's first turn would be lost and this chat's
+                # frames would keep rendering into the new view.
+                logger.info(f"WS dashboard: {cm_type} during pump streaming: detaching")
+                pump.detach(ws_queue)
+                self.pending_control_requests.clear()
+                result["detached"] = True
+                result["resume_msg"] = client_msg
+                return True
+            elif spec.mid_stream == wire.MID_STREAM_END:
+                pump.detach(ws_queue)
+                result["detached"] = True
+                return True
+            else:
+                outcome = await getattr(self, spec.handler)(client_msg, stream=stream)
+                if outcome == wire.HANDLED_BREAK:
+                    return True
+        except (WebSocketDisconnect, RuntimeError):
+            logger.info(f"WS dashboard: WS disconnected during pump streaming")
+            pump.detach(ws_queue)
+            result["detached"] = True
+            return True
+        except json.JSONDecodeError:
+            pass
+        return False
+
+    async def _stream_pump_items(self, first: dict, ws_queue, frame_chat_id: str,
+                                 result: dict) -> bool:
+        """``first`` plus every item already waiting (up to the drain cap),
+        each sent in order; True ends the loop (the rest of the batch is
+        dropped, as the loop never reads past its end). The send does not
+        wait on the socket, so the batch ends with an explicit yield."""
+        items = [first]
+        for _ in range(_VIEWER_DRAIN_MAX):
+            try:
+                items.append(ws_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        for item in items:
+            if await self._stream_pump_item(item, frame_chat_id, result):
+                return True
+        await asyncio.sleep(0)
+        return False
+
+    async def _stream_pump_item(self, item: dict, frame_chat_id: str, result: dict) -> bool:
+        """One pump item to the socket; True ends the loop."""
+        pt = item.get("pump_type", "")
+
+        if pt == wire.PUMP_WS_EVENT:
+            event = item["event"]
+            # Plan mode: track pre-plan mode for restoration
+            if event.get("type") == wire.PLAN_MODE:
+                if event.get("action") == "enter":
+                    self.pre_plan_mode_holder[0] = get_session_mode(self.session_id) or "default"
+                # session mode is already set by the pump
+            await self._send({**event, "chat_id": frame_chat_id})
+
+        elif pt == wire.PUMP_PERMISSION_PROMPT:
+            perm_data = item["perm_data"]
+            event = {"type": wire.PERMISSION_PROMPT,
+                     "request_id": perm_data["request_id"],
+                     "tool_name": perm_data["tool_name"],
+                     "tool_input": perm_data.get("tool_input", {}),
+                     "chat_id": frame_chat_id}
+            if item.get("meeting_agent"):
+                event["meeting_agent"] = item["meeting_agent"]
+            await self._send(event)
+
+        elif pt == wire.PUMP_PLAN_REVIEW:
+            perm_data = item["perm_data"]
+            await self._send({"type": wire.PLAN_REVIEW,
+                         "request_id": perm_data["request_id"],
+                         "plan": perm_data.get("plan", ""),
+                         "tool_input": perm_data.get("tool_input", {}),
+                         "filename": item.get("filename", ""),
+                         "chat_id": frame_chat_id})
+
+        elif pt == wire.PUMP_QUESTION_PROMPT:
+            # Codex request_user_input → the dashboard question card. Unlike
+            # Claude's fire-and-forget `question` (answer = a fresh chat turn),
+            # this carries a request_id: the held turn resumes only when the
+            # FE answers via `question_response`.
+            perm_data = item["perm_data"]
+            await self._send({"type": wire.QUESTION,
+                         "request_id": perm_data["request_id"],
+                         "tool_name": perm_data.get("tool_name", ""),
+                         "tool_input": perm_data.get("tool_input", {}),
+                         "chat_id": frame_chat_id})
+
+        elif pt == wire.PUMP_MODE_RESTORED:
+            await self._send({"type": wire.MODE_CHANGED, "mode": item["mode"], "chat_id": frame_chat_id})
+
+        elif pt == wire.PUMP_QUEUE_TURN:
+            sent_frame = {"type": wire.QUEUE_SENT, "text": item["text"], "chat_id": frame_chat_id}
+            if item.get("images"):
+                sent_frame["images"] = item["images"]
+            if item.get("files"):
+                sent_frame["files"] = item["files"]
+            await self._send(sent_frame)
+
+        elif pt == wire.PUMP_ARTIFACT_INTERACTION:
+            # Drained backchannel interaction: the transcript chip
+            # renders at delivery time (the row is already persisted).
+            await self._send({
+                "type": wire.ARTIFACT_INTERACTION,
+                "token": item.get("token", ""),
+                "title": item.get("title", ""),
+                "payload": item.get("payload"),
+                "chat_id": frame_chat_id,
+            })
+
+        elif pt == wire.PUMP_APP_ACTION:
+            # Drained app send_prompt action: same chip-at-
+            # delivery contract as artifact_interaction.
+            await self._send({
+                "type": wire.APP_ACTION,
+                "app_id": item.get("app_id", ""),
+                "slug": item.get("slug", ""),
+                "title": item.get("title", ""),
+                "action_id": item.get("action_id", ""),
+                "label": item.get("label", ""),
+                "prompt": item.get("prompt", ""),
+                "chat_id": frame_chat_id,
+            })
+
+        elif pt == wire.PUMP_IS_DONE:
+            pass  # Turn boundary: pump already saved to DB
+
+        elif pt == wire.PUMP_ALL_DONE:
+            await self._send({"type": wire.DONE, "chat_id": frame_chat_id})
+            return True
+
+        elif pt == wire.PUMP_ERROR:
+            await self._send({"type": wire.ERROR, "message": item["message"], "chat_id": frame_chat_id})
+            return True
+
+        elif pt == PUMP_RESYNC:
+            # This viewer fell a full queue behind: resync it the way a
+            # reconnect does (chat_history, then a fresh live_state) through
+            # a same-chat resume that never reaps the pump.
+            logger.info(f"WS dashboard: viewer behind on chat={frame_chat_id}: resyncing")
+            result["detached"] = True
+            result["resume_msg"] = {"type": wire.IN_RESUME_CHAT,
+                                    "chat_id": frame_chat_id, "_resync": True}
+            return True
+
+        elif pt in (wire.PUMP_DETACHED, wire.PUMP_ENDED):
+            # Another WS took over, or the pump finished/died. A
+            # pump_ended seen HERE means this loop never consumed
+            # all_done (it attached after the producer's final flush,
+            # e.g. a mid-turn re-attach racing the turn's end), so the
+            # client never got its `done`: always send it. A loop that
+            # did see all_done broke at that branch and never reads
+            # pump_ended, so this cannot double-send.
+            if pt == wire.PUMP_ENDED:
+                await self._send({"type": wire.DONE, "chat_id": frame_chat_id})
+            result["detached"] = True
+            return True
+
+        return False
 
     async def _enter_pump_loop(self) -> ChatStreamPump | None:
         """If there's an active pump for the current chat, attach and stream.
@@ -893,12 +695,13 @@ class ChatStreamMixin:
         # Bounded so a pathological promise→die→promise→die interleave can't
         # spin; in practice one re-send converges (the turn is persisted).
         history_resend_budget = 2
+        resynced = False
         while True:
             pump = _active_pumps.get(self.chat_id)
             # Never attach to an active external session's pump (phone/website/
             # webhook): attach() would steal its stream and kill the live call.
             # These are viewed read-only via chat_history (_handle_resume_chat).
-            if pump and pump.source_type in _EXTERNAL_DRIVEN_SOURCES:
+            if pump and pump.source_type in session_kind.EXTERNAL_DRIVEN_SOURCE_TYPES:
                 pump = None
             if (not pump or pump.is_done):
                 pump = await run_db(self._find_task_pump)
@@ -908,7 +711,7 @@ class ChatStreamMixin:
                 max_retries = 15 if is_meeting else 5  # 30s for meetings, 10s for tasks
                 should_poll = (
                     last_pump and task_wait_retries < max_retries and (
-                        (self.chat_id and self.chat_id.startswith("task-"))
+                        session_kind.is_task_chat_id(self.chat_id)
                         or is_meeting
                     )
                 )
@@ -933,6 +736,10 @@ class ChatStreamMixin:
                     )
                     await self._handle_resume_chat({"chat_id": self.chat_id})
                     continue
+                if resynced:
+                    # The turn ended during a resync: what the normal exit
+                    # below would have flushed is still pending.
+                    await self._flush_pending_control_requests()
                 break
 
             task_wait_retries = 0
@@ -941,7 +748,7 @@ class ChatStreamMixin:
             # New turn's pump found (different chat_id) — re-send history
             # so the frontend gets the new turn's user message before streaming
             if (pump.chat_id != last_pump_chat_id and last_pump_chat_id is not None
-                    and self.chat_id and self.chat_id.startswith("task-")):
+                    and session_kind.is_task_chat_id(self.chat_id)):
                 await self._handle_resume_chat({"chat_id": self.chat_id})
 
             last_pump_chat_id = pump.chat_id
@@ -950,7 +757,8 @@ class ChatStreamMixin:
 
             if result.get("resume_msg"):
                 rm = result["resume_msg"]
-                if rm.get("type") == "resume_chat":
+                resynced = bool(rm.get("_resync"))
+                if rm.get("type") == wire.IN_RESUME_CHAT:
                     prev_chat, prev_sid = self.chat_id, self.session_id
                     await self._handle_resume_chat(rm)
                     # Only a SAME-chat resume supersedes the old sid — on a
@@ -970,7 +778,7 @@ class ChatStreamMixin:
             # For task chats and meetings: after a turn finishes, re-send
             # chat_history, then loop to wait for the next pump.
             if not result.get("detached") and (
-                (self.chat_id and self.chat_id.startswith("task-"))
+                session_kind.is_task_chat_id(self.chat_id)
                 or await run_db(task_store.get_active_meeting_for_chat, self.chat_id)
             ):
                 await self._handle_resume_chat({"chat_id": self.chat_id})
@@ -991,7 +799,7 @@ class ChatStreamMixin:
                                           self.chat_id, pump.implementing_plan, "implemented"),
                         label="plan_implemented",
                     )
-                    await self._send({"type": "plan_status",
+                    await self._send({"type": wire.PLAN_STATUS,
                                  "filename": pump.implementing_plan,
                                  "status": "implemented"})
                     pump.implementing_plan = ""
@@ -1012,9 +820,9 @@ class ChatStreamMixin:
         chat_id (task-{runId}). The user views the first run's chat, but the
         active pump may be on a later turn's chat_id.
         """
-        if not self.chat_id or not self.chat_id.startswith("task-"):
+        if not session_kind.is_task_chat_id(self.chat_id):
             return None
-        run_id = self.chat_id.removeprefix("task-")
+        run_id = session_kind.run_id_of_chat(self.chat_id)
         run = task_store.get_run(run_id)
         if not run or not run.get("session_id"):
             return None

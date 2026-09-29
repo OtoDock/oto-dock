@@ -112,15 +112,15 @@ def test_targets_user_scope_without_owner_is_empty():
     assert qm._targets_for(sc) == []
 
 
-def test_targets_shared_scope_is_managers_and_editors(monkeypatch, tmp_path):
+def test_targets_shared_scope_is_the_workspace_tier(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent_store.create_agent("acme", "Acme")
     database.set_user_agents("user-manager", ["acme"], "user-admin", {"acme": "manager"})
-    database.set_user_agents("user-viewer2", ["acme"], "user-admin", {"acme": "editor"})
+    database.set_user_agents("user-viewer2", ["acme"], "user-admin", {"acme": "contributor"})
     database.set_user_agents("user-viewer", ["acme"], "user-admin", {"acme": "viewer"})
     sc = _scope("acme:shared", "shared", "acme")
     targets = set(qm._targets_for(sc))
-    assert targets == {"user-manager", "user-viewer2"}  # NOT the viewer
+    assert targets == {"user-manager", "user-viewer2"}  # the contributor writes there; NOT the viewer
 
 
 # --- message formatting -----------------------------------------------------
@@ -181,3 +181,18 @@ async def test_check_quotas_skips_when_nothing_limited(monkeypatch):
     monkeypatch.setattr(sq, "iter_scopes", boom)
     await qm.check_quotas()
     assert called["n"] == 0  # early-returned before enumerating scopes
+
+
+# --- staged uploads count against the user's bucket -------------------------
+
+@pytest.mark.asyncio
+async def test_measure_adds_a_users_staged_uploads(monkeypatch):
+    """A chunked upload sits in the staging area until it completes; the
+    user's soft-tier usage counts it, the shared scope never does."""
+    from api.media import uploads
+    monkeypatch.setattr(sq, "hard_enabled", lambda: False)
+    monkeypatch.setattr(uploads, "staged_bytes_for", lambda sub: 1234 if sub == "local:u1" else 0)
+    user = _scope("acme:user:u1", "user", "acme", "u1", owner_sub="local:u1")
+    assert await qm._measure(user) == (1234, 0)
+    shared = _scope("acme:shared", "shared", "acme")
+    assert await qm._measure(shared) == (0, 0)

@@ -20,14 +20,18 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_auth
-from core.session.visibility import chat_history_owner, nouser_read_targets
+from core.session import session_kind
+from core.session.visibility import (
+    chat_history_owner, is_task_chat_owner, nouser_read_targets, shared_chat_owner,
+)
 from services.delegation.spawn_authz import (
     authorize_spawn, check_delegation_chain, validate_spawn_overrides,
 )
 from services.delegation import file_transfer, lane_status
-from services.scheduler import scheduler
+from services.scheduler import lane_steer, scheduler, task_kinds
 from storage import database as task_store
 from storage.mcp import mcp_store
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.delegation-api")
 router = APIRouter()
@@ -78,6 +82,10 @@ class SpawnDelegateRequest(BaseModel):
     model: str | None = None
     layer: str | None = None
     mode: Literal["interactive", "non-interactive"] | None = None
+    # Checks (CHECKS.md) on the worker's runs: the target agent's offered
+    # checks and the caller's own, by name; the agent's mandatory ones run
+    # regardless. On continue_id the list replaces the worker chat's.
+    checks: list[str] | None = None
 
 
 def _resolve_continued_chat(continue_id: str) -> dict | None:
@@ -193,6 +201,8 @@ async def spawn_delegate(
         await asyncio.to_thread(
             validate_spawn_overrides, effective_agent, ov_layer, ov_model,
         )
+    from api.tasks.tasks import _validate_checks
+    checks = await _validate_checks(effective_agent, req.checks, u)
 
     # Callback anchors come from the caller's OWN session token (the
     # delegating session). A cookie / master-key caller has no session —
@@ -222,9 +232,11 @@ async def spawn_delegate(
     worker_chat_id = ""
     if continued_chat is not None:
         # Continuation authority: a worker of THIS chat, or a chat in the
-        # caller's own history pool — never an arbitrary chat id.
-        if (continued_chat.get("parent_chat_id") != parent_chat_id
-                and continued_chat.get("user_sub") != authz.chat_owner):
+        # caller's own history pool — never an arbitrary chat id. A caller
+        # with no chat (a cookie, the master key) has no workers: its empty
+        # parent would match every chat that is nobody's worker.
+        is_worker = bool(parent_chat_id) and continued_chat.get("parent_chat_id") == parent_chat_id
+        if not is_worker and continued_chat.get("user_sub") != authz.chat_owner:
             raise HTTPException(
                 403,
                 "continue_id does not refer to a worker of this chat or "
@@ -251,6 +263,22 @@ async def spawn_delegate(
         ov_mode = (continued_chat.get("execution_mode")
                    if continued_chat.get("execution_mode") in
                    ("interactive", "non-interactive") else None)
+        # A lane that is WORKING on this caller's run takes the follow-up
+        # into its live turn (the engine reads it at its next tool boundary,
+        # nothing is interrupted) — no second run, the running run's report
+        # covers it. Any refusal queues a run behind the lane, as before.
+        steered = await lane_steer.try_steer_continue(
+            continued_chat, req.prompt,
+            parent_chat_id=parent_chat_id, source_agent=authz.source_agent,
+        )
+        if steered is not None:
+            logger.info(
+                f"Delegated follow-up steered: run={steered['run_id']} "
+                f"agent={effective_agent} by={authz.created_by} "
+                f"worker_chat={worker_chat_id} continued={req.continue_id}"
+            )
+            return {**steered, "scope": authz.scope, "scope_note": None,
+                    "project_id": project_id or None}
     elif req.surface == "chat":
         worker_chat_id = str(uuid.uuid4())
         # Best-effort: the run resolves its real model itself (override
@@ -263,7 +291,7 @@ async def spawn_delegate(
                 effective_agent, layer=ov_layer)
         except Exception:
             worker_model = ov_model or ""
-        await asyncio.to_thread(
+        worker_row = await asyncio.to_thread(
             task_store.create_chat,
             worker_chat_id, authz.chat_owner, effective_agent, "auto",
             model=worker_model, origin="delegated",
@@ -271,6 +299,8 @@ async def spawn_delegate(
             parent_chat_id=parent_chat_id, project_id=project_id,
             delegate_role="worker", title=req.name,
         )
+        from api.apps import catalog
+        catalog.announce_new_chat(worker_row)
 
     # The delegating chat is an orchestrator from its first delegation —
     # project or not (the dock and the sidebar accent key on the role).
@@ -310,13 +340,14 @@ async def spawn_delegate(
         # Explicit marker — run classification, the spawn cap, and the
         # runs-listing split all key on it (no use_persistent derivation).
         # Auto-cleanup after the run still applies (keys on schedule/trigger).
-        task_type="delegate",
+        task_type=task_kinds.DELEGATE,
         target_chat_id=worker_chat_id or None,
         parent_chat_id=parent_chat_id or None,
         project_id=project_id or None,
         override_model=ov_model,
         override_execution_path=ov_layer,
         override_execution_mode=ov_mode,
+        checks=checks,
     )
     await scheduler.add_dynamic_task(task)
     # The persistent callback anchor (survives browser close / proxy restart)
@@ -329,7 +360,7 @@ async def spawn_delegate(
         )
 
     run_id = await scheduler.trigger_task_now(
-        task, trigger_type="manual", trigger_source=authz.source_agent,
+        task, trigger_type=task_kinds.TRIGGER_MANUAL, trigger_source=authz.source_agent,
     )
 
     # Delegate badge on the delegating chat — emitted by the PROXY once the
@@ -343,7 +374,7 @@ async def spawn_delegate(
             # "type" rides along so the event-row fallback below persists the
             # same shape the pump stores (the dashboard's history reload keys
             # blocks on event_data["type"], not the event_type column).
-            "type": "delegate_spawn",
+            "type": wire.DELEGATE_SPAWN,
             "task_id": task_id,
             "task_name": req.name,
             "agent": effective_agent,
@@ -357,7 +388,7 @@ async def spawn_delegate(
         ):
             await asyncio.to_thread(
                 task_store.add_chat_message, parent_chat_id, "event", "",
-                event_type="delegate_spawn", event_data=json.dumps(spawn_data),
+                event_type=wire.DELEGATE_SPAWN, event_data=json.dumps(spawn_data),
             )
 
     logger.info(
@@ -383,11 +414,18 @@ def _broadcast_orchestrator_stamp(chat_id: str, project_id: str) -> None:
     which otherwise refreshes only on its 30s poll / turn-end refetch."""
     from core.session.session_state import broadcast_chat_frame
     broadcast_chat_frame(chat_id, {
-        "type": "chat_meta",
+        "type": wire.CHAT_META,
         "chat_id": chat_id,
         "delegate_role": "orchestrator",
         "project_id": project_id,
     })
+    # The catalog's ``sessions`` feed sees the stamp on every screen of the
+    # chat's users, not only the socket viewing the chat.
+    try:
+        from api.apps import catalog
+        catalog.chat_meta_changed(chat_id, {"delegate_role": "orchestrator", "project_id": project_id})
+    except Exception:
+        logger.debug("catalog sessions delta (stamp) failed", exc_info=True)
 
 
 class SendFilesRequest(BaseModel):
@@ -599,7 +637,7 @@ def _caller_visibility(u: UserContext, x_agent_name: str | None) -> tuple[str, s
     if acting is not None:
         owner = chat_history_owner(source_agent, acting) if source_agent else acting
     elif source_agent:
-        owner = f"agent::{source_agent}"
+        owner = shared_chat_owner(source_agent)
     else:
         owner = ""
     caller_chat_id = ""
@@ -621,9 +659,9 @@ def _nouser_edge_peek(u: UserContext, chat: dict) -> bool:
     if not chat_agent or chat_agent not in nouser_read_targets(u):
         return False
     owner = chat.get("user_sub") or ""
-    if owner == f"agent::{chat_agent}":
+    if owner == shared_chat_owner(chat_agent):
         return True
-    if owner.startswith("task::") or (chat.get("id") or "").startswith("task-"):
+    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
         from api.agents.chats import _run_for_chat
         run = _run_for_chat(chat)
         if run is not None:
@@ -706,7 +744,7 @@ async def list_delegation_sessions(
                 # No-user callers read agent-shape pools (rule 1: no user
                 # to follow); user-backed callers read the acting user's
                 # dashboard pools.
-                pool_owner = (f"agent::{slug}" if acting is None
+                pool_owner = (shared_chat_owner(slug) if acting is None
                               else chat_history_owner(slug, acting))
                 for c in task_store.list_chats(pool_owner, agent=slug, limit=limit):
                     rows[c["id"]] = c
@@ -797,9 +835,9 @@ async def peek_delegation_session(
         parts: list[str] = []
         for b in blocks:
             bt = b.get("type")
-            if bt == "text" and b.get("content"):
+            if bt == wire.LIVE_TEXT and b.get("content"):
                 parts.append(str(b["content"]))
-            elif bt == "tool":
+            elif bt == wire.PERSISTED_TOOL:
                 label = b.get("summary") or b.get("name") or "tool"
                 state = "running" if b.get("active") else "done"
                 parts.append(f"[tool {state}: {label}]")

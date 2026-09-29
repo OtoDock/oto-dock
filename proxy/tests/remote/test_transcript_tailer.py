@@ -54,6 +54,8 @@ class _Captured(list):
     interleaving assertions."""
     events: list
     order: list
+    sync: list       # each message row's sync_search flag
+    rebuilds: list   # the chat ids whose search row was rebuilt, in order
 
 
 @pytest.fixture(autouse=True)
@@ -61,15 +63,19 @@ def _capture(monkeypatch):
     rows = _Captured()
     rows.events = []
     rows.order = []
+    rows.sync = []
+    rows.rebuilds = []
     import storage.database as db
 
-    def _add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
+    def _add(chat_id, role, content="", event_type="", event_data="", author_sub="", **kw):
         if role == "event":
             rows.events.append((event_type, json.loads(event_data)))
             rows.order.append(("event", event_type))
         else:
             rows.append((role, content))
             rows.order.append((role, content))
+            rows.sync.append(kw.get("sync_search", True))
+    monkeypatch.setattr(db, "rebuild_chat_search", rows.rebuilds.append)
 
     monkeypatch.setattr(db, "add_chat_message", _add)
     # Title backfill reads the chat + may update it — mock both so the tests stay
@@ -811,7 +817,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     release = threading.Event()
     rows = []
 
-    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub=""):
+    def _slow_add(chat_id, role, content="", event_type="", event_data="", author_sub="", **kw):
         rows.append((role, content))
         entered.set()
         release.wait(timeout=5)
@@ -1112,7 +1118,24 @@ def test_usage_shared_only_agent_bills_agent_scope(tmp_path, _capture, _usage_en
     T.tail_transcript("su6", "cu6", path)
     (row,) = _usage_env
     assert row["scope"] == "agent" and row["agent"] == "shared-bot"
-    assert row["source_type"] == "chat"  # chat row's own source_type wins
+    assert row["source_type"] == "chat"  # an unrecorded session on a chat row bills chat
+
+
+def test_usage_bills_the_drivers_kind(tmp_path, _capture, _usage_env, monkeypatch):
+    """The usage row carries the SESSION's kind (pump parity): an interactive
+    task run — the scheduler's session, ``client_type`` task — bills ``task``
+    even on a row minted before the column said so (``source_type='chat'``
+    with a ``task-`` id); a session nobody classified bills the row's kind."""
+    import storage.database as db
+    from core.session import session_state
+    monkeypatch.setattr(db, "get_chat", lambda cid: {
+        "id": "task-run-k1", "user_sub": "task::bot", "title": "t", "agent": "bot",
+        "source_type": "chat"})
+    monkeypatch.setattr(session_state, "get_session_client_type", lambda sid: "task")
+    path = _write(tmp_path, _assistant_usage("msg_k", {"type": "text", "text": "x"}))
+    T.tail_transcript("su8", "cu8", path)
+    (row,) = _usage_env
+    assert row["source_type"] == "task"
 
 
 def test_usage_unbound_session_attributes_default(tmp_path, _capture, _usage_env,
@@ -1379,3 +1402,39 @@ def test_uuidless_synthetic_text_line_still_persists(tmp_path, _capture):
                               "content": [{"type": "text", "text": "api error text"}]}})
     T.tail_lines("s1", "c1", [line])
     assert _capture == [("assistant", "api error text")]
+
+
+def test_redelivered_user_line_persists_once(_capture):
+    """The CLI inserts its file-history-snapshot line BEFORE the prompt it
+    just appended, so a byte-offset tail (the satellite's) can forward the
+    shifted prompt line twice, ~one poll apart. The user row is claimed by
+    line uuid like assistant text (T1, 2026-09-21: every remote Claude
+    prompt landed twice)."""
+    line = _line({"type": "user", "uuid": "u-shift-1",
+                  "message": {"role": "user", "content": "[Current time: X]\n\nonce only"}})
+    T.tail_lines("s-u1", "c-u1", [line])
+    T.tail_lines("s-u1", "c-u1", [line])
+    assert _capture == [("user", "[Current time: X]\n\nonce only")]
+
+
+def test_distinct_user_lines_same_text_both_persist(_capture):
+    l1 = _line({"type": "user", "uuid": "u-a", "message": {"role": "user", "content": "again"}})
+    l2 = _line({"type": "user", "uuid": "u-b", "message": {"role": "user", "content": "again"}})
+    T.tail_lines("s-u2", "c-u2", [l1])
+    T.tail_lines("s-u2", "c-u2", [l2])
+    assert _capture == [("user", "again"), ("user", "again")]
+
+
+def test_a_batch_rebuilds_the_search_row_once(tmp_path, _capture):
+    """The message rows skip the per-row search rebuild; one rebuild
+    closes the batch, and a batch with nothing new rebuilds nothing."""
+    path = _write(
+        tmp_path,
+        _user("one"),
+        _assistant([{"type": "text", "text": "two"}, {"type": "text", "text": "three"}]),
+    )
+    T.tail_transcript("s9", "c9", path)
+    assert _capture.sync == [False, False, False]
+    assert _capture.rebuilds == ["c9"]
+    T.tail_transcript("s9", "c9", path)
+    assert _capture.rebuilds == ["c9"]

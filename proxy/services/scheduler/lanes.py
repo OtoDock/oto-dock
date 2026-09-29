@@ -10,11 +10,13 @@ this package without the platform.
 
 import asyncio
 import logging
+import re
 import time
 
 
 import config
 from storage import database as task_store
+from storage.automation import run_status
 
 logger = logging.getLogger("claude-proxy.scheduler")
 
@@ -80,6 +82,16 @@ def _limit_notice(final_output: str) -> str | None:
     return None
 
 
+_PASTED_CONTENT_TAG_RE = re.compile(r"</?pasted_content\b[^>]*>")
+
+
+def _prompt_key(text: str) -> str:
+    """A user row and the prompt that produced it, made comparable: the
+    Claude TUI journals a multi-line paste wrapped in ``<pasted_content>``
+    tags, and every terminal re-flows whitespace."""
+    return " ".join(_PASTED_CONTENT_TAG_RE.sub("", text or "").split())
+
+
 def _collect_lane_output_since(chat_id: str, after_id: int = 0,
                                skip_row_id: int = 0, own_prompt: str = "") -> str:
     """Batched delegate-lane collection: everything the lane produced after
@@ -87,9 +99,10 @@ def _collect_lane_output_since(chat_id: str, after_id: int = 0,
     ``[User interjected]`` so the delegating agent sees redirects/steering in
     order. The run's own driven prompt is excluded: by row id when the caller
     persisted it (headless), by first-content-match otherwise (interactive
-    runs, where the transcript tailer backfills it as a user row)."""
-    own_prompt = (own_prompt or "").strip()
-    own_prompt_pending = bool(own_prompt)
+    runs, where the transcript tailer backfills it as a user row, possibly
+    wrapped as pasted content — see ``_prompt_key``)."""
+    own_key = _prompt_key(own_prompt)
+    own_prompt_pending = bool(own_key)
     messages = task_store.get_chat_messages(chat_id)
     parts = []
     for m in messages:
@@ -102,7 +115,7 @@ def _collect_lane_output_since(chat_id: str, after_id: int = 0,
         if m["role"] == "assistant" and content:
             parts.append(content)
         elif m["role"] == "user" and content:
-            if own_prompt_pending and content.strip() == own_prompt:
+            if own_prompt_pending and _prompt_key(content) == own_key:
                 own_prompt_pending = False
                 continue
             parts.append(f"[User interjected]: {content}")
@@ -256,8 +269,8 @@ def _post_run_session_action(chat_row: dict | None) -> tuple[str, bool]:
     crashes never stamp the graceful flag, so they always close."""
     row = chat_row or {}
     if not row.get("last_turn_aborted"):
-        return "completed", False
-    return "user_interrupted", bool(row.get("last_abort_graceful"))
+        return run_status.COMPLETED, False
+    return run_status.USER_INTERRUPTED, bool(row.get("last_abort_graceful"))
 
 
 async def _reap_prior_lane_pump(chat_id: str, run_id: str) -> None:

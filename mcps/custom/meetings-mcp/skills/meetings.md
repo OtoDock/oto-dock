@@ -8,7 +8,7 @@ Act directly in-session when the task is straightforward and doesn't need multip
 
 ### Who you can meet
 
-Meetings follow YOUR USER'S access, not your delegation roster: you can invite any agent your user can access, and each participant joins with that user's role there (your prompt's Meeting Rooms section lists them). Meetings are deliberate, observable communication (every turn lands in a visible transcript), not a work channel: to make another agent DO something, use `delegate()`, which works only on your wired delegation targets. Sessions without a user (scheduled agent-scope runs, phone) can only meet their own delegation targets.
+Meetings follow YOUR USER'S access, not your delegation roster: you can invite any agent your user can access, and each participant joins with that user's role there (your prompt's Meeting Rooms section lists them); a participant that runs as the agent itself (an agent-scope meeting, or a Shared-only agent) needs your user's editor role or above there. Meetings are deliberate, observable communication (every turn lands in a visible transcript), not a work channel: to make another agent DO something, use `delegate()`, which works only on your wired delegation targets. Sessions without a user (scheduled agent-scope runs, phone) can only meet their own delegation targets.
 
 ### Rules
 

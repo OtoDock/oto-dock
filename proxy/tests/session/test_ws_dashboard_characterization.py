@@ -12,6 +12,7 @@ their own modules alongside this one.
 """
 
 import asyncio
+import uuid
 
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
@@ -67,6 +68,121 @@ class TestAuthGate:
             assert not ws.accepted
             assert ws.sent == []
         run_ws_scenario(scenario)
+
+
+    # ── the Origin rule ──────────────────────────────
+
+    def _origin_scenario(self, origin, *, host="otodock.example", public=""):
+        import config
+        from ws import dashboard
+
+        async def scenario():
+            old = config.DASHBOARD_PUBLIC_URL
+            config.DASHBOARD_PUBLIC_URL = public
+            try:
+                from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+                headers = {"host": host}
+                if origin is not None:
+                    headers["origin"] = origin
+                ws = FakeDashboardWebSocket(cookie=session_cookie(), headers=headers)
+                task = asyncio.create_task(dashboard.ws_dashboard_handler(ws))
+                for _ in range(100):
+                    if ws.accepted or ws.closed or task.done():
+                        break
+                    await asyncio.sleep(0.01)
+                if not task.done():
+                    ws.client_disconnect()
+                await asyncio.wait_for(task, 5)
+                return ws
+            finally:
+                config.DASHBOARD_PUBLIC_URL = old
+        return scenario
+
+    def test_foreign_origin_closes_4003_before_accept(self, temp_db):
+        out = {}
+
+        async def run():
+            out["ws"] = await self._origin_scenario("https://www.example")()
+        run_ws_scenario(run)
+        ws = out["ws"]
+        assert ws.closed == (4003, "Origin not allowed") and not ws.accepted and ws.sent == []
+
+    def test_null_origin_closes_4003_before_accept(self, temp_db):
+        out = {}
+
+        async def run():
+            out["ws"] = await self._origin_scenario("null")()
+        run_ws_scenario(run)
+        assert out["ws"].closed[0] == 4003 and not out["ws"].accepted
+
+    def test_own_public_and_missing_origins_are_accepted(self, temp_db):
+        out = []
+
+        async def run():
+            out.append(await self._origin_scenario(None)())
+            out.append(await self._origin_scenario("http://otodock.example")())
+            out.append(await self._origin_scenario(
+                "https://agents.example.com", host="127.0.0.1:8400",
+                public="https://agents.example.com")())
+        run_ws_scenario(run)
+        assert all(ws.accepted for ws in out)
+
+    # ── the gate and the password timeline on the socket ───────────
+
+    def test_a_held_session_closes_4403_after_accept_with_nothing_sent(self, temp_db):
+        from auth import providers
+        from storage import database as db
+        from ws import dashboard
+        providers.clear_auth_gate_caches()
+        db.update_user_auth_fields("user-viewer", must_change_password=True)
+
+        async def scenario():
+            from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+            before = dict(dashboard._dashboard_notify_queues)
+            ws = FakeDashboardWebSocket(cookie=session_cookie(
+                sub="user-viewer", email="viewer@test.com", name="Viewer User", role="member"))
+            await dashboard.ws_dashboard_handler(ws)
+            assert ws.accepted and ws.closed == (4403, "must_change_password")
+            assert ws.sent == []
+            assert dashboard._dashboard_notify_queues == before
+        run_ws_scenario(scenario)
+
+    def test_a_cookie_older_than_the_password_change_closes_4001(self, temp_db):
+        import time as _time
+        from datetime import datetime, timezone
+
+        import jwt
+
+        import config
+        from storage.pg import get_conn
+        from ws import dashboard
+        with get_conn() as conn:
+            conn.execute("UPDATE users SET password_changed_at=%s WHERE sub='user-admin'",
+                         (datetime.now(timezone.utc).isoformat(),))
+            conn.commit()
+        stale = jwt.encode({"purpose": "session", "sub": "user-admin", "email": "admin@test.com",
+                            "name": "Admin User", "role": "admin", "auth_provider": "local",
+                            "iat": int(_time.time()) - 3600, "exp": int(_time.time()) + 3600},
+                           config.JWT_SECRET, algorithm="HS256")
+
+        async def scenario():
+            from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+            ws = FakeDashboardWebSocket(cookie=stale)
+            await dashboard.ws_dashboard_handler(ws)
+            assert ws.closed == (4001, "Invalid or expired session") and not ws.accepted
+        run_ws_scenario(scenario)
+
+    def test_revalidation_finds_a_gate_that_started_mid_session(self, temp_db):
+        from auth import providers
+        from storage import database as db
+        from ws.dashboard import DashboardConnection
+        from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+        providers.clear_auth_gate_caches()
+        ws = FakeDashboardWebSocket(cookie=session_cookie())
+        conn = DashboardConnection(ws, user_sub="user-admin", user=db.get_user("user-admin"))
+        assert conn._revalidate_session() and conn._held_gate == ""
+        db.update_user_auth_fields("user-admin", must_change_password=True)
+        assert conn._revalidate_session() and conn._held_gate == "must_change_password"
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +365,7 @@ class TestNewChatWarmup:
                     "agent": slug,
                     "execution_path": "claude-code-cli",
                     "execution_target": "local",
+                    "new_chat": True,
                 })
                 chat_id = started["chat_id"]
                 # dispatcher continues while the spawn is gated
@@ -278,7 +395,116 @@ class TestNewChatWarmup:
                 assert chat_row["agent"] == slug
                 assert chat_row["user_sub"] == "user-admin"
                 assert sid in [s for s, _kw in slots.acquired]
+                # The funnel waits its turn in the admission queue and names
+                # the session's MCP config.
+                import config as _config
+                _kw = dict(slots.acquired)[sid]
+                assert _kw["queue_wait_s"] == _config.ADMISSION_QUEUE_WAIT_S
+                assert _kw["mcp_config_path"] == cfg.mcp_config_path
+                assert _kw["user_sub"] == "user-admin"
 
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+
+    def test_socket_close_keeps_the_live_sessions_reservation(self, temp_db, monkeypatch):
+        """Closing the socket leaves a live session's admission slot in
+        place; the path that ends the session releases it."""
+        layer = FakeExecutionLayer()
+        slots = stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        seen = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                _chat_id, sid = await warm_new_chat(ws, layer, slug)
+                seen["sid"] = sid
+                ws.client_disconnect()
+        run_ws_scenario(scenario)
+        assert seen["sid"] in [s for s, _kw in slots.acquired]
+        assert seen["sid"] not in slots.released
+
+
+# ---------------------------------------------------------------------------
+# warmup_started.new_chat: true only for a chat THIS warmup minted. The
+# dashboard moves the new-chat page's draft onto the frame's chat_id only
+# then — a re-warmed existing chat's frame must never take it.
+# ---------------------------------------------------------------------------
+
+class TestWarmupStartedNewChatFlag:
+    def test_existing_chat_rewarm_is_not_new(self, temp_db, monkeypatch):
+        from storage import database as task_store
+        layer = FakeExecutionLayer()
+        layer.start_gate = asyncio.Event()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, "user-admin", slug, "default",
+                               model=TEST_MODEL,
+                               execution_path="claude-code-cli")
+        # A bound session that is neither alive nor resumable: the send
+        # re-warms the chat through the backgrounded spawn.
+        task_store.update_chat(cid, session_id="dead-sid")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "warmup", "agent": slug,
+                                "chat_id": cid})
+                await ws.expect({
+                    "type": "warmup_started", "chat_id": cid, "agent": slug,
+                    "execution_path": "claude-code-cli",
+                    "execution_target": "local", "new_chat": False,
+                })
+                await ws.expect({"type": "notification_count", "count": 0})
+                layer.start_gate.set()
+                ready = await ws.expect({
+                    "type": "warmup_ready", "session_id": ANY,
+                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "execution_path": "claude-code-cli",
+                    "execution_target": "local", "fallback_reason": None,
+                    "offline_machine_name": "", "interactive": False,
+                })
+                # The dead session was not resumed: a fresh spawn, the row
+                # rebound to it, the history seed flagged for the next turn.
+                assert ready["session_id"] != "dead-sid"
+                _sid, cfg = layer.started[0]
+                assert cfg.resume is False
+                row = temp_db.get_chat(cid)
+                assert row["session_id"] == ready["session_id"]
+                assert row["pending_history_seed"] == "resume_failed"
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+    def test_unknown_chat_id_mints_a_new_chat(self, temp_db, monkeypatch):
+        layer = FakeExecutionLayer()
+        layer.start_gate = asyncio.Event()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "warmup", "agent": slug,
+                                "chat_id": "no-such-chat"})
+                started = await ws.expect({
+                    "type": "warmup_started", "chat_id": ANY, "agent": slug,
+                    "execution_path": "claude-code-cli",
+                    "execution_target": "local", "new_chat": True,
+                })
+                assert started["chat_id"] != "no-such-chat"
+                await ws.expect({"type": "notification_count", "count": 0})
+                layer.start_gate.set()
+                await ws.expect({
+                    "type": "warmup_ready", "session_id": ANY,
+                    "chat_id": started["chat_id"], "mode": "default",
+                    "model": TEST_MODEL, "execution_path": "claude-code-cli",
+                    "execution_target": "local", "fallback_reason": None,
+                    "offline_machine_name": "", "interactive": False,
+                })
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
@@ -309,7 +535,7 @@ class TestChatTurn:
                 started = await ws.expect({
                     "type": "warmup_started", "chat_id": ANY, "agent": slug,
                     "execution_path": "claude-code-cli",
-                    "execution_target": "local",
+                    "execution_target": "local", "new_chat": True,
                 })
                 chat_id = started["chat_id"]
                 await ws.expect({"type": "notification_count", "count": 0})
@@ -447,7 +673,9 @@ class TestChatTurn:
                 assert img_meta["name"] == "pic.png"
                 assert img_meta["path"].startswith(
                     "users/admin/workspace/uploads/photos/img_")
-                assert img_meta["path"].endswith(".png")
+                # An opaque PNG is re-encoded as a JPEG (only transparency,
+                # a palette or a deep image keeps PNG).
+                assert img_meta["path"].endswith(".jpg")
 
                 import config as cfg
                 assert (cfg.AGENTS_DIR / slug / img_meta["path"]).is_file()

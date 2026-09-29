@@ -271,11 +271,13 @@ class _Cfg:
         self.captured = captured
         self.execution_target = "local"
         self.execution_path = "claude-code-cli"
+        self.mcp_config_path = "/tmp/mcp-heal.json"
         self.interactive = None
 
 
 def _patch_seam(monkeypatch, spawn_layer, *, interactive=False):
-    """Patch the seam's spawn collaborators; returns captured build kwargs."""
+    """Patch the seam's spawn collaborators; returns captured build kwargs
+    (plus ``captured["admission"]``, the kwargs of the slot acquire)."""
     captured = {}
 
     async def _fake_build(**kwargs):
@@ -294,6 +296,7 @@ def _patch_seam(monkeypatch, spawn_layer, *, interactive=False):
 
     async def _acquire(sid, **kw):
         slots["acquired"].append(sid)
+        captured["admission"] = kw
         return True
     monkeypatch.setattr(concurrency, "acquire_chat_slot", _acquire)
     monkeypatch.setattr(
@@ -381,3 +384,53 @@ async def test_seam_refuses_unknown_chat_and_user(temp_db, monkeypatch):
     assert spawn_layer.started == []
     # Refusals must not have consumed the resume protocol.
     assert layer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_seam_queues_for_a_slot_and_reserves_for_its_mcps(temp_db, monkeypatch):
+    """A headless heal waits its turn in the admission queue
+    and names its MCP config so a Direct-LLM session reserves for its stdio
+    MCPs."""
+    import config
+    _make_chat(temp_db, model="model-x", execution_path="claude-code-cli")
+    layer = _SeamLayer(resumable=True)
+    spawn_layer = _SpawnLayer()
+    captured, _slots = _patch_seam(monkeypatch, spawn_layer)
+    await headless_resume.resume_dead_session_headless(
+        "chat-1", "sid-dead", layer, user_sub="user-admin")
+    adm = captured["admission"]
+    assert adm["queue_wait_s"] == config.ADMISSION_QUEUE_WAIT_S
+    assert adm["mcp_config_path"] == "/tmp/mcp-heal.json"
+    assert adm["user_sub"] == "user-admin"
+
+
+@pytest.mark.asyncio
+async def test_seam_waits_for_an_inflight_wake_before_resuming(temp_db, monkeypatch):
+    """A one-shot wake writing the chat's conversation file finishes before
+    the heal reads it (the dashboard warmup's rule): the heal never renders
+    a half-written turn or dual-writes the file."""
+    import asyncio
+    from core.session import session_delivery
+    _make_chat(temp_db, model="model-x", execution_path="claude-code-cli")
+    layer = _SeamLayer(resumable=True)
+    spawn_layer = _SpawnLayer()
+    _patch_seam(monkeypatch, spawn_layer)
+    inflight = asyncio.Event()
+    order: list[str] = []
+    monkeypatch.setattr(session_delivery, "oneshot_inflight",
+                        lambda cid: inflight if cid == "chat-1" else None)
+    orig = layer.can_resume_session
+
+    async def _can(sid, **kw):
+        order.append("resume_check")
+        return await orig(sid, **kw)
+    layer.can_resume_session = _can
+
+    async def _finish_wake():
+        await asyncio.sleep(0.05)
+        order.append("wake_done")
+        inflight.set()
+    asyncio.create_task(_finish_wake())
+    await headless_resume.resume_dead_session_headless(
+        "chat-1", "sid-dead", layer, user_sub="user-admin")
+    assert order == ["wake_done", "resume_check"]

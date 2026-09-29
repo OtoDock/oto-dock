@@ -1,3 +1,5 @@
+import { TASK_KIND } from './kinds/task'
+
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
@@ -14,6 +16,17 @@ export function formatRelativeTime(iso: string): string {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   return new Date(iso).toLocaleDateString()
+}
+
+/** An expiry in words: "expires in 12 days", "expires within a day", "expired";
+ *  '' for no expiry. Days round up, so a link made an hour ago for 30 days
+ *  still says 30. */
+export function formatExpiry(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const days = Math.ceil((new Date(iso).getTime() - Date.now()) / 86_400_000)
+  if (Number.isNaN(days)) return ''
+  if (days <= 0) return 'expired'
+  return days === 1 ? 'expires within a day' : `expires in ${days} days`
 }
 
 export function formatNextRun(iso: string | null): string {
@@ -50,11 +63,14 @@ export function formatCronDescription(cron: string): string {
     ? `${hour.padStart(2, '0')}:${min.padStart(2, '0')}`
     : null
   const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-  const ord = (n: number) => `${n}${n === 1 ? 'st' : n === 2 ? 'nd' : n === 3 ? 'rd' : 'th'}`
+  const ord = (n: number) => {
+    const suffix = n % 100 >= 10 && n % 100 <= 20 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[n % 10] ?? 'th'
+    return `${n}${suffix}`
+  }
 
   if (cron === '* * * * *') return 'Every minute'
   const everyMin = min.match(/^\*\/(\d+)$/)
-  if (everyMin && isEvery(hour) && isEvery(dom) && isEvery(dow)) return `Every ${everyMin[1]} min`
+  if (everyMin && isEvery(hour) && isEvery(dom) && isEvery(dow)) return `Every ${everyMin[1]} minutes`
   const everyHour = hour.match(/^\*\/(\d+)$/)
   if (isFixed(min) && everyHour && isEvery(dom) && isEvery(dow)) {
     return min === '0'
@@ -65,7 +81,7 @@ export function formatCronDescription(cron: string): string {
   if (time && isEvery(dom) && isEvery(dow)) return `Daily at ${time}`
   if (time && isEvery(dom) && isFixed(dow)) return `Weekly on ${+dow <= 7 ? DOW[+dow % 7] : dow} at ${time}`
   if (time && isFixed(dom) && isEvery(dow)) return `Monthly on the ${ord(+dom)} at ${time}`
-  if (time && dom.includes(',') && isEvery(dow)) {
+  if (time && dom.includes(',') && isEvery(dow) && dom.split(',').every(isFixed)) {
     const days = dom.split(',').map((d) => ord(+d)).join(' & ')
     return `On the ${days} of each month at ${time}`
   }
@@ -125,4 +141,123 @@ export function formatIntervalDescription(seconds: number | null | undefined): s
   if (m) parts.push(`${m}m`)
   if (s) parts.push(`${s}s`)
   return `Every ${parts.join(' ')}`
+}
+
+// A task's schedule in words — the same vocabulary as the proxy's
+// services/scheduler/schedule_text.py, which writes `schedule_text` for the
+// apps `tasks` feed and the task REST view; tests/fixtures/scheduleText.json
+// pins both sides case by case, so a change here is a change there.
+
+/** The fields the words need: a task row, or an app feed row. */
+export interface ScheduleRef {
+  schedule?: string | null
+  interval_seconds?: number | null
+  run_at?: string | null
+  delay_seconds?: number | null
+  task_type?: string
+  user_tz?: string | null
+  effective_tz?: string
+}
+
+const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const MON_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** "5 minutes", "1 hour", "2 days", "1d 1h 1m 1s" (the interval words minus "Every"). */
+function durationWords(seconds: number): string {
+  if (seconds === 60) return '1 minute'
+  if (seconds === 3600) return '1 hour'
+  if (seconds === 86400) return '1 day'
+  const words = formatIntervalDescription(seconds)
+  return words.startsWith('Every ') ? words.slice(6) : words
+}
+
+/** Whether a cron has a plain hour and minute ("0 8 * * *"), i.e. a wall clock. */
+function cronHasClock(cron: string): boolean {
+  const parts = cron.trim().split(/\s+/)
+  return parts.length === 5 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])
+}
+
+/** "Once on Sun 20 Sep, 05:00": a naive ISO is a wall clock in the task's zone
+ *  and prints literally (never through Date, which would shift it into the
+ *  browser's zone); an aware one is converted into that zone. No year, no
+ *  locale: the proxy prints the same. */
+function runAtWords(runAt: string, zone: string): string {
+  const naive = runAt.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/)
+  let y: number, mo: number, d: number, hh: string, mm: string
+  if (naive) {
+    ;[y, mo, d] = [+naive[1], +naive[2], +naive[3]]
+    ;[hh, mm] = [naive[4], naive[5]]
+  } else {
+    const date = new Date(runAt)
+    if (Number.isNaN(date.getTime())) return `Once on ${runAt}`
+    let parts: Intl.DateTimeFormatPart[]
+    try {
+      parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone || undefined, year: 'numeric', month: 'numeric', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(date)
+    } catch {
+      parts = new Intl.DateTimeFormat('en-US', {
+        year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(date)
+    }
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? ''
+    ;[y, mo, d] = [+get('year'), +get('month'), +get('day')]
+    ;[hh, mm] = [get('hour').padStart(2, '0'), get('minute').padStart(2, '0')]
+  }
+  const dow = DOW_SHORT[new Date(Date.UTC(y, mo - 1, d)).getUTCDay()]
+  return `Once on ${dow} ${d} ${MON_SHORT[mo - 1]}, ${hh}:${mm}`
+}
+
+export function scheduleZone(task: ScheduleRef): string {
+  return task.effective_tz || task.user_tz || ''
+}
+
+/** Whether the words carry a wall-clock time, i.e. depend on the zone. */
+export function scheduleHasClock(task: ScheduleRef): boolean {
+  if (task.task_type === TASK_KIND.TRIGGER) return false
+  if (task.run_at) return true
+  const cron = task.schedule || ''
+  return !!cron && cronHasClock(cron) && formatCronDescription(cron) !== cron
+}
+
+/** The schedule in words, without the zone. */
+export function scheduleWords(task: ScheduleRef): string {
+  if (task.task_type === TASK_KIND.TRIGGER) return 'On trigger'
+  if (task.interval_seconds) return formatIntervalDescription(task.interval_seconds)
+  if (task.schedule) return formatCronDescription(task.schedule)
+  if (task.run_at) return runAtWords(task.run_at, scheduleZone(task))
+  if (task.delay_seconds != null) return `Once, ${durationWords(task.delay_seconds)} after creation`
+  return '—'
+}
+
+// The names of the zero-offset zone: a browser says "UTC", a platform
+// setting "Etc/UTC" — the same clock, so no suffix between them.
+const UTC_NAMES = new Set([
+  'UTC', 'Etc/UTC', 'Etc/GMT', 'GMT', 'Etc/GMT0', 'GMT0', 'Etc/GMT+0', 'Etc/GMT-0',
+  'Etc/Universal', 'Universal', 'Etc/Zulu', 'Zulu', 'Etc/UCT', 'UCT', 'Etc/Greenwich', 'Greenwich',
+])
+
+/** Whether two IANA names are the same clock (only the UTC aliases fold; two
+ *  real zones sharing an offset are still named apart, the offset can drift). */
+export function sameZone(a: string, b: string): boolean {
+  return a === b || (UTC_NAMES.has(a) && UTC_NAMES.has(b))
+}
+
+/** The words, with the zone named when they carry a clock time and the task's
+ *  zone is not the browser's — "Daily at 08:00 (Europe/Athens)" beside a
+ *  "Next" the browser computes in its own zone. */
+export function describeSchedule(task: ScheduleRef, browserTz: string): string {
+  const text = scheduleWords(task)
+  const zone = scheduleZone(task)
+  return zone && !sameZone(zone, browserTz) && scheduleHasClock(task) ? `${text} (${zone})` : text
+}
+
+/** The browser's own IANA zone ('' when the runtime cannot say). */
+export function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+  } catch {
+    return ''
+  }
 }

@@ -4,7 +4,9 @@ background-terminal list twins.
 The proxy's ``RemoteExecutionLayer.steer/compact`` and its bg-command drain
 tunnel to the satellite as ``codex_steer`` / ``codex_compact`` /
 ``codex_bg_terminals`` RPCs → ``CodexSession.steer/compact/
-list_background_terminals``. These cover the satellite-local pieces:
+list_background_terminals`` (``steer_turn``, the Claude CLI's frame since
+0.5.128, lands on the same ``steer_turn`` handler). These cover the
+satellite-local pieces:
 
   * ``steer`` — strict accept semantics (True ONLY on daemon accept: the
     proxy queues the message otherwise, so a false positive loses input);
@@ -45,8 +47,6 @@ def sat_config():
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=Path("/tmp/test-agents"),
         mcps_dir=Path("/tmp/test-mcps"),
-        claude_bin="claude",
-        codex_bin="codex",
     )
 
 
@@ -321,7 +321,7 @@ class TestRpcHandlers:
     async def test_steer_strict_false_paths(self):
         sm = _manager_with({})
         ws = _FakeWs()
-        await sm.codex_steer(
+        await sm.steer_turn(
             {"command_id": "c1", "session_id": "nope", "text": "hi"}, ws,
         )
         assert ws.sent[0]["steered"] is False
@@ -331,7 +331,7 @@ class TestRpcHandlers:
                 raise RuntimeError("boom")
         sm = _manager_with({"s1": _S()})
         ws = _FakeWs()
-        await sm.codex_steer(
+        await sm.steer_turn(
             {"command_id": "c2", "session_id": "s1", "text": "hi"}, ws,
         )
         assert ws.sent[0]["steered"] is False
@@ -346,7 +346,7 @@ class TestRpcHandlers:
                 return True
         sm = _manager_with({"s1": _S()})
         ws = _FakeWs()
-        await sm.codex_steer({"command_id": "c1", "session_id": "s1", "text": ""}, ws)
+        await sm.steer_turn({"command_id": "c1", "session_id": "s1", "text": ""}, ws)
         assert ws.sent[0]["steered"] is False and called == []
 
     @pytest.mark.asyncio
@@ -356,7 +356,7 @@ class TestRpcHandlers:
                 return True
         sm = _manager_with({"s1": _S()})
         ws = _FakeWs()
-        await sm.codex_steer(
+        await sm.steer_turn(
             {"command_id": "c1", "session_id": "s1", "text": "go"}, ws,
         )
         assert ws.sent[0]["steered"] is True
@@ -435,6 +435,9 @@ class TestValidateConfigToml:
         assert caplog.records == []
 
     def test_invalid_logs_error(self, tmp_path, caplog):
+        # The runtime validates only where the standard library parses TOML
+        # (3.11+); on the host floor it deliberately skips (warn-only guard).
+        pytest.importorskip("tomllib")
         with caplog.at_level("ERROR", logger="satellite"):
             _validate_config_toml("bad = \n", tmp_path / "c.toml")
         assert any("INVALID" in r.message for r in caplog.records)

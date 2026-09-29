@@ -29,6 +29,7 @@ from unittest.mock import patch
 from storage.agents import agent_store
 from storage import remote_store
 from storage import database as task_store
+from core import placement
 
 _ADMIN = {"username": "ada", "display_name": "Ada", "email": "a@x", "role": "admin"}
 _DIRECT = {"execution_target": "machine-admin", "execution_path": "direct-llm"}
@@ -75,12 +76,12 @@ def test_resolver_keeps_the_machine_for_a_cli_agent(temp_db):
 def _stub_builder(monkeypatch, tmp_path) -> dict:
     """Stub the heavy collaborators of build_agent_config; the resolver names
     a MACHINE so the builder's own placement decision is what is under test.
-    Captures the ``is_remote`` flag handed to the MCP config builder."""
+    Captures the placement handed to the MCP config builder."""
     from core.config import config_builder as cb
     captured: dict = {}
 
     def _capture_mcp(*a, **k):
-        captured["is_remote"] = k.get("is_remote")
+        captured["is_remote"] = k["placement"].is_remote
         return (None, {}, {}, {}, set())
 
     monkeypatch.setattr(cb.mcp_registry, "build_session_mcp_config", _capture_mcp)
@@ -94,8 +95,9 @@ def _stub_builder(monkeypatch, tmp_path) -> dict:
     monkeypatch.setattr(cb.remote_store, "resolve_execution_target",
                         lambda *a, **k: ("machine-1", None))
     monkeypatch.setattr(
-        cb.remote_store, "get_target_metadata",
-        lambda target, *a, **k: ("admin_remote", "My Desktop") if target == "machine-1" else ("local", ""),
+        cb.remote_store, "placement_of",
+        lambda target, *a, **k: (placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, label="My Desktop", machine_id="machine-1")
+                                 if target == "machine-1" else placement.LOCAL_PLACEMENT),
     )
     monkeypatch.setattr(cb.remote_store, "get_remote_machine",
                         lambda *a, **k: {"id": "machine-1", "capabilities": "{}"})
@@ -125,7 +127,7 @@ class TestBuilderPlacesDirectLlmLocal:
         captured = _stub_builder(monkeypatch, tmp_path)
         cfg = _build("dl")
         assert cfg.execution_target == "local"
-        assert cfg.security_context.target_kind == "local"
+        assert cfg.security_context.placement.is_local
         assert captured["is_remote"] is False
 
     def test_a_pin_stored_before_the_fix_is_placed_local(self, temp_db, monkeypatch, tmp_path):
@@ -135,7 +137,7 @@ class TestBuilderPlacesDirectLlmLocal:
         with patch("services.remote.remote_status.is_reachable", return_value=True):
             cfg = _build("dl", pinned_target="machine-1")
         assert cfg.execution_target == "local"
-        assert cfg.security_context.target_kind == "local"
+        assert cfg.security_context.placement.is_local
         assert captured["is_remote"] is False
 
     def test_a_chat_level_override_to_direct_llm_is_local_too(self, temp_db, monkeypatch, tmp_path):
@@ -155,7 +157,7 @@ class TestBuilderPlacesDirectLlmLocal:
         captured = _stub_builder(monkeypatch, tmp_path)
         cfg = _build("cx")
         assert cfg.execution_target == "machine-1"
-        assert cfg.security_context.target_kind == "admin_remote"
+        assert cfg.security_context.placement.admin_paired
         assert captured["is_remote"] is True
 
 
@@ -181,7 +183,7 @@ def test_no_move_banner_for_a_direct_llm_chat(temp_db):
     ctl = _controller("sub-ada")
     with patch.object(remote_store, "resolve_execution_target", return_value=("machine-1", None)), \
          patch.object(remote_store, "get_remote_machine", return_value={"name": "My Desktop"}), \
-         patch("ws.dashboard_warmup._effective_agent_role", return_value="admin"):
+         patch("ws.dashboard_warmup.acting_role_of", return_value="admin"):
         assert ctl._target_mismatch_fields("c-dl") == {}
         # The same pin on a CLI chat still advertises the move.
         assert ctl._target_mismatch_fields("c-cli") == {

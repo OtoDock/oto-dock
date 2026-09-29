@@ -79,7 +79,8 @@ class TestPromptQueueGates:
         received = bytearray()
         s.add_output_listener(received.extend)
         _make_idle(s)
-        assert s.queue_prompt("run the report", "delegate_result") is True
+        item = s.queue_prompt("run the report", "delegate_result")
+        assert item and item["text"] == "run the report"
         await _drain_and_settle(s)
         assert b"run the report" in bytes(received)   # pasted into the PTY
         assert s._turn_open is True                    # injection opened a turn
@@ -236,10 +237,10 @@ class TestPromptQueueGates:
         await _drain_and_settle(s)
         assert b"terminal owned" in bytes(received)
 
-    async def test_queue_prompt_on_closed_session_returns_false(self):
+    async def test_queue_prompt_on_closed_session_returns_none(self):
         s = await _register("sid-deadq")
         await s.close()
-        assert s.queue_prompt("late", "delegate_result") is False
+        assert s.queue_prompt("late", "delegate_result") is None
 
     async def test_turn_close_kicks_queue_without_backstop(self, monkeypatch):
         # A queued prompt lands right after the turn closes (the turn-end
@@ -310,6 +311,28 @@ class TestCloseHandback:
         await s.close()
         await asyncio.sleep(0.1)
         assert calls == []                             # dropped at the cap
+
+
+@pytest.mark.asyncio
+async def test_close_session_drop_queued_hands_nothing_back(monkeypatch):
+    """The offboarding closer ends a session through the public argument:
+    its queued server prompts are dropped, never handed back to the ladder."""
+    calls = []
+
+    async def _fake_deliver(chat_id, text, **kw):
+        calls.append(text)
+        return DeliveryOutcome("pump", chat_id=chat_id)
+
+    from core.session import session_delivery
+    monkeypatch.setattr(session_delivery, "deliver_prompt", _fake_deliver)
+
+    s = await _register("sid-dropq", chat_id="chat-dropq")
+    s._turn_open = True
+    s.queue_prompt("queued result", "delegate_result", chat_id="chat-dropq", hops=0)
+    assert await isess.close_session("sid-dropq", reason="offboarded", drop_queued=True)
+    await asyncio.sleep(0.1)
+    assert calls == []
+    assert not s._prompt_queue
 
 
 class _FakeConnMgr:
@@ -388,7 +411,7 @@ class TestSteerItems:
         _make_idle(s)
         s._turn_open = True
         s.last_activity = time.monotonic()            # streaming: never quiet
-        assert s.queue_prompt("steer this in", "delegate_result", steer=True) is True
+        assert s.queue_prompt("steer this in", "delegate_result", steer=True)
         await _drain_and_settle(s)
         assert b"steer this in" in bytes(received)
         assert s._turn_open is True                   # the turn stays open
@@ -449,3 +472,181 @@ class TestSteerItems:
         assert b"normal first" not in bytes(received)
         assert b"steer second" not in bytes(received)
         assert len(s._prompt_queue) == 2
+
+
+@pytest.mark.asyncio
+class TestInjectionHooks:
+    """The hooks a borrowed-terminal delegate round drives: ``on_injected``
+    fires once the prompt is in the terminal (local paste or satellite ACK),
+    the one-shot turn-end waiters fire at the task callback's point with its
+    gates, and a queued item can be dropped by its handle."""
+
+    async def test_on_injected_fires_after_the_paste(self):
+        s = await _register("sid-hook")
+        _make_idle(s)
+        fired: list[str] = []
+        item = s.queue_prompt("go", "delegate_continue", on_injected=lambda: fired.append("in"))
+        assert item and fired == []                      # queued, not yet pasted
+        await _drain_and_settle(s)
+        assert fired == ["in"] and not s._prompt_queue
+
+    async def test_cancel_prompt_drops_only_a_queued_item(self):
+        s = await _register("sid-cancel")
+        _make_idle(s)
+        s._turn_open = True                              # held: never injected
+        item = s.queue_prompt("later", "delegate_continue")
+        await _drain_and_settle(s)
+        assert len(s._prompt_queue) == 1
+        assert s.cancel_prompt(item) is True
+        assert not s._prompt_queue
+        assert s.cancel_prompt(item) is False            # already gone
+
+    async def test_turn_end_waiters_fire_once_with_the_gates(self):
+        s = await _register("sid-waiter")
+        _make_idle(s)
+        s._title_armed = False
+        seen: list[str] = []
+        s.add_turn_end_waiter(seen.append)
+        # A question park is not a turn end for a waiter.
+        s._maybe_fire_turn_complete("", persisted=1, question=True)
+        assert seen == [] and len(s._turn_end_waiters) == 1
+        s._maybe_fire_turn_complete("the answer", persisted=1)
+        assert seen == ["the answer"] and s._turn_end_waiters == []
+        s._maybe_fire_turn_complete("another turn", persisted=1)
+        assert seen == ["the answer"]                    # one-shot
+        s.add_turn_end_waiter(seen.append)
+        s.remove_turn_end_waiter(seen.append)
+        s._maybe_fire_turn_complete("removed", persisted=1)
+        assert seen == ["the answer"]
+
+    async def test_satellite_ack_fires_on_injected(self, monkeypatch):
+        mgr = _FakeConnMgr()
+        import core.remote.satellite_connection as sc
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
+        s = await _register("sid-hook-sat", chat_id="chat-hook-sat")
+        _make_idle(s)
+        s.target = "machine-1"
+        s.otodock_attached = True
+        fired: list[str] = []
+        s.queue_prompt("remote go", "delegate_continue", chat_id="chat-hook-sat",
+                       on_injected=lambda: fired.append("in"))
+        await asyncio.sleep(0.05)
+        frame = mgr.sent[0]
+        assert fired == []                               # sent, not yet in the terminal
+        s.handle_inject_result(frame["inject_id"], True)
+        assert fired == ["in"] and not s._prompt_queue
+
+    async def test_cancel_in_flight_satellite_inject_never_pops_another_item(self, monkeypatch):
+        # A borrowed-terminal round is cancelled while the satellite types its
+        # prompt: the ACK must not take the NEXT item off the queue and report
+        # it injected — that item was never sent.
+        mgr = _FakeConnMgr()
+        import core.remote.satellite_connection as sc
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
+        s = await _register("sid-hook-sat-cancel", chat_id="chat-hook-sat-cancel")
+        _make_idle(s)
+        s.target = "machine-1"
+        s.otodock_attached = True
+        fired: list[str] = []
+        first = s.queue_prompt("round prompt", "delegate_continue",
+                               on_injected=lambda: fired.append("first"))
+        s.queue_prompt("next prompt", "delegate_result",
+                       on_injected=lambda: fired.append("next"))
+        await asyncio.sleep(0.05)
+        frame, = mgr.sent
+        assert frame["text"] == "round prompt"
+        cancelled = s.cancel_prompt(first)
+        s.handle_inject_result(frame["inject_id"], True)
+        assert fired == []
+        assert [q["text"] for q in s._prompt_queue] == ["next prompt"]
+        assert s._turn_open is True                      # the typed prompt opened a turn
+        assert cancelled is False                        # it was on its way into the terminal
+
+    async def test_cancelled_in_flight_item_is_never_re_sent(self, monkeypatch):
+        # The result frame is lost after the cancel: the retry sends the next
+        # item under a fresh id (a re-used id would be ACKed by the
+        # satellite's dedupe without typing it).
+        mgr = _FakeConnMgr()
+        import core.remote.satellite_connection as sc
+        monkeypatch.setattr(sc, "get_connection_manager", lambda: mgr)
+        s = await _register("sid-hook-sat-lost", chat_id="chat-hook-sat-lost")
+        _make_idle(s)
+        s.target = "machine-1"
+        s.otodock_attached = True
+        first = s.queue_prompt("round prompt", "delegate_continue")
+        s.queue_prompt("next prompt", "delegate_result")
+        await asyncio.sleep(0.05)
+        s.cancel_prompt(first)
+        s._satellite_inject["sent_at"] -= 3600           # the result never came
+        await s._try_satellite_inject()
+        old, retry = mgr.sent
+        assert retry["text"] == "next prompt" and retry["inject_id"] != old["inject_id"]
+        s.handle_inject_result(retry["inject_id"], True)
+        assert not s._prompt_queue
+
+    async def test_cancel_during_the_freshness_tail_re_reads_steer_eligibility(self, monkeypatch):
+        # The steer head is cancelled while the drain's pre-inject tail runs:
+        # the item behind it is an ordinary one and must wait for the turn to
+        # close instead of riding the old head's steer pass into it.
+        from core.session import transcript_tailer
+        s = await _register("sid-steer-cancel")
+        received = bytearray()
+        s.add_output_listener(received.extend)
+        _make_idle(s)
+        s._turn_open = True
+        s.last_activity = time.monotonic()               # streaming: never quiet
+        head = s.queue_prompt("steer head", "delegate_continue", steer=True)
+        s.queue_prompt("ordinary next", "delegate_result")
+
+        def _tail(sid, cid):
+            s.cancel_prompt(head)
+            return {"persisted": 0, "last_signal": "user"}
+
+        monkeypatch.setattr(transcript_tailer, "resolve_and_tail", _tail)
+        await _drain_and_settle(s)
+        assert b"ordinary next" not in bytes(received)
+        assert [q["text"] for q in s._prompt_queue] == ["ordinary next"]
+
+    async def test_waiter_skips_an_end_whose_batch_opens_the_next_turn(self, monkeypatch):
+        # A follow-up steered in while the person's turn wrote its final text
+        # runs as the next turn: the batch carrying the person's end AND that
+        # prompt must not answer the waiter with the person's reply.
+        from core.session import transcript_tailer
+        s = await _register("sid-waiter-reopen")
+        _make_idle(s)
+        s._title_armed = False
+        seen: list[str] = []
+        s.add_turn_end_waiter(seen.append)
+        batches = iter([
+            {"persisted": 2, "turn_complete": True, "last_signal": "user",
+             "last_message": "the person's reply"},
+            {"persisted": 1, "turn_complete": True, "last_signal": "end_turn",
+             "last_message": "the follow-up's answer"},
+        ])
+        monkeypatch.setattr(transcript_tailer, "resolve_and_tail",
+                            lambda sid, cid: next(batches))
+        await s._tail_and_maybe_complete()
+        assert seen == [] and s._turn_open is True
+        await s._tail_and_maybe_complete()
+        assert seen == ["the follow-up's answer"]
+
+    async def test_the_drains_freshness_tail_reports_the_turn_end_it_reads(self, monkeypatch):
+        # The pre-inject tail moves the cursor past its batch: a turn end in
+        # it is reported there (the finished ping, the waiters) or never.
+        from core.session import transcript_tailer
+        s = await _register("sid-drain-end")
+        _make_idle(s)
+        s._title_armed = False
+        seen: list[str] = []
+        pings: list[bool] = []
+        monkeypatch.setattr(s, "_fire_turn_notification",
+                            lambda question=False, compacted=False: pings.append(question))
+        s.add_turn_end_waiter(seen.append)
+        monkeypatch.setattr(transcript_tailer, "resolve_and_tail", lambda sid, cid: {
+            "persisted": 1, "turn_complete": True, "last_signal": "end_turn",
+            "last_message": "the earlier answer"})
+        s.queue_prompt("next prompt", "delegate_result")
+        await _drain_and_settle(s)
+        assert seen == ["the earlier answer"]
+        assert pings == [False]
+        assert not s._prompt_queue                       # and the prompt still went in

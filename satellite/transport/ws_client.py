@@ -22,6 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from ..config import otodock_dir
+from .._vendored import layout
 from .lifecycle_update import (
     _finalize_post_update_state,
     _self_uninstall_and_exit,
@@ -150,8 +151,8 @@ def _sweep_satellite_screenshots(agents_dir: "Path", keep: int) -> None:
     files. Targeted globs (not a full tree walk) so it's cheap on a large tree."""
     from pathlib import Path as _P
     base = _P(agents_dir)
-    dirs = list(base.glob("*/users/*/workspace/.screenshots")) \
-        + list(base.glob("*/workspace/.screenshots"))
+    dirs = list(base.glob(f"*/{layout.USERS}/*/{layout.WORKSPACE}/.screenshots")) \
+        + list(base.glob(f"*/{layout.WORKSPACE}/.screenshots"))
     for d in dirs:
         try:
             files = sorted(
@@ -420,6 +421,12 @@ class SatelliteWSClient:
                 # Fail any in-flight tunneled HTTP streams so subprocess
                 # hooks return 502 immediately instead of waiting for the
                 # 7-day permission timeout.
+                # A running app step has nobody to report to: kill its tree
+                # (the proxy marks the delivery dead when the link drops).
+                try:
+                    self.sm.kill_steps("the link to the platform dropped")
+                except Exception:
+                    logger.exception("kill_steps failed")
                 if self.tunnel is not None:
                     try:
                         self.tunnel.fail_all_streams("tunnel-disconnected")
@@ -753,10 +760,7 @@ class SatelliteWSClient:
         # npm install and must not be what spawns wait on.
         cli_pins = resp.get("cli_pins") or {}
         from ..host.cli_versions import reconcile_cli_versions, set_pins
-        set_pins(cli_pins, {
-            "claude": self.config.claude_bin,
-            "codex": self.config.codex_bin,
-        })
+        set_pins(cli_pins, dict(self.config.cli_bins))
         if cli_pins:
             # cli_status trampoline: the reconcile runs in a worker thread;
             # hop its report back to the loop and onto the persistent control
@@ -844,10 +848,12 @@ class SatelliteWSClient:
                     # Manual thread compaction on a headless Codex session
                     # (remote twin of the local layer.compact()); always acks.
                     asyncio.create_task(self.sm.codex_compact(msg, self))
-                elif msg_type == "codex_steer":
-                    # Mid-turn steering into a running headless Codex turn
-                    # (remote twin of layer.steer()); acks {steered}.
-                    asyncio.create_task(self.sm.codex_steer(msg, self))
+                elif msg_type in ("steer_turn", "codex_steer"):
+                    # Mid-turn steering into a running headless turn (remote
+                    # twin of layer.steer()); acks {steered}. codex_steer is
+                    # the Codex frame's released name, steer_turn the Claude
+                    # CLI's (0.5.128); one handler serves both.
+                    asyncio.create_task(self.sm.steer_turn(msg, self))
                 elif msg_type == "codex_bg_terminals":
                     # Background-terminal list pull for the proxy's bg-command
                     # drain (remote twin of its list RPC); always acks.
@@ -874,6 +880,10 @@ class SatelliteWSClient:
                     asyncio.create_task(self.sm.sync_mcps(msg, self))
                 elif msg_type == "sync_mcps_verify":
                     asyncio.create_task(self.sm.sync_mcps_verify(msg, self))
+                elif msg_type == "step_run":
+                    # An app step (proxy APPS.md "Steps", 0.5.122): its own
+                    # task, so a long script never blocks the loop.
+                    asyncio.create_task(self.sm.step_run(msg, self))
                 elif msg_type == "uninstall":
                     # Platform asked us to self-uninstall (admin/user
                     # deleted the remote machine from the dashboard). Run

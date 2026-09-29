@@ -36,6 +36,7 @@ from auth.providers import (
 from services.departments import edge_compiler
 from storage.agents import agent_store
 from storage.agents import db_departments
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.departments")
 
@@ -44,14 +45,14 @@ router = APIRouter()
 
 class CreateDepartmentRequest(BaseModel):
     name: str
-    auto_delegation: bool = True
+    mode: str = db_departments.DEFAULT_MODE  # a db_departments.MODES word
     reach: str = "adjacent"  # 'adjacent' | 'subtree'
     levels: list[str] | None = None  # level names, rank = list order
 
 
 class UpdateDepartmentRequest(BaseModel):
     name: str | None = None
-    auto_delegation: bool | None = None
+    mode: str | None = None
     reach: str | None = None
     position_hint: str | None = None
 
@@ -68,7 +69,7 @@ class SetLevelsRequest(BaseModel):
 def _can_edit_department(u: UserContext, dept: dict) -> bool:
     if u.is_admin:
         return True
-    if u.role != "creator" or getattr(u, "is_api_key", False):
+    if u.role != roles.CREATOR or getattr(u, "is_api_key", False):
         return False
     owner = dept.get("created_by_sub") or ""
     return bool(owner) and owner == (u.acting_sub or "")
@@ -103,7 +104,7 @@ def _serialize(u: UserContext, dept: dict, members: list[dict]) -> dict:
         "id": dept["id"],
         "name": dept["name"],
         "created_by_sub": dept.get("created_by_sub", ""),
-        "auto_delegation": dept["auto_delegation"],
+        "mode": dept["mode"],
         "reach": dept["reach"],
         "position_hint": dept.get("position_hint", ""),
         "levels": dept["levels"],
@@ -153,7 +154,7 @@ async def create_department(
             db_departments.create_department,
             name,
             u.acting_sub or "",
-            auto_delegation=req.auto_delegation,
+            mode=req.mode,
             reach=req.reach,
             level_names=req.levels,
         )
@@ -187,14 +188,14 @@ async def update_department(
             db_departments.update_department,
             department_id,
             name=req.name.strip() if req.name is not None else None,
-            auto_delegation=req.auto_delegation,
+            mode=req.mode,
             reach=req.reach,
             position_hint=req.position_hint,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
-    # auto_delegation / reach change what the department compiles to.
-    if req.auto_delegation is not None or req.reach is not None:
+    # mode / reach change what the department compiles to.
+    if req.mode is not None or req.reach is not None:
         await asyncio.to_thread(edge_compiler.recompile)
     members = (await asyncio.to_thread(_members_by_department)).get(
         department_id, []

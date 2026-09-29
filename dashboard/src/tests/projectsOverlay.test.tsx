@@ -156,7 +156,7 @@ describe('Dock — panel composition', () => {
       },
     })
     expect(await screen.findByText(/review before they work/)).toBeTruthy()
-    expect(screen.getByText('Approve actions')).toBeTruthy()
+    expect(screen.getByText('Approve')).toBeTruthy()
   })
 })
 

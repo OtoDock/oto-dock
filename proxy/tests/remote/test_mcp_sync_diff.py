@@ -156,3 +156,20 @@ def test_deferred_backoff_expires_and_self_prunes():
     mcp_sync._deferred_updates[key] = time.monotonic() - 1.0  # already expired
     assert mcp_sync._is_update_deferred(*key) is False
     assert key not in mcp_sync._deferred_updates  # self-pruned on read
+
+
+def test_the_install_spec_carries_source_build():
+    """The packages a manifest allows to build from source reach the
+    satellite's installer; a manifest without the field ships an empty list."""
+    from services.mcp import mcp_sync
+    tb = MagicMock(tarball_b64="dGFy", version_hash="h1")
+    m = _fake_manifest("unifi")
+    m.server.source_build = ["unifi-network", "antlr4-python3-runtime"]
+    spec = mcp_sync._install_spec("unifi", m, tb)
+    assert spec["source_build"] == ["unifi-network", "antlr4-python3-runtime"]
+    assert spec["name"] == "unifi" and spec["tarball_b64"] == "dGFy" and spec["version_hash"] == "h1"
+    assert set(spec["system_requirements"]) == {
+        "debian", "ubuntu", "rhel", "arch", "macos_brew", "node_min", "notes"}
+    plain = _fake_manifest("plain")
+    plain.server.source_build = None
+    assert mcp_sync._install_spec("plain", plain, tb)["source_build"] == []

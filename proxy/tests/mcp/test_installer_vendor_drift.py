@@ -28,6 +28,10 @@ _VENDORED = [
      "satellite/_vendored/codex_approvals.py", "SHARED_CODEX_APPROVALS_HASH"),
     ("proxy/core/stdio_path_interceptor.py",
      "satellite/_vendored/stdio_path_interceptor.py", "SHARED_STDIO_INTERCEPTOR_HASH"),
+    ("proxy/core/terminal_queries.py",
+     "satellite/_vendored/terminal_queries.py", "SHARED_TERMINAL_QUERIES_HASH"),
+    ("proxy/core/layout.py",
+     "satellite/_vendored/layout.py", "SHARED_LAYOUT_HASH"),
 ]
 
 _IDS = [src.rsplit("/", 1)[-1] for src, _, _ in _VENDORED]

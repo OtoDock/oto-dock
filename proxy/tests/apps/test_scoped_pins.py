@@ -1,4 +1,4 @@
-"""Chat/project-scoped mini-app pins (the Dock) — scope resolution, the
+"""Chat/project-scoped app pins (the Dock) — scope resolution, the
 replace-on-pin contract, and the ``/v1/chats/{chat_id}/pins`` surface.
 
 Load-bearing assertions: scope ids resolve from the pinning SESSION's chat
@@ -87,14 +87,14 @@ def _mk_chat(sid: str | None = None, owner: str = "alice-sub",
 
 def _pin(payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.pins.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match_async"):
         return client.post("/v1/hooks/apps/pin", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
 
 def _hook(op: str, payload: dict, sid: str = SID) -> object:
     payload.setdefault("session_id", sid)
-    with patch("api.hooks.pins.verify_session_match"):
+    with patch("api.hooks.pins.verify_session_match_async"):
         return client.post(f"/v1/hooks/apps/{op}", json=payload,
                            headers={"Authorization": "Bearer dummy"})
 
@@ -153,24 +153,45 @@ def test_replace_carries_approval_iff_manifest_unchanged(agent_tree):
     assert task_store.approve_app_actions(
         row["id"], task_store.actions_sig(row["actions"]), "alice-sub")
 
-    # Same scope, NEW slug, SAME manifest → the old row is replaced, the
-    # approval carries (scope is the identity; slug is cosmetic).
+    # Same scope, NEW slug, SAME manifest → the row is re-pointed in place
+    # (one pin per scope, the id survives the slug change), the approval
+    # carries (scope is the identity; slug is cosmetic).
     second = _pin({"slug": "v2", "html": "<p>2</p>", "scope": "chat",
                    "actions": [action]})
     assert second.status_code == 200
     body = second.json()
     assert "replaced" in body and "v1" in body["replaced"]
     assert body["actions_approved"] is True
-    assert task_store.get_app(first["app_id"]) is None  # one pin per scope
+    assert body["app_id"] == first["app_id"]
     new_row = task_store.get_app(body["app_id"])
     assert new_row["slug"] == "v2" and task_store.app_actions_approved(new_row)
+    assert task_store.get_app_by_slug(AGENT, "alice", "v1") is None
 
-    # A CHANGED manifest resets the approval on replace.
+    # A CHANGED manifest resets the approval on replace; still the same row.
     third = _pin({"slug": "v3", "html": "<p>3</p>", "scope": "chat",
                   "actions": [{**action, "label": "Go now"}]})
     assert third.status_code == 200
     assert third.json()["actions_approved"] is False
-    assert task_store.get_app(body["app_id"]) is None
+    assert third.json()["app_id"] == first["app_id"]
+    assert task_store.get_app(first["app_id"])["slug"] == "v3"
+
+
+def test_another_owner_taking_the_scope_gets_a_new_row(agent_tree):
+    # One pin per project, whoever pins last: but the row of the owner it
+    # replaces is theirs — its state document, hides and shares never pass
+    # to the next owner (the id is what every one of them hangs on).
+    _mk_chat(sid=SID, project_id="proj-t")
+    first = _pin({"slug": "board", "html": "<p>a</p>", "scope": "project"}).json()
+    task_store.write_app_state(first["app_id"], {"secret": "alice-private"})
+    _mk_chat(sid=SID_SHARED, owner=f"agent::{AGENT}", project_id="proj-t")
+    r = _pin({"slug": "board", "html": "<p>b</p>", "scope": "project", "visibility": "agent"},
+             sid=SID_SHARED)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["app_id"] != first["app_id"] and "board" in body.get("replaced", "")
+    assert task_store.get_app(first["app_id"]) is None
+    assert task_store.get_app_state(body["app_id"]) == ({}, 0)
+    assert task_store.get_scoped_app(project_id="proj-t")["id"] == body["app_id"]
 
 
 def test_same_slug_repin_updates_in_place(agent_tree):
@@ -292,3 +313,65 @@ def test_agent_unpin_hook_works_on_scoped(agent_tree):
     app_id = _pin({"slug": "dash", "html": "<p>x</p>", "scope": "chat"}).json()["app_id"]
     assert _hook("unpin", {"slug": "dash"}).status_code == 200
     assert task_store.get_app(app_id) is None
+
+
+# ───────────────────────── chat gate on every app route ─────────────────────
+
+
+def test_scoped_pins_are_chat_gated_on_every_route(agent_tree, monkeypatch):
+    """A Dock pin follows its chat's access rule on the app routes too — a
+    shared dashboard pinned in alice's PRIVATE chat is not servable to a
+    member who merely holds its id. Project pins open for anyone who may
+    open a lane of the project."""
+    chat_id = _mk_chat(sid=SID_SHARED, owner="alice-sub")  # alice's private chat
+    app_id = _pin({"slug": "priv", "html": "<p>c</p>", "scope": "chat",
+                   "actions": [{"id": "ask", "label": "Ask",
+                                "type": "send_prompt", "prompt": "hi"}]},
+                  sid=SID_SHARED).json()["app_id"]
+    row = task_store.get_app(app_id)
+    assert row["username"] == "" and row["scope_chat_id"] == chat_id
+
+    routes = [
+        ("get", f"/v1/apps/{app_id}/html", None),
+        ("get", f"/v1/apps/{app_id}", None),
+        ("post", f"/v1/apps/{app_id}/warm", None),
+        ("post", f"/v1/apps/{app_id}/actions/ask", {"args": None}),
+        ("post", f"/v1/apps/{app_id}/actions/batch",
+         {"calls": [{"call_id": "1", "action_id": "ask"}]}),
+        ("post", f"/v1/apps/{app_id}/approve", {"sig": "0" * 64}),
+    ]
+
+    def statuses(user) -> list[int]:
+        _as(user)
+        out = []
+        for method, path, body in routes:
+            r = getattr(client, method)(path, json=body) if body is not None \
+                else getattr(client, method)(path)
+            out.append(r.status_code)
+        return out
+
+    task_store.upsert_user("bob-sub", "bob@test.com", "Bob", "member")
+    task_store.add_user_agent("bob-sub", AGENT, "manager", "test")
+    # bob is a manager of the agent; the chat is not his → every route 404.
+    assert statuses(_user(sub="bob-sub")) == [404] * len(routes)
+    # alice (the chat's owner) reaches all of them (non-404 on every route).
+    alice = statuses(_user())
+    assert all(code != 404 for code in alice), alice
+    # Admin bypass, as for the chat itself.
+    assert all(code != 404 for code in statuses(_user(sub="root-sub", role="admin")))
+    # Unpin last: the same gate, then the row is gone for everyone.
+    _as(_user(sub="bob-sub"))
+    assert client.delete(f"/v1/apps/{app_id}").status_code == 404
+    _as(_user())
+    assert client.delete(f"/v1/apps/{app_id}").status_code == 200
+
+    # Project pin: alice's private lanes → bob 404; a shared-owner lane in
+    # the same project opens it for every member.
+    lane = _mk_chat(sid=SID_SHARED, owner="alice-sub", project_id="proj-gate")
+    proj_pin = _pin({"slug": "board", "html": "<p>p</p>", "scope": "project"},
+                    sid=SID_SHARED).json()["app_id"]
+    _as(_user(sub="bob-sub"))
+    assert client.get(f"/v1/apps/{proj_pin}").status_code == 404
+    _mk_chat(owner=f"agent::{AGENT}", project_id="proj-gate")
+    assert client.get(f"/v1/apps/{proj_pin}").status_code == 200
+    assert task_store.get_chat(lane) is not None

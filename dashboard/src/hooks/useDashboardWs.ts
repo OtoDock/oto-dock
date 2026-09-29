@@ -11,40 +11,48 @@ import { useQueryClient } from '@tanstack/react-query'
 import type { ActiveChat, Chat } from '../api/chats'
 
 import { useChatStore, getActiveChatIds } from '@/store/chatStore'
+import { toQueuedMessage } from '@/store/types'
 import { useInstallStore } from '@/store/installStore'
 import { useTransferStore } from '@/store/transferStore'
 import { useMachineUpdateStore } from '@/store/machineUpdateStore'
 import { emitFileUpdate } from '../lib/fileUpdates'
+import { CATALOG_RESYNC, emitAppLive, releaseCatalogSender, resendCatalogSubscriptions, setCatalogSender } from '../lib/appLive'
+import { releaseFocusSender, resendFocus, setFocusSender } from '../lib/focus'
 import { noteServerBuild } from '../lib/buildId'
 import type { WsCallbacks } from './useDashboardWs.types'
+import { isTaskChatId } from '../lib/session/kind'
+import { CHAT_PHASE } from '../lib/status/chat'
+import { OUT, PER_CHAT_FRAMES, WIRE, isWireType, type WireFrame, type WireType } from '../api/wireEvents'
+import { callNative } from '../lib/nativeBridge'
 
-/**
- * Frame types that belong to a single chat's stream. A frame carrying a
- * chat_id different from the viewed chat is dropped before dispatch. Untagged
- * frames pass (not every backend send site tags). Global frames (warmup_*,
- * install_*, chat_status, notifications, title_updated, file_updated,
- * chat_history — which has its own stale-guard) are never filtered, nor are
- * server_turn_start / user_message / plan_status, which may legitimately
- * target a non-viewed chat.
- */
-const PER_CHAT_FRAMES = new Set([
-  'text', 'thinking', 'tool_start', 'tool_info', 'tool_end', 'tool_result',
-  'task_spawn', 'delegate_spawn', 'delegate_result', 'bg_agent_done',
-  'bg_command_spawn', 'bg_command_done',
-  'bg_agents_complete', 'bg_commands_complete', 'fg_agents_complete', 'workflow_start',
-  'workflow_progress', 'workflow_end', 'permission_prompt', 'location_request',
-  'plan_mode', 'plan_review', 'system', 'metadata', 'done', 'error', 'images',
-  'video', 'audio', 'media_processing', 'media_failed', 'image_generating',
-  'mcp_cost', 'image_gen_failed', 'limit_warning', 'limit_reached', 'url',
-  'file', 'document_preview', 'mode_changed', 'model_changed',
-  'thinking_changed', 'queued', 'queue_removed', 'queue_sent', 'queue_cleared',
-  'queue_snapshot', 'steered', 'question', 'aborted', 'live_state', 'todo_update',
-  'goal_update', 'context_compact', 'chat_rows', 'chat_meta',
-  // Interactive CLI (PTY) frames — belong to one chat's terminal.
-  'pty_output', 'pty_exit', 'pty_permission', 'pty_artifact', 'pty_status',
-  // NOT 'turn_complete' — it is the origin-routed cross-chat end-of-turn
-  // alert and deliberately targets chats this view is not showing.
-])
+// The frames, their per-chat flag (PER_CHAT_FRAMES is derived from the
+// catalogue's table: a frame carrying a chat_id different from the viewed
+// chat is dropped before dispatch, an untagged frame passes) and the
+// messages this hook sends are the wire catalogue's (api/wireEvents.ts).
+
+// A frame type the catalogue does not know warns ONCE per type per page:
+// an older bundle dropped it silently, this one says so and still hands it
+// to the bus. A catalogued frame without a case is silent.
+const warnedFrameTypes = new Set<string>()
+
+/** The close code of a dashboard socket held by the forced password change
+ *  or 2FA enrolment (proxy ``ws/dashboard.py`` ``WS_CLOSE_GATE``); the close
+ *  reason names the gate. */
+export const WS_CLOSE_GATE = 4403
+function warnUnknownFrame(type: unknown): void {
+  const key = String(type)
+  if (warnedFrameTypes.has(key)) return
+  warnedFrameTypes.add(key)
+  console.warn(`[ws] frame type not in the catalogue: ${key} (api/wireEvents.ts)`)
+}
+export function _resetUnknownFrameWarningsForTests(): void { warnedFrameTypes.clear() }
+
+/** A photo on the wire: a fresh one travels as its data URL, one the chat's
+ * scope already holds (handed back from a cancelled queued message) travels
+ * by its saved path and is used in place. */
+export type WireImage = { name: string; base64?: string; path?: string }
+const wireImage = (i: WireImage) =>
+  i.base64 ? { data: i.base64, name: i.name } : { path: i.path, name: i.name }
 
 export function useDashboardWs(callbacks: WsCallbacks) {
   const wsRef = useRef<WebSocket | null>(null)
@@ -74,7 +82,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const streaming = _streaming
   const setStreaming = useCallback((value: boolean) => {
     _setStreaming(value)
-    try { (window as any).Android?.setStreaming(value) } catch { /* not native */ }
+    callNative('setStreaming', value)
   }, [])
   const callbacksRef = useRef(callbacks)
   callbacksRef.current = callbacks
@@ -88,6 +96,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // Track current chatId so we can re-resume on reconnect
   const currentChatId = useRef<string | null>(null)
   const reconnectedRef = useRef(false)
+  // Minted chat ids whose warmup_started already moved the new-chat draft:
+  // a reconnect replays a still-warming chat's frame (resume_chat) and the
+  // draft typed on the new-chat page since then must stay where it is.
+  const transferredNewChats = useRef<Set<string>>(new Set())
   // title_updated fallback-invalidation bounds (see the handler): once per
   // chat id + a PER-ID cooldown so rename bursts can't refetch-storm the
   // Active-now seed; plus the debounce for the task-list invalidation. The
@@ -135,7 +147,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     lastSentState.current = state
     try {
       ws.send(JSON.stringify(
-        active ? { type: 'user_active' } : { type: 'user_idle', away: visible },
+        active ? { type: OUT.USER_ACTIVE } : { type: OUT.USER_IDLE, away: visible },
       ))
     } catch { /* ignore */ }
   }, [])
@@ -161,7 +173,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
     try {
       ws.send(JSON.stringify({
-        type: 'client_info',
+        type: OUT.CLIENT_INFO,
         platform: isNative ? 'android' : 'web',
         time_zone: tz,
       }))
@@ -187,7 +199,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       }
       pongReceived.current = false
       try {
-        ws.send(JSON.stringify({ type: 'ping' }))
+        ws.send(JSON.stringify({ type: OUT.PING }))
       } catch {
         ws.close()
         return
@@ -211,6 +223,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/dashboard`)
+    // This socket's senders for the per-connection module state (viewer
+    // focus, catalog subscriptions): its close releases these and no other.
+    const sendFrame = (frame: Record<string, unknown>) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame))
+    }
 
     ws.onopen = () => {
       setConnected(true)
@@ -240,6 +257,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // already hidden or after we've been idle through a reconnect. Force-send
       // bypasses the dedup since this WS is a fresh connection.
       sendActiveState(ws, true)
+      // Viewer focus lives per connection on the server, so a fresh socket
+      // starts blank: install the sender and send the current value now.
+      setFocusSender(sendFrame)
+      resendFocus()
+      // Catalog subscriptions live per connection too: re-send them, then
+      // every live server feed re-requests its snapshot, since deltas may
+      // have been missed while the socket was down (APPS.md).
+      setCatalogSender(sendFrame)
+      resendCatalogSubscriptions()
+      emitAppLive({ type: CATALOG_RESYNC })
       // Arm a fresh idle timer for this connection. Any user input will reset
       // it; after 5 min without input we'll switch to user_idle.
       armIdleTimer()
@@ -259,7 +286,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         const ids = new Set<string>(getActiveChatIds())
         if (currentChatId.current) ids.add(currentChatId.current)
         for (const cid of ids) {
-          ws.send(JSON.stringify({ type: 'resume_chat', chat_id: cid }))
+          ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: cid }))
         }
         // A title_updated missed across the gap leaves the Active-now widget
         // stale forever (it has no poll, unlike the history list) — refetch
@@ -269,11 +296,32 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       reconnectedRef.current = true
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event?: CloseEvent) => {
+      // A session held by the forced password change or 2FA enrolment: the
+      // socket closes 4403 with the gate's name, and the tab goes to that
+      // screen (the same targets as apiFetch's X-Auth-Gate rule) instead of
+      // reconnecting into the same refusal.
+      if (event?.code === WS_CLOSE_GATE) {
+        intentionalClose.current = true
+        setConnected(false)
+        setStreaming(false)
+        wsRef.current = null
+        releaseFocusSender(sendFrame)
+        releaseCatalogSender(sendFrame)
+        if (pingTimer.current) {
+          clearTimeout(pingTimer.current)
+          pingTimer.current = null
+        }
+        const target = event.reason === 'must_change_password' ? '/change-password' : '/setup-2fa'
+        if (window.location.pathname !== target) window.location.href = target
+        return
+      }
       const wasStreaming = streamingRef.current
       setConnected(false)
       setStreaming(false)
       wsRef.current = null
+      releaseFocusSender(sendFrame)
+      releaseCatalogSender(sendFrame)
       if (pingTimer.current) {
         clearTimeout(pingTimer.current)
         pingTimer.current = null
@@ -318,9 +366,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
 
     ws.onmessage = (event) => {
-      let msg: any
+      let raw: any
       try {
-        msg = JSON.parse(event.data)
+        raw = JSON.parse(event.data)
       } catch {
         return  // non-JSON frame — ignore
       }
@@ -330,81 +378,82 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         // dropped (cross-chat contamination guard). viewedChatId === null
         // means a brand-new chat with no id yet — every tagged stream frame
         // is foreign until warmup_started mints the id.
-        if (cb.viewedChatId !== undefined && msg.chat_id
-            && msg.chat_id !== cb.viewedChatId && PER_CHAT_FRAMES.has(msg.type)) {
+        if (cb.viewedChatId !== undefined && raw.chat_id
+            && raw.chat_id !== cb.viewedChatId && PER_CHAT_FRAMES.has(raw.type)) {
           return
         }
+        const msg = raw as WireFrame
         switch (msg.type) {
-          case 'text':
+          case WIRE.TEXT:
             cb.onText?.(msg.content)
             break
-          case 'thinking':
+          case WIRE.THINKING:
             cb.onThinking?.(msg)
             break
-          case 'tool_start':
+          case WIRE.TOOL_START:
             cb.onToolStart?.(msg)
             break
-          case 'tool_info':
+          case WIRE.TOOL_INFO:
             cb.onToolInfo?.(msg)
             break
-          case 'tool_end':
+          case WIRE.TOOL_END:
             cb.onToolEnd?.(msg)
             break
-          case 'task_spawn':
+          case WIRE.TASK_SPAWN:
             cb.onTaskSpawn?.(msg)
             break
-          case 'delegate_spawn':
+          case WIRE.DELEGATE_SPAWN:
             cb.onDelegateSpawn?.(msg)
             break
-          case 'delegate_result':
+          case WIRE.DELEGATE_RESULT:
             cb.onDelegateResult?.(msg)
             break
-          case 'bg_agent_done':
+          case WIRE.BG_AGENT_DONE:
             cb.onBgAgentDone?.(msg)
             break
-          case 'bg_command_spawn':
+          case WIRE.BG_COMMAND_SPAWN:
             cb.onBgCommandSpawn?.(msg)
             break
-          case 'bg_command_done':
+          case WIRE.BG_COMMAND_DONE:
             cb.onBgCommandDone?.(msg)
             break
-          case 'bg_agents_complete':
+          case WIRE.BG_AGENTS_COMPLETE:
             cb.onBgAgentsComplete?.(msg)
             break
-          case 'bg_commands_complete':
+          case WIRE.BG_COMMANDS_COMPLETE:
             cb.onBgCommandsComplete?.(msg)
             break
-          case 'workflow_start':
+          case WIRE.WORKFLOW_START:
             cb.onWorkflowStart?.(msg)
             break
-          case 'workflow_progress':
+          case WIRE.WORKFLOW_PROGRESS:
             cb.onWorkflowProgress?.(msg)
             break
-          case 'workflow_end':
+          case WIRE.WORKFLOW_END:
             cb.onWorkflowEnd?.(msg)
             break
-          case 'fg_agents_complete':
+          case WIRE.FG_AGENTS_COMPLETE:
             cb.onFgAgentsComplete?.()
             break
-          case 'permission_prompt':
+          case WIRE.PERMISSION_PROMPT:
             cb.onPermissionPrompt?.(msg)
             break
-          case 'location_request':
+          case WIRE.LOCATION_REQUEST:
             cb.onLocationRequest?.(msg)
             break
-          case 'plan_mode':
+          case WIRE.PLAN_MODE:
             cb.onPlanMode?.(msg)
             break
-          case 'plan_review':
+          case WIRE.PLAN_REVIEW:
             cb.onPlanReview?.(msg)
             break
-          case 'system':
+          case WIRE.SYSTEM:
             cb.onSystem?.(msg)
             break
-          case 'metadata':
+          case WIRE.METADATA:
             cb.onMetadata?.(msg)
             break
-          case 'done':
+          case WIRE.DONE:
             setStreaming(false)
             {
               // Prefer the chat_id the backend stamps on the event over
@@ -422,58 +471,67 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             }
             cb.onDone?.()
             break
-          case 'error':
+          case WIRE.ERROR:
             cb.onError?.(msg.message)
             break
-          case 'images':
+          case WIRE.IMAGES:
             cb.onImages?.(msg)
             break
-          case 'video':
+          case WIRE.VIDEO:
             cb.onVideo?.(msg)
             break
-          case 'audio':
+          case WIRE.AUDIO:
             cb.onAudio?.(msg)
             break
-          case 'media_processing':
+          case WIRE.MEDIA_PROCESSING:
             cb.onMediaProcessing?.(msg)
             break
-          case 'media_failed':
+          case WIRE.MEDIA_FAILED:
             cb.onMediaFailed?.(msg)
             break
-          case 'image_generating':
+          case WIRE.IMAGE_GENERATING:
             cb.onImageGenerating?.(msg)
             break
-          case 'mcp_cost':
+          case WIRE.MCP_COST:
             cb.onMcpCost?.(msg)
             break
-          case 'image_gen_failed':
+          case WIRE.IMAGE_GEN_FAILED:
             cb.onImageGenFailed?.()
             break
-          case 'limit_warning':
+          case WIRE.LIMIT_WARNING:
             cb.onLimitWarning?.(msg)
             break
-          case 'limit_reached':
+          case WIRE.LIMIT_REACHED:
             cb.onLimitReached?.(msg)
             break
-          case 'url':
+          case WIRE.URL:
             cb.onUrl?.(msg)
             break
-          case 'file':
+          case WIRE.FILE:
             cb.onFile?.(msg)
             break
-          case 'document_preview':
+          case WIRE.DOCUMENT_PREVIEW:
             cb.onDocumentPreview?.(msg)
             break
-          case 'file_updated':
+          case WIRE.FILE_UPDATED:
             // Fan out to any open Collabora preview (module bus) + let the host
             // invalidate the workspace file-tree query.
             emitFileUpdate(msg)
             cb.onFileUpdated?.(msg)
             break
-          case 'pre_warmup_ready':
+          case WIRE.APP_PUSH:
+          case WIRE.APP_STATE:
+          case WIRE.OPEN_APP:
+          case WIRE.APP_DEPLOYED:
+          case WIRE.CATALOG:
+            // Live-app frames (APPS.md "Live apps") reach their app
+            // frames and the overlay through the module bus, not props.
+            emitAppLive(msg)
+            break
+          case WIRE.PRE_WARMUP_READY:
             cb.onPreWarmupReady?.(msg)
             break
-          case 'warmup_ready':
+          case WIRE.WARMUP_READY:
             if (msg.chat_id) {
               useChatStore.getState().finishWarmup(msg.chat_id, {
                 execution_path: msg.execution_path,
@@ -495,11 +553,22 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             }
             cb.onWarmupReady?.(msg)
             break
-          case 'warmup_started':
+          case WIRE.WARMUP_STARTED:
             // Order matters: transfer the new-chat draft FIRST so the slice
             // for the freshly-minted chat_id carries it; beginWarmup then
             // merges (does not replace) so the draft survives.
-            if (msg.chat_id && msg.agent) {
+            // Three guards, each load-bearing. `new_chat`: the frame also
+            // fires for an existing chat re-warmed by a send, and that frame
+            // must never take the new-chat page's draft. Strict null: only
+            // the new-chat page (viewedChatId === null) holds a draft that
+            // may move — an open chat (a string) or an opt-out consumer
+            // (undefined) keeps its hands off. Once per id: a reconnect from
+            // the new-chat page replays the still-warming minted chat's
+            // frame, new_chat and all, and would move a draft typed since.
+            if (msg.chat_id && msg.agent && msg.new_chat === true
+                && cb.viewedChatId === null
+                && !transferredNewChats.current.has(msg.chat_id)) {
+              transferredNewChats.current.add(msg.chat_id)
               useChatStore.getState().transferNewChatToChat(msg.agent, msg.chat_id)
             }
             useChatStore.getState().beginWarmup(msg.chat_id, {
@@ -526,45 +595,45 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             }
             cb.onWarmupStarted?.(msg)
             break
-          case 'warmup_heartbeat':
+          case WIRE.WARMUP_HEARTBEAT:
             useChatStore.getState().touchHeartbeat(msg.chat_id)
             break
-          case 'warmup_failed':
+          case WIRE.WARMUP_FAILED:
             useChatStore.getState().failWarmup(msg.chat_id, msg.error || 'warmup failed')
             cb.onWarmupFailed?.(msg)
             break
-          case 'chat_moved':
+          case WIRE.CHAT_MOVED:
             // move_chat ack (the op acts on the connection's OPEN chat). The
             // consumer re-resumes the chat so the fresh warmup runs on the
             // new target and the "moved" history card arrives. Failures come
             // as standard error frames instead.
             cb.onChatMoved?.(msg)
             break
-          case 'engine_switched':
+          case WIRE.ENGINE_SWITCHED:
             // Cross-engine switch: direct ack to the acting socket AND a
             // per-user broadcast to sibling tabs — consumers must be
             // idempotent (the actor receives it twice).
             cb.onEngineSwitched?.(msg)
             break
-          case 'switch_engine_denied':
+          case WIRE.SWITCH_ENGINE_DENIED:
             // Dedicated frame (NOT the generic error rail — that only
             // renders into an open stream bubble, invisible on the idle dead
             // chats this op runs on). Rendered inside the switch dialog.
             cb.onSwitchEngineDenied?.(msg)
             break
-          case 'liveness':
+          case WIRE.LIVENESS:
             // probe_liveness answer — lazy process_alive refresh for the
             // bound chat (fired when the model dropdown opens).
             cb.onLiveness?.(msg)
             break
           // ── Install lifecycle (keyed by machine_id + agent, NOT chat_id) ──
-          case 'install_started':
+          case WIRE.INSTALL_STARTED:
             useInstallStore.getState().begin(msg)
             break
-          case 'install_mcp_plan':
+          case WIRE.INSTALL_MCP_PLAN:
             useInstallStore.getState().setPlan(msg)
             break
-          case 'install_progress':
+          case WIRE.INSTALL_PROGRESS:
             useInstallStore.getState().recordProgress({
               machine_id: msg.machine_id,
               agent: msg.agent,
@@ -574,10 +643,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               message: msg.message || '',
             })
             break
-          case 'install_heartbeat':
+          case WIRE.INSTALL_HEARTBEAT:
             useInstallStore.getState().touchHeartbeat(msg)
             break
-          case 'mcp_install_failed':
+          case WIRE.MCP_INSTALL_FAILED:
             useInstallStore.getState().recordFailure({
               machine_id: msg.machine_id,
               agent: msg.agent,
@@ -585,13 +654,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               error: msg.error || 'install failed',
             })
             break
-          case 'install_verifying':
+          case WIRE.INSTALL_VERIFYING:
             useInstallStore.getState().verifying(msg)
             break
-          case 'install_done':
+          case WIRE.INSTALL_DONE:
             useInstallStore.getState().finish(msg)
             break
-          case 'install_failed':
+          case WIRE.INSTALL_FAILED:
             useInstallStore.getState().fail({
               machine_id: msg.machine_id,
               agent: msg.agent,
@@ -599,67 +668,65 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             })
             break
           // ── Workspace transfer progress (keyed by transfer_id) ──
-          case 'transfer_started':
+          case WIRE.TRANSFER_STARTED:
             useTransferStore.getState().applyStarted(msg)
             break
-          case 'transfer_machine_state':
+          case WIRE.TRANSFER_MACHINE_STATE:
             useTransferStore.getState().applyMachineState(msg)
             break
-          case 'transfer_progress':
+          case WIRE.TRANSFER_PROGRESS:
             useTransferStore.getState().applyProgress(msg)
             break
-          case 'transfer_done':
+          case WIRE.TRANSFER_DONE:
             useTransferStore.getState().applyDone(msg)
             break
-          case 'transfer_state':
+          case WIRE.TRANSFER_STATE:
             useTransferStore.getState().applySnapshot(msg)
             break
-          case 'satellite_updating':
+          case WIRE.SATELLITE_UPDATING:
             useMachineUpdateStore.getState().beginUpdate(msg)
             cb.onSatelliteUpdating?.(msg)
             break
-          case 'satellite_updated':
+          case WIRE.SATELLITE_UPDATED:
             useMachineUpdateStore.getState().markUpdated(msg)
             cb.onSatelliteUpdated?.(msg)
             break
-          case 'satellite_update_failed':
+          case WIRE.SATELLITE_UPDATE_FAILED:
             useMachineUpdateStore.getState().markFailed(msg)
             cb.onSatelliteUpdateFailed?.(msg)
             break
-          case 'satellite_update_sync':
+          case WIRE.SATELLITE_UPDATE_SYNC:
             // Connect-time reconciliation: clears stale 'updating' banners whose
             // update finished while we were briefly disconnected (missed the
             // transient 'satellite_updated'), + surfaces any in-flight update.
             useMachineUpdateStore.getState().reconcile(msg.inflight || [])
             break
-          case 'mode_changed':
+          case WIRE.MODE_CHANGED:
             cb.onModeChanged?.(msg.mode)
             break
-          case 'model_changed':
+          case WIRE.MODEL_CHANGED:
             cb.onModelChanged?.(msg.model)
             break
-          case 'thinking_changed':
-            cb.onThinkingChanged?.(msg.max_tokens)
-            break
-          case 'chat_history':
+          case WIRE.CHAT_HISTORY:
             cb.onChatHistory?.(msg)
             break
-          case 'queued':
+          case WIRE.QUEUED:
             cb.onQueued?.(msg)
             break
-          case 'steered':
+          case WIRE.STEERED:
             // Mid-turn steer accepted by the engine — the message is part of
             // the RUNNING turn (no queue entry, no new turn starts).
             cb.onSteered?.(msg)
             break
-          case 'queue_removed':
-            // If server sends back text, it's for edit-return
-            if (msg.text) {
+          case WIRE.QUEUE_REMOVED:
+            // A removed item's text and attachments go back to the composer
+            // (an attachment-only message carries no text).
+            if (msg.text || msg.images?.length || msg.files?.length) {
               cb.onQueueEditReturn?.(msg)
             }
             cb.onQueueRemoved?.(msg)
             break
-          case 'queue_sent': {
+          case WIRE.QUEUE_SENT: {
             setStreaming(true)  // Queue starts a new streaming turn
             // Key the slice by the FRAME's chat, not the viewed chat.
             const qsChatId = msg.chat_id || currentChatId.current
@@ -667,28 +734,19 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             cb.onQueueSent?.(msg)
             break
           }
-          case 'queue_cleared':
+          case WIRE.QUEUE_CLEARED:
             // Backend confirmed all queue items cleared (from cancel_all_queued)
             break
-          case 'queue_snapshot':
+          case WIRE.QUEUE_SNAPSHOT:
             // Backend-authoritative reconciliation on resume_chat — replaces
             // any reload-persisted queuedMessages with the pump's actual
             // queue. Strict replace, backend wins.
             if (msg.chat_id) {
-              useChatStore.getState().setQueuedMessages(msg.chat_id, Array.isArray(msg.messages) ? msg.messages : [])
+              useChatStore.getState().setQueuedMessages(
+                msg.chat_id, Array.isArray(msg.messages) ? msg.messages.map(toQueuedMessage) : [])
             }
             break
-          case 'user_message': {
-            // Backend-injected message starts a new streaming turn. Key the
-            // slice by the FRAME's chat — a frame for a background chat must
-            // never light the viewed chat's dot or flip its input state.
-            const umChatId = msg.chat_id || currentChatId.current
-            if (umChatId) useChatStore.getState().setStreaming(umChatId)
-            if (!msg.chat_id || msg.chat_id === currentChatId.current) setStreaming(true)
-            cb.onUserMessage?.(msg.content)
-            break
-          }
-          case 'server_turn_start':
+          case WIRE.SERVER_TURN_START:
             // A server-initiated turn (bg-nudge review / delegate-result
             // synthesis) is now streaming on this chat. No user-send flipped the
             // generating state, so do it here — the timer shows + Send becomes
@@ -700,12 +758,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               if (sChatId) useChatStore.getState().setStreaming(sChatId)
             }
             break
-          case 'chat_status':
+          case WIRE.CHAT_STATUS:
             // Authoritative per-chat live-dot signal, broadcast to ALL this user's
             // connections — lights/clears the sidebar dot for a chat generating
             // in the BACKGROUND, regardless of which chat this socket is viewing.
             if (msg.chat_id) {
-              if (msg.status === 'streaming') {
+              if (msg.status === CHAT_PHASE.STREAMING) {
                 useChatStore.getState().setStreaming(msg.chat_id)
                 // Auto-attach: a pump started server-side on the chat this
                 // socket is ALREADY viewing (delegate echo, queued task run
@@ -720,7 +778,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                       && !cb.isViewedChatPtyLive?.()
                       && autoAttachRef.current !== viewed) {
                     autoAttachRef.current = viewed
-                    ws.send(JSON.stringify({ type: 'resume_chat', chat_id: viewed }))
+                    ws.send(JSON.stringify({ type: OUT.RESUME_CHAT, chat_id: viewed }))
                   }
                 }
               } else {
@@ -734,40 +792,40 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                 // tasks carry no unread state anywhere (notifications cover
                 // completion) — this is the flag's only true-setter.
                 const viewed = cb.viewedChatId
-                if (!msg.chat_id.startsWith('task-')
+                if (!isTaskChatId(msg.chat_id)
                     && (msg.chat_id !== viewed || document.visibilityState === 'hidden')) {
                   useChatStore.getState().setUnread(msg.chat_id, true)
                 }
               }
             }
             break
-          case 'chat_status_snapshot': {
+          case WIRE.CHAT_STATUS_SNAPSHOT: {
             // Connect-time authoritative "streaming right now" set — clears
             // stale streaming dots from missed frames and lights ones this
             // client never saw start (mirror of satellite_update_sync).
             const live = new Set<string>((msg.chat_ids as string[]) || [])
             const store = useChatStore.getState()
             for (const [cid, slice] of Object.entries(store.byChat)) {
-              if (slice.status === 'streaming' && !live.has(cid)) store.setReady(cid)
+              if (slice.status === CHAT_PHASE.STREAMING && !live.has(cid)) store.setReady(cid)
             }
             for (const cid of live) store.setStreaming(cid)
             break
           }
-          case 'chat_read':
+          case WIRE.CHAT_READ:
             // Someone (this user's other tab, or any user of a shared-only
             // chat) opened the chat — drop the unread dot everywhere.
             if (msg.chat_id) useChatStore.getState().setUnread(msg.chat_id, false)
             break
-          case 'plan_status':
+          case WIRE.PLAN_STATUS:
             cb.onPlanStatus?.(msg)
             break
-          case 'question':
+          case WIRE.QUESTION:
             cb.onQuestion?.(msg)
             break
-          case 'tool_result':
+          case WIRE.TOOL_RESULT:
             cb.onToolResult?.(msg)
             break
-          case 'title_updated': {
+          case WIRE.TITLE_UPDATED: {
             // Patch the Active-now seed in place: its rows render straight from
             // this cache, and a retitle landing AFTER the seed fetch (auto-title
             // of a still-streaming chat) otherwise shows the stale pre-title
@@ -800,7 +858,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // Task rows label from task_name/chat title — keep the task list
             // fresh on OTHER clients. Scoped to task- ids (uuid worker chats
             // ride onTitleUpdated → refetchChats) and debounced.
-            if (typeof msg.chat_id === 'string' && msg.chat_id.startsWith('task-')) {
+            if (typeof msg.chat_id === 'string' && isTaskChatId(msg.chat_id)) {
               if (taskChatsInvalidateTimer.current) {
                 clearTimeout(taskChatsInvalidateTimer.current)
               }
@@ -812,10 +870,10 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             cb.onTitleUpdated?.(msg)
             break
           }
-          case 'chat_rows':
+          case WIRE.CHAT_ROWS:
             cb.onChatRows?.(msg)
             break
-          case 'chat_meta':
+          case WIRE.CHAT_META:
             // Orchestrator stamp (project adoption / first delegation): patch
             // the cached chat rows so the sidebar accent + Dock gate flip
             // immediately instead of on the chats poll.
@@ -831,7 +889,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               queryClient.invalidateQueries({ queryKey: ['chat-project', msg.chat_id] })
             }
             break
-          case 'aborted':
+          case WIRE.ABORTED:
             setStreaming(false)
             {
               // Same chat_id preference as 'done' above — see comment.
@@ -842,7 +900,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             }
             cb.onAborted?.(msg)
             break
-          case 'live_state': {
+          case WIRE.LIVE_STATE: {
             // streaming === false is a residual snapshot (turn ended, bg
             // subagents still running) — restore badges without flipping the
             // input/stop state to "live".
@@ -854,52 +912,54 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             cb.onLiveState?.(msg)
             break
           }
-          case 'todo_update':
+          case WIRE.TODO_UPDATE:
             cb.onTodoUpdate?.(msg)
             break
-          case 'goal_update':
+          case WIRE.GOAL_UPDATE:
             cb.onGoalUpdate?.(msg)
             break
-          case 'context_compact':
+          case WIRE.CONTEXT_COMPACT:
             cb.onContextCompact?.(msg)
             break
-          case 'notification':
+          case WIRE.NOTIFICATION:
             cb.onNotification?.(msg)
             break
-          case 'notification_silent':
+          case WIRE.NOTIFICATION_SILENT:
             cb.onNotificationSilent?.(msg)
             break
-          case 'notification_count':
+          case WIRE.NOTIFICATION_COUNT:
             cb.onNotificationCount?.(msg)
             break
-          case 'turn_complete':
+          case WIRE.TURN_COMPLETE:
             cb.onTurnComplete?.(msg)
             break
-          case 'pong':
+          case WIRE.PONG:
             pongReceived.current = true
             // The build the server serves rides every pong (and the
             // connect-time server_info): a page running an older build
             // reloads once — lib/buildId decides.
             if (typeof msg.build_id === 'string') noteServerBuild(msg.build_id)
             break
-          case 'server_info':
+          case WIRE.SERVER_INFO:
             noteServerBuild(msg.build_id)
             break
+          default:
+            if (!isWireType(raw.type)) warnUnknownFrame(raw.type)
         }
         // Generic subscribers (after the switch + per-chat gating). A handler
         // throw is isolated per-subscriber so one bad listener can't drop the
         // frame for others.
-        const subs = frameSubsRef.current.get(msg.type)
+        const subs = frameSubsRef.current.get(raw.type)
         if (subs) {
           for (const fn of Array.from(subs)) {
-            try { fn(msg) } catch (e2) { console.error('[ws] subscriber failed:', msg?.type, e2) }
+            try { fn(raw) } catch (e2) { console.error('[ws] subscriber failed:', raw?.type, e2) }
           }
         }
       } catch (e) {
         // A handler throw must not be silently swallowed: the frame is lost
         // either way, but losing it INVISIBLY turns real bugs into "the chat
         // froze" mysteries. Per-frame isolation — later frames still process.
-        console.error('[ws] frame handler failed:', msg?.type, e)
+        console.error('[ws] frame handler failed:', raw?.type, e)
       }
     }
 
@@ -914,14 +974,14 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
   const preWarmup = useCallback(
     (agent: string, model?: string, permissionMode = 'default', executionPath?: string) => {
-      send({ type: 'pre_warmup', agent, model, permission_mode: permissionMode, execution_path: executionPath })
+      send({ type: OUT.PRE_WARMUP, agent, model, permission_mode: permissionMode, execution_path: executionPath })
     },
     [send],
   )
 
   const warmup = useCallback(
     (agent: string, chatId?: string, permissionMode = 'default', model?: string, executionPath?: string,
-     prompt?: { text: string; images?: Array<{ base64: string; name: string }>; files?: Array<{ path: string; name: string }> },
+     prompt?: { text: string; images?: WireImage[]; files?: Array<{ path: string; name: string }> },
      executionMode?: string, theme?: string) => {
       if (chatId) currentChatId.current = chatId
       // Carry the first prompt WITH warmup so the backend persists it
@@ -929,12 +989,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // navigate-away / refresh during spawn — no client-side deferred send).
       // execution_mode is the per-chat interactive override — the backend
       // resolver's chat_override.
-      const msg: Record<string, unknown> = { type: 'warmup', agent, chat_id: chatId, permission_mode: permissionMode, model, execution_path: executionPath }
+      const msg: Record<string, unknown> = { type: OUT.WARMUP, agent, chat_id: chatId, permission_mode: permissionMode, model, execution_path: executionPath }
       if (executionMode) msg.execution_mode = executionMode
       if (theme) msg.theme = theme
       if (prompt?.text) {
         msg.text = prompt.text
-        if (prompt.images?.length) msg.images = prompt.images.map(i => ({ data: i.base64, name: i.name }))
+        if (prompt.images?.length) msg.images = prompt.images.map(wireImage)
         if (prompt.files?.length) msg.files = prompt.files
       }
       send(msg)
@@ -943,12 +1003,12 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   )
 
   const sendMessage = useCallback(
-    (text: string, chatId: string, images?: Array<{ base64: string; name: string }>, files?: Array<{ path: string; name: string }>) => {
+    (text: string, chatId: string, images?: WireImage[], files?: Array<{ path: string; name: string }>) => {
       setStreaming(true)
       useChatStore.getState().setStreaming(chatId)
-      const msg: Record<string, unknown> = { type: 'chat', text, chat_id: chatId }
+      const msg: Record<string, unknown> = { type: OUT.CHAT, text, chat_id: chatId }
       if (images?.length) {
-        msg.images = images.map(i => ({ data: i.base64, name: i.name }))
+        msg.images = images.map(wireImage)
       }
       if (files?.length) {
         msg.files = files
@@ -960,28 +1020,28 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
   const sendPermission = useCallback(
     (requestId: string, approved: boolean) => {
-      send({ type: 'permission_response', request_id: requestId, approved })
+      send({ type: OUT.PERMISSION_RESPONSE, request_id: requestId, approved })
     },
     [send],
   )
 
   const sendLocationResponse = useCallback(
     (requestId: string, result: { lat?: number; lng?: number; accuracy?: number; error?: string }) => {
-      send({ type: 'location_response', request_id: requestId, ...result })
+      send({ type: OUT.LOCATION_RESPONSE, request_id: requestId, ...result })
     },
     [send],
   )
 
   const sendPlanReviewResponse = useCallback(
     (requestId: string, action: string, filename?: string) => {
-      send({ type: 'plan_review_response', request_id: requestId, action, filename: filename || '' })
+      send({ type: OUT.PLAN_REVIEW_RESPONSE, request_id: requestId, action, filename: filename || '' })
     },
     [send],
   )
 
   const sendQuestionResponse = useCallback(
     (requestId: string, answers: Record<string, { answers: string[] }>) => {
-      send({ type: 'question_response', request_id: requestId, answers })
+      send({ type: OUT.QUESTION_RESPONSE, request_id: requestId, answers })
     },
     [send],
   )
@@ -991,22 +1051,22 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // with `artifact_ack` (generic subscribe registry — no switch case).
   const sendArtifactInteraction = useCallback(
     (chatId: string, token: string, title: string, payload: unknown) => {
-      send({ type: 'artifact_interaction', chat_id: chatId, token, title, payload })
+      send({ type: OUT.ARTIFACT_INTERACTION, chat_id: chatId, token, title, payload })
     },
     [send],
   )
 
-  // Pinned mini-app send_prompt action — same delivery rails, gated on the
+  // Pinned app send_prompt action — same delivery rails, gated on the
   // user-approved manifest server-side. Acked with `app_action_ack`.
   const sendAppAction = useCallback(
     (chatId: string, appId: string, actionId: string, args: unknown) => {
-      send({ type: 'app_action', chat_id: chatId, app_id: appId, action_id: actionId, args })
+      send({ type: OUT.APP_ACTION, chat_id: chatId, app_id: appId, action_id: actionId, args })
     },
     [send],
   )
 
   // Interactive CLI (PTY) — subscribe to raw frames + send keystrokes/resize.
-  const subscribe = useCallback((frameType: string, fn: (msg: any) => void) => {
+  const subscribe = useCallback((frameType: WireType, fn: (msg: any) => void) => {
     const m = frameSubsRef.current
     let set = m.get(frameType)
     if (!set) { set = new Set(); m.set(frameType, set) }
@@ -1021,7 +1081,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // so it attaches the PTY viewer + replays scrollback now (no subscribe race).
   const sendPtyAttach = useCallback(
     (chatId: string) => {
-      send({ type: 'pty_attach', chat_id: chatId })
+      send({ type: OUT.PTY_ATTACH, chat_id: chatId })
     },
     [send],
   )
@@ -1031,14 +1091,14 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // `composer` marks a discrete chat-box send (vs raw terminal
       // keystrokes) — the backend holds flagged sends while the TUI is
       // parked on a question picker so the paste can't answer the dialog.
-      send({ type: 'pty_input', chat_id: chatId, data: dataB64, ...(composer ? { composer: true } : {}) })
+      send({ type: OUT.PTY_INPUT, chat_id: chatId, data: dataB64, ...(composer ? { composer: true } : {}) })
     },
     [send],
   )
 
   const sendPtyResize = useCallback(
     (chatId: string, rows: number, cols: number) => {
-      send({ type: 'pty_resize', chat_id: chatId, rows, cols })
+      send({ type: OUT.PTY_RESIZE, chat_id: chatId, rows, cols })
     },
     [send],
   )
@@ -1048,7 +1108,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // then re-warms under THIS user on the next send, resuming the conversation.
   const sendPtyTakeover = useCallback(
     (chatId: string) => {
-      send({ type: 'pty_takeover', chat_id: chatId })
+      send({ type: OUT.PTY_TAKEOVER, chat_id: chatId })
     },
     [send],
   )
@@ -1059,40 +1119,48 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // path references into the live PTY so the TUI's Read tool can open them.
   const sendPtyAttachments = useCallback(
     (chatId: string, text: string,
-     images?: Array<{ base64: string; name: string }>,
+     images?: WireImage[],
      files?: Array<{ path: string; name: string }>) => {
       send({
-        type: 'pty_attachments', chat_id: chatId, text,
-        images: images?.map(i => ({ data: i.base64, name: i.name })),
+        type: OUT.PTY_ATTACHMENTS, chat_id: chatId, text,
+        images: images?.map(wireImage),
         files,
       })
     },
     [send],
   )
 
+  // Mode and model picks NAME their chat. Without a chat_id the server
+  // treats the pick as the new-chat state (deferred for the chat the first
+  // warmup mints) and never applies it to the chat this socket is still
+  // bound to — the previous chat, whose live session and row a pick made
+  // right after "+ New Chat" used to change.
   const changeMode = useCallback(
-    (mode: string) => {
-      send({ type: 'mode_change', mode })
+    (mode: string, chatId?: string | null) => {
+      send({ type: OUT.MODE_CHANGE, mode, ...(chatId ? { chat_id: chatId } : {}) })
     },
     [send],
   )
 
   const changeModel = useCallback(
-    (model: string) => {
-      send({ type: 'model_change', model })
+    (model: string, chatId?: string | null) => {
+      send({ type: OUT.MODEL_CHANGE, model, ...(chatId ? { chat_id: chatId } : {}) })
     },
     [send],
   )
 
   // Interactive CLI toggle. Persists the per-chat
-  // execution_mode ('interactive' or '' for headless `-p`) to the chat row so
-  // it survives reload/resume before the next send (mirrors changeModel). Pass
-  // chatId explicitly so a reopened dead chat persists even if the connection's
-  // bound chat_id isn't set yet. This path is persist-only; the live
-  // kill+rewarm on an already-running session is handled by the live toggle below.
+  // execution_mode ('interactive' or '-p' for headless) to the chat row so
+  // it survives reload/resume before the next send (mirrors changeModel). The
+  // frame names its chat: the server writes nothing without a chat_id and
+  // never substitutes the connection's bound chat (the last one opened on
+  // this socket — a new-chat toggle used to rewrite the previous chat's mode).
+  // A brand-new chat has no row and sends no frame; its mode rides the first
+  // warmup. This path is persist-only; the live kill+rewarm on an
+  // already-running session is handled by the live toggle below.
   const changeExecutionMode = useCallback(
-    (executionMode: string, chatId?: string) => {
-      send({ type: 'execution_mode_change', execution_mode: executionMode, chat_id: chatId })
+    (executionMode: string, chatId: string) => {
+      send({ type: OUT.EXECUTION_MODE_CHANGE, execution_mode: executionMode, chat_id: chatId })
     },
     [send],
   )
@@ -1104,21 +1172,14 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // is sent so an interactive re-warm seeds the TUI to match light/dark.
   const switchExecutionMode = useCallback(
     (executionMode: string, chatId: string, theme?: string) => {
-      send({ type: 'execution_mode_switch', execution_mode: executionMode, chat_id: chatId, theme })
-    },
-    [send],
-  )
-
-  const changeThinking = useCallback(
-    (maxTokens: number | null) => {
-      send({ type: 'thinking_change', max_tokens: maxTokens })
+      send({ type: OUT.EXECUTION_MODE_SWITCH, execution_mode: executionMode, chat_id: chatId, theme })
     },
     [send],
   )
 
   const compactContext = useCallback(
     () => {
-      send({ type: 'compact_context' })
+      send({ type: OUT.COMPACT_CONTEXT })
     },
     [send],
   )
@@ -1130,7 +1191,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // error frames.
   const moveChat = useCallback(
     () => {
-      send({ type: 'move_chat' })
+      send({ type: OUT.MOVE_CHAT })
     },
     [send],
   )
@@ -1140,7 +1201,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // (direct + per-user broadcast); refusals arrive as switch_engine_denied.
   const switchEngine = useCallback(
     (executionPath: string, model: string) => {
-      send({ type: 'switch_engine', execution_path: executionPath, model })
+      send({ type: OUT.SWITCH_ENGINE, execution_path: executionPath, model })
     },
     [send],
   )
@@ -1150,14 +1211,14 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // emits no frame a viewer would see.
   const probeLiveness = useCallback(
     () => {
-      send({ type: 'probe_liveness' })
+      send({ type: OUT.PROBE_LIVENESS })
     },
     [send],
   )
 
   const implementPlan = useCallback(
     (planPath: string, mode = 'acceptEdits') => {
-      send({ type: 'implement_plan', plan_path: planPath, mode })
+      send({ type: OUT.IMPLEMENT_PLAN, plan_path: planPath, mode })
     },
     [send],
   )
@@ -1171,7 +1232,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     (chatId: string) => {
       currentChatId.current = chatId
       setStreaming(false)  // Reset streaming state before switching chats
-      send({ type: 'resume_chat', chat_id: chatId })
+      send({ type: OUT.RESUME_CHAT, chat_id: chatId })
     },
     [send],
   )
@@ -1182,24 +1243,24 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       // locally and persist the read marker server-side (which echoes
       // chat_read to this user's other tabs / a shared chat's other users).
       useChatStore.getState().setUnread(chatId, false)
-      send({ type: 'chat_read', chat_id: chatId })
+      send({ type: OUT.CHAT_READ, chat_id: chatId })
     },
     [send],
   )
 
   const cancelQueued = useCallback(
     (index: number) => {
-      send({ type: 'cancel_queued', index })
+      send({ type: OUT.CANCEL_QUEUED, index })
     },
     [send],
   )
 
   const cancelAllQueued = useCallback(() => {
-    send({ type: 'cancel_all_queued' })
+    send({ type: OUT.CANCEL_ALL_QUEUED })
   }, [send])
 
   const abort = useCallback(() => {
-    send({ type: 'abort' })
+    send({ type: OUT.ABORT })
     // Don't set streaming=false — wait for the CLI to finish cancellation
     // and send done/aborted event. The pump stays attached to receive it.
   }, [send])
@@ -1214,7 +1275,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       clearTimeout(pingTimer.current)
       pingTimer.current = null
     }
-    send({ type: 'close' })
+    send({ type: OUT.CLOSE })
     wsRef.current?.close()
     wsRef.current = null
     setConnected(false)
@@ -1239,7 +1300,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
       pongReceived.current = false
       try {
-        ws.send(JSON.stringify({ type: 'ping' }))
+        ws.send(JSON.stringify({ type: OUT.PING }))
       } catch {
         ws.close()
         return
@@ -1365,7 +1426,6 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     changeModel,
     changeExecutionMode,
     switchExecutionMode,
-    changeThinking,
     implementPlan,
     compactContext,
     moveChat,
@@ -1402,7 +1462,6 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     changeModel,
     changeExecutionMode,
     switchExecutionMode,
-    changeThinking,
     implementPlan,
     compactContext,
     moveChat,

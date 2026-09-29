@@ -54,19 +54,45 @@ services:
     logging: *default-logging
     environment:
       POSTGRES_DB: otodock
-      POSTGRES_USER: otodock
+      # Two roles. The bootstrap superuser is `otodock_admin`, and it has NO
+      # network password: reach it over the container's local socket, which the
+      # image trusts (`docker compose exec otodock-postgres psql -U otodock_admin
+      # -d otodock`), the way Debian or GitLab keep their `postgres` superuser.
+      # The platform connects as the NON-SUPERUSER role `otodock`, which owns
+      # this database. The one-shot otodock-db-init below converges both roles
+      # on every start. POSTGRES_PASSWORD here is only initdb's password for a
+      # FRESH volume: the one-shot replaces it seconds later (with no password,
+      # or with the optional OTODOCK_DB_ADMIN_PASSWORD, which only db-init reads,
+      # so setting or unsetting that key never recreates this container). On an
+      # EXISTING volume the image ignores both vars (initdb already ran).
+      POSTGRES_USER: otodock_admin
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this compose file (the dev flow uses config.env via proxy/setup.sh) — refusing to init Postgres with a default password}
     # The default 64MB /dev/shm makes Postgres throw "could not resize shared
     # memory segment" under parallel queries / large sorts.
     shm_size: 256mb
     volumes:
       - otodock-pgdata:/var/lib/postgresql/data
-    networks: [otodock]
+      # The live unix socket, shared with otodock-db-init (read-only there): the
+      # one-shot's admin path is the same local trust `docker exec` uses, so no
+      # superuser password ever travels. Holds nothing but the socket and its
+      # lock; a killed server's leftovers are reused by the next start. Never add
+      # `init: true` or `pid: host` here: that reuse relies on the postmaster
+      # being PID 1.
+      - otodock-pgsock:/var/run/postgresql
+    # Data-plane network: internal (no gateway/egress), joined ONLY by the proxy
+    # and the db-init one-shot. No sidecar or community MCP can reach 5432.
+    networks: [otodock-data]
     healthcheck:
+      # pg_isready does not authenticate, so `-U otodock` works even before
+      # db-init creates that role on a fresh install. start_period keeps a long
+      # WAL replay (a large database after an unclean stop) from flipping the
+      # container unhealthy before the one-shot ever runs; a success is still
+      # reported at once.
       test: ["CMD-SHELL", "pg_isready -U otodock"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 300s
 
   # --- Docker socket proxy (Tecnativa) ---
   # The proxy reaches the host Docker daemon ONLY through this read-restricted
@@ -89,11 +115,13 @@ services:
       POST: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [otodock]
+    # Control-plane network: internal, joined ONLY by the proxy. No sidecar or
+    # community MCP can reach :2375, the Docker API that is root on the host.
+    networks: [socketproxy]
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.6.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.0}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
@@ -111,6 +139,21 @@ services:
     # MemAvailable), so a leaky sibling container still blocks admission (with an
     # honest "host memory" denial) either way.
     mem_limit: ${OTODOCK_PROXY_MEM_LIMIT:-0}
+    # Open-file floor: the json-file/systemd default soft limit is 1024, at which
+    # uvloop silently drops new connections. The proxy also raises its own soft
+    # limit at boot (startup.raise_nofile_limit); this covers what it starts.
+    # soft:hard (hard = Docker's default 524288): a single value would LOWER the
+    # hard limit children raise.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
+    # PID floor for the whole proxy container: a fork bomb in one sandbox cannot
+    # exhaust the host PID space. This is a container-wide FLOOR sized well above
+    # the platform's real thread/process count at full session load; per-session
+    # containment (a cgroup pids.max per sandbox) is separate, later work.
+    # Override OTODOCK_PROXY_PIDS_LIMIT (0 = unlimited).
+    pids_limit: ${OTODOCK_PROXY_PIDS_LIMIT:-32768}
     # Non-root runtime user (matches the Dockerfile USER + file-tools' uid). The
     # agent inherits this uid → it runs as uid 1000, capability-less.
     user: "1000:1000"
@@ -153,7 +196,14 @@ services:
       # mapping (the container side is pinned to 8400 above). In production,
       # prefer fronting this with a reverse proxy / tunnel instead of exposing
       # it directly.
-      - "${PROXY_PORT:-8400}:8400"
+      #
+      # PROXY_BIND_IP restricts the host interface the port binds to. Empty (the
+      # default) publishes on all interfaces exactly as before ("8400:8400");
+      # behind a same-host reverse proxy set PROXY_BIND_IP=127.0.0.1 together
+      # with TRUSTED_PROXY (the installation guide's HTTPS section) so only the
+      # edge can reach the proxy and X-Forwarded-For cannot be forged from other
+      # host interfaces, IPv6 or a hairpinning sidecar.
+      - "${PROXY_BIND_IP:+${PROXY_BIND_IP}:}${PROXY_PORT:-8400}:8400"
     volumes:
       # The operator env file (`.env` next to this compose file; the source/dev
       # flow points this at config.env via OTODOCK_ENV_FILE — see compose.sh)
@@ -208,7 +258,13 @@ services:
     # docs/architecture/SANDBOX.md.
     devices:
       - /dev/net/tun
-    networks: [otodock]
+    # The proxy is the ONLY container that bridges every plane: `otodock` (the
+    # shared bridge of community MCPs and the phone, and the only non-internal net, so
+    # it provides the default route / internet egress), `socketproxy` (drive the
+    # daemon), `otodock-data` (Postgres) and `otodock-internal` (file-tools +
+    # Collabora). The other three nets are internal:true (no gateway); egress stays
+    # via `otodock`.
+    networks: [otodock, socketproxy, otodock-data, otodock-internal]
     # Reach services on the Docker host (e.g. a local Ollama / OpenAI-compatible
     # LLM endpoint, or local STT/TTS) at host.docker.internal. The proxy is the
     # trusted control plane and only dials admin-configured endpoints — agents
@@ -223,6 +279,10 @@ services:
       # agents volume + config.env to uid 1000 before the (non-root) proxy starts.
       otodock-agents-init:
         condition: service_completed_successfully
+      # Demote the app DB role (and, on an existing volume, upgrade it) before
+      # the proxy connects.
+      otodock-db-init:
+        condition: service_completed_successfully
 
   # --- One-shot init: own the data volume for the non-root proxy ---
   # Docker creates named volumes root-owned, but the proxy + file-tools + agent
@@ -231,7 +291,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.6.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.7.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -250,12 +310,201 @@ services:
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
     restart: "no"
 
+  # --- One-shot init: the two database roles ---
+  # Makes the runtime role `otodock` a NON-SUPERUSER that OWNS this database and
+  # follows POSTGRES_PASSWORD, and leaves the separate superuser `otodock_admin`
+  # with NO network password unless OTODOCK_DB_ADMIN_PASSWORD opts in. On a
+  # FRESH volume the image bootstraps `otodock_admin` and this creates `otodock`;
+  # on an EXISTING pre-1.7 volume it upgrades the old superuser `otodock` in place
+  # (rename the bootstrap role out of the way, recreate `otodock` non-super with
+  # the same app password, transfer ownership). Every admin statement runs over
+  # the unix socket shared through otodock-pgsock, which the image trusts, so the
+  # one-shot needs no superuser password in any mode and an interrupted run heals
+  # on the next start. Idempotent, injection-safe. Postgres image (ships psql):
+  # no Dockerfile change. Runs before the proxy connects.
+  otodock-db-init:
+    image: ${POSTGRES_IMAGE:-postgres:16.14-alpine}
+    restart: "no"
+    logging: *default-logging
+    # Data-plane only: the TCP gate and the app-role proof reach
+    # otodock-postgres:5432 by service DNS; everything else is the socket.
+    networks: [otodock-data]
+    volumes:
+      - otodock-pgsock:/var/run/postgresql:ro
+    environment:
+      POSTGRES_DB: otodock
+      # The APP role password (the proxy's DATABASE_URL uses it). Required; the
+      # role is made to match it on every start.
+      OTODOCK_DB_APP_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this compose file}
+      # Optional network password for the superuser (TCP admin tools). Empty,
+      # the default, means none: the superuser is reachable only through the
+      # container's socket. Applied on every start; unset it to drop it again.
+      OTODOCK_DB_ADMIN_PASSWORD: ${OTODOCK_DB_ADMIN_PASSWORD:-}
+      # Seconds to wait for Postgres to accept TCP (covers a large DB's WAL replay).
+      OTODOCK_DB_INIT_WAIT_S: ${OTODOCK_DB_INIT_WAIT_S:-180}
+    depends_on:
+      otodock-postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # otodock-db-init converge. POSIX sh (busybox ash). Every admin statement goes
+        # over the unix socket in $$SOCK (the image's pg_hba: `local all all trust`), so
+        # no superuser password is needed in any mode; the only TCP login is the proof
+        # that the proxy's own path works. Passwords enter psql as -v pw=... :'pw' on
+        # stdin (never -c, which does not substitute): one quoted literal, no injection.
+        DBH="$${DB_HOST:-otodock-postgres}"
+        DBP="$${DB_PORT:-5432}"
+        DBN="$${POSTGRES_DB:-otodock}"
+        APPPW="$${OTODOCK_DB_APP_PASSWORD:-}"
+        ADMPW="$${OTODOCK_DB_ADMIN_PASSWORD:-}"
+        WAIT="$${OTODOCK_DB_INIT_WAIT_S:-180}"
+        SOCK=/var/run/postgresql
+        TMP=otodock_db_init_tmp
+
+        [ -n "$$APPPW" ] || { echo "db-init: OTODOCK_DB_APP_PASSWORD (=POSTGRES_PASSWORD) is empty" >&2; exit 1; }
+        mountpoint -q "$$SOCK" || { echo "db-init: $$SOCK is not a mounted volume; mount otodock-pgsock there in both otodock-postgres and otodock-db-init" >&2; exit 1; }
+
+        # psql over the socket as a role (no password); over TCP as the app role.
+        s() { u="$$1"; shift; psql -X -h "$$SOCK" -p "$$DBP" -U "$$u" -d "$$DBN" -v ON_ERROR_STOP=1 -tAq "$$@"; }
+        tcp_app() { PGPASSWORD="$$APPPW" psql -X -h "$$DBH" -p "$$DBP" -U otodock -d "$$DBN" -v ON_ERROR_STOP=1 -tAq "$$@"; }
+
+        # Wait for the REAL server over TCP. The healthcheck is already green during
+        # the entrypoint's socket-only initdb server, which pg_ctl stops right after;
+        # a converge run against it would die mid-transaction. pg_isready needs no
+        # auth: 0 accepting, 1 rejecting (WAL replay), 2 no response.
+        i=0
+        until pg_isready -q -h "$$DBH" -p "$$DBP"; do
+          i=$$((i + 1))
+          [ "$$i" -lt "$$WAIT" ] || { echo "db-init: no Postgres accepting TCP at $$DBH:$$DBP within $${WAIT}s (OTODOCK_DB_INIT_WAIT_S)" >&2; exit 1; }
+          sleep 1
+        done
+
+        # Detect over the socket: otodock_admin present (fresh, converged, or a crash
+        # after the rename) -> admin; only the bootstrap superuser otodock (a pre-1.7
+        # volume) -> existing; otodock non-super and no admin -> appnonsuper.
+        MODE=""
+        i=0
+        while [ -z "$$MODE" ]; do
+          if r="$$(s otodock_admin -c "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>/dev/null)"; then
+            [ "$$r" = t ] || { echo "db-init: a role otodock_admin exists but is not a superuser; fix it over the socket (docker compose exec otodock-postgres psql -U <a superuser> -d $$DBN) and re-run" >&2; exit 1; }
+            if [ "$$(s otodock_admin -c "SELECT rolsuper FROM pg_roles WHERE rolname = 'otodock'")" = t ]; then
+              echo "db-init: otodock is still the bootstrap superuser and otodock_admin already exists; drop or rename otodock_admin over the socket and re-run" >&2; exit 1
+            fi
+            MODE="admin"
+          elif r="$$(s otodock -c "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>/dev/null)"; then
+            if [ "$$r" = t ]; then MODE="existing"; else MODE="appnonsuper"; fi
+          else
+            i=$$((i + 1))
+            [ "$$i" -lt 15 ] || { echo "db-init: no login over the socket $$SOCK although TCP is up; is otodock-pgsock the volume otodock-postgres mounts at $$SOCK?" >&2; exit 1; }
+            sleep 1
+          fi
+        done
+        echo "db-init: mode=$$MODE"
+
+        # Move the public schema itself when a role other than pg_database_owner
+        # owns it (a stock cluster's follows the database owner; one recreated by
+        # hand, as a restore that dropped and created it does, belongs to whoever
+        # made it and carries no grant, so the app role could not create in it),
+        # then every public table (a table carries its serial sequences), standalone
+        # sequence and view not already owned by otodock. Captured first, then fed as
+        # one advisory-locked batch: a pipeline would hide a failing generator behind
+        # the batch's own exit status.
+        sweep() {
+          sch="$$(s otodock_admin -c "SELECT 'ALTER SCHEMA public OWNER TO otodock;' FROM pg_namespace WHERE nspname = 'public' AND pg_get_userbyid(nspowner) NOT IN ('pg_database_owner', 'otodock')")"
+          tbl="$$(s otodock_admin -c "SELECT format('ALTER TABLE public.%I OWNER TO otodock;', tablename) FROM pg_tables WHERE schemaname = 'public' AND tableowner <> 'otodock'")"
+          seq="$$(s otodock_admin -c "SELECT format('ALTER SEQUENCE public.%I OWNER TO otodock;', sequencename) FROM pg_sequences WHERE schemaname = 'public' AND sequenceowner <> 'otodock'")"
+          vw="$$(s otodock_admin -c "SELECT format('ALTER VIEW public.%I OWNER TO otodock;', viewname) FROM pg_views WHERE schemaname = 'public' AND viewowner <> 'otodock'")"
+          mv="$$(s otodock_admin -c "SELECT format('ALTER MATERIALIZED VIEW public.%I OWNER TO otodock;', matviewname) FROM pg_matviews WHERE schemaname = 'public' AND matviewowner <> 'otodock'")"
+          printf 'BEGIN;\nSELECT pg_advisory_xact_lock(4021977);\n%s\n%s\n%s\n%s\n%s\nCOMMIT;\n' "$$sch" "$$tbl" "$$seq" "$$vw" "$$mv" | s otodock_admin >/dev/null
+        }
+
+        # As otodock_admin: the app role exists, owns the database and every object.
+        # Runs on every branch so an interrupted earlier run heals; a no-op when done.
+        converge_admin() {
+          s otodock_admin -c "DROP ROLE IF EXISTS $$TMP" >/dev/null
+          if [ "$$(s otodock_admin -c "SELECT 1 FROM pg_roles WHERE rolname = 'otodock'")" != 1 ]; then
+            printf "CREATE ROLE otodock LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB PASSWORD :'pw';\n" | s otodock_admin -v pw="$$APPPW" >/dev/null
+            echo "db-init: created role otodock (NOSUPERUSER)"
+          fi
+          s otodock_admin -c "ALTER DATABASE \"$$DBN\" OWNER TO otodock" >/dev/null
+          sweep
+          s otodock_admin -c "DROP ROLE IF EXISTS $$TMP" >/dev/null
+          echo "db-init: otodock owns \"$$DBN\", the public schema and every public table, sequence and view"
+        }
+
+        case "$$MODE" in
+          admin) converge_admin ;;
+          existing)
+            # PostgreSQL refuses NOSUPERUSER on the bootstrap role and a rename from
+            # its own session: a passwordless temporary superuser (socket only) renames
+            # it; the bootstrap identity becomes the admin and the app role is recreated.
+            s otodock -c "DROP ROLE IF EXISTS $$TMP" >/dev/null
+            s otodock -c "CREATE ROLE $$TMP LOGIN SUPERUSER" >/dev/null
+            s "$$TMP" -c "ALTER ROLE otodock RENAME TO otodock_admin" >/dev/null
+            echo "db-init: renamed the bootstrap superuser otodock -> otodock_admin"
+            converge_admin ;;
+          appnonsuper)
+            stranded="$$(s otodock -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner <> 'otodock'")"
+            if [ "$$stranded" != 0 ]; then
+              supers="$$(s otodock -c "SELECT string_agg(rolname, ', ') FROM pg_roles WHERE rolsuper AND rolcanlogin")"
+              echo "db-init: no superuser is reachable on the socket (otodock_admin is missing) and $$stranded public table(s) are owned by another role; recreate otodock_admin with: docker compose exec otodock-postgres psql -U <a superuser: $${supers:-none}> -d $$DBN, then re-run" >&2
+              exit 1
+            fi
+            echo "db-init: otodock is non-super and owns every table; no superuser role otodock_admin exists" ;;
+        esac
+
+        # Prove the proxy's own path: TCP login as otodock with POSTGRES_PASSWORD, not
+        # a superuser. Only a failed login sets the role's password (a rotated .env),
+        # so a steady-state run issues no password statement at all.
+        if [ "$$MODE" = appnonsuper ]; then SU=otodock; else SU=otodock_admin; fi
+        if ! r="$$(tcp_app -c "SELECT rolsuper FROM pg_roles WHERE rolname = current_user" 2>/dev/null)"; then
+          printf "ALTER ROLE otodock PASSWORD :'pw';\n" | s "$$SU" -v pw="$$APPPW" >/dev/null
+          echo "db-init: app password set from POSTGRES_PASSWORD"
+          r="$$(tcp_app -c "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")" || { echo "db-init: otodock cannot log in over TCP with POSTGRES_PASSWORD" >&2; exit 1; }
+        fi
+        [ "$$r" = f ] || { echo "db-init: otodock is still a superuser" >&2; exit 1; }
+        # The socket and the TCP server must be the same postmaster (a second server
+        # on this volume would silently take over the socket).
+        if [ "$$(tcp_app -c "SELECT pg_postmaster_start_time()")" != "$$(s "$$SU" -c "SELECT pg_postmaster_start_time()")" ]; then
+          echo "db-init: the socket volume $$SOCK is served by another postmaster than $$DBH:$$DBP" >&2; exit 1
+        fi
+        echo "db-init: app role otodock verified over TCP"
+
+        # A login proves nothing about the schema: the app role must be able to use
+        # and create in public, or the proxy's first migration fails with "no schema
+        # has been selected to create in" and it crash-loops. The sweep gives a
+        # recreated public to otodock in the admin modes; in appnonsuper mode nothing
+        # can, so the run stops here with the fix. Checked over TCP as the app role.
+        if [ "$$(tcp_app -c "SELECT has_schema_privilege(current_user, 'public', 'USAGE') AND has_schema_privilege(current_user, 'public', 'CREATE')")" != t ]; then
+          owner="$$(tcp_app -c "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public'" 2>/dev/null || echo unknown)"
+          echo "db-init: otodock cannot use or create in schema public (owned by $$owner); the proxy would fail with 'no schema has been selected to create in'. As a superuser over the socket (docker compose exec otodock-postgres psql -U <a superuser> -d $$DBN) run: ALTER SCHEMA public OWNER TO otodock; then re-run" >&2; exit 1
+        fi
+        echo "db-init: otodock can use and create in schema public"
+
+        # LAST: the superuser's network password. Unset -> none (the socket, that is
+        # docker exec, is the admin path); set -> applied on every start.
+        if [ "$$MODE" != appnonsuper ]; then
+          if [ -n "$$ADMPW" ]; then
+            printf "ALTER ROLE otodock_admin PASSWORD :'pw';\n" | s otodock_admin -v pw="$$ADMPW" >/dev/null
+            echo "db-init: network password set from OTODOCK_DB_ADMIN_PASSWORD (opt-in; remove the key and run up -d to drop it)"
+            [ "$$ADMPW" != "$$APPPW" ] || echo "db-init: WARNING: OTODOCK_DB_ADMIN_PASSWORD equals POSTGRES_PASSWORD; the superuser answers to the app password over TCP" >&2
+          else
+            s otodock_admin -c "ALTER ROLE otodock_admin PASSWORD NULL" >/dev/null
+            echo "db-init: no network password on otodock_admin (reach it with: docker compose exec otodock-postgres psql -U otodock_admin -d $$DBN)"
+          fi
+          s otodock_admin -c "SELECT format('db-init: %s rolsuper=%s rolpassword_null=%s', rolname, rolsuper, rolpassword IS NULL) FROM pg_authid WHERE rolname IN ('otodock', 'otodock_admin') ORDER BY rolname" || true
+        fi
+        echo "db-init: done"
+
   # --- Core MCP: file-tools (operator-managed compose sibling) ---
   # Reached by the proxy at http://file-tools:8932 (service-DNS). NO host port.
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.6.1}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.7.0}
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document parse OOM-restarts this container instead of
@@ -275,7 +524,12 @@ services:
     # (the numeric uid is the contract; the username differs and that's fine).
     volumes:
       - otodock-agents:/agents
-    networks: [otodock]
+    # Internal-only: file-tools parses untrusted uploads and renders pages, so it
+    # gets NO route to the internet, the LAN, Postgres or the socket proxy. It
+    # reaches only the proxy (WOPI callbacks, resolve-path/hook posts) over this
+    # network; the sandboxed agent reaches its :8932 through the proxy's stack.
+    # (The WeasyPrint SSRF blast radius is closed at the network layer.)
+    networks: [otodock-internal]
     depends_on:
       - otodock-proxy
 
@@ -313,7 +567,10 @@ services:
         exec /start-collabora-online.sh
     cap_add:
       - MKNOD
-    networks: [otodock]
+    # Internal-only, same as file-tools: Collabora reaches only the proxy (its
+    # WOPI host); the browser reaches it solely through the proxy's /collabora/*
+    # forward.
+    networks: [otodock-internal]
     depends_on:
       - otodock-proxy
 
@@ -334,12 +591,36 @@ networks:
       config:
         - subnet: ${OTODOCK_NETWORK_SUBNET:-10.200.0.0/24}
 
+  # Three internal (no gateway, no egress) planes the proxy alone bridges, so the
+  # control planes and the untrusted sidecars can't reach each other or the wider
+  # network. Small pinned /24s inside 10/8, disjoint from 10.200.0.0/24 and the
+  # 10.201/16 MCP pool, and inside the sandbox's RFC1918 blackhole. Override the
+  # subnets if a second install shares this daemon or they overlap your LAN.
+  socketproxy:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${OTODOCK_SOCKETPROXY_SUBNET:-10.202.0.0/24}
+  otodock-data:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${OTODOCK_DATA_SUBNET:-10.203.0.0/24}
+  otodock-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${OTODOCK_INTERNAL_SUBNET:-10.204.0.0/24}
+
 # Explicit (project-independent) volume names, matching the named network above:
 # predictable for backup/restore tooling (`docker run -v otodock-agents:… tar`)
 # and stable however the compose project is named.
 volumes:
   otodock-pgdata:
     name: otodock-pgdata
+  # The Postgres unix socket, shared with otodock-db-init. No data.
+  otodock-pgsock:
+    name: otodock-pgsock
   otodock-agents:
     name: otodock-agents
   otodock-mcps:

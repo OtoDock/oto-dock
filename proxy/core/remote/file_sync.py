@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
+from services.infra import safe_fs
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from auth import roles
+from core import layout
 
 logger = logging.getLogger("claude-proxy.file-sync")
 
@@ -51,7 +55,7 @@ MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 # - ``.claude`` — Claude Code CLI per-user dir. Mixed authority:
 #   ``settings.json`` + the hook scripts are HOST-LOCAL (regenerated at every
 #   session start on whichever host runs it — the proxy's
-#   ``ensure_persistent_claude_dir`` for local sessions, the satellite's
+#   ``core/layers/cli/config_dir.ensure_persistent_claude_dir`` for local sessions, the satellite's
 #   ``CLISession.start`` / ``_write_cli_hooks`` for remote ones — and the
 #   platform copy carries sandbox-internal ``/users/{u}/.claude`` hook paths
 #   that are invalid on a satellite; never synced, see
@@ -65,6 +69,19 @@ MAX_FILE_SIZE = config.SYNC_MAX_FILE_BYTES
 #   it — never synced, see ``_CODEX_HOST_LOCAL_FILES``); ``sessions/`` is
 #   satellite-authoritative.
 INCLUDE_DOTTED_DIRS = {".claude", ".codex"}
+
+# Agent-tree roots that exist on the proxy host only: external callers'
+# trees, app release copies and app databases (APPS.md) and chat snapshots
+# (SHARING.md). Never synced either way, never listed or served by the
+# files API — each has its own routes.
+PLATFORM_ONLY_TREES = ("externals", "app-releases", "app-data", "shares")
+
+
+def is_platform_only_tree(rel_path: str) -> bool:
+    """True for a path under one of ``PLATFORM_ONLY_TREES`` (agent-root
+    relative, forward slashes)."""
+    head = (rel_path or "").lstrip("/").split("/", 1)[0]
+    return head in PLATFORM_ONLY_TREES
 
 # Path segments whose subtrees are **satellite-authoritative** — they may
 # legitimately appear in the satellite manifest without a platform
@@ -121,14 +138,15 @@ _CLI_RUNTIME_CHILD_DIRS = frozenset({
 
 
 def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
-    """True for a runtime-cruft dir that is an immediate child of ``.claude``/``.codex``."""
-    return parent_name in (".claude", ".codex") and child_name in _CLI_RUNTIME_CHILD_DIRS
+    """True for a runtime-cruft dir that is an immediate child of an engine
+    config dir (``INCLUDE_DOTTED_DIRS``)."""
+    return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
 
 
 def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
-    """True for CLI backup/corrupted state files directly under ``.claude``/``.codex``
-    (e.g. ``.claude.json.backup.<ts>``) — host-local, never synced."""
-    if parent_name not in (".claude", ".codex"):
+    """True for CLI backup/corrupted state files directly under an engine
+    config dir (e.g. ``.claude.json.backup.<ts>``) — host-local, never synced."""
+    if parent_name not in INCLUDE_DOTTED_DIRS:
         return False
     return ".backup." in file_name or ".corrupted." in file_name
 
@@ -182,7 +200,7 @@ def _is_codex_runtime_state(rel_path: str) -> bool:
 
 
 # Per-session REGENERATED Claude Code config — each host writes its own at
-# session start (the proxy's ``ensure_persistent_claude_dir`` for local sessions;
+# session start (the proxy's ``core/layers/cli/config_dir.ensure_persistent_claude_dir`` for local sessions;
 # the satellite's ``CLISession.start`` via ``_write_cli_hooks`` /
 # ``_write_hook_scripts`` for remote ones). The platform copy carries
 # sandbox-internal hook paths (e.g. ``/users/{u}/.claude/permission_gate.py``)
@@ -250,7 +268,7 @@ def _is_venv_dir(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 _CACHEDIR_SIG = b"Signature: 8a477f597d28d172789f06886806bc55"
-_RULE_PROTECTED_DIR_NAMES = frozenset({"workspace", "config", "users"})
+_RULE_PROTECTED_DIR_NAMES = frozenset({layout.WORKSPACE, layout.CONFIG, layout.USERS})
 _RULES_MAX_LIST = 64
 _RULES_MAX_MARKERS = 16
 _RULES_MAX_STR = 128
@@ -497,7 +515,6 @@ def compute_manifest(
     agent_dir: Path,
     *,
     scope: str = "full",
-    execution_path: str = "claude-code-cli",
     target_username: str | None = None,
     target_role: str = "",
     exclude_user_dirs: bool = False,
@@ -509,7 +526,6 @@ def compute_manifest(
     Args:
         agent_dir: Root agent directory on the platform.
         scope: "full" | "config_only" (for push-only config dir).
-        execution_path: "claude-code-cli" or "codex-cli" (affects which config dirs to include).
         exclude_user_dirs: True for SHARED-ONLY agents — their mode has no
             per-user scope at all, so the ``users/`` subtree never syncs to
             any satellite (stray dirs from older installs stay platform-side).
@@ -519,13 +535,12 @@ def compute_manifest(
             data and agent-scoped credentials. None = admin-shared
             target, no filtering (default).
         target_role: the per-agent role of the session driving
-            this sync (``"manager"`` / ``"editor"`` / ``"viewer"`` / ``"admin"``
-            / ``""`` for agent-scope sessions). When the role is not in the
-            owner tier (manager/admin), ``config/`` paths are excluded so
-            the satellite never receives the agent's prompt / context files
-            for editor/viewer sessions. ``""`` = no role filter (default;
-            agent-scope sessions inherit this behavior — config is not
-            relevant to them either).
+            this sync (``auth/roles.EFFECTIVE_ROLES``, or ``""`` — a
+            user-paired machine whose owner holds no row, the fail-closed
+            sync role). When the role is not in the owner tier
+            (``roles.can_manage``), ``config/`` paths are excluded so the
+            satellite never receives the agent's prompt / context files —
+            ``""`` and any word the table does not know are non-owners.
         max_file_size: Per-file byte cap override. Pass the target machine's
             ``effective_sync_cap`` so a pre-0.5.103 satellite's merge plan
             never contains a file it would reject at 100MB. None = the
@@ -561,11 +576,10 @@ def compute_manifest(
                 dirs[:] = []
                 continue
         # Skip heavy / unwanted dirs. Hidden dirs are skipped UNLESS in
-        # the dotted-dir whitelist (``.credentials/``, ``.claude/``,
-        # ``.codex/``) so OAuth tokens + CLI config sync to the satellite.
-        # Without the whitelist carve-out, every OAuth-based MCP on a
-        # remote satellite would fail silently at runtime because its
-        # tokens never reach the satellite.
+        # the dotted-dir whitelist (``INCLUDE_DOTTED_DIRS``: ``.claude/`` and
+        # ``.codex/``, the CLI config) so the CLI state syncs to the
+        # satellite; ``.credentials/`` is NOT in it any more — tokens are
+        # brokered per session (see the module head).
         _root_name = os.path.basename(root)
         dirs[:] = [
             d for d in dirs
@@ -574,12 +588,15 @@ def compute_manifest(
             and (not d.startswith(".") or d in INCLUDE_DOTTED_DIRS)
             and not _is_cli_runtime_child(_root_name, d)
         ]
-        if exclude_user_dirs and root == str(agent_dir) and "users" in dirs:
-            dirs.remove("users")
-        # External callers' trees (phone callers who are not platform users)
-        # live on the proxy host only — never synced to any satellite.
-        if root == str(agent_dir) and "externals" in dirs:
-            dirs.remove("externals")
+        if exclude_user_dirs and root == str(agent_dir) and layout.USERS in dirs:
+            dirs.remove(layout.USERS)
+        # The platform-only trees (external callers' trees, app release
+        # copies, chat snapshots) live on the proxy host only — never synced
+        # to any satellite.
+        if root == str(agent_dir):
+            for name in PLATFORM_ONLY_TREES:
+                if name in dirs:
+                    dirs.remove(name)
         if matcher is not None:
             for d in dirs:
                 if matcher.named_match(d, files):
@@ -588,7 +605,7 @@ def compute_manifest(
         # Scope filtering
         if scope == "config_only":
             # Only include config/ directory
-            if str(rel_root) != "." and not str(rel_root).startswith("config"):
+            if str(rel_root) != "." and not str(rel_root).startswith(layout.CONFIG):
                 continue
 
         for f in files:
@@ -675,11 +692,11 @@ def _is_other_user_or_sensitive(rel_path: str, target_username: str) -> bool:
     sessions never see config files even on their own paired laptop.
     """
     parts = rel_path.split("/")
-    if parts and parts[0] == "users" and len(parts) >= 2:
+    if parts and parts[0] == layout.USERS and len(parts) >= 2:
         if parts[1] != target_username:
             return True
-    if parts and parts[0] == "externals":
-        return True  # callers' trees never leave the proxy host
+    if is_platform_only_tree(rel_path):
+        return True  # callers' trees, releases, snapshots never leave the proxy host
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if rel_path.startswith(prefix):
             return True
@@ -687,7 +704,7 @@ def _is_other_user_or_sensitive(rel_path: str, target_username: str) -> bool:
     # credentials dir (e.g. under a knowledge-library mirror) must stay
     # just as unsyncable as ``knowledge/.credentials/`` itself. Mirrors
     # never contain one (projector exclusion) — defense-in-depth.
-    if ".credentials" in parts:
+    if layout.CREDENTIALS_DIR in parts:
         return True
     return False
 
@@ -740,12 +757,14 @@ def is_canonical_rel_path(rel_path: str) -> bool:
     ``C:`` is just a directory name). Shared by ``can_write_back`` and the
     ``pull_through`` / ``push_back`` hook flows.
     """
-    if not rel_path or "\x00" in rel_path or "\\" in rel_path:
+    if not rel_path or "\\" in rel_path:
         return False
-    parts = rel_path.split("/")
-    if any(p in ("", ".", "..") for p in parts):
+    try:
+        if normalize_rel_path(rel_path) != rel_path:  # a leading or trailing slash
+            return False
+    except PathOutsideRoot:  # a NUL, an empty or dot segment
         return False
-    return parts[0] in ("config", "knowledge", "workspace", "users")
+    return bool(layout.head_of(rel_path))
 
 
 def is_engine_machinery_path(rel_path: str) -> bool:
@@ -758,7 +777,7 @@ def is_engine_machinery_path(rel_path: str) -> bool:
     WARNING (observed 2026-07-09: recurring write-back-denied noise per
     codex turn)."""
     parts = rel_path.split("/")
-    return ".claude" in parts or ".codex" in parts or ".credentials" in parts
+    return any(p in INCLUDE_DOTTED_DIRS or p == layout.CREDENTIALS_DIR for p in parts)
 
 
 def library_mirror_source(rel_path: str) -> str | None:
@@ -769,7 +788,7 @@ def library_mirror_source(rel_path: str) -> str | None:
     Which LIBRARY of that source covers the path — libraries are
     per-subtree — is :func:`library_for_mirror_rel`."""
     parts = rel_path.split("/")
-    if len(parts) >= 3 and parts[0] == "knowledge" and parts[1] == "shared":
+    if len(parts) >= 3 and parts[0] == layout.KNOWLEDGE and parts[1] == "shared":
         return parts[2]
     return None
 
@@ -788,7 +807,7 @@ def library_for_mirror_rel(
     stays storage-import-free.
     """
     parts = rel_path.split("/")
-    if len(parts) < 3 or parts[0] != "knowledge" or parts[1] != "shared":
+    if len(parts) < 3 or parts[0] != layout.KNOWLEDGE or parts[1] != "shared":
         return None
     src, sub_parts = parts[2], parts[3:]
     for lib_src, lib_subdir in libraries or ():
@@ -852,7 +871,11 @@ def can_write_back(rel_path: str, role: str, username: str,
     #    platform is the sole source of truth for all three, for every role.
     if is_engine_machinery_path(rel_path):
         return False
-    owner_tier = role in ("manager", "admin")
+    # The platform-only trees never reach a satellite, so nothing under them
+    # can come back from one.
+    if is_platform_only_tree(rel_path):
+        return False
+    owner_tier = roles.can_manage(role)
     top = parts[0]
     # 1b. Knowledge-library mirrors (``knowledge/shared/<source>/…``) — the
     #     covering attachment's writable flag decides, ON TOP of the
@@ -877,19 +900,19 @@ def can_write_back(rel_path: str, role: str, username: str,
     #    and mount knowledge RO, so the username gate blocks exactly them —
     #    EXCEPT a manager-provenance task fire (``knowledge_rw``), which may
     #    write knowledge/ (never config/: that stays human-manager-only).
-    if top == "knowledge":
+    if top == layout.KNOWLEDGE:
         return owner_tier and (bool(username) or knowledge_rw)
-    if top == "config":
+    if top == layout.CONFIG:
         return owner_tier and bool(username)
-    # 3. Shared agent workspace — editor tier and up (viewer is read-only here).
-    if top == "workspace":
-        return role in ("manager", "admin", "editor")
+    # 3. Shared agent workspace — the workspace tier (viewer is read-only here).
+    if top == layout.WORKSPACE:
+        return roles.can_write_workspace(role)
     # 4. Per-user dirs — own dir only, any role, keyed on the MOUNT identity
     #    (a Shared-only human chat has no per-user dirs; its mount_username
     #    "" denies every users/ write-back). (Stricter than local for
     #    admin-on-admin-agent cross-user writes — intentionally not synced back
     #    from a remote satellite; revisit if a real workflow needs it.)
-    if top == "users":
+    if top == layout.USERS:
         mu = username if mount_username is None else mount_username
         if len(parts) < 2 or not mu:
             return False
@@ -916,17 +939,20 @@ def should_sync_to_target(rel_path: str, username: str | None, role: str) -> boo
         paths, never another user's data.
       * Other users' data + agent-scope credentials (``_is_other_user_or_sensitive``)
         never sync to a user-scoped target.
-      * ``config/`` is owner-tier only (manager/admin); non-owner (editor / viewer /
-        agent-scope) targets never receive the agent's prompt/context files.
+      * ``config/`` is owner-tier only (``roles.can_manage``); a non-owner
+        target (editor, viewer, ``""`` — a user-paired machine whose owner
+        holds no row —, any word the table does not know) never receives the
+        agent's prompt/context files. An agent-scope session on an
+        admin-paired machine carries the agent's own ``manager`` and does.
 
     NOTE: this governs the PUSH direction (platform → satellite). The satellite →
     platform WRITE direction is the separate ``can_write_back`` predicate above.
     """
-    if rel_path.startswith("externals/"):
-        return False  # callers' trees never leave the proxy host (any target)
+    if is_platform_only_tree(rel_path):
+        return False  # callers' trees, releases, snapshots never leave the proxy host
     if username is not None and _is_other_user_or_sensitive(rel_path, username):
         return False
-    owner_tier = role in ("manager", "admin")
+    owner_tier = roles.can_manage(role)
     if not owner_tier and rel_path.startswith("config/"):
         return False
     return True
@@ -945,7 +971,7 @@ def _divergence_capture(
     whichever side did NOT win. ``author_of(path)`` and ``satellite_user`` are
     username slugs.
     """
-    if path.split("/", 1)[0] == "users":
+    if layout.head_of(path) == layout.USERS:
         return (None, None, None)  # personal → same-user domain → no capture
     loser_side = "satellite" if platform_wins else "platform"
     author = author_of(path)  # platform last-writer slug, or None
@@ -1040,7 +1066,7 @@ def _resolve_merge(
         # in-session instead).
         if (B is not None and P == B and satellite_tree_present and cwb()
                 and P != _EMPTY_CONTENT_HASH
-                and path.split("/", 1)[0] != "config"):
+                and path.split("/", 1)[0] != layout.CONFIG):
             return FileAction(
                 path, "delete_platform", clear_base=True,
                 capture_side="platform", capture_reason="deleted",
@@ -1158,12 +1184,12 @@ def diff_manifests(
     if exclude_user_dirs:
         # Drop users/ from EVERY input (manifests + carried state) so the
         # union loop below can never manufacture an action for one.
-        local = [e for e in local if not e.path.startswith("users/")]
+        local = [e for e in local if not layout.is_personal(e.path)]
         remote = [r for r in remote
-                  if not str(r.get("path", "")).startswith("users/")]
-        base = {k: v for k, v in base.items() if not k.startswith("users/")}
+                  if not layout.is_personal(str(r.get("path", "")))]
+        base = {k: v for k, v in base.items() if not layout.is_personal(k)}
         tombstones = {k: v for k, v in tombstones.items()
-                      if not k.startswith("users/")}
+                      if not layout.is_personal(k)}
     local_map = {e.path: e for e in local}
     remote_map = {r["path"]: r for r in remote}
     # The satellite tree is "alive" iff it reported ANY file. An EMPTY manifest with
@@ -1275,27 +1301,27 @@ def prepare_outgoing_files(
     """Prepare files for pushing to satellite.
 
     Returns list of file_push message dicts. Files > MAX_CHUNK_SIZE are
-    split into write_chunk actions.
+    split into write_chunk actions. Each file is read beneath the agent root
+    with no link followed (a link, at the leaf or on the way, is skipped:
+    symlinks don't round-trip).
     """
     messages = []
-    for rel_path in paths:
-        file_path = agent_dir / rel_path
-        if not file_path.exists():
-            continue
-
-        # Symlinks don't round-trip — skip.
-        if file_path.is_symlink():
-            continue
-
-        # Validate path stays within agent_dir
+    agent_dir = Path(agent_dir)
+    with safe_fs.open_root(agent_dir.parent, agent_dir.name) as rootfd:
+      for rel_path in paths:
         try:
-            file_path.resolve().relative_to(agent_dir.resolve())
-        except ValueError:
+            rel = normalize_rel_path(rel_path)
+        except PathOutsideRoot:
             logger.warning("Path traversal attempt: %s", rel_path)
             continue
-
         try:
-            content = file_path.read_bytes()
+            content = safe_fs.read_bytes_beneath(rootfd, rel, max_size=MAX_FILE_SIZE)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning("Cannot read %s for sync: %s", rel_path, type(e).__name__)
+            continue
+        try:
             file_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
 
             if len(content) <= MAX_CHUNK_SIZE:
@@ -1354,13 +1380,36 @@ def prune_empty_parents(file_path: Path, root: Path) -> None:
         except ValueError:
             return
         depth = len(rel.parts)
-        if depth < 2 or (depth == 2 and rel.parts[0] == "users"):
+        if depth < 2 or (depth == 2 and rel.parts[0] == layout.USERS):
             return
         try:
             cur.rmdir()
         except OSError:
             return
         cur = cur.parent
+
+
+def _prune_empty_parents_beneath(rootfd: int, rel: str) -> None:
+    """``prune_empty_parents`` on handles: after a delete beneath the root,
+    remove the now-empty parents of ``rel`` bottom-up, each with ``rmdir``
+    from its own parent's handle, never the root, its depth-1 children or a
+    per-user root; the first directory that is not empty stops the walk."""
+    parts = rel.split("/")[:-1]
+    while parts:
+        depth = len(parts)
+        if depth < 2 or (depth == 2 and parts[0] == layout.USERS):
+            return
+        try:
+            pfd = safe_fs.open_dir_beneath(rootfd, "/".join(parts[:-1]))
+        except OSError:
+            return
+        try:
+            os.rmdir(parts[-1], dir_fd=pfd)
+        except OSError:
+            return
+        finally:
+            os.close(pfd)
+        parts.pop()
 
 
 def apply_incoming_file(
@@ -1373,63 +1422,68 @@ def apply_incoming_file(
 ) -> None:
     """Apply a file change received from the satellite.
 
-    Validates that the path stays within agent_dir. Writes are atomic:
-    `write` uses write-to-.partial + fsync + rename. `write_chunk` appends
-    to .partial until `final_chunk=True`, then renames atomically.
+    Every step opens beneath the agent's folder, reached strictly from the
+    agents root (``open_root(agent_dir.parent, agent_dir.name)``), with no
+    component followed: a path swapped for a link after any check is refused
+    (an ``OSError`` the caller logs, the sync state left un-advanced). Writes
+    are atomic: `write` is ``atomic_write_beneath`` (a ``.partial`` temp
+    renamed within the parent handle); `write_chunk` appends to
+    ``<path>.partial`` beneath the root until `final_chunk=True`, then
+    renames it onto the name.
     """
-    target = (agent_dir / path).resolve()
-
-    # Path traversal check
+    agent_dir = Path(agent_dir)
     try:
-        target.relative_to(agent_dir.resolve())
-    except ValueError:
+        rel = normalize_rel_path(path)
+    except PathOutsideRoot:
         logger.warning("Path traversal in incoming file: %s", path)
         return
+    partial_rel = rel + ".partial"
 
-    partial = target.with_suffix(target.suffix + ".partial")
-
-    if action == "delete":
-        if target.exists():
-            target.unlink()
-        prune_empty_parents(target, agent_dir)
-    elif action == "mkdir":
-        target.mkdir(parents=True, exist_ok=True)
-    elif action == "write":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # "" is a real ZERO-BYTE write (b64 of empty content); only None means
-        # "no inline content" (large-file flow — the caller pulls instead).
-        if content_b64 is not None:
-            content = base64.b64decode(content_b64)
+    with safe_fs.open_root(agent_dir.parent, agent_dir.name) as rootfd:
+        if action == "delete":
+            safe_fs.unlink_beneath(rootfd, rel, missing_ok=True)
+            _prune_empty_parents_beneath(rootfd, rel)
+        elif action == "mkdir":
+            safe_fs.mkdirs_beneath(rootfd, rel)
+        elif action == "write":
+            # "" is a real ZERO-BYTE write (b64 of empty content); only None means
+            # "no inline content" (large-file flow: the caller pulls instead).
+            # EDQUOT / ENOSPC / I/O: the helper removes its temp (a left-behind
+            # partial would consume the agent's quota and wedge every retry)
+            # and raises, so the caller leaves sync_state un-advanced and the
+            # satellite re-sends once space frees up.
+            if content_b64 is not None:
+                safe_fs.atomic_write_beneath(
+                    rootfd, rel, base64.b64decode(content_b64), mkdirs=True, fsync=True,
+                )
+        elif action == "write_chunk":
+            parent = rel.rpartition("/")[0]
+            if parent:
+                safe_fs.mkdirs_beneath(rootfd, parent)
             try:
-                with open(partial, "wb") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(partial, target)
+                if content_b64:
+                    content = base64.b64decode(content_b64)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                    try:
+                        fd = safe_fs.open_beneath(rootfd, partial_rel, flags, 0o644)
+                    except safe_fs.SymlinkRefused:
+                        # A link planted at the staging name: it goes (its
+                        # target stays), the chunks land in a fresh file.
+                        safe_fs.unlink_beneath(rootfd, partial_rel, missing_ok=True)
+                        fd = safe_fs.open_beneath(rootfd, partial_rel, flags | os.O_EXCL, 0o644)
+                    with os.fdopen(fd, "ab") as f:
+                        f.write(content)
+                        f.flush()
+                        os.fsync(f.fileno())
+                if final_chunk:
+                    with contextlib.suppress(FileNotFoundError):
+                        safe_fs.rename_beneath(rootfd, partial_rel, rel, replace=True)
             except OSError:
-                # EDQUOT / ENOSPC / I/O: drop the orphan .partial so it can't
-                # leak quota — it's manifest-invisible and never swept, so a
-                # left-behind partial would consume the agent's quota and wedge
-                # every retry. Re-raise so the caller leaves sync_state
-                # un-advanced and the satellite re-sends once space frees up.
-                _unlink_quiet(partial)
+                # A failed chunk wedges the whole chunked transfer; drop the
+                # accumulated .partial rather than leak it (same reasoning as above).
+                with contextlib.suppress(OSError):
+                    safe_fs.unlink_beneath(rootfd, partial_rel, missing_ok=True)
                 raise
-    elif action == "write_chunk":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if content_b64:
-                content = base64.b64decode(content_b64)
-                with open(partial, "ab") as f:
-                    f.write(content)
-                    f.flush()
-                    os.fsync(f.fileno())
-            if final_chunk and partial.exists():
-                os.replace(partial, target)
-        except OSError:
-            # A failed chunk wedges the whole chunked transfer; drop the
-            # accumulated .partial rather than leak it (same reasoning as above).
-            _unlink_quiet(partial)
-            raise
 
 
 def pull_timeout_for_size(size_bytes: int) -> float:
@@ -1448,13 +1502,45 @@ def _hash_file(path: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
-# (path → (size, mtime_ns, hash)) LRU so repeated manifest passes never re-hash
+# (path → (size, mtime_ns, digest)) LRU so repeated manifest passes never re-hash
 # unchanged files — at the 1GB cap a single re-hash is seconds of CPU+IO, and
 # manifests run every sync cycle. Thread-safe: compute_manifest runs inside
-# asyncio.to_thread, potentially concurrently for several machines.
-_HASH_CACHE: OrderedDict[str, tuple[int, int, str]] = OrderedDict()
-_HASH_CACHE_MAX = 50_000
+# asyncio.to_thread, potentially concurrently for several machines. The
+# digest is the raw 32 bytes (a third of the ``sha256:<hex>`` text), and the
+# ceiling covers a fleet's synced trees: a cache that thrashes turns every
+# cyclic walk cold, which one INFO line per process reports the first time.
+_HASH_CACHE: OrderedDict[str, tuple[int, int, bytes]] = OrderedDict()
+_HASH_CACHE_MAX = 200_000
 _hash_cache_lock = threading.Lock()
+_hash_cache_evicted_logged = False
+
+
+def _digest_of(file_hash: str) -> bytes | None:
+    """The raw digest of a ``sha256:<hex>`` text; None for anything else."""
+    if not isinstance(file_hash, str) or not file_hash.startswith("sha256:"):
+        return None
+    try:
+        digest = bytes.fromhex(file_hash[7:])
+    except ValueError:
+        return None
+    return digest if len(digest) == 32 else None
+
+
+def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
+    """Under the lock: store one entry, keep the LRU under its ceiling."""
+    global _hash_cache_evicted_logged
+    _HASH_CACHE[key] = (size, mtime_ns, digest)
+    _HASH_CACHE.move_to_end(key)
+    evicted = 0
+    while len(_HASH_CACHE) > _HASH_CACHE_MAX:
+        _HASH_CACHE.popitem(last=False)
+        evicted += 1
+    if evicted and not _hash_cache_evicted_logged:
+        _hash_cache_evicted_logged = True
+        logger.info(
+            "sync hash cache is full (%d entries): older files are re-hashed on "
+            "the next walk", _HASH_CACHE_MAX,
+        )
 # Git's "racily clean" rule: filesystem mtime granularity is the kernel tick
 # (can be milliseconds), so two same-size writes inside one tick are
 # indistinguishable by (size, mtime_ns). Never TRUST a cache hit for a file
@@ -1473,7 +1559,7 @@ def _hash_file_cached(path: Path, st: os.stat_result) -> str:
             hit = _HASH_CACHE.get(key)
             if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
                 _HASH_CACHE.move_to_end(key)
-                return hit[2]
+                return "sha256:" + hit[2].hex()
     file_hash = _hash_file(path)
     try:
         st2 = os.stat(path)
@@ -1484,24 +1570,24 @@ def _hash_file_cached(path: Path, st: os.stat_result) -> str:
     # (Caching a racy-fresh entry is fine — reads inside the racy window
     # bypass the cache anyway.)
     if st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns:
-        with _hash_cache_lock:
-            _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, file_hash)
-            _HASH_CACHE.move_to_end(key)
-            while len(_HASH_CACHE) > _HASH_CACHE_MAX:
-                _HASH_CACHE.popitem(last=False)
+        digest = _digest_of(file_hash)
+        if digest is not None:
+            with _hash_cache_lock:
+                _hash_cache_put(key, st.st_size, st.st_mtime_ns, digest)
     return file_hash
 
 
 def prime_hash_cache(path: Path, file_hash: str) -> None:
     """Record a KNOWN-good hash for a file the caller just wrote (e.g. a
     committed pull whose sha256 was verified) so the next manifest pass never
-    re-hashes it. Best-effort: a failed stat simply skips the prime."""
+    re-hashes it. Best-effort: a failed stat or a hash that is not a sha256
+    text simply skips the prime (never raises: it runs after a commit)."""
+    digest = _digest_of(file_hash)
+    if digest is None:
+        return
     try:
         st = os.stat(path)
     except OSError:
         return
     with _hash_cache_lock:
-        _HASH_CACHE[str(path)] = (st.st_size, st.st_mtime_ns, file_hash)
-        _HASH_CACHE.move_to_end(str(path))
-        while len(_HASH_CACHE) > _HASH_CACHE_MAX:
-            _HASH_CACHE.popitem(last=False)
+        _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)

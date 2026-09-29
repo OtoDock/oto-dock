@@ -25,8 +25,6 @@ def sat_config():
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=Path("/tmp/test-agents"),
         mcps_dir=Path("/tmp/test-mcps"),
-        claude_bin="claude",
-        codex_bin="codex",
     )
 
 
@@ -54,8 +52,15 @@ class TestWriteCliHooks:
         assert settings_file.exists()
         settings = json.loads(settings_file.read_text())
         assert "hooks" in settings
-        assert "PreToolUse" in settings["hooks"]
-        assert "PostToolUse" in settings["hooks"]
+        # Hook parity (0.5.121): the same four events the proxy's
+        # _build_sandbox_cli_settings writes for the local sandbox.
+        assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "SubagentStop", "Stop"}
+        stop = settings["hooks"]["Stop"][0]["hooks"][0]
+        assert "stop_tracker.py" in stop["command"] and stop["timeout"] == 604800
+        # Claude Code ≥ 2.1.275 would sync the pool account's claude.ai skills
+        # and plugins into the session — both off (mirrors the proxy builder).
+        assert settings["syncClaudeAiSkills"] is False
+        assert settings["syncClaudeAiPlugins"] is False
 
     def test_hook_paths_point_to_dir(self, tmp_path):
         _write_cli_hooks(tmp_path)
@@ -296,6 +301,9 @@ class TestCLISessionFlagParity:
         prompt_file = Path(cmd[cmd.index("--append-system-prompt-file") + 1])
         assert prompt_file.read_text() == "test"
         assert "--resume" in cmd
+        # Claude Code ≥ 2.1.267 would re-send the prompt recorded on the
+        # conversation's first request instead of this file — recording off.
+        assert cmd[cmd.index("--system-prompt-snapshot") + 1] == "off"
 
 
 class TestCLISessionDetectChanges:
@@ -304,3 +312,106 @@ class TestCLISessionDetectChanges:
         session._file_snapshot = {}
         changes = session.detect_file_changes()
         assert changes == []
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+class _FakeProc:
+    """A CLI process whose stdout yields ``lines`` then EOF."""
+
+    def __init__(self, lines: list[dict]):
+        self.pid = 4242
+        self.returncode = None
+        self.stdin = _FakeStdin()
+        self.stdout = AsyncMock()
+        self.stderr = AsyncMock()
+        self._lines = [json.dumps(ln).encode() + b"\n" for ln in lines]
+        self.stdout.readline = AsyncMock(side_effect=self._readline)
+
+    async def _readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+
+def _frames(proc: _FakeProc) -> list[dict]:
+    return [json.loads(w.decode().strip()) for w in proc.stdin.writes]
+
+
+class TestCLISessionSteer:
+    """``steer`` writes a user frame into the RUNNING turn's stdin — the
+    satellite half of the proxy's PersistentSession.steer (0.5.128). Strict:
+    True only when the frame reached the pipe; the proxy queues otherwise."""
+
+    def _session(self, tmp_agent_dir, cli_config, sat_config, proc):
+        session = CLISession("sess-s", tmp_agent_dir, cli_config, sat_config)
+        session.proc = proc
+        session._stderr_buf = []
+        return session
+
+    @pytest.mark.asyncio
+    async def test_refused_without_a_live_turn(self, tmp_agent_dir, cli_config, sat_config):
+        proc = _FakeProc([])
+        session = self._session(tmp_agent_dir, cli_config, sat_config, proc)
+        assert await session.steer("hi") is False
+        assert proc.stdin.writes == []
+
+    @pytest.mark.asyncio
+    async def test_mid_turn_frame_lands_after_the_prompt(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        proc = _FakeProc([
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": []}},
+        ])
+        session = self._session(tmp_agent_dir, cli_config, sat_config, proc)
+        turn = session.send_message("do the thing")
+        assert (await turn.__anext__())["type"] == "system"
+        # The loop is open: a steer is accepted, with the chat's sandbox
+        # paths rewritten for this host like the prompt's are.
+        assert await session.steer(
+            "also look at /users/alice/workspace/uploads/photos/p.jpg",
+        ) is True
+        frames = _frames(proc)
+        assert [f["type"] for f in frames] == ["user", "user"]
+        assert frames[0]["message"]["content"] == "do the thing"
+        content = frames[1]["message"]["content"]
+        assert content == (
+            f"also look at {tmp_agent_dir}/users/alice/workspace/uploads/photos/p.jpg"
+        )
+        async for _ in turn:
+            pass
+        # The loop exited on EOF: nothing reads a turn now.
+        assert await session.steer("late") is False
+        assert len(proc.stdin.writes) == 2
+
+    @pytest.mark.asyncio
+    async def test_refused_when_the_process_is_gone(
+        self, tmp_agent_dir, cli_config, sat_config,
+    ):
+        proc = _FakeProc([{"type": "system", "subtype": "init"}])
+        session = self._session(tmp_agent_dir, cli_config, sat_config, proc)
+        turn = session.send_message("go")
+        await turn.__anext__()
+        proc.returncode = 1
+        assert await session.steer("hi") is False
+        async for _ in turn:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_empty_text_never_writes(self, tmp_agent_dir, cli_config, sat_config):
+        proc = _FakeProc([{"type": "system", "subtype": "init"}])
+        session = self._session(tmp_agent_dir, cli_config, sat_config, proc)
+        turn = session.send_message("go")
+        await turn.__anext__()
+        assert await session.steer("") is False
+        assert len(proc.stdin.writes) == 1
+        async for _ in turn:
+            pass

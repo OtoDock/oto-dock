@@ -12,6 +12,7 @@ import httpx
 
 import config
 from auth.providers.base import AuthProvider, AuthResult
+from auth import roles
 
 logger = logging.getLogger("claude-proxy")
 
@@ -65,6 +66,25 @@ async def ensure_oidc_discovery() -> None:
             return
         config.apply_oidc_discovery(meta)
         logger.info(f"OIDC discovery recovered: authorize={config.OIDC_AUTHORIZE_URL}")
+
+
+def _id_token_claims(id_token) -> dict:
+    """The payload of the ID token the token endpoint returned, decoded
+    without a signature check: it arrived over TLS from the token endpoint
+    against the client secret, the same trust the userinfo call rests on,
+    and only the confirm flow reads it. Anything malformed is no claims."""
+    import base64
+    import binascii
+    import json
+    if not isinstance(id_token, str) or id_token.count(".") != 2:
+        return {}
+    payload = id_token.split(".")[1]
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw)
+    except (ValueError, binascii.Error):
+        return {}
+    return claims if isinstance(claims, dict) else {}
 
 
 class OIDCAuthProvider(AuthProvider):
@@ -136,18 +156,25 @@ class OIDCAuthProvider(AuthProvider):
             display_name=display_name,
             role=role,
             auth_provider=f"oidc:{provider_slug}",
+            id_claims=_id_token_claims(tokens.get("id_token")),
         )
 
     def get_login_url(self, *, redirect_uri: str | None = None,
-                      mobile: bool = False) -> str | None:
-        """Build OIDC authorization URL."""
+                      mobile: bool = False, prompt_login: bool = False,
+                      purpose: str = "login", sub: str = "",
+                      return_to: str = "") -> str | None:
+        """Build OIDC authorization URL. ``prompt_login`` asks the provider
+        for a new login (the strict confirm, ``OIDC_CONFIRM_FRESH_LOGIN``):
+        ``prompt=login`` requests it and ``max_age=0`` requires it per the
+        spec, which then makes ``auth_time`` mandatory in the ID token."""
         if not config.OIDC_AUTHORIZE_URL or not config.OIDC_CLIENT_ID:
             return None
 
         from urllib.parse import urlencode
 
         from auth.providers import create_oauth_state
-        state = create_oauth_state(redirect_uri=redirect_uri)
+        state = create_oauth_state(redirect_uri=redirect_uri, purpose=purpose, sub=sub,
+                                   return_to=return_to)
 
         actual_redirect = redirect_uri or config.OIDC_REDIRECT_URI
         params = {
@@ -157,6 +184,9 @@ class OIDCAuthProvider(AuthProvider):
             "scope": config.OIDC_SCOPES,
             "state": state,
         }
+        if prompt_login:
+            params["prompt"] = "login"
+            params["max_age"] = "0"
         return f"{config.OIDC_AUTHORIZE_URL}?{urlencode(params)}"
 
     def get_logout_url(self, post_redirect: str | None = None) -> str | None:
@@ -197,12 +227,5 @@ class OIDCAuthProvider(AuthProvider):
 
     @staticmethod
     def _extract_role(groups: list[str]) -> str | None:
-        """Map OIDC groups to role. Highest-priority wins."""
-        best_role = None
-        best_priority = 999
-        for group in groups:
-            role = config.OIDC_ROLE_GROUPS.get(group)
-            if role and config.ROLE_PRIORITY.get(role, 999) < best_priority:
-                best_role = role
-                best_priority = config.ROLE_PRIORITY[role]
-        return best_role
+        """Map OIDC groups to role. The strongest platform role wins."""
+        return roles.highest_platform_role(config.OIDC_ROLE_GROUPS.get(group) for group in groups)

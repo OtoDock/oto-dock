@@ -24,8 +24,14 @@ def _row(sub_id="s1", *, owner="user-1", label="Claude Max", email="me@example.c
 
 
 def _reading(seven=50.0, *, resets_at=RESET, scoped=()):
-    return sw.Windows(five_hour=sw.Window(5.0, NOW + timedelta(hours=2)),
-                      seven_day=sw.Window(seven, resets_at),
+    from core.execution_layer import WindowSpec
+    specs = {
+        "five_hour": WindowSpec("five_hour", 5 * 3600, "session", "session"),
+        "seven_day": WindowSpec("seven_day", 7 * 86400, "quota", "weekly"),
+    }
+    return sw.Windows(specs=specs,
+                      windows={"five_hour": sw.Window(5.0, NOW + timedelta(hours=2)),
+                               "seven_day": sw.Window(seven, resets_at)},
                       scoped=list(scoped), observed_at=NOW)
 
 
@@ -49,13 +55,20 @@ class _Store:
         }
 
 
+def _readings_for(subs, readings):
+    """``latest`` takes subscription ROWS (the layer names the window specs) —
+    the sweep once passed bare ids and failed on every pass in production."""
+    assert all(isinstance(s, dict) and s.get("id") and s.get("layer") for s in subs), subs
+    return readings
+
+
 def _sweep(rows, readings, store=None, *, prefs=None, enabled=True, now=NOW):
     store = store or _Store(rows)
     fire = AsyncMock()
     alerts._last_run = 0.0
     with patch.object(alerts, "subscription_store", store), \
          patch.object(sw, "is_enabled", return_value=enabled), \
-         patch.object(sw, "latest", return_value=readings), \
+         patch.object(sw, "latest", side_effect=lambda subs, now=None: _readings_for(subs, readings)), \
          patch("storage.prefs.user_ui_prefs_store.get_prefs",
                side_effect=lambda owner: (prefs or {}).get(owner, {})), \
          patch("core.session.session_state.get_user_tz", return_value="Europe/Athens"), \

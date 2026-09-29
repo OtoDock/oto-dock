@@ -6,54 +6,42 @@ Both are optional — if libraries/config are missing, calls are no-ops.
 """
 
 import asyncio
-import ipaddress
+import functools
 import json
 import logging
-import socket
-from urllib.parse import urlparse
+import ssl
+from urllib.parse import urlsplit
 
 import config
+from services.infra.outbound_url import validate_outbound_url
 from storage.automation import notification_store
 
 logger = logging.getLogger("claude-proxy.push")
 
 
-def _ip_blocked(ip_str: str) -> bool:
-    """True if an IP is non-public (loopback / RFC1918 / link-local / reserved /
-    unspecified / multicast), incl. IPv4-mapped IPv6 and the cloud-metadata
-    address (169.254.169.254 → link-local). Unparseable → blocked."""
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return True
-    if ip.version == 6 and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return (
-        ip.is_private or ip.is_loopback or ip.is_link_local
-        or ip.is_reserved or ip.is_unspecified or ip.is_multicast
-    )
-
-
 def _endpoint_is_public(endpoint: str) -> bool:
-    """SSRF guard for a user-supplied Web Push endpoint: require ``https`` and
-    confirm EVERY address the host resolves to is publicly routable, so a member
-    can't point the proxy at ``169.254.169.254`` / loopback / an internal host
-    via a notification they trigger themselves."""
-    if not endpoint:
+    """SSRF guard for a user-supplied Web Push endpoint: ``https`` and EVERY
+    address the host resolves to publicly routable
+    (``services.infra.outbound_url``), so a member can't point the proxy at
+    ``169.254.169.254`` / loopback / an internal host via a notification
+    they trigger themselves. A backslash or a userinfo part is refused
+    first: ``requests`` reads the host of such a URL differently from the
+    validator's ``urlsplit`` (``https://10.0.0.5\\@example.com/`` connects to
+    10.0.0.5), and no push service issues one."""
+    if "\\" in endpoint or "@" in urlsplit(endpoint).netloc:
         return False
-    try:
-        u = urlparse(endpoint)
-    except Exception:
-        return False
-    if u.scheme != "https" or not u.hostname:
-        return False
-    try:
-        infos = socket.getaddrinfo(u.hostname, u.port or 443, proto=socket.IPPROTO_TCP)
-    except Exception:
-        return False
-    if not infos:
-        return False
-    return not any(_ip_blocked(info[4][0]) for info in infos)
+    return validate_outbound_url(endpoint, require_https=True) is None
+
+
+def _no_redirect_session():
+    """The session a Web Push POST goes through: a redirect raises instead
+    of being followed, so a validated public endpoint cannot bounce the
+    request to an internal address."""
+    import requests
+    session = requests.Session()
+    session.max_redirects = 0
+    return session
+
 
 # --- Web Push (VAPID) ---
 
@@ -84,14 +72,16 @@ async def send_web_push(subscription_data: str, payload: dict) -> bool:
         if not await asyncio.to_thread(_endpoint_is_public, endpoint):
             logger.warning("Refusing Web Push to non-public endpoint: %s", endpoint[:80])
             return False
-        await asyncio.to_thread(
-            webpush,
-            subscription_info=sub_info,
-            data=json.dumps(payload),
-            vapid_private_key=config.VAPID_PRIVATE_KEY,
-            vapid_claims={"sub": f"mailto:{config.VAPID_EMAIL}"},
-            timeout=10,
-        )
+        with _no_redirect_session() as session:
+            await asyncio.to_thread(
+                webpush,
+                subscription_info=sub_info,
+                data=json.dumps(payload),
+                vapid_private_key=config.VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": f"mailto:{config.VAPID_EMAIL}"},
+                timeout=10,
+                requests_session=session,
+            )
         return True
     except Exception as e:
         error_str = str(e)
@@ -130,6 +120,79 @@ try:
 except Exception as e:
     logger.info(f"FCM not configured: {e}")
 
+# google-auth's transport waits 120 s per attempt by default; the refresh
+# runs in a worker thread under the lock below, so its wait is bounded.
+_FCM_TOKEN_TIMEOUT_S = 15
+
+
+class _FcmLoopState:
+    """The sender's per-loop state: one refresh in flight, one HTTP client.
+    Rebuilt when the running loop changes (the test suite runs several)."""
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.token_lock: asyncio.Lock | None = None
+        self.client_lock: asyncio.Lock | None = None
+        self.client = None
+
+    def current(self) -> "_FcmLoopState":
+        loop = asyncio.get_running_loop()
+        if self.loop is not loop:
+            self.loop = loop
+            self.token_lock = asyncio.Lock()
+            self.client_lock = asyncio.Lock()
+            self.client = None
+        return self
+
+
+_fcm_state = _FcmLoopState()
+_ssl_context: ssl.SSLContext | None = None
+
+
+def reset_fcm_state() -> None:
+    """Drop the per-loop lock and client (tests)."""
+    global _fcm_state
+    _fcm_state = _FcmLoopState()
+
+
+def _refresh_fcm_token_blocking() -> None:
+    request = functools.partial(GoogleAuthRequest(), timeout=_FCM_TOKEN_TIMEOUT_S)
+    _fcm_credentials.refresh(request)
+
+
+async def _fcm_access_token() -> str:
+    """The service account's access token: cached while google-auth reports
+    it valid (about an hour), refreshed in a worker thread with one refresh
+    in flight, the other pushes waiting for its result."""
+    if _fcm_credentials.valid:
+        return _fcm_credentials.token
+    async with _fcm_state.current().token_lock:
+        if not _fcm_credentials.valid:
+            await asyncio.to_thread(_refresh_fcm_token_blocking)
+    return _fcm_credentials.token
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    import certifi
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+async def _fcm_http_client():
+    """One ``httpx.AsyncClient`` per loop. The SSL context is what makes a
+    client construction cost several milliseconds on the loop: built once,
+    in a thread."""
+    import httpx
+
+    global _ssl_context
+    state = _fcm_state.current()
+    if state.client is None:
+        async with state.client_lock:
+            if state.client is None:
+                if _ssl_context is None:
+                    _ssl_context = await asyncio.to_thread(_build_ssl_context)
+                state.client = httpx.AsyncClient(verify=_ssl_context, timeout=10)
+    return state.client
+
 
 async def _send_fcm_direct(token: str, payload: dict) -> bool:
     """BYO-Firebase **direct** FCM send — the escape hatch.
@@ -145,12 +208,8 @@ async def _send_fcm_direct(token: str, payload: dict) -> bool:
     if not _fcm_available:
         return False
 
-    import httpx
-
     try:
-        # Refresh credentials
-        _fcm_credentials.refresh(GoogleAuthRequest())
-        access_token = _fcm_credentials.token
+        access_token = await _fcm_access_token()
 
         # Use data-only message (no "notification" key) so our custom
         # FirebaseMessagingService always handles it — even in background.
@@ -173,24 +232,29 @@ async def _send_fcm_direct(token: str, payload: dict) -> bool:
             }
         }
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"https://fcm.googleapis.com/v1/projects/{_fcm_project_id}/messages:send",
-                json=message,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10,
+        client = await _fcm_http_client()
+        resp = await client.post(
+            f"https://fcm.googleapis.com/v1/projects/{_fcm_project_id}/messages:send",
+            json=message,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True
+        elif resp.status_code == 404:
+            # Token invalid, clean up
+            logger.info("FCM token invalid, removing")
+            await asyncio.to_thread(
+                notification_store.delete_push_subscription_by_data, token
             )
-            if resp.status_code == 200:
-                return True
-            elif resp.status_code == 404:
-                # Token invalid, clean up
-                logger.info(f"FCM token invalid, removing")
-                await asyncio.to_thread(
-                    notification_store.delete_push_subscription_by_data, token
-                )
-            else:
-                logger.warning(f"FCM send failed: {resp.status_code} {resp.text[:200]}")
-            return False
+        elif resp.status_code == 401:
+            # A rotated or revoked key: the cached token must not keep
+            # failing until it expires.
+            _fcm_credentials.token = None
+            logger.warning("FCM refused the access token; the next push refreshes it")
+        else:
+            logger.warning(f"FCM send failed: {resp.status_code} {resp.text[:200]}")
+        return False
     except Exception as e:
         logger.warning(f"FCM error: {e}")
         return False

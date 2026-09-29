@@ -29,6 +29,7 @@ from core.session.visibility import available_scopes_for
 from storage.agents import agent_store
 from storage.phone import phone_route_store
 from storage import database as task_store
+from auth import roles
 
 logger = logging.getLogger("claude-proxy")
 
@@ -36,11 +37,16 @@ logger = logging.getLogger("claude-proxy")
 #: a platform user): viewer of the agent's shared space, writer only of its
 #: own tree. Not a setting — a trusted line is a route tied to a platform
 #: user, whose own per-agent role applies (capped below).
-EXTERNAL_ROUTE_ROLE = "viewer"
+EXTERNAL_ROUTE_ROLE = roles.VIEWER
+#: A route's ``identity_mode``: the caller's own external identity, or the
+#: platform user the route is tied to (``identity_user_sub``). Named here,
+#: once; ``shared`` is the retired spelling that resolves as ``caller``.
+IDENTITY_MODE_CALLER = "caller"
+IDENTITY_MODE_USER = "user"
 
 #: The tied user's per-agent role is capped here: a phone line never runs the
 #: unrestricted admin policy (admin-on-admin-agent fast paths, admin bash tier).
-USER_ROUTE_ROLE_CAP = "manager"
+USER_ROUTE_ROLE_CAP = roles.MANAGER
 
 
 @dataclass(frozen=True)
@@ -96,17 +102,26 @@ def tied_user_problem(sub: str, agent: str) -> str:
         return "the tied user has no username"
     if user.get("locked_until"):
         return "the tied user account is locked"
-    if user.get("role") != "admin" and agent not in task_store.get_user_agent_roles(sub):
+    if not roles.is_admin(user.get("role")) and agent not in task_store.get_user_agent_roles(sub):
         return "the tied user has no access to this agent"
     return ""
 
 
 def effective_user_role(user: dict, agent: str) -> str:
     """The tied user's per-agent role, capped for a phone line."""
-    if user.get("role") == "admin":
-        return USER_ROUTE_ROLE_CAP
-    role = task_store.get_user_agent_roles(user["sub"]).get(agent, "viewer")
-    return USER_ROUTE_ROLE_CAP if role == "admin" else role
+    return roles.capped(
+        roles.acting_role(user.get("role"), task_store.get_user_agent_roles(user["sub"]), agent),
+        USER_ROUTE_ROLE_CAP)
+
+
+def route_identity_mode(route: dict) -> str:
+    """The route's identity mode as one of the two named members: the
+    retired ``shared`` spelling (removed 2026-09-07) resolves as ``caller``,
+    because per-caller on a Shared-only agent IS the shared space with no
+    per-caller memory, and ``remember_callers`` off covers "no memory"
+    everywhere else."""
+    mode = route.get("identity_mode") or IDENTITY_MODE_CALLER
+    return IDENTITY_MODE_USER if mode == IDENTITY_MODE_USER else IDENTITY_MODE_CALLER
 
 
 def resolve_route_identity(
@@ -152,16 +167,11 @@ def resolve_route_identity(
             fallback_reason="no route" if route is None else "route/agent mismatch",
         )
 
-    mode = route.get("identity_mode") or "caller"
-    if mode == "shared":
-        # Legacy value (the option was removed 2026-09-07): per-caller on a
-        # Shared-only agent IS the shared space with no per-caller memory,
-        # and `remember_callers` off covers "no memory" everywhere else.
-        mode = "caller"
+    mode = route_identity_mode(route)
     verified = bool(pin_verified) and bool(phone_route_store.get_route_pin(route["id"]))
     fallback = ""
 
-    if mode == "user":
+    if mode == IDENTITY_MODE_USER:
         sub = route.get("identity_user_sub") or ""
         problem = tied_user_problem(sub, agent)
         if not problem:

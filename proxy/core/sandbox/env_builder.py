@@ -86,7 +86,7 @@ def build_session_env(
     # Belt-and-braces disable of Claude Code's built-in auto-memory
     # subsystem. Paired with ``autoMemoryEnabled: false`` in the
     # session ``settings.json`` (see ``core/sandbox/sandbox.py``) and the
-    # session-start memory-dir wipe in ``ensure_persistent_claude_dir``.
+    # session-start memory-dir wipe in ``core/layers/cli/config_dir.ensure_persistent_claude_dir``.
     # Otodock memory-mcp is the single source of memory truth.
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
 

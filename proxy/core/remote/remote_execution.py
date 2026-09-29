@@ -9,18 +9,25 @@ The layer is composed from sibling mixins, one per concern:
 ``remote_start_payload`` (the satellite's start payload), ``remote_turn``
 (send, stream, settle, stop), ``remote_abort`` (soft interrupt, watchdog,
 hard kill), ``remote_resume`` (adopt, resume, liveness),
-``remote_bg_commands`` (between-turns queue reads), ``remote_workspace_sync``
-and ``remote_bg_subagent``. ``remote_session_info`` holds the per-session
+``remote_bg_commands`` (between-turns queue reads) and
+``remote_workspace_sync``. ``remote_session_info`` holds the per-session
 record and ``remote_reaper`` the idle reaper. This module keeps the control
 surface (close, permissions, model and mode changes, steer, compact, the
 liveness and lock accessors) and re-exports the names importers and tests
 take from here.
+
+The layer is a PLACEMENT, not an engine: a session here still runs one of
+the registered engines on the satellite, and everything engine-specific —
+the payload keys, the translators, the frames, the resume probe — is that
+engine's ``RemoteEngineAdapter`` (``core/layers/<x>/remote.py``), reached
+through ``_adapter(info)``. Nothing in this package names an engine.
 """
 
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+from core import placement
 from core.execution_layer import ExecutionLayer, LayerCapabilities
 from core.remote.satellite_connection import SatelliteConnectionManager
 from core.session.session_state import (
@@ -52,7 +59,6 @@ from core.remote.remote_turn import RemoteTurnMixin  # noqa: E402
 from core.remote.remote_abort import RemoteAbortMixin  # noqa: E402
 from core.remote.remote_resume import RemoteResumeMixin  # noqa: E402
 from core.remote.remote_bg_commands import RemoteBgCommandsMixin  # noqa: E402
-from core.remote.remote_bg_subagent import RemoteBgSubagentMixin  # noqa: E402
 from core.remote.remote_workspace_sync import (  # noqa: E402,F401
     RemoteWorkspaceSyncMixin,
     _partition_deferred_pulls,
@@ -72,13 +78,13 @@ class RemoteExecutionLayer(
     RemoteResumeMixin,
     RemoteBgCommandsMixin,
     RemoteWorkspaceSyncMixin,
-    RemoteBgSubagentMixin,
     ExecutionLayer,
 ):
     """Routes sessions to satellite daemons via WebSocket.
 
-    Supports both CLI and Codex execution paths. Direct LLM is always
-    handled locally and never routes through this layer.
+    Every engine with a remote adapter (``runtime.supports_remote_execution``)
+    runs here; Direct LLM is always handled locally and never routes through
+    this layer.
     """
 
     def __init__(self, connection_manager: SatelliteConnectionManager):
@@ -88,6 +94,16 @@ class RemoteExecutionLayer(
         # aren't GC'd mid-flight; each removes itself on completion.
         self._deferred_sync_tasks: set[asyncio.Task] = set()
 
+    @staticmethod
+    def _adapter(info: RemoteSessionInfo):
+        """The remote adapter of the engine ``info``'s session runs — every
+        per-engine question about a session goes through it."""
+        from core.session.session_manager import get_layer_by_path
+        adapter = get_layer_by_path(info.execution_path).remote_adapter()
+        if adapter is None:
+            raise RuntimeError(f"{info.execution_path} has no remote adapter")
+        return adapter
+
     # --- ExecutionLayer interface: control surface ---
 
     async def close_session(self, session_id: str) -> None:
@@ -95,11 +111,11 @@ class RemoteExecutionLayer(
         if not info:
             return
         info.alive = False
-        # Cancel the bg router + supervisors BEFORE removing the event queue
-        # (the router is its sole consumer) so nothing is left waiting on an
-        # orphaned queue, and resolve any still-pending bg sub-agents.
-        if info.bg_supervised:
-            await self._teardown_remote_bg(info)
+        # The engine's per-session state goes first — BEFORE the event queue
+        # is removed (a Codex router is that queue's sole consumer), so nothing
+        # is left waiting on an orphaned queue and every still-pending
+        # background sub-agent and terminal is resolved.
+        await self._adapter(info).close_state(info)
         try:
             await self._cm.send_command(info.machine_id, {
                 "type": "close_session",
@@ -176,71 +192,59 @@ class RemoteExecutionLayer(
                 )
 
     async def change_model(self, session_id: str, model: str) -> None:
+        """The model change reaches the satellite in the engine's shape
+        (``RemoteEngineAdapter.control_request``): Claude's stdin control
+        frame, Codex's per-turn override on the next ``turn/start``."""
         info = self._sessions.get(session_id)
         if not info:
             return
         info.model = model
-        if info.execution_path == "claude-code-cli":
-            # Subtype must match what Claude Code CLI expects on its stdin
-            # control channel (same as local CLIExecutionLayer.change_model).
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "control_request",
-                "session_id": session_id,
-                "subtype": "set_model",
-                "kwargs": {"model": model},
-            })
-        # Codex: model change applies on next turn automatically
+        await self._adapter(info).control_request(
+            info, self._cm, "set_model", model=model,
+        )
 
     async def change_mode(self, session_id: str, mode: str) -> None:
+        """The proxy-side gate verdict follows the new mode at once
+        (``set_session_mode``); the engine's own mode reaches the satellite
+        in the engine's shape (Claude's stdin control frame; Codex's sandbox
+        mode, which its satellite twin re-derives approvalPolicy from and
+        rebuilds the per-turn sandboxPolicy with)."""
         info = self._sessions.get(session_id)
         if not info:
             return
         info.mode = mode
         set_session_mode(session_id, mode)
-        if info.execution_path == "claude-code-cli":
-            # Subtype must match what Claude Code CLI expects on its stdin
-            # control channel (same as local CLIExecutionLayer.change_mode).
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "control_request",
-                "session_id": session_id,
-                "subtype": "set_permission_mode",
-                "kwargs": {"mode": mode},
-            })
-        elif info.execution_path == "codex-cli":
-            # Codex app-server gates at the sandbox boundary: the satellite
-            # re-derives approvalPolicy from the sandbox mode + rebuilds the
-            # per-turn sandboxPolicy, so the new escape behaviour takes effect on
-            # the next turn. (The proxy-side gate verdict already follows the new
-            # mode via set_session_mode above.)
-            from core.layers.codex.helpers import permission_to_sandbox
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "control_request",
-                "session_id": session_id,
-                "subtype": "set_permission_mode",
-                "kwargs": {"sandbox_mode": permission_to_sandbox(
-                    mode, allow_full_fs=info.allow_full_fs,
-                )},
-            })
+        await self._adapter(info).control_request(
+            info, self._cm, "set_permission_mode", mode=mode,
+        )
 
     async def send_control_request(
         self, session_id: str, subtype: str, **kwargs,
     ) -> dict:
+        """A queued control request flushed after a streaming turn. The two
+        subtypes the dashboard queues go through ``change_model`` /
+        ``change_mode`` so the session record (and the proxy-side mode the
+        plan card and the gate read) stay in step; anything else is the
+        engine's to forward or ignore."""
         info = self._sessions.get(session_id)
         if not info:
             return {}
-        if info.execution_path == "claude-code-cli":
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "control_request",
-                "session_id": session_id,
-                "subtype": subtype,
-                "kwargs": kwargs,
-            })
+        if subtype == "set_model":
+            await self.change_model(session_id, kwargs.get("model", ""))
+        elif subtype == "set_permission_mode":
+            await self.change_mode(session_id, kwargs.get("mode", ""))
+        else:
+            await self._adapter(info).control_request(info, self._cm, subtype, **kwargs)
         return {}
 
     @property
     def capabilities(self) -> LayerCapabilities:
-        # Remote layer inherits capabilities from the underlying execution path
-        # The dashboard should check the agent's execution_path for specific capabilities
+        """The PLACEMENT's descriptor, not an engine's: remote is where a
+        session runs, the engine is still claude-code-cli or codex-cli on the
+        satellite. Every flat flag reads True ("the placement forbids
+        nothing"); the typed groups are defaults. Shared code that has a
+        session in hand asks ``capabilities_for(session_id)`` and gets the
+        engine's real descriptor — never these flags for an engine's facts."""
         return LayerCapabilities(
             name="remote",
             display_name="Remote Execution",
@@ -252,6 +256,40 @@ class RemoteExecutionLayer(
             supports_control_commands=True,
             supports_mcps=True,
         )
+
+    def capabilities_for(self, session_id: str) -> LayerCapabilities:
+        """The descriptor of the engine ``session_id`` runs on its satellite:
+        a headless session's from its record, a remote INTERACTIVE session's
+        (no record — it lives in ``interactive_session``) from that registry;
+        the placement descriptor for a session this layer does not hold."""
+        from core.session.session_manager import capabilities_for_path
+        info = self._sessions.get(session_id)
+        if info is not None:
+            return capabilities_for_path(info.execution_path)
+        from core.session import interactive_session
+        isess = interactive_session.get(session_id) if session_id else None
+        if isess is not None and not placement.is_local(isess.target):
+            return capabilities_for_path(isess.execution_path)
+        return self.capabilities
+
+    def owns_session(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
+    def canonical_tool_name(self, session_id: str, native: str) -> str:
+        """The engine behind the session answers (a placement has no tool
+        names of its own); identity for a session this layer does not hold."""
+        caps = self.capabilities_for(session_id)
+        if caps is self.capabilities:
+            return native
+        from core.session.session_manager import get_layer_by_path
+        return get_layer_by_path(caps.name).canonical_tool_name(session_id, native)
+
+    def local_session_ids(self) -> list[str]:
+        """Remote sessions are the satellite's processes, not ours — but the
+        session RECORDS are held here, and every caller that asks "which
+        sessions does this layer know about" means those records (liveness
+        gates, the token-confinement check, the lane wedge sweep)."""
+        return list(self._sessions)
 
     async def get_session(self, session_id: str):
         return self._sessions.get(session_id)
@@ -277,71 +315,25 @@ class RemoteExecutionLayer(
         else:
             yield
 
-    async def session_self_wakes(self, session_id: str) -> bool:
-        """Wake-grace eligibility (see pump_bg_monitors._wake_grace_covers):
-        only claude sessions self-wake; a remote codex session must not pay
-        the grace window."""
-        info = self._sessions.get(session_id)
-        return bool(info) and info.execution_path == "claude-code-cli"
-
     async def steer(self, session_id: str, text: str) -> bool:
-        """Mid-turn steering for a REMOTE headless Codex session — tunnel twin
-        of the local layer's ``turn/steer``. Version-gated: an old satellite
-        would silently drop the frame, so return False immediately and let the
-        caller take today's queue fallback. ``steered`` in the ack is strict
-        (True only on daemon accept) — the exactly-once contract the
-        steer-vs-queue branch in dashboard_chat depends on."""
+        """Mid-turn steering for a REMOTE headless session — the engine's
+        satellite frame (``RemoteEngineAdapter.steer``: Codex's
+        ``codex_steer`` since satellite 0.5.98, Claude's ``steer_turn`` since
+        0.5.128, each refused before the send on an older satellite). False
+        takes the caller's queue fallback; the accept is strict
+        (exactly-once)."""
         info = self._sessions.get(session_id)
-        if not info or info.execution_path != "codex-cli" or not text:
+        if not info or not text:
             return False
-        if not self._cm.supports_codex_thread_ops(info.machine_id):
-            logger.info(
-                "remote steer unsupported by satellite %s (< 0.5.98) — "
-                "falling back to queue", info.machine_id[:8],
-            )
-            return False
-        try:
-            ack = await self._cm.send_command(info.machine_id, {
-                "type": "codex_steer",
-                "session_id": session_id,
-                "text": text,
-            }, timeout=15.0)
-        except RuntimeError as e:
-            logger.warning("remote steer RPC failed for %s: %s", session_id[:8], e)
-            return False
-        return bool(ack.get("steered"))
+        return await self._adapter(info).steer(info, self._cm, text)
 
     async def compact(self, session_id: str) -> dict | None:
-        """Manual context compaction for a REMOTE headless Codex session —
-        tunnel twin of the local layer's ``thread/compact/start`` flow. The
-        satellite runs the whole wait loop (up to ~125s) and acks
-        ``{ok, post_tokens|reason}``; version-gated like ``steer``."""
+        """Manual context compaction for a REMOTE headless session — the
+        engine's satellite frame, when it has one (``RemoteEngineAdapter.compact``)."""
         info = self._sessions.get(session_id)
-        if not info or info.execution_path != "codex-cli":
+        if not info:
             return None
-        if not self._cm.supports_codex_thread_ops(info.machine_id):
-            logger.info(
-                "remote compact unsupported by satellite %s (< 0.5.98)",
-                info.machine_id[:8],
-            )
-            return None
-        try:
-            ack = await self._cm.send_command(info.machine_id, {
-                "type": "codex_compact",
-                "session_id": session_id,
-            }, timeout=150.0)
-        except RuntimeError as e:
-            logger.warning(
-                "remote compact RPC failed for %s: %s", session_id[:8], e,
-            )
-            return None
-        if not ack.get("ok"):
-            logger.info(
-                "remote compact refused for %s: %s",
-                session_id[:8], ack.get("reason", "unknown"),
-            )
-            return None
-        return {"post_tokens": ack.get("post_tokens")}
+        return await self._adapter(info).compact(info, self._cm)
 
 
 # The MCP config-rewriting functions live in remote_mcp_rewrite.py; the payload
@@ -358,6 +350,5 @@ from core.remote.remote_mcp_rewrite import (  # noqa: F401
     _rewrite_mcp_json_for_remote,
     _rewrite_mcp_toml_for_remote,
     _rewrite_stdio_paths,
-    _translate_venv_for_windows,
     _rewrite_env_for_remote,
 )

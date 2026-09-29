@@ -21,6 +21,7 @@ from pathlib import Path
 from ..host import env_hygiene
 from ..config import atomic_replace, force_rmtree, kill_process_tree, venv_exe
 import contextlib
+from .. import config
 
 logger = logging.getLogger("satellite")
 
@@ -123,7 +124,7 @@ def _fix_shebangs_after_swap(old_root: Path, new_root: Path) -> None:
             tmp = entry.with_suffix(entry.suffix + ".shebang-tmp")
             tmp.write_text(fixed)
             # Mode bits only matter on Unix (entry scripts need +x).
-            if sys.platform != "win32":
+            if config.HOST.posix:
                 tmp.chmod(entry.stat().st_mode)
             atomic_replace(tmp, entry)
         except (OSError, UnicodeDecodeError):
@@ -155,7 +156,7 @@ def _fix_windows_exe_paths_after_swap(old_root: Path, new_root: Path) -> None:
 
     No-op on every platform except Windows.
     """
-    if sys.platform != "win32":
+    if config.HOST.posix:
         return
     venv_scripts = new_root / "venv" / "Scripts"
     if not venv_scripts.is_dir():
@@ -221,7 +222,7 @@ def _uv_bin_if_present() -> str | None:
     X_OK)`` is essentially ``os.access(..., F_OK)`` (existence only),
     which is fine since we look at named ``.exe`` paths.
     """
-    if sys.platform == "win32":
+    if not config.HOST.posix:
         # Astral's PowerShell installer (used by install.ps1's
         # baseline-tools step) drops uv.exe in %USERPROFILE%\.local\bin\.
         # %LOCALAPPDATA%\uv\ is a fallback for some package managers.
@@ -542,11 +543,14 @@ async def _uv_venv_pinned(uv_bin: str, venv_dir: Path, target: tuple[int, int], 
     """Pre-create ``venv_dir`` on this host's interpreter so the subsequent
     install pip-installs into a venv that matches the platform. Best-effort."""
     spec = f"{target[0]}.{target[1]}"
-    env = {
-        **os.environ,
+    # The installer's own scrubbed environment (its allowlisted names, no
+    # configuration file of any package manager), as every other subprocess
+    # of an install gets: no satellite-side variable reaches uv.
+    from .._vendored.mcp_installer import _install_env
+    env = _install_env({
         "UV_PYTHON_INSTALL_DIR": str(mcp_dir.parent.parent / ".uv-python"),
         "UV_LINK_MODE": "copy",
-    }
+    })
     try:
         proc = await asyncio.create_subprocess_exec(
             uv_bin, "venv", "--python", spec, str(venv_dir),
@@ -625,6 +629,13 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
             runtime = (manifest.get("server") or {}).get("runtime", "")
 
             if runtime == "python":
+                # A requirements build runs whatever the file names (an index,
+                # a VCS source, an sdist build backend) as this account, which
+                # the install refuses for catalog content: platform-shipped
+                # folders only, as the proxy's startup reconcile does.
+                if cat_dir.name == "community":
+                    results[name] = "skipped-community-python"
+                    continue
                 venv_dir = mcp_dir / "venv"
                 if not (mcp_dir / "requirements.txt").is_file():
                     continue
@@ -651,6 +662,14 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
                     results[name] = "exception"
 
             elif runtime == "node" and (mcp_dir / "node_modules").is_dir():
+                # A rebuild runs the packages' own lifecycle scripts, which the
+                # install refuses for catalog content: platform-shipped folders
+                # only (the satellite lays MCPs out by manifest category, so
+                # the community folder is the one left out), as the proxy's
+                # startup reconcile does.
+                if cat_dir.name == "community":
+                    results[name] = "skipped-bundled-node"
+                    continue
                 outcome = await _reconcile_node_addons(mcp_dir, name)
                 if outcome:
                     results[name] = outcome

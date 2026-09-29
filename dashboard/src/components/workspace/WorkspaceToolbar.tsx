@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import type { WorkspaceView } from '../../hooks/useWorkspaceState'
+import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '../ui/popoverPosition'
 
 interface NewFileOption {
   ext: string
@@ -67,15 +68,18 @@ export default function WorkspaceToolbar({
   // button) because the toolbar uses `overflow-x: auto`, which per CSS spec
   // computes `overflow-y` to `auto` as well — so an absolute-positioned
   // child would get clipped by the toolbar's scroll viewport.
-  const [newFileAnchor, setNewFileAnchor] = useState<{ left: number; top: number } | null>(null)
+  // Left-aligned to the button and clamped to the viewport on both axes
+  // (`usePopoverPlacement`, shared with the app tab menu).
+  const [newFileAnchor, setNewFileAnchor] = useState<AnchorBox | null>(null)
   const newFileButtonRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const newFilePlacement = usePopoverPlacement(newFileAnchor, menuRef, { align: 'left' })
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const openNewFileMenu = () => {
     const rect = newFileButtonRef.current?.getBoundingClientRect()
     if (!rect) return
-    setNewFileAnchor({ left: rect.left, top: rect.bottom + 4 })
+    setNewFileAnchor(anchorBoxOf(rect))
   }
   const closeNewFileMenu = () => setNewFileAnchor(null)
 
@@ -257,7 +261,13 @@ export default function WorkspaceToolbar({
       {newFileAnchor && createPortal(
         <div
           ref={menuRef}
-          style={{ position: 'fixed', left: newFileAnchor.left, top: newFileAnchor.top, zIndex: 60 }}
+          style={{
+            position: 'fixed',
+            left: newFilePlacement?.left ?? newFileAnchor.left,
+            top: newFilePlacement?.top ?? newFileAnchor.bottom,
+            visibility: newFilePlacement ? 'visible' : 'hidden',
+            zIndex: 60,
+          }}
           className="min-w-[160px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
         >
           {NEW_FILE_OPTIONS.map((opt) => (

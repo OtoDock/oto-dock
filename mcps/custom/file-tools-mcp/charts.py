@@ -5,14 +5,13 @@ to the dashboard chat via _push_image_preview. Optionally saves to file.
 """
 
 import io
-from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 
-from shared import _push_image_preview, _resolve_path, _to_agents_relative
+from shared import _push_image_preview, _resolve_path, _to_agents_relative, safe_open_write
 
 # ---------------------------------------------------------------------------
 # Default styling
@@ -484,8 +483,8 @@ async def handle_create_chart(args: dict) -> str:
     if save_path:
         try:
             out = await _resolve_path(save_path, writing=True)
-            Path(out).parent.mkdir(parents=True, exist_ok=True)
-            Path(out).write_bytes(png_bytes)
+            with safe_open_write(out) as fh:
+                fh.write(png_bytes)
             saved_msg = f" Saved to: {_to_agents_relative(out)}"
         except Exception as exc:
             saved_msg = f" Save failed: {exc}"

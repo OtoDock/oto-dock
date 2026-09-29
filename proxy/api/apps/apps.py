@@ -1,4 +1,4 @@
-"""Pinned mini-apps — serve + CRUD + fire_task execution (``/v1/apps``).
+"""Pinned apps — serve + CRUD + fire_task execution (``/v1/apps``).
 
 Standing agent-authored dashboards: the registry row names a workspace
 ``.html`` file, served COOKIE-AUTHED (no capability tokens — a standing
@@ -20,17 +20,16 @@ the declared ``fixed_args`` before the headless executor
 """
 
 import asyncio
-import hashlib
 import html as html_escape
-import json
 import logging
 import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
-import config
+from core import placement
 from api.apps import manifest as _mf
 from api.media.ui import (
     _placeholder,
@@ -45,26 +44,50 @@ from auth.providers import (
     get_current_user,
     require_agent_access,
     require_auth,
+    require_human,
 )
 from storage import database as task_store
+from storage import db_apps
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.apps")
 router = APIRouter()
 
 # Static action-runtime extension (NEVER per-row interpolation — see
 # wrap_fragment). window.otodock exists: UI_RUNTIME defines it just above.
-# The action_result listener mirrors UI_RUNTIME's action_ack bridge: the host
-# posts an mcp_tool's result back into the frame, re-fired in-page as an
-# `otodock:action-result` window event so buttons can render tool output.
+# otodock.action(id, args) returns a call id; calls issued within one
+# macrotask coalesce into a single `app_actions` message the host runs as one
+# batch, and every call ends in exactly one `action_result` (mirroring
+# UI_RUNTIME's action_ack bridge: re-fired in-page as `otodock:action-result`
+# with {id, ok, result, call_id} — pages that key on `id` keep working).
 # otodock.feed(name, cb) subscribes to a declared read-only platform feed —
 # the HOST answers from the viewer's authenticated context (`feed_update`
 # messages: initial snapshot on subscribe, pushes on change); the frame
 # itself still has no network. cb(rows, error) — error non-null when the
 # feed is undeclared/unapproved/unavailable in this view.
+# otodock.open(target) asks the host to move the viewer to a platform page
+# by KIND and id ({kind:'chat', id} …; the host builds the route, never the
+# page); acked in-page as `otodock:open-ack` {status, reason}.
+# Live apps: the host posts `push` {payload, ts} (an agent's app_push) and
+# `state` {doc, rev} (the state document, on load and on every write); the
+# page sees them as `otodock:push` / `otodock:state` window events, and
+# `otodock.state` / `otodock.stateRev` hold the latest delivery (-1 until
+# the first one). The runtime lands AFTER a full document's own scripts, so
+# pages listen for the window events rather than calling `otodock.onState`
+# at parse time.
 APP_RUNTIME = """<script>
 window.otodock.action = function(id, args){
-  parent.postMessage({source:'otodock-artifact', v:1, type:'app_action',
-    id:String(id||''), args:(args===undefined?null:args)}, '*');
+  var b = window.__otodockBatch = window.__otodockBatch || {calls: [], seq: 0, timer: 0};
+  var callId = 'c' + (++b.seq);
+  b.calls.push({call_id: callId, id: String(id||''), args: (args===undefined?null:args)});
+  if (!b.timer){
+    b.timer = setTimeout(function(){
+      var calls = b.calls; b.calls = []; b.timer = 0;
+      parent.postMessage({source:'otodock-artifact', v:1, type:'app_actions',
+        calls: calls}, '*');
+    }, 0);
+  }
+  return callId;
 };
 window.otodock.feed = function(name, cb){
   var n = String(name||'');
@@ -73,13 +96,149 @@ window.otodock.feed = function(name, cb){
   parent.postMessage({source:'otodock-artifact', v:1, type:'feed_subscribe',
     feed:n}, '*');
 };
+window.otodock.open = function(target){
+  parent.postMessage({source:'otodock-artifact', v:1, type:'open_target',
+    target: (target && typeof target === 'object') ? target : {}}, '*');
+};
+// otodock.platform(method, args): a declared platform method (an action of
+// type "platform"); resolves with the platform's answer, rejects with the
+// reason. The host answers as the viewer; the frame never talks to it.
+window.otodock.platform = function(method, args){
+  var reg = window.__otodockPlatform = window.__otodockPlatform || {seq: 0, pending: {}};
+  var callId = 'p' + (++reg.seq);
+  return new Promise(function(resolve, reject){
+    reg.pending[callId] = {resolve: resolve, reject: reject};
+    parent.postMessage({source:'otodock-artifact', v:1, type:'platform_call',
+      call_id: callId, method: String(method||''), args: (args===undefined?null:args)}, '*');
+  });
+};
+window.otodock.state = {};
+window.otodock.stateRev = -1;
+window.otodock.sharedLink = null;
+window.otodock.onPush = function(cb){
+  addEventListener('otodock:push', function(e){
+    try { cb(e.detail.payload, e.detail); } catch (err) {}
+  });
+};
+window.otodock.onState = function(cb){
+  addEventListener('otodock:state', function(e){
+    try { cb(e.detail.doc, e.detail.rev); } catch (err) {}
+  });
+};
+// Accounts kept by the host (APPS.md "External links"): on a link the host
+// keeps the app's own session token in a cookie of its own and tells the
+// page through `app_session` (after every viewer_token, and after a set or
+// a clear); otodock.session.set(token) / .clear() ask the host and resolve
+// with {token, status} — `unavailable` on the dashboard, where a viewer
+// has an identity already. The app reads the session from the verified
+// claim (`session`), never from a header the page sets.
+window.otodock.session = {token: null, _pending: []};
+function otodockSessionAsk(msg){
+  return new Promise(function(resolve){
+    window.otodock.session._pending.push(resolve);
+    parent.postMessage(Object.assign({source:'otodock-artifact', v:1}, msg), '*');
+    setTimeout(function(){
+      var i = window.otodock.session._pending.indexOf(resolve);
+      if (i >= 0){ window.otodock.session._pending.splice(i, 1); resolve({token: window.otodock.session.token, status: 'timeout'}); }
+    }, 15000);
+  });
+}
+window.otodock.session.set = function(t){ return otodockSessionAsk({type: 'session_set', token: String(t || '')}); };
+window.otodock.session.clear = function(){ return otodockSessionAsk({type: 'session_clear'}); };
+// otodock.challenge(): the host renders the bot check over the page and
+// resolves with a token the page sends on its own request as
+// X-OtoDock-Challenge (the proxy verifies it once and never forwards it);
+// null when the host has none (the dashboard, an install without one) or
+// the person gave up.
+window.otodock.challenge = function(){
+  var reg = window.__otodockChallenge = window.__otodockChallenge || {seq: 0, pending: {}};
+  var callId = 'h' + (++reg.seq);
+  return new Promise(function(resolve){
+    reg.pending[callId] = resolve;
+    parent.postMessage({source:'otodock-artifact', v:1, type:'challenge', call_id: callId}, '*');
+    setTimeout(function(){ if (reg.pending[callId]){ delete reg.pending[callId]; resolve(null); } }, 120000);
+  });
+};
+// otodock.openExternal(url): the host opens an absolute http(s) URL in a
+// new tab — on a link only a host the manifest declares under
+// external.links, on the dashboard behind its consent chip unless declared
+// — from a user gesture; the frame itself never navigates. Resolves with
+// {status: opened|blocked|denied, reason}. The <a href> bridge posts the
+// same `open_url` without a call id and is acked by the window event alone.
+window.otodock.openExternal = function(url){
+  var reg = window.__otodockOpen = window.__otodockOpen || {seq: 0, pending: {}};
+  var callId = 'o' + (++reg.seq);
+  return new Promise(function(resolve){
+    reg.pending[callId] = resolve;
+    parent.postMessage({source:'otodock-artifact', v:1, type:'open_url', url: String(url || ''), call_id: callId}, '*');
+    setTimeout(function(){ if (reg.pending[callId]){ delete reg.pending[callId]; resolve({status: 'denied', reason: 'no answer'}); } }, 15000);
+  });
+};
 addEventListener('message', function(e){
   if (!e.data || e.data.source !== 'otodock-host') return;
+  if (e.data.type === 'app_session'){
+    var sst = String(e.data.status || (e.data.token ? 'ok' : 'none'));
+    window.otodock.session.token = e.data.token ? String(e.data.token) : null;
+    var spend = window.otodock.session._pending; window.otodock.session._pending = [];
+    for (var si = 0; si < spend.length; si++){ try { spend[si]({token: window.otodock.session.token, status: sst}); } catch (err) {} }
+    try { window.dispatchEvent(new CustomEvent('otodock:session', {detail: {token: window.otodock.session.token, status: sst}})); } catch (err) {}
+  }
+  if (e.data.type === 'challenge_result'){
+    var creg = window.__otodockChallenge || {pending: {}};
+    var cr = creg.pending[String(e.data.call_id || '')];
+    if (cr){ delete creg.pending[String(e.data.call_id || '')]; try { cr(e.data.token ? String(e.data.token) : null); } catch (err) {} }
+  }
+  if (e.data.type === 'open_url_ack' && e.data.call_id){
+    var oreg = window.__otodockOpen || {pending: {}};
+    var op = oreg.pending[String(e.data.call_id || '')];
+    if (op){ delete oreg.pending[String(e.data.call_id || '')]; try { op({status: String(e.data.status || ''), reason: String(e.data.reason || '')}); } catch (err) {} }
+  }
+  if (e.data.type === 'push'){
+    try {
+      window.dispatchEvent(new CustomEvent('otodock:push', {
+        detail: {payload: e.data.payload, ts: Number(e.data.ts || 0)}
+      }));
+    } catch (err) {}
+  }
+  if (e.data.type === 'state'){
+    var rev = Number(e.data.rev || 0);
+    if (rev > window.otodock.stateRev){
+      window.otodock.stateRev = rev;
+      window.otodock.state = (e.data.doc && typeof e.data.doc === 'object') ? e.data.doc : {};
+      try {
+        window.dispatchEvent(new CustomEvent('otodock:state', {
+          detail: {doc: window.otodock.state, rev: rev}
+        }));
+      } catch (err) {}
+    }
+  }
+  if (e.data.type === 'shared_link'){
+    // Opened through an external link: the page may hide what a link
+    // cannot do (buttons unless `actions`, and never feeds or navigation);
+    // `links` are the hosts otodock.openExternal may open from here, `url`
+    // the link's own address without its query (what a vendor's return
+    // URL points back to), `query` the link page's own query string (data
+    // — a Stripe success_url comes back to the link with it).
+    var lk = Array.isArray(e.data.links) ? e.data.links.filter(function(h){ return typeof h === 'string'; }) : [];
+    window.otodock.sharedLink = {actions: !!e.data.actions, links: lk,
+      url: String(e.data.url || '').slice(0, 512), query: String(e.data.query || '').slice(0, 512)};
+    try {
+      window.dispatchEvent(new CustomEvent('otodock:shared-link', {detail: window.otodock.sharedLink}));
+    } catch (err) {}
+  }
   if (e.data.type === 'action_result'){
     try {
       window.dispatchEvent(new CustomEvent('otodock:action-result', {
         detail: {id: String(e.data.id || ''), ok: !!e.data.ok,
-                 result: String(e.data.result || '')}
+                 result: String(e.data.result || ''),
+                 call_id: String(e.data.call_id || '')}
+      }));
+    } catch (err) {}
+  }
+  if (e.data.type === 'open_ack'){
+    try {
+      window.dispatchEvent(new CustomEvent('otodock:open-ack', {
+        detail: {status: String(e.data.status || ''), reason: String(e.data.reason || '')}
       }));
     } catch (err) {}
   }
@@ -87,6 +246,17 @@ addEventListener('message', function(e){
     var subs = (window.__otodockFeeds || {})[String(e.data.feed || '')] || [];
     for (var i = 0; i < subs.length; i++){
       try { subs[i](e.data.rows || [], e.data.error || null); } catch (err) {}
+    }
+  }
+  if (e.data.type === 'platform_result'){
+    var preg = window.__otodockPlatform || {pending: {}};
+    var p = preg.pending[String(e.data.call_id || '')];
+    if (p){
+      delete preg.pending[String(e.data.call_id || '')];
+      try {
+        if (e.data.ok) p.resolve(e.data.result);
+        else p.reject(new Error(String(e.data.reason || 'unavailable')));
+      } catch (err) {}
     }
   }
 });
@@ -113,20 +283,100 @@ addEventListener('message', function(e){
   }
   addEventListener('load', report);
 })();
-// Scroll-position reporting: the host anchors overlay chrome (the solo-app
-// removal ✕) to the document's top-right and slides it away with the page —
-// the sandbox swallows scroll, so the frame reports its own offset
-// (rAF-throttled; fixed-height hosts that don't care simply ignore it).
+// Apps with a server (APPS.md): the host posts `viewer_token` after the
+// page's `ready`; otodock.fetch(path, init) calls the app's own API under
+// its base (derived from this document's path — the runtime stays static)
+// with the token, credentials omitted, and waits through a 503 while the
+// server starts; otodock.ws(path) opens the bridge, sends the auth frame
+// first, re-sends it on rotation and reconnects with backoff.
 (function(){
-  var raf = 0;
-  function post(){
-    raf = 0;
-    parent.postMessage({source:'otodock-artifact', v:1, type:'scroll_pos',
-      y: Math.max(0, window.scrollY || 0)}, '*');
+  var m = location.pathname.match(/^(\\/v1\\/apps\\/[0-9a-f-]{36}|\\/s\\/[A-Za-z0-9_-]+)\\//);
+  var base = m ? m[1] : '';
+  var tok = {value: '', exp: 0};
+  var waiters = [];
+  var sockets = [];
+  window.otodock.appBase = base;
+  window.otodock.viewerToken = function(){ return tok.value; };
+  addEventListener('message', function(e){
+    if (!e.data || e.data.source !== 'otodock-host' || e.data.type !== 'viewer_token') return;
+    tok.value = String(e.data.token || ''); tok.exp = Number(e.data.exp || 0);
+    while (waiters.length) { try { waiters.shift()(); } catch (err) {} }
+    for (var i = 0; i < sockets.length; i++) { try { sockets[i]._auth(); } catch (err) {} }
+    try { window.dispatchEvent(new CustomEvent('otodock:viewer-token', {detail: {exp: tok.exp}})); } catch (err) {}
+  });
+  function ready(){ return tok.value ? Promise.resolve() : new Promise(function(r){ waiters.push(r); }); }
+  function status(state, retry){
+    parent.postMessage({source:'otodock-artifact', v:1, type:'server_status', state: state, retry_after: retry || 0}, '*');
   }
-  addEventListener('scroll', function(){
-    if (!raf) raf = requestAnimationFrame(post);
-  }, {passive:true});
+  window.otodock.fetch = function(path, init){
+    init = init || {};
+    var p = String(path || '/');
+    var url = base + '/api' + (p.charAt(0) === '/' ? p : '/' + p);
+    var started = Date.now();
+    return ready().then(function(){
+      var h = new Headers(init.headers || {});
+      h.set('Authorization', 'Bearer ' + tok.value);
+      var opts = Object.assign({}, init, {headers: h, credentials: 'omit'});
+      function attempt(){
+        return fetch(url, opts).then(function(r){
+          if (r.status === 503 && Date.now() - started < 30000){
+            var ra = Number(r.headers.get('Retry-After') || 2);
+            status(r.headers.get('X-OtoDock-Server') || 'starting', ra);
+            return new Promise(function(res){ setTimeout(res, Math.min(ra, 5) * 1000); }).then(attempt);
+          }
+          status(r.status === 503 ? 'failed' : 'up', 0);
+          return r;
+        });
+      }
+      return attempt();
+    });
+  };
+  // ONE socket per path, reused on every later call for it: this wrapper
+  // reconnects with its own backoff, so a page that wraps a reconnect of
+  // its own around it doubles the sockets on every close until the
+  // platform's per-viewer cap refuses them all and the app looks
+  // permanently offline (found live, 2026-09-13). Reuse makes that
+  // impossible instead of merely bounded.
+  var byPath = {};
+  window.otodock.ws = function(path){
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var p = path ? String(path) : '';
+    var key = p ? (p.charAt(0) === '/' ? p : '/' + p) : '/';
+    var held = byPath[key];
+    if (held && !held._closed) return held;
+    var url = proto + location.host + base + '/ws' + (p ? (p.charAt(0) === '/' ? p : '/' + p) : '');
+    var w = {readyState: 0, onopen: null, onmessage: null, onclose: null, _q: [], _ws: null, _closed: false};
+    var backoff = 1000;
+    w._auth = function(){
+      if (w._ws && w._ws.readyState === 1 && tok.value) w._ws.send(JSON.stringify({type: 'auth', token: tok.value}));
+    };
+    function open(){
+      if (w._closed) return;
+      ready().then(function(){
+        if (w._closed) return;
+        var s = new WebSocket(url); w._ws = s;
+        s.onopen = function(){
+          s.send(JSON.stringify({type: 'auth', token: tok.value}));
+          w.readyState = 1; backoff = 1000;
+          while (w._q.length) s.send(w._q.shift());
+          if (w.onopen) w.onopen();
+        };
+        s.onmessage = function(ev){ if (w.onmessage) w.onmessage(ev); };
+        s.onclose = function(ev){
+          w.readyState = 3;
+          if (w.onclose) w.onclose(ev);
+          if (w._closed) return;
+          if (ev.code === 4401){ tok.value = ''; parent.postMessage({source:'otodock-artifact', v:1, type:'viewer_token_expired'}, '*'); }
+          if (ev.code === 4429){ try { console.warn('otodock.ws: the platform refused another socket for this app. This socket reconnects on its own — a page must not open or reconnect it a second time.'); } catch (err) {} }
+          setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000);
+        };
+      });
+    }
+    w.send = function(d){ if (w._ws && w._ws.readyState === 1) w._ws.send(d); else w._q.push(d); };
+    w.close = function(){ w._closed = true; delete byPath[key]; if (w._ws) w._ws.close(); };
+    byPath[key] = w; sockets.push(w); open();
+    return w;
+  };
 })();
 </script>"""
 
@@ -136,14 +386,116 @@ _FIRE_MIN_INTERVAL_S = 2.0
 _fire_rate: dict[tuple[str, str, str], float] = {}
 
 
+def _check_fire_rate(app_id: str, action_id: str, sub: str,
+                     args_key: str = "",
+                     interval: float = _FIRE_MIN_INTERVAL_S) -> None:
+    """Min-interval per (app, action[, args], user). ``args_key``
+    distinguishes DIFFERENT parameter values of one declared action — a
+    control panel often shares one schema-bound action across many widgets
+    (one ``toggle`` action, entity in args), and keying without the args
+    made pressing two different lights look like hammering one button.
+    Same args stay limited (a toggle double-press must not fire twice)."""
+    key = (app_id, f"{action_id}|{args_key}" if args_key else action_id, sub)
+    now = time.monotonic()
+    # A key never seen is not "fired at zero": the monotonic clock starts at
+    # boot, so that reading refused every first press for ``interval`` after
+    # a host restart (ten minutes for a warm).
+    last = _fire_rate.get(key)
+    if last is not None and now - last < interval:
+        raise HTTPException(status_code=429, detail="Too fast — try again in a moment")
+    _fire_rate[key] = now
+    if len(_fire_rate) > 1024:
+        for k in [k for k, t in _fire_rate.items() if now - t > 300]:
+            _fire_rate.pop(k, None)
+
+
+def _manifest_target_error(row: dict, u: UserContext) -> str:
+    """Why ``u`` may not approve the row's manifest as it stands: an MCP
+    the agent lacks, a task target that is gone or one they may not run.
+    Empty when every target holds. Sync — call off the loop."""
+    available_mcps: dict[str, str] | None = None
+    for a in _mf.parse_actions(row):
+        if a.get("type") == "mcp_tool":
+            if available_mcps is None:
+                available_mcps = _mf.assigned_mcp_keys(row["agent"])
+            if available_mcps.get(a.get("mcp") or "") != a.get("mcp"):
+                return f"action {a.get('id')!r}: its MCP is not available on this agent"
+            continue
+        if a.get("type") != "fire_task":
+            continue
+        err = _mf.check_task_target(
+            a.get("task_id") or "", row["agent"], shared=not row.get("username"),
+        )
+        if err:
+            return err
+        dyn = task_store.get_dynamic_task(a.get("task_id") or "")
+        if not _mf.user_can_run_task(u, dyn or {}):
+            return f"action {a.get('id')!r}: you lack run authority for its task"
+    return ""
+
+
 def app_access(row: dict, user: UserContext) -> bool:
     """May ``user`` see/serve this app? Personal rows → owner only; shared
-    rows → anyone assigned to the agent; admin always."""
+    rows → anyone assigned to the agent; a live internal share grants
+    either (SHARING.md); admin always. A chat- or project-scoped pin is
+    additionally reachable only from its scope (``_scope_access``), grant or
+    not. Reads the DB for scoped rows and for non-member callers — call it
+    off the loop (``_visible_row``)."""
+    # A session acts on the agent it was minted for and never across one,
+    # whoever drives it (the app API's agent basis keeps the same rule): its
+    # bearer resolves to its user, who may belong to other agents too.
+    if user.is_session and (row.get("agent") or "") != (user.agent or ""):
+        return False
     if user.is_admin:
         return True
+    # A personal app whose owner lost the agent is dormant (APPS.md
+    # "Lifecycle"): to the owner, a grantee and the render alike it is gone.
+    if db_apps.personal_row_dormant(row):
+        return False
+    # The platform's own headless render sees the one app it was minted for
+    # (auth/render_principal.py), whatever the row's scope.
+    if user.render_app and user.render_app == row.get("id"):
+        return True
     if row.get("username"):
-        return (row.get("owner_sub") or "") == user.sub
-    return user.can_access_agent(row.get("agent") or "")
+        direct = (row.get("owner_sub") or "") == user.sub
+    else:
+        direct = user.can_access_agent(row.get("agent") or "")
+    if not direct and not _granted(row, user):
+        return False
+    return _scope_access(row, user)
+
+
+def _granted(row: dict, user: UserContext) -> bool:
+    from storage.sharing import share_store
+    return share_store.internal_grant("app", row.get("id") or "", user.sub) is not None
+
+
+def _scope_access(row: dict, user: UserContext) -> bool:
+    """A Dock pin follows its chat's access rule: the chat itself, or for a
+    project pin any lane of the project the viewer may open. Without this a
+    dashboard pinned in a private chat would serve to any member holding
+    its id (the Dock route checked the anchor chat; the app routes did
+    not)."""
+    chat_id = row.get("scope_chat_id") or ""
+    project_id = row.get("scope_project_id") or ""
+    if not chat_id and not project_id:
+        return True
+    from api.agents.chats import can_access_chat
+    if chat_id:
+        chat = task_store.get_chat(chat_id)
+        return bool(chat) and can_access_chat(user, chat)
+    return any(can_access_chat(user, c)
+               for c in task_store.list_chats_by_project(project_id))
+
+
+def _visible_row(app_id: str, user: UserContext) -> dict | None:
+    """The row iff it exists, is not soft-unpinned and ``user`` may reach
+    it — every other outcome is the same absence (no oracle). Synchronous:
+    call via ``asyncio.to_thread``."""
+    row = task_store.get_app(app_id)
+    if not row or row.get("hidden") or not app_access(row, user):
+        return None
+    return row
 
 
 def _viewer_username(user: UserContext) -> str:
@@ -153,8 +505,12 @@ def _viewer_username(user: UserContext) -> str:
 
 def _can_approve_surface(row: dict, user: UserContext) -> bool:
     """The APP surface of approval authority (the task surface is checked
-    per fire_task action)."""
+    per fire_task action). A render principal counts for its own app: it is
+    served the scratch copy the check cut (the approval routes themselves
+    are closed to it by the render confinement)."""
     if user.is_admin:
+        return True
+    if user.render_app and user.render_app == row.get("id"):
         return True
     if row.get("username"):
         return (row.get("owner_sub") or "") == user.sub
@@ -166,35 +522,237 @@ def _can_manage(row: dict, user: UserContext) -> bool:
     return _can_approve_surface(row, user)
 
 
+def _app_document(row: dict, user: UserContext, preview: bool) -> tuple[str, str]:
+    """``(kind, content)`` for the serve route: the release copy (verified
+    against its hash) unless the row has none, or the owner or an editor
+    asked for a preview of the working file; ``missing`` when the working
+    file is gone, ``unreadable`` when it is not a regular file inside the
+    agent's tree (a link is never followed), ``damaged`` when the release no
+    longer matches. Sync."""
+    from services.apps import releases
+    if row.get("release_path") and not (preview and _can_approve_surface(row, user)):
+        try:
+            data = releases.read_release(row)
+        except releases.ReleaseDamaged:
+            return "damaged", ""
+        if data is not None:
+            return "ok", data.decode("utf-8", "replace")
+    name = (row.get("rel_path") or "").rsplit("/", 1)[-1]
+    try:
+        return "ok", releases.read_working_file(row).decode("utf-8", "replace")
+    except FileNotFoundError:
+        return "missing", name
+    except OSError:
+        return "unreadable", name
+
+
 @router.get("/v1/apps/{app_id}/html")
 async def serve_app(
     app_id: str,
     request: Request,
+    preview: int = 0,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Serve a pinned mini-app (sandboxed on every branch — see
-    ``api.media.ui._ui_response``)."""
+    """Serve a pinned app (sandboxed on every branch — see
+    ``api.media.ui._ui_response``): the release copy made at pin time,
+    never the working file the agent edits; ``?preview=1`` serves the
+    working file to the owner or an editor and the release, silently, to
+    anyone else (APPS.md "Releases and rollback")."""
     origin = request_origin(request)
     if user is None:
         return _ui_response(
-            _placeholder("Sign in to OtoDock to view this mini-app."), origin, 401,
+            _placeholder("Sign in to OtoDock to view this app."), origin, 401,
         )
-    row = await asyncio.to_thread(task_store.get_app, app_id)
     # Access-denied is the SAME 404 as missing (no liveness oracle); a
     # soft-unpinned row is gone to every viewer surface.
-    if not row or row.get("hidden") or not app_access(row, user):
-        return _ui_response(_placeholder("This mini-app no longer exists."), origin, 404)
-    path = config.get_agent_dir(row["agent"]) / row["rel_path"]
-    if not path.is_file():
-        name = html_escape.escape(path.name)
+    row = await asyncio.to_thread(_visible_row, app_id, user)
+    if not row:
+        return _ui_response(_placeholder("This app no longer exists."), origin, 404)
+    if db_apps.app_kind_of(row).serves_tree:
+        # A folder app's document (its assets resolve under the hashed
+        # client prefix the frame normally loads; this path serves the
+        # same document for hosts that key on it).
+        from api.apps.app_proxy import folder_document
+        return await folder_document(row, user, request, preview=bool(preview))
+    kind, content = await asyncio.to_thread(_app_document, row, user, bool(preview))
+    if kind == "missing":
+        name = html_escape.escape(content)
         return _ui_response(
-            _placeholder(f"The mini-app file <code>{name}</code> was deleted from the workspace."),
+            _placeholder(f"The app file <code>{name}</code> was deleted from the workspace."),
             origin, 404,
         )
-    content = await asyncio.to_thread(path.read_text, "utf-8", "replace")
+    if kind == "unreadable":
+        name = html_escape.escape(content)
+        return _ui_response(
+            _placeholder(f"The app file <code>{name}</code> is not a regular file the platform "
+                         "can show. Ask the agent to pin it again."),
+            origin, 404,
+        )
+    if kind == "damaged":
+        return _ui_response(
+            _placeholder("This app's release copy is damaged — ask the agent to pin it again."),
+            origin, 404,
+        )
     if is_full_document(content):
         return _ui_response(inject_runtime(content, runtime_extra=APP_RUNTIME), origin)
     return _ui_response(wrap_fragment(content, runtime_extra=APP_RUNTIME), origin)
+
+
+# ── Releases (APPS.md "Releases and rollback") ────────────────────────
+# One lock per row: a deploy is a copy plus one UPDATE of the pointer; two
+# pins of the same app a moment apart must not interleave them.
+_deploy_locks: dict[str, asyncio.Lock] = {}
+
+
+def _deploy_lock(app_id: str) -> asyncio.Lock:
+    return _deploy_locks.setdefault(app_id, asyncio.Lock())
+
+
+async def cut_and_point(row: dict, source) -> dict:
+    """Copy the working file into the next release and point the row at it;
+    returns the fresh row."""
+    from services.apps import releases
+    async with _deploy_lock(row["id"]):
+        try:
+            rel, sha = await asyncio.to_thread(releases.cut_release, row, source)
+        except releases.ReleaseInvalid:
+            raise HTTPException(status_code=400, detail=(
+                f"apps/{row.get('slug')}.html is not a regular file in the workspace: "
+                "pin it again with html"))
+        fresh = await asyncio.to_thread(task_store.set_app_release, row["id"], rel, sha)
+    return fresh or row
+
+
+async def announce_deploy(row: dict, release: int, *, file_updated: bool = True) -> int:
+    """Tell every screen that may see the row that a new release serves:
+    ``app_deployed`` on the live queue (the frame reloads once its row
+    carries this manifest signature) and, for dashboards built before the
+    frame existed, the working file's ``file_updated``."""
+    from services.apps.audience import app_audience
+    from services.notifications import notification_manager
+    if file_updated:
+        await notification_manager.broadcast_file_updated(
+            row["agent"], row["rel_path"], source="disk",
+        )
+    frame = {"type": wire.APP_DEPLOYED, "app_id": row["id"], "release": release,
+             "actions_sig": task_store.manifest_sig(row)}
+    subs = await asyncio.to_thread(app_audience, row)
+    return sum(notification_manager.push_live(sub, frame) for sub in subs)
+
+
+async def rollback_app_row(row: dict) -> dict:
+    """Point the row at the release before the current one; 409 when there
+    is none. Shared by the REST route and the session hook."""
+    from services.apps import releases
+    if db_apps.app_kind_of(row).keeps_data:
+        # A folder app rolls its database back with its code (APPS.md).
+        from services.apps import app_deploy
+        async with _deploy_lock(row["id"]):
+            try:
+                return await app_deploy.rollback_folder(row)
+            except app_deploy.DeployError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+    async with _deploy_lock(row["id"]):
+        prev = await asyncio.to_thread(releases.previous_number, row)
+        if prev is None:
+            raise HTTPException(status_code=409, detail="no previous release")
+        rel, sha = await asyncio.to_thread(releases.point_to, row, prev)
+        fresh = await asyncio.to_thread(task_store.set_app_release, row["id"], rel, sha) or row
+    screens = await announce_deploy(fresh, prev)
+    logger.info(f"App rolled back: app={row.get('slug')}, release={prev}, screens={screens}")
+    return {"release": prev, "screens": screens}
+
+
+@router.post("/v1/apps/{app_id}/rollback")
+async def rollback_app(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """The menu's Roll back: whoever may manage the row, a human at the
+    keyboard (``require_human``)."""
+    u = require_human(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    if not _can_manage(row, u):
+        raise HTTPException(status_code=403, detail="Not authorized to roll back this app")
+    return {"status": "ok", **await rollback_app_row(row)}
+
+
+# ── Folder deploys waiting for a human (APPS.md "Deploy pipeline") ─────────
+
+
+@router.get("/v1/apps/{app_id}/deploy/status")
+async def deploy_status(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """The deploy state, the pending release and what it changes — what the
+    card shows whoever may see the app."""
+    from services.apps import app_deploy
+    u = require_auth(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    return await asyncio.to_thread(app_deploy.status, row)
+
+
+class DeployApproveRequest(BaseModel):
+    release: int | None = None
+    sig: str | None = None
+
+
+@router.post("/v1/apps/{app_id}/deploy/approve")
+async def approve_deploy(
+    app_id: str,
+    req: DeployApproveRequest | None = None,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Take the pending release live; the manifest it carries becomes the
+    approved one in the same click. A person at the keyboard with the
+    approval authority (``require_human``, the owner or an editor). The
+    body names the release and the manifest sig the card RENDERED: a deploy
+    while a release waits replaces the waiting copy and its manifest, so
+    without them the click would approve whatever the agent shipped since
+    the card was drawn (409, like the plain approve route)."""
+    from services.apps import app_deploy
+    u = require_human(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    if not _can_approve_surface(row, u):
+        raise HTTPException(status_code=403, detail="Not authorized to approve this app's release")
+    if req is not None and (
+            (req.release is not None and req.release != int(row.get("pending_release") or 0))
+            or (req.sig is not None and req.sig != task_store.manifest_sig(row))):
+        raise HTTPException(status_code=409, detail="The release changed — review it again")
+    err = await asyncio.to_thread(_manifest_target_error, row, u)
+    if err:
+        raise HTTPException(status_code=409, detail=err)
+    try:
+        return {"status": "ok", **await app_deploy.approve_pending(
+            row, u.sub, expect_sig=req.sig if req else None,
+            expect_release=req.release if req else None)}
+    except app_deploy.DeployError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.post("/v1/apps/{app_id}/deploy/reject")
+async def reject_deploy(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    from services.apps import app_deploy
+    u = require_human(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    if not _can_approve_surface(row, u):
+        raise HTTPException(status_code=403, detail="Not authorized to reject this app's release")
+    try:
+        return await app_deploy.reject_pending(row)
+    except app_deploy.DeployError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
@@ -204,11 +762,13 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
     semantics. Synchronous — call via ``asyncio.to_thread``."""
     # Keyed per agent: the pins route may mix rows from different agents
     # (a project spans agents), and mcp availability is per-agent.
+    from services.apps import releases
     mcps_by_agent: dict[str, dict[str, str]] = {}
     out = []
     for row in rows:
         agent = row.get("agent") or ""
         actions = _mf.parse_actions(row)
+        requires = _mf.parse_requires(row)
         approved = task_store.app_actions_approved(row)
         stale = False
         has_mcp_tool = any(a.get("type") == "mcp_tool" for a in actions)
@@ -233,6 +793,15 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
                     row.get("approved_by") or "", row):
                 stale = True
         can_approve = _can_approve_surface(row, u)
+        steps = _mf.parse_steps(row)
+        # A shared app whose steps receive the agent's service accounts is
+        # approved by a manager only (APPS.md "Steps": the token leaves the
+        # platform with the script); an editor's approval would run the
+        # scripts with no token, so the card says who may approve instead.
+        steps_need_manager = bool(steps and not row.get("username")
+                                  and (requires.get("providers") or []))
+        if steps_need_manager and can_approve and not u.can_manage_agent(agent):
+            can_approve = False
         if can_approve:
             for a in actions:
                 if a.get("type") == "mcp_tool" and not a.get("mcp_available"):
@@ -248,7 +817,7 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "id": row["id"],
             "slug": row["slug"],
             "title": row["title"],
-            "scope": "personal" if row.get("username") else "shared",
+            "scope": db_apps.app_scope(row.get("username")),
             "pin_scope": ("chat" if row.get("scope_chat_id")
                           else "project" if row.get("scope_project_id")
                           else "standing"),
@@ -256,16 +825,160 @@ def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
             "rel_path": row["rel_path"],
             "updated_at": row["updated_at"],
             "actions": actions,
-            "actions_sig": task_store.actions_sig(row.get("actions") or "[]"),
+            "actions_sig": task_store.manifest_sig(row),
             "actions_approved": approved and not stale,
             "approval_stale": stale,
             "can_approve": can_approve,
             "can_manage": _can_manage(row, u),
+            # The role this viewer's action floors are judged against
+            # (``min_role``); the host page hides nothing but can say why.
+            "viewer_role": _mf.caller_role(row, u),
             # S2: this viewer parked the shared row off their own strip
             # (rows still return — the client's hidden affordance restores).
             "hidden_for_me": bool(row.get("hidden_for_me")),
+            # Another user's personal app the viewer holds a share on
+            # (SHARING.md): listed under "Shared with me", never managed.
+            "granted": bool(row.get("granted")),
+            # The release served (0 = the working file) and whether the
+            # menu may offer Roll back.
+            "release": releases.current_number(row),
+            "has_previous_release": releases.previous_number(row) is not None,
+            # The manifest's other blocks, for the card's words (APPS.md
+            # "The approval card"); `requires_status` says which needs are
+            # met for this viewer; `manifest_empty` is the server's
+            # "nothing to approve" (the card keys off it, not the actions).
+            "files": _mf.parse_files(row),
+            "egress": _mf.parse_egress(row),
+            "handlers": _mf.parse_handlers(row),
+            "exports": _mf.parse_exports(row),
+            "bindings": _mf.parse_bindings(row),
+            "requires": requires,
+            "requires_status": _requires_status(agent, requires, u, mcps_by_agent, row),
+            "manifest_empty": task_store.canonical_manifest(row) == "[]",
+            # APPS.md "Steps": the scripts, where they would run, whether a
+            # live link reaches the app (the card's warning line) and who
+            # may approve.
+            "steps": steps,
+            **(_step_fields(row) if steps else {}),
+            "steps_need_manager": steps_need_manager,
+            # APPS.md "Secrets": the declared names, where the platform
+            # sends each, and whether a value is set — never a value.
+            "secrets": _secret_fields(row),
+            # APPS.md "Inbound hooks": the public routes a vendor may call.
+            "inbound": _mf.parse_inbound(row),
+            # APPS.md "External links": what a link may do, with defaults.
+            "external": _mf.parse_external(row),
+            **_runtime_fields(row, u),
         })
     return out
+
+
+def _secret_fields(row: dict) -> list[dict]:
+    """The card's secrets list: each declared name with its use and whether
+    it is set (a names-only read of the store, nothing decrypted). Best
+    effort: a lookup that fails leaves the flags out rather than the row."""
+    if not _mf.parse_secrets(row):
+        return []
+    try:
+        from services.apps import app_secrets
+        return [{k: v for k, v in s.items() if k in ("name", "required", "description",
+                                                     "sends_to", "env", "set", "declared")}
+                for s in app_secrets.status_for(row)]
+    except Exception:
+        logger.exception("App %s: the secrets listing failed", row.get("slug"))
+        return [{**s, "set": False, "declared": True} for s in _mf.parse_secrets(row)]
+
+
+def _step_fields(row: dict) -> dict:
+    """Where the app's steps run, in the card's words, and whether the app
+    has a live external link (a step-running app reachable by a link gets
+    the "link input is data" line). Synchronous, best effort: a lookup that
+    fails leaves the field out rather than the row."""
+    out: dict = {}
+    try:
+        from services.apps import app_steps
+        from storage import remote_store
+        from storage.remote_store import resolve_execution_target
+        identity, _vis = app_steps.identity_for(row)
+        target, _reason = resolve_execution_target(
+            row.get("agent") or "", identity.creds_user_sub or None, identity.role)
+        machine_id = placement.machine_of(target)
+        if not machine_id:
+            out["step_target"] = {"kind": placement.SITE_LOCAL}
+        else:
+            machine = remote_store.get_remote_machine(machine_id) or {}
+            out["step_target"] = {"kind": "machine",
+                                  "name": machine.get("name") or target[:8]}
+    except Exception:
+        logger.debug("app %s: step placement lookup failed", row.get("slug"), exc_info=True)
+    try:
+        from storage.sharing import share_store
+        out["has_live_link"] = any(
+            s.get("scope") == "external" and share_store.is_live(s)
+            for s in share_store.list_target_shares("app", row["id"]))
+    except Exception:
+        logger.debug("app %s: share lookup failed", row.get("slug"), exc_info=True)
+    return out
+
+
+def _requires_status(agent: str, requires: dict, u: UserContext,
+                     mcps_by_agent: dict[str, dict[str, str]], row: dict) -> dict:
+    """Which of an app's declared needs are met: an MCP when the agent has
+    it assigned, a provider when the identity the app's calls RUN WITH has
+    an account on one of the agent's MCPs that uses it — the agent's
+    service account for a shared app, the owner's for a personal one (the
+    lookup ``integrations.status`` performs; the card names the account
+    and whose it is)."""
+    mcps = [m for m in (requires.get("mcps") or []) if isinstance(m, str)]
+    providers = [p for p in (requires.get("providers") or []) if isinstance(p, str)]
+    if not mcps and not providers:
+        return {"mcps": [], "providers": []}
+    if agent not in mcps_by_agent:
+        mcps_by_agent[agent] = _mf.assigned_mcp_keys(agent)
+    keys = mcps_by_agent[agent]
+    status: dict = {"mcps": [{"name": m, "assigned": bool(keys.get(m))} for m in mcps],
+                    "providers": []}
+    if providers:
+        from api.apps import catalog
+        known = {p["provider"]: p for p in catalog.provider_status(agent, row, u)}
+        for p in providers:
+            hit = known.get(p) or {}
+            status["providers"].append({
+                "provider": p, "mcp": hit.get("mcp", ""),
+                "connected": bool(hit.get("connected")),
+                "account": hit.get("account", ""), "identity": hit.get("identity", ""),
+            })
+    return status
+
+
+def _runtime_fields(row: dict, u: UserContext) -> dict:
+    """What a folder app adds to the shape (APPS.md): the kind, the tree
+    hash the client document is addressed by, the preview copy's hash for
+    whoever may open it, the deploy state and the server's state."""
+    from services.apps import app_sandbox, app_supervisor, releases
+    if not db_apps.app_kind_of(row).serves_tree:
+        return {"kind": db_apps.APP_KIND_FILE}
+    preview_sha = ""
+    if _can_approve_surface(row, u):
+        pd = releases.preview_dir(row)
+        if (pd / releases.MANIFEST_NAME).is_file():
+            preview_sha = releases.tree_sha(pd)
+    try:
+        live = releases.live_release_dir(row)
+    except releases.ReleaseDamaged:
+        live = None
+    status = app_supervisor.status(row["id"])
+    return {
+        "kind": db_apps.APP_KIND_FOLDER,
+        "release_sha": row.get("release_sha256") or "",
+        "preview_sha": preview_sha,
+        "has_server": bool(live is not None and app_sandbox.server_entry(live)),
+        "deploy_state": row.get("deploy_state") or db_apps.DEPLOY_IDLE,
+        "pending_release": int(row.get("pending_release") or 0),
+        "deploying": _deploy_lock(row["id"]).locked(),
+        "server": status["server"],
+        "server_error": status["error"],
+    }
 
 
 @router.get("/v1/apps")
@@ -283,11 +996,66 @@ async def list_apps(
     require_agent_access(u, agent)
 
     def _load() -> list[dict]:
-        return shape_app_rows(
-            task_store.list_apps(agent, _viewer_username(u), viewer_sub=u.sub), u,
-        )
+        username = _viewer_username(u)
+        # A per-user template app this member never got (a crash mid-loop,
+        # a restore) is queued for the seeder here, at most once a minute
+        # (COMMUNITY-AGENTS-REGISTRY.md "Per-user template apps").
+        if not u.is_api_key:
+            from services.community import template_app_seeder
+            try:
+                template_app_seeder.heal_missing(agent, u.sub, username)
+            except Exception:
+                logger.exception("template app heal failed for %s", agent)
+        return shape_app_rows(task_store.list_apps(agent, username, viewer_sub=u.sub), u)
 
     return {"apps": await asyncio.to_thread(_load)}
+
+
+@router.get("/v1/apps/{app_id}")
+async def read_app(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """One app in the list shape (the full-screen page's header and
+    manifest), plus its agent and, for a chat-scoped pin, the chat it
+    belongs to. Denied is the same 404 as missing, like the serve route."""
+    u = require_auth(user)
+
+    def _load() -> dict | None:
+        row = _visible_row(app_id, u)
+        if not row:
+            return None
+        shaped = shape_app_rows([row], u)[0]
+        shaped["agent"] = row.get("agent") or ""
+        shaped["chat_id"] = row.get("scope_chat_id") or ""
+        return shaped
+
+    out = await asyncio.to_thread(_load)
+    if out is None:
+        raise HTTPException(status_code=404, detail="App not found")
+    return out
+
+
+@router.get("/v1/apps/{app_id}/state")
+async def read_app_state(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """The app's state document for a viewer's page (APPS.md "Live
+    apps"): ``{doc, rev}``, ``rev`` 0 for an app never written. Denied is
+    the same 404 as missing."""
+    u = require_auth(user)
+
+    def _load() -> dict | None:
+        if not _visible_row(app_id, u):
+            return None
+        doc, rev = task_store.get_app_state(app_id)
+        return {"doc": doc, "rev": rev}
+
+    out = await asyncio.to_thread(_load)
+    if out is None:
+        raise HTTPException(status_code=404, detail="App not found")
+    return out
 
 
 @router.post("/v1/apps/{app_id}/hide")
@@ -300,10 +1068,14 @@ async def hide_app_for_me(
     ``DELETE /v1/apps/{id}`` behind ``_can_manage``). Personal rows are
     refused: their owner already has the real unpin."""
     u = require_auth(user)
-    row = await asyncio.to_thread(task_store.get_app, app_id)
-    if not row or row.get("hidden") or not app_access(row, u):
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
         raise HTTPException(status_code=404, detail="App not found")
     if row.get("username"):
+        # A grantee parks another user's personal app off their own list
+        # through the share row (SHARING.md); the owner has the real unpin.
+        if await asyncio.to_thread(_set_grant_hidden, row, u, True):
+            return {"status": "ok"}
         raise HTTPException(
             status_code=400,
             detail="hide-for-me applies to shared apps only — unpin your "
@@ -316,6 +1088,20 @@ async def hide_app_for_me(
     return {"status": "ok"}
 
 
+def _set_grant_hidden(row: dict, u: UserContext, hidden: bool) -> bool:
+    """Flip the caller's own hide on their grant of a personal app. False
+    when the caller is the owner or holds no grant (the caller then takes
+    the row's own path)."""
+    if (row.get("owner_sub") or "") == u.sub:
+        return False
+    from services.apps import audience
+    from storage.sharing import share_store
+    if not share_store.set_grant_hidden("app", row["id"], u.sub, hidden):
+        return False
+    audience.forget(row["id"])
+    return True
+
+
 @router.post("/v1/apps/{app_id}/unhide")
 async def unhide_app_for_me(
     app_id: str,
@@ -323,198 +1109,189 @@ async def unhide_app_for_me(
 ):
     """Restore a hide-for-me (S2). Idempotent."""
     u = require_auth(user)
-    row = await asyncio.to_thread(task_store.get_app, app_id)
-    if not row or row.get("hidden") or not app_access(row, u):
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
         raise HTTPException(status_code=404, detail="App not found")
+    if row.get("username") and await asyncio.to_thread(_set_grant_hidden, row, u, False):
+        return {"status": "ok"}
     await asyncio.to_thread(task_store.unhide_app_for_user, app_id, u.sub)
     return {"status": "ok"}
 
 
-class ApproveRequest(BaseModel):
-    sig: str
+# ── The platform catalog (APPS.md "Platform catalog") ─────────────────
 
 
-@router.post("/v1/apps/{app_id}/approve")
-async def approve_app(
+def _catalog_entry(row: dict, u: UserContext, *, feed: str = "", method: str = "",
+                   unattended: bool = False, role: str | None = None) -> dict:
+    """The declared, approved entry the viewer clears the floor of; raises
+    the refusal otherwise. ``unattended`` is the platform basis (a handler
+    of the app itself, APPS.md "Handlers"): the approval is the floor.
+    ``role`` judges the floor instead of ``u``'s standing: an agent session
+    is judged at its per-agent row, never its owner's platform role."""
+    for a in _mf.parse_actions(row):
+        if feed and a.get("type") == "data_feed" and a.get("feed") == feed:
+            break
+        if method and a.get("type") == "platform" and a.get("method") == method:
+            break
+    else:
+        raise HTTPException(status_code=404, detail="not declared in this app's manifest")
+    if not task_store.app_actions_approved(row):
+        raise HTTPException(status_code=409, detail="actions not approved")
+    if not unattended and not _mf.meets_floor(a, role or _mf.caller_role(row, u)):
+        raise HTTPException(status_code=403, detail=_mf.floor_reason(a))
+    return a
+
+
+@router.get("/v1/apps/{app_id}/catalog/{feed}")
+async def read_catalog_feed(
     app_id: str,
-    req: ApproveRequest,
+    feed: str,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Approve the declared-actions manifest. The body carries the sig the
-    client RENDERED, so a manifest mutated after the approval card was shown
-    is refused (409) — the user only ever approves actions they saw. The
-    approver must hold run authority for every fire_task target: approval
-    is what delegates the run to every app viewer."""
+    """A feed's snapshot for this viewer, with the sequence deltas continue
+    from. The two host-answered feeds are not served here."""
+    from api.apps import catalog
     u = require_auth(user)
-    row = await asyncio.to_thread(task_store.get_app, app_id)
-    if not row or row.get("hidden") or not app_access(row, u):
-        raise HTTPException(status_code=404, detail="App not found")
-    if not _can_approve_surface(row, u):
-        raise HTTPException(status_code=403, detail="Not authorized to approve this app's actions")
+    if feed not in catalog.FEEDS or feed in catalog.CLIENT_FEEDS:
+        raise HTTPException(status_code=404, detail="unknown feed")
+    if feed == "notifications" and u.is_api_key:
+        # The inbox spans every agent; ``/v1/notifications`` answers a
+        # bearer the definitions only, and an app's page is no way round it.
+        raise HTTPException(status_code=403, detail="the inbox is a person's own page")
 
-    def _check_targets() -> str:
-        available_mcps: dict[str, str] | None = None
-        for a in _mf.parse_actions(row):
-            if a.get("type") == "mcp_tool":
-                if available_mcps is None:
-                    available_mcps = _mf.assigned_mcp_keys(row["agent"])
-                if available_mcps.get(a.get("mcp") or "") != a.get("mcp"):
-                    return f"action {a.get('id')!r}: its MCP is not available on this agent"
-                continue
-            if a.get("type") != "fire_task":
-                continue
-            err = _mf.check_task_target(
-                a.get("task_id") or "", row["agent"], shared=not row.get("username"),
-            )
-            if err:
-                return err
-            dyn = task_store.get_dynamic_task(a.get("task_id") or "")
-            if not _mf.user_can_run_task(u, dyn or {}):
-                return f"action {a.get('id')!r}: you lack run authority for its task"
-        return ""
+    def _load() -> dict:
+        row = _visible_row(app_id, u)
+        if not row:
+            raise HTTPException(status_code=404, detail="App not found")
+        _catalog_entry(row, u, feed=feed)
+        agent = row.get("agent") or ""
+        return {"rows": catalog.snapshot(feed, agent, u),
+                "seq": catalog.current_seq(u.sub, "" if feed == "notifications" else agent, feed)}
 
-    err = await asyncio.to_thread(_check_targets)
-    if err:
-        raise HTTPException(status_code=403, detail=err)
-    ok = await asyncio.to_thread(task_store.approve_app_actions, app_id, req.sig, u.sub)
-    if not ok:
-        raise HTTPException(status_code=409, detail="The manifest changed — review it again")
-    return {"status": "ok"}
+    return await asyncio.to_thread(_load)
 
 
-class ActionRequest(BaseModel):
+class PlatformCallRequest(BaseModel):
     args: Any = None
 
 
-def _validate_action_args(action: dict, args) -> dict:
-    """Gate page-supplied args behind the action's user-approved schema.
-    Schema-less actions take NO args (fail-closed: unexpected input is
-    refused, not dropped). Raises HTTPException on any mismatch."""
-    schema = action.get("args_schema")
-    if not schema:
-        if args:
-            raise HTTPException(status_code=400, detail="This action takes no arguments")
-        return {}
-    validated, err = _mf.validate_args(schema, args)
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-    return validated
-
-
-def _check_fire_rate(app_id: str, action_id: str, sub: str,
-                     args_key: str = "",
-                     interval: float = _FIRE_MIN_INTERVAL_S) -> None:
-    """Min-interval per (app, action[, args], user). ``args_key``
-    distinguishes DIFFERENT parameter values of one declared action — a
-    control panel often shares one schema-bound action across many widgets
-    (one ``toggle`` action, entity in args), and keying without the args
-    made pressing two different lights look like hammering one button.
-    Same args stay limited (a toggle double-press must not fire twice)."""
-    key = (app_id, f"{action_id}|{args_key}" if args_key else action_id, sub)
-    now = time.monotonic()
-    if now - _fire_rate.get(key, 0.0) < interval:
-        raise HTTPException(status_code=429, detail="Too fast — try again in a moment")
-    _fire_rate[key] = now
-    if len(_fire_rate) > 1024:
-        for k in [k for k, t in _fire_rate.items() if now - t > 300]:
-            _fire_rate.pop(k, None)
-
-
-@router.post("/v1/apps/{app_id}/actions/{action_id}")
-async def run_app_action(
+@router.post("/v1/apps/{app_id}/catalog/{method}")
+async def call_catalog_method(
     app_id: str,
-    action_id: str,
-    req: ActionRequest | None = None,
+    method: str,
+    req: PlatformCallRequest | None = None,
     user: UserContext | None = Depends(get_current_user),
 ):
-    """Execute a declared fire_task or mcp_tool action. send_prompt actions
-    are delivered through the chat WS instead.
-
-    Page args only ever pass through the action's user-approved
-    ``args_schema``: a schema-less fire_task fires VERBATIM (args rejected —
-    a page-controlled prompt_override would be prompt injection with full
-    task authority); with a schema, validated args substitute into the task
-    prompt. mcp_tool merges validated args UNDER the declared fixed_args and
-    runs the one declared tool headlessly (no agent session, no LLM turn)."""
+    """One platform method as the viewer: ``{ok, result}`` or ``{ok: false,
+    reason}``; four calls per second per (app, viewer)."""
+    from api.apps import catalog
     u = require_auth(user)
-    row = await asyncio.to_thread(task_store.get_app, app_id)
-    if not row or row.get("hidden") or not app_access(row, u):
+    if method not in catalog.METHODS:
+        raise HTTPException(status_code=404, detail="unknown platform method")
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
         raise HTTPException(status_code=404, detail="App not found")
-    action = _mf.find_action(row, action_id)
-    if action is None:
-        raise HTTPException(status_code=404, detail="Unknown action")
-    if action.get("type") == "send_prompt":
-        raise HTTPException(status_code=400, detail="This action is delivered through the chat")
-    if action.get("type") == "data_feed":
-        raise HTTPException(status_code=400,
-                            detail="Feeds are answered by the host page, not fired")
-    if not task_store.app_actions_approved(row):
-        raise HTTPException(status_code=409, detail="Actions not approved")
+    entry = _catalog_entry(row, u, method=method)
     args = req.args if req else None
+    if entry.get("args_schema"):
+        validated, err = _mf.validate_args(entry["args_schema"], args)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        args = validated
+    _check_fire_rate(app_id, f"\x00platform:{method}", u.sub, interval=0.25)
 
-    if action.get("type") == "mcp_tool":
-        # Click-time re-checks: the APPROVER's standing surface authority
-        # (mcp_tool runs with real credentials on their delegation — a
-        # demoted approver fails closed) and the MCP's availability.
-        if not await asyncio.to_thread(
-            _mf.sub_can_approve_surface, row.get("approved_by") or "", row,
-        ):
-            raise HTTPException(status_code=409, detail="Approval stale — re-approve this app's actions")
-        keys = await asyncio.to_thread(_mf.assigned_mcp_keys, row["agent"])
-        if keys.get(action.get("mcp") or "") != action.get("mcp"):
-            raise HTTPException(status_code=409, detail="This action's MCP is no longer available")
-        validated = _validate_action_args(action, args)
-        merged = _mf.merge_fixed_args(action.get("fixed_args") or {}, validated)
-        merged_json = json.dumps(merged, sort_keys=True, separators=(",", ":"))
-        if len(merged_json.encode("utf-8")) > 8192:
-            raise HTTPException(status_code=400, detail="Arguments too large")
-        # Args-aware, shorter interval for direct tool calls: the schema
-        # bounds every value and the headless in-flight guard + the tool's
-        # own latency do the heavy limiting. Identical repeat calls (a
-        # toggle double-press) still wait the full second.
-        args_key = hashlib.sha256(merged_json.encode("utf-8")).hexdigest()[:16]
-        _check_fire_rate(app_id, action_id, u.sub, args_key=args_key, interval=1.0)
-        from services.apps import headless_exec
-        return await headless_exec.execute_app_tool(row, action, merged)
+    def _run() -> dict:
+        try:
+            return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, args)}
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        except PermissionError as e:
+            return {"ok": False, "reason": str(e)}
 
-    # fire_task
-    task_id = action.get("task_id") or ""
-    dyn = await asyncio.to_thread(task_store.get_dynamic_task, task_id)
-    # Re-checks at click time: the task and the APPROVER's authority may
-    # both have changed since approval (edited/rescoped task, demoted
-    # approver). Stale approval fails closed until someone re-approves.
-    err = await asyncio.to_thread(
-        _mf.check_task_target, task_id, row["agent"], not row.get("username"),
-    )
-    if err:
-        raise HTTPException(status_code=409, detail=err)
-    if not await asyncio.to_thread(
-        _mf.sub_can_run_task, row.get("approved_by") or "", dyn or {},
-    ):
-        raise HTTPException(status_code=409, detail="Approval stale — re-approve this app's actions")
-    validated = _validate_action_args(action, args)
-    _check_fire_rate(app_id, action_id, u.sub)
+    out = await asyncio.to_thread(_run)
+    await finish_platform_result(out, u.sub)
+    return out
 
-    from services.scheduler import scheduler
-    task_def = scheduler._row_to_task(dyn)
-    prompt_override = None
-    if action.get("args_schema"):
-        # Safe now: the values are schema-bounded (type/enum/length) and the
-        # SCHEMA was what the user approved — never free-form page text.
-        from services.scheduler.trigger_manager import _substitute_placeholders
-        prompt_override = _substitute_placeholders(task_def.prompt or "", validated) or ""
-        if len(prompt_override) > 8000:
-            raise HTTPException(status_code=400, detail="Prompt too large after substitution")
-    run_id = await scheduler.trigger_task_now(
-        task_def, trigger_type="app_action",
-        trigger_source=f"{row['slug']}:{action_id}",
-        prompt_override=prompt_override,
-    )
-    logger.info(
-        f"App action fired: app={row['slug']}, action={action_id}, "
-        f"task={task_id}, by={u.sub[:16]}, run={run_id}"
-    )
-    return {"status": "ok", "run_id": run_id}
+
+async def finish_platform_result(out: dict, user_sub: str) -> None:
+    """The async tail of a platform method: a notification to oneself goes
+    out like any other (toast, inbox, the catalog's own feed); a file the
+    method wrote is announced like a pin's (dashboards and satellites)."""
+    if not out.get("ok") or not isinstance(out.get("result"), dict):
+        return
+    delivery = out["result"].pop("_delivery", None)
+    if delivery:
+        from services.notifications import notification_manager
+        await notification_manager._deliver_to_user(user_sub, delivery)
+    written = out["result"].pop("_written", None)
+    if written:
+        agent, rel, host_path = written
+        from pathlib import Path as _Path
+        from api.media.uploads import _push_upload_to_active_remote_sessions
+        from services.notifications import notification_manager
+        await notification_manager.broadcast_file_updated(agent, rel, source="disk")
+        await _push_upload_to_active_remote_sessions(agent, rel, _Path(host_path))
+    setup = out["result"].pop("_setup", None)
+    if setup:
+        # ``setup.complete`` (COMMUNITY-AGENTS-REGISTRY.md): the same service
+        # the complete_setup tool's route runs, for the viewer alone.
+        from services.agents import setup_state
+        if setup["scope"] == "user":
+            done = await setup_state.complete_user_setup(setup["agent"], setup["username"], setup["sub"])
+        else:
+            from storage.agents import agent_store
+            row = await asyncio.to_thread(agent_store.get_agent, setup["agent"]) or {}
+            done = await setup_state.complete_agent_setup(setup["agent"], row)
+            done.pop("agent", None)
+        out["result"].update(done)
+
+
+# One keep-warm per (app, viewer) per window: the host page asks on every
+# open; the pool entry it builds outlives the window on its own grace.
+_WARM_MIN_INTERVAL_S = 600.0
+_warm_tasks: set[asyncio.Task] = set()
+
+
+@router.post("/v1/apps/{app_id}/warm")
+async def warm_app(
+    app_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Keep the app's tool manager warm: any accessor of an approved app may
+    ask, the build runs in the background under the app's own identity
+    (exactly what a click would build), and the entry stays for the
+    keep-warm grace. 202 when a build was scheduled, 204 when there is
+    nothing to build (no tool buttons, stale approval, asked recently)."""
+    u = require_auth(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    from services.apps import headless_exec
+
+    def _warmable() -> bool:
+        if not headless_exec.manifest_mcps(row):
+            return False
+        if not task_store.app_actions_approved(row):
+            return False
+        return _mf.sub_can_approve_surface(row.get("approved_by") or "", row)
+
+    if not await asyncio.to_thread(_warmable):
+        return Response(status_code=204)
+    try:
+        _check_fire_rate(app_id, "\x00warm", u.sub, interval=_WARM_MIN_INTERVAL_S)
+    except HTTPException:
+        return Response(status_code=204)
+
+    async def _build() -> None:
+        try:
+            await headless_exec.warm(row)
+        except Exception:
+            logger.exception(f"app warm failed: app={row.get('slug')}")
+
+    task = asyncio.get_running_loop().create_task(_build())
+    _warm_tasks.add(task)
+    task.add_done_callback(_warm_tasks.discard)
+    return Response(status_code=202)
 
 
 class OrderRequest(BaseModel):
@@ -565,10 +1342,47 @@ async def unpin_app(
     so an agent ``pin_app(slug)`` restores the app exactly as approved.
     The agent-side unpin hook is the hard delete."""
     u = require_auth(user)
-    row = await asyncio.to_thread(task_store.get_app, app_id)
-    if not row or row.get("hidden") or not app_access(row, u):
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
         raise HTTPException(status_code=404, detail="App not found")
     if not _can_manage(row, u):
         raise HTTPException(status_code=403, detail="Not authorized to unpin this app")
-    await asyncio.to_thread(task_store.set_app_hidden, app_id, True)
+    # A folder app's server stops with the soft unpin (APPS.md "Lifecycle").
+    from services.apps import app_supervisor
+    await app_supervisor.stop(app_id)
+    # The parked set stays bounded: rows the hide pruned take their release
+    # copies with them (the database owns the rows, not the files).
+    pruned: list[dict] = []
+    await asyncio.to_thread(task_store.set_app_hidden, app_id, True, pruned=pruned)
+    if pruned:
+        from services.apps import app_lifecycle, releases
+        await app_lifecycle.forget_rows(pruned)
+        for gone in pruned:
+            await app_supervisor.stop(gone["id"])
+            await asyncio.to_thread(releases.remove_release_dir, gone)
     return {"status": "ok"}
+
+
+class PurgeRequest(BaseModel):
+    confirm: str = ""
+
+
+@router.post("/v1/apps/{app_id}/purge")
+async def purge_app(
+    app_id: str,
+    req: PurgeRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """"Delete app and its data" (APPS.md "Lifecycle"): the row, the
+    releases, the database and the folder. A person at the keyboard who
+    may manage the row, who typed the slug."""
+    u = require_human(user)
+    row = await asyncio.to_thread(_visible_row, app_id, u)
+    if not row:
+        raise HTTPException(status_code=404, detail="App not found")
+    if not _can_manage(row, u):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this app")
+    if (req.confirm or "").strip().lower() != row["slug"]:
+        raise HTTPException(status_code=400, detail="Type the app's slug to confirm")
+    from services.apps import app_lifecycle
+    return await app_lifecycle.purge(row)

@@ -10,7 +10,7 @@ One stop for every OAuth flow side-effect after a successful exchange:
   * Mark the connected services on the account.
 
 Also owns the central-token-dir path helpers used by
-``services/credential_resolver`` and ``core/credential_writeback``.
+``services/credential_resolver`` and ``core/credentials/credential_files``.
 
 Directory layout — keyed by provider_id, one dir per user:
 

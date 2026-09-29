@@ -6,7 +6,6 @@ search & replace, table manipulation, and mixed-formatting paragraphs.
 """
 
 import contextlib
-import os
 from pathlib import Path
 
 from equations import OMML_NS, latex_to_omml_element, omml_to_latex
@@ -20,9 +19,10 @@ from shared import (
     _push_preview,
     _resolve_path,
     _to_agents_relative,
-    _WORKER_TMP_SUFFIX,
     _WRITE_OP_ADVICE,
     logger,
+    cleanup_partials,
+    safe_open_write,
 )
 
 
@@ -406,8 +406,7 @@ async def handle_write_docx(args: dict) -> str:
             _advice=_WRITE_OP_ADVICE,
         )
     except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(path + _WORKER_TMP_SUFFIX)
+        cleanup_partials(path)
         raise
     await _push_preview(path)
     return msg
@@ -425,7 +424,6 @@ def _write_docx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     if Path(path).exists() and not create_new:
         doc = Document(path)
     else:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
         doc = Document()
 
     align_map = {
@@ -957,11 +955,11 @@ def _write_docx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
             "op unless an intentional blank final page is desired."
         )
 
-    # Save even if some operations failed. Atomic: a killed worker must
-    # never leave the user's document truncated.
-    tmp = path + _WORKER_TMP_SUFFIX
-    doc.save(tmp)
-    os.replace(tmp, path)
+    # Save even if some operations failed. Atomic and beneath the mount: a
+    # killed worker never leaves the user's document truncated, and a link
+    # swapped in at the name or on the way never redirects the save.
+    with safe_open_write(path) as fh:
+        doc.save(fh)
 
     msg = f"Document saved: {_to_agents_relative(path)} ({len(ops)} operations applied)"
     msg += _dropped_note(dropped)

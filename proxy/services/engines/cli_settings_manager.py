@@ -4,7 +4,7 @@ The native Claude TUI (interactive sessions) needs its per-session
 ``CLAUDE_CONFIG_DIR/.claude.json`` pre-seeded past first-run onboarding —
 headless ``-p`` sessions never hit the wizard, so nothing else needs this.
 Headless session settings (hooks, deny list, sandbox-off) are written
-per-session by ``core/sandbox/session_config_dir._build_sandbox_cli_settings``.
+per-session by ``core/layers/cli/config_dir.build_settings``.
 """
 
 from __future__ import annotations

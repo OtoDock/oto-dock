@@ -195,8 +195,9 @@ class KeyMismatch(Exception):
     ``code`` is one of:
       - ``"format"``    — token doesn't start with otok_ / wrong length
       - ``"master"``    — token is the master PROXY_API_KEY (rejected here)
-      - ``"unknown"``   — no matching key by prefix
-      - ``"hash"``      — prefix matched but bcrypt mismatch (or revoked)
+      - ``"unknown"``:  no live key under the prefix matches (none stored,
+                          revoked, or a bcrypt mismatch: one code, so a guesser
+                          learns nothing from which of the three it was)
       - ``"scope"``     — key found but scope/owner doesn't match the URL
       - ``"permission"``— key valid but lacks the required permission scope
     """
@@ -288,8 +289,11 @@ def verify_bearer_for_user(
         raise KeyMismatch("format", "Key too short")
     prefix = body[:KEY_INDEX_PREFIX_LEN]
 
-    target_sub = notification_store.resolve_username_to_sub(username)
-    if not target_sub:
+    # A segment may name one user by username and another by display name
+    # (addresses written before 2026-09-19 carry the display name): the key
+    # decides which of them the address means.
+    target_subs = notification_store.resolve_username_candidates(username)
+    if not target_subs:
         # User not found → reject with scope mismatch (don't leak user existence).
         raise KeyMismatch("scope", "Key does not authorize this user")
 
@@ -302,7 +306,7 @@ def verify_bearer_for_user(
     if matched is None:
         raise KeyMismatch("unknown", "Invalid key")
 
-    if matched.get("user_sub") != target_sub:
+    if matched.get("user_sub") not in target_subs:
         raise KeyMismatch("scope", "Key does not authorize this user")
 
     if not api_key_store.has_permission(matched, required_permission):

@@ -14,14 +14,20 @@ export async function openExternalUrl(url: string): Promise<'opened' | 'blocked'
     await Browser.open({ url })
     return 'opened'
   }
-  // A null return means the popup blocker ate it — callers that bridge for
-  // sandboxed frames ack this back so the page can tell the user.
+  // With `noopener` the browser answers null by design (the new window sits
+  // in its own browsing-context group), so a null return alone does not mean
+  // the popup blocker ate it: it did only when no user activation vouched for
+  // the open. Read the activation BEFORE the open — opening a window consumes
+  // it. Callers that bridge for sandboxed frames ack that back so the page
+  // can tell the user (2026-09-18; before, every noopener open acked
+  // "blocked" while the tab opened).
+  const vouched = hasUserActivation()
   const w = window.open(url, '_blank', 'noopener,noreferrer')
-  return w ? 'opened' : 'blocked'
+  return w === null && !vouched ? 'blocked' : 'opened'
 }
 
 /**
- * Validate a URL bridged out of a sandboxed artifact/mini-app frame before
+ * Validate a URL bridged out of a sandboxed artifact/app frame before
  * opening it. Absolute http(s) only, and NEVER same-origin: a same-origin
  * `/v1/...` link would open a cookie-carrying top-level GET to any proxy
  * route from agent-authored HTML. Returns the destination origin (the
@@ -51,6 +57,16 @@ export function validateBridgedUrl(
 export function hasUserActivation(): boolean {
   const ua = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation
   return ua ? ua.isActive : true
+}
+
+/**
+ * The fail-closed twin for navigation bridged out of an app: moving the
+ * viewer to another platform page has no popup blocker behind it, so a
+ * browser that cannot vouch for the gesture refuses.
+ */
+export function hasStrictUserActivation(): boolean {
+  const ua = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation
+  return !!ua && ua.isActive
 }
 
 /**

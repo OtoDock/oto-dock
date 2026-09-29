@@ -2,7 +2,10 @@
 
 Manager-managed keys for agent-scoped trigger webhook auth. The raw key is
 returned ONCE on creation; subsequent reads only see the prefix +
-metadata.
+metadata. A key outlives the session that could ask for it and fires the
+agent's webhooks from anywhere, so every route is a person's decision at
+the dashboard: bearer principals (session tokens, the master key) are
+refused.
 
 Endpoints:
   POST   /v1/agents/{agent}/api-keys                 — create (manager+)
@@ -12,15 +15,16 @@ Endpoints:
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from storage.identity import api_key_store
+from storage.pg import run_db
 from services.infra import api_key_manager
 from auth.providers import (
     UserContext,
     get_current_user,
-    require_auth,
+    require_human,
 )
 
 logger = logging.getLogger("claude-proxy.agent-api-keys")
@@ -33,7 +37,7 @@ class CreateAgentKeyRequest(BaseModel):
 
 
 def _check_manager(user: UserContext, agent: str) -> None:
-    if user.is_admin or user.is_service:
+    if user.is_admin:
         return
     if not user.can_manage_agent(agent):
         raise HTTPException(
@@ -46,24 +50,17 @@ def _check_manager(user: UserContext, agent: str) -> None:
 async def create_agent_key(
     agent: str,
     req: CreateAgentKeyRequest,
-    request: Request,
     user: UserContext | None = Depends(get_current_user),
 ):
-    u = require_auth(user)
+    u = require_human(user)
     _check_manager(u, agent)
-    # created_by is token-authoritative: a real user is attributed to self; a
-    # no-user session has no identity (attributed to the agent); only the master
-    # key (s2s) may attribute to a specific user via X-On-Behalf-Of.
-    if u.sub == "api-key":
-        creator_sub = request.headers.get("x-on-behalf-of") or u.sub
-    else:
-        creator_sub = u.acting_sub or u.agent or u.sub
     try:
-        row, raw = api_key_manager.create_agent_key(
+        row, raw = await run_db(
+            api_key_manager.create_agent_key,
             agent=agent,
             name=req.name,
             permissions=req.permissions,
-            created_by=creator_sub,
+            created_by=u.sub,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -84,10 +81,10 @@ async def list_agent_keys(
     include_revoked: bool = Query(False),
     user: UserContext | None = Depends(get_current_user),
 ):
-    u = require_auth(user)
+    u = require_human(user)
     _check_manager(u, agent)
-    rows = api_key_store.list_agent_api_keys(
-        agent=agent, include_revoked=include_revoked,
+    rows = await run_db(
+        api_key_store.list_agent_api_keys, agent=agent, include_revoked=include_revoked,
     )
     return {
         "keys": [
@@ -113,9 +110,9 @@ async def revoke_agent_key(
     key_id: str,
     user: UserContext | None = Depends(get_current_user),
 ):
-    u = require_auth(user)
+    u = require_human(user)
     _check_manager(u, agent)
-    row = api_key_store.get_agent_api_key(key_id)
+    row = await run_db(api_key_store.get_agent_api_key, key_id)
     if not row:
         raise HTTPException(404, "Key not found")
     if row.get("agent") != agent:
@@ -123,6 +120,6 @@ async def revoke_agent_key(
         raise HTTPException(404, "Key not found")
     if row.get("revoked_at"):
         return {"status": "already_revoked", "id": key_id}
-    api_key_manager.revoke_agent_key(key_id)
+    await run_db(api_key_manager.revoke_agent_key, key_id)
     logger.info(f"Revoked agent_api_key {key_id[:8]} for agent {agent}")
     return {"status": "revoked", "id": key_id}

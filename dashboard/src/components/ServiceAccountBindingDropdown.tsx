@@ -11,6 +11,10 @@
  *   • Personal: <email>               — caller's own connected accounts
  *   • Personal (<owner>): <email>     — READ-ONLY when a co-manager bound theirs
  *   • + Connect new…                  — deep-link User Settings
+ *
+ * With a binding in place (and the agent's mode offering agent scope) the
+ * agent's vendor event subscriptions follow beneath: the bound account is
+ * the one they register with.
  */
 
 import { useNavigate } from 'react-router-dom'
@@ -19,6 +23,7 @@ import {
   useClearAgentServiceBinding,
   useSetAgentServiceBinding,
 } from '../api/serviceAccounts'
+import { AgentServiceSubscriptions } from './accounts/AgentServiceSubscriptions'
 
 interface Props {
   agentName: string
@@ -26,6 +31,9 @@ interface Props {
   /** Caller's own user_sub. Drives "is this binding mine?" detection so we
    * can render the co-manager read-only annotation correctly. */
   callerSub: string
+  /** Whether the agent's visibility mode offers agent scope: a service-scope
+   * subscription needs it, so the subscriptions section hides otherwise. */
+  agentScopeAvailable?: boolean
 }
 
 /** Sentinel values for the <select>. ``encodeOption`` packs (label, owner_sub)
@@ -50,6 +58,7 @@ export function ServiceAccountBindingDropdown({
   agentName,
   mcpName,
   callerSub,
+  agentScopeAvailable = false,
 }: Props) {
   const navigate = useNavigate()
   const opts = useAgentServiceAccountOptions(agentName, mcpName)
@@ -97,13 +106,13 @@ export function ServiceAccountBindingDropdown({
   const isPending = setBinding.isPending || clearBinding.isPending
 
   return (
+    // Don't let clicks on the dropdown toggle the MCP enable checkbox in
+    // the wrapping <label>.
+    <div onClick={(e) => e.stopPropagation()}>
     <div
       // Stack on mobile (label above a full-width select) so the select never
       // overflows the card / makes the page horizontally scrollable.
       className="flex flex-col gap-1 mt-2 sm:flex-row sm:items-center sm:gap-2"
-      // Don't let clicks on the dropdown toggle the MCP enable checkbox in
-      // the wrapping <label>.
-      onClick={(e) => e.stopPropagation()}
     >
       <span className="text-[10px] uppercase tracking-wide text-p-text-light shrink-0">
         Service account
@@ -140,6 +149,14 @@ export function ServiceAccountBindingDropdown({
 
         <option value={SENTINEL_CONNECT_NEW}>+ Connect new…</option>
       </select>
+    </div>
+    {current_binding && agentScopeAvailable && (
+      <AgentServiceSubscriptions
+        agentName={agentName}
+        mcpName={mcpName}
+        accountLabel={current_binding.label}
+      />
+    )}
     </div>
   )
 }

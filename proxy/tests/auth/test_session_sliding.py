@@ -87,3 +87,58 @@ def test_logout_not_resurrected():
     val = _cookie_value(cookies[0])
     assert val in ("", '""')                 # a deletion, not a JWT
     assert validate_session_jwt(val) is None
+
+
+# ── the refresh reads ──────────────────────────────────
+# The re-mint reads nothing when the route already resolved this exact
+# cookie, reads off the loop otherwise, and never costs the route its
+# answer: any error there skips the re-mint.
+
+import pytest  # noqa: E402
+
+import middleware  # noqa: E402
+from storage import pg  # noqa: E402
+
+
+@pytest.fixture
+def fast_lane_calls(monkeypatch):
+    calls = []
+    real = pg.run_db_fast
+
+    async def spy(fn, *a, **kw):
+        calls.append(getattr(fn, "__name__", str(fn)))
+        return await real(fn, *a, **kw)
+
+    monkeypatch.setattr(pg, "run_db_fast", spy)
+    monkeypatch.setattr(middleware, "_expiry_cache", (0, 0.0))
+    return calls
+
+
+def test_a_cookie_the_route_resolved_is_reminted_without_a_user_read(fast_lane_calls):
+    r = client.get("/v1/users/me/passkeys", headers={"Cookie": f"session={_stale_token()}"})
+    assert r.status_code == 200
+    assert _session_set_cookies(r)
+    assert "get_user" not in fast_lane_calls
+
+
+def test_a_cookie_no_route_resolved_is_read_first(fast_lane_calls):
+    r = client.get("/auth/config", headers={"Cookie": f"session={_stale_token()}"})
+    assert r.status_code == 200 and _session_set_cookies(r)
+    assert "get_user" in fast_lane_calls
+
+
+def test_a_database_error_in_the_refresh_keeps_the_routes_answer(monkeypatch):
+    async def down(fn, *a, **kw):
+        raise pg.DatabaseUnavailable("breaker open")
+
+    monkeypatch.setattr(pg, "run_db_fast", down)
+    monkeypatch.setattr(middleware, "_expiry_cache", (0, 0.0))
+    r = client.get("/auth/config", headers={"Cookie": f"session={_stale_token()}"})
+    assert r.status_code == 200
+    assert _session_set_cookies(r) == []
+
+
+def test_a_deleted_users_cookie_is_not_reminted():
+    r = client.get("/auth/config", headers={"Cookie": f"session={_stale_token('local:gone')}"})
+    assert r.status_code == 200
+    assert _session_set_cookies(r) == []

@@ -56,6 +56,28 @@ def _write_template(root: Path, slug: str = "demo-template", **kw) -> Path:
         (d / "notifications.json").write_text(
             json.dumps({"notifications": kw["notifications"]}),
         )
+    # ``apps`` / ``user_apps`` map an app slug to its app.json (``_files``
+    # adds files); ``checks`` map a check name to its document (``_script``
+    # is the script the document names).
+    for folder, items in (("apps", kw.get("apps")), ("user-apps", kw.get("user_apps"))):
+        for app_slug, manifest in (items or {}).items():
+            manifest = dict(manifest)
+            extra = manifest.pop("_files", {})
+            root = d / folder / app_slug
+            (root / "client").mkdir(parents=True, exist_ok=True)
+            (root / "app.json").write_text(json.dumps(manifest))
+            (root / "client" / "index.html").write_text("<p>app</p>")
+            for rel, content in extra.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(content)
+    for name, doc in (kw.get("checks") or {}).items():
+        doc = dict(doc)
+        script = doc.pop("_script", None)
+        root = d / "checks" / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "check.json").write_text(json.dumps(doc))
+        if script is not None:
+            (root / doc["script"]["run"]).write_text(script)
     return d
 
 
@@ -203,6 +225,56 @@ class TestSnapshotGuards:
         )
         assert resp.status_code == 400
 
+    def test_a_file_swapped_for_a_symlink_mid_walk_is_refused(self, tmp_path, monkeypatch):
+        # The folder is the session's own and can change under the walk: a
+        # name checked as a regular file and then swapped for a symlink is
+        # judged by what was opened, never copied as the link's target.
+        import os
+        import pytest
+        from fastapi import HTTPException
+        from api.mcp import local_templates as lt
+        src = tmp_path / "tpl"
+        (src / "context").mkdir(parents=True)
+        (src / "context" / "notes.md").write_text("ok")
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        real_fwalk = os.fwalk
+
+        def racing(top, **kw):
+            for root, dirs, files, fd in real_fwalk(top, **kw):
+                if root.endswith("context"):
+                    os.remove(os.path.join(root, "notes.md"))
+                    os.symlink(secret, os.path.join(root, "notes.md"))
+                yield root, dirs, files, fd
+        monkeypatch.setattr(lt.os, "fwalk", racing)
+        with pytest.raises(HTTPException) as e:
+            lt._snapshot_template_dir(src)
+        assert "symlink" in str(e.value.detail).lower()
+
+    def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(self, tmp_path, monkeypatch):
+        import os
+        from api.mcp import local_templates as lt
+        src = tmp_path / "tpl"
+        (src / "context").mkdir(parents=True)
+        (src / "context" / "notes.md").write_text("ok")
+        (tmp_path / "elsewhere").mkdir()
+        (tmp_path / "elsewhere" / "notes.md").write_text("SECRET")
+        real_fwalk = os.fwalk
+
+        def racing(top, **kw):
+            for root, dirs, files, fd in real_fwalk(top, **kw):
+                yield root, dirs, files, fd
+                if root == str(src):
+                    os.rename(src / "context", tmp_path / "moved")
+                    os.symlink(tmp_path / "elsewhere", src / "context")
+        monkeypatch.setattr(lt.os, "fwalk", racing)
+        dest = lt._snapshot_template_dir(src)
+        try:
+            assert "SECRET" not in "".join(p.read_text() for p in dest.rglob("*") if p.is_file())
+        finally:
+            import shutil
+            shutil.rmtree(dest, ignore_errors=True)
+
     def test_oversized_file_is_rejected(self, tmp_path, monkeypatch, temp_db):
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         d = _write_template(_agent_root(agents_dir))
@@ -226,6 +298,33 @@ class TestSnapshotGuards:
             json={"path": "/users/alice/workspace/demo-template"},
         )
         assert resp.status_code == 400
+
+    def test_what_a_release_drops_is_skipped_not_counted(self, tmp_path, monkeypatch, temp_db):
+        """An author's ``bun install`` beside the app, its ``data/`` and
+        dotfiles never reach the snapshot: they would fill the file cap and
+        the loader would refuse the app folder for carrying them."""
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(
+            _agent_root(agents_dir),
+            agent_json_extra={"collaborative": False, "default_scope": "user"},
+            user_apps={"home": {"title": "Home"}},
+        )
+        deps = d / "user-apps" / "home" / "node_modules" / "left-pad"
+        deps.mkdir(parents=True)
+        for i in range(320):
+            (deps / f"f{i}.js").write_text("x")
+        (d / "user-apps" / "home" / "data").mkdir()
+        (d / "user-apps" / "home" / "data" / "app.db").write_text("x")
+        (d / "user-apps" / "home" / ".env").write_text("SECRET=1")
+        (d / ".DS_Store").write_text("x")
+        body = TestClient(app).post(
+            "/v1/agents/local-template/validate",
+            json={"path": "/users/alice/workspace/demo-template"},
+        ).json()
+        assert body["ok"] is True, body
+        assert body["seeds"]["apps"] == [
+            {"slug": "home", "title": "Home", "visibility": "user", "owner_approval": False},
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +378,57 @@ class TestValidate:
             json={"path": "/users/alice/workspace/demo-template"},
         )
         assert resp.json()["ok"] is False
+
+    def test_apps_go_through_the_deploy_checks(self, tmp_path, monkeypatch, temp_db):
+        """Each app folder is validated the way ``deploy_app`` would refuse
+        it, before the agent exists: a manifest key the deploy rejects and a
+        page calling an action the manifest does not declare are errors with
+        the folder named; an ``mcp_tool`` action on an MCP the template
+        requires is not (the agent has it only after the install)."""
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(
+            _agent_root(agents_dir),
+            mcps=[{"name": "github-mcp"}],
+            apps={
+                "board": {"title": "Board", "deploy_requires_approval": "yes"},
+                "issues": {
+                    "title": "Issues",
+                    "actions": [{"id": "sync", "label": "Sync", "type": "mcp_tool",
+                                 "mcp": "github-mcp", "tool": "list_issues"}],
+                    "_files": {"client/index.html": "<button onclick=\"otodock.action('nope')\">x</button>"},
+                },
+            },
+        )
+        from unittest.mock import patch
+        with patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+                patch("services.community.community_catalog.fetch_registry",
+                      return_value={"mcps": [{"name": "github-mcp"}]}):
+            body = TestClient(app).post(
+                "/v1/agents/local-template/validate",
+                json={"path": "/users/alice/workspace/demo-template"},
+            ).json()
+        assert body["ok"] is False
+        assert any(e.startswith("apps/board: app.json: deploy_requires_approval") for e in body["errors"]), body
+        assert any(e.startswith("apps/issues: client/index.html:") and "nope" in e for e in body["errors"]), body
+        assert not any("not available to this agent" in e for e in body["errors"]), body
+
+    def test_checks_and_apps_are_reported_as_seeds(self, tmp_path, monkeypatch, temp_db):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(
+            _agent_root(agents_dir),
+            user_apps={"home": {"title": "Home", "actions": [
+                {"id": "save", "label": "Save", "type": "platform", "method": "files.write",
+                 "fixed_args": {"path": "notes.md"}}]}},
+            checks={"coding": {"name": "coding", "mandatory": True, "applies": ["chats"],
+                               "script": {"run": "lint.sh"}, "_script": "#!/bin/sh\nexit 0\n"}},
+        )
+        body = TestClient(app).post(
+            "/v1/agents/local-template/validate",
+            json={"path": "/users/alice/workspace/demo-template"},
+        ).json()
+        assert body["ok"] is True, body
+        assert body["seeds"]["apps"][0]["owner_approval"] is True
+        assert body["seeds"]["checks"] == [{"name": "coding", "mandatory": True}]
 
     def test_taken_slug_suggests_an_alternative(self, tmp_path, monkeypatch, temp_db):
         from storage.agents import agent_store
@@ -469,6 +619,38 @@ class TestInstall:
         from storage.agents import agent_store
         # Provenance still records the TEMPLATE's slug, not the install name.
         assert agent_store.get_agent("renamed-agent")["community_template"] == "local:demo-template"
+
+    def test_apps_land_pending_and_checks_offered_without_consent(self, tmp_path, monkeypatch, temp_db):
+        """An agent creating an agent consents to nothing: the shipped app
+        waits for approval on its card and the check is installed offered,
+        its ``mandatory`` request not granted."""
+        from storage import database as task_store
+        # upsert_user gives the seeded admin the username the per-user copy
+        # is filed under.
+        task_store.upsert_user(ADMIN_SUB, "admin@test.com", "admin", "admin")
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(
+            _agent_root(agents_dir),
+            user_apps={"home": {"title": "Home", "actions": [
+                {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]}},
+            checks={"coding": {"name": "coding", "mandatory": True, "applies": ["chats"],
+                               "judge": {"rubric": "Did it do the job?"}}},
+        )
+        resp = TestClient(app).post(
+            "/v1/agents/install-from-local-template",
+            json={"path": "/users/alice/workspace/demo-template"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [p["slug"] for p in body["seeded_apps"]["pending"]] == ["home"]
+        assert body["seeded_apps"]["user"] == []
+        assert body["seeded_checks"] == {"consented": [], "offered": ["coding"], "failed": []}
+        username = task_store.get_username_by_sub(ADMIN_SUB)
+        row = task_store.get_app_by_slug("demo-template", username, "home")
+        assert row is not None and not task_store.app_actions_approved(row)
+        from services.checks import documents
+        check = documents.load_check("demo-template", "", "coding")
+        assert check is not None and check.doc["mandatory"] is False
 
     def test_shared_workspace_path_is_accepted(self, tmp_path, monkeypatch, temp_db):
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")

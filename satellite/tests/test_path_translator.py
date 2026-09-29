@@ -3,6 +3,10 @@
 The proxy emits sandbox-style virtual paths in MCP env vars (the same paths
 local-bwrap-sandboxed agents see). The satellite has no bwrap, so it
 rewrites them to its own ``{agent_dir}/...`` paths before subprocess spawn.
+The rule itself is the vendored agent-tree leaf (``_vendored/layout.py``,
+``host_of_virtual`` / ``user_of``) and is tested from the proxy suite
+(``proxy/tests/core/test_layout.py``); this file covers the three shapes the
+satellite applies it to.
 """
 
 from pathlib import Path
@@ -16,186 +20,6 @@ from satellite.host import path_translator
 def agent_dir(tmp_path):
     """A throwaway satellite agent dir."""
     return tmp_path / "agents" / "my-agent"
-
-
-# ---------------------------------------------------------------------------
-# translate_path: workspace
-# ---------------------------------------------------------------------------
-
-
-def test_workspace_user_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/users/alice/workspace", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/users/alice/workspace"
-
-
-def test_workspace_user_subpath(agent_dir):
-    result = path_translator.translate_path(
-        "/users/alice/workspace/foo.png", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/users/alice/workspace/foo.png"
-
-
-def test_workspace_agent_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/workspace", agent_dir, username="",
-    )
-    assert result == f"{agent_dir}/workspace"
-
-
-def test_workspace_agent_subpath(agent_dir):
-    result = path_translator.translate_path(
-        "/workspace/.screenshots/sid-xyz/foo.png", agent_dir, username="",
-    )
-    assert result == f"{agent_dir}/workspace/.screenshots/sid-xyz/foo.png"
-
-
-# ---------------------------------------------------------------------------
-# translate_path: config dir
-# ---------------------------------------------------------------------------
-
-
-def test_config_user_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/config", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/config"
-
-
-def test_config_subpath(agent_dir):
-    result = path_translator.translate_path(
-        "/config/prompt.md", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/config/prompt.md"
-
-
-# ---------------------------------------------------------------------------
-# translate_path: knowledge dir
-# ---------------------------------------------------------------------------
-
-
-def test_knowledge_user_scoped(agent_dir):
-    """/knowledge translates to {agent_dir}/knowledge for user-scope."""
-    result = path_translator.translate_path(
-        "/knowledge", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/knowledge"
-
-
-def test_knowledge_agent_scoped(agent_dir):
-    """/knowledge translates the same way for agent-scope sessions
-    (knowledge is universal — both user-scope and agent-scope read from
-    the same {agent_dir}/knowledge dir on the satellite)."""
-    result = path_translator.translate_path(
-        "/knowledge", agent_dir, username="",
-    )
-    assert result == f"{agent_dir}/knowledge"
-
-
-def test_knowledge_subpath(agent_dir):
-    result = path_translator.translate_path(
-        "/knowledge/refs/template.md", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/knowledge/refs/template.md"
-
-
-def test_knowledge_credentials_subpath(agent_dir):
-    """/knowledge/.credentials/google-tokens — used for agent-scope
-    OAuth token reads on the satellite."""
-    result = path_translator.translate_path(
-        "/knowledge/.credentials/google-tokens",
-        agent_dir,
-        username="",
-    )
-    assert result == f"{agent_dir}/knowledge/.credentials/google-tokens"
-
-
-# ---------------------------------------------------------------------------
-# translate_path: .claude / .codex
-# ---------------------------------------------------------------------------
-
-
-def test_claude_dir_user_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/.claude/settings.json", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/users/alice/.claude/settings.json"
-
-
-def test_claude_dir_agent_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/.claude/settings.json", agent_dir, username="",
-    )
-    assert result == f"{agent_dir}/workspace/.claude/settings.json"
-
-
-def test_codex_dir_user_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/.codex/config.toml", agent_dir, username="alice",
-    )
-    assert result == f"{agent_dir}/users/alice/.codex/config.toml"
-
-
-def test_codex_dir_agent_scoped(agent_dir):
-    result = path_translator.translate_path(
-        "/.codex/config.toml", agent_dir, username="",
-    )
-    assert result == f"{agent_dir}/workspace/.codex/config.toml"
-
-
-# ---------------------------------------------------------------------------
-# translate_path: passthrough cases
-# ---------------------------------------------------------------------------
-
-
-def test_url_passes_through(agent_dir):
-    """URLs aren't paths — leave alone."""
-    val = "https://example.com/foo"
-    assert path_translator.translate_path(val, agent_dir, username="alice") == val
-
-
-def test_proxy_url_passes_through(agent_dir):
-    """PROXY_URL value should not be rewritten."""
-    val = "http://100.64.5.10:8400"
-    assert path_translator.translate_path(val, agent_dir, username="alice") == val
-
-
-def test_arbitrary_string_passes_through(agent_dir):
-    val = "some-api-key-XXXX"
-    assert path_translator.translate_path(val, agent_dir, username="alice") == val
-
-
-def test_empty_string_passes_through(agent_dir):
-    assert path_translator.translate_path("", agent_dir, username="alice") == ""
-
-
-def test_unrelated_absolute_path_passes_through(agent_dir):
-    """Random absolute paths the MCP might use directly aren't translated."""
-    val = "/tmp/scratch.txt"
-    assert path_translator.translate_path(val, agent_dir, username="alice") == val
-
-
-# ---------------------------------------------------------------------------
-# translate_path: tricky/edge cases
-# ---------------------------------------------------------------------------
-
-
-def test_users_alone_translates(agent_dir):
-    """Bare /users (no trailing slash) should still translate."""
-    result = path_translator.translate_path("/users", agent_dir, username="alice")
-    assert result == f"{agent_dir}/users"
-
-
-def test_workspace_alone_translates(agent_dir):
-    result = path_translator.translate_path("/workspace", agent_dir, username="")
-    assert result == f"{agent_dir}/workspace"
-
-
-def test_path_lookalike_no_leading_slash(agent_dir):
-    """No leading slash means no sandbox prefix — not rewritten."""
-    val = "users/alice/workspace"
-    assert path_translator.translate_path(val, agent_dir, username="alice") == val
 
 
 # ---------------------------------------------------------------------------
@@ -260,37 +84,6 @@ def test_translate_env_agent_scoped(agent_dir):
     )
     assert result["IMAGE_SAVE_DIR"] == f"{agent_dir}/workspace"
     assert result["SCREENSHOTS"] == f"{agent_dir}/workspace/.screenshots/sid-1"
-
-
-# ---------------------------------------------------------------------------
-# derive_username_from_cwd_relative
-# ---------------------------------------------------------------------------
-
-
-def test_derive_username_user_scoped():
-    assert path_translator.derive_username_from_cwd_relative("users/alice") == "alice"
-
-
-def test_derive_username_user_scoped_with_subpath():
-    assert path_translator.derive_username_from_cwd_relative("users/alice/sub") == "alice"
-
-
-def test_derive_username_agent_scoped():
-    assert path_translator.derive_username_from_cwd_relative("workspace") == ""
-
-
-def test_derive_username_empty():
-    assert path_translator.derive_username_from_cwd_relative("") == ""
-
-
-def test_derive_username_with_leading_slash():
-    """Defensive: strip leading slash."""
-    assert path_translator.derive_username_from_cwd_relative("/users/alice") == "alice"
-
-
-def test_derive_username_random():
-    """Anything not starting with 'users/' is agent-scoped."""
-    assert path_translator.derive_username_from_cwd_relative("foo/bar") == ""
 
 
 # ---------------------------------------------------------------------------

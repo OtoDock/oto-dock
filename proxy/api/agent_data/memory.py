@@ -59,6 +59,9 @@ from storage.agents import memory_store
 from services.infra.path_confinement import safe_agent_dir
 from services.memory import memory_file
 from services.memory.memory_file import MemoryOpError, OpResult
+from auth import roles
+from auth.providers import acting_role_of
+from core import layout
 
 
 logger = logging.getLogger("claude-proxy.memory-api")
@@ -76,16 +79,12 @@ _WRITE_COMMANDS = {"create", "str_replace", "insert", "delete", "rename"}
 def _resolve_effective_role(user_sub: str, agent: str) -> str:
     """Real role at this (user, agent) pair, ignoring ``is_api_key`` inflation.
 
-    Returns ``"admin"`` / ``"manager"`` / ``"editor"`` / ``"viewer"``, or
-    ``"agent"`` for agent-scope service sessions with no user owner.
+    Returns an effective role (``roles.EFFECTIVE_ROLES``), or
+    ``roles.SERVICE`` for agent-scope service sessions with no user owner.
     """
     if not user_sub:
-        return "agent"
-    u = task_store.get_user(user_sub)
-    if u and u.get("role") == "admin":
-        return "admin"
-    roles = task_store.get_user_agent_roles(user_sub)
-    return roles.get(agent, "viewer")
+        return roles.SERVICE
+    return acting_role_of(user_sub, agent)
 
 
 def _require_mcp_caller(user: UserContext, agent: str) -> None:
@@ -382,10 +381,11 @@ async def memory_op(
         # Role gate: writes to agent scope need editor+ (or an agent-scope
         # service session); user scope is always the caller's own.
         if command in _WRITE_COMMANDS and scope == "agent":
-            if role not in ("editor", "manager", "admin", "agent"):
+            if not (roles.can_edit(role) or role == roles.SERVICE):
                 return _err(
-                    "agent memory is read-only for viewers — save user-scope "
-                    "memories under /memories/user/ instead."
+                    "agent memory is read-only for your role (editors and "
+                    "managers write it) — save user-scope memories under "
+                    "/memories/user/ instead."
                 )
 
         root = scopes[scope]
@@ -605,7 +605,7 @@ async def clear_all_endpoint(
         if scope == "agent":
             touched += await _clear_and_tombstone(slug, "agent", None)
         else:
-            users_dir = agent_dir / "users"
+            users_dir = agent_dir / layout.USERS
             if users_dir.exists():
                 for user_dir in users_dir.iterdir():
                     if user_dir.is_dir():

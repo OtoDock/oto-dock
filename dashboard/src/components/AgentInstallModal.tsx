@@ -18,6 +18,7 @@ import { useNavigate } from 'react-router-dom'
 
 import { useCreateAgent } from '../api/agents'
 import { useAuth } from '../contexts/AuthContext'
+import { isAdmin } from '../lib/permissions'
 import {
   type VisibilityMode,
   columnsOf,
@@ -27,9 +28,11 @@ import {
 } from '../lib/visibility'
 import {
   CommunityAgentRegistryEntry,
+  type PreviewApp,
   useInstallCommunityAgent,
   useInstallPreview,
 } from '../api/communityAgents'
+import { DetailsToggle, ManifestBlocks, ManifestSummary } from './apps/AppApprovalCard'
 
 interface Props {
   open: boolean
@@ -62,6 +65,13 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   // Easily changed afterward in the agent's Configuration tab.
   const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('personal_shared')
   const [error, setError] = useState('')
+  // The consent (COMMUNITY-AGENTS-REGISTRY.md "Consent"): approve the
+  // template's apps and checks at install — for every member's copy when
+  // an admin installs, for the shared apps and one's own copy otherwise.
+  // A copy whose manifest does things only its owner may approve always
+  // waits on that owner's card; the dialog says so per app.
+  const [approveAll, setApproveAll] = useState(true)
+  const [openDetails, setOpenDetails] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     if (!open) return
@@ -75,6 +85,8 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
     setSlugEdited(false)
     setAdminOnly(false)
     setVisibilityMode('personal_shared')
+    setApproveAll(true)
+    setOpenDetails({})
     setError('')
   }, [open, mode, template])
 
@@ -83,6 +95,10 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
     mode === 'install' ? template?.slug ?? null : null,
     mode === 'install' ? slug || null : null,
   )
+  const previewApps: PreviewApp[] = mode === 'install' ? (preview.data?.apps ?? []) : []
+  const previewChecks = mode === 'install' ? (preview.data?.checks ?? []) : []
+  const consentScope = preview.data?.consent_scope ?? 'everyone'
+  const hasConsentItems = previewApps.length > 0 || previewChecks.length > 0
 
   const installing = createAgent.isPending || installAgent.isPending
 
@@ -130,9 +146,17 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
     let attemptSlug = cleanSlug
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
+        const consent = approveAll && hasConsentItems
+          ? {
+              approve_apps: Object.fromEntries(previewApps.map(a => [a.slug, a.sig])),
+              approve_checks: Object.fromEntries(previewChecks.map(c => [c.name, c.sig])),
+            }
+          : {}
         const result = await installAgent.mutateAsync({
           template_slug: template!.slug,
           target_slug: attemptSlug,
+          display_name: cleanName,
+          ...consent,
         })
         onClose()
         navigate(`/agents/${result.agent_slug}/config`)
@@ -232,7 +256,7 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
               </select>
               <p className="text-xs text-p-text-light mt-1">{MODE_OPTION_HINT[visibilityMode]}</p>
             </div>
-            {user?.role === 'admin' && (
+            {isAdmin(user) && (
               <label className="flex items-center gap-2 cursor-pointer">
                 <input
                   type="checkbox"
@@ -288,13 +312,98 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                 {blockedMcps.length > 0 && (
                   <div className="mt-2 text-xs text-red-600 dark:text-red-400">
                     {blockedMcps.length === 1
-                      ? `${blockedMcps[0].name} is not installed and not in any catalog`
-                      : `${blockedMcps.length} required MCPs are not installed and not in any catalog`}
+                      ? `${blockedMcps[0].name}: ${blockedMcps[0].reason || 'not installed and not in any catalog'}`
+                      : `${blockedMcps.length} required MCPs are blocked (not installed and in no catalog, or explicit-mode without an instance)`}
                     {' '}— this template can't be installed on this platform.
                   </div>
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {/* The apps and checks the template ships, and the consent */}
+        {mode === 'install' && hasConsentItems && (
+          <div className="mb-4 rounded-lg border border-p-border-light bg-p-bg p-3 text-xs" data-testid="install-consent">
+            {previewApps.length > 0 && (
+              <div className="font-medium text-p-text mb-2">
+                {previewApps.length === 1 ? 'An app it brings' : `${previewApps.length} apps it brings`}
+              </div>
+            )}
+            {previewApps.map(a => (
+              <div key={a.slug} className="mb-3" data-testid={`consent-app-${a.slug}`}>
+                <div className="flex flex-wrap items-baseline gap-x-1.5">
+                  <span className="font-medium text-p-text">{a.title}</span>
+                  <span className="text-p-text-secondary">
+                    {a.visibility === 'user' ? 'one copy for each member' : 'shared by the agent'}
+                    {a.owner_approval ? ' · each member approves their own copy' : ''}
+                  </span>
+                </div>
+                <ManifestSummary app={a.row} />
+                {a.blueprint_tasks.length > 0 && (
+                  <details className="mt-1 text-p-text-secondary">
+                    <summary className="cursor-pointer">The tasks its buttons run</summary>
+                    <ul className="mt-1 space-y-1 pl-3">
+                      {a.blueprint_tasks.map(t => (
+                        <li key={t.slug}>
+                          <span className="font-medium text-p-text">{t.description || t.slug}</span>
+                          <span className="block break-words">“{t.prompt.slice(0, 300)}{t.prompt.length > 300 ? '…' : ''}”</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+                {(a.blueprint_triggers?.length ?? 0) > 0 && (
+                  <p className="mt-1 text-p-text-secondary" data-testid={`consent-app-triggers-${a.slug}`}>
+                    Comes with {a.blueprint_triggers!.length === 1 ? 'a trigger' : `${a.blueprint_triggers!.length} triggers`}
+                    {a.visibility === 'user' ? ' of each member’s own' : ''}: {a.blueprint_triggers!.map(t => t.description || t.slug).join(', ')}
+                  </p>
+                )}
+                <div className="mt-1">
+                  <DetailsToggle
+                    open={!!openDetails[a.slug]}
+                    onToggle={() => setOpenDetails(d => ({ ...d, [a.slug]: !d[a.slug] }))}
+                  />
+                </div>
+                {openDetails[a.slug] && <ManifestBlocks app={a.row} />}
+              </div>
+            ))}
+            {previewChecks.length > 0 && (
+              <div className="mb-2">
+                <div className="font-medium text-p-text mb-1">
+                  {previewChecks.length === 1 ? 'A check it brings' : `${previewChecks.length} checks it brings`}
+                </div>
+                <ul className="space-y-1 text-p-text-secondary">
+                  {previewChecks.map(c => (
+                    <li key={c.name} data-testid={`consent-check-${c.name}`}>
+                      <span className="font-mono text-[11px] text-p-text">{c.name}</span>
+                      {c.mandatory ? <span> (mandatory)</span> : null}
+                      {c.description ? <span>: {c.description}</span> : null}
+                      {c.words ? <span> — {c.words}</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <label className="mt-2 flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={approveAll}
+                onChange={e => setApproveAll(e.target.checked)}
+                className="mt-0.5 rounded-sm border-p-border-light text-brand focus:ring-brand/40"
+                data-testid="consent-checkbox"
+              />
+              <span className="text-p-text">
+                {consentScope === 'everyone'
+                  ? 'Approve its apps and checks for everyone who gets a copy'
+                  : 'Approve its apps and checks (the shared ones and your own copy; members approve theirs)'}
+              </span>
+            </label>
+            <p className="mt-1 text-p-text-light">
+              {approveAll
+                ? 'Unticked, each app waits for approval on its card and each check is offered, not mandatory.'
+                : 'Each app will wait for approval on its card; each check will be offered, not mandatory.'}
+            </p>
           </div>
         )}
 
@@ -316,7 +425,9 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
           >
             {installing
               ? mode === 'install' ? 'Installing…' : 'Creating…'
-              : mode === 'install' ? 'Install agent' : 'Create'}
+              : mode === 'install'
+                ? approveAll && hasConsentItems ? 'Install and approve' : 'Install agent'
+                : 'Create'}
           </button>
         </div>
       </div>

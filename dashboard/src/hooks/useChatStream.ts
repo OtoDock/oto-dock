@@ -4,22 +4,56 @@ import type { ThreadGoal } from './useDashboardWs.types'
 import type { LimitPayload } from '../api/usage'
 import { useChatStore } from '@/store/chatStore'
 import { getDeviceLocation } from '../lib/geolocation'
+import { TARGET_LOCAL } from '../lib/placement'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
-import { dbMessagesToDisplay, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
+import { attachmentBlocks, dbMessagesToDisplay, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
+import { toQueuedMessage, type QueuedMessage } from '@/store/types'
+import type { SteeredFrame } from '../api/wireEvents'
+
+/** A steer accepted by the engine, waiting for the block boundary where it
+ * lands: the text, the attachment meta and (a delegated steer) the
+ * delegating agent's identity. */
+type HeldSteer = {
+  text: string
+  images?: SteeredFrame['images']
+  files?: SteeredFrame['files']
+  meta?: SteeredFrame['event_data']
+}
+
+function steeredUserMessage(h: HeldSteer, id: string): DisplayMessage {
+  return {
+    id,
+    role: 'user',
+    blocks: [...attachmentBlocks(h.images, h.files), { type: 'text', content: h.text }],
+    createdAt: new Date().toISOString(),
+    agentSlug: h.meta?.agent_slug,
+    agentDisplayName: h.meta?.agent_display_name,
+    agentColor: h.meta?.agent_color,
+    badge: h.meta?.badge,
+  }
+}
 import type { ActiveAgent } from '../components/chat/ChatStatusBar'
 import type { WorkflowLive } from '../components/chat/plan/WorkflowPanel'
 import type { SessionPlan } from '../components/chat/plan/PlanPanel'
 import { useChatMessages } from './useChatMessages'
 import { buildLiveStateMessages } from './chatStream/liveStateBuilder'
 import type { UseChatStreamOptions } from './chatStream/types'
+import { DELEGATE_TOOL, ROLE, toolRole } from '../lib/tools/roles'
+import { HOOK_ITEM, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
+import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../lib/status/run'
+import { evictedBy, isArtifactBlock } from '../lib/kinds/artifact'
 
-// Tools that should NOT generate tool_start/tool_end blocks (they have dedicated display events).
-// mcp__delegation-mcp__delegate renders as the (expandable) delegate pill from the proxy's
-// delegate_spawn — without this skip it ALSO got a bare generic tool pill (live only; the
-// backend never persisted it, so history and live disagreed).
-const SKIP_TOOL_EVENTS = new Set(['EnterPlanMode', 'ExitPlanMode', 'mcp__delegation-mcp__delegate'])
+// Tools that should NOT generate tool_start/tool_end blocks (they have dedicated display
+// events): the plan-mode tools by ROLE (lib/tools/roles), and the platform's delegate MCP
+// tool, which renders as the (expandable) delegate pill from the proxy's delegate_spawn —
+// without this skip it ALSO got a bare generic tool pill (live only; the backend never
+// persisted it, so history and live disagreed).
+const skipsToolEvents = (name: string): boolean => {
+  const role = toolRole(name)
+  return role === ROLE.PLAN_ENTER || role === ROLE.PLAN_EXIT || name === DELEGATE_TOOL
+}
 // Tools that have dedicated subagent blocks — skip tool block but keep tracking logic
-const AGENT_TOOL_NAMES = new Set(['Agent', 'Task'])
+const isSubagentTool = (name: string): boolean => toolRole(name) === ROLE.SUBAGENT
 
 // Reasons the backend's NoSubscriptionError classifier emits — all of them are
 // "connect/reconnect an account" prompts and render the amber setup card, not
@@ -73,7 +107,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     messages, setMessages, currentMsgRef,
     rawRowsRef, oldestLoadedIdRef, loadingOlderRef,
     hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder,
-    appendBlock, seedDbHistory: seedDbRows, loadOlder, removeMediaProcessing,
+    appendBlock, seedDbHistory: seedDbRows, loadOlder, removePlaceholders,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
     ensureAssistantMsg, removePreviewBlocks,
@@ -95,7 +129,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // Execution target for the active session (set by warmup_ready). When the
   // session falls back to local, fallbackReason is set so the header can render
   // an amber badge; offlineMachineName names the user's offline override.
-  const [sessionExecutionTarget, setSessionExecutionTarget] = useState<string>('local')
+  const [sessionExecutionTarget, setSessionExecutionTarget] = useState<string>(TARGET_LOCAL)
   const [sessionFallbackReason, setSessionFallbackReason] = useState<string | null>(null)
   const [offlineMachineName, setOfflineMachineName] = useState<string>('')
 
@@ -121,7 +155,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             startTime: 0,
             background: !!b._background,
           })
-        } else if (b.type === 'delegate' && b.status === 'running') {
+        } else if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) {
           out.push({
             id: `delegate-${b._taskId || b.taskName}`,
             description: `${b.taskName} → ${b.agent}`,
@@ -208,7 +242,19 @@ export function useChatStream(options: UseChatStreamOptions) {
   // yet. Splitting immediately cut sentences in half; instead the user
   // bubble + fresh assistant header render at the boundary where the steer
   // actually lands: the next tool/thinking/subagent block, or turn end.
-  const pendingSteerRef = useRef<string[]>([])
+  const pendingSteerRef = useRef<HeldSteer[]>([])
+  // The held steers, mirrored into state so the page can SHOW them while
+  // they wait for the boundary (a long tool call otherwise hides a steered
+  // message for minutes). Display only: the message already sits in the
+  // engine, so nothing here is editable or cancellable.
+  const [pendingSteers, setPendingSteers] = useState<QueuedMessage[]>([])
+  // Held steers belong to the chat they were sent in. A chat that loads its
+  // history drops them there (onChatHistory); a new chat loads none, so a
+  // steer held in the chat just left rendered into the new chat's first turn.
+  useEffect(() => {
+    pendingSteerRef.current = []
+    setPendingSteers([])
+  }, [chatId])
   // Guard against stale WS events during chat switch / run switch. Set true by
   // the page on navigation, cleared in onChatHistory / onWarmupReady. While
   // true, all streaming callbacks are no-ops (prevents ghost messages, stale
@@ -239,13 +285,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!pendingSteerRef.current.length) return
     const held = pendingSteerRef.current
     pendingSteerRef.current = []
+    setPendingSteers([])
     const now = Date.now()
-    const userMsgs: DisplayMessage[] = held.map((text, i) => ({
-      id: `user-${now}-${i}`,
-      role: 'user',
-      blocks: [{ type: 'text', content: text }],
-      createdAt: new Date().toISOString(),
-    }))
+    const userMsgs: DisplayMessage[] = held.map((h, i) => steeredUserMessage(h, `user-${now}-${i}`))
     if (!withContinuation) {
       setMessages((prev) => [...prev, ...userMsgs])
       return
@@ -287,7 +329,11 @@ export function useChatStream(options: UseChatStreamOptions) {
       // chat_id locally AND navigate (via onWarmupStartedExtra) so the URL
       // carries it during the whole spawn — a refresh/back then re-resumes the
       // in-flight warmup instead of losing the chat.
-      if (data.chat_id) {
+      // Only a chat THIS warmup minted (`new_chat`) is ours to adopt: the
+      // same frame fires for an existing chat re-warmed by a send, and a
+      // reconnect on the new-chat page replays every warming chat's frame —
+      // adopting one still spawning elsewhere would walk the user into it.
+      if (data.chat_id && data.new_chat === true) {
         if (!chatIdRef.current) setChatId(data.chat_id)
         options.onWarmupStartedExtra?.(data)
       }
@@ -311,7 +357,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (data.mode) setMode(data.mode)
       if (data.model) setModel(data.model)
       else if (options.fallbackModel !== undefined) setModel(options.fallbackModel)
-      setSessionExecutionTarget(data.execution_target || 'local')
+      setSessionExecutionTarget(data.execution_target || TARGET_LOCAL)
       setSessionFallbackReason(data.fallback_reason ?? null)
       setOfflineMachineName(data.offline_machine_name || '')
 
@@ -364,6 +410,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       thinkingBufRef.current = ''
       abortedRef.current = false
       pendingSteerRef.current = []  // held steers belong to the previous view
+      setPendingSteers([])
       liveStateSeededRef.current = false  // view is DB-authoritative again
       setTurnStartTime(null)
       setThinkingActive(false)
@@ -575,7 +622,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     onToolStart: (data) => {
       if (discardingRef.current || abortedRef.current) return
       // Filter out plan mode tools (they have dedicated plan_mode events)
-      if (SKIP_TOOL_EVENTS.has(data.name)) return
+      if (skipsToolEvents(data.name)) return
       flushPendingSteer()  // a new block = the boundary a held steer lands at
 
       const toolId = data.tool_id || data.name
@@ -589,7 +636,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // the badge + block now appear together at task_spawn and clear together
       // by the same key. (No badge before task_spawn = a ~sub-second delay
       // while the tool input streams — a worthwhile trade for no desync.)
-      if (AGENT_TOOL_NAMES.has(data.name)) {
+      if (isSubagentTool(data.name)) {
         return
       }
 
@@ -615,7 +662,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // tool block; attach the result to the subagent block (by tool_use_id)
       // so the pill expands to the report. Background spawns keep their
       // "launched" ack out of the pill (the real report arrives next turn).
-      if (AGENT_TOOL_NAMES.has(data.tool_name)) {
+      if (isSubagentTool(data.tool_name)) {
         const toolId = data.tool_use_id || ''
         if (!toolId || !data.result_content) return
         setMessages((prev) =>
@@ -637,13 +684,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     onToolEnd: (data) => {
       if (discardingRef.current) return
       // Filter out plan mode tools
-      if (SKIP_TOOL_EVENTS.has(data.name)) return
+      if (skipsToolEvents(data.name)) return
 
       const toolId = data.tool_id || data.name
 
-      // Agent/Task tool_end means "content block streamed", NOT "agent finished".
+      // A subagent's tool_end means "content block streamed", NOT "agent finished".
       // Agents haven't even started executing yet. Ignore entirely.
-      if (AGENT_TOOL_NAMES.has(data.name)) return
+      if (isSubagentTool(data.name)) return
 
       updateToolBlock(toolId, { status: 'done' })
     },
@@ -698,7 +745,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             b.type === 'delegate'
               && ((data.task_id && b._taskId === data.task_id)
                   || (!data.task_id && b.taskName === data.task_name))
-              ? { ...b, status: ((data.status || 'completed') as 'completed' | 'failed' | 'cancelled' | 'user_interrupted') }
+              ? { ...b, status: ((data.status || DELEGATE_RESULT.COMPLETED) as DelegateBlockStatus) }
               : b,
           ),
         })),
@@ -725,9 +772,9 @@ export function useChatStream(options: UseChatStreamOptions) {
             agentSlug: data.agent || '',
             agentDisplayName: delegateAgent?.display_name,
             agentColor: delegateAgent?.color || '',
-            badge: data.status === 'cancelled' ? 'delegate canceled'
-              : data.status === 'failed' ? 'delegate failed'
-              : data.status === 'user_interrupted' ? 'delegate interrupted'
+            badge: data.status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
+              : data.status === DELEGATE_RESULT.FAILED ? 'delegate failed'
+              : data.status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
               : 'delegate response',
           },
         ])
@@ -976,7 +1023,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       const subtype = data.subtype
 
       // Meeting events: update state, selectively create blocks
-      if (subtype === 'meeting_started') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_STARTED) {
         setMeetingActive(true)
         setMeetingParticipants(Array.isArray(data.participants) ? data.participants : [])
         setMeetingMaxRounds(data.max_turns || data.max_rounds || 30)
@@ -988,10 +1035,10 @@ export function useChatStream(options: UseChatStreamOptions) {
           for (let i = prev.length - 1; i >= 0; i--) {
             if (prev[i].role === 'assistant') {
               const alreadyHas = prev[i].blocks.some(
-                (b) => b.type === 'system' && (b as any).subtype === 'meeting_started'
+                (b) => b.type === 'system' && (b as any).subtype === SYSTEM_SUBTYPE.MEETING_STARTED
               )
               if (alreadyHas) return prev
-              const updated = { ...prev[i], blocks: [...prev[i].blocks, { type: 'system' as const, subtype: 'meeting_started' }] }
+              const updated = { ...prev[i], blocks: [...prev[i].blocks, { type: 'system' as const, subtype: SYSTEM_SUBTYPE.MEETING_STARTED }] }
               return [...prev.slice(0, i), updated, ...prev.slice(i + 1)]
             }
           }
@@ -999,7 +1046,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         })
         return
       }
-      if (subtype === 'meeting_turn_start') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) {
         const agentSlug = data.agent || ''
         setMeetingSpeaker(agentSlug || null)
         setMeetingRound(data.round || 0)
@@ -1018,18 +1065,18 @@ export function useChatStream(options: UseChatStreamOptions) {
         }
         return  // no block — agent header on the message is enough
       }
-      if (subtype === 'meeting_turn_end') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_END) {
         setMeetingSpeaker(null)
         meetingSpeakerRef.current = null
         return  // no block
       }
-      if (subtype === 'meeting_agent_left') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_AGENT_LEFT) {
         if (data.agent) setMeetingLeftParticipants(prev => new Set([...prev, data.agent!]))
         ensureAssistantMsg()
         appendBlock({ type: 'system', subtype, agentName: data.agent_display_name || data.agent, agentColor: data.agent_color })
         return
       }
-      if (subtype === 'meeting_concluded') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_CONCLUDED) {
         setMeetingActive(false)
         setMeetingSpeaker(null)
         setMeetingParticipants([])
@@ -1037,15 +1084,15 @@ export function useChatStream(options: UseChatStreamOptions) {
         meetingSpeakerRef.current = null
         // Show conclusion banner
         ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: 'meeting_concluded' })
+        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_CONCLUDED })
         return
       }
-      if (subtype === 'meeting_agent_failed') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_AGENT_FAILED) {
         ensureAssistantMsg()
         appendBlock({ type: 'system', subtype, agentName: data.agent_display_name || data.agent, agentColor: data.agent_color })
         return
       }
-      if (subtype === 'meeting_failed') {
+      if (subtype === SYSTEM_SUBTYPE.MEETING_FAILED) {
         // The meeting never started (admission denial, spawn failure…) —
         // clear the pill state and show the reason where the "meeting is
         // set up" ack was left hanging.
@@ -1055,7 +1102,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         setMeetingLeftParticipants(new Set())
         meetingSpeakerRef.current = null
         ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: 'meeting_failed', message: data.message })
+        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_FAILED, message: data.message })
         return
       }
 
@@ -1068,11 +1115,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     onImages: (data) => {
       if (discardingRef.current) return
       ensureAssistantMsg()
-      // Remove image_generating placeholder (if any) before appending the gallery
+      // Remove the placeholder a gallery evicts (the first one — the inline
+      // chat's own quantity rule) before appending the gallery
       setMessages(prev => {
         const last = prev[prev.length - 1]
         if (!last || last.role !== 'assistant') return prev
-        const genIdx = last.blocks.findIndex(b => b.type === 'image_generating')
+        const genIdx = last.blocks.findIndex(b => b.type === evictedBy(WIRE.IMAGES))
         if (genIdx === -1) return prev
         const blocks = [...last.blocks]
         blocks.splice(genIdx, 1)
@@ -1113,15 +1161,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
     onImageGenFailed: () => {
       if (discardingRef.current) return
-      setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (!last || last.role !== 'assistant') return prev
-        const blocks = last.blocks.filter(b => b.type !== 'image_generating')
-        if (blocks.length === last.blocks.length) return prev
-        const updated = { ...last, blocks }
-        currentMsgRef.current = updated
-        return [...prev.slice(0, -1), updated]
-      })
+      removePlaceholders(evictedBy(WIRE.IMAGE_GEN_FAILED))
     },
     onLimitWarning: (data) => {
       if (discardingRef.current) return
@@ -1146,7 +1186,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     onVideo: (data) => {
       if (discardingRef.current) return
       ensureAssistantMsg()
-      removeMediaProcessing()
+      removePlaceholders(evictedBy(WIRE.VIDEO))
       appendBlock({
         type: 'video',
         srcKind: data.src_kind === 'token' ? 'token' : 'url',
@@ -1162,7 +1202,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     onAudio: (data) => {
       if (discardingRef.current) return
       ensureAssistantMsg()
-      removeMediaProcessing()
+      removePlaceholders(evictedBy(WIRE.AUDIO))
       appendBlock({
         type: 'audio',
         srcKind: data.src_kind === 'token' ? 'token' : 'url',
@@ -1185,7 +1225,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
     onMediaFailed: (_msg) => {
       if (discardingRef.current) return
-      removeMediaProcessing()
+      removePlaceholders(evictedBy(WIRE.MEDIA_FAILED))
     },
     onDocumentPreview: (data) => {
       if (discardingRef.current) return
@@ -1259,7 +1299,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       } else if (data.phase === 'completed') {
         setCompressingActive(false)
         ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: 'context_compressed' })
+        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.CONTEXT_COMPRESSED })
         // A between-turns manual compaction has no follow-up metadata frame —
         // the completed event carries the post-compaction size itself.
         if (data.post_tokens != null) setContextUsed(data.post_tokens)
@@ -1360,8 +1400,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         // rescue a genuinely empty bubble (text OR any rich block = keep)…
         const bubble = currentMsgRef.current
         const hasContent = (bubble?.blocks ?? []).some((b: any) =>
-          (b.type === 'text' && (b.content || '').trim().length > 0) ||
-          ['audio', 'video', 'images', 'image_generating', 'file', 'url', 'document_preview', 'media_processing'].includes(b.type),
+          (b.type === 'text' && (b.content || '').trim().length > 0) || isArtifactBlock(b.type),
         )
         // …or a view seeded from a live_state snapshot (mid-turn attach): the
         // snapshot races the turn's end, so a truncated tail LOOKS like
@@ -1407,6 +1446,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (currentMsgRef.current) {
         appendToLastTextBlock(`\n\n**Error:** ${message}`)
       }
+      // The error ends the turn (no done follows): an accepted steer still
+      // owes its user bubble, like at done and abort.
+      flushPendingSteer(false)
       currentMsgRef.current = null
       setTurnStartTime(null)
     },
@@ -1481,7 +1523,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       // bubble (the reconnect/stale-pump dedup) — any OTHER text is a real
       // mid-turn queue (claude's steer fallback) and must show its chip.
       if (sentWithBubbleRef.current === data.text) return
-      options.queue.addQueued(data.index, data.text)
+      options.queue.addQueued(data.index, toQueuedMessage(data))
     },
     onQueueRemoved: (_msg) => {
       // No-op for queuedMessages — the page's cancel/edit handlers already
@@ -1498,11 +1540,11 @@ export function useChatStream(options: UseChatStreamOptions) {
         setTurnStartTime(Date.now())
         return
       }
-      // Queue processed — add user bubble + assistant placeholder.
+      // Queue processed — add user bubble (chips + text) + assistant placeholder.
       const userMsg: DisplayMessage = {
         id: `user-${Date.now()}`,
         role: 'user',
-        blocks: [{ type: 'text', content: data.text }],
+        blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
         createdAt: new Date().toISOString(),
       }
       // During meetings, skip the assistant placeholder — meeting agents create
@@ -1531,18 +1573,17 @@ export function useChatStream(options: UseChatStreamOptions) {
       // open and streaming, splitting here cut its text mid-sentence, so
       // hold the bubble and let the next block boundary render it (the
       // flushPendingSteer calls in the block handlers + turn end).
+      const held: HeldSteer = {
+        text: data.text, images: data.images, files: data.files, meta: data.event_data,
+      }
       if (currentMsgRef.current) {
-        pendingSteerRef.current.push(data.text)
+        pendingSteerRef.current.push(held)
+        setPendingSteers(pendingSteerRef.current.map(toQueuedMessage))
         return
       }
       // Idle position (between blocks): render at the live position and
       // continue the assistant's response in a NEW message below it.
-      const userMsg: DisplayMessage = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        blocks: [{ type: 'text', content: data.text }],
-        createdAt: new Date().toISOString(),
-      }
+      const userMsg = steeredUserMessage(held, `user-${Date.now()}`)
       const continuation: DisplayMessage = {
         id: `stream-${Date.now()}`,
         role: 'assistant',
@@ -1551,31 +1592,6 @@ export function useChatStream(options: UseChatStreamOptions) {
       }
       currentMsgRef.current = continuation
       setMessages((prev) => [...prev, userMsg, continuation])
-    },
-
-    onUserMessage: (content) => {
-      if (discardingRef.current) return
-      // Backend-injected user message (e.g. auto "implement plan" prompt)
-      const userMsg: DisplayMessage = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        blocks: [{ type: 'text', content }],
-        createdAt: new Date().toISOString(),
-      }
-      // During meetings, skip placeholder (meeting agents create own messages)
-      if (meetingActive) {
-        setMessages((prev) => [...prev, userMsg])
-        return
-      }
-      const placeholder: DisplayMessage = {
-        id: `stream-${Date.now()}`,
-        role: 'assistant',
-        blocks: [],
-        createdAt: new Date().toISOString(),
-      }
-      currentMsgRef.current = placeholder
-      setMessages((prev) => [...prev, userMsg, placeholder])
-      setTurnStartTime(Date.now())
     },
 
     onPlanStatus: (data) => {
@@ -1618,8 +1634,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
 
     onQueueEditReturn: (data) => {
-      // Pull the text back into input for editing
-      setEditText(data.text)
+      // Pull the text back into the composer for editing, and the
+      // attachments the queued message carried with it. An attachment-only
+      // message returns no text: the composer's draft stays as it is.
+      if (data.text) setEditText(data.text)
+      if (data.images?.length || data.files?.length) {
+        options.queue.restoreAttachments?.(data.images ?? [], data.files ?? [])
+      }
     },
 
     onLiveState: (data) => {
@@ -1656,7 +1677,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         // Check if live_blocks contain meeting_started — append banner to last
         // assistant message from DB (prev), not as a new message.
         const hasMeetingStartedBlock = liveBlocks.some(
-          (lb: any) => lb.type === 'system' && lb.subtype === 'meeting_started'
+          (lb: any) => lb.type === 'system' && lb.subtype === SYSTEM_SUBTYPE.MEETING_STARTED
         )
 
         if (newMsgs.length > 0 || hasMeetingStartedBlock) {
@@ -1677,7 +1698,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             if (hasMeetingStartedBlock) {
               for (let i = updated.length - 1; i >= 0; i--) {
                 if (updated[i].role === 'assistant') {
-                  updated[i] = { ...updated[i], blocks: [...updated[i].blocks, { type: 'system' as const, subtype: 'meeting_started' }] }
+                  updated[i] = { ...updated[i], blocks: [...updated[i].blocks, { type: 'system' as const, subtype: SYSTEM_SUBTYPE.MEETING_STARTED }] }
                   break
                 }
               }
@@ -1710,7 +1731,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         setPermissionPending(true)
         setTurnStartTime(null)  // Pause timer — LLM is blocked
         ensureAssistantMsg()
-        if (ppType === 'plan_review') {
+        if (ppType === HOOK_ITEM.PLAN_REVIEW) {
           appendBlock({
             type: 'plan_review',
             requestId: pp.request_id || '',
@@ -1718,7 +1739,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             toolInput: pp.tool_input || {},
             filename: pp.filename || '',
           })
-        } else if (ppType === 'question_prompt') {
+        } else if (ppType === HOOK_ITEM.QUESTION_PROMPT) {
           // Reconnect mid-question (codex held turn) — re-render the card with
           // its request_id so the answer still resolves the held request.
           appendBlock({
@@ -1795,7 +1816,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendBlock(block)
   }
   const wsSubscribe = ws.subscribe
-  useEffect(() => wsSubscribe('ui', (msg: any) => onUiFrameRef.current(msg)), [wsSubscribe])
+  useEffect(() => wsSubscribe(WIRE.UI, (msg: any) => onUiFrameRef.current(msg)), [wsSubscribe])
+  // A check's verdict card (CHECKS.md) rides the same path: the evaluator
+  // pushes the `check_verdict` event onto the chat's pump after the turn,
+  // and history replays the persisted event row through eventToBlock.
+  useEffect(() => wsSubscribe(WIRE.CHECK_VERDICT, (msg: any) => onUiFrameRef.current(msg)), [wsSubscribe])
 
   // display_ui backchannel. Two disjoint chip-append sources: the
   // `artifact_interaction` frame renders QUEUED interactions at boundary
@@ -1824,12 +1849,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (msg.chat_id && chatIdRef.current && msg.chat_id !== chatIdRef.current) return
     appendArtifactChipTurn(msg.token || '', msg.title || undefined, msg.payload)
   }
-  useEffect(() => wsSubscribe('artifact_interaction', (msg: any) => onArtifactFrameRef.current(msg)), [wsSubscribe])
+  useEffect(() => wsSubscribe(WIRE.ARTIFACT_INTERACTION, (msg: any) => onArtifactFrameRef.current(msg)), [wsSubscribe])
 
   // In-flight send acks, keyed by token (the server's ≥1s per-token
   // min-interval guarantees one in-flight send per token).
   const artifactAckWaiters = useRef<Map<string, (ack: { status: string; reason?: string }) => void>>(new Map())
-  useEffect(() => wsSubscribe('artifact_ack', (msg: any) => {
+  useEffect(() => wsSubscribe(WIRE.ARTIFACT_ACK, (msg: any) => {
     const waiter = artifactAckWaiters.current.get(msg.token || '')
     if (waiter) {
       artifactAckWaiters.current.delete(msg.token || '')
@@ -1866,7 +1891,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     [ws],
   )
 
-  // Pinned mini-app send_prompt actions — the app_action twin of the artifact
+  // Pinned app send_prompt actions — the app_action twin of the artifact
   // backchannel above: same chip-turn semantics (queued interactions render
   // via the `app_action` frame at boundary drain; the `sent` ack renders the
   // idle path), acks keyed by app+action.
@@ -1897,10 +1922,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (msg.chat_id && chatIdRef.current && msg.chat_id !== chatIdRef.current) return
     appendAppActionChipTurn(msg)
   }
-  useEffect(() => wsSubscribe('app_action', (msg: any) => onAppActionFrameRef.current(msg)), [wsSubscribe])
+  useEffect(() => wsSubscribe(WIRE.APP_ACTION, (msg: any) => onAppActionFrameRef.current(msg)), [wsSubscribe])
 
   const appActionAckWaiters = useRef<Map<string, (ack: { status: string; reason?: string }) => void>>(new Map())
-  useEffect(() => wsSubscribe('app_action_ack', (msg: any) => {
+  useEffect(() => wsSubscribe(WIRE.APP_ACTION_ACK, (msg: any) => {
     const key = `${msg.app_id || ''}:${msg.action_id || ''}`
     const waiter = appActionAckWaiters.current.get(key)
     if (waiter) {
@@ -2135,7 +2160,7 @@ export function useChatStream(options: UseChatStreamOptions) {
           (b) =>
             (b.type === 'tool' && b.status === 'running')
             || (b.type === 'subagent' && b.isActive)
-            || (b.type === 'delegate' && b.status === 'running')
+            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING)
             || (b.type === 'bgcommand' && b.isActive),
         )
         if (!hasRunning) return msg
@@ -2145,7 +2170,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             if (b.type === 'tool' && b.status === 'running') return { ...b, status: 'failed' as const }
             if (b.type === 'subagent' && b.isActive) return { ...b, isActive: false, failed: true }
             if (b.type === 'bgcommand' && b.isActive) return { ...b, isActive: false, failed: true }
-            if (b.type === 'delegate' && b.status === 'running') return { ...b, status: 'failed' as const }
+            if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) return { ...b, status: DELEGATE_RESULT.FAILED }
             return b
           }),
         }
@@ -2172,6 +2197,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     ws,
     // state
     messages, setMessages,
+    pendingSteers,
     // lazy chat-history pagination (scroll-back)
     loadOlder, hasMoreOlder, loadingOlder, seedDbHistory,
     chatId, setChatId, chatIdRef,

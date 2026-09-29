@@ -191,6 +191,18 @@ _test_agents_root.mkdir(parents=True, exist_ok=True)
 # side-effect (e.g. via pre-conftest registration in pytest collection).
 import config as _config  # noqa: E402
 _config.AGENTS_DIR = _test_agents_root
+# The sessions dir (index.json, prompt files, per-user MCP configs) lives
+# BESIDE the agents root, never inside it: the suite must never rewrite the
+# live install's sessions/index.json (the T1 dev install runs from this
+# checkout), and the per-test wipe of the agents root must not take the
+# sessions dir with it. The name keeps the agents-root prefix, so the
+# age-gated startup sweep above reaps it too.
+_config.SESSIONS_DIR = Path(tempfile.gettempdir()) / f"{_agents_dir_name}-sessions"
+_config.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+if "core.session.session_state" in sys.modules:
+    _ss = sys.modules["core.session.session_state"]
+    _ss._SESSION_INDEX = _config.SESSIONS_DIR / "index.json"
+    _ss._SECURITY_INDEX = _config.SESSIONS_DIR / "security_index.json"
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -217,11 +229,14 @@ def pytest_sessionfinish(session, exitstatus):
                 print("\n[db-loop-guard] loop-side store calls:\n" + "\n".join(_lines))
     except Exception:
         pass
-    # Stop the dedicated DB executor before the pool's own atexit close so
-    # its idle worker threads never delay interpreter exit.
+    # Stop the run_db lanes, then close the pools: their worker threads are
+    # non-daemon, so left open they stall interpreter exit (about 20 s per
+    # test process) and keep this run's databases busy, so the DROP below
+    # would skip them.
     try:
         from storage import pg as _pg
         _pg.shutdown_db_executor()
+        _pg.close_pool(timeout=2.0)
     except Exception:
         pass
     if _xdist_worker:
@@ -314,6 +329,16 @@ def temp_db():
     try:
         from core.events import chat_writer as _chat_writer
         _chat_writer.reset_for_tests()
+    except Exception:
+        pass
+
+    # The audience cache and the webhook dispatcher's counters are module
+    # global: an entry one test filled must not answer the next test's read.
+    try:
+        from services.notifications import notification_manager as _nm
+        from services.webhooks import webhook_dispatcher as _wd
+        _nm.reset_audience_cache()
+        _wd.reset_caches()
     except Exception:
         pass
 

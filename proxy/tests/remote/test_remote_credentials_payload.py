@@ -48,13 +48,22 @@ async def _build(layer, config, execution_path):
         return await layer._build_start_payload("sess-1", config, execution_path)
 
 
+async def _payload(layer, config, execution_path):
+    return (await _build(layer, config, execution_path)).payload
+
+
 class TestClaudePayload:
     @pytest.mark.asyncio
-    async def test_creds_blob_becomes_credentials_json_and_leaves_env(self, layer):
+    async def test_credentials_file_becomes_credentials_json_and_leaves_env(self, layer):
+        # The env carries the FULL file content the engine's adapter built
+        # (its credential_file_payload); the payload ships it verbatim under
+        # the engine's declared start-payload key.
         blob = {"accessToken": "at", "refreshToken": "", "expiresAt": 5,
                 "scopes": [], "subscriptionType": "", "rateLimitTier": ""}
-        config = _config(extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(blob)})
-        payload = await _build(layer, config, "claude-code-cli")
+        config = _config(extra_env={"_CLAUDE_CREDS_BLOB": json.dumps({"claudeAiOauth": blob})})
+        plan = await _build(layer, config, "claude-code-cli")
+        payload = plan.payload
+        assert plan.credential_file_delivered is True
         assert payload["credentials_json"] == {"claudeAiOauth": blob}
         # No token in the spawned env — the file is the only carrier.
         assert "_CLAUDE_CREDS_BLOB" not in payload["env"]
@@ -65,7 +74,9 @@ class TestClaudePayload:
     @pytest.mark.asyncio
     async def test_api_key_session_has_no_credentials_json(self, layer):
         config = _config(extra_env={"ANTHROPIC_API_KEY": "sk-test"})
-        payload = await _build(layer, config, "claude-code-cli")
+        plan = await _build(layer, config, "claude-code-cli")
+        payload = plan.payload
+        assert plan.credential_file_delivered is False
         assert "credentials_json" not in payload
         assert "CLAUDE_CODE_OAUTH_401_WAIT_MS" not in payload["env"]
         assert payload["env"]["ANTHROPIC_API_KEY"] == "sk-test"
@@ -74,18 +85,23 @@ class TestClaudePayload:
 class TestCodexPayload:
     @pytest.mark.asyncio
     async def test_auth_json_carries_neutralized_refresh(self, layer):
+        # The Codex adapter built the full auth.json from the login blob and
+        # the issued token (refresh neutralized); the payload ships it.
+        from core.session.session_manager import get_layer_by_path
         blob = {"auth_mode": "chatgpt",
                 "tokens": {"id_token": "ID", "access_token": "OLD",
                            "refresh_token": "RFR", "account_id": "A"}}
-        config = _config(extra_env={
-            "_CODEX_OAUTH_TOKEN": "NEW",
-            "_CODEX_AUTH_BLOB": json.dumps(blob),
-        })
-        payload = await _build(layer, config, "codex-cli")
+        auth_json = get_layer_by_path("codex-cli").credential_file_payload(
+            "NEW", 0, {"codex_auth_blob": blob})
+        config = _config(extra_env={"_CODEX_AUTH_JSON": json.dumps(auth_json)})
+        plan = await _build(layer, config, "codex-cli")
+        payload = plan.payload
+        assert plan.credential_file_delivered is True
+        assert plan.start_timeout_s == 60.0
         assert payload["auth_json"]["tokens"]["access_token"] == "NEW"
         assert payload["auth_json"]["tokens"]["refresh_token"] == ""
-        assert "_CODEX_OAUTH_TOKEN" not in payload["env"]
-        assert "_CODEX_AUTH_BLOB" not in payload["env"]
+        assert payload["auth_json"]["tokens"]["id_token"] == "ID"
+        assert "_CODEX_AUTH_JSON" not in payload["env"]
 
 
 class TestBindSubscription:
@@ -98,17 +114,19 @@ class TestBindSubscription:
         token_fanout._targets.clear()
 
     def test_binds_and_registers_claude_target(self):
+        from types import SimpleNamespace
         from services.engines import subscription_pool as pool
         from services.engines import token_fanout
-        config = _config(subscription_id="sub-1")
-        payload = {"claude_dir_relative": "users/alice/.claude",
-                   "credentials_json": {"claudeAiOauth": {}}}
+        # The target's dir is the scope root the payload builder used (the
+        # SecurityContext's mount username) + the engine's declared dirname.
+        config = _config(subscription_id="sub-1",
+                         security_context=SimpleNamespace(mount_username="alice"))
         RemoteExecutionLayer._bind_subscription(
-            "sess-1", config, "claude-code-cli", payload,
+            "sess-1", config, "claude-code-cli", True,
         )
         assert pool.get_session_subscription("sess-1") == "sub-1"
         target = token_fanout.session_target("sess-1")
-        assert target.kind == "claude"
+        assert target.layer == "claude-code-cli"
         assert target.machine_id == "machine-1"
         assert target.agent_name == "test-agent"
         assert target.dir_relative == "users/alice/.claude"
@@ -116,22 +134,20 @@ class TestBindSubscription:
     def test_binds_and_registers_codex_target(self):
         from services.engines import subscription_pool as pool
         from services.engines import token_fanout
-        config = _config(subscription_id="sub-2")
-        payload = {"codex_dir_relative": "workspace/.codex",
-                   "auth_json": {"tokens": {}}}
+        config = _config(subscription_id="sub-2")     # agent-scope mount → workspace
         RemoteExecutionLayer._bind_subscription(
-            "sess-2", config, "codex-cli", payload,
+            "sess-2", config, "codex-cli", True,
         )
         assert pool.get_session_subscription("sess-2") == "sub-2"
-        assert token_fanout.session_target("sess-2").kind == "codex"
+        target = token_fanout.session_target("sess-2")
+        assert target.layer == "codex-cli" and target.dir_relative == "workspace/.codex"
 
     def test_api_key_session_binds_without_target(self):
         from services.engines import subscription_pool as pool
         from services.engines import token_fanout
         config = _config(subscription_id="sub-3")
-        payload = {"claude_dir_relative": "workspace/.claude"}  # no credentials_json
-        RemoteExecutionLayer._bind_subscription(
-            "sess-3", config, "claude-code-cli", payload,
+        RemoteExecutionLayer._bind_subscription(       # no credential file delivered
+            "sess-3", config, "claude-code-cli", False,
         )
         assert pool.get_session_subscription("sess-3") == "sub-3"
         assert token_fanout.session_target("sess-3") is None
@@ -140,6 +156,6 @@ class TestBindSubscription:
         from services.engines import subscription_pool as pool
         config = _config(subscription_id="")
         RemoteExecutionLayer._bind_subscription(
-            "sess-4", config, "claude-code-cli", {},
+            "sess-4", config, "claude-code-cli", True,
         )
         assert pool.get_session_subscription("sess-4") is None

@@ -9,12 +9,16 @@ import asyncio
 import contextlib
 import json
 import logging
+from core.events import tool_roles
+from core import placement
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from storage import database as task_store
 from storage.agents import agent_store
+from storage.chat import meeting_status
+from storage.pg import run_db
 from core.session.session_manager import get_execution_layer
 from core.events.common_events import (
     CommonEvent, TEXT, THINKING, PRODUCER_DONE,
@@ -23,6 +27,7 @@ from core.events.common_events import (
 )
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from core.events.bg_command_state import get_bg_command_registry
+from core.execution_layer import DEFAULT_EXECUTION_PATH
 from core.events.pump_bg_monitors import (
     _bg_agent_monitor, bg_monitor_running,
     _bg_command_monitor, bg_command_monitor_running,
@@ -41,6 +46,9 @@ from services.meetings.meeting_context import (
     build_meeting_agent_config,
     build_turn_prompt,
 )
+from core.session import session_kind
+from auth import roles
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -106,10 +114,11 @@ _THIN_TURN_MAX_CHARS = 300
 
 def _tool_resets_tail(name: str) -> bool:
     """Whether a TOOL_RESULT for `name` resets the tail-text tracker. Meeting
-    tools only route (their result lands after the written report) and
-    ToolSearch only loads schemas (models legitimately run it between the
-    report text and direct_to) — neither invalidates text written before it."""
-    return "meetings-mcp__" not in name and name != "ToolSearch"
+    tools only route (their result lands after the written report) and a
+    tool-discovery call only loads schemas (models legitimately run it
+    between the report text and direct_to) — neither invalidates text
+    written before it."""
+    return "meetings-mcp__" not in name and tool_roles.role_of(name) != tool_roles.DISCOVERY
 
 
 class _TurnTracker:
@@ -304,7 +313,7 @@ async def _run_live_turn(
     # Emit turn_start
     ad = agent_store.get_agent(agent_slug)
     await event_queue.put(CommonEvent(type=SYSTEM, data={
-        "subtype": "meeting_turn_start",
+        "subtype": wire.SUBTYPE_MEETING_TURN_START,
         "meeting_id": meeting_id,
         "agent": agent_slug,
         "agent_display_name": (ad or {}).get("display_name", agent_slug),
@@ -333,7 +342,7 @@ async def _run_live_turn(
     except Exception as e:
         logger.error(f"Meeting {meeting_id}: agent {agent_slug} failed: {e}")
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_agent_failed",
+            "subtype": wire.SUBTYPE_MEETING_AGENT_FAILED,
             "agent": agent_slug,
             "error": str(e)[:200],
         }))
@@ -347,7 +356,7 @@ async def _run_live_turn(
     # Emit turn_end — cost is added later by meeting_produce after computing
     # per-turn delta (METADATA cost is cumulative per CLI session).
     await event_queue.put(CommonEvent(type=SYSTEM, data={
-        "subtype": "meeting_turn_end",
+        "subtype": wire.SUBTYPE_MEETING_TURN_END,
         "agent": agent_slug,
         "cost_usd": 0,  # placeholder — meeting_produce emits actual cost as metadata
     }))
@@ -449,7 +458,7 @@ async def _run_parallel_batch(
         if result_ref and "_failed" in result_ref.tools_called:
             # Agent already failed before producing events
             await event_queue.put(CommonEvent(type=SYSTEM, data={
-                "subtype": "meeting_agent_failed",
+                "subtype": wire.SUBTYPE_MEETING_AGENT_FAILED,
                 "agent": chosen,
                 "error": (result_ref.content or "unknown error")[:200],
             }))
@@ -464,7 +473,7 @@ async def _run_parallel_batch(
         # Emit turn_start
         ad = agent_store.get_agent(chosen)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_turn_start",
+            "subtype": wire.SUBTYPE_MEETING_TURN_START,
             "meeting_id": meeting_id,
             "agent": chosen,
             "agent_display_name": (ad or {}).get("display_name", chosen),
@@ -482,7 +491,7 @@ async def _run_parallel_batch(
         # Collect result and emit turn_end — cost is added by meeting_produce
         result = agent_results.get(chosen)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_turn_end",
+            "subtype": wire.SUBTYPE_MEETING_TURN_END,
             "agent": chosen,
             "cost_usd": 0,  # placeholder — meeting_produce emits actual cost
         }))
@@ -507,7 +516,7 @@ async def meeting_produce(
     meeting_participants: list[dict] | None = None,
 ) -> None:
     """Producer for the meeting — directed message routing with parallel execution."""
-    meeting = task_store.get_meeting(meeting_id)
+    meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
         return
 
@@ -517,7 +526,7 @@ async def meeting_produce(
 
     # Emit meeting_started as the very first event (so WS receives it live)
     await event_queue.put(CommonEvent(type=SYSTEM, data={
-        "subtype": "meeting_started",
+        "subtype": wire.SUBTYPE_MEETING_STARTED,
         "meeting_id": meeting_id,
         "topic": meeting["topic"],
         "participants": meeting_participants or [],
@@ -543,10 +552,11 @@ async def meeting_produce(
     # Per-agent pending queues
     pending: dict[str, list] = {a: [] for a in active_participants}
 
-    # Moderator speaks first
-    pending[moderator].append({"type": "start"})
-
     try:
+        # Moderator speaks first. Inside the try: a moderator that is not a
+        # participant ends the meeting with an error and PRODUCER_DONE still
+        # goes out, so the host chat's pump ends.
+        pending[moderator].append({"type": "start"})
         while meeting_active and total_turns < max_turns:
             # Find agents with pending messages
             ready = [a for a in active_participants if pending.get(a)]
@@ -597,8 +607,8 @@ async def meeting_produce(
                 if "_failed" in result.tools_called:
                     active_participants = [a for a in active_participants if a != result.agent]
                     pending_restates.pop(result.agent, None)
-                    task_store.update_meeting(
-                        meeting_id,
+                    await run_db(
+                        task_store.update_meeting, meeting_id,
                         active_participants=json.dumps(active_participants),
                     )
                     try:
@@ -659,7 +669,8 @@ async def meeting_produce(
                 transcript.append(entry)
 
                 # Save to DB
-                task_store.add_meeting_turn(
+                await run_db(
+                    task_store.add_meeting_turn,
                     meeting_id, total_turns, 0, result.agent, "assistant",
                     result.content, result.thinking,
                     json.dumps(result.tools),
@@ -690,15 +701,15 @@ async def meeting_produce(
                 if "leave_meeting" in result.tools_called:
                     active_participants = [a for a in active_participants if a != result.agent]
                     pending_restates.pop(result.agent, None)
-                    task_store.update_meeting(
-                        meeting_id,
+                    await run_db(
+                        task_store.update_meeting, meeting_id,
                         active_participants=json.dumps(active_participants),
                     )
                     pending.pop(result.agent, None)
                     # Notify frontend so the banner can grey out the agent
                     ad = agent_store.get_agent(result.agent)
                     await event_queue.put(CommonEvent(type=SYSTEM, data={
-                        "subtype": "meeting_agent_left",
+                        "subtype": wire.SUBTYPE_MEETING_AGENT_LEFT,
                         "agent": result.agent,
                         "agent_display_name": (ad or {}).get("display_name", result.agent),
                         "agent_color": (ad or {}).get("color", ""),
@@ -754,19 +765,22 @@ async def meeting_produce(
                         if other != result.agent and other not in batch_agents:
                             pending.setdefault(other, []).append(entry)
 
-            # Check if moderator decided to resume after propose_conclude
-            meeting = task_store.get_meeting(meeting_id)
-            if meeting and meeting["status"] == "paused":
-                # Check if moderator just spoke (decided to resume or end)
-                if moderator in batch_agents and meeting_active:
-                    # Moderator responded without end_meeting → resume
-                    task_store.update_meeting(meeting_id, status="active")
+            # Check if moderator decided to resume after propose_conclude, or
+            # whether an end landed from outside this loop.
+            meeting = await run_db(task_store.get_meeting, meeting_id)
+            if meeting and meeting["status"] == meeting_status.PAUSED:
+                # The moderator spoke without ending: resume. One conditional
+                # write, so an end that lands between the read and here
+                # (CONCLUDING) is never overwritten back to ACTIVE.
+                if moderator in batch_agents and meeting_active and await run_db(
+                        task_store.update_meeting_if, meeting_id,
+                        (meeting_status.PAUSED,), status=meeting_status.ACTIVE):
                     if paused_pending:
                         for a, msgs in paused_pending.items():
                             if a != moderator and msgs:
                                 pending.setdefault(a, []).extend(msgs)
                         paused_pending = None
-            elif meeting and meeting["status"] in ("concluding", "failed"):
+            elif meeting and meeting["status"] in meeting_status.ROUND_STOPS:
                 meeting_active = False
 
             # Auto-queue moderator after 3+ turns without speaking
@@ -785,7 +799,10 @@ async def meeting_produce(
 
             # Check for user messages
             while pump.message_queue:
-                user_msg = pump.message_queue.pop(0)
+                queued = pump.message_queue.pop(0)
+                # The agents read the engine text (attachment paths included);
+                # the row keeps the raw text and the attachment meta.
+                user_msg = queued.cli_text
                 user_entry = {
                     "agent": "user",
                     "content": user_msg,
@@ -794,7 +811,10 @@ async def meeting_produce(
                     "role": "user",
                 }
                 transcript.append(user_entry)
-                await event_queue.put(CommonEvent(type=QUEUE_TURN, data={"text": user_msg}))
+                await event_queue.put(CommonEvent(
+                    type=QUEUE_TURN,
+                    data={"text": queued.text, "event_data": queued.event_meta},
+                ))
                 # User messages go only to the moderator — the moderator
                 # decides how to act (route to others, answer directly, etc.)
                 pending.setdefault(moderator, []).append(user_entry)
@@ -804,7 +824,7 @@ async def meeting_produce(
 
         # Meeting concluded
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_concluded",
+            "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
             "total_turns": total_turns,
             "cost_usd": meeting_total_cost,
@@ -813,7 +833,7 @@ async def meeting_produce(
     except asyncio.CancelledError:
         logger.info(f"Meeting {meeting_id} cancelled")
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_concluded",
+            "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
             "total_turns": total_turns,
             "cost_usd": meeting_total_cost,
@@ -822,7 +842,7 @@ async def meeting_produce(
     except Exception as e:
         logger.error(f"Meeting {meeting_id} producer error: {e}", exc_info=True)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
-            "subtype": "meeting_concluded",
+            "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
             "total_turns": total_turns,
             "error": str(e)[:200],
@@ -842,6 +862,12 @@ async def meeting_produce(
 _FAIL_PUMP_LINGER_S = 10.0
 
 
+async def fail_meeting(meeting_id: str, reason: str) -> None:
+    """A meeting that will not run (its convener lost the agent): marked
+    failed with the reason and surfaced into the requesting chat."""
+    await _notify_meeting_failed(meeting_id, reason)
+
+
 async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
     """Surface a pre-pump meeting failure into the requesting chat.
 
@@ -855,12 +881,12 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
     surfacing must never mask the original failure path.
     """
     try:
-        task_store.update_meeting(meeting_id, status="failed",
-                                  summary=(reason or "")[:5000])
+        await run_db(task_store.update_meeting, meeting_id, status=meeting_status.FAILED,
+                     summary=(reason or "")[:5000])
     except Exception:
         logger.exception(f"Meeting {meeting_id}: failed-status update failed")
     try:
-        meeting = task_store.get_meeting(meeting_id)
+        meeting = await run_db(task_store.get_meeting, meeting_id)
         if not meeting:
             return
         parent_chat_id = meeting["parent_chat_id"]
@@ -881,7 +907,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
 
         async def _produce_failure() -> None:
             await event_queue.put(CommonEvent(type=SYSTEM, data={
-                "subtype": "meeting_failed",
+                "subtype": wire.SUBTYPE_MEETING_FAILED,
                 "meeting_id": meeting_id,
                 "message": reason,
             }))
@@ -895,7 +921,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
             event_queue=event_queue,
             perm_queue=get_permission_queue(pump_session_id),
             scope=meeting.get("scope", "user"),
-            source_type="meeting",
+            source_type=session_kind.MEETING.source_type,
         )
         pump.producer = asyncio.create_task(_produce_failure())
         _active_pumps[parent_chat_id] = pump
@@ -914,11 +940,11 @@ async def _notify_meeting_failed(meeting_id: str, reason: str) -> None:
 
 async def start_meeting(meeting_id: str) -> None:
     """Start the meeting orchestrator."""
-    meeting = task_store.get_meeting(meeting_id)
+    meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
         logger.error(f"Meeting {meeting_id} not found")
         return
-    if meeting["status"] != "pending":
+    if meeting["status"] != meeting_status.PENDING:
         logger.error(f"Meeting {meeting_id} status is {meeting['status']}, expected pending")
         return
 
@@ -932,7 +958,7 @@ async def start_meeting(meeting_id: str) -> None:
         from services.engines import subscription_pool
         m_scope = meeting.get("scope", "user")
         blocked_reason = ""
-        host_chat = task_store.get_chat(meeting["parent_chat_id"]) or {}
+        host_chat = await run_db(task_store.get_chat, meeting["parent_chat_id"]) or {}
         host_agent = host_chat.get("agent") or meeting.get("moderator", "")
         if m_scope == "agent":
             if host_agent:
@@ -940,7 +966,7 @@ async def start_meeting(meeting_id: str) -> None:
                 if not ls["allowed"]:
                     blocked_reason = f"Agent '{host_agent}' usage limit exceeded"
         elif meeting.get("created_by"):
-            creator = await asyncio.to_thread(task_store.get_user, meeting["created_by"])
+            creator = await run_db(task_store.get_user, meeting["created_by"])
             creator_role = (creator or {}).get("role", "member")
             ls = await asyncio.to_thread(
                 usage_service.check_user_limit, meeting["created_by"], creator_role
@@ -950,8 +976,8 @@ async def start_meeting(meeting_id: str) -> None:
         # The subscription pool cap, on the host agent's engine (a participant
         # on another engine is refused by the pool at its own spawn).
         if not blocked_reason and host_agent:
-            host_layer = (agent_store.get_agent(host_agent) or {}).get(
-                "execution_path", "claude-code-cli")
+            host_layer = ((agent_store.get_agent(host_agent) or {}).get(
+                "execution_path") or DEFAULT_EXECUTION_PATH)
             if m_scope == "agent":
                 cap = await asyncio.to_thread(pool_caps.evaluate, "platform", "", host_layer)
                 cap_sub = None
@@ -971,7 +997,14 @@ async def start_meeting(meeting_id: str) -> None:
     except Exception as e:
         logger.error(f"Meeting {meeting_id} usage limit pre-check failed: {e}")
 
-    task_store.update_meeting(meeting_id, status="active")
+    # Pending to active in one conditional write: a second start of the same
+    # meeting, or a failure written while the checks above awaited (the
+    # offboarding's fail_meeting), leaves the row elsewhere and this start
+    # runs nothing.
+    if not await run_db(task_store.update_meeting_if, meeting_id,
+                        (meeting_status.PENDING,), status=meeting_status.ACTIVE):
+        logger.info(f"Meeting {meeting_id}: no longer pending, not started")
+        return
     parent_chat_id = meeting["parent_chat_id"]
     participants = json.loads(meeting["participants"])
 
@@ -1039,14 +1072,18 @@ async def start_meeting(meeting_id: str) -> None:
             )
         return
     agent_cfgs = dict(zip(participants, _built))
-    sid_targets = {session_id_map[slug]: (cfg.execution_target or "local")
+    sid_targets = {session_id_map[slug]: (cfg.execution_target or placement.LOCAL)
                    for slug, cfg in agent_cfgs.items()}
     sid_paths = {session_id_map[slug]: (cfg.execution_path or "")
                  for slug, cfg in agent_cfgs.items()}
+    # A Direct-LLM participant reserves for its stdio MCPs.
+    sid_mcps = {session_id_map[slug]: (cfg.mcp_config_path or "")
+                for slug, cfg in agent_cfgs.items()}
 
     # Atomic-N reserve of the LOCAL participants only (remote ones are enforced
     # by their satellites). All-or-nothing for the local subset.
-    adm = await acquire_meeting_slots(all_sids, targets=sid_targets, exec_paths=sid_paths)
+    adm = await acquire_meeting_slots(all_sids, targets=sid_targets, exec_paths=sid_paths,
+                                      mcp_paths=sid_mcps)
     if not adm:
         logger.error(f"Meeting {meeting_id}: denied — {adm.user_message}")
         for slug, cfg in agent_cfgs.items():
@@ -1075,7 +1112,7 @@ async def start_meeting(meeting_id: str) -> None:
             agent_slug,
             execution_path=agent_cfg.execution_path,
             user_sub=agent_cfg.user_sub or None,
-            role=getattr(agent_cfg.security_context, "role", "manager") or "manager",
+            role=getattr(agent_cfg.security_context, "role", roles.MANAGER) or roles.MANAGER,
             execution_target=agent_cfg.execution_target,
         )
         _meeting_session_layers[sid] = layer
@@ -1103,7 +1140,7 @@ async def start_meeting(meeting_id: str) -> None:
             _sessions[sid].update({
                 "is_task": True,
                 "is_meeting": True,
-                "client_type": "meeting",
+                "client_type": session_kind.MEETING.name,
                 "agent": agent_slug,
                 "last_active": now_iso(),
                 "meeting_id": meeting_id,
@@ -1169,7 +1206,7 @@ async def start_meeting(meeting_id: str) -> None:
         event_queue=event_queue,
         perm_queue=get_permission_queue(pump_session_id),
         scope=meeting["scope"],
-        source_type="meeting",
+        source_type=session_kind.MEETING.source_type,
     )
 
     producer_task = asyncio.create_task(
@@ -1188,7 +1225,7 @@ async def start_meeting(meeting_id: str) -> None:
     finally:
         _active_meetings.pop(meeting_id, None)
 
-        turns = task_store.get_meeting_turns(meeting_id)
+        turns = await run_db(task_store.get_meeting_turns, meeting_id)
         total_cost = sum(t.get("cost_usd", 0) for t in turns)
 
         for slug, sid in agent_sessions.items():
@@ -1204,15 +1241,17 @@ async def start_meeting(meeting_id: str) -> None:
         cleanup_session_permission_state(pump_session_id)
 
         # Extract moderator's final summary from the last moderator turn
-        meeting = task_store.get_meeting(meeting_id)
+        meeting = await run_db(task_store.get_meeting, meeting_id)
         moderator = (meeting or {}).get("moderator", "")
         mod_turns = [t for t in turns if t.get("agent") == moderator and t.get("content")]
         meeting_summary = mod_turns[-1]["content"] if mod_turns else ""
 
-        if meeting and meeting["status"] not in ("concluded", "failed"):
-            task_store.update_meeting(
-                meeting_id,
-                status="concluded",
+        # One conditional write: a row already failed or concluded keeps it.
+        if meeting:
+            await run_db(
+                task_store.update_meeting_if, meeting_id,
+                meeting_status.STATUSES - meeting_status.TERMINAL,
+                status=meeting_status.CONCLUDED,
                 concluded_at=now_iso(),
                 cost_usd=total_cost,
                 summary=meeting_summary[:5000],
@@ -1230,26 +1269,31 @@ async def start_meeting(meeting_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def end_meeting(meeting_id: str, agent_slug: str | None = None) -> dict:
-    meeting = task_store.get_meeting(meeting_id)
+    meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
         return {"error": "Meeting not found"}
-    if meeting["status"] not in ("active", "concluding", "paused"):
+    if meeting["status"] not in meeting_status.ENDABLE:
         return {"error": "Meeting not active"}
     if agent_slug and agent_slug != meeting["moderator"]:
         return {"error": "Only the moderator can end the meeting"}
-    task_store.update_meeting(meeting_id, status="concluding")
-    return {"status": "concluding", "meeting_id": meeting_id}
+    # The status may have moved since the read: the write is conditional.
+    if not await run_db(task_store.update_meeting_if, meeting_id, meeting_status.ENDABLE,
+                        status=meeting_status.CONCLUDING):
+        return {"error": "Meeting not active"}
+    return {"status": meeting_status.CONCLUDING, "meeting_id": meeting_id}
 
 
 async def leave_meeting(meeting_id: str, agent_slug: str, reason: str = "") -> dict:
-    meeting = task_store.get_meeting(meeting_id)
+    meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
         return {"error": "Meeting not found"}
-    if meeting["status"] not in ("active", "paused"):
+    if meeting["status"] not in meeting_status.LEAVABLE:
         return {"error": "Meeting not active"}
-    active = json.loads(meeting["active_participants"])
-    if agent_slug not in active:
+    if agent_slug not in json.loads(meeting["active_participants"]):
         return {"error": "Agent not in meeting"}
-    active.remove(agent_slug)
-    task_store.update_meeting(meeting_id, active_participants=json.dumps(active))
+    # Under the row's lock: two agents leaving at once both leave.
+    active = await run_db(task_store.remove_active_participant, meeting_id, agent_slug,
+                          meeting_status.LEAVABLE)
+    if active is None:
+        return {"error": "Meeting not active"}
     return {"status": "left", "meeting_id": meeting_id, "agent": agent_slug, "remaining": len(active)}

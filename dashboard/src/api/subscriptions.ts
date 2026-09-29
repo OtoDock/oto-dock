@@ -8,6 +8,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { WebhookSubscriptionStatus } from '../lib/status/webhookSubscription'
 
 export interface WebhookSubscription {
   id: string
@@ -18,26 +19,70 @@ export interface WebhookSubscription {
   provider_id: string
   account_label: string
   vendor_target: string
+  /** The manifest's `target_kinds` key the row registered as; '' = the
+   * default kind (every row made before kinds existed). */
+  target_kind?: string
   vendor_subscription_id: string | null
   selected_events: string[]
   selected_subevents: Record<string, string[]>
-  status:
-    | 'creating'
-    | 'active'
-    | 'failed'
-    | 'renew_failed'
-    | 'expired'
-    | 'disabled'
+  status: WebhookSubscriptionStatus
   last_error: string | null
   last_event_at: string | null
   event_count: number
   expires_at: string | null
   created_by: string
+  /** Display name of the creator: a service row may have been made by a
+   * co-manager rather than the bound account's owner. */
+  created_by_name?: string
   created_at: string
   updated_at: string
   /** 'vendor' = the vendor calls this install directly; 'relay' = events
    * arrive via the OtoDock relay (hosted delivery, no console steps). */
   delivery_mode: 'vendor' | 'relay'
+}
+
+/** A refused subscription request, with the HTTP status and the parsed
+ * `detail` so callers can act on it (409 exists / linked_triggers, 400
+ * missing_scopes) instead of parsing a message. */
+export class SubscriptionRequestError extends Error {
+  status: number
+  detail: Record<string, unknown> | string
+  constructor(status: number, detail: Record<string, unknown> | string, message: string) {
+    super(message)
+    this.name = 'SubscriptionRequestError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
+async function throwSubscriptionError(res: Response): Promise<never> {
+  const text = await res.text()
+  let detail: Record<string, unknown> | string = text || res.statusText
+  try {
+    const parsed = JSON.parse(text)
+    detail = parsed.detail ?? parsed
+  } catch {
+    // Not JSON — keep the raw text.
+  }
+  const message =
+    typeof detail === 'string'
+      ? detail
+      : typeof detail.message === 'string'
+        ? detail.message
+        : JSON.stringify(detail)
+  throw new SubscriptionRequestError(res.status, detail, message)
+}
+
+/** The triggers a 409 `linked_triggers` refusal listed, or []. */
+export function linkedTriggersOf(
+  err: unknown,
+): Array<{ id: string; name: string; scope: string }> {
+  if (!(err instanceof SubscriptionRequestError) || err.status !== 409) return []
+  const d = err.detail
+  if (typeof d === 'string' || d.error !== 'linked_triggers') return []
+  return Array.isArray(d.triggers)
+    ? (d.triggers as Array<{ id: string; name: string; scope: string }>)
+    : []
 }
 
 export interface WebhookEventCatalogEntry {
@@ -56,6 +101,17 @@ export interface WebhookEventCatalogEntry {
   resource_contains?: string
 }
 
+/** One way to register (GitHub: one repository, or every repository in an
+ * organization). Its fields replace the flat spec's while it is chosen. */
+export interface VendorTargetKind {
+  key: string
+  label: string
+  placeholder?: string
+  validation_regex?: string
+  help_text?: string
+  required_scopes?: string[]
+}
+
 export interface VendorTargetSpec {
   kind: 'free_text' | 'remote_list' | 'static_list'
   label: string
@@ -65,6 +121,8 @@ export interface VendorTargetSpec {
   static_options?: Array<{ value: string; label: string }>
   // remote_list details are server-side; the dashboard fetches via
   // `/v1/mcps/{name}/webhook-vendor-targets` when kind='remote_list'.
+  /** Absent or a single entry: the flat fields above are the whole story. */
+  target_kinds?: VendorTargetKind[]
 }
 
 export interface WebhookEventCatalogResponse {
@@ -92,6 +150,8 @@ export interface CreateSubscriptionRequest {
   selected_events: string[]
   selected_subevents?: Record<string, string[]>
   agent?: string // required for scope='service'
+  /** A `target_kinds` key; sent only when the manifest declares kinds. */
+  vendor_target_kind?: string
 }
 
 export interface SubscriptionFilters {
@@ -138,21 +198,7 @@ export const useCreateSubscription = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req),
       })
-      if (!res.ok) {
-        const text = await res.text()
-        let message = text || res.statusText
-        try {
-          const parsed = JSON.parse(text)
-          // Bubble structured errors (e.g. missing_scopes) to callers verbatim.
-          // The throw lives OUTSIDE this try — throwing in here would be
-          // swallowed by the catch and replaced with the raw JSON envelope.
-          const detail = parsed.detail ?? parsed
-          message = typeof detail === 'string' ? detail : JSON.stringify(detail)
-        } catch {
-          // Not JSON — keep the raw text.
-        }
-        throw new Error(message)
-      }
+      if (!res.ok) await throwSubscriptionError(res)
       return res.json() as Promise<WebhookSubscription>
     },
     onSuccess: () => {
@@ -164,11 +210,23 @@ export const useCreateSubscription = () => {
 export const useDeleteSubscription = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/subscriptions/${id}`, {
-        method: 'DELETE',
-      })
-      if (!res.ok) throw new Error(await res.text())
+    // Without `force` the server answers 409 while triggers still fire from
+    // the subscription (linkedTriggersOf reads them); with it the triggers
+    // are left without a source.
+    mutationFn: async ({
+      id,
+      force = false,
+    }: {
+      id: string
+      force?: boolean
+    }): Promise<{ deleted: boolean; vendor_detached?: boolean }> => {
+      const res = await apiFetch(
+        `/v1/subscriptions/${id}${force ? '?force=true' : ''}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) await throwSubscriptionError(res)
+      // vendor_detached=false: the row is gone, the vendor still holds the
+      // registration (an older proxy omits the key).
       return res.json()
     },
     onSuccess: () => {

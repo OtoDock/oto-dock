@@ -1,4 +1,7 @@
-FROM python:3.13-slim
+# The base pin follows VERSIONS.md (PYTHON_IMAGE); the build overlay passes
+# it as a build arg and a bare `docker build` falls back to the default.
+ARG PYTHON_IMAGE=python:3.13.14-slim-bookworm
+FROM ${PYTHON_IMAGE}
 
 # LibreOffice (Writer/Calc/Impress only — not the full metapackage)
 # WeasyPrint system deps: libpango, libharfbuzz, libgdk-pixbuf
@@ -16,7 +19,15 @@ RUN useradd -m -s /bin/bash mcp
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The headless browser of the app checks (render.py, APPS.md "Deploy
+# pipeline"): Chromium's headless shell, installed system-wide before USER
+# mcp so the runtime user can read it; --with-deps pulls the browser's
+# shared libraries through apt.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install --with-deps chromium-headless-shell \
+    && chmod -R a+rX /opt/ms-playwright \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pre-download the rembg background-removal model (avoids first-use delay +
 # any network at runtime). isnet-general-use = cleaner edges/hair than the

@@ -239,7 +239,8 @@ class TestTierDecision:
 
 
 # ---------------------------------------------------------------------------
-# canonical_tool_name — Codex's sanitized server keys map back to the manifest
+# The Codex layer's canonical_tool_name — its sanitized server keys map back
+# to the manifest, and its native tool names to the platform's
 # ---------------------------------------------------------------------------
 #
 # Codex names MCP tools for its PreToolUse hook with the server key sanitized
@@ -249,25 +250,51 @@ class TestTierDecision:
 # permission card in acceptEdits mode.
 
 
+def _canonical(name: str, session_id: str = "") -> str:
+    from core.layers.codex.layer import CodexCLIExecutionLayer
+    return CodexCLIExecutionLayer().canonical_tool_name(session_id, name)
+
+
 class TestCanonicalToolName:
     def test_sanitized_server_key_maps_to_the_manifest(self, manifests):
         manifests["meetings-mcp"] = _mk("meetings-mcp")
-        assert (mcp_permissions.canonical_tool_name("mcp__meetings_mcp__direct_to")
-                == "mcp__meetings-mcp__direct_to")
+        assert _canonical("mcp__meetings_mcp__direct_to") == "mcp__meetings-mcp__direct_to"
 
     def test_exact_server_name_and_non_mcp_tools_are_untouched(self, manifests):
         manifests["meetings-mcp"] = _mk("meetings-mcp")
         manifests["my_tools"] = _mk("my_tools")
-        assert (mcp_permissions.canonical_tool_name("mcp__meetings-mcp__direct_to")
-                == "mcp__meetings-mcp__direct_to")
-        assert mcp_permissions.canonical_tool_name("mcp__my_tools__go") == "mcp__my_tools__go"
-        assert mcp_permissions.canonical_tool_name("Bash") == "Bash"
-        assert mcp_permissions.canonical_tool_name("mcp__meetings_mcp") == "mcp__meetings_mcp"
+        assert _canonical("mcp__meetings-mcp__direct_to") == "mcp__meetings-mcp__direct_to"
+        assert _canonical("mcp__my_tools__go") == "mcp__my_tools__go"
+        assert _canonical("Bash") == "Bash"
+        assert _canonical("mcp__meetings_mcp") == "mcp__meetings_mcp"
 
     def test_unknown_server_stays_as_is(self, manifests):
-        assert mcp_permissions.canonical_tool_name("mcp__ghost_x__y") == "mcp__ghost_x__y"
+        assert _canonical("mcp__ghost_x__y") == "mcp__ghost_x__y"
 
     def test_server_name_override_is_the_key(self, manifests):
         manifests["gh"] = _mk("gh", server_name="github-mcp")
-        assert (mcp_permissions.canonical_tool_name("mcp__github_mcp__list_issues")
-                == "mcp__github-mcp__list_issues")
+        assert _canonical("mcp__github_mcp__list_issues") == "mcp__github-mcp__list_issues"
+
+    def test_a_known_session_restores_against_its_own_servers(self, manifests, monkeypatch):
+        """Two manifests whose names sanitise alike: a session that declared
+        one of them resolves to that one, never to whichever the registry
+        lists first."""
+        manifests["a-b"] = _mk("a-b")
+        manifests["a_b"] = _mk("a_b", server_name="a.b")
+        from core.layers.codex import session as codex_session
+        sess = codex_session.CodexAppServerSession(
+            session_id="11111111-2222-4333-8444-555555555555", agent_name="pa",
+            model="gpt-6", sandbox_mode="workspace-write", working_dir="",
+            config_dir="/tmp/x", mcp_server_names=["a.b"],
+        )
+        monkeypatch.setitem(codex_session._codex_sessions, sess.session_id, sess)
+        assert _canonical("mcp__a_b__go", sess.session_id) == "mcp__a.b__go"
+        assert _canonical("mcp__a_b__go") == "mcp__a-b__go"
+
+    def test_native_names_map_to_the_platforms(self):
+        assert _canonical("commandExecution") == "Bash"
+        assert _canonical("exec_command") == "Bash"
+        assert _canonical("fileChange") == "apply_patch"
+        assert _canonical("update_plan") == "TodoWrite"
+        assert _canonical("webSearch") == "web_search"
+        assert _canonical("request_user_input") == "request_user_input"

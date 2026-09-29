@@ -250,7 +250,7 @@ def test_knowledge_dir_ignores_user_role():
 
 
 # ---------------------------------------------------------------------------
-# resolve_role: editor now in _PRIVILEGED
+# resolve_role: editor in WORKSPACE_TIER
 # ---------------------------------------------------------------------------
 
 
@@ -789,3 +789,13 @@ def test_parse_path_env_mixed_shorthand_and_multi():
     result = _parse_path_env(raw, "test-mcp")
     assert result["IMAGE_SAVE_DIR"].is_multi is False
     assert result["ALLOWED_FILE_DIRS"].is_multi is True
+
+
+def test_shared_workspace_contributor_user_scoped():
+    """The workspace tier resolves /workspace; a viewer still gets nothing."""
+    assert resolve_role("shared_workspace", username="alice", user_role="contributor") == "/workspace"
+    assert resolve_role("shared_workspace", username="alice", user_role="viewer") == ""
+
+
+def test_config_contributor_user_scoped_empty():
+    assert resolve_role("config", username="alice", user_role="contributor") == ""

@@ -104,6 +104,45 @@ def _request_with_bearer(token: str) -> Request:
     return Request(scope)
 
 
+def _request_with_cookie(token: str) -> Request:
+    scope = {
+        "type": "http", "method": "GET", "path": "/", "query_string": b"",
+        "headers": [(b"cookie", f"session={token}".encode())],
+    }
+    return Request(scope)
+
+
+class TestPrincipalResolution:
+    """The reads behind a principal run on the DB executor and happen once
+    per connection (the memo on ``request.state``)."""
+
+    @pytest.mark.asyncio
+    async def test_cookie_principal_resolves_off_loop_and_once(self, temp_db, loop_db_guard, monkeypatch):
+        from auth.providers import create_session_jwt
+        from storage import database as task_store
+        token = create_session_jwt("user-admin", "admin@test.com", "Admin User", "admin")
+        req = _request_with_cookie(token)
+        with loop_db_guard.active():
+            u = await get_current_user(req)
+        assert u is not None and u.sub == "user-admin" and not u.is_api_key
+
+        def boom(*a, **kw):
+            raise AssertionError("resolved twice on one request")
+
+        monkeypatch.setattr(task_store, "get_user", boom)
+        assert await get_current_user(req) is u
+        # A fresh request resolves again (the memo is per connection).
+        with pytest.raises(AssertionError):
+            await get_current_user(_request_with_cookie(token))
+
+    @pytest.mark.asyncio
+    async def test_session_token_principal_resolves_off_loop(self, temp_db, loop_db_guard):
+        token = create_session_token(str(uuid.uuid4()), "support", "user-admin")
+        with loop_db_guard.active():
+            u = await get_current_user(_request_with_bearer(token))
+        assert u is not None and u.sub == "user-admin" and u.is_api_key
+
+
 class TestPrincipal:
     @pytest.mark.asyncio
     async def test_no_user_token_with_claim_is_external(self, temp_db):

@@ -54,7 +54,7 @@ def _resp_401_json() -> MagicMock:
 def _resolve(sub_id: str, cred: dict, resp: MagicMock, provider: str = "openai"):
     """One refresh attempt through _resolve_oauth_access_token."""
     post_target = (
-        "services.engines.subscription_pool.requests.post"
+        "core.layers.codex.oauth.requests.post"
         if provider == "openai" else "httpx.post"
     )
     with patch("services.engines.subscription_pool.subscription_store") as store, \
@@ -152,7 +152,7 @@ def test_replacement_mid_attempt_discards_verdict_and_streak():
     cred_old = {"oauth_token": _oauth("ort-old")}
     cred_new = {"oauth_token": _oauth("ort-new", runway_s=7200)}
     with patch("services.engines.subscription_pool.subscription_store") as store, \
-            patch("services.engines.subscription_pool.requests.post",
+            patch("core.layers.codex.oauth.requests.post",
                   return_value=_resp_401_json()):
         # Two reads inside _resolve: the under-lock re-read (old blob), then
         # the post-failure ownership check (replacement landed).
@@ -163,3 +163,17 @@ def test_replacement_mid_attempt_discards_verdict_and_streak():
     assert token == "oat-stored"  # the replacement's still-valid token
     store.update_subscription.assert_not_called()
     assert "st-swap" not in sp._auth_fail_streaks
+
+
+def test_a_login_on_the_wrong_engine_is_never_sent_to_its_vendor():
+    """A 1.6.1 exchange could store an OpenAI login on the Claude engine:
+    the refresh must not post that refresh token to Anthropic."""
+    sub = {"id": "sub-wrong-engine", "layer": "claude-code-cli", "provider": "openai",
+           "auth_type": "oauth", "owner_type": "platform"}
+    with patch("httpx.post") as post, patch("core.layers.codex.oauth.requests.post") as rpost, \
+         patch("services.engines.subscription_pool.subscription_store") as store:
+        token, terminal = sp._refresh_oauth_token(sub, "ort-openai", {"oauth_token": _oauth()})
+    assert (token, terminal) == (None, False)
+    post.assert_not_called()
+    rpost.assert_not_called()
+    store.update_credential_data.assert_not_called()

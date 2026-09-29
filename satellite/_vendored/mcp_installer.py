@@ -7,7 +7,7 @@ Single source of truth for:
 - Installing Node/Python packages into a self-contained MCP directory
   (`node_modules/` or `venv/`), reading back the concrete installed version so
   the caller can pin it into the local manifest.
-- Applying patch-package patches for Node MCPs.
+- Applying the patches a Node MCP ships (``patches/*.patch``) with git.
 - Checking and optionally installing system-level dependencies (libmagic,
   libreoffice, etc.) declared in the manifest's `system_requirements`.
 - Computing a stable `version_hash` over install-relevant inputs so the
@@ -59,6 +59,9 @@ _PY_FLOOR_RE = re.compile(
     r"Python(>=\s*\d+(?:\.\d+)?(?:\s*,\s*<\s*\d+(?:\.\d+)?)?)"
 )
 
+# A distro package name (dpkg, rpm, pacman and brew all fit).
+_SYSTEM_PKG_RE = re.compile(r"[a-z0-9][a-z0-9+.@_-]*")
+
 
 def _shell_argv(cmd: list[str]) -> list[str]:
     """Wrap an argv for cross-platform ``asyncio.create_subprocess_exec``.
@@ -75,6 +78,95 @@ def _shell_argv(cmd: list[str]) -> list[str]:
     if sys.platform == "win32":
         return ["cmd", "/c", *cmd]
     return cmd
+
+
+# ---------------------------------------------------------------------------
+# The environment every install subprocess gets
+# ---------------------------------------------------------------------------
+
+# An allowlist, not a denylist: the process that runs the installer holds the
+# platform's secrets (the proxy) or a machine's (a satellite), and a package
+# manager or a build backend must see none of them. Names are compared
+# case-insensitively (Windows). Package-manager names are listed one by one:
+# a prefix would admit index credentials and build-steering knobs unreviewed.
+_INSTALL_ENV_NAMES = frozenset(name.upper() for name in (
+    # runtime
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL",
+    "LC_CTYPE", "TERM", "TZ", "TMPDIR", "TEMP", "TMP", "PWD",
+    "SystemRoot", "windir", "SystemDrive", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "ProgramData", "ProgramFiles", "ProgramFiles(x86)",
+    "ProgramW6432", "ComSpec", "PATHEXT", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+    "PYTHONIOENCODING", "PYTHONUTF8",
+    # network and trust
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO",
+    # package managers, by exact name
+    "UV_CACHE_DIR", "UV_INDEX_URL", "UV_EXTRA_INDEX_URL", "UV_OFFLINE",
+    "UV_NATIVE_TLS", "UV_HTTP_TIMEOUT",
+    "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST", "PIP_CACHE_DIR",
+    "NPM_CONFIG_REGISTRY", "NPM_CONFIG_CACHE", "NPM_CONFIG_CAFILE",
+    "NPM_CONFIG_STRICT_SSL", "XDG_CACHE_HOME",
+))
+
+
+def _install_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment for a package manager, a build backend or git run by
+    the installer: the allowlisted names of the parent, no configuration
+    file of any of them, and ``extra`` on top."""
+    env = {k: v for k, v in os.environ.items() if k.upper() in _INSTALL_ENV_NAMES}
+    env.update({
+        "UV_NO_CONFIG": "1",
+        "PIP_CONFIG_FILE": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    })
+    if extra:
+        env.update(extra)
+    return env
+
+
+async def _apply_patches(
+    mcp_dir: Path, patches: list[Path], env: dict[str, str], timeout: int,
+) -> tuple[bool, str]:
+    """Apply ``patches`` (git-format diffs rooted at ``mcp_dir``) with the
+    platform's own git; never an executable the package or a registry
+    provides. Git may not discover a repository above the MCP folder (a
+    bare-metal install keeps ``mcps/`` under the platform checkout, where an
+    in-tree run skips every path outside its prefix with exit 0), reads no
+    configuration (see ``_install_env``), and a patch already present in
+    ``node_modules`` (a re-install) is skipped rather than failed."""
+    git = shutil.which("git")
+    if not git:
+        return False, "this MCP ships patches, which need git on this machine"
+    git_env = {**env, "GIT_CEILING_DIRECTORIES": str(mcp_dir.parent)}
+    log: list[str] = []
+
+    async def _git(*args: str) -> tuple[int, str]:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                git, "apply", *args, cwd=str(mcp_dir), env=git_env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            ),
+            timeout=timeout,
+        )
+        out, _ = await proc.communicate()
+        return proc.returncode, out.decode(errors="replace")
+
+    for patch in patches:
+        rel = f"patches/{patch.name}"
+        rc, _out = await _git("-R", "--check", rel)
+        if rc == 0:
+            log.append(f"{patch.name}: already applied")
+            continue
+        rc, out = await _git("--verbose", "--whitespace=nowarn", rel)
+        log.append(out.strip())
+        if rc != 0 or "Skipped patch" in out:
+            log.append(f"{patch.name}: not applied")
+            return False, "\n".join(log)
+    return True, "\n".join(log)
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +472,11 @@ def install_system_requirements(
     family, pkgs = _packages_for_host(req)
     if not family or not pkgs:
         return True, ""
+    # Manifest content reaches a privileged package manager here: a name is a
+    # name, never an option or a list.
+    bad = [p for p in pkgs if not isinstance(p, str) or not _SYSTEM_PKG_RE.fullmatch(p)]
+    if bad:
+        return False, f"Invalid system package name(s): {bad}"
     missing = [p for p in pkgs if not _is_package_installed(family, p)]
     if not missing:
         return True, "All system requirements satisfied."
@@ -389,11 +486,11 @@ def install_system_requirements(
 
     cmd: list[str]
     if family in ("debian", "ubuntu"):
-        cmd = ["sudo", "apt", "install", "-y", *missing]
+        cmd = ["sudo", "apt", "install", "-y", "--", *missing]
     elif family == "rhel":
-        cmd = ["sudo", "dnf", "install", "-y", *missing]
+        cmd = ["sudo", "dnf", "install", "-y", "--", *missing]
     elif family == "arch":
-        cmd = ["sudo", "pacman", "-S", "--noconfirm", *missing]
+        cmd = ["sudo", "pacman", "-S", "--noconfirm", "--", *missing]
     elif family == "macos_brew":
         cmd = ["brew", "install", *missing]
     else:
@@ -460,36 +557,29 @@ def _node_installed_version(mcp_dir: Path, pkg_name: str) -> str:
         return ""
 
 
-async def _python_installed_version(
-    venv_dir: Path, dist: str, *, timeout: int = 15,
-) -> str:
+def _python_installed_version(venv_dir: Path, dist: str) -> str:
     """Concrete version of distribution ``dist`` installed in ``venv_dir``.
 
-    Queries the venv's own interpreter (the proxy's ``importlib.metadata`` can't
-    see venv site-packages) via the cross-platform interpreter path
-    (``Scripts/python.exe`` on Windows satellites). ``dist`` is the PyPI package
-    name; ``importlib.metadata`` normalizes dash/underscore/case. Returns ``""``
-    on any error (never raises) — the caller logs + skips pinning.
+    Read from the venv's ``*.dist-info`` metadata in THIS process: the venv's
+    own interpreter is never started by the installer (its site hooks would
+    be third-party code running outside any sandbox). Both venv layouts are
+    searched (``lib/pythonX.Y/site-packages``, Windows ``Lib/site-packages``);
+    ``importlib.metadata`` normalizes dash, underscore and case. Returns
+    ``""`` on any miss (never raises); the caller logs + skips pinning.
     """
-    py = venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"
-    if not py.is_file():
+    import importlib.metadata as metadata
+    paths = [
+        str(p) for pattern in ("lib/python*/site-packages", "Lib/site-packages")
+        for p in venv_dir.glob(pattern) if p.is_dir()
+    ]
+    if not paths:
         return ""
-    code = (
-        "import importlib.metadata as m, sys\n"
-        f"sys.stdout.write(m.version({dist!r}))\n"
-    )
     try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                str(py), "-c", code,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            ),
-            timeout=timeout,
-        )
-        out, _ = await proc.communicate()
-        return out.decode(errors="replace").strip() if proc.returncode == 0 else ""
-    except (OSError, asyncio.TimeoutError):
+        for found in metadata.Distribution.discover(name=dist, path=paths):
+            return str(found.version or "")
+    except Exception:
         return ""
+    return ""
 
 
 async def install_mcp(
@@ -501,18 +591,24 @@ async def install_mcp(
     uv_bin: str | None = None,
     python_bin: str = "python3",
     timeout: int = DEFAULT_INSTALL_TIMEOUT,
+    source_build: list[str] | None = None,
 ) -> InstallResult:
     """Install or update an MCP's Node/Python dependencies in-place.
 
     - Node: ensures `package.json` exists, runs `npm install --omit=dev`,
-      applies `patch-package` if `patches/*.patch` present.
-    - Python: creates `venv/` and installs via `uv pip install` (preferred)
-      or `venv/bin/pip` (fallback). When uv needs to fetch a Python version
-      that differs from system Python, it installs it under the platform's
-      `mcps/.uv-python/` (via ``UV_PYTHON_INSTALL_DIR``) so the interpreter
-      lives inside the already-sandbox-mounted `mcps/` tree — keeping every
-      MCP self-contained and the sandbox free of any user-home leakage.
+      applies the shipped `patches/*.patch` with git.
+    - Python: recreates `venv/` and installs via `uv pip install` (preferred)
+      or `venv/bin/pip` (fallback). A `pypi:` source installs wheels only;
+      `source_build` names the packages the manifest allows to build from
+      source. When uv needs to fetch a Python version that differs from
+      system Python, it installs it under the platform's `mcps/.uv-python/`
+      (via ``UV_PYTHON_INSTALL_DIR``) so the interpreter lives inside the
+      already-sandbox-mounted `mcps/` tree, keeping every MCP
+      self-contained and the sandbox free of any user-home leakage.
     - Docker: returns success with a note (build/run is a separate flow).
+
+    Every subprocess runs under ``_install_env``: the parent's secrets never
+    reach a package manager or a build backend.
 
     `progress_cb` receives `{phase, pct, message}` dicts (both sync and
     async callables supported) so the satellite can stream them over WS.
@@ -529,11 +625,10 @@ async def install_mcp(
     # without them, `uv venv` fails with "Failed to create Python
     # executable link ... .tmpXXX". Copy mode is slightly slower but
     # works on every OS without extra system privileges.
-    uv_env = {
-        **os.environ,
+    env = _install_env({
         "UV_PYTHON_INSTALL_DIR": str(uv_python_dir),
         "UV_LINK_MODE": "copy",
-    }
+    })
 
     if runtime == "node" and source.startswith("npm:"):
         parsed = parse_source(source)
@@ -571,6 +666,7 @@ async def install_mcp(
                 cwd=str(mcp_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             ),
             timeout=timeout,
         )
@@ -580,18 +676,17 @@ async def install_mcp(
             await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "npm install failed", "error": log})
             return InstallResult(ok=False, log=log)
 
-        # Apply patches if present
+        # Shipped patches, applied by git (never by an executable the package
+        # or a registry provides).
         patches_dir = mcp_dir / "patches"
-        if patches_dir.is_dir() and any(patches_dir.glob("*.patch")):
-            await _emit(progress_cb, {"mcp": name, "phase": "npm", "pct": 80, "message": "patch-package"})
-            npx = await asyncio.create_subprocess_exec(
-                *_shell_argv(["npx", "patch-package"]),
-                cwd=str(mcp_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            patch_out, _ = await npx.communicate()
-            log += "\n" + patch_out.decode(errors="replace")
+        patches = sorted(patches_dir.glob("*.patch")) if patches_dir.is_dir() else []
+        if patches:
+            await _emit(progress_cb, {"mcp": name, "phase": "npm", "pct": 80, "message": "patches"})
+            patched, patch_log = await _apply_patches(mcp_dir, patches, env, timeout)
+            log += "\n" + patch_log
+            if not patched:
+                await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "patches failed", "error": log})
+                return InstallResult(ok=False, log=log)
 
         # Read back the concrete installed version. A successful npm install
         # always writes node_modules/<pkg>/package.json, so an empty readback is
@@ -621,13 +716,21 @@ async def install_mcp(
             upgrade = False
         else:
             pip_pkg = source[5:].replace("@", "==", 1)  # "ha-mcp@6.6.1" -> "ha-mcp==6.6.1"
-            # Unpinned "pypi:pkg" → bare requirement (no "=="). Without --upgrade,
-            # a re-install over a PRESERVED venv is a no-op against the satisfied
-            # requirement and would keep + re-pin the STALE version. A pinned
-            # "pkg==X.Y.Z" needs no flag (exact forces it) and must NOT float
-            # transitive deps on the satellite.
+            # Unpinned "pypi:pkg" → bare requirement (no "=="); the venv is
+            # fresh, so --upgrade only keeps the resolver honest about
+            # cached wheels. A pinned "pkg==X.Y.Z" needs no flag (exact
+            # forces it) and must NOT float transitive deps on the satellite.
             upgrade = "==" not in pip_pkg
         venv_dir = mcp_dir / "venv"
+        # A catalog package installs from wheels only: no build backend of a
+        # source distribution ever runs here, except for the packages the
+        # manifest names in ``source_build``. A git source builds by
+        # definition (an explicit admin install; never the weekly job).
+        binary_flags: list[str] = []
+        if source.startswith("pypi:"):
+            binary_flags.append("--only-binary=:all:")
+            for allowed in source_build or []:
+                binary_flags.extend(["--no-binary", allowed])
 
         async def _create_venv(python_spec: str | None) -> tuple[bool, str]:
             """Create venv. ``python_spec`` like ``>=3.13`` or ``None`` for default."""
@@ -638,13 +741,11 @@ async def install_mcp(
                 if python_spec:
                     cmd.extend(["--python", python_spec])
                 cmd.append(str(venv_dir))
-                env = uv_env
             else:
                 if python_spec:
                     return False, f"python {python_spec} required but uv not available"
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": "python -m venv"})
                 cmd = [python_bin, "-m", "venv", str(venv_dir)]
-                env = None
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
                     *cmd, cwd=str(mcp_dir),
@@ -665,12 +766,10 @@ async def install_mcp(
             if uv_bin and os.path.isfile(uv_bin):
                 cmd = [uv_bin, "pip", "install",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
-                       *upgrade_flag, pip_pkg]
-                env = uv_env
+                       *binary_flags, *upgrade_flag, pip_pkg]
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
-                       "install", *upgrade_flag, pip_pkg]
-                env = None
+                       "install", "--isolated", *binary_flags, *upgrade_flag, pip_pkg]
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
                     *cmd, cwd=str(mcp_dir),
@@ -682,12 +781,17 @@ async def install_mcp(
             out, _ = await proc.communicate()
             return proc.returncode == 0, out.decode(errors="replace")
 
-        if not venv_dir.is_dir():
-            ok, venv_log = await _create_venv(None)
-            if not ok:
-                log = f"venv creation failed:\n{venv_log}"
-                await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "venv failed", "error": log})
-                return InstallResult(ok=False, log=log)
+        # Always a fresh venv: the package manager probes the venv's
+        # interpreter, and a preserved venv would run the previous install's
+        # site hooks on the host. The caller's whole-dir backup restores the
+        # old venv when the install fails. A venv holds thousands of files,
+        # so it is removed off the event loop.
+        await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
+        ok, venv_log = await _create_venv(None)
+        if not ok:
+            log = f"venv creation failed:\n{venv_log}"
+            await _emit(progress_cb, {"mcp": name, "phase": "failed", "pct": 100, "message": "venv failed", "error": log})
+            return InstallResult(ok=False, log=log)
 
         await _emit(progress_cb, {"mcp": name, "phase": "pip", "pct": 50, "message": f"pip install {pip_pkg}"})
         ok, log = await _pip_install()
@@ -701,7 +805,7 @@ async def install_mcp(
             if m:
                 python_spec = m.group(1).replace(" ", "")
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30, "message": f"retry with Python{python_spec}"})
-                shutil.rmtree(venv_dir, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
                 ok, venv_log = await _create_venv(python_spec)
                 if ok:
                     ok, log = await _pip_install()
@@ -716,7 +820,7 @@ async def install_mcp(
         if ok and source.startswith("pypi:"):
             parsed = parse_source(source)
             if parsed:
-                resolved = await _python_installed_version(venv_dir, parsed.package)
+                resolved = _python_installed_version(venv_dir, parsed.package)
                 if not resolved:
                     log += f"\nInstalled {parsed.package} but could not read its version back; leaving manifest unpinned."
 
@@ -750,19 +854,17 @@ async def install_mcp(
             # builds a clean venv WITHOUT ensurepip — uv manages pip ops
             # natively, so the broken step is sidestepped. Falls back to
             # `python -m venv` only if uv isn't bundled (shouldn't happen on
-            # any supported satellite, but defensive). The uv_env carries
+            # any supported satellite, but defensive). The install env carries
             # UV_LINK_MODE=copy so the python.exe link step also works
             # without Windows Developer Mode / admin.
             if uv_bin and os.path.isfile(uv_bin):
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
                                            "message": "uv venv"})
                 cmd = [uv_bin, "venv", str(venv_dir)]
-                env = uv_env
             else:
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
                                            "message": "python -m venv"})
                 cmd = [python_bin, "-m", "venv", str(venv_dir)]
-                env = None
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
                     *cmd, cwd=str(mcp_dir),
@@ -785,11 +887,9 @@ async def install_mcp(
                 cmd = [uv_bin, "pip", "install",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
                        "-r", str(req_file)]
-                env = uv_env
             else:
                 cmd = [str(venv_dir / _VENV_BIN_DIR / f"pip{_EXE_SUFFIX}"),
-                       "install", "-r", str(req_file)]
-                env = None
+                       "install", "--isolated", "-r", str(req_file)]
             proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
                     *cmd, cwd=str(mcp_dir),
@@ -818,14 +918,14 @@ async def install_mcp(
                 python_spec = m.group(1).replace(" ", "")
                 await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 30,
                                            "message": f"retry with Python{python_spec}"})
-                shutil.rmtree(venv_dir, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, venv_dir, ignore_errors=True)
                 proc = await asyncio.wait_for(
                     asyncio.create_subprocess_exec(
                         uv_bin, "venv", "--python", python_spec, str(venv_dir),
                         cwd=str(mcp_dir),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.STDOUT,
-                        env=uv_env,
+                        env=env,
                     ),
                     timeout=timeout,
                 )

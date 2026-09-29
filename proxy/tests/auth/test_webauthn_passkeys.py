@@ -5,7 +5,8 @@ monkeypatch its two verify functions and cover OUR contract: the https
 feature gate, single-use short-lived challenges, password-confirmed
 management, credential storage/ownership, sign-count + last-used updates,
 session issuance on login, and the require-2FA interplay (a registered
-passkey satisfies the policy).
+passkey satisfies the policy, and under it a password login is sent to the
+passkey step in either passkey mode).
 """
 
 from types import SimpleNamespace
@@ -233,17 +234,91 @@ def test_cannot_touch_someone_elses_passkey(monkeypatch):
 
 
 def test_registered_passkey_satisfies_require_2fa(monkeypatch):
+    """Under Require 2FA a registered passkey is the account's second factor,
+    so in passwordless mode too the password alone opens no session: the
+    login is sent to the second-factor step offering the passkey, and the
+    passkey ceremony opens the session."""
+    from auth import providers
     sub = _mk_user()
     db.set_platform_setting("require_2fa", "1")
+    providers.clear_auth_gate_caches()
     clear_rate_limit("login", "testclient")
 
     login = client.post("/auth/login/local", json={"email": _EMAIL, "password": _PW}).json()
     assert login["user"]["must_enroll_2fa"] is True
 
-    _register(monkeypatch, sub)
-    login = client.post("/auth/login/local", json={"email": _EMAIL, "password": _PW}).json()
-    assert "must_enroll_2fa" not in login["user"]
+    cred_id = _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    client.cookies.clear()
+    assert client.get("/auth/config").json()["passkey_login_mode"] == "passwordless"
+
+    resp = client.post("/auth/login/local", json={"email": _EMAIL, "password": _PW})
+    assert resp.status_code == 200
+    login = resp.json()
+    assert login["requires_2fa"] is True
+    assert login["second_factors"] == ["passkey"]
+    assert "user" not in login
+    assert "session" not in resp.cookies
+    assert client.get("/auth/me").status_code == 401
+
+    step = login["totp_session_token"]
+    data = client.post("/auth/passkey/options", json={"totp_session_token": step}).json()
+    assert data["options"]["allowCredentials"]
+    monkeypatch.setattr(wa, "verify_authentication_response",
+                        lambda **kw: SimpleNamespace(new_sign_count=1))
+    resp = client.post("/auth/passkey/verify", json={
+        "state": data["state"], "credential": {"id": cred_id},
+        "totp_session_token": step,
+    })
+    assert resp.status_code == 200
+    assert "session" in resp.cookies
+    assert resp.json()["user"]["must_enroll_2fa"] is False
     assert client.get("/auth/me").json()["user"]["must_enroll_2fa"] is False
+
+
+def test_require_2fa_with_passkeys_disabled_holds_for_totp_enrolment(monkeypatch):
+    """Without an https public URL the login cannot run a passkey ceremony,
+    so a passkey holder is not sent to a passkey step: the session is issued
+    and held for TOTP enrolment by the gate."""
+    from auth import providers
+    sub = _mk_user()
+    _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "http://192.168.1.10:8400")
+    db.set_platform_setting("require_2fa", "1")
+    providers.clear_auth_gate_caches()
+    clear_rate_limit("login", "testclient")
+    client.cookies.clear()
+
+    resp = client.post("/auth/login/local", json={"email": _EMAIL, "password": _PW})
+    assert resp.status_code == 200
+    login = resp.json()
+    assert "requires_2fa" not in login
+    assert "second_factors" not in login
+    assert login["user"]["must_enroll_2fa"] is True
+    assert "session" in resp.cookies
+    assert client.get("/auth/me").json()["user"]["must_enroll_2fa"] is True
+
+
+def test_a_passkey_holders_password_login_is_full_without_require_2fa(monkeypatch):
+    """Require 2FA off, passwordless mode: nothing asks for a second factor,
+    so a passkey holder's password login still opens the session."""
+    from auth import providers
+    sub = _mk_user()
+    _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    db.set_platform_setting("require_2fa", "0")
+    providers.clear_auth_gate_caches()
+    clear_rate_limit("login", "testclient")
+    client.cookies.clear()
+
+    resp = client.post("/auth/login/local", json={"email": _EMAIL, "password": _PW})
+    assert resp.status_code == 200
+    login = resp.json()
+    assert "requires_2fa" not in login
+    assert login["user"]["must_enroll_2fa"] is False
+    assert "session" in resp.cookies
+    assert client.get("/auth/me").json()["user"]["email"] == _EMAIL
 
 
 def test_credentials_cascade_on_user_delete(monkeypatch):
@@ -253,33 +328,88 @@ def test_credentials_cascade_on_user_delete(monkeypatch):
     assert webauthn_store.get_credential(cred_id) is None
 
 
+def _native_token(monkeypatch, cred_id: str, handoff: str) -> str:
+    """The system browser's leg: the ceremony with native=true and the
+    WebView's nonce."""
+    browser = TestClient(app)
+    state = browser.post("/auth/passkey/options").json()["state"]
+    monkeypatch.setattr(wa, "verify_authentication_response",
+                        lambda **kw: SimpleNamespace(new_sign_count=1))
+    resp = browser.post("/auth/passkey/verify", json={
+        "state": state, "credential": {"id": cred_id}, "native": True, "handoff": handoff,
+    })
+    assert resp.status_code == 200, resp.text
+    assert "user" not in resp.json()
+    assert "session" not in resp.cookies  # the system browser stays logged out
+    return resp.json()["native_token"]
+
+
 def test_native_handoff_token_exchange(monkeypatch):
-    """Native-app flow: verify with native=true mints a one-time token (no
-    cookie for the system browser); the webview exchanges it for a session."""
+    """Native-app flow: the WebView starts the handoff (a nonce in its own
+    cookie), the system browser's verify mints a one-time token bound to that
+    nonce, and only the starting WebView exchanges it for a session."""
     sub = _mk_user()
     cred_id = _register(monkeypatch, sub)
     app.dependency_overrides.pop(get_current_user, None)
 
-    state = client.post("/auth/passkey/options").json()["state"]
-    monkeypatch.setattr(wa, "verify_authentication_response",
-                        lambda **kw: SimpleNamespace(new_sign_count=1))
-    resp = client.post("/auth/passkey/verify", json={
-        "state": state, "credential": {"id": cred_id}, "native": True,
-    })
-    assert resp.status_code == 200
-    token = resp.json()["native_token"]
-    assert token
-    assert "user" not in resp.json()
-    assert "session" not in resp.cookies  # the system browser stays logged out
+    webview = TestClient(app)
+    start = webview.post("/auth/passkey/native/start")
+    assert start.status_code == 200
+    handoff = start.json()["handoff"]
+    assert webview.cookies.get("pk_handoff") == handoff
+    token = _native_token(monkeypatch, cred_id, handoff)
 
-    resp = client.post("/auth/passkey/native/exchange", json={"token": token})
+    resp = webview.post("/auth/passkey/native/exchange", json={"token": token})
     assert resp.status_code == 200
     assert resp.json()["user"]["email"] == _EMAIL
     assert "session" in resp.cookies
+    assert not webview.cookies.get("pk_handoff")  # the nonce is spent
 
     # Single-use: a replayed token is dead.
-    resp = client.post("/auth/passkey/native/exchange", json={"token": token})
+    resp = webview.post("/auth/passkey/native/exchange", json={"token": token})
     assert resp.status_code == 401
+
+
+def test_the_handoff_token_needs_the_starting_webview(monkeypatch):
+    """A token minted for a nonce is
+    refused to a browser that does not hold that nonce."""
+    sub = _mk_user()
+    cred_id = _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    starter = TestClient(app)
+    handoff = starter.post("/auth/passkey/native/start").json()["handoff"]
+    token = _native_token(monkeypatch, cred_id, handoff)
+
+    other = TestClient(app)
+    other.post("/auth/passkey/native/start")   # a nonce of its own, not this one
+    resp = other.post("/auth/passkey/native/exchange", json={"token": token})
+    assert resp.status_code == 401 and "session" not in resp.cookies
+
+
+def test_the_nonce_ring_keeps_two_sign_ins_apart(monkeypatch):
+    sub = _mk_user()
+    cred_id = _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    webview = TestClient(app)
+    first = webview.post("/auth/passkey/native/start").json()["handoff"]
+    second = webview.post("/auth/passkey/native/start").json()["handoff"]
+    assert webview.cookies.get("pk_handoff") == f"{first}.{second}"
+    token = _native_token(monkeypatch, cred_id, first)
+    assert webview.post("/auth/passkey/native/exchange", json={"token": token}).status_code == 200
+    assert webview.cookies.get("pk_handoff") == second
+
+
+def test_a_native_verify_without_a_handoff_is_refused(monkeypatch):
+    sub = _mk_user()
+    cred_id = _register(monkeypatch, sub)
+    app.dependency_overrides.pop(get_current_user, None)
+    browser = TestClient(app)
+    state = browser.post("/auth/passkey/options").json()["state"]
+    monkeypatch.setattr(wa, "verify_authentication_response",
+                        lambda **kw: SimpleNamespace(new_sign_count=1))
+    resp = browser.post("/auth/passkey/verify", json={
+        "state": state, "credential": {"id": cred_id}, "native": True})
+    assert resp.status_code == 400 and "start the sign-in again" in resp.json()["detail"]
 
 
 def test_registration_and_login_options_require_uv():
@@ -385,7 +515,7 @@ def test_passwordless_mode_offers_passkey_at_totp_step(monkeypatch):
 
 def test_native_exchange_rejects_expired_and_garbage(monkeypatch):
     sub = _mk_user()
-    wa._native_tokens["stale-token"] = (sub, 0.0)  # already expired
+    wa._native_tokens["stale-token"] = (sub, "n" * 32, 0.0)  # already expired
     for tok in ("stale-token", "garbage"):
         resp = client.post("/auth/passkey/native/exchange", json={"token": tok})
         assert resp.status_code == 401

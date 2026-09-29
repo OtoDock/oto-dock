@@ -11,6 +11,7 @@ import { useAuth } from '../../contexts/AuthContext'
 import { canManageAgent } from '../../lib/permissions'
 import { CreateTriggerModal, EditTriggerModal, FireTestModal } from './AgentTriggers.modals'
 import { AgentApiKeysSection } from './AgentTriggers.apiKeys'
+import { TaskModelChip, linkedTaskModel } from '../../components/common/TaskModelChip'
 
 type ScopeFilter = 'all' | 'user' | 'agent'
 type StatusFilter = 'all' | 'active' | 'paused'
@@ -239,10 +240,23 @@ function TriggerRow({ trigger }: { trigger: Trigger }) {
         <div>
           <span className="text-p-text-light">Action</span>
           <p className="text-p-text">
-            {trigger.task_id ? `Task: ${trigger.task_name ?? trigger.task_id.slice(0, 8)}` : ''}
-            {trigger.task_id && trigger.notify_enabled ? ' + ' : ''}
+            {trigger.task_id ? (
+              <>
+                Task: {trigger.task_name ?? trigger.task_id.slice(0, 8)}
+                {trigger.task_effective_model ? (
+                  <>{' '}<TaskModelChip task={linkedTaskModel(trigger)} /></>
+                ) : null}
+              </>
+            ) : ''}
+            {trigger.app_id ? (
+              <>
+                App: <a href={`/apps/${trigger.app_id}`} className="text-brand hover:underline">{trigger.app_title ?? trigger.app_slug}</a>
+                {' → '}<code className="font-mono text-[11px]">{trigger.handler}</code>
+              </>
+            ) : ''}
+            {(trigger.task_id || trigger.app_id) && trigger.notify_enabled ? ' + ' : ''}
             {trigger.notify_enabled ? `Notify (${trigger.notify_severity})` : ''}
-            {!trigger.task_id && !trigger.notify_enabled ? '—' : ''}
+            {!trigger.task_id && !trigger.app_id && !trigger.notify_enabled ? '—' : ''}
           </p>
         </div>
         <div>

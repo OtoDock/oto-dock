@@ -182,3 +182,211 @@ class TestStopAndSend:
                 # No note on a turn that was never interrupted.
                 assert layer.messages[1][1] == "later please"
         run_ws_scenario(scenario)
+
+
+# ---------------------------------------------------------------------------
+# The viewer loop is event-driven (no fixed receive wait per frame)
+# ---------------------------------------------------------------------------
+
+import collections  # noqa: E402
+import time  # noqa: E402
+
+from core.events import stream_pump  # noqa: E402
+from core.events.common_events import PRODUCER_DONE  # noqa: E402
+from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket  # noqa: E402
+
+
+class _TimedWebSocket(FakeDashboardWebSocket):
+    def __init__(self):
+        super().__init__(cookie=None)
+        self.sent_at: list[tuple[float, dict]] = []
+
+    async def send_json(self, data: dict) -> None:
+        self.sent_at.append((time.monotonic(), data))
+        await super().send_json(data)
+
+
+def _viewer(ws, chat_id: str, sid: str):
+    from services.notifications.notification_manager import LiveQueue
+    from ws.dashboard import DashboardConnection
+    conn = DashboardConnection.__new__(DashboardConnection)
+    conn.websocket = ws
+    conn.chat_id = chat_id
+    conn.session_id = sid
+    conn.streaming = False
+    conn.live_queue = LiveQueue()
+    conn._send_lock = asyncio.Lock()
+    conn._client_pushback = collections.deque()
+    conn.pending_control_requests = []
+    # The session was checked just now: the throttled revalidation is not due.
+    conn._last_authz_check = time.time()
+    return conn
+
+
+def _pump(chat_id: str, events, *, rate_hz: float = 0.0):
+    eq: asyncio.Queue = asyncio.Queue()
+
+    async def _produce():
+        for ev in events:
+            await eq.put(ev)
+            await asyncio.sleep(1 / rate_hz if rate_hz else 0)
+        await eq.put(CommonEvent(type=PRODUCER_DONE, data={}))
+        await asyncio.sleep(3600)
+
+    producer = asyncio.get_event_loop().create_task(_produce())
+    pump = stream_pump.ChatStreamPump(chat_id=chat_id, session_id=f"sess-{chat_id}",
+                                      producer=producer, event_queue=eq, perm_queue=None)
+    stream_pump._active_pumps[chat_id] = pump
+    return pump
+
+
+@pytest.mark.asyncio
+async def test_a_fast_stream_reaches_a_silent_viewer_in_time(temp_db):
+    """200 deltas at 100/s: every character arrives while the model streams
+    (a loop that sends at most ~20 frames/s lags seconds behind), and
+    `done` follows the pump's all_done at once."""
+    task_store.create_chat("vw1", "user-admin", "a1")
+    words = [f"w{i} " for i in range(200)]
+    pump = _pump("vw1", [CommonEvent(type=TEXT, data={"content": w}) for w in words],
+                 rate_hz=100)
+    all_done_at: list[float] = []
+    real_forward = pump._forward
+
+    async def _stamp(item):
+        if item.get("pump_type") == "all_done":
+            all_done_at.append(time.monotonic())
+        await real_forward(item)
+    pump._forward = _stamp
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw1", pump.session_id)
+    try:
+        started = time.monotonic()
+        pump.start()
+        result = await asyncio.wait_for(conn._stream_via_pump(pump), timeout=10)
+        assert result["detached"] is False
+        text = "".join(d.get("content", "") for _t, d in ws.sent_at if d.get("type") == "text")
+        assert text == "".join(words)
+        done_at = next(t for t, d in ws.sent_at if d.get("type") == "done")
+        assert done_at - all_done_at[0] < 0.1
+        assert done_at - started < 5.0
+    finally:
+        stream_pump._active_pumps.pop("vw1", None)
+        stream_pump._chat_streaming_state.pop("vw1", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_client_message_is_read_while_a_backlog_is_pending(temp_db):
+    pump = _pump("vw2", [])
+    pump.producer.cancel()
+    pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw2", pump.session_id)
+    try:
+        loop_task = asyncio.create_task(conn._stream_via_pump(pump))
+        while not pump._ws_queues:
+            await asyncio.sleep(0)
+        for i in range(1000):
+            pump.push_ws_event({"type": "system", "subtype": f"n{i}"})
+        ws.client_send({"type": "resume_chat", "chat_id": "elsewhere"})
+        result = await asyncio.wait_for(loop_task, timeout=5)
+        assert result["detached"] is True
+        assert result["resume_msg"]["type"] == "resume_chat"
+        assert sum(1 for _t, d in ws.sent_at if d.get("type") == "system") < 1000
+    finally:
+        stream_pump._active_pumps.pop("vw2", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_resync_marker_becomes_a_same_chat_resume(temp_db):
+    pump = _pump("vw3", [])
+    pump.producer.cancel()
+    pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw3", pump.session_id)
+    try:
+        loop_task = asyncio.create_task(conn._stream_via_pump(pump))
+        while not pump._ws_queues:
+            await asyncio.sleep(0)
+        pump._ws_queues[0].put_nowait({"pump_type": stream_pump.PUMP_RESYNC})
+        result = await asyncio.wait_for(loop_task, timeout=5)
+        assert result["detached"] is True
+        assert result["resume_msg"] == {"type": "resume_chat", "chat_id": "vw3", "_resync": True}
+        assert not pump._ws_queues          # detached
+    finally:
+        stream_pump._active_pumps.pop("vw3", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_viewer_attaching_to_an_ended_pump_gets_done(temp_db):
+    pump = _pump("vw4", [])
+    pump._ended = True
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw4", pump.session_id)
+    try:
+        result = await asyncio.wait_for(conn._stream_via_pump(pump), timeout=5)
+        assert result["detached"] is True
+        assert [d["type"] for _t, d in ws.sent_at][-1] == "done"
+    finally:
+        stream_pump._active_pumps.pop("vw4", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_non_object_client_message_gets_an_error_not_a_crash(temp_db):
+    pump = _pump("vw5", [])
+    pump.producer.cancel()
+    pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw5", pump.session_id)
+    try:
+        loop_task = asyncio.create_task(conn._stream_via_pump(pump))
+        ws.client_send_raw("[]")
+        ws.client_send({"type": "resume_chat", "chat_id": "elsewhere"})
+        result = await asyncio.wait_for(loop_task, timeout=5)
+        assert result["resume_msg"]["chat_id"] == "elsewhere"
+        assert {"type": "error", "message": "Invalid message"} in [d for _t, d in ws.sent_at]
+    finally:
+        stream_pump._active_pumps.pop("vw5", None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_received_message_left_unprocessed_is_handed_back(temp_db):
+    """A client message that completed as a loop ended is never lost: it is
+    handed back to the connection and read before the socket."""
+    ws = _TimedWebSocket()
+    conn = _viewer(ws, "vw6", "sess-vw6")
+
+    async def _done():
+        return '{"type": "chat_read", "chat_id": "vw6"}'
+
+    recv = asyncio.create_task(_done())
+    await asyncio.sleep(0)
+    pending = asyncio.create_task(asyncio.sleep(3600))
+    await conn._settle_stream_tasks(recv, pending, None)
+    assert pending.cancelled()
+    assert await conn._receive_client_text() == '{"type": "chat_read", "chat_id": "vw6"}'
+    ws.client_send({"type": "ping"})
+    assert await conn._receive_client_text() == '{"type": "ping"}'
+
+
+@pytest.mark.asyncio
+async def test_the_multiplex_keeps_a_result_that_lands_while_cancelling():
+    from ws.dashboard import DashboardConnection
+    gate = asyncio.Event()
+
+    async def _slow_then_value():
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            return "landed"          # completes instead of cancelling
+        return "never"
+
+    first = asyncio.create_task(asyncio.sleep(0))
+    late = asyncio.create_task(_slow_then_value())
+    await asyncio.sleep(0.01)
+    done = await DashboardConnection._collect_late_results({first}, {late})
+    assert late in done and late.result() == "landed"

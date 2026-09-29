@@ -54,12 +54,31 @@ export interface PlatformSettings {
   air_gapped: boolean               // effective (forced false on cloud)
   cloud: boolean                    // deployment axis
   forced_keys: string[]             // operator-pinned platform settings (hidden + immutable)
+  // Forwarding headers seen from an address that is not a trusted proxy, or a
+  // trusted proxy that appends none: the admin sets TRUSTED_PROXY from these.
+  forwarding_warnings?: ForwardingWarning[]
   password_min_score: string
   password_min_length: string
   // Require a second factor for local-password accounts (OIDC exempt)
   require_2fa: boolean
   // Passkey sign-in: 'passwordless' (primary button) | 'second_factor' (after password only)
   passkey_login_mode: string
+  // Sharing (SHARING.md): external links, public links, the longest link
+  // expiry in days ('' = no cap), the user directory for members.
+  sharing_external_enabled: boolean
+  sharing_public_links_enabled: boolean
+  sharing_max_expiry_days: string
+  user_directory_visible_to_members: boolean
+}
+
+export interface ForwardingWarning {
+  peer: string
+  // True when the peer is the container's gateway (a published port's clients arrive from it too)
+  gateway?: boolean
+  case: 'untrusted_forwarder' | 'edge_without_xff' | string
+  first_seen: number | string   // epoch seconds
+  last_seen: number | string
+  count: number
 }
 
 export interface ConcurrencyBucket {

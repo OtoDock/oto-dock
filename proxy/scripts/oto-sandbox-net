@@ -10,7 +10,17 @@ existing bwrap argv; see core/sandbox/sandbox.py::SandboxBuilder.build_command_p
 Usage:
     oto-sandbox-net [--forward PORT]... [--allow-host ADDR]... \
                     [--dns-forward ADDR] [--block-private] \
+                    [--inbound HOSTPORT:PORT] [--egress-deny] \
                     -- <inner argv (bwrap ... -- agent ...)>
+
+App servers (services/apps/app_supervisor.py) add two flags the agent
+sandboxes never use: ``--inbound HOSTPORT:PORT`` splices init-namespace
+loopback:HOSTPORT INTO the namespace (``-t 127.0.0.1/HOSTPORT:PORT`` instead
+of ``-t none``; pasta delivers it to the namespace's own address, so the
+server listens on 0.0.0.0:PORT), and ``--egress-deny`` closes the public
+internet too (``unreachable 0.0.0.0/1`` + ``128.0.0.0/1`` after the gateway
+and resolver carves), so an app reaches only the proxy port, its
+``--allow-host`` carves and DNS.
 
 Behavior:
     1. exec pasta with an EXPLICIT port-forward policy:
@@ -76,6 +86,7 @@ entirely in this file — call sites never change.
 
 import ctypes
 import os
+import re
 import shutil
 import signal
 import sys
@@ -124,17 +135,27 @@ def _die(msg: str) -> None:
 
 def _parse_argv(
     argv: list[str],
-) -> tuple[list[str], list[str], str, bool, list[str]]:
+) -> tuple[list[str], list[str], str, bool, str, bool, list[str]]:
     forwards: list[str] = []
     allow_hosts: list[str] = []
     dns_forward = ""
     block_private = False
+    inbound = ""
+    egress_deny = False
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            return forwards, allow_hosts, dns_forward, block_private, argv[i + 1:]
-        if arg == "--forward":
+            return (forwards, allow_hosts, dns_forward, block_private,
+                    inbound, egress_deny, argv[i + 1:])
+        if arg == "--inbound":
+            i += 1
+            if i >= len(argv) or not re.fullmatch(r"\d{1,5}:\d{1,5}", argv[i]):
+                _die("--inbound requires HOSTPORT:PORT")
+            inbound = argv[i]
+        elif arg == "--egress-deny":
+            egress_deny = True
+        elif arg == "--forward":
             i += 1
             if i >= len(argv):
                 _die("--forward requires a port argument")
@@ -154,7 +175,7 @@ def _parse_argv(
             block_private = True
         else:
             _die(f"unknown argument: {arg!r} (expected --forward/--allow-host/"
-                 f"--dns-forward/--block-private/--)")
+                 f"--dns-forward/--block-private/--inbound/--egress-deny/--)")
         i += 1
     _die("missing `--` separator before the inner command")
     raise AssertionError  # unreachable
@@ -179,6 +200,7 @@ _BLOCK_V4 = {block_v4!r}
 _BLOCK_V6 = {block_v6!r}
 _CARVE = {carve!r}
 _BLOCK = {block!r}
+_EGRESS_DENY = {egress_deny!r}
 
 def _ip(args, v6=False):
     cmd = ["ip"] + (["-6"] if v6 else ["-4"]) + args
@@ -280,6 +302,17 @@ if _BLOCK:
     for net in _BLOCK_V6:
         _ip(["route", "replace", "unreachable", net], v6=True)
 
+if _EGRESS_DENY:
+    # The public internet too: two halves shadow the default route while
+    # the /32 carves above (gateway, resolvers, allow-hosts) stay more
+    # specific and survive. Fail closed like the private blackholes.
+    for net in ("0.0.0.0/1", "128.0.0.0/1"):
+        if _ip(["route", "replace", "unreachable", net]).returncode != 0:
+            sys.stderr.write("oto-sandbox-net-shim: failed to deny egress " + net + "\\n")
+            os._exit(41)
+    for net in ("::/1", "8000::/1"):
+        _ip(["route", "replace", "unreachable", net], v6=True)
+
 _ensure_proc_for_pidns()
 os.execvp(inner[0], inner)
 '''
@@ -287,7 +320,7 @@ os.execvp(inner[0], inner)
 
 def _build_pyshim(
     forwards: list[str], allow_hosts: list[str],
-    dns_forward: str, block_private: bool,
+    dns_forward: str, block_private: bool, egress_deny: bool = False,
 ) -> str:
     """The in-netns python3 program (config baked in). See _PYSHIM."""
     # Non-loopback forward targets (`addr/port` specs) carve back out; loopback
@@ -297,12 +330,13 @@ def _build_pyshim(
     carve = ([dns_forward] if dns_forward else []) + fwd_addrs + list(allow_hosts)
     return _PYSHIM.format(
         block_v4=_BLOCK_V4, block_v6=_BLOCK_V6,
-        carve=carve, block=block_private,
+        carve=carve, block=block_private, egress_deny=egress_deny,
     )
 
 
 def main() -> None:
-    forwards, allow_hosts, dns_forward, block_private, inner = _parse_argv(sys.argv[1:])
+    (forwards, allow_hosts, dns_forward, block_private,
+     inbound, egress_deny, inner) = _parse_argv(sys.argv[1:])
     if not inner:
         _die("empty inner command after `--`")
 
@@ -322,7 +356,9 @@ def main() -> None:
         "--no-map-gw",    # gateway address must NOT alias the host's loopback
         # Pin every forward direction: pasta defaults to `auto` (scans bound
         # ports!) — only the explicit allowlist below may cross the boundary.
-        "-t", "none",
+        # An app server's one inbound splice replaces `-t none`.
+        "-t", (f"127.0.0.1/{inbound.split(':')[0]}:{inbound.split(':')[1]}"
+               if inbound else "none"),
         "-u", "none",
         "-U", "none",
     ]
@@ -334,7 +370,7 @@ def main() -> None:
     if dns_forward:
         cmd.extend(["--dns-forward", dns_forward])
 
-    pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private)
+    pyshim = _build_pyshim(forwards, allow_hosts, dns_forward, block_private, egress_deny)
     cmd.extend(["--", python3, "-c", pyshim, *inner])
 
     # Preserve the kill chain (see module docstring). prctl survives execve

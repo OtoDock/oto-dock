@@ -88,7 +88,7 @@ class TestEnableGate:
             headers=_cookie(MEMBER, "viewer@test.com", "member"),
         )
         assert r.status_code == 403
-        assert "No Codex subscription" in r.json()["detail"]
+        assert "No OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
         assert _enabled_paths(SLUG) == ["claude-code-cli"]
 
     def test_admin_pool_sub_counts(self, client, agent):
@@ -177,7 +177,7 @@ class TestEnableGate:
             headers=_bearer_session(ADMIN),
         )
         assert r.status_code == 403
-        assert "No Codex subscription" in r.json()["detail"]
+        assert "No OpenAI Codex subscription" in r.json()["detail"]  # the engine's display_name
 
     def test_create_explicit_path_gated_for_non_admin(self, client, temp_db):
         r = client.post(

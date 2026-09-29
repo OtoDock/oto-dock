@@ -137,7 +137,7 @@ async def test_headless_ignores_live_mode(monkeypatch):
 # it would hard-allow every later call and suppress the CLI's own re-prompt.
 # The CLI's own allow-memory now owns interactive persistence.
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -148,7 +148,7 @@ _client = TestClient(app)
 
 
 def _post_tool_result(sid: str, tool: str, is_error: bool = False):
-    with patch("api.hooks.lifecycle.verify_session_match"):
+    with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock):
         resp = _client.post(
             "/v1/hooks/tool-result",
             json={"session_id": sid, "tool_name": tool,
@@ -195,7 +195,7 @@ def test_memory_only_ping_renders_nothing_and_feeds_nothing(monkeypatch):
     # pump event AND (post-flip) no allow-memory feed.
     monkeypatch.setattr(permission, "_is_interactive_session", lambda sid: True)
     sid = "int-sess-mem-5"
-    with patch("api.hooks.lifecycle.verify_session_match"):
+    with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock):
         resp = _client.post(
             "/v1/hooks/tool-result",
             json={"session_id": sid, "tool_name": "mcp__ssh-hosts__list_ssh_hosts",

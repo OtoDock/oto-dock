@@ -21,9 +21,13 @@ subdirectory for a symlink between the check and the read.
 from __future__ import annotations
 
 import asyncio
+import errno
+import json
 import logging
 import os
+import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
@@ -31,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.local-templates")
 router = APIRouter()
@@ -54,7 +59,7 @@ class InstallLocalTemplateBody(BaseModel):
 def _require_creator_or_admin(user: UserContext | None) -> UserContext:
     if not user:
         raise HTTPException(403, "Authentication required")
-    if user.role not in ("admin", "creator"):
+    if not roles.is_creator_or_above(user.role):
         raise HTTPException(
             403, "Creating agents requires a platform creator or admin account",
         )
@@ -79,7 +84,7 @@ def _resolve_template_dir(user: UserContext, raw_path: str) -> Path:
 
     from core.session import session_state
     from services import path_policy_v2
-    from auth.path_policy import enforce_agent_tree_rbac
+    from auth.path_policy import check_host_path_access, enforce_agent_tree_rbac
 
     ctx = session_state.get_session_security(user.session_id)
     if ctx is None:
@@ -111,7 +116,9 @@ def _resolve_template_dir(user: UserContext, raw_path: str) -> Path:
     import config
     agent_root = config.get_agent_dir(ctx.agent).resolve()
     resolved = (agent_root / ref.value).resolve()
-    if not resolved.is_relative_to(agent_root):
+    # Judged again where it resolves NOW: a symlink swapped in since the
+    # check above must not lead into another person's tree.
+    if not resolved.is_relative_to(agent_root) or not check_host_path_access(resolved, ctx).allowed:
         raise HTTPException(403, "access denied")
     if not resolved.is_dir():
         raise HTTPException(400, f"Not a directory: {raw_path}")
@@ -123,21 +130,26 @@ def _snapshot_template_dir(src: Path) -> Path:
 
     Only regular files and real directories are copied — no symlinks, no
     devices — so the parser (which globs and follows symlinked dirs) can
-    never reach outside what was validated here. The caller deletes the
-    snapshot.
+    never reach outside what was validated here. The folder is the
+    session's own and may change while it is read: the walk holds each
+    directory open (``os.fwalk``) and opens every file relative to it with
+    ``O_NOFOLLOW``, judging what it opened (``fstat``), never a name it
+    checked before. The caller deletes the snapshot.
     """
     dest = Path(tempfile.mkdtemp(prefix="oto-local-template-"))
     files = 0
     total = 0
     try:
-        for root, dirnames, filenames in os.walk(src, followlinks=False):
-            root_path = Path(root)
-            rel_root = root_path.relative_to(src)
-            # Skip VCS noise; reject symlinked dirs outright.
+        for root, dirnames, filenames, dirfd in os.fwalk(src, follow_symlinks=False):
+            rel_root = Path(root).relative_to(src)
+            # Skip what a release never takes (dotfiles, node_modules, an
+            # app's data/) — an author's `bun install` beside the app would
+            # otherwise fill the file cap; reject symlinked dirs outright.
             for name in list(dirnames):
-                if name == ".git":
+                if name.startswith(".") or name == "node_modules" or (
+                        name == "data" and _is_app_dir(rel_root)):
                     dirnames.remove(name)
-                elif (root_path / name).is_symlink():
+                elif stat.S_ISLNK(os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_mode):
                     raise HTTPException(
                         400,
                         f"Symlinks are not allowed in a template folder: "
@@ -145,41 +157,91 @@ def _snapshot_template_dir(src: Path) -> Path:
                     )
             (dest / rel_root).mkdir(parents=True, exist_ok=True)
             for name in filenames:
-                src_file = root_path / name
+                if name.startswith("."):
+                    continue
                 rel = rel_root / name
-                st = src_file.lstat()
-                if src_file.is_symlink():
-                    raise HTTPException(
-                        400,
-                        f"Symlinks are not allowed in a template folder: {rel}",
-                    )
-                if not os.path.isfile(src_file):
-                    raise HTTPException(
-                        400, f"Only regular files are allowed: {rel}",
-                    )
-                files += 1
-                if files > _MAX_FILES:
-                    raise HTTPException(
-                        400, f"Template folder has too many files (max {_MAX_FILES})",
-                    )
-                if st.st_size > _MAX_FILE_BYTES:
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd)
+                except OSError as e:
+                    if e.errno == errno.ELOOP:
+                        raise HTTPException(
+                            400,
+                            f"Symlinks are not allowed in a template folder: {rel}",
+                        )
+                    raise HTTPException(400, f"{rel} cannot be read")
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):
+                        raise HTTPException(
+                            400, f"Only regular files are allowed: {rel}",
+                        )
+                    files += 1
+                    if files > _MAX_FILES:
+                        raise HTTPException(
+                            400, f"Template folder has too many files (max {_MAX_FILES})",
+                        )
+                    with os.fdopen(os.dup(fd), "rb") as fh:
+                        data = fh.read(_MAX_FILE_BYTES + 1)
+                finally:
+                    os.close(fd)
+                if len(data) > _MAX_FILE_BYTES:
                     raise HTTPException(
                         400,
                         f"{rel} is too large "
                         f"(max {_MAX_FILE_BYTES // 1024} KB per file)",
                     )
-                total += st.st_size
+                total += len(data)
                 if total > _MAX_TOTAL_BYTES:
                     raise HTTPException(
                         400,
                         f"Template folder is too large "
                         f"(max {_MAX_TOTAL_BYTES // (1024 * 1024)} MB total)",
                     )
-                shutil.copyfile(src_file, dest / rel, follow_symlinks=False)
+                (dest / rel).write_bytes(data)
         return dest
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
+
+
+def _is_app_dir(rel_root: Path) -> bool:
+    """``apps/<slug>`` or ``user-apps/<slug>`` inside the template."""
+    parts = rel_root.parts
+    return len(parts) == 2 and parts[0] in ("apps", "user-apps")
+
+
+def _validate_apps(template) -> list[str]:
+    """Each app folder through the deploy's own validator and static
+    checks, before its agent exists. An ``mcp_tool`` action names an MCP the
+    agent will only have after the install, so that one refusal is
+    tolerated when the template requires the MCP; everything else the
+    deploy would refuse is reported here, with the file and the line."""
+    from services.apps import app_deploy, app_lint, releases
+    errors: list[str] = []
+    required = {m.name for m in template.mcps}
+    for item in template.apps:
+        label = f"{'user-apps' if item.visibility == 'user' else 'apps'}/{item.slug}"
+        required |= set(item.requires_mcps)
+        doc = json.loads((item.dir / "app.json").read_text(encoding="utf-8"))
+        try:
+            app_deploy.validate_app_json(doc, template.slug, item.visibility != "user", item.dir)
+        except app_deploy.DeployError as exc:
+            m = _MCP_UNAVAILABLE_RE.search(str(exc))
+            if not (m and m.group(1) in required):
+                errors.append(f"{label}: {exc}")
+                continue
+        try:
+            files = releases.walk_tree(item.dir)
+        except releases.ReleaseInvalid as exc:
+            errors.append(f"{label}: {exc.reason}")
+            continue
+        for f in app_lint.lint_tree(item.dir, files, app_lint.declared_from_doc(doc)):
+            if f.severity == "fail":
+                errors.append(f"{label}: {f.file}:{f.line} {f.message}")
+    return errors
+
+
+_MCP_UNAVAILABLE_RE = re.compile(r"MCP '([^']+)' is not available to this agent")
 
 
 async def _load_snapshot(user: UserContext, raw_path: str):
@@ -290,8 +352,33 @@ async def local_template_building_blocks(
             skill_packages, key=lambda s: (not s["installed"], s["name"]),
         ),
         "agent_slugs": sorted(slugs),
+        "check_examples": await asyncio.to_thread(_check_examples),
         "catalog_error": catalog_error,
     }
+
+
+def _check_examples() -> list[dict]:
+    """The checks-mcp's example folders: a template's ``checks/<name>/`` is
+    one of these shapes, so an authoring agent copies the closest."""
+    import config
+    root = config.MCPS_DIR / "custom" / "checks-mcp" / "examples"
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        try:
+            doc = json.loads((d / "check.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        out.append({
+            "name": d.name,
+            "description": str(doc.get("description") or ""),
+            "sections": [s for s in ("schema", "script", "handler", "judge") if doc.get(s)],
+            "files": sorted(p.name for p in d.iterdir() if p.is_file()),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +428,7 @@ async def validate_local_template(
             for req in template.mcps:
                 if req.name in installed:
                     mcp_plan["ready"].append(req.name)
-                elif u.role == "admin":
+                elif u.is_admin:
                     mcp_plan["needs_install"].append(req.name)
                 else:
                     mcp_plan["needs_admin_request"].append(req.name)
@@ -369,6 +456,8 @@ async def validate_local_template(
         else:
             skill_plan["ready"] = [p.name for p in template.skill_packages]
 
+        errors.extend(await asyncio.to_thread(_validate_apps, template))
+
         slug = agent_store.sanitize_slug(template.slug)
         slug_available = bool(slug) and not await asyncio.to_thread(
             agent_store.agent_exists, slug,
@@ -393,6 +482,14 @@ async def validate_local_template(
                 "context_files": len(template.context_files),
                 "has_setup": template.setup_md is not None,
                 "has_user_setup": template.user_setup_md is not None,
+                "apps": [
+                    {"slug": a.slug, "title": a.title, "visibility": a.visibility,
+                     "owner_approval": a.owner_approval}
+                    for a in template.apps
+                ],
+                "checks": [
+                    {"name": c.name, "mandatory": c.mandatory} for c in template.checks
+                ],
             },
         }
     finally:
@@ -429,7 +526,7 @@ async def install_from_local_template(
             # catalog entry that happens to share its slug in Browse.
             template_ref=f"local:{template.slug}",
             # Attaching every future platform user is an admin decision.
-            allow_default_for_new_users=(u.role == "admin"),
+            allow_default_for_new_users=u.is_admin,
         )
     finally:
         shutil.rmtree(snapshot, ignore_errors=True)

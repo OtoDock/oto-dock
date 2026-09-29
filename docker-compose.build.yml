@@ -44,3 +44,5 @@ services:
     pull_policy: build
     build:
       context: ./mcps/custom/file-tools-mcp
+      args:
+        - PYTHON_IMAGE

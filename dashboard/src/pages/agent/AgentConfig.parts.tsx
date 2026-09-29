@@ -19,25 +19,9 @@ export const COLOR_PRESETS = [
   { hex: '#64748B', name: 'Slate' },
 ]
 
-// Display metadata + ordering for execution-layer engines. Order drives the
-// AI Engines list and the Default Model picker (Claude Code → Codex → Direct →
-// any others). Provider badges mirror the AI Engines section in User Settings.
-const ENGINE_ORDER = ['claude-code-cli', 'codex-cli', 'direct-llm']
-export const ENGINE_META: Record<string, { badge?: string; label?: string; desc?: string }> = {
-  'claude-code-cli': { badge: 'Anthropic', label: 'Claude Code CLI' },
-  'codex-cli': { badge: 'OpenAI', label: 'Codex' },
-  'direct-llm': { label: 'Direct LLM API', desc: 'Not all tools supported — use only for low latency.' },
-}
-export function orderEngines(paths: string[]): string[] {
-  return [...paths].sort(
-    (a, b) =>
-      (ENGINE_ORDER.indexOf(a) === -1 ? 99 : ENGINE_ORDER.indexOf(a)) -
-      (ENGINE_ORDER.indexOf(b) === -1 ? 99 : ENGINE_ORDER.indexOf(b)),
-  )
-}
-
-// Models per execution path are now fetched from /v1/execution-layers API
-// (see useExecutionLayers hook). No hardcoded lists here.
+// Engine labels, badges, order and models all come from the catalog
+// (/v1/execution-layers via useExecutionLayers, read through lib/engines.ts).
+// Nothing engine-specific is kept here.
 
 // ---------------------------------------------------------------------------
 // Small reusable pieces

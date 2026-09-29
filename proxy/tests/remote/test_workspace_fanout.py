@@ -11,6 +11,8 @@ Covers:
 import base64
 import hashlib
 from types import SimpleNamespace
+
+from core import placement
 from unittest.mock import AsyncMock
 
 import pytest
@@ -46,7 +48,7 @@ def _setup_layer(monkeypatch, sessions, secs):
 
 
 def _sec(username, role):
-    return SimpleNamespace(username=username, role=role)
+    return SimpleNamespace(placement=placement.LOCAL_PLACEMENT, username=username, role=role)
 
 
 def test_fanout_excludes_source_machine(temp_db, monkeypatch):
@@ -300,7 +302,8 @@ def _patch_apply_deps(monkeypatch, *, sec, loser_sub_for, notifs):
     import storage.database as db
     import services.notifications.notification_manager as nm
     monkeypatch.setattr(ss, "get_session_security", lambda sid: sec)
-    monkeypatch.setattr(wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None: [])
+    monkeypatch.setattr(
+        wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None, shared_only=None: [])
     monkeypatch.setattr(db, "get_user_sub_by_username", loser_sub_for)
     monkeypatch.setattr(config, "RECOVER_BIN_DIR", config.AGENTS_DIR / "_recover-bin")
 
@@ -347,7 +350,7 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-alice" if u == "alice" else None,
         notifs=notifs,
     )
@@ -373,6 +376,50 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_pre_overwrite_capture_never_reads_through_a_link(tmp_path, monkeypatch):
+    """The bytes a conflict capture copies into the recover bin are read
+    beneath the agents root, never by the checked name: a link swapped in
+    after the check is refused, not followed."""
+    from pathlib import Path
+    from core.remote.satellite_connection import SatelliteConnectionManager
+
+    agents = tmp_path / "agents"
+    agent_dir = agents / "agent-1"
+    (agent_dir / "workspace").mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"secret")
+    (agent_dir / "workspace" / "shared.md").symlink_to(victim)
+    real_resolve = Path.resolve
+
+    def resolve_as_checked(self, *a, **kw):
+        # The check window: the name looked like a plain in-tree file.
+        if self.name == "shared.md":
+            return agent_dir / "workspace" / "shared.md"
+        return real_resolve(self, *a, **kw)
+    monkeypatch.setattr(Path, "resolve", resolve_as_checked)
+    cm = SatelliteConnectionManager()
+    assert await cm._capture_pre_overwrite(agent_dir, "workspace/shared.md") == (None, None)
+    (agent_dir / "workspace" / "plain.md").write_bytes(b"mine")
+    data, digest = await cm._capture_pre_overwrite(agent_dir, "workspace/plain.md")
+    assert data == b"mine" and digest == "sha256:" + hashlib.sha256(b"mine").hexdigest()
+
+
+def test_the_merge_loser_read_never_reads_through_a_link(tmp_path):
+    from core.remote import remote_workspace_sync as rws
+
+    agents = tmp_path / "agents"
+    agent_dir = agents / "agent-1"
+    (agent_dir / "workspace").mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"secret")
+    (agent_dir / "workspace" / "shared.md").symlink_to(victim)
+    (agent_dir / "workspace" / "plain.md").write_bytes(b"mine")
+    assert rws._platform_bytes(agent_dir, "workspace/shared.md") is None
+    assert rws._platform_bytes(agent_dir, "workspace/plain.md") == b"mine"
+    assert rws._platform_bytes(agent_dir, "workspace/../../victim.txt") is None
+
+
+@pytest.mark.asyncio
 async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
@@ -391,7 +438,7 @@ async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-bob",
         notifs=notifs,
     )
@@ -428,7 +475,7 @@ async def test_apply_no_conflict_when_base_matches(temp_db, tmp_path, monkeypatc
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-alice",
         notifs=notifs,
     )
@@ -464,7 +511,7 @@ async def test_apply_delete_writes_tombstone_and_captures(temp_db, tmp_path, mon
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(role="editor", username="bob", agent=agent, display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="editor", username="bob", agent=agent, display_name="Bob"),
         loser_sub_for=lambda u: "user-bob",
         notifs=notifs,
     )
@@ -491,7 +538,7 @@ async def test_apply_agent_mismatch_rejected(temp_db, tmp_path, monkeypatch):
     notifs = []
     _patch_apply_deps(
         monkeypatch,
-        sec=SimpleNamespace(role="manager", username="bob", agent="real-agent", display_name="Bob"),
+        sec=SimpleNamespace(placement=placement.LOCAL_PLACEMENT, role="manager", username="bob", agent="real-agent", display_name="Bob"),
         loser_sub_for=lambda u: "user-viewer",
         notifs=notifs,
     )
@@ -647,3 +694,161 @@ async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
     for mid in ("m1", "m2"):
         assert (mid, "active") in seen_states
         assert (mid, "done") in seen_states
+
+
+# ---------------------------------------------------------------------------
+# The platform write beneath the root; the push reads the checked file
+# ---------------------------------------------------------------------------
+
+
+def _swap_component_on_open(monkeypatch, agent_dir, victim):
+    """A component swapped for a link right as the helper opens the root,
+    after every earlier check: the strict open must refuse it."""
+    import contextlib
+    import os
+    from services.infra import safe_fs
+    real = safe_fs.open_root
+    state = {"done": False}
+
+    @contextlib.contextmanager
+    def _patched(root, rel=""):
+        if not state["done"]:
+            state["done"] = True
+            d = agent_dir / "workspace" / "sub"
+            d.rmdir()
+            os.symlink(victim, d)
+        with real(root, rel) as fd:
+            yield fd
+
+    monkeypatch.setattr(safe_fs, "open_root", _patched)
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_refuses_a_component_swapped_after_the_check(temp_db, tmp_path, monkeypatch):
+    import config
+    from services.remote import workspace_fanout as wf
+    agents = tmp_path / "agents"
+    (agents / "agent-1" / "workspace" / "sub").mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "agent.md").write_text("ORIGINAL")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents, raising=False)
+    _swap_component_on_open(monkeypatch, agents / "agent-1", victim)
+    with pytest.raises(OSError):
+        await wf._atomic_write_agent_file("agent-1", "workspace/sub/agent.md", b"NEW")
+    assert (victim / "agent.md").read_text() == "ORIGINAL"
+    assert sorted(p.name for p in victim.iterdir()) == ["agent.md"]
+
+
+@pytest.mark.asyncio
+async def test_atomic_write_refuses_a_bad_rel_as_value_error(temp_db, tmp_path, monkeypatch):
+    import config
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    with pytest.raises(ValueError):
+        await wf._atomic_write_agent_file("agent-1", "../x.md", b"NEW")
+    with pytest.raises(ValueError):
+        await wf._atomic_write_agent_file("../agent-1", "workspace/x.md", b"NEW")
+
+
+@pytest.mark.asyncio
+async def test_fan_out_write_pushes_the_checked_descriptor_and_records_its_hash(temp_db, tmp_path, monkeypatch):
+    """A Path source is opened beneath the agents root once; ``push_file``
+    receives the descriptor's own path and the merge base records the hash
+    taken from that descriptor before any push."""
+    import config
+    from services.remote import workspace_fanout as wf
+    from storage.files import sync_state_store
+    agents = tmp_path / "agents"
+    (agents / "agent-1" / "workspace").mkdir(parents=True)
+    f = agents / "agent-1" / "workspace" / "x.md"
+    f.write_bytes(b"hello")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents, raising=False)
+    monkeypatch.setattr(wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None: ["m1"])
+    seen = {}
+
+    async def _push(mid, ref, source, **kw):
+        seen["source"] = source
+        seen["bytes"] = source.read_bytes()
+        return True
+
+    cm = SimpleNamespace(push_file=_push)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    recorded = []
+    monkeypatch.setattr(sync_state_store, "record_one",
+                        lambda mid, a, r, h, m: recorded.append((mid, a, r, h, m)))
+    await wf.fan_out_write("agent-1", "workspace/x.md", f)
+    assert str(seen["source"]).startswith(("/proc/self/fd/", "/dev/fd/"))
+    assert seen["bytes"] == b"hello"
+    assert recorded and recorded[0][:4] == ("m1", "agent-1", "workspace/x.md", _h(b"hello"))
+
+
+@pytest.mark.asyncio
+async def test_fan_out_write_refuses_a_source_that_is_not_the_platform_copy(temp_db, tmp_path, monkeypatch):
+    import config
+    from core.remote import transfer_registry
+    from services.remote import workspace_fanout as wf
+    agents = tmp_path / "agents"
+    (agents / "agent-1" / "workspace").mkdir(parents=True)
+    (agents / "agent-1" / "workspace" / "sub").symlink_to(tmp_path)
+    (tmp_path / "x.md").write_bytes(b"outside")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents, raising=False)
+    monkeypatch.setattr(wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None: ["m1"])
+    pushed = AsyncMock(return_value=True)
+    cm = SimpleNamespace(push_file=pushed)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    begun = []
+
+    async def _begin(agent, rel, **kw):
+        begun.append(kw.get("machine_ids"))
+        return "tid"
+
+    monkeypatch.setattr(transfer_registry, "begin", _begin)
+    # A link component: the strict open refuses, nothing is pushed, and a
+    # tracked transfer still gets its terminal (no rows).
+    await wf.fan_out_write("agent-1", "workspace/sub/x.md",
+                           agents / "agent-1" / "workspace" / "sub" / "x.md", transfer_id="t1")
+    pushed.assert_not_awaited()
+    assert begun == [[]]
+    # A Path that is not the platform copy of ``rel_path`` at all.
+    await wf.fan_out_write("agent-1", "workspace/y.md", tmp_path / "x.md")
+    pushed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_propagate_write_holds_the_fan_out_lock_inside_the_path_lock(temp_db, tmp_path, monkeypatch):
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout as wf
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    seen = {}
+
+    async def _fan_out(agent_slug, rel_path, source, **kw):
+        path_lock = await remote_file_flow._acquire_global_path_lock(agent_slug, rel_path)
+        fan_lock = await remote_file_flow.acquire_fanout_lock(agent_slug, rel_path)
+        seen["path"] = path_lock.locked()
+        seen["fanout"] = fan_lock.locked()
+
+    monkeypatch.setattr(wf, "fan_out_write", _fan_out)
+    await wf.propagate_write("agent-1", "workspace/x.md", b"hello")
+    assert seen == {"path": True, "fanout": True}
+
+
+def test_fanout_targets_takes_the_shared_only_answer_without_a_store_read(temp_db, monkeypatch):
+    """A caller that resolved ``is_shared_only`` off the loop passes it; the
+    gate then never reads the store itself."""
+    import core.session.visibility as vis
+    _setup_layer(
+        monkeypatch,
+        {"s1": _FakeInfo("mA", "agent-1")},
+        {"s1": _sec("alice", "manager")},
+    )
+
+    def _boom(agent):
+        raise AssertionError("the store was read on the loop")
+
+    monkeypatch.setattr(vis, "is_shared_only", _boom)
+    from services.remote.workspace_fanout import fanout_targets, has_fanout_candidates
+    assert fanout_targets("agent-1", "users/alice/workspace/x.md", shared_only=False) == ["mA"]
+    assert fanout_targets("agent-1", "users/alice/workspace/x.md", shared_only=True) == []
+    assert has_fanout_candidates("agent-1", "users/alice/workspace/x.md", shared_only=True) is False

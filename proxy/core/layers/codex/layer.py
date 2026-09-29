@@ -9,6 +9,7 @@ item/completed carrying a ThreadItem, item/agentMessage/delta, turn/completed,
 identically to CLI or Direct LLM events.
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -19,10 +20,17 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import config as app_config
+from core import placement
 from core.events.common_events import CommonEvent, ERROR, METADATA, DONE, PLAN_MODE
 from core.execution_layer import (
-    ExecutionLayer, AgentConfig, LayerCapabilities, UNATTENDED_CLIENT_TYPES,
+    AgentConfig, AuthProfile, BehaviourProfile,
+    CredentialFileSpec, EngineIdentity, ExecutionLayer, LayerCapabilities,
+    ModelPolicy, OAuthRefresh, RuntimeProfile, SubscriptionHandle, UsageProfile,
+    WindowSpec, Windows,
 )
+from core.layers.codex import oauth as codex_oauth
+from core.layers.codex import usage as codex_usage
+from core import layout
 from core.layers.codex.session import (
     create_codex_session, get_codex_session, close_codex_session,
 )
@@ -64,31 +72,116 @@ _CODEX_CAPABILITIES = LayerCapabilities(
     supports_mcps=True,
     permission_modes=["default", "acceptEdits", "plan", "dontAsk"],
     control_commands=["set_model", "set_permission_mode"],
-    models=app_config.get_layer_models("codex-cli"),
+    models=app_config.get_layer_models("codex-cli", offers_ultra=True),
     # "max" is real wire vocabulary from the GPT-5.6 family on (GPT-6 too);
     # older models clamp to xhigh in map_effort_to_codex. "ultra" (Codex-
     # native proactive multi-agent orchestration on top of max/xhigh
-    # reasoning) is per-model: gpt-5.6 Sol/Terra and gpt-6-astra — the
-    # dashboard gates it on the model's supports_ultra flag and
-    # map_effort_to_codex clamps it everywhere else (see helpers).
-    effort_levels=["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    # reasoning) is per-MODEL — gpt-5.6 Sol/Terra and gpt-6-astra, never
+    # Luna — so the registry flag is emitted per model row (offers_ultra
+    # above says this engine can run it at all) and map_effort_to_codex
+    # clamps it everywhere else (see helpers).
+    effort_levels=["low", "medium", "high", "xhigh", "max", "ultra"],
     effort_changeable_mid_session=True,   # effort is a per-turn override now
     compression_threshold_pct=None,
     mcp_delivery="external_config",
     mcp_config_format="toml",
     providers=[
-        {"id": "openai", "label": "OpenAI", "requires_key": True},
+        # map_effort_to_codex: max and ultra are unlocked by the model
+        # FAMILY (prefix tables) — max has no row flag and clamps to xhigh
+        # at the wire on an older id; ultra is the per-row supports_ultra.
+        {"id": "openai", "label": "OpenAI", "requires_key": True,
+         "kind": "vendor", "relay_path": "", "api_path": "",
+         "effort_scale": ["low", "medium", "high", "xhigh", "max", "ultra"],
+         "effort_per_model": ["ultra"]},
         # Local providers reach the operator's own network — unavailable on
         # hosted OtoDock (no operator LAN). Gated off at import on cloud.
+        # A local model id matches no unlock prefix: its ladder tops at xhigh.
+        # Ollama's OpenAI-compatible API answers under /v1 (its root is the
+        # native API the model discovery reads).
         *([] if app_config.OTODOCK_CLOUD else [
-            {"id": "ollama", "label": "Ollama (Local)", "requires_key": False},
-            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False},
+            {"id": "ollama", "label": "Ollama (Local)", "requires_key": False,
+             "kind": "local", "relay_path": "", "api_path": "/v1",
+             "effort_scale": ["low", "medium", "high", "xhigh"],
+             "effort_per_model": []},
+            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False,
+             "kind": "local", "relay_path": "", "api_path": "",
+             "effort_scale": ["low", "medium", "high", "xhigh"],
+             "effort_per_model": []},
         ]),
     ],
+    identity=EngineIdentity(
+        short_name="codex",
+        vendor_id="openai",
+        vendor_label="OpenAI",
+        account_label="ChatGPT",
+        role="coding",
+        sort_order=20,
+    ),
+    runtime=RuntimeProfile(
+        has_os_process=True,                  # one `codex app-server` daemon per session
+        hard_abort_kills_process=False,       # turn/interrupt — the daemon + MCPs stay warm
+        supports_remote_execution=True,
+        supports_interactive_pty=True,        # the native Ratatui TUI under a PTY
+        interactive_first_prompt_via_argv=True,    # `codex <PROMPT>` auto-runs after MCP warm
+        supports_reattach_after_restart=False,# next-turn resume by thread id, no live re-adopt
+        binary="codex",
+        pin_key="codex",                      # cli_pins wire key — frozen
+        config_dir_name=".codex",             # CODEX_HOME under the session's scope root
+        self_wakes=False,                     # no self-wake turn; the bg monitors nudge at once
+        event_queue_depth=4096,               # the router delivers between-turns terminal exits OOB — a drop is correctness-bearing
+        interactive_submit_backstop=False,    # the Ratatui TUI takes the single Enter under ConPTY
+        installed_name="codex",               # installed_clis wire value — frozen
+    ),
+    behaviour=BehaviourProfile(
+        rebuilds_history_from_db=False,       # the daemon owns its rollout (thread/resume)
+        attach_images_inline=False,           # photos ride as sandbox paths
+        phone_http_mcps=True,
+        skills_delivery="materialized_dir",
+        supports_bash=True,
+        supports_plans_dir=False,             # no plan FILE — the plan is the turn's final message
+        builtin_file_tools=False,
+        has_shell_on_external_route=False,    # [features] shell_tool = false for external callers
+        provider_pinned_per_session=True,     # model_provider is fixed in config.toml at spawn
+        supports_steer=True,                  # turn/steer
+        supports_compact=True,                # thread/compact/start
+        supports_interrupt_for_queued=False,  # an engine with steer never reaches the queue branch
+        # Codex's native names, by role — four spellings of the same calls
+        # (the app-server item types, the rollout's function calls and custom
+        # tools, its server-side call types, the hook wire's Bash /
+        # apply_patch and the approval bridge's synthetic names); each maps
+        # into the canonical set in tool_names.py (canonical_tool_name).
+        tools={
+            "shell": ("commandExecution", "exec_command", "exec", "Bash"),
+            "write": ("fileChange", "apply_patch"),
+            "web_search": ("webSearch", "web_search_call"),
+            "discovery": ("tool_search_call",),
+            "todo": ("update_plan",),
+            "question": ("request_user_input",),
+            "escalation": ("CodexEscalation",),
+        },
+        question_tool_holds_turn=True,        # request_user_input holds the turn on item/tool/requestUserInput; ask_user_question answers it
+    ),
+    model_policy=ModelPolicy(
+        default_model="gpt-6-sol",            # tier 2; Astra (tier 1) is offered, never defaulted
+        model_filter_policy="local_providers",# a personal ChatGPT account keeps the OpenAI builtins
+        pricing_editable=False,
+    ),
+    auth=AuthProfile(
+        auth_types=("oauth", "api_key", "local_endpoint"),  # a ChatGPT login, an OpenAI key, or a local server
+        credential_file=CredentialFileSpec(   # the satellite clamp's row — frozen
+            wire_kind="codex", dirname=".codex", filename="auth.json",
+        ),
+        oauth_flow="device_code",             # a verification URL + one-time code the page polls on
+    ),
+    usage=UsageProfile(windows=(
+        # ChatGPT's consumer windows; the vendor reports them by length, and
+        # the platform lists them under the same keys as Claude's.
+        WindowSpec(key="five_hour", length_s=5 * 3600, role="session", label="session"),
+        WindowSpec(key="seven_day", length_s=7 * 86400, role="quota", label="weekly"),
+    )),
 )
 
 
-from core.credentials.credential_writeback import writeback_credential_dirs as _writeback_credential_dirs
 
 
 # Child-env variable named by the local provider's ``env_key`` when the
@@ -108,6 +201,7 @@ from core.layers.codex.local_model_catalog import (
     local_model_catalog_json,
     parse_local_model_rows,
 )
+from core.session import session_kind
 
 # config.toml [tools] table every session gets — see _write_config_toml.
 _CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
@@ -250,6 +344,66 @@ class CodexCLIExecutionLayer(ExecutionLayer):
     def capabilities(self) -> LayerCapabilities:
         return _CODEX_CAPABILITIES
 
+    def transcript_tailer(self):
+        """The Ratatui TUI writes a rollout JSONL under
+        ``<CODEX_HOME>/sessions/``; ``codex_rollout_tailer`` persists it."""
+        from core.session import codex_rollout_tailer
+        return codex_rollout_tailer
+
+    _remote_adapter = None
+
+    def remote_adapter(self):
+        """This engine on a satellite — ``core/layers/codex/remote.py``
+        (imported here, not at module level: it reads this module's class)."""
+        if self._remote_adapter is None:
+            from core.layers.codex.remote import CodexRemoteAdapter
+            self._remote_adapter = CodexRemoteAdapter(self)
+        return self._remote_adapter
+
+    def canonical_tool_name(self, session_id: str, native: str) -> str:
+        """Codex's native names → the canonical set (``tool_names.py``), and
+        its hook's MCP tool names restored to the manifest's server name:
+        the PreToolUse hook sanitises the server key
+        (``mcp__meetings_mcp__direct_to`` for ``meetings-mcp``) while every
+        permission rule, tier lookup and meeting check keys on the manifest's
+        ``server_name`` (a mangled name fell to the default tier and parked a
+        meeting on a permission card, 2026-09-09). A known session restores
+        against the servers it declared (``mcp_server_names``); otherwise —
+        a satellite session, a hook before registration — against every
+        manifest. Unchanged when the server part already names a manifest or
+        nothing matches."""
+        from core.layers.codex import tool_names
+        if not native.startswith("mcp__"):
+            return tool_names.canonical(native)
+        parts = native.split("__", 2)
+        if len(parts) < 3 or not parts[1] or not parts[2]:
+            return native
+        server, tool = parts[1], parts[2]
+        from .session import _codex_sessions
+        sess = _codex_sessions.get(session_id) if session_id else None
+        declared = list(sess.mcp_server_names) if sess is not None and sess.mcp_server_names else []
+        if not declared:
+            from services.mcp import mcp_registry
+            declared = [(m.server_name or m.name) for m in mcp_registry.get_all_manifests().values()]
+        if server in declared:
+            return native
+        for name in declared:
+            if tool_names.sanitized_server_name(name) == server:
+                return f"mcp__{name}__{tool}"
+        return native
+
+    def chat_session_files(self, home: Path, session_id: str, resume_handle: str) -> list[Path]:
+        """The rollout of one chat: ``<home>/.codex/sessions/**/*<thread id>.jsonl``
+        (the thread id is the chat's resume handle; the caller keeps the
+        id-shape and liveness guards)."""
+        if not resume_handle:
+            return []
+        return list((home / ".codex" / "sessions").rglob(f"*{resume_handle}.jsonl"))
+
+    def iter_session_files(self, home: Path):
+        for f in (home / ".codex" / "sessions").rglob("rollout-*.jsonl"):
+            yield f, f.stem[-36:]
+
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
@@ -279,6 +433,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 f"'{config.agent_name}' without a sandbox dir — local agents "
                 f"must run sandboxed + network-isolated."
             )
+        # Below the editor tier a session never runs from the agent's own
+        # CODEX_HOME (its sandbox masks it).
+        from core.sandbox.session_config_dir import refuse_session_on_agent_state
+        refuse_session_on_agent_state(config.security_context)
         mcp_path = Path(config.mcp_config_path) if config.mcp_config_path else None
         extra_env = dict(config.extra_env)
         # Merge MCP credential env vars (Google tokens, API keys, etc.)
@@ -326,9 +484,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         if _ext_home:
             work_dir = _ext_home   # an external caller's own tree (/caller)
         elif username:
-            work_dir = str(agent_dir / "users" / username)
+            work_dir = str(layout.user_dir(agent_dir, username))
         else:
-            work_dir = str(agent_dir / "workspace")
+            work_dir = str(agent_dir / layout.WORKSPACE)
 
         # Sandbox setup
         from core.sandbox.sandbox import resolve_sandbox_config, SandboxBuilder
@@ -339,7 +497,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # path — satellite_only device MCPs run native on the satellite and must
         # never be mounted locally.
         mcp_mounts = []
-        for manifest in (mcp_registry.get_agent_mcps(config.agent_name, is_remote=False) or []):
+        for manifest in (mcp_registry.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []):
             mcp_mounts.extend(manifest.sandbox_mounts)
 
         # Mount the Codex CLI installation directory inside the sandbox
@@ -388,7 +546,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 "scripts/sandbox-doctor.sh to pinpoint the denial."
             )
         env_overrides = sandbox_builder.get_env_overrides(
-            config_dir_name=".codex", config_env_var="CODEX_HOME",
+            config_dir_name=self.capabilities.runtime.config_dir_name,
+            config_env_var="CODEX_HOME",
         )
         extra_env.update(env_overrides)
         # CODEX_HOME as Codex sees it INSIDE the sandbox (config.toml paths).
@@ -396,16 +555,22 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 
         # ssh-hosts (context-only MCP): provision the agent's authorized SSH
         # keys into <.codex>/ssh so the prompt's `ssh -i "$OTO_SSH_KEY_DIR/…"`
-        # lines work from the Codex shell (mirrors the CLI layer).
-        # Never for an EXTERNAL session (see the CLI layer).
-        from core.sandbox.session_config_dir import (
-            materialize_ssh_keys_for_sandbox,
+        # lines work from the Codex shell (mirrors the CLI layer). A session
+        # that takes no keys is left none from an earlier one (the helper's
+        # rule).
+        from core.sandbox.session_config_dir import provision_ssh_keys_for_sandbox
+        ssh_dir = provision_ssh_keys_for_sandbox(
+            _ctx, config.agent_name, config.sandbox_host_claude_dir, sandbox_codex_dir,
         )
-        if not is_external_ctx(_ctx) and materialize_ssh_keys_for_sandbox(
-            config.agent_name, config.sandbox_host_claude_dir,
-        ):
-            _codex_home = env_overrides.get("CODEX_HOME", "/workspace/.codex")
-            extra_env["OTO_SSH_KEY_DIR"] = f"{_codex_home}/ssh"
+        if ssh_dir:
+            extra_env["OTO_SSH_KEY_DIR"] = ssh_dir
+
+        # OAuth token files for the stdio MCPs that read one: delivered in
+        # the MCP's secret bundle (the tree's copy is masked out of the
+        # sandbox), so this precedes the TOML fetch-token injection that
+        # keys on the bundles.
+        from core.credentials.credential_files import attach_token_files
+        await asyncio.to_thread(attach_token_files, config)
 
         # Read MCP TOML content (generated by build_session_mcp_config with format="toml")
         mcp_toml_content = ""
@@ -514,16 +679,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             no_shell=is_external_ctx(_ctx),
         )
 
-        # Write OAuth auth.json if token provided
-        wrote_auth_json = bool(extra_env.get("_CODEX_OAUTH_TOKEN"))
+        # A ChatGPT login rides as the full auth.json payload (the pool's
+        # adapter built it, refresh token neutralized); write it verbatim with
+        # the same writer the rotation fan-out uses, so spawn and fan-out
+        # cannot drift. A session without one must not inherit a previous
+        # session's file from this persistent CODEX_HOME.
+        auth_json = self.credential_file_from_env(extra_env)
+        wrote_auth_json = auth_json is not None
         if wrote_auth_json:
-            config_dir = Path(config.sandbox_host_claude_dir)
-            auth_blob_json = extra_env.pop("_CODEX_AUTH_BLOB", "")
-            auth_blob = json.loads(auth_blob_json) if auth_blob_json else None
-            self._write_auth_json(
-                config_dir,
-                extra_env.pop("_CODEX_OAUTH_TOKEN"),
-                auth_blob=auth_blob,
+            from services.engines.token_fanout import write_credential_file
+            write_credential_file(
+                Path(config.sandbox_host_claude_dir),
+                self.capabilities.auth.credential_file.filename, auth_json,
             )
         else:
             self._drop_stale_auth_json(Path(config.sandbox_host_claude_dir))
@@ -589,10 +756,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             if codex_effort:
                 flags += ["-c", f'model_reasoning_effort="{codex_effort}"']
             _prompt_in_argv = False
-            if config.codex_thread_id and config.resume:
+            if config.resume_handle and config.resume:
                 # Resume the existing rollout/thread (codex resume <id>). The
                 # continuation prompt arrives via the PTY, not argv.
-                argv = [*sandbox_cmd_prefix, codex_bin, "resume", config.codex_thread_id, *flags]
+                argv = [*sandbox_cmd_prefix, codex_bin, "resume", config.resume_handle, *flags]
             else:
                 argv = [*sandbox_cmd_prefix, codex_bin, *flags]
                 # Cold first prompt as the trailing positional PROMPT → codex
@@ -625,10 +792,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 user_sub=config.user_sub,
                 role=_user_role,
                 username=username,
-                target=config.execution_target or "local",
+                target=config.execution_target or placement.LOCAL,
                 tui_theme=config.interactive_theme or "dark",
-                # Persist turns from the Codex rollout JSONL (not the Claude transcript).
-                transcript_kind="codex",
+                # Persist turns from the Codex rollout JSONL (this engine's tailer).
+                execution_path=self.capabilities.name,
                 # Fresh codex delivers the prompt via argv (auto-run) → no cold
                 # prompt to gate: start READY so viewer xterm bytes pass through live
                 # instead of being buffered + flushed late into the composer.
@@ -647,7 +814,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                     session_id, config.subscription_id,
                     layer="codex-cli", user_sub=config.subscription_user_sub,
                     scope_key=credential_scope_key(
-                        config.execution_target or "local",
+                        config.execution_target or placement.LOCAL,
                         config.sandbox_host_claude_dir,
                     ),
                 )
@@ -665,13 +832,16 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             extra_env=extra_env,
             sandbox_cmd_prefix=sandbox_cmd_prefix,
             effort=codex_effort,
-            thread_id=config.codex_thread_id or None,
+            thread_id=config.resume_handle or None,
             user_role=_user_role,
             # The warm gate waits for each declared server; a local model
             # gets the longer cap (a changed tool list re-prefills for minutes).
             mcp_server_names=mcp_server_names_from_toml(mcp_toml_content),
             local_model=bool(local_endpoint),
             hooks_floor=hooks_floor,
+            # The plan collaboration mode follows the platform mode, not the
+            # sandbox: a judge (CHECKS.md) is read-only without planning.
+            plan_mode=(config.permission_mode == "plan"),
         )
 
         # Session metadata (permission mode + security context were
@@ -687,7 +857,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 session_id, config.subscription_id,
                 layer="codex-cli", user_sub=config.subscription_user_sub,
                 scope_key=credential_scope_key(
-                    config.execution_target or "local",
+                    config.execution_target or placement.LOCAL,
                     config.sandbox_host_claude_dir,
                 ),
             )
@@ -703,14 +873,136 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         token_fanout.register_session_target(
             session_id,
             token_fanout.CredentialFileTarget(
-                kind="codex",
+                layer=_CODEX_CAPABILITIES.name,
                 host_dir=config.sandbox_host_claude_dir,
             ),
         )
 
-    async def send_message(
+    def pinned_cli_version(self) -> str:
+        return app_config.PINNED_CODEX_VERSION
+
+    def cli_binary_path(self) -> str:
+        return app_config.CODEX_BIN
+
+    def prepare_config_dir(
+        self, agent_name: str, *, username: str = "", scope: str = "user",
+        external_home=None, no_shell: bool = False, read_only: bool = False,
+    ) -> Path:
+        """The ``.codex`` dir: hooks.json, the hook scripts, the skills dir.
+        ``no_shell`` and ``read_only`` are not written here — the Codex
+        builder has no settings file for them (the permission hook floors an
+        external session, the judge's sandbox is read-only by mount), which
+        is today's behaviour, kept. The builder
+        (``core/layers/codex/config_dir``) is reached through its module at
+        call time (tests patch it there)."""
+        from core.layers.codex import config_dir as _cd
+        extra: dict = {}
+        if external_home:
+            extra["external_home"] = external_home
+        return _cd.ensure_persistent_codex_dir(
+            agent_name, username=username, scope=scope, **extra)
+
+    def resumes_interactive(self, config: AgentConfig) -> bool:
+        """Codex resumes by THREAD id (``config.resume_handle``, read through
+        from ``chats.codex_thread_id``), whose rollout persists on disk
+        independently of the in-memory app-server session AND of the
+        warmup's ``resume`` flag (keyed on the just-closed ``-p`` session,
+        so False right after a ``-p`` → terminal switch). Remote: the
+        rollout lives on the satellite, out of reach of a local glob — trust
+        the handle (the satellite's ``CodexPtySession`` locates
+        ``rollout-*-<tid>.jsonl`` and ``codex resume <tid>`` continues it; a
+        rollout genuinely missing there starts a fresh thread). Local: the
+        handle AND its rollout under this session's ``CODEX_HOME``, else a
+        switch back to the terminal would start a fresh codex with no
+        context. A non-interactive config keeps the warmup's flag."""
+        if not config.interactive:
+            return config.resume
+        tid = (config.resume_handle or "").strip()
+        if not placement.is_local(config.execution_target):
+            return bool(tid)
+        from core.session import codex_rollout_tailer
+        return bool(tid) and codex_rollout_tailer.rollout_exists(
+            config.sandbox_host_claude_dir, tid,
+        )
+
+    # --- Credentials -------------------------------------------------------
+
+    #: The env entry the pool's login payload (the full auth.json) rides in
+    #: from the config builder to ``start_session`` (popped there).
+    _AUTH_JSON_ENV = "_CODEX_AUTH_JSON"
+
+    def subscription_env(self, handle: SubscriptionHandle) -> dict[str, str]:
+        env: dict[str, str] = {}
+        if handle.auth_type == "local_endpoint":
+            # A key on a LOCAL endpoint rides its own variable: CODEX_API_KEY
+            # would switch Codex into API-key auth against its built-in
+            # OpenAI provider, not the custom one the layer writes.
+            if handle.api_key:
+                env["_CODEX_LOCAL_API_KEY"] = handle.api_key
+        elif handle.api_key:
+            env["CODEX_API_KEY"] = handle.api_key
+        if handle.oauth_access_token:
+            payload = self.credential_file_payload(
+                handle.oauth_access_token, handle.oauth_expires_at_ms, handle.credential,
+            )
+            if payload is not None:
+                env[self._AUTH_JSON_ENV] = json.dumps(payload)
+        if handle.endpoint_url:
+            env["_CODEX_ENDPOINT_URL"] = handle.endpoint_url
+            # The provider (ollama / openai_compatible) picks the AGENTS.md
+            # note that tells the model whether its MCP tools reach it
+            # (helpers.local_provider_note). Popped by start_session like the URL.
+            env["_CODEX_ENDPOINT_PROVIDER"] = handle.provider or ""
+            # The provider's codex-cli model rows (id + context window) feed
+            # the per-session model catalog that makes Codex defer its MCP
+            # tools (local_model_catalog). Read HERE, off the event loop —
+            # the pool's resolver runs under to_thread — so start_session
+            # never touches the store on the loop. The one adapter call that
+            # reads storage.
+            from core.layers.codex.local_model_catalog import (
+                LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
+            )
+            env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(handle.provider or "")
+        return env
+
+    def credential_file_payload(
+        self, access_token: str, expires_at_ms: int, stored: dict,
+    ) -> dict | None:
+        # auth.json needs the login's id_token and account_id, which only the
+        # device-auth blob carries; a row without one has no file to write
+        # (the pool skips it on rotation and the spawn writes nothing).
+        blob = stored.get("codex_auth_blob")
+        if not isinstance(blob, dict) or not blob:
+            return None
+        from core.layers.codex.helpers import build_auth_json
+        return build_auth_json(access_token, auth_blob=blob)
+
+    def credential_file_from_env(self, env: dict) -> dict | None:
+        raw = env.pop(self._AUTH_JSON_ENV, "")
+        return json.loads(raw) if raw else None
+
+    def refresh_oauth(self, refresh_token: str, stored: dict) -> OAuthRefresh:
+        return codex_oauth.refresh(refresh_token, stored)
+
+    # --- Usage windows -----------------------------------------------------
+
+    def _window_specs(self) -> dict[str, WindowSpec]:
+        return {s.key: s for s in self.capabilities.usage.windows}
+
+    def usage_request(self, stored: dict) -> tuple[str, dict] | None:
+        return codex_usage.usage_request(stored)
+
+    def parse_usage(self, payload) -> Windows | None:
+        return codex_usage.from_usage(payload, self._window_specs())
+
+    def record_usage_event(self, session_id: str, payload) -> None:
+        codex_usage.record_snapshot_async(session_id, payload)
+
+    async def _send_turn(
         self, session_id: str, message: str, **kwargs,
     ) -> AsyncIterator[CommonEvent]:
+        """One turn on the app-server thread (``send_message`` on the base
+        wraps the turn-end loop)."""
         import time as _time
 
         session = await get_codex_session(session_id)
@@ -754,7 +1046,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # right before DONE, but only for a normally-completed plan turn with a
         # non-empty plan. A held request_user_input can't leave a question pending
         # at turn-end (codex resumes the turn only after it's answered).
-        in_plan = getattr(session, "sandbox_mode", "") == "read-only"
+        in_plan = bool(getattr(session, "plan_mode", False))
         final_plan_msg = ""
         turn_interrupted = False
 
@@ -792,7 +1084,6 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 yield common_event
 
     async def close_session(self, session_id: str) -> None:
-        await _writeback_credential_dirs(session_id)
         await close_codex_session(session_id)
         # A closed session must not keep a live permission context (see the
         # CLI layer).
@@ -861,7 +1152,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         set_session_mode(session_id, mode)
         session = await get_codex_session(session_id)
         if session:
-            session.set_sandbox_mode(_permission_to_sandbox(mode))
+            session.set_sandbox_mode(_permission_to_sandbox(mode), plan_mode=(mode == "plan"))
 
     async def send_control_request(
         self, session_id: str, subtype: str, **kwargs,
@@ -875,6 +1166,14 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             await self.change_mode(session_id, kwargs["mode"])
             return {"ok": True}
         return {"error": f"Codex: unsupported control command {subtype!r}"}
+
+    def owns_session(self, session_id: str) -> bool:
+        from .session import _codex_sessions
+        return session_id in _codex_sessions
+
+    def local_session_ids(self) -> list[str]:
+        from .session import _codex_sessions
+        return list(_codex_sessions)
 
     async def get_session(self, session_id: str):
         return await get_codex_session(session_id)
@@ -935,9 +1234,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             if external_home:
                 candidate = Path(external_home) / ".codex"
             elif username:
-                candidate = agent_dir / "users" / username / ".codex"
+                candidate = layout.user_dir(agent_dir, username) / ".codex"
             else:
-                candidate = agent_dir / "workspace" / ".codex"
+                candidate = agent_dir / layout.WORKSPACE / ".codex"
             if candidate.is_dir():
                 codex_dir = str(candidate)
         return bool(codex_dir) and codex_rollout_tailer.rollout_exists(
@@ -1052,9 +1351,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # gate). Native to plan mode regardless of this flag. Upstream marks it
         # under-development — drop this line (+ suppress_unstable_features_warning)
         # when a Codex bump graduates it to default-on (see CODEX.md).
-        if interactive or client_type == "dashboard":
+        if interactive or client_type == session_kind.DASHBOARD.name:
             parts.append("default_mode_request_user_input = true")
-        if interactive or client_type in UNATTENDED_CLIENT_TYPES:
+        if interactive or not session_kind.attended(client_type):
             # Enable Codex's hook system so our PreToolUse permission_gate.py runs
             # as the command-level FLOOR (baseline restricted-tools + dangerous +
             # RBAC + path) — the SAME decide_tool_permission authority every other
@@ -1165,19 +1464,6 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             system_prompt = with_local_provider_note(system_prompt, local_provider)
         if system_prompt:
             (config_dir / "AGENTS.md").write_text(system_prompt)
-
-    @staticmethod
-    def _write_auth_json(
-        config_dir: Path,
-        token: str,
-        *,
-        auth_blob: dict | None = None,
-    ) -> None:
-        """Write ChatGPT OAuth token to auth.json in .codex/ dir (same writer
-        the rotation fan-out uses, so spawn and fan-out can't drift)."""
-        from core.layers.codex.helpers import build_auth_json
-        from services.engines.token_fanout import write_codex_auth_file
-        write_codex_auth_file(config_dir, build_auth_json(token, auth_blob=auth_blob))
 
     @staticmethod
     def _drop_stale_auth_json(config_dir: Path) -> None:

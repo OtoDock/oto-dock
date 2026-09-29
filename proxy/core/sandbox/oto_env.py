@@ -21,6 +21,7 @@ API to translate sandbox paths in tool args (see ``api/hooks/hooks.py``).
 
 from __future__ import annotations
 
+from auth import roles
 from services import path_roles
 
 
@@ -62,7 +63,8 @@ def build_oto_env(
             agent-scoped sessions (no human owner). Exposed as
             ``OTO_USER_SUB`` so MCPs scoping data per-user (e.g. memory-mcp)
             don't have to decode the session JWT.
-        user_role: access level (``"viewer"``/``"manager"``/``"admin"``/``""``).
+        user_role: the session's per-agent role (``auth/roles.EFFECTIVE_ROLES``,
+            or ``""`` when a chat builder gave none).
         platform_role: the session user's PLATFORM role
             (``"admin"``/``"creator"``/``"member"``), empty for sessions
             without a human user. Distinct from ``user_role``, which is the
@@ -145,6 +147,13 @@ def build_oto_env(
         "OTO_SCOPE": scope,
         "OTO_ROLE": user_role,
         "OTO_PLATFORM_ROLE": platform_role,
+        # The tier questions, answered: an MCP process cannot import the
+        # proxy and carries no role vocabulary of its own (auth/roles is the
+        # authority) — it reads these and the endpoint stays the boundary.
+        "OTO_CAN_MANAGE_AGENT": "true" if roles.can_manage(user_role) else "false",
+        "OTO_CAN_EDIT_AGENT": "true" if roles.can_edit(user_role) else "false",
+        "OTO_CAN_WRITE_WORKSPACE": "true" if roles.can_write_workspace(user_role) else "false",
+        "OTO_CAN_CREATE_AGENTS": "true" if roles.is_creator_or_above(platform_role) else "false",
         "OTO_SESSION_ID": session_id,
         "OTO_WORKSPACE_DIR": workspace_dir,
         "OTO_USER_ROOT": user_root,

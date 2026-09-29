@@ -304,3 +304,44 @@ def test_external_data_endpoints(client):
     assert result["callers_forgotten"] == 1 and result["phone_chats_deleted"] == 1
     assert result["call_log_rows_deleted"] == 1
     assert client.get("/v1/admin/phone/external-data").json()["callers"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Check verdicts (CHECKS.md): the same knob and window as Pass A
+# ---------------------------------------------------------------------------
+
+def _verdict(days_old: float, name: str = "coding") -> str:
+    from storage.checks import db_checks
+    row = db_checks.insert_verdict(
+        agent=AGENT, owner="", check_name=name, section="judge", status="pass", passed=True,
+        score=1.0, findings=[], summary="fine", reason="", session_id="s", chat_id="c", run_id="",
+        judge_run_id="", user_sub="", round_no=1, ran_on="local", engine="", model="",
+        cost_usd=0.0, duration_ms=1, script_sha256="")
+    iso = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        conn.execute("UPDATE check_verdicts SET created_at=%s WHERE id=%s", (iso, row["id"]))
+        conn.commit()
+    return row["id"]
+
+
+def test_aged_check_verdicts_go_with_the_session_files_and_the_list_pages_by_time(temp_db):
+    from storage.checks import db_checks
+    old = _verdict(40)
+    fresh = _verdict(3)
+    mid = _verdict(20)
+    # The page cursor: the rows older than a time, newest first.
+    newest_first = [r["id"] for r in db_checks.list_verdicts(AGENT)]
+    assert newest_first == [fresh, mid, old]
+    cursor = db_checks.list_verdicts(AGENT, limit=1)[0]["created_at"]
+    assert [r["id"] for r in db_checks.list_verdicts(AGENT, before=cursor)] == [mid, old]
+    # A dry run counts, the sweep deletes, and the 30-day window is Pass A's.
+    assert _sweep(dry_run=True)["check_verdicts_deleted"] == 1
+    assert {r["id"] for r in db_checks.list_verdicts(AGENT)} == {old, mid, fresh}
+    stats = _sweep()
+    assert stats["check_verdicts_deleted"] == 1
+    assert [r["id"] for r in db_checks.list_verdicts(AGENT)] == [fresh, mid]
+    # With the knob off nothing of the verdicts is touched.
+    _verdict(50)
+    off = retention._run_sweep_sync(30, False, LiveSnapshot(), False)
+    assert off["check_verdicts_deleted"] == 0 and len(db_checks.list_verdicts(AGENT)) == 3

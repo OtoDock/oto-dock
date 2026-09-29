@@ -140,6 +140,146 @@ class TestTaskSurface:
         assert row["continue_session"] == prior_sid
         assert row["target_chat_id"] == "task-run-old2"
 
+    def test_continue_onto_a_working_lane_steers(self, client, monkeypatch):
+        # The worker is mid-turn on THIS caller's delegate run: the follow-up
+        # goes INTO that turn — no second task row, no run fired, the response
+        # names the running run and the row wears the delegating badge.
+        from core.events import stream_pump
+        from core.session import session_delivery
+        from services.scheduler import lane_steer
+
+        prior_sid = str(uuid.uuid4())
+        task_store.create_chat("task-run-live1", "user-alice", AGENT, "auto",
+                               origin="delegated", title="live lane")
+        task_store.update_chat("task-run-live1", session_id=prior_sid)
+        task_store.create_dynamic_task(
+            "dyn-live1", AGENT, "live lane", "do the work", "cli", "delegate",
+            None, None, None, 3600, "user-alice",
+            on_complete_agent=AGENT, on_complete_prompt="report",
+            on_complete_session_id=PARENT_SESSION,
+            on_complete_chat_id=client.parent_chat_id,
+        )
+        task_store.create_run("run-live1", "dyn-live1", AGENT, "manual", None,
+                              "do the work", task_type="delegate")
+        task_store.update_run("run-live1", status="running",
+                              session_id=prior_sid, chat_id="task-run-live1")
+
+        class _Pump:
+            session_id = prior_sid
+            is_done = False
+            source_type = "task"
+
+        class _Caps:
+            class behaviour:
+                supports_steer = True
+
+        steers: list = []
+
+        class _Layer:
+            def capabilities_for(self, sid):
+                return _Caps()
+
+            async def steer(self, sid, text):
+                steers.append((sid, text))
+                return True
+
+        async def _chat_layer(chat):
+            return _Layer()
+        monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
+        pushed: list = []
+        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+                            lambda cid: task_store.get_run("run-live1"))
+        from core.session import session_state
+        monkeypatch.setattr(session_state, "push_pump_event",
+                            lambda cid, ev: pushed.append((cid, ev)) or True)
+        stream_pump._active_pumps["task-run-live1"] = _Pump()
+        try:
+            r = _spawn(client, continue_id="task-run-live1", prompt="also X")
+        finally:
+            stream_pump._active_pumps.pop("task-run-live1", None)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["steered"] is True
+        assert data["run_id"] == "run-live1"
+        assert data["task_id"] == "dyn-live1"
+        assert data["chat_id"] == "task-run-live1"
+        assert steers == [(prior_sid, "also X")]
+        assert client.fired == []              # no second run
+        assert task_store.list_dynamic_tasks(AGENT) == [
+            task_store.get_dynamic_task("dyn-live1")]
+        rows = task_store.get_chat_messages("task-run-live1")
+        assert [(m["role"], m["content"]) for m in rows] == [("user", "also X")]
+        import json as _json
+        assert _json.loads(rows[0]["event_data"])["badge"] == "delegated by"
+        assert pushed and pushed[0][1]["type"] == "steered"
+        assert pushed[0][1]["text"] == "also X"
+
+    def test_continue_onto_a_lane_working_for_another_caller_queues(
+            self, client, monkeypatch):
+        # The running run reports to ANOTHER chat: this caller's follow-up
+        # would vanish into that report, so it queues a run as before. A
+        # refused steer and a human's own turn on the worker take the same
+        # path.
+        from core.events import stream_pump
+        from core.session import session_delivery
+
+        prior_sid = str(uuid.uuid4())
+        task_store.create_chat("task-run-live2", "user-alice", AGENT, "auto",
+                               origin="delegated", title="live lane")
+        task_store.update_chat("task-run-live2", session_id=prior_sid)
+        task_store.create_dynamic_task(
+            "dyn-live2", AGENT, "live lane", "do the work", "cli", "delegate",
+            None, None, None, 3600, "user-alice",
+            on_complete_agent=AGENT, on_complete_prompt="report",
+            on_complete_session_id="other-session",
+            on_complete_chat_id="other-chat",
+        )
+        task_store.create_run("run-live2", "dyn-live2", AGENT, "manual", None,
+                              "do the work", task_type="delegate")
+        task_store.update_run("run-live2", status="running",
+                              session_id=prior_sid, chat_id="task-run-live2")
+        steers: list = []
+
+        class _Caps:
+            class behaviour:
+                supports_steer = True
+
+        class _Layer:
+            def capabilities_for(self, sid):
+                return _Caps()
+
+            async def steer(self, sid, text):
+                steers.append(text)
+                return True
+
+        async def _chat_layer(chat):
+            return _Layer()
+        monkeypatch.setattr(session_delivery, "chat_layer", _chat_layer)
+
+        class _Pump:
+            session_id = prior_sid
+            is_done = False
+            source_type = "task"
+        stream_pump._active_pumps["task-run-live2"] = _Pump()
+        try:
+            r = _spawn(client, continue_id="task-run-live2", prompt="also Y")
+            assert r.status_code == 200
+            assert "steered" not in r.json()
+            assert steers == []
+            assert len(client.fired) == 1
+
+            # A person's own dashboard turn on the worker chat: queued too.
+            _Pump.source_type = "chat"
+            task_store.update_dynamic_task_on_complete(
+                "dyn-live2", AGENT, "report", PARENT_SESSION, client.parent_chat_id)
+            r = _spawn(client, continue_id="task-run-live2", prompt="also Z")
+            assert r.status_code == 200
+            assert "steered" not in r.json()
+            assert steers == []
+            assert len(client.fired) == 2
+        finally:
+            stream_pump._active_pumps.pop("task-run-live2", None)
+
     def test_continue_derives_agent_from_worker(self, client):
         # Continued worker lives on ANOTHER agent: the spawn runs there even
         # when the caller omits `agent` (the old behavior defaulted to the
@@ -220,6 +360,18 @@ class TestChatSurface:
         task_store.create_chat(foreign, "user-bob", AGENT)
         r = _spawn(client, surface="chat", continue_id=foreign)
         assert r.status_code == 403
+
+    def test_a_caller_with_no_chat_cannot_continue_a_foreign_chat(self, client):
+        # A cookie caller has no parent chat: its empty parent must not
+        # match every chat that is nobody's worker.
+        client.app_ref.state.user = _cookie_user()
+        foreign = str(uuid.uuid4())
+        task_store.create_chat(foreign, "user-bob", AGENT)
+        r = _spawn(client, surface="chat", continue_id=foreign)
+        assert r.status_code == 403
+        own = str(uuid.uuid4())
+        task_store.create_chat(own, "user-alice", AGENT)
+        assert _spawn(client, surface="chat", continue_id=own).status_code == 200
 
     def test_continue_unknown_chat_404(self, client):
         r = _spawn(client, surface="chat", continue_id=str(uuid.uuid4()))
@@ -439,3 +591,89 @@ class TestAdoptProject:
     def test_adopt_rejects_bad_slug(self, client):
         r = client.post("/v1/delegation/adopt", json={"project_id": "Not A Slug!"})
         assert r.status_code == 400
+
+
+class _LiveTerminal:
+    """A live interactive session on a lane chat, as find_live_for_chat sees
+    it, recording the prompts queued on it."""
+
+    def __init__(self, chat_id: str, session_id: str):
+        self.chat_id = chat_id
+        self.session_id = session_id
+        self.alive = True
+        self.created_at = 1.0
+        self.queued: list[dict] = []
+
+    def queue_prompt(self, text, source, **context):
+        item = {"text": text, "source": source, **context}
+        self.queued.append(item)
+        return item
+
+
+class TestContinueOntoALiveTerminal:
+    """No pump, a live interactive terminal on the lane: a follow-up onto a
+    round working for THIS caller goes into the terminal (that round's
+    report covers it, no second run); for another caller a run queues."""
+
+    def _lane(self, client, chat_id: str, run_id: str, *, callback_chat: str):
+        sid = str(uuid.uuid4())
+        task_store.create_chat(chat_id, "user-alice", AGENT, "auto",
+                               origin="delegated", title="terminal lane",
+                               execution_mode="interactive")
+        task_store.update_chat(chat_id, session_id=sid)
+        task_store.create_dynamic_task(
+            f"dyn-{run_id}", AGENT, "terminal lane", "do the work", "cli", "delegate",
+            None, None, None, 3600, "user-alice",
+            on_complete_agent=AGENT, on_complete_prompt="report",
+            on_complete_session_id=PARENT_SESSION,
+            on_complete_chat_id=callback_chat,
+        )
+        task_store.create_run(run_id, f"dyn-{run_id}", AGENT, "manual", None,
+                              "do the work", task_type="delegate")
+        task_store.update_run(run_id, status="running", session_id=sid, chat_id=chat_id)
+        return _LiveTerminal(chat_id, sid)
+
+    def test_a_working_round_for_this_caller_takes_the_prompt(self, client, monkeypatch):
+        from core.session import interactive_session
+        from services.scheduler import lane_steer
+        term = self._lane(client, "task-run-term1", "run-term1",
+                          callback_chat=client.parent_chat_id)
+        monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
+        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+                            lambda cid: task_store.get_run("run-term1"))
+        r = _spawn(client, continue_id="task-run-term1", prompt="also T")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["steered"] is True and data["run_id"] == "run-term1"
+        assert client.fired == []                           # no second run
+        assert [(q["text"], q["source"], q["steer"]) for q in term.queued] == [
+            ("also T", "delegate_continue", True)]
+        assert term.queued[0]["chat_id"] == "task-run-term1"
+        # The transcript tailer owns the terminal's rows: nothing persisted here.
+        assert task_store.get_chat_messages("task-run-term1") == []
+
+    def test_a_round_for_another_caller_queues_a_run(self, client, monkeypatch):
+        from core.session import interactive_session
+        from services.scheduler import lane_steer
+        term = self._lane(client, "task-run-term2", "run-term2", callback_chat="other-chat")
+        monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
+        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+                            lambda cid: task_store.get_run("run-term2"))
+        r = _spawn(client, continue_id="task-run-term2", prompt="also U")
+        assert r.status_code == 200
+        assert "steered" not in r.json()
+        assert term.queued == [] and len(client.fired) == 1
+
+    def test_a_dead_terminal_queues_a_run(self, client, monkeypatch):
+        from core.session import interactive_session
+        from services.scheduler import lane_steer
+        term = self._lane(client, "task-run-term3", "run-term3",
+                          callback_chat=client.parent_chat_id)
+        term.alive = False
+        monkeypatch.setitem(interactive_session._sessions, term.session_id, term)
+        monkeypatch.setattr(lane_steer, "_running_delegate_run",
+                            lambda cid: task_store.get_run("run-term3"))
+        r = _spawn(client, continue_id="task-run-term3", prompt="also V")
+        assert r.status_code == 200
+        assert "steered" not in r.json()
+        assert term.queued == [] and len(client.fired) == 1

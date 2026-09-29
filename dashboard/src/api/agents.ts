@@ -1,6 +1,10 @@
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import type { EngineDescriptor } from './engineDescriptor'
 import { useAuth } from '../contexts/AuthContext'
+import type { AgentRole, EffectiveRole } from '../lib/permissions'
+import type { PairingScope } from '../lib/placement'
+import type { MachineState } from '../lib/status/machine'
 
 export interface AgentSummary {
   name: string
@@ -118,13 +122,26 @@ export interface AgentInfo {
   delegation_targets: string[]
   // Empty string when auto-attach is disabled for this agent;
   // otherwise one of 'viewer' / 'editor' / 'manager'. Admin-only field.
-  default_for_new_users_role: '' | 'viewer' | 'editor' | 'manager'
+  default_for_new_users_role: '' | AgentRole
   // Interactive-CLI per-agent default execution mode: '' (unset)
   // | 'interactive' | '-p'. Only meaningful for CLI execution layers.
   default_execution_mode?: '' | 'interactive' | '-p'
   // Departments (agents map): '' = unassigned.
   department_id?: string
   department_level_id?: string
+  // The community template the agent came from (its slug, or `local:<slug>`
+  // for a locally authored one) and the version installed — the Config
+  // tab's Template row; empty for a hand-made agent.
+  community_template?: string | null
+  community_template_version?: string | null
+  // A community-template install's catalog state (the Config tab's
+  // update banner); null for a locally authored or hand-made agent.
+  template_update?: {
+    installed_version: string
+    catalog_version: string
+    update_available: boolean
+    compat_ok: boolean
+  } | null
 }
 
 export interface FileNode {
@@ -154,34 +171,28 @@ export const useAgents = (opts?: { all?: boolean; keepPrevious?: boolean }) =>
   })
 
 // ---------------------------------------------------------------------------
-// Execution layers (capabilities, models, providers)
+// Execution layers (the engine catalog)
 // ---------------------------------------------------------------------------
 
-export interface LayerCapabilities {
-  name: string
-  display_name: string
-  supports_resume: boolean
-  supports_permissions: boolean
-  supports_plan_mode: boolean
-  supports_todos: boolean
-  supports_subagents: boolean
-  supports_context_compression: boolean
-  supports_control_commands: boolean
-  supports_mcps: boolean
-  permission_modes: string[]
-  control_commands: string[]
-  models: { value: string; label: string; provider?: string; supports_xhigh?: boolean; supports_ultra?: boolean }[]
+export type { LayerModelOption } from './engineDescriptor'
+
+/** One row of `GET /v1/execution-layers` (keyed by engine id): the engine's
+ *  descriptor (api/engineDescriptor.ts) plus the two per-install extras the
+ *  catalog adds. Pages read the descriptor through lib/engines.ts. */
+export type LayerCapabilities = EngineDescriptor & {
   // Platform-level availability: some subscription for this engine is
   // connected anywhere on the platform (pool or any user's personal). Drives
   // the AgentConfig engine-card enable gate (server mirror: PATCH /v1/agents).
   // Optional: absent on stale caches from an older proxy → treat as true.
   configured?: boolean
-  effort_levels: string[]
-  effort_changeable_mid_session: boolean
-  compression_threshold_pct: number | null
-  mcp_delivery: string
-  mcp_config_format: string | null
-  providers: { id: string; label: string; requires_key?: boolean }[] | null
+  // What "Auto" runs on this engine right now — the resolver's answer for an
+  // unpinned agent (declared default → fall-down, within what the platform
+  // pool serves) and its display name. "" when nothing is enabled. The
+  // dashboard renders these and never re-derives them: the catalog's
+  // `models` filter is not the resolver's, so the model may be absent from
+  // the list. Optional: absent on an older proxy.
+  auto_model?: string
+  auto_model_label?: string
 }
 
 export const useExecutionLayers = () =>
@@ -214,7 +225,7 @@ export interface AgentUser {
   sub: string
   name: string
   email: string
-  role: 'viewer' | 'editor' | 'manager' | 'admin' | string
+  role: EffectiveRole | string
 }
 
 export const useAgentUsers = (name: string) =>
@@ -237,8 +248,10 @@ export const useAgentUsers = (name: string) =>
 // since it soft-falls-back to local) from the agent's admin-paired
 // default ('admin' → red when offline, blocks everyone on the agent).
 export type AgentTargetStatus = {
-  state: 'online' | 'stale' | 'disconnected' | 'never_connected' | null
-  scope?: 'admin' | 'user'
+  // The machine's live state (`lib/status/machine.ts`, the proxy's
+  // remote_status words — `paused` included), or null for a local run.
+  state: MachineState | null
+  scope?: PairingScope
   machine_name?: string
   last_heartbeat_age_s?: number | null
   last_seen_iso?: string | null
@@ -272,6 +285,12 @@ export const useAgentFileContent = (name: string, path: string | null) =>
     queryKey: ['agent-file-content', name, path],
     queryFn: async (): Promise<string> => {
       const res = await apiFetch(`/v1/agents/${name}/files/${path}`)
+      if (!res.ok) {
+        // A refused read (413 over the inline cap, 403, 404) must never
+        // open as an empty editor: a save from it would truncate the file.
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail ?? res.statusText)
+      }
       const data = await res.json()
       return data.content ?? ''
     },
@@ -666,7 +685,7 @@ export function useSetDefaultForNewUsers() {
   return useMutation({
     mutationFn: async (
       { agent, enabled, role }:
-      { agent: string; enabled: boolean; role: 'viewer' | 'editor' | 'manager' | null },
+      { agent: string; enabled: boolean; role: AgentRole | null },
     ) => {
       const res = await apiFetch(
         `/v1/admin/agents/${agent}/default-for-new-users`,

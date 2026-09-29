@@ -31,7 +31,7 @@ export function useChatAttachments({ agentName, draftKey }: {
     }))
     useChatStore.getState().addPendingFiles(draftKey, tagged)
     for (const f of tagged) {
-      if (f.error || !f.abortController) continue
+      if (f.error || !f.abortController || !f.file) continue
       enqueueChatUpload({
         fileId: f.id, file: f.file, agent: agentName || '',
         abort: f.abortController,

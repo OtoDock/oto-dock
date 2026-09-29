@@ -11,10 +11,12 @@ def test_load_hook_scripts_loads_all_hooks():
     (absent) and returned an EMPTY dict. Remote/satellite sessions therefore ran
     with NO permission_gate / tool_result_forwarder / subagent_tracker hooks.
 
-    Pin that all three hook scripts load from the real proxy/hooks dir with
-    non-empty content.
+    Pin that all four hook scripts (the one HOOK_SCRIPTS list the local
+    sandbox installs — the Stop hook joined for satellite 0.5.121) load from
+    the real proxy/hooks dir with non-empty content.
     """
     from core.remote import remote_start_payload as re
+    from core.sandbox.session_config_dir import HOOK_SCRIPTS
 
     re._HOOK_SCRIPTS_CACHE = None  # bypass the module-level cache
     try:
@@ -22,8 +24,9 @@ def test_load_hook_scripts_loads_all_hooks():
     finally:
         re._HOOK_SCRIPTS_CACHE = None  # don't leak forced state to other tests
 
-    for name in ("permission_gate.py", "tool_result_forwarder.py",
-                 "subagent_tracker.py"):
+    assert set(HOOK_SCRIPTS) == {"permission_gate.py", "tool_result_forwarder.py",
+                                 "subagent_tracker.py", "stop_tracker.py"}
+    for name in HOOK_SCRIPTS:
         assert name in scripts, f"hook script not loaded: {name}"
         assert scripts[name].strip(), f"hook script empty: {name}"
 
@@ -61,9 +64,9 @@ class TestRestoreAdoptedCredentials:
         monkeypatch.setattr(subscription_pool, "fan_out_current_token",
                             lambda sub_id: calls.__setitem__("fanned", sub_id))
 
-        RemoteExecutionLayer._restore_adopted_credentials("sess-a", "mach-1", "pa")
+        RemoteExecutionLayer._restore_adopted_credentials("sess-a", "mach-1", "pa", "claude-code-cli")
         t = calls["target"]
-        assert t.kind == "claude"
+        assert t.layer == "claude-code-cli"
         assert t.machine_id == "mach-1"
         assert t.agent_name == "pa"
         assert t.dir_relative == "users/alice/.claude"
@@ -86,7 +89,7 @@ class TestRestoreAdoptedCredentials:
         monkeypatch.setattr(subscription_pool, "fan_out_current_token",
                             lambda sub_id: None)
 
-        RemoteExecutionLayer._restore_adopted_credentials("sess-b", "m", "pa")
+        RemoteExecutionLayer._restore_adopted_credentials("sess-b", "m", "pa", "claude-code-cli")
         assert calls["target"].dir_relative == "workspace/.claude"
 
     def test_api_key_subscription_skips_registration(self, monkeypatch):
@@ -102,7 +105,7 @@ class TestRestoreAdoptedCredentials:
         monkeypatch.setattr(token_fanout, "register_session_target",
                             lambda sid, target: calls.__setitem__("target", target))
 
-        RemoteExecutionLayer._restore_adopted_credentials("sess-c", "m", "pa")
+        RemoteExecutionLayer._restore_adopted_credentials("sess-c", "m", "pa", "claude-code-cli")
         assert "target" not in calls
 
     def test_no_binding_is_quiet_noop(self, monkeypatch):
@@ -111,4 +114,4 @@ class TestRestoreAdoptedCredentials:
 
         monkeypatch.setattr(subscription_pool, "restore_session_binding",
                             lambda sid: None)
-        RemoteExecutionLayer._restore_adopted_credentials("sess-d", "m", "pa")
+        RemoteExecutionLayer._restore_adopted_credentials("sess-d", "m", "pa", "claude-code-cli")

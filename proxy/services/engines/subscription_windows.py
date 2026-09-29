@@ -1,19 +1,33 @@
-"""Provider windows: an OAuth account's real 5-hour and weekly window state.
+"""Provider windows: an OAuth account's real session and quota window state.
 
 Claude and ChatGPT both cap a consumer subscription with a rolling session
 window and a rolling weekly window, and both report the state of those
-windows to their own CLI: Claude on a usage endpoint and in the headless
-stream's ``rate_limit_event``, Codex on a usage endpoint, in the app-server's
-``account/rateLimits/updated`` and next to the rollout's token counts. This
-module turns every one of those shapes into one ``Windows`` reading, stores
-it as a sample (``subscription_store.insert_window_sample``), and answers the
-questions the pool asks of the latest sample: is this account exhausted for
-this spawn, and when does its weekly window reset. The vendor's reading is
-the account's whole truth, the owner's own chats and their CLI on a laptop
-included, which is exactly why the pool prefers it to our own cost estimate.
+windows to their own CLI. Each ENGINE turns its vendor's shapes into one
+``Windows`` reading (``ExecutionLayer.parse_usage`` for the poll,
+``record_usage_event`` for the in-band stream — ``core/layers/cli/usage.py``,
+``core/layers/codex/usage.py``); this module stores a reading as a sample
+(``subscription_store.insert_window_sample``) and answers the questions the
+pool asks of the latest one: is this account exhausted for this spawn, and
+when does its quota window reset. The vendor's reading is the account's
+whole truth, the owner's own chats and their CLI on a laptop included, which
+is exactly why the pool prefers it to our own cost estimate.
 
-Nothing here touches the network; ``token_fanout`` polls and the layers
-record.
+WHICH windows an engine's vendor reports is the engine's declaration
+(``LayerCapabilities.usage.windows`` — a ``WindowSpec`` per window: its key,
+length, role and label; ``core/execution_layer.py``). Every reading carries
+the specs it was read against, so nothing here names a window by attribute:
+the routing, the caps and the alerts ask for the window whose ROLE is
+``quota``, and settle each window by ITS declared length. The two engines
+today declare the same two windows (``five_hour`` session, ``seven_day``
+quota), which are also the two the sample table has columns for; a window
+under any other key rides in the row's JSONB ``data`` (``to_row`` /
+``from_row``), so a fourth engine with a different quota window needs no
+migration. What is NOT the engine's to declare is the routing margin: the
+spill marks below are the platform's policy, keyed by role. A per-model
+window is matched to a spawn by the engine's ``usage_scope_key(model)``.
+
+The poller here asks each engine for its vendor request and hands the
+answer back to it to parse; ``token_fanout`` drives the poll.
 """
 
 from __future__ import annotations
@@ -23,63 +37,70 @@ import contextlib
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+from core.execution_layer import Scoped, Window, WindowSpec, Windows
 
 logger = logging.getLogger("claude-proxy.subscription-windows")
 
 SETTING_KEY = "subscription_windows_enabled"
 _SETTING_CACHE_S = 60
 
-FIVE_HOUR_S = 5 * 3600
-SEVEN_DAY_S = 7 * 86400
+# An account is skipped for new work at/after these; the vendor's hard stop
+# is 100, the margin keeps a live session's next few turns from hitting the
+# wall. Platform ROUTING policy, keyed by the window's role — an engine
+# declares its windows, never the margin the pool routes by. A per-model
+# window is a quota window.
+SPILL_PCT: dict[str, float] = {"session": 90.0, "quota": 95.0}
 
-# An account is skipped for new work past these; the vendor's hard stop is
-# 100, the margin keeps a live session's next few turns from hitting the wall.
-SPILL_5H = 90.0
-SPILL_7D = 95.0
-
-# Vendors name their windows differently; both are identified by length.
-_FIVE_HOUR_MAX_S = 6 * 3600
-
-_FAMILIES = ("fable", "opus", "sonnet", "haiku")
-
-
-@dataclass
-class Window:
-    pct: float                       # 0..100, above 100 when the vendor says so
-    resets_at: datetime | None       # aware UTC; None when the vendor gave none
+# The two window keys the sample table has columns for (``five_hour_pct`` …);
+# a storage fact, frozen with the schema. Any other declared key is stored
+# under ``data["windows"]``.
+_COLUMN_KEYS: tuple[str, ...] = ("five_hour", "seven_day")
 
 
-@dataclass
-class Scoped:
-    key: str                         # model family: fable | opus | sonnet | …
-    label: str                       # the vendor's display name
-    pct: float
-    resets_at: datetime | None
-    active: bool = False             # the vendor says this window is limiting now
+def window_specs(layer: str) -> dict[str, WindowSpec]:
+    """The windows ``layer``'s vendor reports, keyed by window key — the
+    engine's declaration, read through the registry per call (registry-pull;
+    the session manager is never imported at module level here). An engine
+    that is not registered declares nothing: its readings have no windows
+    and never exhaust."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(layer)
+    if caps is None:
+        return {}
+    return {spec.key: spec for spec in caps.usage.windows}
 
 
-@dataclass
-class Windows:
-    five_hour: Window | None = None
-    seven_day: Window | None = None
-    scoped: list[Scoped] = field(default_factory=list)
-    reached: str = ""                # "" | five_hour | seven_day | scoped:<key>
-    plan: str = ""
-    observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    source: str = ""
+def spill_pct(spec: WindowSpec) -> float:
+    """The percentage at which the pool stops sending new work to an account
+    for this window (100 when the role is unknown — only the vendor's own
+    stop applies)."""
+    return SPILL_PCT.get(spec.role, 100.0)
 
-    def scoped_for(self, key: str) -> Scoped | None:
-        for s in self.scoped:
-            if s.key == key:
-                return s
+
+def quota_spec(specs: dict[str, WindowSpec]) -> WindowSpec | None:
+    """The declared quota window — the one the drain-first sort, the day cap
+    and the alerts key off — or None for an engine that declares none."""
+    for spec in specs.values():
+        if spec.role == "quota":
+            return spec
+    return None
+
+
+def spec_for_length(specs: dict[str, WindowSpec], seconds: float | None) -> WindowSpec | None:
+    """The declared window a vendor-reported length belongs to: the shortest
+    whose length covers the report with a fifth of slack (5 h covers a report
+    of up to 6 h — the boundary the Codex parser always used), else the
+    longest. None when nothing is declared or no length was reported."""
+    if seconds is None or not specs:
         return None
+    by_length = sorted(specs.values(), key=lambda s: s.length_s)
+    for spec in by_length:
+        if seconds <= spec.length_s * 1.2:
+            return spec
+    return by_length[-1]
 
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
 
 def _iso_dt(value) -> datetime | None:
     if not value or not isinstance(value, str):
@@ -93,49 +114,10 @@ def _iso_dt(value) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _epoch_dt(value) -> datetime | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if value <= 0:
-        return None
-    try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def _any_dt(value) -> datetime | None:
-    return _epoch_dt(value) if isinstance(value, (int, float)) else _iso_dt(value)
-
-
 def _pct(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
-
-
-def _pick(d: dict, *names):
-    """First present key among camelCase and snake_case spellings."""
-    for n in names:
-        if n in d:
-            return d[n]
-    return None
-
-
-def model_family(model: str) -> str:
-    """``claude-fable-5-1`` → ``fable``; a name with no known family → ``""``."""
-    m = (model or "").lower()
-    for fam in _FAMILIES:
-        if fam in m:
-            return fam
-    return ""
-
-
-def _scoped_key(label: str) -> str:
-    fam = model_family(label)
-    if fam:
-        return fam
-    return "".join(ch if ch.isalnum() else "-" for ch in (label or "").lower()).strip("-")
 
 
 def _dt_iso(dt: datetime | None) -> str | None:
@@ -143,211 +125,18 @@ def _dt_iso(dt: datetime | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Normalizers — each returns None on a shape it does not recognise
-# ---------------------------------------------------------------------------
-
-def from_claude_usage(payload: dict) -> Windows | None:
-    """``GET /api/oauth/usage``: percents and ISO reset instants; per-model
-    weekly windows both as ``seven_day_<family>`` fields and as
-    ``limits[]`` entries (which also carry ``is_active``)."""
-    if not isinstance(payload, dict):
-        return None
-    if "five_hour" not in payload and "seven_day" not in payload:
-        return None
-    w = Windows(source="poll")
-
-    def window(d) -> Window | None:
-        if not isinstance(d, dict):
-            return None
-        pct = _pct(d.get("utilization"))
-        if pct is None:
-            return None
-        return Window(pct=pct, resets_at=_iso_dt(d.get("resets_at")))
-
-    w.five_hour = window(payload.get("five_hour"))
-    w.seven_day = window(payload.get("seven_day"))
-    scoped: dict[str, Scoped] = {}
-    for fam in ("opus", "sonnet"):
-        win = window(payload.get(f"seven_day_{fam}"))
-        if win is not None:
-            scoped[fam] = Scoped(key=fam, label=fam.capitalize(), pct=win.pct,
-                                 resets_at=win.resets_at)
-    # ``limits[]``: ``is_active`` is the vendor's "this limit is the one to
-    # watch" (seen true on a session window at 85 %), NOT "refused" — the
-    # vendor refuses at 100 %. ``reached`` therefore comes from the percent
-    # alone; ``is_active`` survives as the scoped window's ``active`` flag,
-    # which the pool treats as a spill mark (steer new work elsewhere).
-    limits = payload.get("limits")
-    if isinstance(limits, list):
-        for entry in limits:
-            if not isinstance(entry, dict):
-                continue
-            kind = entry.get("kind")
-            active = bool(entry.get("is_active"))
-            pct = _pct(entry.get("percent"))
-            full = pct is not None and pct >= 100
-            if kind == "weekly_scoped":
-                scope = entry.get("scope") or {}
-                model = scope.get("model") if isinstance(scope, dict) else None
-                label = (model or {}).get("display_name") if isinstance(model, dict) else None
-                if not label:
-                    continue
-                key = _scoped_key(str(label))
-                scoped[key] = Scoped(
-                    key=key, label=str(label),
-                    pct=pct if pct is not None else scoped.get(key, Scoped(key, label, 0.0, None)).pct,
-                    resets_at=_iso_dt(entry.get("resets_at")), active=active,
-                )
-                if full and not w.reached:
-                    w.reached = f"scoped:{key}"
-            elif kind == "session" and full and not w.reached:
-                w.reached = "five_hour"
-            elif kind == "weekly_all" and full and not w.reached:
-                w.reached = "seven_day"
-    if not w.reached:
-        if w.five_hour is not None and w.five_hour.pct >= 100:
-            w.reached = "five_hour"
-        elif w.seven_day is not None and w.seven_day.pct >= 100:
-            w.reached = "seven_day"
-    w.scoped = list(scoped.values())
-    if w.five_hour is None and w.seven_day is None and not w.scoped:
-        return None
-    return w
-
-
-_EVENT_TYPE_TO_KEY = {
-    "five_hour": "five_hour",
-    "seven_day": "seven_day",
-    "seven_day_opus": "scoped:opus",
-    "seven_day_sonnet": "scoped:sonnet",
-}
-
-
-def from_claude_event(info: dict) -> Windows | None:
-    """The headless stream's ``rate_limit_event.rate_limit_info``: fractions
-    (0..1, above 1 when usage ran past a cap) and epoch reset instants."""
-    if not isinstance(info, dict):
-        return None
-    unified = info.get("unifiedWindows")
-    if not isinstance(unified, dict):
-        return None
-    w = Windows(source="claude_event")
-
-    def window(d) -> Window | None:
-        if not isinstance(d, dict):
-            return None
-        frac = _pct(d.get("utilization"))
-        if frac is None:
-            return None
-        return Window(pct=frac * 100.0, resets_at=_epoch_dt(d.get("resetsAt")))
-
-    w.five_hour = window(unified.get("five_hour"))
-    w.seven_day = window(unified.get("seven_day"))
-    if w.five_hour is None and w.seven_day is None:
-        return None
-    if info.get("status") == "rejected":
-        w.reached = _EVENT_TYPE_TO_KEY.get(str(info.get("rateLimitType") or ""), "")
-    return w
-
-
-def _codex_window_key(seconds: float | None) -> str:
-    if seconds is None:
-        return ""
-    return "five_hour" if seconds <= _FIVE_HOUR_MAX_S else "seven_day"
-
-
-def from_codex_usage(payload: dict) -> Windows | None:
-    """``GET /backend-api/wham/usage``: percents, window lengths in seconds,
-    epoch reset instants; the windows are told apart by their length."""
-    if not isinstance(payload, dict):
-        return None
-    rl = payload.get("rate_limit")
-    if not isinstance(rl, dict):
-        return None
-    w = Windows(source="poll", plan=str(payload.get("plan_type") or ""))
-    reached_type = str(rl.get("rate_limit_reached_type") or payload.get("rate_limit_reached_type") or "")
-    slot_keys: dict[str, str] = {}
-    for slot in ("primary_window", "secondary_window"):
-        d = rl.get(slot)
-        if not isinstance(d, dict):
-            continue
-        pct = _pct(d.get("used_percent"))
-        if pct is None:
-            continue
-        key = _codex_window_key(_pct(d.get("limit_window_seconds")))
-        if not key:
-            continue
-        resets = _epoch_dt(d.get("reset_at"))
-        if resets is None:
-            after = _pct(d.get("reset_after_seconds"))
-            if after is not None:
-                resets = w.observed_at + timedelta(seconds=after)
-        setattr(w, key, Window(pct=pct, resets_at=resets))
-        slot_keys[slot.split("_")[0]] = key
-    if w.five_hour is None and w.seven_day is None:
-        return None
-    if rl.get("limit_reached"):
-        w.reached = slot_keys.get(reached_type, "") or _fullest(w)
-    return w
-
-
-def from_codex_snapshot(rl: dict) -> Windows | None:
-    """The app-server ``account/rateLimits/updated`` params (camelCase:
-    ``{rateLimits: {primary, secondary: {usedPercent, windowDurationMins,
-    resetsAt}, planType, rateLimitReachedType}}``, the ``account/rateLimits/
-    read`` result carries the same ``rateLimits``) and the rollout
-    ``token_count.rate_limits`` (snake_case): percents, window lengths in
-    minutes, epoch reset instants."""
-    if not isinstance(rl, dict):
-        return None
-    w = Windows(source="codex_event",
-                plan=str(_pick(rl, "planType", "plan_type") or ""))
-    reached_type = str(_pick(rl, "rateLimitReachedType", "rate_limit_reached_type") or "")
-    slot_keys: dict[str, str] = {}
-    for slot in ("primary", "secondary"):
-        d = rl.get(slot)
-        if not isinstance(d, dict):
-            continue
-        pct = _pct(_pick(d, "usedPercent", "used_percent"))
-        if pct is None:
-            continue
-        # The app-server names the length ``windowDurationMins`` (verified on
-        # 0.153.4), the rollout ``window_minutes``.
-        minutes = _pct(_pick(d, "windowDurationMins", "windowMinutes", "window_minutes"))
-        key = _codex_window_key(minutes * 60 if minutes is not None else None)
-        if not key:
-            continue
-        setattr(w, key, Window(pct=pct, resets_at=_any_dt(_pick(d, "resetsAt", "resets_at"))))
-        slot_keys[slot] = key
-    if w.five_hour is None and w.seven_day is None:
-        return None
-    if reached_type:
-        w.reached = slot_keys.get(reached_type, "") or _fullest(w)
-    return w
-
-
-def _fullest(w: Windows) -> str:
-    best, best_pct = "", -1.0
-    for key in ("five_hour", "seven_day"):
-        win = getattr(w, key)
-        if win is not None and win.pct > best_pct:
-            best, best_pct = key, win.pct
-    return best
-
-
-# ---------------------------------------------------------------------------
 # Store rows ⇄ readings
 # ---------------------------------------------------------------------------
 
 def to_row(w: Windows) -> dict:
-    """The keyword arguments ``subscription_store.insert_window_sample`` takes."""
-    return {
+    """The keyword arguments ``subscription_store.insert_window_sample`` takes.
+    A column-backed window (``_COLUMN_KEYS``) goes to its columns; any other
+    declared window rides under ``data["windows"]``."""
+    row: dict = {
         "observed_at": w.observed_at.isoformat(),
         "source": w.source,
-        "five_hour_pct": w.five_hour.pct if w.five_hour else None,
-        "five_hour_resets_at": _dt_iso(w.five_hour.resets_at) if w.five_hour else None,
-        "seven_day_pct": w.seven_day.pct if w.seven_day else None,
-        "seven_day_resets_at": _dt_iso(w.seven_day.resets_at) if w.seven_day else None,
+        "five_hour_pct": None, "five_hour_resets_at": None,
+        "seven_day_pct": None, "seven_day_resets_at": None,
         "data": {
             "scoped": [
                 {"key": s.key, "label": s.label, "pct": s.pct,
@@ -358,20 +147,51 @@ def to_row(w: Windows) -> dict:
             "plan": w.plan,
         },
     }
+    extra: dict[str, dict] = {}
+    for key, win in w.windows.items():
+        if key in _COLUMN_KEYS:
+            row[f"{key}_pct"] = win.pct
+            row[f"{key}_resets_at"] = _dt_iso(win.resets_at)
+        else:
+            extra[key] = {"pct": win.pct, "resets_at": _dt_iso(win.resets_at)}
+    if extra:
+        row["data"]["windows"] = extra
+    return row
 
 
-def from_row(row: dict) -> Windows:
+def sample_window(row: dict, key: str) -> Window | None:
+    """One window out of a stored sample row — from its columns when the key
+    is column-backed, else from ``data["windows"]``. None when the sample
+    did not carry it."""
+    if key in _COLUMN_KEYS:
+        pct = row.get(f"{key}_pct")
+        if pct is None:
+            return None
+        return Window(float(pct), _iso_dt(row.get(f"{key}_resets_at")))
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    extra = data.get("windows") if isinstance(data.get("windows"), dict) else {}
+    entry = extra.get(key)
+    if not isinstance(entry, dict):
+        return None
+    pct = _pct(entry.get("pct"))
+    if pct is None:
+        return None
+    return Window(pct, _iso_dt(entry.get("resets_at")))
+
+
+def from_row(row: dict, specs: dict[str, WindowSpec]) -> Windows:
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
     w = Windows(
+        specs=specs,
         observed_at=_iso_dt(row.get("observed_at")) or datetime.now(timezone.utc),
         source=str(row.get("source") or ""),
         reached=str(data.get("reached") or ""),
         plan=str(data.get("plan") or ""),
     )
-    if row.get("five_hour_pct") is not None:
-        w.five_hour = Window(float(row["five_hour_pct"]), _iso_dt(row.get("five_hour_resets_at")))
-    if row.get("seven_day_pct") is not None:
-        w.seven_day = Window(float(row["seven_day_pct"]), _iso_dt(row.get("seven_day_resets_at")))
+    for key in specs:
+        win = sample_window(row, key)
+        if win is not None:
+            w.windows[key] = win
     for s in data.get("scoped") or []:
         if not isinstance(s, dict) or not s.get("key"):
             continue
@@ -387,11 +207,13 @@ def from_row(row: dict) -> Windows:
 def effective(w: Windows, now: datetime | None = None) -> Windows:
     """What the sample says about NOW. A window whose reset instant has
     passed is empty (and no longer ``reached``); a window with usage but no
-    reset instant is unknown; a sample older than the window's own length is
-    unknown for that window."""
+    reset instant is unknown; a sample older than the window's own declared
+    length is unknown for that window. The per-model windows settle by the
+    quota window's length (they are per-model quota windows)."""
     now = now or datetime.now(timezone.utc)
     age = (now - w.observed_at).total_seconds()
-    out = Windows(observed_at=w.observed_at, source=w.source, plan=w.plan, reached=w.reached)
+    out = Windows(specs=w.specs, observed_at=w.observed_at, source=w.source,
+                  plan=w.plan, reached=w.reached)
 
     def settle(win: Window | None, length: float) -> Window | None:
         if win is None or age > length:
@@ -402,14 +224,18 @@ def effective(w: Windows, now: datetime | None = None) -> Windows:
             return None
         return win
 
-    out.five_hour = settle(w.five_hour, FIVE_HOUR_S)
-    out.seven_day = settle(w.seven_day, SEVEN_DAY_S)
-    for key in ("five_hour", "seven_day"):
-        src, dst = getattr(w, key), getattr(out, key)
+    for key, spec in w.specs.items():
+        src = w.windows.get(key)
+        dst = settle(src, spec.length_s)
+        if dst is not None:
+            out.windows[key] = dst
         if out.reached == key and (dst is None or (src and src.resets_at and src.resets_at <= now)):
             out.reached = ""
+    quota = quota_spec(w.specs)
+    scoped_len = quota.length_s if quota else max(
+        (s.length_s for s in w.specs.values()), default=0)
     for s in w.scoped:
-        settled = settle(Window(s.pct, s.resets_at), SEVEN_DAY_S)
+        settled = settle(Window(s.pct, s.resets_at), scoped_len)
         if settled is None:
             if out.reached == f"scoped:{s.key}":
                 out.reached = ""
@@ -424,12 +250,14 @@ def effective(w: Windows, now: datetime | None = None) -> Windows:
 
 
 def to_public(w: Windows) -> dict:
-    """The listing payload (an EFFECTIVE reading)."""
+    """The listing payload (an EFFECTIVE reading): one entry per declared
+    window under its key (``five_hour`` / ``seven_day`` for both engines
+    today — the dashboard's ``SubscriptionWindows`` shape), null when the
+    reading does not carry it."""
     def win(x: Window | None):
         return None if x is None else {"pct": round(x.pct, 1), "resets_at": _dt_iso(x.resets_at)}
-    return {
-        "five_hour": win(w.five_hour),
-        "seven_day": win(w.seven_day),
+    out: dict = {key: win(w.windows.get(key)) for key in w.specs}
+    out.update({
         "scoped": [
             {"key": s.key, "label": s.label, "pct": round(s.pct, 1),
              "resets_at": _dt_iso(s.resets_at), "active": s.active}
@@ -439,60 +267,69 @@ def to_public(w: Windows) -> dict:
         "plan": w.plan,
         "observed_at": w.observed_at.isoformat(),
         "source": w.source,
-    }
+    })
+    return out
 
 
 # ---------------------------------------------------------------------------
 # The questions the pool asks
 # ---------------------------------------------------------------------------
 
-def exhausted(w: Windows, model: str = "") -> bool:
-    """Skip this account for a spawn of ``model``: either overall window past
-    its spill mark, the vendor's own reached flag on an overall window, or the
-    per-model weekly window of the spawn's family past its spill mark or
-    reached. A scoped window's ``active`` flag is NOT exhaustion: it is the
-    vendor's "the limit to watch" and sits on a window at 61 % once the
+def _scoped_spill() -> float:
+    return SPILL_PCT["quota"]
+
+
+def exhausted(w: Windows, scope_key: str = "") -> bool:
+    """Skip this account for a spawn: either overall window past its spill
+    mark, the vendor's own reached flag on an overall window, or — when the
+    spawn's model falls under a per-model window (``scope_key``, the engine's
+    ``usage_scope_key(model)``; "" = none) — that window past its spill mark
+    or reached. A scoped window's ``active`` flag is NOT exhaustion: it is
+    the vendor's "the limit to watch" and sits on a window at 61 % once the
     session window has reset (seen 2026-09-11, when it made the pool treat
     both accounts as out of Fable and pin a chat to the one that really was)."""
     if exhausted_overall(w):
         return True
-    fam = model_family(model)
-    if not fam:
+    if not scope_key:
         return False
-    s = w.scoped_for(fam)
+    s = w.scoped_for(scope_key)
     if s is None:
         return False
-    return s.pct >= SPILL_7D or w.reached == f"scoped:{fam}"
+    return s.pct >= _scoped_spill() or w.reached == f"scoped:{scope_key}"
 
 
 def exhausted_overall(w: Windows) -> bool:
-    """Exhaustion that holds for every model (what moves a pinned scope)."""
-    if w.five_hour is not None and w.five_hour.pct >= SPILL_5H:
-        return True
-    if w.seven_day is not None and w.seven_day.pct >= SPILL_7D:
-        return True
-    return w.reached in ("five_hour", "seven_day")
+    """Exhaustion that holds for every model (what moves a pinned scope):
+    any declared window at or past the spill mark of its role, or the
+    vendor's reached flag on one."""
+    for key, win in w.windows.items():
+        spec = w.specs.get(key)
+        if spec is not None and win.pct >= spill_pct(spec):
+            return True
+    return w.reached in w.specs
 
 
-def frees_at(w: Windows, model: str = "") -> datetime | None:
+def frees_at(w: Windows, scope_key: str = "") -> datetime | None:
     """The earliest reset instant among the windows that exhaust this account
     (how the all-exhausted fallback orders candidates)."""
     instants: list[datetime] = []
-    if w.five_hour is not None and (w.five_hour.pct >= SPILL_5H or w.reached == "five_hour"):
-        if w.five_hour.resets_at:
-            instants.append(w.five_hour.resets_at)
-    if w.seven_day is not None and (w.seven_day.pct >= SPILL_7D or w.reached == "seven_day"):
-        if w.seven_day.resets_at:
-            instants.append(w.seven_day.resets_at)
-    fam = model_family(model)
-    s = w.scoped_for(fam) if fam else None
-    if s is not None and (s.pct >= SPILL_7D or w.reached == f"scoped:{fam}") and s.resets_at:
+    for key, win in w.windows.items():
+        spec = w.specs.get(key)
+        if spec is None:
+            continue
+        if (win.pct >= spill_pct(spec) or w.reached == key) and win.resets_at:
+            instants.append(win.resets_at)
+    s = w.scoped_for(scope_key) if scope_key else None
+    if s is not None and (s.pct >= _scoped_spill() or w.reached == f"scoped:{scope_key}") and s.resets_at:
         instants.append(s.resets_at)
     return min(instants) if instants else None
 
 
-def weekly_reset(w: Windows) -> datetime | None:
-    return w.seven_day.resets_at if w.seven_day is not None else None
+def quota_reset(w: Windows) -> datetime | None:
+    """When the account's quota window resets (the drain-first sort key);
+    None without a quota window or a reading of it."""
+    win = w.windows.get(w.quota_key)
+    return win.resets_at if win is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +365,8 @@ def invalidate_setting_cache() -> None:
         _setting_cache = None
 
 
-def merged_reading(newest: dict, poll: dict | None, now: datetime | None = None) -> Windows:
+def merged_reading(specs: dict[str, WindowSpec], newest: dict, poll: dict | None,
+                   now: datetime | None = None) -> Windows:
     """The effective reading of an account from its newest sample, with the
     per-model windows carried over from its newest POLL when the newest
     sample is a stream event: the CLI's in-band events report the overall
@@ -536,39 +374,46 @@ def merged_reading(newest: dict, poll: dict | None, now: datetime | None = None)
     minutes between two polls (live-observed 2026-09-11 — the pool sent
     Fable work to an account the poll had read at 100 %). The poll's scoped
     windows are settled by the poll's own age and reset instants."""
-    e = effective(from_row(newest), now)
+    e = effective(from_row(newest, specs), now)
     if newest.get("source") != "poll" and poll:
-        p = effective(from_row(poll), now)
+        p = effective(from_row(poll, specs), now)
         e.scoped = p.scoped
         if not e.reached and p.reached.startswith("scoped:"):
             e.reached = p.reached
     return e
 
 
-def latest_readings(store, sub_ids: list[str], now: datetime | None = None) -> dict[str, Windows]:
+def latest_readings(store, subs: list[dict], now: datetime | None = None) -> dict[str, Windows]:
     """``merged_reading`` per account that has a sample, through ``store``
     (``storage.billing.subscription_store`` or a caller's own import of it —
-    the pool patches its module in tests)."""
-    ids = list(sub_ids)
-    rows = store.latest_window_samples(ids)
+    the pool patches its module in tests). ``subs`` are subscription ROWS
+    (``id`` + ``layer``): the layer names the windows the sample is read
+    against."""
+    by_id = {str(s.get("id")): s for s in subs if s.get("id")}
+    rows = store.latest_window_samples(list(by_id))
     need = [sid for sid, row in rows.items() if row.get("source") != "poll"]
     polls = store.latest_window_samples(need, source="poll") if need else {}
-    return {sid: merged_reading(row, polls.get(sid), now) for sid, row in rows.items()}
+    return {
+        sid: merged_reading(window_specs(by_id[sid].get("layer") or ""), row,
+                            polls.get(sid), now)
+        for sid, row in rows.items()
+    }
 
 
-def latest(sub_ids: list[str], now: datetime | None = None) -> dict[str, Windows]:
-    """Effective readings for the accounts that have a sample."""
+def latest(subs: list[dict], now: datetime | None = None) -> dict[str, Windows]:
+    """Effective readings for the accounts (rows with ``id`` + ``layer``)
+    that have a sample."""
     from storage.billing import subscription_store
-    return latest_readings(subscription_store, sub_ids, now)
+    return latest_readings(subscription_store, subs, now)
 
 
 def exhausted_any(w: Windows) -> bool:
     """Exhausted for SOME model: the overall windows, or any per-model
-    weekly window past its spill mark or reached. What makes a new sample
+    quota window past its spill mark or reached. What makes a new sample
     worth a rebalance pass (the pass then judges each scope by its model)."""
     if exhausted_overall(w):
         return True
-    return any(s.pct >= SPILL_7D or w.reached == f"scoped:{s.key}" for s in w.scoped)
+    return any(s.pct >= _scoped_spill() or w.reached == f"scoped:{s.key}" for s in w.scoped)
 
 
 def record(sub_id: str, w: Windows) -> bool:
@@ -579,7 +424,7 @@ def record(sub_id: str, w: Windows) -> bool:
         return False
     from storage.billing import subscription_store
     before = subscription_store.latest_window_samples([sub_id]).get(sub_id)
-    was_exhausted = bool(before) and exhausted_any(effective(from_row(before), w.observed_at))
+    was_exhausted = bool(before) and exhausted_any(effective(from_row(before, w.specs), w.observed_at))
     written = subscription_store.insert_window_sample(sub_id, **to_row(w))
     if written and not was_exhausted and exhausted_any(effective(w, w.observed_at)):
         try:
@@ -623,43 +468,9 @@ def record_for_session_async(session_id: str, w: Windows) -> None:
     loop.create_task(_run())
 
 
-# The stream consumers' entry points: a raw vendor shape in, a sample out.
-
-def record_claude_event_async(session_id: str, info: dict) -> None:
-    """A headless Claude session's ``rate_limit_event.rate_limit_info``."""
-    w = from_claude_event(info)
-    if w is not None:
-        record_for_session_async(session_id, w)
-
-
-def record_codex_snapshot_async(session_id: str, snapshot: dict) -> None:
-    """The app-server's ``account/rateLimits/updated`` params."""
-    w = from_codex_snapshot(snapshot)
-    if w is not None:
-        record_for_session_async(session_id, w)
-
-
-def record_codex_snapshot(session_id: str, snapshot: dict, observed_at: str | None = None) -> bool:
-    """A rollout line's ``rate_limits``, dated by the line's own timestamp so a
-    replayed line never reads as a fresh observation. Synchronous: the
-    tailer already runs in a thread."""
-    w = from_codex_snapshot(snapshot)
-    if w is None:
-        return False
-    stamped = _iso_dt(observed_at)
-    if stamped is not None:
-        w.observed_at = stamped
-    return record_for_session(session_id, w)
-
-
 # ---------------------------------------------------------------------------
 # Polling — idle accounts and interactive sessions have no in-band signal
 # ---------------------------------------------------------------------------
-
-CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-# The beta the CLI itself sends on every OAuth request.
-_CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 
 # An account with a younger sample is not asked. Below the freshness tick
 # (300 s) so every tick polls every account without an in-band sample: an
@@ -718,38 +529,27 @@ def reset_poll_state() -> None:
 
 
 def poll_request(sub: dict, cred: dict) -> tuple[str, dict] | None:
-    """The URL and headers for one account's usage read, or None when the
-    stored credential lacks what the vendor needs."""
-    oauth = cred.get("oauth_token") if isinstance(cred.get("oauth_token"), dict) else {}
-    token = str(oauth.get("accessToken") or "")
-    if not token:
+    """The URL and headers for one account's usage read — the ENGINE's
+    request (``ExecutionLayer.usage_request``) with the platform's
+    ``User-Agent`` (honest: these are the endpoints the official CLIs use,
+    not published APIs) — or None when the engine is not registered, declares
+    no windows, or the stored credential lacks what the vendor needs."""
+    from core.session.session_manager import get_all_layers
+    layer = get_all_layers().get(str(sub.get("layer") or ""))
+    if layer is None or not layer.capabilities.usage.windows:
         return None
-    ua = _user_agent()
-    layer = sub.get("layer")
-    if layer == "claude-code-cli":
-        return CLAUDE_USAGE_URL, {
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": _CLAUDE_OAUTH_BETA,
-            "Content-Type": "application/json",
-            "User-Agent": ua,
-        }
-    if layer == "codex-cli":
-        blob = cred.get("codex_auth_blob") if isinstance(cred.get("codex_auth_blob"), dict) else {}
-        tokens = blob.get("tokens") if isinstance(blob.get("tokens"), dict) else {}
-        account_id = str(tokens.get("account_id") or "")
-        headers = {"Authorization": f"Bearer {token}", "User-Agent": ua}
-        if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
-        return CODEX_USAGE_URL, headers
-    return None
+    req = layer.usage_request(cred)
+    if req is None:
+        return None
+    url, headers = req
+    return url, {**headers, "User-Agent": _user_agent()}
 
 
 def normalize_poll(sub: dict, payload) -> Windows | None:
-    if sub.get("layer") == "claude-code-cli":
-        return from_claude_usage(payload)
-    if sub.get("layer") == "codex-cli":
-        return from_codex_usage(payload)
-    return None
+    """The engine's reading of its vendor's usage payload, or None."""
+    from core.session.session_manager import get_all_layers
+    layer = get_all_layers().get(str(sub.get("layer") or ""))
+    return layer.parse_usage(payload) if layer is not None else None
 
 
 async def poll_one(sub: dict, client, *, now: float | None = None) -> bool:
@@ -811,10 +611,11 @@ def _new_client():
 
 async def poll_due(*, client=None, now: datetime | None = None) -> int:
     """Poll every active OAuth account whose latest sample is older than the
-    interval. The freshness tick's first step; returns how many were asked."""
+    interval, on every engine whose vendor reports windows. The freshness
+    tick's first step; returns how many were asked."""
     if not is_enabled() or _air_gapped():
         return 0
-    from storage.billing import subscription_store
+    from storage.billing import subscription_status, subscription_store
     try:
         rows = await asyncio.to_thread(subscription_store.list_subscriptions)
     except Exception:
@@ -822,8 +623,8 @@ async def poll_due(*, client=None, now: datetime | None = None) -> int:
         return 0
     candidates = [
         r for r in rows
-        if r.get("auth_type") == "oauth" and r.get("status") == "active"
-        and r.get("layer") in ("claude-code-cli", "codex-cli")
+        if r.get("auth_type") == "oauth" and r.get("status") == subscription_status.ACTIVE
+        and window_specs(str(r.get("layer") or ""))
     ]
     if not candidates:
         return 0

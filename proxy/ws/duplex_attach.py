@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass, field
 
 from storage import database as task_store
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy")
 
@@ -139,6 +140,21 @@ async def _resolve(bridge) -> "_AttachState | str":
     chat = await asyncio.to_thread(task_store.get_chat, bridge.chat_id)
     if not chat:
         return "chat_not_found"
+    from core.session.visibility import SCOPE_AGENT, is_shared_chat_owner
+    if is_shared_chat_owner(chat.get("user_sub")):
+        # A pool chat runs as the agent: the editor tier at every drive. The
+        # mint and the attach judged the token's principal; this is the live
+        # role at the first utterance, ahead of both the pump and the PTY path.
+        from auth.providers import acting_role_of
+        from core.sandbox.session_config_dir import (
+            AgentStateRefused, refuse_agent_state_below_editor,
+        )
+        from storage.pg import run_db
+        pool_role = await run_db(acting_role_of, bridge.sub, chat.get("agent") or "")
+        try:
+            refuse_agent_state_below_editor(SCOPE_AGENT, pool_role)
+        except AgentStateRefused as e:
+            return str(e)
     session_id = chat.get("session_id") or ""
     if not session_id:
         return "no_session"
@@ -164,8 +180,8 @@ async def _resolve(bridge) -> "_AttachState | str":
 
     from core.session.session_manager import get_execution_layer
     from storage.pg import run_db
-    from ws.dashboard import _effective_agent_role
-    role = await run_db(_effective_agent_role, bridge.sub, chat.get("agent") or "")
+    from auth.providers import acting_role_of
+    role = await run_db(acting_role_of, bridge.sub, chat.get("agent") or "")
     try:
         layer = get_execution_layer(
             chat.get("agent") or "",
@@ -186,8 +202,13 @@ async def _resolve(bridge) -> "_AttachState | str":
     return st
 
 
-def _build_prompt(st: _AttachState, text: str, barge_in_chars: int | None) -> str:
+def _build_prompt(st: _AttachState, text: str, barge_in_chars: int | None,
+                  focus: str = "") -> str:
+    """``focus`` is the viewer-focus line for this turn (the app on the
+    user's newest screen, APPS.md "Live apps"); prompt-side only."""
     parts: list[str] = []
+    if focus:
+        parts.append(focus)
     if not st.context_injected:
         ctx = task_store.get_platform_setting("chat_duplex_context") or ""
         if ctx.strip():
@@ -198,10 +219,13 @@ def _build_prompt(st: _AttachState, text: str, barge_in_chars: int | None) -> st
             f"; they heard only the first {barge_in_chars} characters"
             if barge_in_chars else ""
         )
-        # Direct-llm gets the precise history annotation via the
-        # barge_in_chars kwarg; this textual note is for the layers that
-        # can't rewrite their own history (CLI/Codex).
-        if "direct" not in (st.execution_path or ""):
+        # An engine that rebuilds its history from the DB gets the precise
+        # annotation via the barge_in_chars kwarg; this textual note is for
+        # the engines that cannot rewrite their own history (an unknown or
+        # empty path reads as one of those).
+        from core.session.session_manager import get_layer_capabilities
+        _caps = get_layer_capabilities(st.execution_path or "")
+        if _caps is None or not _caps.behaviour.rebuilds_history_from_db:
             parts.append(
                 "[The user interrupted your previous spoken reply"
                 f"{heard} — they did not hear the rest.]"
@@ -211,6 +235,17 @@ def _build_prompt(st: _AttachState, text: str, barge_in_chars: int | None) -> st
     return "\n\n".join(parts)
 
 
+async def _focus_for(bridge) -> str:
+    """The focus line for a spoken turn: the user's newest screen (a duplex
+    turn has no dashboard connection of its own)."""
+    from services.apps.focus_context import focus_line
+    try:
+        return await asyncio.to_thread(focus_line, bridge.sub or "")
+    except Exception:
+        logger.debug("focus line unavailable for duplex %s", bridge.duplex_id, exc_info=True)
+        return ""
+
+
 async def run_utterance(bridge, frame: dict) -> None:
     """One daemon utterance → one chat turn (or a queue onto a live one)."""
     turn = int(frame.get("turn") or 0)
@@ -218,13 +253,13 @@ async def run_utterance(bridge, frame: dict) -> None:
     raw_chars = frame.get("barge_in_chars")
     barge_in_chars = int(raw_chars) if raw_chars else None
     if not text:
-        await _engine_send(bridge, {"type": "done", "turn": turn, "data": {}})
+        await _engine_send(bridge, {"type": wire.DONE, "turn": turn, "data": {}})
         return
 
     st = await _resolve(bridge)
     if isinstance(st, str):
         await _engine_send(bridge, {
-            "type": "error", "turn": turn, "data": {"message": st},
+            "type": wire.ERROR, "turn": turn, "data": {"message": st},
         })
         return
 
@@ -232,6 +267,7 @@ async def run_utterance(bridge, frame: dict) -> None:
         await _run_interactive_utterance(bridge, st, turn, text, barge_in_chars)
         return
 
+    from core.events.common_events import TurnInput
     from core.events.stream_pump import _active_pumps
 
     st.active_turn = turn
@@ -244,7 +280,7 @@ async def run_utterance(bridge, frame: dict) -> None:
         # as the abort target: a barge-in against this turn must interrupt
         # THAT pump's generation (st.pump stays None by invariant, which
         # used to silently drop the abort).
-        live.queue_message(_build_prompt(st, text, barge_in_chars))
+        live.queue_message(TurnInput(_build_prompt(st, text, barge_in_chars)))
         st.abort_target = live
         _start_forward(bridge, st, live, turn)
         return
@@ -256,7 +292,7 @@ async def run_utterance(bridge, frame: dict) -> None:
         # turn id and drops stale labels, so without the restart the queued
         # utterance's reply would be relayed under the old turn and silently
         # discarded.
-        st.pump.queue_message(_build_prompt(st, text, barge_in_chars))
+        st.pump.queue_message(TurnInput(_build_prompt(st, text, barge_in_chars)))
         _start_forward(bridge, st, st.pump, turn)
         return
 
@@ -274,7 +310,7 @@ async def run_utterance(bridge, frame: dict) -> None:
         )
         st.active_turn = None
         await _engine_send(bridge, {
-            "type": "error", "turn": turn, "data": {"message": "session_dead"},
+            "type": wire.ERROR, "turn": turn, "data": {"message": "session_dead"},
         })
         return
 
@@ -360,17 +396,24 @@ async def _run_interactive_utterance(
     isess = interactive_session.find_live_for_chat(bridge.chat_id)
     if isess is None:
         await _engine_send(bridge, {
-            "type": "error", "turn": turn, "data": {"message": "session_dead"},
+            "type": wire.ERROR, "turn": turn, "data": {"message": "session_dead"},
+        })
+        return
+    # The terminal runs as whoever warmed it: a voice that may not type
+    # into it may not speak into it either.
+    if not isess.may_drive(bridge.sub or ""):
+        await _engine_send(bridge, {
+            "type": wire.ERROR, "turn": turn, "data": {"message": "access_denied"},
         })
         return
     st.active_turn = turn
     st.turn_saw_open = False
-    prompt = _build_prompt(st, text, barge_in_chars)
+    prompt = _build_prompt(st, text, barge_in_chars, focus=await _focus_for(bridge))
     ok = isess.queue_prompt(prompt, "duplex", steer=True, chat_id=bridge.chat_id)
     if not ok:
         st.active_turn = None
         await _engine_send(bridge, {
-            "type": "error", "turn": turn, "data": {"message": "session_dead"},
+            "type": wire.ERROR, "turn": turn, "data": {"message": "session_dead"},
         })
 
 
@@ -407,10 +450,10 @@ async def _feed_interactive(
                         and (r.get("content") or "").strip()):
                     st.turn_saw_open = True
                     await _engine_send(bridge, {
-                        "type": "text", "turn": turn,
+                        "type": wire.TEXT, "turn": turn,
                         "data": {"content": r["content"] + "\n"},
                     })
-                elif r.get("event_type") in ("tool", "task_spawn"):
+                elif r.get("event_type") in (wire.PERSISTED_TOOL, wire.TASK_SPAWN):
                     # A persisted tool row means the tool already COMPLETED
                     # (interactive rows land post-hoc), so forward the
                     # boundary as tool_end — the engine finalizes the
@@ -419,7 +462,7 @@ async def _feed_interactive(
                     # the headless layers' tool frames).
                     st.turn_saw_open = True
                     await _engine_send(bridge, {
-                        "type": "tool_end", "turn": turn, "data": {},
+                        "type": wire.TOOL_END, "turn": turn, "data": {},
                     })
         if not turn_open:
             if not st.turn_saw_open:
@@ -433,7 +476,7 @@ async def _feed_interactive(
                 # follows a seen-open or forwarded output.
                 return
             st.active_turn = None
-            await _engine_send(bridge, {"type": "done", "turn": turn, "data": {}})
+            await _engine_send(bridge, {"type": wire.DONE, "turn": turn, "data": {}})
 
 
 async def _run_new_turn(
@@ -441,18 +484,18 @@ async def _run_new_turn(
     barge_in_chars: int | None,
 ) -> None:
     from core.events.common_events import (
-        ARTIFACT_TURN, ERROR, PRODUCER_DONE, QUEUE_TURN, CommonEvent,
+        ARTIFACT_TURN, ERROR, PRODUCER_DONE, QUEUE_TURN, CommonEvent, TurnInput,
     )
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session import visibility as _vis
     from core.session.session_state import get_permission_queue
 
-    prompt = _build_prompt(st, text, barge_in_chars)
+    prompt = _build_prompt(st, text, barge_in_chars, focus=await _focus_for(bridge))
     # A fresh session spawned by the heal (resume refused) has no context —
     # claim the chat's pending DB-history digest into this prompt. Same
-    # chokepoint rule as the dashboard turn path; direct-llm rebuilds full
-    # history from the DB on its own and is never seeded.
-    if st.layer.capabilities.name != "direct-llm":
+    # chokepoint rule as the dashboard turn path; an engine that rebuilds
+    # full history from the DB on its own is never seeded.
+    if not st.layer.capabilities_for(st.session_id).behaviour.rebuilds_history_from_db:
         from core.session.history_seed import consume_pending_seed
         prompt, _seed_notice = await asyncio.to_thread(
             consume_pending_seed, bridge.chat_id, prompt,
@@ -482,12 +525,17 @@ async def _run_new_turn(
                 # a typed message queued mid-voice must run, not drop.
                 while msg_queue or art_queue or sys_queue:
                     if msg_queue:
-                        combined = "\n\n".join(msg_queue)
+                        batch = TurnInput.combine(msg_queue)
                         msg_queue.clear()
-                        await event_queue.put(
-                            CommonEvent(type=QUEUE_TURN, data={"text": combined}))
+                        await event_queue.put(CommonEvent(
+                            type=QUEUE_TURN,
+                            data={"text": batch.text, "event_data": batch.event_meta},
+                        ))
+                        drain_kwargs = {"inject_time": True}
+                        if batch.images:
+                            drain_kwargs["images"] = batch.images
                         async for event in layer.send_message(
-                                sid, combined, inject_time=True):
+                                sid, batch.cli_text, **drain_kwargs):
                             await event_queue.put(event)
                     if art_queue:
                         from ws import artifact_interactions as _ai
@@ -558,7 +606,7 @@ async def _forward(bridge, st: _AttachState, pump, turn: int) -> None:
                 # first text frame carries the forward-start elapsed: the
                 # proxy-side engine leg, comparable with the daemon's
                 # dispatch→text.
-                if first_text_ms < 0 and msg.get("type") == "text":
+                if first_text_ms < 0 and msg.get("type") == wire.TEXT:
                     first_text_ms = (time.monotonic() - t_start) * 1000
                     logger.info(
                         "duplex %s turn %s → text (%d chars, first "
@@ -574,7 +622,7 @@ async def _forward(bridge, st: _AttachState, pump, turn: int) -> None:
                         len((msg.get("data") or {}).get("content", "") or ""),
                     )
                 await _engine_send(bridge, msg)
-            if item.get("pump_type") in ("all_done", "pump_ended"):
+            if item.get("pump_type") in (wire.PUMP_ALL_DONE, wire.PUMP_ENDED):
                 break
     except asyncio.CancelledError:
         pass

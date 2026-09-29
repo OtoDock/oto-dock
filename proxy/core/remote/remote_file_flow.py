@@ -62,6 +62,7 @@ collaborative agent can't clobber each other on a shared workspace file.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -348,26 +349,69 @@ async def push_back_host_path(session_id: str, cache_path: str) -> bool:
 # the life of the process (one tiny asyncio.Lock each) — bounded and acceptable
 # for v1; there is no per-session cleanup hook (these locks are NOT session-scoped,
 # unlike the pending_push events in _SessionState).
-_global_path_locks: dict[tuple[str, str], asyncio.Lock] = {}
-_global_path_locks_lock = asyncio.Lock()
+class _PathLock(asyncio.Lock):
+    """An asyncio.Lock that can say whether anyone is using it: held, or with
+    a waiter (a woken waiter stays in ``_waiters`` until its task resumes, so
+    a lock in hand-off is never idle)."""
+
+    def idle(self) -> bool:
+        return not self.locked() and not self._waiters
 
 
-async def _acquire_global_path_lock(agent_slug: str, rel_path: str) -> asyncio.Lock:
+# One lock per distinct (agent_slug, rel_path) written through the platform,
+# insertion-ordered and bounded: past the bound the oldest IDLE entries are
+# evicted. Eviction is safe because of the shape every caller keeps (pinned
+# by tests/remote/test_remote_file_flow.py): the lock handed out by
+# ``_acquire_global_path_lock`` is entered on the caller's next statement
+# with no await in between, and the acquire itself never suspends, so a lock
+# that is idle here is referenced by nobody about to enter it. A second map
+# with the same rule serializes fan-outs per path (``acquire_fanout_lock``);
+# the lock order is the path lock, then the fan-out lock, then the transfer
+# gate, and no caller takes them the other way round.
+_PATH_LOCKS_MAX = 4096
+_global_path_locks: OrderedDict[tuple[str, str], _PathLock] = OrderedDict()
+_fanout_locks: OrderedDict[tuple[str, str], _PathLock] = OrderedDict()
+
+
+def _get_or_create_lock(table: OrderedDict, key: tuple[str, str]) -> _PathLock:
+    lock = table.get(key)
+    if lock is None:
+        lock = _PathLock()
+    else:
+        del table[key]
+    table[key] = lock
+    if len(table) > _PATH_LOCKS_MAX:
+        # A bounded scan from the oldest end: idle entries go until the table
+        # fits; an entry in use stays whatever its age.
+        for old_key in list(table.keys())[:64]:
+            if len(table) <= _PATH_LOCKS_MAX:
+                break
+            if old_key != key and table[old_key].idle():
+                del table[old_key]
+    return lock
+
+
+async def _acquire_global_path_lock(agent_slug: str, rel_path: str) -> _PathLock:
     """Get-or-create the global per-(agent_slug, rel_path) workspace write lock.
 
     The SINGLE serialization point for platform-side writes to an agent-tree
     file. Cross-module + cross-session: pull_through / push_back (this module),
-    the ``file_changed`` applier (core/remote/satellite_connection.py), and the fan-out
-    (services/remote/workspace_fanout.py) all serialize on the same key so concurrent
-    writers to one shared workspace file can't clobber each other mid-write.
+    the ``file_changed`` applier (core/remote/satellite_file_transfer.py), and
+    the fan-out (services/remote/workspace_fanout.py) all serialize on the same
+    key so concurrent writers to one shared workspace file can't clobber each
+    other mid-write. Never suspends (the map belongs to the loop thread); the
+    caller enters the lock on its next statement (see the note on the map).
     """
-    key = (agent_slug, rel_path)
-    async with _global_path_locks_lock:
-        lock = _global_path_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _global_path_locks[key] = lock
-        return lock
+    return _get_or_create_lock(_global_path_locks, (agent_slug, rel_path))
+
+
+async def acquire_fanout_lock(agent_slug: str, rel_path: str) -> _PathLock:
+    """The per-(agent_slug, rel_path) lock that serializes fan-outs of one
+    file to the other machines. Taken INSIDE the path lock and kept after it
+    is released, so same-path fan-outs run in apply order while a slow
+    target no longer holds the next writer of the path back. Same shape rule
+    as the path lock."""
+    return _get_or_create_lock(_fanout_locks, (agent_slug, rel_path))
 
 
 @dataclass
@@ -439,7 +483,7 @@ def _get_remote_session_info(session_id: str):
         return info
     from core.session.session_state import get_session_security
     ctx = get_session_security(session_id)
-    machine_id = getattr(ctx, "target_machine_id", "") if ctx is not None else ""
+    machine_id = ctx.placement.machine_id if ctx is not None else ""
     if not machine_id:
         return None
     if session_id not in _fallback_logged:
@@ -502,12 +546,13 @@ async def list_remote_files(session_id: str, rel_prefix: str) -> list[str] | Non
     info = _get_remote_session_info(session_id)
     if info is None:
         return None
+    from core.remote.remote_workspace_sync import manifest_request
     from core.remote.satellite_connection import get_connection_manager
     cm = get_connection_manager()
     try:
         ack = await cm.send_command(
             info.machine_id,
-            {"type": "request_manifest", "agent_slug": info.agent_name},
+            manifest_request(cm, info.machine_id, info.agent_name),
             timeout=30.0,
         )
     except Exception as e:
@@ -713,17 +758,21 @@ async def push_back(session_id: str, rel_path: str) -> bool:
             # the session's OWN satellite; propagate the same bytes to every
             # OTHER satellite running this agent so collaborators see a
             # file-tools edit live (not just at their next session start). The
-            # global lock is already held → no interleave; fan-out is
-            # best-effort (never raises) and excludes the source machine.
+            # global lock is already held → no interleave, and the fan-out
+            # lock (taken inside it) keeps this fan-out in order with the
+            # file_changed applier's; fan-out is best-effort (never raises)
+            # and excludes the source machine.
             # NO conflict capture: the Docker MCP already overwrote the platform
             # cache before this hook fired, so the loser's pre-overwrite bytes
             # are unrecoverable here. Last-writer-wins still converges; conflict
             # recovery stays on the file_changed path (which pre-captures).
             from services.remote import workspace_fanout
-            await workspace_fanout.fan_out_write(
-                info.agent_name, rel_path, host_path,
-                exclude_machine_id=info.machine_id,
-            )
+            fanout_lock = await acquire_fanout_lock(info.agent_name, rel_path)
+            async with fanout_lock:
+                await workspace_fanout.fan_out_write(
+                    info.agent_name, rel_path, host_path,
+                    exclude_machine_id=info.machine_id,
+                )
             return ok
     finally:
         event.set()

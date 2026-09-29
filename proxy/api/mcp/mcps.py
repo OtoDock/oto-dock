@@ -6,22 +6,27 @@ managing Docker containers, and agent assignments.
 
 import asyncio
 import logging
+import stat
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 
 import config
+from core import host_os
 from auth.providers import UserContext, get_current_user
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from services.mcp import mcp_manifest_types as _mt
 from services.mcp import mcp_registry
 from storage.mcp import mcp_store
+from auth import roles
 
 logger = logging.getLogger("claude-proxy.mcp-api")
 router = APIRouter()
 
 
 def _require_admin(user: UserContext | None) -> UserContext:
-    if not user or user.role != "admin":
+    if not user or not user.is_admin:
         raise HTTPException(403, "Admin only")
     return user
 
@@ -32,7 +37,7 @@ def _require_manage(user: UserContext | None, agent: str | None = None) -> UserC
     if agent:
         if not user.can_manage_agent(agent):
             raise HTTPException(403, "Manager access required for this agent")
-    elif user.role not in ("admin", "creator"):
+    elif not roles.is_creator_or_above(user.role):
         raise HTTPException(403, "Admin or creator only")
     return user
 
@@ -92,7 +97,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
     docker_unmanaged: set[str] = set()
     docker_statuses: dict[str, str] = {}
     for name, m in manifests.items():
-        if m.server.runtime != "docker":
+        if not _mt.is_container(m.server):
             continue
         if _in_t2 and not (getattr(m.server, "image", "") or ""):
             docker_unmanaged.add(name)
@@ -104,7 +109,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
                     docker_manager.get_container_status, m
                 )
             except Exception:
-                docker_statuses[name] = "unknown"
+                docker_statuses[name] = docker_manager.UNKNOWN
 
     result = []
     for name, m in manifests.items():
@@ -234,11 +239,12 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         # Docker status. Unmanaged (operator-owned compose sibling on a
         # containerized install): no status, and the dashboard hides the
         # pill + start/stop/restart controls — the proxy can't drive it.
-        if m.server.runtime == "docker":
+        if _mt.is_container(m.server):
             if name in docker_unmanaged:
                 entry["docker_managed"] = False
             else:
-                entry["docker_status"] = docker_statuses.get(name, "not_checked")
+                from services.mcp import docker_manager
+                entry["docker_status"] = docker_statuses.get(name, docker_manager.NOT_CHECKED)
 
         # Generic tool filter. Dashboard renders
         # the regex field when `tool_filter_supported` is true; greys it
@@ -282,11 +288,11 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     m = mcp_registry.get_manifest(name)
     docker_status: str | None = None
     docker_error: str | None = None
-    if m and m.server.runtime == "docker":
+    if m and _mt.is_container(m.server):
         try:
             from services.mcp import docker_manager
             ok = await asyncio.to_thread(docker_manager.start_container, m)
-            docker_status = "started" if ok else "failed"
+            docker_status = docker_manager.ENABLE_STARTED if ok else docker_manager.ENABLE_FAILED
             if not ok:
                 docker_error = (
                     "docker compose up -d exited non-zero. Likely cause: "
@@ -294,7 +300,8 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
                     "conflict. Check proxy logs for the compose output."
                 )
         except Exception as e:
-            docker_status = "failed"
+            from services.mcp import docker_manager
+            docker_status = docker_manager.ENABLE_FAILED
             docker_error = (
                 f"{type(e).__name__} while starting the container. "
                 "Check proxy logs for the full error."
@@ -322,7 +329,7 @@ async def disable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     await asyncio.to_thread(mcp_store.set_mcp_enabled, name, False)
 
     # Stop Docker container if applicable
-    if m and m.server.runtime == "docker":
+    if m and _mt.is_container(m.server):
         try:
             from services.mcp import docker_manager
             await asyncio.to_thread(docker_manager.stop_container, m)
@@ -376,7 +383,7 @@ async def set_mcp_tool_filter(
     # ENABLED_TOOLS_FLAG takes effect. Stdio MCPs pick up the new value
     # on their next session spawn — no proxy-side restart needed.
     docker_restarted = False
-    if m.server.runtime == "docker":
+    if _mt.is_container(m.server):
         try:
             from services.mcp import docker_manager
             docker_restarted = await asyncio.to_thread(
@@ -499,7 +506,7 @@ async def set_network_access(
 async def docker_start(name: str, user: UserContext = Depends(get_current_user)):
     _require_admin(user)
     m = mcp_registry.get_manifest(name)
-    if not m or m.server.runtime != "docker":
+    if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     from services.mcp import docker_manager
     ok = await asyncio.to_thread(docker_manager.start_container, m)
@@ -512,7 +519,7 @@ async def docker_start(name: str, user: UserContext = Depends(get_current_user))
 async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
     _require_admin(user)
     m = mcp_registry.get_manifest(name)
-    if not m or m.server.runtime != "docker":
+    if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     from services.mcp import docker_manager
     ok = await asyncio.to_thread(docker_manager.stop_container, m)
@@ -525,7 +532,7 @@ async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
 async def docker_restart(name: str, user: UserContext = Depends(get_current_user)):
     _require_admin(user)
     m = mcp_registry.get_manifest(name)
-    if not m or m.server.runtime != "docker":
+    if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     from services.mcp import docker_manager
     ok = await asyncio.to_thread(docker_manager.restart_container, m)
@@ -538,7 +545,7 @@ async def docker_restart(name: str, user: UserContext = Depends(get_current_user
 async def docker_status(name: str, user: UserContext = Depends(get_current_user)):
     _require_admin(user)
     m = mcp_registry.get_manifest(name)
-    if not m or m.server.runtime != "docker":
+    if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
     from services.mcp import docker_manager
     status = await asyncio.to_thread(docker_manager.get_container_status, m)
@@ -708,6 +715,22 @@ async def set_agent_mcps(
     return {"status": "saved", "agent": name, "mcps": effective_mcps}
 
 
+def _require_session_editor_tier(user: UserContext, agent: str) -> None:
+    """A session principal reads the agent's SSH hosts only at the tier that
+    holds the keys (``session_config_dir.session_takes_ssh_keys``): a person
+    by their acting role, an agent-scope session by its live context."""
+    from auth import roles
+    if user.is_no_user_session:
+        from core.session.session_state import get_session_security
+        ctx = get_session_security(user.session_id or "")
+        role = getattr(ctx, "role", "") if ctx is not None else ""
+    else:
+        role = user.acting_role(agent)
+    if not isinstance(role, str) or not roles.can_edit(role):
+        raise HTTPException(
+            403, "The editor role or above on this agent is required to list SSH hosts")
+
+
 @router.get("/v1/agents/{name}/ssh-hosts")
 async def get_agent_ssh_hosts(
     name: str,
@@ -722,11 +745,15 @@ async def get_agent_ssh_hosts(
     session-file-broker path. ``target_os`` gates the ControlMaster mux
     options in ``command`` (no unix-socket mux on Windows).
 
-    Auth: the agent's OWN session JWT (the tool path — any role, matching the
-    prompt block every session already receives), or manage rights on the
-    agent (dashboard/debug callers).
+    Auth: the agent's OWN session JWT (the tool path) at the editor tier,
+    the tier that holds the keys and the prompt block: a person's session by
+    its acting role on the agent, an agent-scope session by the role of its
+    live SecurityContext (none live: refused); or manage rights on the agent
+    (dashboard/debug callers).
     """
-    if not (user and user.is_session and user.agent == name):
+    if user and user.is_session and user.agent == name:
+        _require_session_editor_tier(user, name)
+    else:
         _require_manage(user, name)
 
     if mcp_registry.get_manifest("ssh-hosts") is None:
@@ -737,7 +764,8 @@ async def get_agent_ssh_hosts(
 
     from services.mcp.dynamic_context import format_ssh_host_command
 
-    mux = (target_os or "").strip().lower() in ("linux", "darwin")
+    row = host_os.of(target_os)
+    mux = bool(row is not None and row.posix)
     instances = await asyncio.to_thread(
         mcp_store.get_mcp_instances_for_agent, "ssh-hosts", name,
     )
@@ -1033,7 +1061,7 @@ async def _refresh_container_after_instance_change(name: str) -> bool:
     Best-effort: a refresh failure never fails the instance save.
     """
     manifest = mcp_registry.get_manifest(name)
-    if not manifest or manifest.server.runtime != "docker":
+    if not manifest or not _mt.is_container(manifest.server):
         return False
     from core.config import deployment
     if deployment.current_mode() == deployment.EXTERNAL_POOL:
@@ -1047,7 +1075,7 @@ async def _refresh_container_after_instance_change(name: str) -> bool:
         status = await asyncio.to_thread(
             docker_manager.get_container_status, manifest,
         )
-        if status in ("running", "starting", "unhealthy"):
+        if status in docker_manager.PRESENT:
             await asyncio.to_thread(
                 docker_manager.start_container, manifest, force_recreate=True,
             )
@@ -1263,7 +1291,7 @@ async def delete_mcp(name: str, user: UserContext = Depends(get_current_user)):
     # above is the whole delete.
     from core.config import deployment
     if (
-        manifest.server.runtime == "docker"
+        _mt.is_container(manifest.server)
         and deployment.current_mode() != deployment.EXTERNAL_POOL
     ):
         from services.mcp import docker_manager
@@ -1370,7 +1398,19 @@ async def _extract_upload_zip(file: UploadFile, tmp):
             # total-size cap doesn't.)
             total_uncompressed = 0
             for info in infos:
-                if info.filename.startswith("/") or ".." in info.filename:
+                # An absolute name, a dot segment, a NUL or a symlink member
+                # (which extractall would materialise) is refused.
+                if info.filename.startswith("/") or stat.S_ISLNK(info.external_attr >> 16):
+                    raise HTTPException(400, f"Invalid path in zip: {info.filename}")
+                # A leading "./" is how some archivers (bsdtar, Windows'
+                # tar -a) name every member; extractall drops it too.
+                name = info.filename
+                while name.startswith("./"):
+                    name = name[2:]
+                try:
+                    if name not in ("", "."):
+                        normalize_rel_path(name)
+                except PathOutsideRoot:
                     raise HTTPException(400, f"Invalid path in zip: {info.filename}")
                 total_uncompressed += info.file_size
                 if total_uncompressed > config.MCP_ZIP_DECOMPRESSED_MAX:

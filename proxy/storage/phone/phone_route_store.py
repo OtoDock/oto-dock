@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 
 from storage.pg import get_conn
+from auth import roles
 
 
 def _now() -> str:
@@ -136,7 +137,7 @@ def create_route(data: dict) -> dict:
                 data.get("trigger_slug") or None,
                 data.get("identity_mode") or "caller",
                 data.get("identity_user_sub") or None,
-                data.get("role") or "viewer",
+                data.get("role") or roles.VIEWER,
                 bool(data.get("remember_callers", True)),
                 now,
                 now,

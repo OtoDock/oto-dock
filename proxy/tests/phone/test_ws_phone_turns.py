@@ -167,6 +167,7 @@ class FakePump:
 
 class _FakeAgentCfg:
     execution_path = "direct-llm"
+    mcp_config_path = "/tmp/phone-mcp.json"
 
 
 @pytest.fixture
@@ -199,7 +200,10 @@ def phone_ws_env(monkeypatch):
     monkeypatch.setattr(ws_phone, "build_phone_agent_config", _fake_build)
 
     import core.concurrency as concurrency
-    async def _fake_acquire(session_id, target=None, execution_path=None):
+    layer.admissions = []  # the kwargs of every acquire the handler made
+
+    async def _fake_acquire(session_id, **kw):
+        layer.admissions.append(kw)
         return True
     monkeypatch.setattr(concurrency, "acquire_chat_slot", _fake_acquire)
     monkeypatch.setattr(concurrency, "release_chat_slot", lambda sid: None)
@@ -433,3 +437,70 @@ def test_dead_process_respawns_in_place(phone_ws_env):
         await handler
 
     asyncio.run(run())
+
+
+def test_a_call_is_admitted_as_a_phone_session(phone_ws_env):
+    """A call takes a slot of its own kind (never evicted,
+    outside the per-person cap, counted by the admin gauge as a phone) and
+    names its MCP config so a Direct-LLM call reserves for its stdio MCPs;
+    an external caller has no owner."""
+    ws, layer = phone_ws_env
+
+    async def run():
+        handler = await _run_handler(ws)
+        await _warmup(ws)
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+    adm = layer.admissions[-1]
+    assert adm["kind"] == "phone"
+    assert adm["mcp_config_path"] == "/tmp/phone-mcp.json"
+    assert adm.get("user_sub") is None
+
+
+def test_a_user_route_call_is_owned_by_its_tied_user(phone_ws_env, monkeypatch):
+    ws, layer = phone_ws_env
+    from services.phone.phone_identity import RouteIdentity
+    monkeypatch.setattr(
+        ws_phone, "resolve_route_identity",
+        lambda route, **kw: RouteIdentity(
+            mode="user", role="viewer", external=None,
+            user={"sub": "user-tied", "username": "tied"}, user_role="editor",
+        ),
+    )
+
+    async def run():
+        handler = await _run_handler(ws)
+        await _warmup(ws)
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+    assert layer.admissions[-1]["user_sub"] == "user-tied"
+
+
+def test_the_user_row_and_the_title_ride_the_chat_writer(phone_ws_env, monkeypatch):
+    """A call's user row and first title land on the chat's writer
+    lane, off the loop, before the turn runs."""
+    ws, layer = phone_ws_env
+    from core.events import chat_writer
+    labels: list[str] = []
+    orig = chat_writer.submit
+
+    def _submit(chat_id, job, *, label=""):
+        labels.append(label)
+        return orig(chat_id, job, label=label)
+    monkeypatch.setattr(chat_writer, "submit", _submit)
+
+    async def run():
+        handler = await _run_handler(ws)
+        await _warmup(ws)
+        ws.push({"type": "chat", "prompt": "hello there", "turn": 1})
+        await ws.wait_for_frame(lambda f: f["type"] == "done" and f.get("turn") == 1)
+        ws.disconnect()
+        await handler
+
+    asyncio.run(run())
+    assert labels[:2] == ["phone_user_row", "phone_title"]
+    assert [a for a in layer.persisted if a[1] == "user"][-1][2] == "hello there"

@@ -4,7 +4,7 @@ The Windows sibling of ``pty_relay`` (the Unix ``pty.openpty`` backend). Same
 public interface — :func:`spawn_pty` returning a handle with
 ``write``/``resize``/``close``/``terminate``/``scrollback``/``closed``/``pid``
 and ``on_output``/``on_exit`` callbacks — so ``pty_session`` can dispatch to
-either backend by ``sys.platform`` and everything above the spawn seam (the
+either backend by ``config.HOST.conpty`` and everything above the spawn seam (the
 ``PtySession`` orchestration, the ``pty_*`` WS frames, the proxy's entire
 ``RemotePtyProcess`` / ``InteractiveSession``) is identical.
 

@@ -65,7 +65,7 @@ class OllamaAdapter(OpenAIAdapter):
     def _get_base_url(self, endpoint_url: str | None) -> str:
         return endpoint_url or "http://localhost:11434/v1"
 
-    def _get_default_api_key(self) -> str:
+    def default_api_key(self) -> str:
         return "ollama"  # Ollama doesn't require auth but SDK needs a value
 
     def _extra_api_kwargs(self, model: str, has_tools: bool, effort: str) -> dict:
@@ -129,7 +129,7 @@ class OpenAICompatibleAdapter(OpenAIAdapter):
     def _get_base_url(self, endpoint_url: str | None) -> str:
         return endpoint_url or "http://localhost:4000/v1"
 
-    def _get_default_api_key(self) -> str:
+    def default_api_key(self) -> str:
         return "not-needed"  # many local servers ignore it; SDK needs a value
 
     def _extra_api_kwargs(self, model: str, has_tools: bool, effort: str) -> dict:

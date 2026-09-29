@@ -40,6 +40,9 @@ import json
 import logging
 import re
 from typing import Any, Callable
+from auth import roles
+from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
+from core import host_os
 
 logger = logging.getLogger("claude-proxy")
 
@@ -623,16 +626,24 @@ def build_delegation_roster(
     from storage.agents import agent_store
     from storage.billing import subscription_store
 
-    models_by_layer: dict[str, list[str]] = {}
+    models_by_layer: dict[str, list[dict]] = {}
 
-    def _layer_models(path: str) -> list[str]:
+    def _layer_models(path: str) -> list[dict]:
+        # Tier order (untiered last), then registry order: the line an
+        # agent reads is the ranking it must not get backwards.
         if path not in models_by_layer:
             try:
-                models_by_layer[path] = [
-                    m["model_id"]
-                    for m in subscription_store.list_models(path)
+                rows = [
+                    m for m in subscription_store.list_models(path)
                     if m.get("enabled") and m.get("model_id")
                 ]
+                rows.sort(key=app_config.model_catalog_sort_key)
+                models_by_layer[path] = [{
+                    "model_id": m["model_id"],
+                    "tier": m.get("tier"),
+                    "tier_label": app_config.MODEL_TIER_LABELS.get(m.get("tier") or 0, ""),
+                    "good_at": m.get("good_at") or "",
+                } for m in rows]
             except Exception:
                 models_by_layer[path] = []
         return models_by_layer[path]
@@ -642,13 +653,18 @@ def build_delegation_roster(
         data = agent_store.get_agent(slug)
         if not data:
             continue
-        try:
-            default_model = app_config.resolve_agent_model(slug)
-        except Exception:
-            default_model = ""
         layers: list[dict] = []
         for i, path in enumerate(_get_execution_paths(data)):
-            models = _layer_models(path)
+            # Per path: the agent default is honoured only where that
+            # layer serves it, else the layer's own first choice (the same
+            # rule the task runner applies), so a non-default layer never
+            # shows no default at all.
+            try:
+                default_model = app_config.resolve_agent_model(slug, layer=path)
+            except Exception:
+                default_model = ""
+            catalog = _layer_models(path)
+            models = [m["model_id"] for m in catalog]
             # Default first so the cap can never hide it.
             if default_model in models:
                 models = [default_model] + [
@@ -657,13 +673,59 @@ def build_delegation_roster(
             layers.append({
                 "path": path,
                 "is_default": i == 0,
-                "local_only": path == "direct-llm",
+                "local_only": not _supports_remote(path),
                 "default_model": default_model,
                 "models": models[:_ROSTER_MODEL_CAP],
                 "more": max(0, len(models) - _ROSTER_MODEL_CAP),
+                "tiers": {m["model_id"]: m["tier"] for m in catalog},
+                "catalog": catalog,
             })
         roster[slug] = layers
     return roster
+
+
+def _tier_tag(tier) -> str:
+    return f"t{int(tier)}" if tier else "t?"
+
+
+def _fmt_model_tiers(roster: dict[str, list[dict]]) -> list[str]:
+    """The tier legend rendered ONCE per prompt: every model any roster
+    layer offers, grouped by tier, with its one-line "good at"."""
+    import config as app_config
+    seen: dict[str, dict] = {}
+    for layers in roster.values():
+        for layer in layers:
+            for m in layer.get("catalog") or []:
+                seen.setdefault(m["model_id"], m)
+    if not seen:
+        return []
+    by_tier: dict[int | None, list[dict]] = {}
+    for m in seen.values():
+        by_tier.setdefault(m.get("tier") or None, []).append(m)
+    lines = [
+        "",
+        "**Model tiers** (most capable first; complex, open-ended or "
+        "judgement-heavy work belongs on tier 1, only mechanical, well-defined "
+        "work should run lower; never assume a newer or bigger-sounding id "
+        "is stronger):",
+    ]
+    for tier in (*sorted(t for t in by_tier if t), None):
+        rows = by_tier.get(tier)
+        if not rows:
+            continue
+        label = (f"t{tier} {app_config.MODEL_TIER_LABELS.get(tier, '')}" if tier
+                 else "t? untiered (a local or custom model nobody rated)")
+        # Models that share a line share it once — the ids first, then the
+        # line — so two vendors' models of one tier read as the same thing.
+        groups: dict[str, list[str]] = {}
+        for m in rows:
+            groups.setdefault(m.get("good_at") or "", []).append(f"`{m['model_id']}`")
+        items = ", ".join(
+            f"{', '.join(ids)} ({good_at})" if good_at else ", ".join(ids)
+            for good_at, ids in groups.items()
+        )
+        lines.append(f"- {label}: {items}")
+    return lines
 
 
 def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
@@ -685,13 +747,13 @@ def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
 
     if not user_sub:
         return []
-    if user_role == "admin":
-        roles: dict[str, str] = {
-            slug: "admin" for slug in agent_store.get_agent_slugs()}
+    if roles.is_admin(user_role):
+        by_agent: dict[str, str] = {
+            slug: roles.ADMIN for slug in agent_store.get_agent_slugs()}
     else:
-        roles = task_store.get_user_agent_roles(user_sub) or {}
+        by_agent = task_store.get_user_agent_roles(user_sub) or {}
     rows: list[dict] = []
-    for slug in sorted(roles):
+    for slug in sorted(by_agent):
         data = agent_store.get_agent(slug)
         if not data:
             continue
@@ -699,9 +761,17 @@ def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
             "slug": slug,
             "display_name": data.get("display_name", slug),
             "description": data.get("description", "") or "",
-            "role": roles[slug],
+            "role": by_agent[slug],
         })
     return rows
+
+
+def _supports_remote(execution_path: str) -> bool:
+    """Whether the engine can run on a satellite at all (the roster's
+    ``local_only`` flag). An unregistered id reads as local."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(execution_path)
+    return bool(caps and caps.runtime.supports_remote_execution)
 
 
 def _fmt_roster_layers(layers: list[dict]) -> str:
@@ -714,8 +784,11 @@ def _fmt_roster_layers(layers: list[dict]) -> str:
         if layer["local_only"]:
             parts.append("local only")
         if layer["models"]:
+            tiers = layer.get("tiers") or {}
             shown = ", ".join(
-                f"{m} [default]" if m == layer["default_model"] else m
+                f"{m} [default, {_tier_tag(tiers.get(m))}]"
+                if m == layer["default_model"]
+                else f"{m} [{_tier_tag(tiers.get(m))}]"
                 for m in layer["models"]
             )
             if layer["more"]:
@@ -734,10 +807,13 @@ def _department_line(
     """One compact department-membership line for the roster, or ''.
 
     "You are in <Dept> at level <Head>. Same-level: a; level above: b;
-    level below: c." Buckets follow the SYMMETRIC topology (2026-09-02):
-    adjacent = one level either way, subtree = the whole department (listed
-    in the same above/below buckets, capped so a big mesh can't bloat the
-    prompt). Best-effort — a lookup failure must never break a prompt build."""
+    level below: c." Buckets follow the department's mode × reach (the
+    wired targets are the input, so they already do): under 'both' adjacent
+    = one level either way and subtree = the whole department; under the
+    downward modes no level above appears (the buckets are capped so a big
+    mesh can't bloat the prompt) and one clause says so, since a bottom-level
+    agent would otherwise see no list at all and guess. Best-effort — a
+    lookup failure must never break a prompt build."""
     dept_id = self_data.get("department_id") or ""
     level_id = self_data.get("department_level_id") or ""
     if not dept_id or not level_id:
@@ -775,6 +851,13 @@ def _department_line(
             f"\nYou are part of the **{dept['name']}** department "
             f"at level **{level['name']}**."
         )
+        wiring = db_departments.MODE_WIRING[dept["mode"]]
+        if wiring.down and not wiring.up:
+            line += (
+                " Delegation in this department runs downward and across "
+                "your own level, never upward." if wiring.peers
+                else " Delegation in this department runs downward only."
+            )
 
         def _bucket(slugs: list[str], cap: int = 15) -> str:
             # A subtree (full-mesh) department can be large — cap the listing
@@ -869,9 +952,9 @@ def _delegation_mcp_context(
     # Department framing (agents map): one compact line when assigned. Peer
     # lists are drawn ONLY from delegation_targets (already access-filtered
     # and edge-backed), so the prompt never claims reach that spawn authz
-    # would refuse — with auto_delegation off, dept-mates simply don't
-    # appear. Buckets are capped inside _department_line (a subtree mesh can
-    # be the whole department since the 2026-09-02 symmetric topology).
+    # would refuse — with the department's mode off, dept-mates simply
+    # don't appear. Buckets are capped inside _department_line (a subtree
+    # mesh can be the whole department under mode 'both').
     dept_line = _department_line(agent_name, self_data or {}, delegation_targets)
     if dept_line:
         lines.append(dept_line)
@@ -884,6 +967,7 @@ def _delegation_mcp_context(
         if data:
             lines.extend(_agent_lines(slug, data, is_self=False))
 
+    lines.extend(_fmt_model_tiers(roster))
     lines.append("")
     lines.append(
         "**Delegation**: Use `delegate(agent=\"...\", surface=...)` to delegate work to another agent. "
@@ -892,8 +976,10 @@ def _delegation_mcp_context(
     if roster:
         lines.append(
             "Model/layer overrides on `delegate()` must come from the "
-            "target's `layers:` line above; omit both to inherit the "
-            "worker's defaults (recommended). Ignored with `continue_id`."
+            "target's `layers:` line above (the `[t1]`..`[t4]` tags are the "
+            "capability tiers listed under Model tiers); omit both to "
+            "inherit the worker's defaults (recommended). Ignored with "
+            "`continue_id`."
         )
     lines.append(
         "`send_files(target_agent, paths, …)` copies workspace files into a "
@@ -947,20 +1033,25 @@ def _schedules_mcp_context(
     if "delegation-mcp" in (kwargs.get("assigned_mcps") or []):
         lines.append(
             "Your own `layers:` line in **Available Agents** above lists the "
-            "execution layers and model ids your scheduled tasks may pin."
+            "execution layers and model ids your scheduled tasks may pin, "
+            "and the Model tiers list there ranks them."
         )
     else:
         lines.append(f"Your layers: {_fmt_roster_layers(layers)}")
+        lines.extend(_fmt_model_tiers({agent_name: layers}))
 
     lines.append(
         "\nTasks run on your default model unless pinned. `model` / `layer` "
         "on `create_scheduled_task`, `create_one_time_task` and `edit_task` "
         "pin ONE task's runs to a different model or layer, leaving your "
-        "default untouched everywhere else — the lever for keeping a cheap "
+        "default untouched everywhere else — the lever for keeping a lighter "
         "default while one demanding task runs on a stronger model (or the "
-        "reverse). Values outside the list above are rejected. Ask the user "
-        "before pinning unless they asked for it; `edit_task(model=\"\")` "
-        "clears a pin."
+        "reverse). Pin by tier, never by how an id sounds: complex, "
+        "open-ended or judgement-heavy work belongs on a tier 1 model. Values "
+        "outside the list above are "
+        "rejected. Ask the user before pinning unless they asked for it; "
+        "`edit_task(model=\"\")` clears a pin. `get_task` reads a task back "
+        "with its prompt."
     )
     return "\n".join(lines)
 
@@ -1049,9 +1140,7 @@ register("meetings-mcp", _meetings_mcp_context)
 
 def _ssh_hosts_context(
     agent_name: str,
-    is_remote: bool = False,
-    target_admin_paired: bool = False,
-    target_os: str = "",
+    placement: PlacementCapabilities = LOCAL_PLACEMENT,
     **kwargs: Any,
 ) -> str | None:
     """Inject the authorized SSH host list for the ssh-hosts MCP.
@@ -1063,9 +1152,15 @@ def _ssh_hosts_context(
     ``session_config_dir.materialize_ssh_keys_for_sandbox``, on admin-paired
     satellites via the session-file broker. Any other remote target gets
     nothing (``build_session_mcp_config`` excludes the MCP there with a
-    visible reason — infra key material never reaches user-paired machines).
+    visible reason: infra key material never reaches user-paired machines),
+    and so does a session below the editor tier: it holds no keys
+    (``session_config_dir.session_takes_ssh_keys``), so the block that names
+    them is not rendered.
     """
-    if is_remote and not target_admin_paired:
+    from auth import roles
+    if not roles.can_edit(kwargs.get("user_role") or ""):
+        return None
+    if placement.is_remote and not placement.admin_paired:
         return None
 
     from storage.mcp import mcp_store
@@ -1080,8 +1175,8 @@ def _ssh_hosts_context(
     # ControlMaster reuses one authenticated connection; ControlPersist keeps
     # the master ≤60s past last use so nothing authenticated outlives session
     # teardown by much. Windows OpenSSH has no unix-socket mux — omit there,
-    # and omit when the satellite predates the os capability ("" = unknown,
-    # conservative).
+    # and omit when the machine reported no ``os`` ("" = unknown,
+    # conservative — the RAW capability, not the path-shape family).
     #
     # Socket path: NOT under $OTO_SSH_KEY_DIR — on satellites that dir nests
     # in the session-secrets tree and `cm-%C` (40-hex) overflowed the 108-byte
@@ -1091,7 +1186,8 @@ def _ssh_hosts_context(
     # (per-user 0700 /var/folders/… on macOS) → /tmp (inside the local
     # sandbox /tmp is mount-namespaced private; the chain only lands on a
     # shared /tmp for exotic non-systemd admin-paired hosts).
-    mux_capable = (not is_remote) or (target_os or "").lower() in ("linux", "darwin")
+    _row = host_os.of(placement.os)
+    mux_capable = (not placement.is_remote) or bool(_row is not None and _row.posix)
 
     lines = [
         "## SSH Hosts\n",

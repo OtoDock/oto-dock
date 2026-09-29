@@ -293,8 +293,14 @@ class TestUnknownToolBackstop:
     def test_unknown_tool_powershell_dangerous_denied(self):
         assert not self._tool("SomeFutureShell", {"script": "Format-Volume -DriveLetter C"}).allowed
 
-    def test_unknown_tool_benign_allowed(self):
-        assert self._tool("SomeFutureShell", {"command": "echo hello"}).allowed
+    def test_unknown_command_tool_is_refused_even_when_benign(self):
+        # core-seams phase 2: a command tool the platform does not declare
+        # never runs ungated — the refusal names the declaration to make.
+        d = self._tool("SomeFutureShell", {"command": "echo hello"})
+        assert not d.allowed and "core/events/tool_roles.py" in d.reason
+
+    def test_unknown_structured_tool_benign_allowed(self):
+        assert self._tool("SomeFutureWidget", {"note": "echo hello"}).allowed
 
     def test_known_structured_tool_not_content_filtered(self):
         # A benign NL arg mentioning rm -rf MUST NOT be denied (BLOCKER fix: the

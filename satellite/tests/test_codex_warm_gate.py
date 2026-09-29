@@ -23,7 +23,6 @@ def sat_config():
         machine_id="test-machine", machine_secret="test-secret",
         platform_url="ws://localhost:8400/v1/satellite",
         agents_dir=Path("/tmp/test-agents"), mcps_dir=Path("/tmp/test-mcps"),
-        claude_bin="claude", codex_bin="codex",
     )
 
 

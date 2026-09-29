@@ -22,7 +22,7 @@ Two good options:
 
 ```bash
 git clone https://github.com/OtoDock/oto-dock.git && cd oto-dock
-printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" > config.env
+(umask 077; printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" > config.env)
 scripts/compose.sh up -d --build
 ```
 
@@ -99,6 +99,10 @@ npx vitest run                      # unit tests
   type-check/build/tests) and must be green — merging is blocked until it is.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.
+- **Dependency bumps**: please don't send them. Pins are managed internally
+  and swept as a batch before each release, so a bump PR here can't be merged.
+  If you spot an advisory in one of our pins, open an issue instead. That's
+  genuinely useful.
 - **AI-assisted contributions** are welcome — much of OtoDock is built that
   way. The bar is the same as for any PR: you understand and stand behind
   every line you submit, tests ride along, and CI is green. Please don't
@@ -125,4 +129,6 @@ A short gap between approval and merge is that porting step, not a stall.
 OtoDock is fair source, licensed
 [FSL-1.1-Apache-2.0](LICENSE) (each release converts to Apache 2.0 after two
 years). By contributing, you agree your contribution is licensed under the
-same terms — standard inbound = outbound, no CLA to sign.
+same terms — standard inbound = outbound, no CLA to sign. You also agree we
+may make that Apache 2.0 conversion earlier, for the whole project, at any
+time.

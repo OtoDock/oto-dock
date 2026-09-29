@@ -51,7 +51,7 @@ def validate_outbound_call(body: dict) -> dict:
     instructions = body.get("instructions") or ""
     route_id = body.get("route_id") or ""
 
-    if not isinstance(phone, str) or not _PHONE_RE.match(phone):
+    if not isinstance(phone, str) or not _PHONE_RE.fullmatch(phone):
         raise ValidationError("phone_number must be 2–20 digits with an optional leading +")
     if not isinstance(task, str) or not task.strip():
         raise ValidationError("task_description is required")
@@ -59,8 +59,10 @@ def validate_outbound_call(body: dict) -> dict:
         raise ValidationError("task_description is too long")
     if not isinstance(instructions, str) or len(instructions) > _MAX_INSTRUCTIONS:
         raise ValidationError("instructions are too long")
-    if not isinstance(route_id, str) or len(route_id) > _MAX_SHORT or not _no_control(route_id):
-        raise ValidationError("route_id is invalid")
+    # An origination names its route: the daemon never picks a default one.
+    if (not isinstance(route_id, str) or not route_id or len(route_id) > _MAX_SHORT
+            or not _no_control(route_id)):
+        raise ValidationError("route_id is required")
 
     return {
         "phone_number": phone,

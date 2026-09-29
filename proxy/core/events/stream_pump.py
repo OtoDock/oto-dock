@@ -21,10 +21,19 @@ import time
 from datetime import datetime, timezone
 
 from storage import database as task_store
+from storage.automation import run_status
 from storage.pg import run_db
-from core.events import chat_writer
+from core.events import chat_writer, tool_roles
 from services.notifications import notification_manager
+from core.events import artifact_events
 from core.events.artifact_events import artifact_event_from_perm_item
+from ws import chat_phase
+from ws import wire_events as wire
+
+#: The platform's own delegate MCP tool: its call renders as the delegate
+#: pill from the proxy's ``delegate_spawn`` frame, never as a tool block
+#: (the dashboard's skip set carries the same name — ``lib/tools/roles.ts``).
+DELEGATE_TOOL = "mcp__delegation-mcp__delegate"
 from core.session.session_state import (
     _chat_streaming_state,
     set_session_mode,
@@ -36,11 +45,11 @@ from core.events.common_events import (
     CommonEvent,
     TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
     PERMISSION_REQUEST, SUBAGENT_START, SUBAGENT_END, DELEGATE_SPAWN,
-    BG_COMMAND_START, BG_COMMAND_END,
+    CHECK_VERDICT, BG_COMMAND_START, BG_COMMAND_END,
     WORKFLOW_START, WORKFLOW_PROGRESS, WORKFLOW_END,
     PLAN_MODE, SYSTEM, METADATA, DONE, ERROR, QUEUE_TURN, ARTIFACT_TURN,
     PRODUCER_DONE, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
-    goal_payload_to_state,
+    TurnInput, goal_payload_to_state,
 )
 
 # Min seconds between workflow_progress WS forwards per workflow (the live
@@ -61,8 +70,49 @@ from services.title_generator import (
     TITLE_CHAR_THRESHOLD as _TITLE_CHAR_THRESHOLD,
     TITLE_TOOL_THRESHOLD as _TITLE_TOOL_THRESHOLD,
 )
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy")
+
+# Text and thinking deltas coalesce per pump: a delta goes out at once when
+# none went out in the last window, else it joins one pending frame flushed
+# at the window's end (any other frame flushes it first). A token-by-token
+# engine then costs at most one delta frame per window per viewer.
+_DELTA_FLUSH_S = 0.04
+# A dashboard viewer's queue is cut here (about 1 MB of frames): cleared, one
+# PUMP_RESYNC, nothing after it, so a stalled viewer cannot grow memory.
+_VIEWER_QUEUE_MAX = 2048
+# Pump-local item (not a wire type): the viewer fell behind and must resync
+# through a resume (chat_history, then a fresh live_state).
+PUMP_RESYNC = "resync"
+
+
+class _ViewerQueue(asyncio.Queue):
+    """One subscriber's queue. Only ``bounded`` ones (dashboard viewers) are
+    cut at ``_VIEWER_QUEUE_MAX``; phone and duplex keep every frame (their
+    consumers speak the text)."""
+
+    def __init__(self, bounded: bool) -> None:
+        super().__init__()
+        self.bounded = bounded
+        self.overflowed = False
+
+
+def _delta_key(event_type: str, payload: dict) -> tuple | None:
+    """What a delta may merge with, or None when the frame never coalesces:
+    a TEXT that is only content, a THINKING text delta (same other keys), a
+    THINKING progress ping (latest wins)."""
+    if event_type == TEXT:
+        return (TEXT,) if payload.keys() == {"content"} else None
+    if event_type == THINKING:
+        phase = payload.get("phase")
+        if phase == "progress":
+            return ("progress",) if payload.keys() == {"phase", "estimated_tokens"} else None
+        if payload.get("text") and phase not in ("start", "end"):
+            others = dict(payload)
+            others.pop("text")
+            return (THINKING, json.dumps(others, sort_keys=True, default=str))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +151,15 @@ _session_cumulative_cost: dict[str, float] = {}  # session_id -> last CLI cost
 _GOAL_UNSET = object()
 
 
+def _evict_latest(blocks: list[dict], kind: str) -> None:
+    """Remove the LATEST block of ``kind`` (a placeholder the real artifact
+    or its failure replaces) from a block list, in place."""
+    for i in range(len(blocks) - 1, -1, -1):
+        if blocks[i].get("type") == kind:
+            blocks.pop(i)
+            return
+
+
 def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
     """``(role, content, event_type, event_data)`` rows for the writer, built
     ON THE LOOP: the block dicts are shared with live_state and keep changing
@@ -109,12 +168,14 @@ def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
     badge lookup is an agent_store cache read."""
     rows: list[tuple[str, str, str, str]] = []
     for block in blocks:
-        if block["type"] == "media_processing":
-            # Transient transcode skeleton — never persisted. If a turn ends
-            # while a transcode is still running, the placeholder is dropped
-            # rather than frozen into history.
+        artifact = artifact_events.kind_of(block["type"])
+        if artifact is not None and not artifact.saved:
+            # A transient transcode skeleton — never persisted. If a turn
+            # ends while a transcode is still running, the placeholder is
+            # dropped rather than frozen into history (the table says which
+            # kinds; every non-artifact block is a row).
             continue
-        if block["type"] == "text":
+        if block["type"] == wire.LIVE_TEXT:
             meeting_agent = block.get("_meeting_agent")
             event_data = ""
             if meeting_agent:
@@ -240,8 +301,17 @@ class ChatStreamPump:
         self._chat_owner = chat_owner
         self._chat_agent = chat_agent
 
-        self._ws_queues: list[asyncio.Queue] = []
+        self._ws_queues: list[_ViewerQueue] = []
         self._done = False
+        # PUMP_ENDED went out: a later attach() gets it at once.
+        self._ended = False
+        self._live_ready = False  # _init_live_state ran (start() or _run)
+        # Delta coalescing (_forward_delta): the pending frame, its merge key,
+        # when a delta frame last went out, the flush timer.
+        self._delta_item: dict | None = None
+        self._delta_key: tuple | None = None
+        self._delta_sent_at = float("-inf")
+        self._delta_timer: asyncio.TimerHandle | None = None
         self._abort_requested = False  # abort() sets; drives the resumed-task run-status close
         self._task: asyncio.Task | None = None
         # Terminal engine/provider error, if the stream died on one. The
@@ -252,7 +322,7 @@ class ChatStreamPump:
         self.last_error: str = ""
 
         # Message queue (shared with producer closure)
-        self.message_queue: list[str] = []
+        self.message_queue: list[TurnInput] = []
         # System prompt queue — delivered silently (no user bubble).
         # Used for delegate results and bg nudges during background drain.
         self.system_queue: list[str] = []
@@ -294,11 +364,12 @@ class ChatStreamPump:
         # once the first response crosses _TITLE_CHAR_THRESHOLD, in the
         # TOOL_USE handler at _TITLE_TOOL_THRESHOLD tool calls, or after the
         # turn-end save for a short first response. Task chats title like every
-        # chat (they live in the sidebar's Task history view); only meetings
-        # are excluded. Armed by default — the service's atomic claim makes a
+        # chat (they live in the sidebar's Task history view); only a meeting
+        # pump is excluded (its chat is the PARENT chat, titled by its own
+        # turn). Armed by default — the service's atomic claim makes a
         # redundant attempt a no-op — and disarmed by the start job when the
         # row says the title was already generated.
-        self._title_armed = not chat_id.startswith("meeting-")
+        self._title_armed = source_type != session_kind.MEETING.source_type
         self._completed = False  # PRODUCER_DONE reached: all_done goes out after the drain
         self._owner_sub = ""
         self._tool_seen = 0  # tool calls this pump — the title tool-count trigger
@@ -356,14 +427,20 @@ class ChatStreamPump:
         # turn whose queued message nothing would deliver.
         self.stop_and_send: dict | None = None
 
-    # Tools that have dedicated events (task_spawn, plan_mode) — skip tool persistence
-    _SKIP_TOOL_PERSIST = frozenset({"Agent", "Task", "EnterPlanMode", "ExitPlanMode", "mcp__delegation-mcp__delegate"})
+    # Tools that have dedicated events (task_spawn, plan_mode, the delegate
+    # pill) — skip tool persistence: by ROLE, plus the platform's own
+    # delegate MCP tool (the dashboard's skip set names the same constant).
+    _SKIP_TOOL_PERSIST_ROLES = frozenset({tool_roles.SUBAGENT, tool_roles.PLAN_ENTER, tool_roles.PLAN_EXIT})
+
+    @classmethod
+    def _skips_tool_persist(cls, name: str) -> bool:
+        return tool_roles.role_of(name) in cls._SKIP_TOOL_PERSIST_ROLES or name == DELEGATE_TOOL
 
     @property
     def is_done(self) -> bool:
         return self._done
 
-    def attach(self) -> asyncio.Queue:
+    def attach(self, *, bounded: bool = False) -> asyncio.Queue:
         """Attach a WS consumer. Returns queue to read pump events from.
 
         Fan-out: every attached consumer gets every frame. A second viewer
@@ -371,8 +448,16 @@ class ChatStreamPump:
         must never displace the first — the old single-slot steal made the
         viewers' 3s `_task_pump_poll` fight over the stream, wholesale-reloading
         the chat on every takeover (the "chat refreshes mid-generation" bug).
+
+        The pending delta goes to the existing viewers BEFORE the new queue
+        joins: the newcomer's live_state snapshot already holds its text.
+        ``bounded`` (dashboard viewers) caps the queue (``_ViewerQueue``). A
+        pump that already ended answers ``pump_ended`` at once.
         """
-        q: asyncio.Queue = asyncio.Queue()
+        self._flush_deltas()
+        q = _ViewerQueue(bounded)
+        if self._ended:
+            q.put_nowait({"pump_type": wire.PUMP_ENDED})
         self._ws_queues.append(q)
         return q
 
@@ -447,20 +532,20 @@ class ChatStreamPump:
             live["pending_permission"] = perm_data
 
         evt_type = perm_data.get("event_type", "")
-        if evt_type == "plan_review":
+        if evt_type == wire.ITEM_PLAN_REVIEW:
             filename = perm_data.get("filename", "")
             await self._forward(
-                {"pump_type": "perm_plan_review", "perm_data": perm_data,
+                {"pump_type": wire.PUMP_PLAN_REVIEW, "perm_data": perm_data,
                  "filename": filename},
             )
-        elif evt_type == "question_prompt":
+        elif evt_type == wire.ITEM_QUESTION_PROMPT:
             # Codex request_user_input: the daemon HOLDS the turn open on this
             # question, so the turn-end ping never fires for it. Surface the card
             # and fire a "needs your input" ephemeral NOW (away/FCM aware) so a
             # user who stepped away still gets pinged. Do NOT touch chat_status —
             # the turn is still streaming (no "ready" flip mid-held-turn).
             await self._forward(
-                {"pump_type": "perm_question_prompt", "perm_data": perm_data},
+                {"pump_type": wire.PUMP_QUESTION_PROMPT, "perm_data": perm_data},
             )
             _q_cid = self.chat_id
 
@@ -475,7 +560,7 @@ class ChatStreamPump:
                 )
 
             chat, _in_meeting, _label = await run_db(_row_meeting_label)
-            if chat and self.source_type != "task" and not _in_meeting:
+            if chat and self.source_type != session_kind.TASK.source_type and not _in_meeting:
                 qs = (perm_data.get("tool_input") or {}).get("questions") or []
                 first_q = (qs[0].get("question") if qs and isinstance(qs[0], dict)
                            else "") or "Waiting for your answer"
@@ -486,7 +571,7 @@ class ChatStreamPump:
                     chat_id=self.chat_id,
                 ))
         else:
-            forward_data = {"pump_type": "perm_permission_prompt", "perm_data": perm_data}
+            forward_data = {"pump_type": wire.PUMP_PERMISSION_PROMPT, "perm_data": perm_data}
             # Include meeting agent identity so the frontend can show which agent is asking
             if perm_data.get("meeting_agent"):
                 forward_data["meeting_agent"] = perm_data["meeting_agent"]
@@ -506,16 +591,16 @@ class ChatStreamPump:
     # between-turns backlog.
     _QUEUE_CAP = 64
 
-    def queue_message(self, text: str) -> int:
+    def queue_message(self, item: TurnInput) -> int:
         """Queue a user message for the producer. Returns the index, or -1 when
         the backlog cap is hit (caller surfaces a 'queue full' notice)."""
         if len(self.message_queue) >= self._QUEUE_CAP:
             return -1
-        self.message_queue.append(text)
+        self.message_queue.append(item)
         return len(self.message_queue) - 1
 
-    def cancel_queued(self, index: int) -> str | None:
-        """Remove queued message by index. Returns removed text or None."""
+    def cancel_queued(self, index: int) -> TurnInput | None:
+        """Remove queued message by index. Returns the removed item or None."""
         if 0 <= index < len(self.message_queue):
             return self.message_queue.pop(index)
         return None
@@ -523,7 +608,7 @@ class ChatStreamPump:
     def cancel_all_queued(self) -> str:
         """Remove all queued messages (artifact interactions too — they were
         never delivered, so nothing persists). Returns combined user text."""
-        combined = "\n\n".join(self.message_queue) if self.message_queue else ""
+        combined = "\n\n".join(i.text for i in self.message_queue) if self.message_queue else ""
         self.message_queue.clear()
         self.artifact_queue.clear()
         return combined
@@ -546,7 +631,7 @@ class ChatStreamPump:
         """
         text = "".join(self._pending_text)
         if text:
-            self._turn_blocks.append(self._stamp_speaker({"type": "text", "content": text}))
+            self._turn_blocks.append(self._stamp_speaker({"type": wire.TEXT, "content": text}))
             self._pending_text.clear()
 
     def _stamp_speaker(self, block: dict) -> dict:
@@ -562,12 +647,44 @@ class ChatStreamPump:
             block["_meeting_agent"] = self._meeting_agent
         return block
 
+    def _buffer_preview(self, evt: dict, identity: str, live: dict | None) -> None:
+        """A deferred artifact (the document preview): replace the push of
+        the same identity in place in the turn and live lists — dropping the
+        replaced push's snapshot, which the dashboard never saw because
+        previews forward only at the flush — else append; then hold the
+        latest per identity for ``_flush_pending_previews``."""
+        key = evt[identity]
+        replaced = False
+        for i, block in enumerate(self._turn_blocks):
+            if block.get("type") == evt["type"] and block.get(identity) == key:
+                old_snap = block.get("snapshot_id") or ""
+                if old_snap and old_snap != evt.get("snapshot_id"):
+                    from services.media import preview_snapshots
+                    chat_writer.submit(
+                        self.chat_id,
+                        functools.partial(preview_snapshots.delete_snapshot, self.chat_id, old_snap),
+                        label="snapshot_delete",
+                    )
+                self._turn_blocks[i] = evt
+                replaced = True
+                break
+        if not replaced:
+            self._turn_blocks.append(evt)
+        self._pending_previews[key] = evt
+        if live:
+            for i, lb in enumerate(live["live_blocks"]):
+                if lb.get("type") == evt["type"] and lb.get(identity) == key:
+                    live["live_blocks"][i] = evt
+                    break
+            else:
+                live["live_blocks"].append(evt)
+
     async def _flush_pending_previews(self):
         """Forward buffered document previews to dashboard (called at turn end)."""
         if self._pending_previews:
             self._gc_snapshots_pending = True
         for evt in self._pending_previews.values():
-            await self._forward({"pump_type": "ws_event", "event": evt})
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
         self._pending_previews.clear()
 
     def _save_turn_blocks(self) -> asyncio.Future | None:
@@ -600,15 +717,12 @@ class ChatStreamPump:
         live_len = len(live_list) if live_list is not None else 0
 
         def _job() -> int:
-            for role, content, event_type, event_data in rows:
-                if role == "assistant":
-                    task_store.add_chat_message(chat_id, "assistant", content,
-                                                event_data=event_data)
-                else:
-                    task_store.add_chat_message(
-                        chat_id, "event", "",
-                        event_type=event_type, event_data=event_data,
-                    )
+            # One transaction and ONE search-row rebuild for the turn's rows.
+            task_store.add_chat_messages_batch(chat_id, [
+                ("assistant", content, "", event_data) if role == "assistant"
+                else ("event", "", event_type, event_data)
+                for role, content, event_type, event_data in rows
+            ])
             if gc_pending:
                 # The flushed preview rows are persisted now — prune this
                 # chat's unreferenced version-pinned snapshots (dismissed
@@ -649,6 +763,25 @@ class ChatStreamPump:
             label=label,
         )
 
+    def _seed_cost_baseline(self, row: dict) -> None:
+        """The engine's saved running cost total for THIS session, off the
+        chat row (`engine_cost_total` / `engine_cost_session_id`, written at
+        every cumulative-cost turn): Claude Code ≥ 2.1.277 resumes a session
+        from its saved total, and the in-memory baseline
+        (`_session_cumulative_cost`) dies with the proxy process. Seeded only
+        when the map still has no entry (a late callback on a stalled lane
+        never overwrites what the METADATA branch already recorded) and only
+        for the SAME session id (a fresh session on this chat — an engine
+        switch, a rebuilt history — starts at 0, as ever)."""
+        if self.session_id in _session_cumulative_cost:
+            return
+        if (row.get("engine_cost_session_id") or "") != self.session_id:
+            return
+        seeded = float(row.get("engine_cost_total") or 0.0)
+        if seeded > 0:
+            self._last_session_cost = seeded
+            _session_cumulative_cost[self.session_id] = seeded
+
     def _submit_turn_start(self) -> None:
         """Turn-start persistence, never awaited: the cutoff read + the row
         that says whether the title was already generated (one lane job —
@@ -661,7 +794,7 @@ class ChatStreamPump:
         if self._chat_owner:
             self._owner_sub = self._chat_owner
             notification_manager.broadcast_chat_status(
-                self._owner_sub, chat_id, "streaming", agent=self._chat_agent,
+                self._owner_sub, chat_id, chat_phase.STREAMING, agent=self._chat_agent,
             )
 
         def _job() -> tuple[int, dict]:
@@ -675,6 +808,7 @@ class ChatStreamPump:
             self._db_msg_cutoff_id = max(self._db_msg_cutoff_id or 0, cutoff or 0)
             if row.get("title_generated"):
                 self._title_armed = False
+            self._seed_cost_baseline(row)
             if not self._chat_owner:
                 # Light this chat's sidebar dot on every device of its owner
                 # — the authoritative turn-start signal, viewed or background.
@@ -683,12 +817,12 @@ class ChatStreamPump:
                 self._owner_sub = row.get("user_sub") or ""
                 if self._owner_sub:
                     notification_manager.broadcast_chat_status(
-                        self._owner_sub, chat_id, "streaming",
+                        self._owner_sub, chat_id, chat_phase.STREAMING,
                         agent=row.get("agent") or "",
                     )
 
         chat_writer.submit(chat_id, _job, label="turn_start").add_done_callback(_started)
-        if chat_id.startswith("task-run-") and self.source_type != "task":
+        if session_kind.is_task_chat_id(chat_id) and self.source_type != session_kind.TASK.source_type:
             # Dashboard-RESUMED task conversation (the scheduler's own runs are
             # source_type == "task"): reflect the live turn in the Task History
             # row, which otherwise freezes on its pre-resume terminal state.
@@ -697,8 +831,8 @@ class ChatStreamPump:
             chat_writer.submit(
                 chat_id,
                 functools.partial(
-                    task_store.update_latest_run_status_for_chat, chat_id, "running",
-                    only_from=("completed", "failed", "cancelled", "limit_exceeded"),
+                    task_store.update_latest_run_status_for_chat, chat_id, run_status.RUNNING,
+                    only_from=tuple(sorted(run_status.TERMINAL)),
                 ),
                 label="run_open",
             )
@@ -794,7 +928,8 @@ class ChatStreamPump:
         re-read on the loop."""
         chat_id = self.chat_id
         now_iso = datetime.now(timezone.utc).isoformat()
-        resumed_task = chat_id.startswith("task-run-") and self.source_type != "task"
+        resumed_task = (session_kind.is_task_chat_id(chat_id)
+                        and self.source_type != session_kind.TASK.source_type)
         aborted = self._abort_requested
 
         def _job() -> tuple[dict | None, bool, str]:
@@ -807,8 +942,8 @@ class ChatStreamPump:
                 # before aborting us, and that verdict must survive.
                 try:
                     task_store.update_latest_run_status_for_chat(
-                        chat_id, "cancelled" if aborted else "completed",
-                        only_from=("running",),
+                        chat_id, run_status.CANCELLED if aborted else run_status.COMPLETED,
+                        only_from=(run_status.RUNNING,),
                     )
                 except Exception as e:
                     logger.debug("resumed-task run status close failed: %s", e)
@@ -836,27 +971,95 @@ class ChatStreamPump:
                 f"after {waited:.0f}s — database slow?"
             )
 
+    def _deliver(self, item: dict) -> None:
+        """Put ``item`` on every subscriber's queue; never waits on a viewer.
+        A bounded queue at its cap is cleared and gets one PUMP_RESYNC."""
+        for q in list(self._ws_queues):
+            if q.overflowed:
+                continue
+            if q.bounded and q.qsize() >= _VIEWER_QUEUE_MAX:
+                while not q.empty():
+                    q.get_nowait()
+                q.put_nowait({"pump_type": PUMP_RESYNC})
+                q.overflowed = True
+                logger.warning(
+                    f"ChatStreamPump chat={self.chat_id}: a viewer fell "
+                    f"{_VIEWER_QUEUE_MAX} frames behind; resyncing it")
+                continue
+            q.put_nowait(item)
+
+    def _flush_deltas(self) -> None:
+        """Deliver the pending delta frame, if any (before any other frame)."""
+        if self._delta_timer is not None:
+            self._delta_timer.cancel()
+            self._delta_timer = None
+        item, self._delta_item, self._delta_key = self._delta_item, None, None
+        if item is not None:
+            self._delta_sent_at = time.monotonic()
+            self._deliver(item)
+
     async def _forward(self, item: dict):
         """Forward event to every attached WS subscriber."""
-        for q in self._ws_queues:
-            await q.put(item)
+        self._flush_deltas()
+        self._deliver(item)
+
+    async def _forward_event(self, event_type: str, payload: dict):
+        """Forward a CommonEvent as the frame the catalogue names for it
+        (``wire.WIRE_OF_EVENT``), the payload spread in."""
+        await self._forward({"pump_type": wire.PUMP_WS_EVENT,
+                             "event": {"type": wire.WIRE_OF_EVENT[event_type], **payload}})
+
+    async def _forward_delta(self, event_type: str, payload: dict):
+        """``_forward_event`` for a text or thinking delta, coalesced: at once
+        when no delta frame went out in the last ``_DELTA_FLUSH_S``, else
+        merged into one pending frame flushed at the window's end."""
+        key = _delta_key(event_type, payload)
+        if key is None:
+            await self._forward_event(event_type, payload)
+            return
+        if not self._ws_queues:
+            return
+        event = {"type": wire.WIRE_OF_EVENT[event_type], **payload}
+        pending = self._delta_item
+        if pending is not None and self._delta_key == key:
+            merged = pending["event"]
+            if key[0] == TEXT:
+                merged["content"] += event["content"]
+            elif key[0] == THINKING:
+                merged["text"] += event["text"]
+            else:
+                merged["estimated_tokens"] = event["estimated_tokens"]
+            return
+        self._flush_deltas()
+        item = {"pump_type": wire.PUMP_WS_EVENT, "event": event}
+        now = time.monotonic()
+        if now - self._delta_sent_at >= _DELTA_FLUSH_S:
+            self._delta_sent_at = now
+            self._deliver(item)
+            return
+        self._delta_item, self._delta_key = item, key
+        self._delta_timer = asyncio.get_running_loop().call_later(
+            self._delta_sent_at + _DELTA_FLUSH_S - now, self._flush_deltas)
 
     def push_ws_event(self, event: dict) -> bool:
         """External push (scheduler / session_state): fan a ready-made ws_event
         to every attached subscriber. Returns whether anyone received it."""
         if not self._ws_queues:
             return False
-        for q in list(self._ws_queues):
-            q.put_nowait({"pump_type": "ws_event", "event": event})
+        self._flush_deltas()
+        self._deliver({"pump_type": wire.PUMP_WS_EVENT, "event": event})
         return True
 
     def start(self) -> asyncio.Task:
-        """Start the pump's background processing task."""
+        """Start the pump's background processing task. The live state
+        exists from here on, so a viewer attaching before the task first
+        runs still gets its live_state snapshot."""
+        self._init_live_state()
         self._task = asyncio.create_task(self._run())
         return self._task
 
-    async def _run(self):
-        """Main pump loop — reads CommonEvent objects, updates state, saves to DB."""
+    def _init_live_state(self) -> None:
+        self._live_ready = True
         _chat_streaming_state[self.chat_id] = {
             "streaming": True,
             "session_id": self.session_id,
@@ -880,6 +1083,11 @@ class ChatStreamPump:
         # to this chat without a DB lookup (DB lookup is the fallback).
         get_subagent_registry(self.session_id).chat_id = self.chat_id
         get_bg_command_registry(self.session_id).chat_id = self.chat_id
+
+    async def _run(self):
+        """Main pump loop: reads CommonEvent objects, updates state, saves to DB."""
+        if not self._live_ready:
+            self._init_live_state()
 
         try:
             # Inside the try: whatever the start job does, the finally below
@@ -929,7 +1137,7 @@ class ChatStreamPump:
                             )
                     except Exception:
                         pass
-                    await self._forward({"pump_type": "error", "message": err_msg})
+                    await self._forward({"pump_type": wire.PUMP_ERROR, "message": err_msg})
                     # For an interruption that genuinely lost
                     # output (satellite reconnect-grace expiry — `durable_marker`),
                     # persist a visible ⚠ block so a refresh shows it instead of a
@@ -941,7 +1149,7 @@ class ChatStreamPump:
                     # errors omit the flag → today's live-only behaviour.
                     if event.data.get("durable_marker") and err_msg:
                         self._flush_pending_text()
-                        self._turn_blocks.append({"type": "text", "content": err_msg})
+                        self._turn_blocks.append({"type": wire.TEXT, "content": err_msg})
                     break
 
                 if event.type == PRODUCER_DONE:
@@ -994,16 +1202,20 @@ class ChatStreamPump:
                         if self._turn_blocks:
                             self._save_turn_blocks()
                     meeting_agent = event.data.get("meeting_agent")
-                    event_data_str = ""
+                    # The row's meta: the batch's attachments (photos and
+                    # files the drained messages carried) plus, in a
+                    # meeting, the moderator's identity badge.
+                    event_meta: dict = dict(event.data.get("event_data") or {})
                     if meeting_agent:
                         from storage.agents import agent_store as _agent_store
                         ad = _agent_store.get_agent(meeting_agent)
-                        event_data_str = json.dumps({
+                        event_meta.update({
                             "agent_slug": meeting_agent,
                             "agent_display_name": (ad or {}).get("display_name", meeting_agent),
                             "agent_color": (ad or {}).get("color", ""),
                             "badge": "meeting prompt",
                         })
+                    event_data_str = json.dumps(event_meta) if event_meta else ""
                     # Lane-ordered after the blocks saved above; the frame is
                     # the live echo, not a read.
                     chat_writer.submit(
@@ -1014,12 +1226,17 @@ class ChatStreamPump:
                         ),
                         label="queue_turn",
                     )
-                    await self._forward({"pump_type": "queue_turn", "text": event.data["text"]})
+                    forwarded = {"pump_type": wire.PUMP_QUEUE_TURN, "text": event.data["text"]}
+                    if event_meta.get("images"):
+                        forwarded["images"] = event_meta["images"]
+                    if event_meta.get("files"):
+                        forwarded["files"] = event_meta["files"]
+                    await self._forward(forwarded)
                     continue
 
                 if event.type == ARTIFACT_TURN:
                     # Drained backchannel interactions (artifact sends AND
-                    # mini-app send_prompt actions, kind-tagged): one distinct
+                    # app send_prompt actions, kind-tagged): one distinct
                     # event row per entry (NEVER a "user" row — the row type +
                     # the framed prompt carry the provenance), forwarded live
                     # so the sender's transcript shows the chip at delivery.
@@ -1068,7 +1285,7 @@ class ChatStreamPump:
             # block would silently vanish on chat refresh.
             if self._thinking_text:
                 self._turn_blocks.append(self._stamp_speaker({
-                    "type": "thinking", "content": self._thinking_text,
+                    "type": wire.THINKING, "content": self._thinking_text,
                 }))
                 self._thinking_text = ""
             for tool_evt in self._active_tools.values():
@@ -1109,7 +1326,7 @@ class ChatStreamPump:
                 if end_fut is not None and not end_fut.cancelled() and end_fut.exception() is None:
                     end_row, end_meeting, end_label = end_fut.result()
                 if self._completed:
-                    await self._forward({"pump_type": "all_done"})
+                    await self._forward({"pump_type": wire.PUMP_ALL_DONE})
             finally:
                 # Shared-state teardown runs whatever happened above (a
                 # cancellation inside the drain must not leave the pump
@@ -1154,9 +1371,10 @@ class ChatStreamPump:
                 if still_active:
                     del _active_pumps[self.chat_id]
 
-                # Signal any remaining subscribers
-                for q in list(self._ws_queues):
-                    q.put_nowait({"pump_type": "pump_ended"})
+                # Signal any remaining subscribers (a later attach gets it too)
+                self._flush_deltas()
+                self._ended = True
+                self._deliver({"pump_type": wire.PUMP_ENDED})
 
             # Fire the ephemeral turn-complete signal — but NOT while background
             # subagents are still running. When the LLM spawns bg agents and ends
@@ -1212,19 +1430,20 @@ class ChatStreamPump:
         end-of-turn alert. ``chat`` / ``in_meeting`` / ``agent_label`` come from
         the turn-end job (read after the rows landed). The alert is skipped
         during meetings (per-speaker turn ends are not completions) and for
-        scheduled task runs (``source_type == "task"``) — a task's completion
-        alert is its ``notification_mode`` contract, and an extra "finished"
-        push on top is noise. A continued (re-warmed) task chat runs through
-        the dashboard pump (``source_type == "chat"``) and keeps the normal
+        a pump the scheduler drives (``source_type == session_kind.TASK.source_type``
+        — the DRIVER's kind, a captured wake into its warm session included) —
+        a task's completion alert is its ``notification_mode`` contract, and an
+        extra "finished" push on top is noise. A continued (re-warmed) task chat
+        runs through a dashboard-driven pump (``DASHBOARD.source_type``) and keeps the normal
         per-turn signal — it is the only completion signal those follow-up
         turns have."""
         if not chat:
             return
         notification_manager.broadcast_chat_status(
-            chat["user_sub"], self.chat_id, "ready",
+            chat["user_sub"], self.chat_id, chat_phase.READY,
             agent=chat.get("agent") or "",
         )
-        if self.source_type == "task":
+        if self.source_type == session_kind.TASK.source_type:
             return
         if not in_meeting:
             asyncio.create_task(notification_manager.fire_ephemeral(
@@ -1238,10 +1457,10 @@ class ChatStreamPump:
     def _live_append_text(live: dict, text: str):
         """Append text to the last text block in live_blocks, or create a new one."""
         blocks = live["live_blocks"]
-        if blocks and blocks[-1].get("type") == "text":
+        if blocks and blocks[-1].get("type") == wire.LIVE_TEXT:
             blocks[-1]["content"] += text
         else:
-            blocks.append({"type": "text", "content": text})
+            blocks.append({"type": wire.TEXT, "content": text})
 
     async def _clear_orphan_thinking(self, live: dict | None):
         """Real output started while a progress-only thinking was still live.
@@ -1254,10 +1473,7 @@ class ChatStreamPump:
         if live and live.get("thinking_active") and not self._thinking_text:
             live["thinking_active"] = False
             live["thinking_tokens"] = 0
-            await self._forward(
-                {"pump_type": "ws_event",
-                 "event": {"type": "thinking", "phase": "end", "text": ""}},
-            )
+            await self._forward_event(THINKING, {"phase": "end", "text": ""})
 
     async def _process_event(self, event: CommonEvent):
         """Process a single CommonEvent — update live state, save events, forward.
@@ -1276,9 +1492,7 @@ class ChatStreamPump:
             content = ed.get("content", "")
             if content:
                 await self._clear_orphan_thinking(live)
-                await self._forward(
-                    {"pump_type": "ws_event", "event": {"type": "text", "content": content}},
-                )
+                await self._forward_delta(TEXT, {"content": content})
                 self._pending_text.append(content)
                 if live:
                     self._live_append_text(live, content)
@@ -1297,9 +1511,7 @@ class ChatStreamPump:
                     ))
 
         elif event.type == THINKING:
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "thinking", **ed}},
-            )
+            await self._forward_delta(THINKING, ed)
             live = _chat_streaming_state.get(self.chat_id)
             if ed.get("phase") == "start":
                 self._thinking_text = ""
@@ -1323,7 +1535,7 @@ class ChatStreamPump:
                 if self._thinking_text:
                     self._flush_pending_text()
                     thinking_block = self._stamp_speaker(
-                        {"type": "thinking", "content": self._thinking_text})
+                        {"type": wire.THINKING, "content": self._thinking_text})
                     self._turn_blocks.append(thinking_block)
                     if live:
                         live["live_blocks"].append(thinking_block)
@@ -1335,12 +1547,10 @@ class ChatStreamPump:
 
         elif event.type == TOOL_USE:
             await self._clear_orphan_thinking(live)
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "tool_start", **ed}},
-            )
+            await self._forward_event(TOOL_USE, ed)
             tool_name = ed.get("name", "")
             # LLM chat-title: tool-count early trigger. Counted at branch top —
-            # before _SKIP_TOOL_PERSIST — so Agent/Task/delegate spawns count.
+            # before _skips_tool_persist — so subagent/delegate spawns count.
             self._tool_seen += 1
             if self._title_armed and self._tool_seen >= _TITLE_TOOL_THRESHOLD:
                 self._title_armed = False
@@ -1376,11 +1586,11 @@ class ChatStreamPump:
                 except Exception:
                     logger.debug("record_tool_start failed", exc_info=True)
             # Skip tool tracking for Agent/Task/PlanMode (they have dedicated events)
-            if tool_name not in self._SKIP_TOOL_PERSIST:
+            if not self._skips_tool_persist(tool_name):
                 tool_id = ed.get("tool_id") or tool_name
                 self._flush_pending_text()
                 tool_block = self._stamp_speaker({
-                    "type": "tool", "name": tool_name,
+                    "type": wire.PERSISTED_TOOL, "name": tool_name,
                     "tool_id": tool_id, "summary": "", "active": True,
                     "tool_input": None,
                     "_insert_idx": len(self._turn_blocks),  # track position for correct DB ordering
@@ -1391,9 +1601,7 @@ class ChatStreamPump:
                     live["live_blocks"].append(tool_block)
 
         elif event.type == TOOL_INPUT:
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "tool_info", **ed}},
-            )
+            await self._forward_event(TOOL_INPUT, ed)
             name = ed.get("name", "")
             summary = ed.get("summary", "")
             tool_input = ed.get("tool_input")
@@ -1405,7 +1613,7 @@ class ChatStreamPump:
             # Capture plan filename from file-writing tools. Normalize
             # separators first: a Windows-satellite session reports the
             # host-absolute path with backslashes (C:\Users\...\.claude\plans\x.md).
-            if name in ("Write", "Edit", "apply_patch", "file_change"):
+            if tool_roles.role_of(name) == tool_roles.WRITE:
                 fp = (ed.get("file_path", "") or "").replace("\\", "/")
                 if ("/.claude/plans/" in fp or "/.codex/plans/" in fp) and fp.endswith(".md"):
                     self._plan_filename = fp.rsplit("/", 1)[-1]
@@ -1434,15 +1642,13 @@ class ChatStreamPump:
                     target["tool_result"] = result_content
                     target["result_summary"] = summary
                     target["is_error"] = result_is_error
-                await self._forward({"pump_type": "ws_event",
-                    "event": {"type": "tool_result",
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT,
+                    "event": {"type": wire.TOOL_RESULT,
                                "tool_name": tool_name,
                                "tool_use_id": tool_id,
                                "summary": summary,
                                "result_content": result_content}})
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "tool_end", **ed}},
-            )
+            await self._forward_event(TOOL_RESULT, ed)
             tool_evt = self._active_tools.pop(tool_id, None)
             if tool_evt:
                 tool_evt["active"] = False  # Also updates live_blocks (same dict ref)
@@ -1514,8 +1720,8 @@ class ChatStreamPump:
                             self._mcp_cost_by_key[key] = round(
                                 self._mcp_cost_by_key.get(key, 0.0) + hit.amount, 6,
                             )
-                            await self._forward({"pump_type": "ws_event", "event": {
-                                "type": "mcp_cost",
+                            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": {
+                                "type": wire.MCP_COST,
                                 "cost_usd": hit.amount,
                                 # A tool fee is money whatever credential the
                                 # LLM runs on — the gauge shows it even on a
@@ -1530,15 +1736,13 @@ class ChatStreamPump:
                     logger.exception("mcp cost evaluation failed for %s", tool_name)
 
         elif event.type == SUBAGENT_START:
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "task_spawn", **ed}},
-            )
+            await self._forward_event(SUBAGENT_START, ed)
             self._flush_pending_text()
-            self._turn_blocks.append({"type": "task_spawn", **ed})
+            self._turn_blocks.append({"type": wire.TASK_SPAWN, **ed})
             is_bg = ed.get("run_in_background", False)
             if live:
                 agent_block = {
-                    "type": "agent",
+                    "type": wire.LIVE_AGENT,
                     "description": ed.get("description", ""),
                     "subagent_type": ed.get("subagent_type", ""),
                     "background": is_bg,
@@ -1557,10 +1761,7 @@ class ChatStreamPump:
             # out-of-band via push_pump_event). Clears the widget by id —
             # order-independent, no FIFO.
             tuid = ed.get("tool_use_id", "")
-            await self._forward(
-                {"pump_type": "ws_event",
-                 "event": {"type": "bg_agent_done", "tool_use_id": tuid}},
-            )
+            await self._forward_event(SUBAGENT_END, {"tool_use_id": tuid})
             if live and tuid:
                 for a in live["active_agents"]:
                     if a.get("tool_use_id") == tuid:
@@ -1574,14 +1775,12 @@ class ChatStreamPump:
             # (pairBgCommandBlocks) — one expandable pill per command.
             # Completion (BG_COMMAND_END) clears it by id, order-independent
             # (multiple bg commands run concurrently).
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "bg_command_spawn", **ed}},
-            )
+            await self._forward_event(BG_COMMAND_START, ed)
             self._flush_pending_text()
-            self._turn_blocks.append({"type": "bg_command_spawn", **ed})
+            self._turn_blocks.append({"type": wire.BG_COMMAND_SPAWN, **ed})
             if live:
                 command_block = {
-                    "type": "command",
+                    "type": wire.LIVE_COMMAND,
                     "command": ed.get("command", ""),
                     "description": ed.get("description", ""),
                     "tool_use_id": ed.get("tool_use_id", ""),  # completion key (BG_COMMAND_END)
@@ -1595,11 +1794,8 @@ class ChatStreamPump:
             # task_updated frame (no completion hook exists for bg bash). Clears
             # the widget by tool_use_id, order-independent (no FIFO guessing).
             tuid = ed.get("tool_use_id", "")
-            await self._forward(
-                {"pump_type": "ws_event",
-                 "event": {"type": "bg_command_done", "tool_use_id": tuid,
-                           "status": ed.get("status", "")}},
-            )
+            await self._forward_event(BG_COMMAND_END, {"tool_use_id": tuid,
+                                                       "status": ed.get("status", "")})
             if live and tuid:
                 for c in live["active_commands"]:
                     if c.get("tool_use_id") == tuid:
@@ -1613,10 +1809,9 @@ class ChatStreamPump:
             # live-state only (not persisted as a turn block) — the agents'
             # actual output streams as normal text/tool blocks.
             tuid = ed.get("tool_use_id", "")
-            await self._forward({"pump_type": "ws_event", "event": {
-                "type": "workflow_start", "tool_use_id": tuid,
-                "workflow_name": ed.get("workflow_name", ""),
-            }})
+            await self._forward_event(WORKFLOW_START, {
+                "tool_use_id": tuid, "workflow_name": ed.get("workflow_name", ""),
+            })
             if live:
                 live["workflows"][tuid] = {
                     "tool_use_id": tuid,
@@ -1634,50 +1829,58 @@ class ChatStreamPump:
             now = time.monotonic()
             if now - self._wf_last_forward.get(tuid, 0.0) >= _WORKFLOW_PROGRESS_MIN_INTERVAL:
                 self._wf_last_forward[tuid] = now
-                await self._forward({"pump_type": "ws_event", "event": {
-                    "type": "workflow_progress", "tool_use_id": tuid,
-                    "workflow_progress": progress,
-                }})
+                await self._forward_event(WORKFLOW_PROGRESS, {
+                    "tool_use_id": tuid, "workflow_progress": progress,
+                })
 
         elif event.type == WORKFLOW_END:
             tuid = ed.get("tool_use_id", "")
             self._wf_last_forward.pop(tuid, None)
-            await self._forward({"pump_type": "ws_event", "event": {
-                "type": "workflow_end", "tool_use_id": tuid,
-            }})
+            await self._forward_event(WORKFLOW_END, {"tool_use_id": tuid})
             if live and tuid in live.get("workflows", {}):
                 live["workflows"][tuid]["active"] = False
 
         elif event.type == DELEGATE_SPAWN:
-            evt = {"type": "delegate_spawn", **ed}
-            await self._forward({"pump_type": "ws_event", "event": evt})
+            evt = {"type": wire.DELEGATE_SPAWN, **ed}
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
             self._flush_pending_text()
             self._turn_blocks.append(evt)
             if live:
                 delegate_block = {
-                    "type": "delegate",
+                    "type": wire.LIVE_DELEGATE,
                     "task_id": ed.get("task_id", ""),
                     "task_name": ed.get("task_name", ""),
                     "agent": ed.get("agent", ""),
                     # Full prompt for the expandable pill (reconnect parity).
                     "prompt": ed.get("prompt", ""),
                     "active": True,
-                    "status": "running",  # set to completed/failed/cancelled on terminal
+                    "status": run_status.RUNNING,  # a DELEGATE_RESULTS word on terminal
                 }
                 live["active_delegates"].append(delegate_block)
                 live["live_blocks"].append(delegate_block)
 
+        elif event.type == CHECK_VERDICT:
+            # A check's verdict (CHECKS.md "Rendering"): the card rides the
+            # turn in order — forwarded live, kept in the live state for a
+            # reconnect, persisted as an event row with the turn's blocks.
+            evt = {**ed, "type": wire.CHECK_VERDICT}
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+            self._flush_pending_text()
+            self._turn_blocks.append(evt)
+            if live:
+                live["live_blocks"].append(evt)
+
         elif event.type == PERMISSION_REQUEST:
             self._flush_pending_text()
-            self._turn_blocks.append({"type": "permission_prompt", **ed})
+            self._turn_blocks.append({"type": wire.PERMISSION_PROMPT, **ed})
             # Gate: use the same queue as perm_queue permissions
-            perm_data = {**ed, "event_type": "permission_prompt"}
+            perm_data = {**ed, "event_type": wire.ITEM_PERMISSION_PROMPT}
             await self._queue_or_show_permission(perm_data)
 
         elif event.type == PLAN_MODE:
-            evt = {"type": "plan_mode", **ed}
+            evt = {"type": wire.PLAN_MODE, **ed}
             await self._forward(
-                {"pump_type": "ws_event", "event": evt},
+                {"pump_type": wire.PUMP_WS_EVENT, "event": evt},
             )
             self._flush_pending_text()
             self._turn_blocks.append(evt)
@@ -1695,9 +1898,7 @@ class ChatStreamPump:
             # Cross-layer todo/checklist update (TodoWrite for CLI, update_plan for Codex)
             todos = ed.get("todos", [])
             self._current_todos = todos
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "todo_update", "todos": todos}},
-            )
+            await self._forward_event(TODO_UPDATE, {"todos": todos})
             if live:
                 live["todos"] = todos
             # Some checklist sources have no tool-path block the panel can rehydrate
@@ -1713,7 +1914,7 @@ class ChatStreamPump:
                 if self._todo_block is None:
                     self._flush_pending_text()
                     self._todo_block = self._stamp_speaker({
-                        "type": "tool", "name": "TodoWrite",
+                        "type": wire.PERSISTED_TOOL, "name": tool_roles.TODO_SNAPSHOT,
                         "tool_input": {"todos": todos},
                     })
                     if ed.get("panel_only"):
@@ -1731,9 +1932,7 @@ class ChatStreamPump:
             goal = goal_payload_to_state(ed)
             changed = goal != self._current_goal
             self._current_goal = goal
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "goal_update", "goal": goal}},
-            )
+            await self._forward_event(GOAL_UPDATE, {"goal": goal})
             if live:
                 live["goal"] = goal
             if changed and self.chat_id:
@@ -1743,8 +1942,8 @@ class ChatStreamPump:
         elif event.type == CONTEXT_COMPACT:
             # Context compression event (CLI auto-compact, Codex compaction, etc.)
             phase = ed.get("phase", "")
-            evt = {"type": "context_compact", **ed}
-            await self._forward({"pump_type": "ws_event", "event": evt})
+            evt = {"type": wire.CONTEXT_COMPACT, **ed}
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
             if phase == "completed":
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
@@ -1765,25 +1964,14 @@ class ChatStreamPump:
 
         elif event.type == SYSTEM:
             subtype = ed.get("subtype", "")
-            # Claude CLI subagent completion (fg + bg) is now a first-class
-            # SUBAGENT_END event keyed by tool_use_id (SubagentStop hook +
-            # task_notification backup) — no FIFO matching, no message_start
-            # inference. `fg_agents_complete` is still emitted by the Codex
-            # layer (collab `wait` tool), which has no per-agent completion
-            # signal, so that branch stays for Codex.
-            if subtype == "fg_agents_complete":
-                await self._forward(
-                    {"pump_type": "ws_event", "event": {"type": "fg_agents_complete"}},
-                )
-                self._flush_pending_text()
-                self._turn_blocks.append({"type": "fg_agents_complete"})
-                if live:
-                    for a in live["active_agents"]:
-                        if not a.get("background") and a.get("active", True):
-                            a["active"] = False
-            elif subtype == "meeting_started":
-                evt = {"type": "system", **ed}
-                await self._forward({"pump_type": "ws_event", "event": evt})
+            # Subagent completion (fg + bg) is a first-class SUBAGENT_END
+            # event keyed by tool_use_id (the SubagentStop hook + the
+            # task_notification backup) — no FIFO matching. No layer mints
+            # a `fg_agents_complete` subtype; that frame's one minter is the
+            # liveness clear (ws/dashboard_server_events).
+            if subtype == wire.SUBTYPE_MEETING_STARTED:
+                evt = {"type": wire.SYSTEM, **ed}
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
                 # Save immediately so it appears before any QUEUE_TURN user messages
@@ -1792,16 +1980,16 @@ class ChatStreamPump:
                     live["meeting_participants"] = ed.get("participants", [])
                     # Don't re-add to live_blocks — it's now in DB and will come
                     # via chat_history on reconnect.  Re-adding caused duplicates.
-            elif subtype == "meeting_turn_start":
+            elif subtype == wire.SUBTYPE_MEETING_TURN_START:
                 self._meeting_agent = ed.get("agent", "")
-                evt = {"type": "system", **ed}
-                await self._forward({"pump_type": "ws_event", "event": evt})
+                evt = {"type": wire.SYSTEM, **ed}
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
                 if live:
                     live["meeting_agent"] = self._meeting_agent
                     live["live_blocks"].append(evt)
-            elif subtype == "meeting_failed":
+            elif subtype == wire.SUBTYPE_MEETING_FAILED:
                 # Pre-turn meeting failure (admission denial, spawn failure…)
                 # surfaced by the orchestrator: persist immediately so the
                 # attach-time chat_history re-send carries the banner, and
@@ -1809,19 +1997,19 @@ class ChatStreamPump:
                 # to live_blocks after the save (meeting_started precedent —
                 # it would duplicate on reconnect).
                 self._meeting_agent = None
-                evt = {"type": "system", **ed}
-                await self._forward({"pump_type": "ws_event", "event": evt})
+                evt = {"type": wire.SYSTEM, **ed}
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
                 self._save_turn_blocks()
                 if live:
                     live["meeting_agent"] = None
                     live["meeting_participants"] = []
-            elif subtype in ("meeting_turn_end", "meeting_concluded", "meeting_agent_failed"):
-                if subtype in ("meeting_turn_end", "meeting_concluded"):
+            elif subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED, wire.SUBTYPE_MEETING_AGENT_FAILED):
+                if subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED):
                     self._meeting_agent = None
-                evt = {"type": "system", **ed}
-                await self._forward({"pump_type": "ws_event", "event": evt})
+                evt = {"type": wire.SYSTEM, **ed}
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
                 # Meeting costs now arrive as separate METADATA events with
@@ -1833,15 +2021,15 @@ class ChatStreamPump:
                 # meeting content which is deferred to PRODUCER_DONE).
                 self._save_turn_blocks()
                 if live:
-                    if subtype in ("meeting_turn_end", "meeting_concluded"):
+                    if subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED):
                         live["meeting_agent"] = None
-                    if subtype == "meeting_concluded":
+                    if subtype == wire.SUBTYPE_MEETING_CONCLUDED:
                         live["meeting_participants"] = []
                     live["live_blocks"].append(evt)
-            elif subtype not in ("task_started", "task_progress"):
-                evt = {"type": "system", **ed}
+            elif subtype not in wire.SYSTEM_SUBTYPES_TRANSIENT:
+                evt = {"type": wire.SYSTEM, **ed}
                 await self._forward(
-                    {"pump_type": "ws_event", "event": evt},
+                    {"pump_type": wire.PUMP_WS_EVENT, "event": evt},
                 )
                 self._flush_pending_text()
                 self._turn_blocks.append(evt)
@@ -1867,7 +2055,7 @@ class ChatStreamPump:
                 # Cost is already a per-turn delta (Direct LLM, Codex, meetings).
                 # Use directly — don't touch cumulative tracking.
                 turn_cost = ed.get("cost_usd", 0)
-                meta_event = {"type": "metadata", "cost_usd": turn_cost,
+                meta_event = {"type": wire.METADATA, "cost_usd": turn_cost,
                               "cost_billed": cost_billed}
                 # Preserve context/cache/duration fields if present
                 for k in ("context_used", "context_max", "cache_read",
@@ -1875,7 +2063,7 @@ class ChatStreamPump:
                           "duration_ms"):
                     if k in ed:
                         meta_event[k] = ed[k]
-                await self._forward({"pump_type": "ws_event", "event": meta_event})
+                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": meta_event})
                 self._flush_pending_text()
                 self._turn_blocks.append(meta_event)
                 self._total_cost_delta += turn_cost
@@ -1889,13 +2077,18 @@ class ChatStreamPump:
                 turn_cost = max(0, session_cost - self._last_session_cost)
                 self._last_session_cost = session_cost
                 _session_cumulative_cost[self.session_id] = session_cost
+                # The baseline made durable for a resume after a proxy restart
+                # (the turn-start callback seeds from it: _seed_cost_baseline).
+                if self.chat_id:
+                    self._submit_chat_update(
+                        "engine_cost", engine_cost_total=session_cost,
+                        engine_cost_session_id=self.session_id,
+                    )
                 # Forward per-turn cost (not cumulative)
                 meta_event = {**ed, "cost_usd": turn_cost, "cost_billed": cost_billed}
-                await self._forward(
-                    {"pump_type": "ws_event", "event": {"type": "metadata", **meta_event}},
-                )
+                await self._forward_event(METADATA, meta_event)
                 self._flush_pending_text()
-                self._turn_blocks.append({"type": "metadata", **meta_event})
+                self._turn_blocks.append({"type": wire.METADATA, **meta_event})
                 self._total_cost_delta += turn_cost
                 self._llm_cost_delta += turn_cost
             # Track context + cache stats for persistence
@@ -1921,9 +2114,7 @@ class ChatStreamPump:
             # this dispatcher is reached, so a grace-expiry's durable marker is
             # persisted there (see the ERROR branch in `_run`). This path remains
             # for any future caller that routes an ERROR through `_process_event`.
-            await self._forward(
-                {"pump_type": "ws_event", "event": {"type": "error", "message": ed.get("message", "")}},
-            )
+            await self._forward_event(ERROR, {"message": ed.get("message", "")})
 
         elif event.type == DONE:
             # Turn boundary — flush all pending data to DB in order
@@ -1939,159 +2130,47 @@ class ChatStreamPump:
                 # reconnect (DB messages are truncated at _db_msg_cutoff_id)
                 self._live_append_text(live, "\n\n")  # paragraph break between turns
                 live["active_tools"] = []
-            await self._forward({"pump_type": "is_done"})
+            await self._forward({"pump_type": wire.PUMP_IS_DONE})
 
     async def _handle_perm_event(self, perm_data: dict):
         """Handle a permission queue event — forward to WS or store for re-presentation."""
         evt_type = perm_data.get("event_type", "")
         live = _chat_streaming_state.get(self.chat_id)
+        artifact = artifact_events.kind_of(evt_type)
 
-        if evt_type == "images":
-            # Unified gallery event (1-N images). Replaces the old singular
-            # `image` event — display-mcp, image-gen-mcp, file-tools-mcp, and
-            # the new image-search-mcp all post via /v1/hooks/images now.
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            # Remove image_generating placeholder (if any) — applies when the
-            # gallery is coming from image-gen-mcp's completion path.
-            for i in range(len(self._turn_blocks) - 1, -1, -1):
-                if self._turn_blocks[i].get("type") == "image_generating":
-                    self._turn_blocks.pop(i)
-                    break
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                for i in range(len(live["live_blocks"]) - 1, -1, -1):
-                    if live["live_blocks"][i].get("type") == "image_generating":
-                        live["live_blocks"].pop(i)
-                        break
-                live["live_blocks"].append(evt)
-        elif evt_type == "image_generating":
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                live["live_blocks"].append(evt)
-        elif evt_type == "image_gen_failed":
-            await self._forward({"pump_type": "ws_event",
-                                 "event": artifact_event_from_perm_item(perm_data)})
-            # Remove placeholder from turn_blocks and live_blocks
-            for i in range(len(self._turn_blocks) - 1, -1, -1):
-                if self._turn_blocks[i].get("type") == "image_generating":
-                    self._turn_blocks.pop(i)
-                    break
-            if live:
-                for i in range(len(live["live_blocks"]) - 1, -1, -1):
-                    if live["live_blocks"][i].get("type") == "image_generating":
-                        live["live_blocks"].pop(i)
-                        break
-        elif evt_type == "url":
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                live["live_blocks"].append(evt)
-        elif evt_type == "file":
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                live["live_blocks"].append(evt)
-        elif evt_type == "ui":
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                live["live_blocks"].append(evt)
-        elif evt_type in ("video", "audio"):
-            # Audio/video player block. Carries either a web URL (src_kind=url)
-            # or a capability token (src_kind=token → /v1/media/{token}); the
-            # bytes are NEVER inlined (unlike images). Replaces a
-            # media_processing placeholder if one was shown during transcode.
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            self._flush_pending_text()
-            for i in range(len(self._turn_blocks) - 1, -1, -1):
-                if self._turn_blocks[i].get("type") == "media_processing":
-                    self._turn_blocks.pop(i)
-                    break
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                for i in range(len(live["live_blocks"]) - 1, -1, -1):
-                    if live["live_blocks"][i].get("type") == "media_processing":
-                        live["live_blocks"].pop(i)
-                        break
-                live["live_blocks"].append(evt)
-        elif evt_type == "media_processing":
-            # Transient skeleton shown while the proxy transcodes a non-web-safe
-            # codec. Removed when the real video/audio block arrives or
-            # on media_failed; not persisted (skipped in _save_turn_blocks).
+        if artifact is not None:
+            # One arm for the eleven artifact kinds (core-seams phase 9); the
+            # table in core/events/artifact_events.py says what each does.
+            # A block kind (a gallery, a link, a file, a player, a ui page,
+            # a preview, a placeholder) is stamped with the meeting speaker,
+            # closes the pending text, evicts the latest placeholder of its
+            # twin from the turn and live lists and is appended to both; a
+            # removal kind (a failed generation or transcode) only evicts.
+            # A deferred kind (the document preview) replaces the push of
+            # the same file in place and waits for the turn's flush
+            # (``_flush_pending_previews``) instead of being forwarded now.
             evt = artifact_event_from_perm_item(perm_data)
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
-            if live:
-                live["live_blocks"].append(evt)
-        elif evt_type == "media_failed":
-            await self._forward({"pump_type": "ws_event",
-                                 "event": artifact_event_from_perm_item(perm_data)})
-            for i in range(len(self._turn_blocks) - 1, -1, -1):
-                if self._turn_blocks[i].get("type") == "media_processing":
-                    self._turn_blocks.pop(i)
-                    break
-            if live:
-                for i in range(len(live["live_blocks"]) - 1, -1, -1):
-                    if live["live_blocks"][i].get("type") == "media_processing":
-                        live["live_blocks"].pop(i)
-                        break
-        elif evt_type == "document_preview":
-            evt = self._stamp_speaker(artifact_event_from_perm_item(perm_data))
-            # Buffer preview — only forward to dashboard at turn end.
-            # Replace-in-place in turn_blocks and live_blocks for state consistency.
-            self._flush_pending_text()
-            replaced = False
-            for i, block in enumerate(self._turn_blocks):
-                if (block.get("type") == "document_preview"
-                        and block.get("file_id") == evt["file_id"]):
-                    # Intra-turn supersede: the replaced push's snapshot was
-                    # never exposed to the dashboard (previews only forward at
-                    # flush) — drop its file now.
-                    old_snap = block.get("snapshot_id") or ""
-                    if old_snap and old_snap != evt.get("snapshot_id"):
-                        from services.media import preview_snapshots
-                        chat_writer.submit(
-                            self.chat_id,
-                            functools.partial(preview_snapshots.delete_snapshot,
-                                              self.chat_id, old_snap),
-                            label="snapshot_delete",
-                        )
-                    self._turn_blocks[i] = evt
-                    replaced = True
-                    break
-            if not replaced:
+            if artifact.block:
+                evt = self._stamp_speaker(evt)
+                self._flush_pending_text()
+            if artifact.evicts:
+                _evict_latest(self._turn_blocks, artifact.evicts)
+                if live:
+                    _evict_latest(live["live_blocks"], artifact.evicts)
+            if artifact.deferred:
+                self._buffer_preview(evt, artifact.identity, live)
+                return
+            if artifact.block:
                 self._turn_blocks.append(evt)
-            # Buffer latest preview per file_id (don't forward WS event yet)
-            self._pending_previews[evt["file_id"]] = evt
-            if live:
-                replaced_live = False
-                for i, lb in enumerate(live["live_blocks"]):
-                    if (lb.get("type") == "document_preview"
-                            and lb.get("file_id") == evt["file_id"]):
-                        live["live_blocks"][i] = evt
-                        replaced_live = True
-                        break
-                if not replaced_live:
-                    live["live_blocks"].append(evt)
-        elif evt_type == "tool_result":
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+            if live and artifact.block:
+                live["live_blocks"].append(evt)
+        elif evt_type == wire.ITEM_TOOL_RESULT:
             tool_name = perm_data["tool_name"]
             result_content = perm_data.get("result_content", "")
             tool_use_id = perm_data.get("tool_use_id", "") or ""
-            await self._forward({"pump_type": "ws_event",
-                "event": {"type": "tool_result",
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT,
+                "event": {"type": wire.TOOL_RESULT,
                            "tool_name": tool_name,
                            "tool_use_id": tool_use_id,
                            "summary": perm_data["summary"],
@@ -2113,7 +2192,7 @@ class ChatStreamPump:
                 # Carried to the cost engine at TOOL_RESULT so a failed
                 # tool call (e.g. a failed image generation) isn't charged.
                 target["is_error"] = bool(perm_data.get("is_error", False))
-            elif tool_name in ("Agent", "Task") and tool_use_id:
+            elif tool_roles.role_of(tool_name) == tool_roles.SUBAGENT and tool_use_id:
                 # A FOREGROUND subagent's final report (Agent tools are not
                 # tracked in _active_tools — they have dedicated task_spawn
                 # blocks). Attach it to the spawn block so the dashboard's
@@ -2123,7 +2202,7 @@ class ChatStreamPump:
                 # just the "launched" ack, and the real report arrives via
                 # task_notification in a later turn.
                 for blk in reversed(self._turn_blocks):
-                    if (blk.get("type") == "task_spawn"
+                    if (blk.get("type") == wire.TASK_SPAWN
                             and blk.get("tool_use_id") == tool_use_id):
                         if not blk.get("run_in_background"):
                             blk["tool_result"] = result_content
@@ -2134,24 +2213,24 @@ class ChatStreamPump:
                                 and not a.get("background")):
                             a["tool_result"] = result_content
                             break
-        elif evt_type == "question":
+        elif evt_type == wire.ITEM_QUESTION:
             evt = self._stamp_speaker(
-                {"type": "question", "tool_name": perm_data["tool_name"],
+                {"type": wire.QUESTION, "tool_name": perm_data["tool_name"],
                  "tool_input": perm_data["tool_input"]})
             self._flush_pending_text()
             self._turn_blocks.append(evt)
-            await self._forward({"pump_type": "ws_event", "event": evt})
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
             if live:
                 live["live_blocks"].append(evt)
-        elif evt_type == "permission_prompt":
+        elif evt_type == wire.ITEM_PERMISSION_PROMPT:
             # Gate: only show one blocking prompt at a time
             await self._queue_or_show_permission(perm_data)
-        elif evt_type == "question_prompt":
+        elif evt_type == wire.ITEM_QUESTION_PROMPT:
             # Codex request_user_input — the daemon holds the turn open until
             # question_response resolves it, so this MUST reach the blocking-
             # prompt gate (card + reconnect replay); dropping it hangs the turn.
             await self._queue_or_show_permission(perm_data)
-        elif evt_type == "plan_review":
+        elif evt_type == wire.ITEM_PLAN_REVIEW:
             plan_content = perm_data.get("plan", "")
             plan_tool_input = perm_data.get("tool_input", {})
             plan_filename = ""
@@ -2179,16 +2258,16 @@ class ChatStreamPump:
             # Save plan_review event for DB history reconstruction
             self._flush_pending_text()
             self._turn_blocks.append({
-                "type": "plan_review", "request_id": perm_data.get("request_id", ""),
+                "type": wire.PLAN_REVIEW, "request_id": perm_data.get("request_id", ""),
                 "plan": plan_content, "tool_input": plan_tool_input,
                 "filename": plan_filename,
             })
             # Gate: only show one blocking prompt at a time
             await self._queue_or_show_permission(enriched)
-        elif evt_type == "mode_restored":
+        elif evt_type == wire.ITEM_MODE_RESTORED:
             mode = perm_data.get("mode", "default")
             self._submit_chat_update("mode_restored", permission_mode=mode)
-            await self._forward({"pump_type": "perm_mode_restored", "mode": mode})
+            await self._forward({"pump_type": wire.PUMP_MODE_RESTORED, "mode": mode})
 
 
 # The background-work monitors live in pump_bg_monitors.py; re-exported here

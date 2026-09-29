@@ -23,6 +23,7 @@ import logging
 import time
 
 from storage import database as task_store
+from core.session import session_kind
 
 logger = logging.getLogger("claude-proxy.siblings")
 
@@ -96,7 +97,7 @@ def _gather_sync(agent: str, owner: str, own_chat_id: str) -> tuple[list, list]:
     siblings: list[tuple[str, str]] = []
     sibling_ids: set[str] = set()
     for cid, status in snap["lanes"].items():
-        if cid == own_chat_id or cid.startswith("task-"):
+        if cid == own_chat_id or session_kind.is_task_chat_id(cid):
             continue
         row = _chat_row_sync(cid)
         if not row or row.get("agent") != agent or row.get("user_sub") != owner:
@@ -184,9 +185,9 @@ def context_block(agent_name: str, user_sub: str) -> str | None:
     """Session-start markdown block for the dynamic-context provider — covers
     layers with no per-turn injection (PTY, remote) on their first turn."""
     try:
-        from core.session.visibility import chat_history_owner
+        from core.session.visibility import chat_history_owner, shared_chat_owner
         owner = (chat_history_owner(agent_name, user_sub)
-                 if user_sub else f"agent::{agent_name}")
+                 if user_sub else shared_chat_owner(agent_name))
         siblings, tasks = _gather_sync(agent_name, owner, own_chat_id="")
     except Exception:
         logger.exception(f"sibling context block failed for agent {agent_name}")

@@ -20,6 +20,7 @@ from services.path_policy_v2 import (  # noqa: E402
     resolve_path_for_session,
     context_from_security,
 )
+from core import placement
 
 HOME = "/home/alice"
 AGENTS = "/home/alice/.oto-dock/agents"
@@ -27,15 +28,10 @@ AGENTS = "/home/alice/.oto-dock/agents"
 
 def _ctx(roots=()):
     return PathPolicyContext(
-        target_kind="user_remote",
-        machine_id="m1",
-        home_dir=HOME,
-        target_agents_dir=AGENTS,
-        allow_full_fs=False,
-        target_os="linux",
         agent_slug="my-agent",
         role="manager",
         session_allowed_roots=tuple(roots),
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1", home_dir=HOME, agents_dir=AGENTS, allow_full_fs=False, os="linux"),
     )
 
 
@@ -101,10 +97,9 @@ def main() -> int:
     # 6. context_from_security threads session_allowed_roots off a duck-typed ctx.
     from types import SimpleNamespace
     sec = SimpleNamespace(
-        target_kind="user_remote", target_machine_id="m1",
-        target_agents_dir=AGENTS, target_home_dir=HOME,
-        target_allow_full_fs=False, role="manager", agent="my-agent",
+        role="manager", agent="my-agent",
         session_allowed_roots=("/srv/proj",),
+        placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m1", agents_dir=AGENTS, home_dir=HOME, allow_full_fs=False),
     )
     built = context_from_security(sec)
     threaded = built.session_allowed_roots == ("/srv/proj",)

@@ -460,7 +460,8 @@ async def test_create_call_dispatches_twilio_routes_to_rest(harness, monkeypatch
 
     resp = await harness.client.post(
         "/api/calls",
-        json={"phone_number": "+306912223344", "task_description": "test"},
+        json={"phone_number": "+306912223344", "task_description": "test",
+              "route_id": "r-out"},
         headers={"Authorization": "Bearer s3cret"},
     )
     assert resp.status == 202

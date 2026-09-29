@@ -138,7 +138,6 @@ class ConfigManager:
         self._routes_by_uuid: dict[str, PhoneRoute] = {}
         self._routes_by_server_did: dict[tuple[int, str], PhoneRoute] = {}
         self._routes_outbound: dict[str, PhoneRoute] = {}
-        self._default_outbound: PhoneRoute | None = None
         # Provider map (id → {provider_name, voices, advanced, api_key}) + the
         # call-default ids, pushed by the proxy so routes resolve their STT/TTS.
         self._providers: dict[str, dict] = {}
@@ -163,7 +162,6 @@ class ConfigManager:
         self._routes_by_uuid.clear()
         self._routes_by_server_did.clear()
         self._routes_outbound.clear()
-        self._default_outbound = None
 
         for r in self._data.get("routes", []):
             if not r.get("enabled", True):
@@ -198,8 +196,6 @@ class ConfigManager:
                     self._routes_by_server_did[(int(route.phone_server_id), did)] = route
             else:
                 self._routes_outbound[route.id] = route
-                if self._default_outbound is None:
-                    self._default_outbound = route
 
     # -----------------------------------------------------------------------
     # Route lookup
@@ -278,10 +274,6 @@ class ConfigManager:
     def get_outbound_route(self, route_id: str) -> PhoneRoute | None:
         """Get a specific outbound route by ID."""
         return self._routes_outbound.get(route_id)
-
-    def get_default_outbound_route(self) -> PhoneRoute | None:
-        """Get the first enabled outbound route (default)."""
-        return self._default_outbound
 
     def enabled_routes(self) -> list[PhoneRoute]:
         """All enabled routes (inbound + outbound) — used by the filler pre-warm.

@@ -195,13 +195,10 @@ class OutboundCallAPI:
             "phone_number": "+30...",
             "task_description": "Reserve table for 4...",
             "instructions": "Optional extra instructions",
-            "route_id": "optional-route-uuid",
+            "route_id": "route-uuid",  // required: the daemon picks no default
             "wait": true  // block until call completes
         }
         """
-        if not self._calls_limiter.allow():
-            return web.json_response({"error": "rate limit exceeded"}, status=429)
-
         try:
             body = await request.json()
         except Exception:
@@ -214,18 +211,20 @@ class OutboundCallAPI:
         except ValidationError as e:
             return web.json_response({"error": str(e)}, status=400)
 
+        # The window counts admitted bodies only: a request that never
+        # reaches a dial cannot spend it.
+        if not self._calls_limiter.allow():
+            return web.json_response({"error": "rate limit exceeded"}, status=429)
+
         phone_number = fields["phone_number"]
         task_description = fields["task_description"]
         instructions = fields["instructions"]
         route_id = fields["route_id"]
         wait = bool(body.get("wait", False))
 
-        # Resolve outbound route
-        if route_id:
-            route = self.cfg.get_outbound_route(route_id)
-        else:
-            route = self.cfg.get_default_outbound_route()
-
+        # The body names its route (validation requires it); there is no
+        # default route to fall back to.
+        route = self.cfg.get_outbound_route(route_id)
         if not route:
             return web.json_response(
                 {"error": "no outbound route configured"}, status=400,

@@ -107,6 +107,7 @@ def _cfg(slug):
     return SimpleNamespace(
         execution_target="local", execution_path="claude-code-cli",
         user_sub="", security_context=SimpleNamespace(role="manager"),
+        mcp_config_path=f"/tmp/{slug}-mcp.json",
     )
 
 
@@ -115,19 +116,25 @@ async def test_admission_denial_notifies_with_reason():
     denial = Admission(False, "host_memory",
                        "The platform host is low on memory (123 MB free).")
     notify = AsyncMock()
+    acquire = AsyncMock(return_value=denial)
     with patch.object(MO.task_store, "get_meeting",
                       return_value=_pending_meeting_row()), \
          patch.object(MO.task_store, "get_chat", return_value={}), \
          patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
          patch.object(MO, "build_meeting_agent_config",
                       new=AsyncMock(side_effect=lambda slug, m, sid: _cfg(slug))), \
-         patch("core.concurrency.acquire_meeting_slots",
-               new=AsyncMock(return_value=denial)), \
+         patch("core.concurrency.acquire_meeting_slots", new=acquire), \
          patch.object(MO, "_notify_meeting_failed", new=notify):
         await MO.start_meeting("m1")
 
     notify.assert_awaited_once_with(
         "m1", "The platform host is low on memory (123 MB free).")
+    # Every participant names its MCP config, so a Direct-LLM
+    # participant reserves for its stdio MCPs.
+    kw = acquire.await_args.kwargs
+    assert set(kw["mcp_paths"]) == set(kw["exec_paths"])
+    assert all(p.endswith("-mcp.json") for p in kw["mcp_paths"].values())
 
 
 @pytest.mark.asyncio
@@ -137,6 +144,7 @@ async def test_config_build_failure_notifies():
                       return_value=_pending_meeting_row()), \
          patch.object(MO.task_store, "get_chat", return_value={}), \
          patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
          patch.object(MO, "build_meeting_agent_config",
                       new=AsyncMock(side_effect=RuntimeError("boom"))), \
          patch.object(MO, "_notify_meeting_failed", new=notify):
@@ -202,6 +210,7 @@ async def test_pool_cap_continue_with_a_key_lets_the_meeting_start():
          patch.object(MO.task_store, "get_chat", return_value={"agent": "host"}), \
          patch.object(MO.task_store, "get_user", return_value={"role": "member"}), \
          patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
          patch.object(agent_store, "get_agent",
                       return_value={"execution_path": "claude-code-cli"}), \
          patch.object(usage_service, "check_user_limit",
@@ -228,6 +237,7 @@ async def test_participant_pool_refusal_is_the_meeting_reason():
                       return_value=_pending_meeting_row()), \
          patch.object(MO.task_store, "get_chat", return_value={}), \
          patch.object(MO.task_store, "update_meeting"), \
+         patch.object(MO.task_store, "update_meeting_if", return_value=True), \
          patch.object(MO, "build_meeting_agent_config",
                       new=AsyncMock(side_effect=err)), \
          patch.object(MO, "_notify_meeting_failed", new=notify):

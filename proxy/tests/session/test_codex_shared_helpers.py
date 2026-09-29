@@ -5,11 +5,9 @@ and auth.json construction produce identical output on both paths.
 
 from __future__ import annotations
 
-import json
 
 from core.layers.codex.helpers import (
     build_auth_json,
-    build_auth_json_from_env,
     map_effort_to_codex,
     permission_to_sandbox,
 )
@@ -97,6 +95,19 @@ def test_map_effort_gpt6_astra_unlocks_max_and_ultra():
     assert map_effort_to_codex("ultra", "gpt-6-mini") == "xhigh"
 
 
+def test_map_effort_gpt6_sol_and_luna_follow_the_0_156_catalog():
+    # Codex 0.156.1's bundled catalog (verified 2026-09-24): GPT-6 Sol carries
+    # low…max + ultra like 5.6 Sol; GPT-6 Luna low…max, no ultra, like 5.6 Luna.
+    assert map_effort_to_codex("max", "gpt-6-sol") == "max"
+    assert map_effort_to_codex("ultra", "gpt-6-sol") == "ultra"
+    assert map_effort_to_codex("max", "gpt-6-luna") == "max"
+    assert map_effort_to_codex("ultra", "gpt-6-luna") == "max"
+    # The retired 5.6 ids keep their ceilings (a custom re-add, a session
+    # whose row remaps at the next boot).
+    assert map_effort_to_codex("ultra", "gpt-5.6-sol") == "ultra"
+    assert map_effort_to_codex("max", "gpt-5.6-luna") == "max"
+
+
 def test_map_effort_ultra_clamps_to_model_ceiling_elsewhere():
     # Luna's wire scale tops at "max"; pre-5.6 families top at "xhigh"; a
     # stored "ultra" must degrade to the actual ceiling, never be rejected.
@@ -150,52 +161,6 @@ def test_build_auth_json_with_blob_preserves_ids_updates_access_token():
     assert blob["tokens"]["refresh_token"] == "RFR"
 
 
-def test_build_auth_json_no_blob_minimal_structure():
-    out = build_auth_json("TOK")
-    assert out["auth_mode"] == "chatgpt"
-    assert out["tokens"]["access_token"] == "TOK"
-    assert out["tokens"]["refresh_token"] == ""
-    assert "id_token" in out["tokens"]
-    assert "last_refresh" in out
-
-
-# ---------------------------------------------------------------------------
-# build_auth_json_from_env
-# ---------------------------------------------------------------------------
-
-def test_build_auth_json_from_env_pops_both_keys():
-    env = {
-        "OTHER": "x",
-        "_CODEX_OAUTH_TOKEN": "NEW",
-        "_CODEX_AUTH_BLOB": json.dumps({
-            "auth_mode": "chatgpt",
-            "tokens": {"id_token": "ID", "refresh_token": "RFR", "account_id": "A"},
-        }),
-    }
-    out = build_auth_json_from_env(env)
-    assert out is not None
-    assert out["tokens"]["access_token"] == "NEW"
-    assert out["tokens"]["id_token"] == "ID"
-    # Both keys should be popped out of env
-    assert "_CODEX_OAUTH_TOKEN" not in env
-    assert "_CODEX_AUTH_BLOB" not in env
-    assert env["OTHER"] == "x"
-
-
-def test_build_auth_json_from_env_returns_none_when_no_token():
-    env = {"FOO": "bar"}
-    assert build_auth_json_from_env(env) is None
-    assert env == {"FOO": "bar"}
-
-
-def test_build_auth_json_from_env_handles_bad_json_blob():
-    env = {"_CODEX_OAUTH_TOKEN": "TOK", "_CODEX_AUTH_BLOB": "{not json"}
-    out = build_auth_json_from_env(env)
-    # Falls back to minimal structure when blob is unparseable
-    assert out is not None
-    assert out["tokens"]["access_token"] == "TOK"
-
-
 # ---------------------------------------------------------------------------
 # config-side ultra gate (registry flag + per-layer emission)
 # ---------------------------------------------------------------------------
@@ -204,11 +169,14 @@ def test_supports_ultra_flags_match_openai_manifest():
     # Sol/Terra and Astra carry ultra; Luna is capped at max by OpenAI's own
     # manifest. These flags must stay in sync with helpers._ULTRA_EFFORT_MODEL_PREFIXES.
     import config as app_config
-    assert app_config.get_model_supports_ultra("gpt-5.6-sol") is True
+    assert app_config.get_model_supports_ultra("gpt-6-sol") is True
     assert app_config.get_model_supports_ultra("gpt-5.6-terra") is True
     assert app_config.get_model_supports_ultra("gpt-6-astra") is True
-    assert app_config.get_model_supports_ultra("gpt-5.6-luna") is False
-    assert app_config.get_model_supports_ultra("claude-opus-5") is False
+    assert app_config.get_model_supports_ultra("gpt-6-luna") is False
+    assert app_config.get_model_supports_ultra("claude-opus-5-5") is False
+    # Registry-only gate: the retired 5.6 Sol has no row any more (the wire
+    # clamp in helpers still knows it).
+    assert app_config.get_model_supports_ultra("gpt-5.6-sol") is False
     assert app_config.get_model_supports_ultra("no-such-model") is False
 
 
@@ -224,7 +192,7 @@ def test_gpt6_astra_registry_entry():
     assert entry["pricing"] == (10.0, 50.0, 12.50, 1.00)
     assert entry["supports_xhigh"] and entry["supports_ultra"] and entry["supports_reasoning"]
     codex_ids = [m["value"] for m in app_config.get_layer_models("codex-cli")]
-    assert codex_ids.index("gpt-5.6-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-5.6-terra")
+    assert codex_ids.index("gpt-6-sol") < codex_ids.index("gpt-6-astra") < codex_ids.index("gpt-5.6-terra")
     assert "gpt-6-astra" not in {m["value"] for m in app_config.get_layer_models("direct-llm")}
     assert "gpt-6-astra" not in app_config.MODEL_SUCCESSORS
     assert app_config.get_model_supports_xhigh("gpt-6-astra") is True
@@ -233,11 +201,15 @@ def test_gpt6_astra_registry_entry():
 def test_layer_models_emit_ultra_only_on_codex_layer():
     # Terra ships on codex-cli AND direct-llm — only the codex engine can run
     # the multi-agent orchestration, so only its list may advertise the flag
-    # (the dashboard's effort picker keys on this).
-    import config as app_config
-    codex = {m["value"]: m for m in app_config.get_layer_models("codex-cli")}
-    direct = {m["value"]: m for m in app_config.get_layer_models("direct-llm")}
-    assert codex["gpt-5.6-sol"]["supports_ultra"] is True
+    # (the dashboard's effort picker keys on this). The flag is per MODEL
+    # (Luna never gets it) ANDed with the engine's offers_ultra — read from
+    # the layers' own descriptors, the lists the API actually serves.
+    from core.layers.codex.layer import _CODEX_CAPABILITIES
+    from core.layers.direct.layer import _DIRECT_CAPABILITIES
+    codex = {m["value"]: m for m in _CODEX_CAPABILITIES.models}
+    direct = {m["value"]: m for m in _DIRECT_CAPABILITIES.models}
+    assert codex["gpt-6-sol"]["supports_ultra"] is True
     assert codex["gpt-5.6-terra"]["supports_ultra"] is True
-    assert codex["gpt-5.6-luna"]["supports_ultra"] is False
+    assert codex["gpt-6-luna"]["supports_ultra"] is False
     assert direct["gpt-5.6-terra"]["supports_ultra"] is False
+    assert direct["gpt-6-luna"]["supports_ultra"] is False

@@ -115,6 +115,19 @@ export interface AdminAgentUsage {
   breakdown: ProviderBreakdownEntry[]
 }
 
+/** Unattended spend per app (APPS.md "Handlers"): the runs an app's
+ * handler fired, named by the app while its row exists. */
+export interface AdminAppUsage {
+  app_id: string
+  title: string
+  slug: string
+  agent: string
+  scope: 'shared' | 'personal' | 'gone'
+  total_cost: number
+  run_count: number
+  message_count: number
+}
+
 export interface ProviderTotal {
   provider: string
   cost: number
@@ -135,7 +148,19 @@ export interface AdminUsageOverview {
   model_totals: ModelTotal[]
   users: AdminUserUsage[]
   agents: AdminAgentUsage[]
+  /** Absent on an older proxy. */
+  apps?: AdminAppUsage[]
+  /** Judge spend per check (CHECKS.md "Spend"); absent on an older proxy. */
+  checks?: AdminCheckUsage[]
   pool: Record<string, PoolCapStatus>
+}
+
+export interface AdminCheckUsage {
+  agent: string
+  check_name: string
+  total_cost: number
+  run_count: number
+  message_count: number
 }
 
 export interface UsageLimit {

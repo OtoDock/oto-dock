@@ -11,10 +11,29 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+import config
 from core.sandbox import skills_materializer as sm
 from services.mcp import mcp_registry
+
+
+@pytest.fixture(autouse=True)
+def _roots(tmp_path, monkeypatch):
+    """The three roots the materializer opens beneath: skill sources under
+    MCPS_DIR, the config dir under the agent tree, the lock under
+    SESSIONS_DIR."""
+    (tmp_path / "agents").mkdir()
+    monkeypatch.setattr(config, "MCPS_DIR", tmp_path / "mcps")
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    monkeypatch.setattr(config, "SESSIONS_DIR", tmp_path / "sessions")
+
+
+def _cfg_dir(tmp_path, name: str = ".claude") -> Path:
+    return tmp_path / "agents" / "pa" / "workspace" / name
 
 
 def _wire(tmp_path, skills):
@@ -54,7 +73,7 @@ def test_folder_skill_materializes_scrubbed(tmp_path):
     ref.parent.mkdir(parents=True)
     ref.write_text("reference body")
 
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -74,7 +93,7 @@ def test_legacy_flat_file_synthesizes_frontmatter(tmp_path):
         ("voiceover", "skills/voiceover.md", "# Voice-overs\n\nPick a voice.\n",
          "Produce narrated voice-overs."),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -90,7 +109,7 @@ def test_tamper_is_repaired_next_ensure(tmp_path):
     wanted = _wire(tmp_path, [
         ("pdf-tricks", "skills/pdf-tricks/SKILL.md", FOLDER_SKILL, "PDF."),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -106,7 +125,7 @@ def test_source_edit_rematerializes(tmp_path):
     wanted = _wire(tmp_path, [
         ("voiceover", "skills/voiceover.md", "old body", "d"),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -119,7 +138,7 @@ def test_disabled_skill_quarantined_not_deleted(tmp_path):
     wanted = _wire(tmp_path, [
         ("voiceover", "skills/voiceover.md", "body", "d"),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -132,7 +151,7 @@ def test_disabled_skill_quarantined_not_deleted(tmp_path):
 
 
 def test_agent_written_stray_quarantined(tmp_path):
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     stray = cfg / "skills" / "self-made"
     stray.mkdir(parents=True)
     (stray / "SKILL.md").write_text("agent parallel memory")
@@ -144,7 +163,7 @@ def test_agent_written_stray_quarantined(tmp_path):
 
 
 def test_dot_entries_never_touched(tmp_path):
-    cfg = tmp_path / ".codex"
+    cfg = _cfg_dir(tmp_path, ".codex")
     system = cfg / "skills" / ".system" / "imagegen"
     system.mkdir(parents=True)
     (system / "SKILL.md").write_text("codex builtin")
@@ -155,8 +174,8 @@ def test_dot_entries_never_touched(tmp_path):
 
 
 def test_no_skills_no_dir_creates_nothing(tmp_path):
-    cfg = tmp_path / ".claude"
-    cfg.mkdir()
+    cfg = _cfg_dir(tmp_path)
+    cfg.mkdir(parents=True)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=[]):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -164,7 +183,7 @@ def test_no_skills_no_dir_creates_nothing(tmp_path):
 
 
 def test_missing_source_fail_soft(tmp_path):
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     wanted = [("ghost", tmp_path / "nope.md", "pkg", "1", "d")]
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
@@ -173,7 +192,7 @@ def test_missing_source_fail_soft(tmp_path):
 
 
 def test_registry_error_fail_soft(tmp_path):
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       side_effect=RuntimeError("db down")):
         sm.materialize_skills_for_sandbox("pa", cfg)   # must not raise
@@ -186,7 +205,7 @@ def test_symlink_in_source_not_followed_into_output(tmp_path):
     secret = tmp_path / "secret.txt"
     secret.write_text("credential")
     (tmp_path / "mcps/pkg/skills/pdf-tricks/link.txt").symlink_to(secret)
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -199,7 +218,7 @@ def test_concurrent_ensures_converge(tmp_path):
         ("voiceover", "skills/voiceover.md", "body", "d"),
         ("pdf-tricks", "skills/pdf-tricks/SKILL.md", FOLDER_SKILL, "d"),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         threads = [threading.Thread(
@@ -220,7 +239,7 @@ def test_idempotent_second_run_no_rewrite(tmp_path):
     wanted = _wire(tmp_path, [
         ("voiceover", "skills/voiceover.md", "body", "d"),
     ])
-    cfg = tmp_path / ".claude"
+    cfg = _cfg_dir(tmp_path)
     with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
                       return_value=wanted):
         sm.materialize_skills_for_sandbox("pa", cfg)
@@ -228,3 +247,148 @@ def test_idempotent_second_run_no_rewrite(tmp_path):
         ino_before = target.stat().st_ino
         sm.materialize_skills_for_sandbox("pa", cfg)
         assert target.stat().st_ino == ino_before  # unchanged tree kept in place
+
+
+# ---------------------------------------------------------------------------
+# Symlinks in a package, the lock's home, the staging rewrite
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_in_package_skips_the_skill(tmp_path):
+    """The PoC's shape: a package ships ``leaked.env -> <host secret>``.
+    Nothing of the secret lands in the skills tree, the skill is skipped and
+    the other skills materialize."""
+    wanted = _wire(tmp_path, [
+        ("evil", "skills/evil/SKILL.md", "---\nname: evil\ndescription: b\n---\n\nhello\n", "b"),
+        ("voiceover", "skills/voiceover.md", "body", "d"),
+    ])
+    secret = tmp_path / "config.env"
+    secret.write_text("MASTER_KEY=super-secret-value\n")
+    (tmp_path / "mcps/pkg/skills/evil/leaked.env").symlink_to(secret)
+    cfg = _cfg_dir(tmp_path)
+    with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                      return_value=wanted):
+        sm.materialize_skills_for_sandbox("pa", cfg)
+    assert not (cfg / "skills/evil").exists()
+    assert (cfg / "skills/voiceover/SKILL.md").is_file()
+    for f in (cfg / "skills").rglob("*"):
+        if f.is_file():
+            assert b"super-secret-value" not in f.read_bytes()
+    assert not list((cfg / "skills").glob(".staging-*"))
+
+
+def test_lock_lives_outside_the_agent_tree(tmp_path):
+    wanted = _wire(tmp_path, [("voiceover", "skills/voiceover.md", "body", "d")])
+    cfg = _cfg_dir(tmp_path)
+    with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                      return_value=wanted):
+        sm.materialize_skills_for_sandbox("pa", cfg)
+    assert not (cfg / "skills" / ".oto-lock").exists()
+    locks = list((tmp_path / "sessions" / "skills-locks").glob("*.lock"))
+    assert len(locks) == 1
+
+
+def test_staging_rewrite_never_follows_a_planted_link(tmp_path):
+    """Between the copy and the SKILL.md rewrite an agent plants a link at
+    the staging name (the staging dir sits in its RW config dir): the
+    rewrite replaces the link, never writes through it."""
+    from services.mcp import skill_format
+    wanted = _wire(tmp_path, [
+        ("pdf-tricks", "skills/pdf-tricks/SKILL.md", FOLDER_SKILL, "PDF."),
+    ])
+    cfg = _cfg_dir(tmp_path)
+    target = tmp_path / "outside.md"
+    target.write_text("untouched")
+    real_scrub = skill_format.scrub_frontmatter
+
+    def _plant(text, origin=""):
+        for staging in (cfg / "skills").glob(".staging-*"):
+            (staging / "SKILL.md").unlink()
+            (staging / "SKILL.md").symlink_to(target)
+        return real_scrub(text, origin=origin)
+
+    with patch.object(skill_format, "scrub_frontmatter", _plant), \
+            patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                         return_value=wanted):
+        sm.materialize_skills_for_sandbox("pa", cfg)
+    assert target.read_text() == "untouched"
+    out = cfg / "skills/pdf-tricks/SKILL.md"
+    assert out.is_file() and not out.is_symlink() and "# PDF tricks" in out.read_text()
+
+
+def test_config_dir_outside_the_agents_tree_is_fail_soft(tmp_path):
+    wanted = _wire(tmp_path, [("voiceover", "skills/voiceover.md", "body", "d")])
+    cfg = tmp_path / "elsewhere" / ".claude"
+    with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                      return_value=wanted):
+        sm.materialize_skills_for_sandbox("pa", cfg)   # must not raise
+    assert not (cfg / "skills/voiceover").exists()
+
+
+def _materialize(tmp_path, wanted):
+    cfg = _cfg_dir(tmp_path)
+    with patch.object(mcp_registry, "get_on_demand_skills_for_materialization",
+                      return_value=wanted):
+        sm.materialize_skills_for_sandbox("pa", cfg)
+    return cfg
+
+
+def test_a_link_at_the_quarantine_name_never_redirects_the_move_or_the_prune(tmp_path):
+    """The config dir is writable from inside the sandbox: a link planted at
+    ``skills/.quarantine`` must not carry the stray into its target, and the
+    prune of old quarantine entries must not delete inside that target."""
+    wanted = _wire(tmp_path, [
+        ("pdf-tricks", "skills/pdf-tricks/SKILL.md", FOLDER_SKILL, "PDF."),
+    ])
+    cfg = _materialize(tmp_path, wanted)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for i in range(8):
+        (outside / f"keep-{i}").write_text(str(i))
+    (cfg / "skills" / "stray").mkdir()
+    (cfg / "skills" / ".quarantine").symlink_to(outside)
+
+    _materialize(tmp_path, wanted)
+
+    assert sorted(p.name for p in outside.iterdir()) == [f"keep-{i}" for i in range(8)]
+    qdir = cfg / "skills" / ".quarantine"
+    assert qdir.is_dir() and not qdir.is_symlink()
+    assert (qdir / "stray").is_dir()
+    assert not (cfg / "skills" / "stray").exists()
+
+
+def test_a_link_at_a_skill_name_is_replaced_and_never_read_through(tmp_path):
+    wanted = _wire(tmp_path, [
+        ("pdf-tricks", "skills/pdf-tricks/SKILL.md", FOLDER_SKILL, "PDF."),
+    ])
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("theirs")
+    cfg = _cfg_dir(tmp_path)
+    (cfg / "skills").mkdir(parents=True)
+    (cfg / "skills" / "pdf-tricks").symlink_to(outside)
+
+    with pytest.raises(sm.safe_fs.SymlinkRefused):
+        sm._skill_tree_digest("pa/workspace/.claude/skills/pdf-tricks")
+    _materialize(tmp_path, wanted)
+
+    out = cfg / "skills" / "pdf-tricks"
+    assert out.is_dir() and not out.is_symlink()
+    assert "# PDF tricks" in (out / "SKILL.md").read_text()
+    assert (outside / "SKILL.md").read_text() == "theirs"
+    assert not list((cfg / "skills").glob(".staging-*"))
+
+
+def test_staging_debris_that_is_a_link_is_removed_not_followed(tmp_path):
+    wanted = _wire(tmp_path, [("voiceover", "skills/voiceover.md", "body", "d")])
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "file").write_text("x")
+    cfg = _cfg_dir(tmp_path)
+    (cfg / "skills").mkdir(parents=True)
+    (cfg / "skills" / ".staging-old").symlink_to(outside)
+
+    _materialize(tmp_path, wanted)
+
+    assert not (cfg / "skills" / ".staging-old").is_symlink()
+    assert (outside / "file").read_text() == "x"

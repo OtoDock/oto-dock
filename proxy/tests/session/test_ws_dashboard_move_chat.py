@@ -104,15 +104,17 @@ class TestMoveChatGates:
         run_ws_scenario(scenario)
 
     def test_non_owner_refused(self, temp_db, monkeypatch):
-        # A Shared-only agent's assigned viewer may OPEN the owner's chat
-        # (connection binding admits shared readers), but must never relocate
-        # it — a non-owner's resolve is role-forced 'local' anyway.
+        # A Shared-only agent's assigned viewer may OPEN the shared pool's
+        # chat (the ``agent::`` owner every dashboard chat on such an agent
+        # gets), but must never relocate it — a non-owner's resolve is
+        # role-forced 'local' anyway.
+        from core.session.visibility import shared_chat_owner
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent(default_scope="agent", collaborative=False)
         task_store.set_user_agents("user-viewer", [slug], "user-admin",
                                    agent_roles={slug: "viewer"})
-        cid = _make_chat(slug, user_sub="user-admin")
+        cid = _make_chat(slug, user_sub=shared_chat_owner(slug))
 
         async def scenario():
             cookie = session_cookie(sub="user-viewer", email="viewer@test.com",

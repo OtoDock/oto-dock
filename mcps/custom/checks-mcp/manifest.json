@@ -1,0 +1,49 @@
+{
+  "name": "checks-mcp",
+  "label": "Checks",
+  "description": "Named checks that judge an agent's work at the end of a turn (schema, script, handler and judge kinds). Everyone lists the agent's checks, attaches an offered one to the current chat, runs one by hand and keeps private checks for their own sessions; managers create and edit the agent's checks and mark them mandatory. Ships the `checks` skill.",
+  "version": "1.0.1",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "CHECKS_MCP_AGENT": "${agent_name}"
+  },
+
+  "exclude_from": ["meeting", "phone", "external"],
+
+  "skills": [
+    {
+      "id": "checks",
+      "loading": "on_demand",
+      "file": "skills/checks/SKILL.md",
+      "description": "How checks work on OtoDock — the four kinds (schema, script, handler, judge), conditions on what a turn changed, rounds, where a check lives and who may create, attach or remove one, how to write a rubric that yields located findings, and the tools of the checks MCP. Use when creating, attaching, editing or explaining a check, or when a check's findings arrive in a session.",
+      "default_exclude_from": []
+    }
+  ],
+
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      { "tool": "list_checks", "tier": "open" },
+      { "tool": "run_check", "tier": "open" },
+      { "tool": "set_check", "tier": "critical" },
+      { "tool": "delete_check", "tier": "critical" },
+      { "tool": "create_private_check", "tier": "sensitive" },
+      { "tool": "delete_private_check", "tier": "sensitive" }
+    ]
+  }
+}

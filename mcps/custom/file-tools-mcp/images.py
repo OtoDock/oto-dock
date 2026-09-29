@@ -26,6 +26,7 @@ from shared import (
     _resolve_path,
     _to_agents_relative,
     logger,
+    safe_open_write,
 )
 
 
@@ -112,7 +113,6 @@ async def handle_edit_image(args: dict) -> str:
 
     if output_path:
         out = await _resolve_path(output_path, writing=True)
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
     else:
         out = path
 
@@ -761,7 +761,6 @@ async def handle_edit_image(args: dict) -> str:
                         target_format = "jpeg"
                     new_ext = target_format if target_format != "jpeg" else "jpg"
                     out = str(Path(out).with_suffix(f".{new_ext}"))
-                    Path(out).parent.mkdir(parents=True, exist_ok=True)
 
             else:
                 logger.warning(
@@ -781,6 +780,12 @@ async def handle_edit_image(args: dict) -> str:
         save_format = "JPEG"
     if compress_format:
         save_format = compress_format
+    if save_format not in ("JPEG", "PNG", "WEBP", "TIFF", "BMP"):
+        # A file object needs the format spelled out: the one Pillow
+        # registers for the suffix, else the output is refused.
+        save_format = Image.registered_extensions().get(Path(out).suffix.lower())
+        if not save_format:
+            return f"Error: unsupported output format '{Path(out).suffix}'"
     if save_format == "JPEG" and img.mode == "RGBA":
         img = img.convert("RGB")
     save_kwargs = {}
@@ -791,15 +796,10 @@ async def handle_edit_image(args: dict) -> str:
         save_kwargs["compress_level"] = 6
     elif save_format == "WEBP":
         save_kwargs["quality"] = compress_quality or 95
-    img.save(
-        out,
-        format=(
-            save_format
-            if save_format in ("JPEG", "PNG", "WEBP", "TIFF", "BMP")
-            else None
-        ),
-        **save_kwargs,
-    )
+    # Beneath the mount, no link followed: a link at the output name is
+    # replaced, a link on the way refuses the write.
+    with safe_open_write(out) as fh:
+        img.save(fh, format=save_format, **save_kwargs)
 
     # Flush platform-cache write to remote satellite (no-op for local).
     await _notify_file_written(out)

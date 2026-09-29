@@ -13,7 +13,7 @@ interface Props {
   onMarkAllRead: () => void
   onDismiss: (id: string) => void
   onAcknowledge: (id: string) => void
-  onNavigate?: (agentSlug: string, chatId: string) => void
+  onNavigate?: (agentSlug: string, chatId: string, href?: string) => void
   onClose: () => void
 }
 
@@ -231,11 +231,11 @@ export default function NotificationPanel({ deliveries, loading, agents, onMarkR
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                         </svg>
                       </button>
-                      {d.agent_slug && onNavigate && (d.chat_id || d.source === 'file_conflict') && (
+                      {onNavigate && (d.href || (d.agent_slug && (d.chat_id || d.source === 'file_conflict'))) && (
                         <button
-                          onClick={(e) => { e.stopPropagation(); if (!d.read) onMarkRead(d.id); onNavigate(d.agent_slug!, d.chat_id || '') }}
+                          onClick={(e) => { e.stopPropagation(); if (!d.read) onMarkRead(d.id); onNavigate(d.agent_slug || '', d.chat_id || '', d.href || undefined) }}
                           className="w-5 h-5 flex items-center justify-center text-p-text-light hover:text-brand transition-colors"
-                          title={d.source === 'file_conflict' ? 'Open Recover bin' : 'Open chat'}
+                          title={d.href ? 'Open' : d.source === 'file_conflict' ? 'Open Recover bin' : 'Open chat'}
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />

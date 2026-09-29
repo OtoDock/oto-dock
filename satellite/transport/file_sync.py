@@ -13,7 +13,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-from ..config import atomic_replace
+from .._vendored import layout
 
 logger = logging.getLogger("satellite")
 
@@ -170,7 +170,7 @@ def _is_venv_dir(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 _CACHEDIR_SIG = b"Signature: 8a477f597d28d172789f06886806bc55"
-_RULE_PROTECTED_DIR_NAMES = frozenset({"workspace", "config", "users"})
+_RULE_PROTECTED_DIR_NAMES = frozenset({layout.WORKSPACE, layout.CONFIG, layout.USERS})
 # Validation caps — a compromised/buggy proxy must not be able to ship a
 # table that turns every per-turn walk into an O(#rules) CPU sink.
 _RULES_MAX_LIST = 64
@@ -435,13 +435,15 @@ _CLI_RUNTIME_CHILD_DIRS = frozenset({
 
 
 def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
-    """True for a runtime-cruft dir that is an immediate child of ``.claude``/``.codex``."""
-    return parent_name in (".claude", ".codex") and child_name in _CLI_RUNTIME_CHILD_DIRS
+    """True for a runtime-cruft dir that is an immediate child of an engine
+    config dir (``INCLUDE_DOTTED_DIRS``)."""
+    return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
 
 
 def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
-    """True for CLI backup/corrupted state files directly under ``.claude``/``.codex``."""
-    if parent_name not in (".claude", ".codex"):
+    """True for CLI backup/corrupted state files directly under an engine
+    config dir — host-local, never synced."""
+    if parent_name not in INCLUDE_DOTTED_DIRS:
         return False
     return ".backup." in file_name or ".corrupted." in file_name
 
@@ -464,9 +466,39 @@ def _hash_file(path: Path) -> str:
 # re-hash is seconds of CPU+IO, and snapshots run every turn. Thread-safe
 # (snapshot/manifest calls can run off-thread). Mirrors the proxy-side cache
 # in proxy/core/remote/file_sync.py.
-_HASH_CACHE: OrderedDict[str, tuple[int, int, str]] = OrderedDict()
-_HASH_CACHE_MAX = 50_000
+_HASH_CACHE: OrderedDict[str, tuple[int, int, bytes]] = OrderedDict()
+_HASH_CACHE_MAX = 200_000
 _hash_cache_lock = threading.Lock()
+_hash_cache_evicted_logged = False
+
+
+def _digest_of(file_hash: str) -> bytes | None:
+    """The raw digest of a ``sha256:<hex>`` text; None for anything else."""
+    if not isinstance(file_hash, str) or not file_hash.startswith("sha256:"):
+        return None
+    try:
+        digest = bytes.fromhex(file_hash[7:])
+    except ValueError:
+        return None
+    return digest if len(digest) == 32 else None
+
+
+def _hash_cache_put(key: str, size: int, mtime_ns: int, digest: bytes) -> None:
+    """Under the lock: store one entry (the raw 32-byte digest), keep the LRU
+    under its ceiling, and say so once per process when it evicts."""
+    global _hash_cache_evicted_logged
+    _HASH_CACHE[key] = (size, mtime_ns, digest)
+    _HASH_CACHE.move_to_end(key)
+    evicted = 0
+    while len(_HASH_CACHE) > _HASH_CACHE_MAX:
+        _HASH_CACHE.popitem(last=False)
+        evicted += 1
+    if evicted and not _hash_cache_evicted_logged:
+        _hash_cache_evicted_logged = True
+        logger.info(
+            "sync hash cache is full (%d entries): older files are re-hashed on "
+            "the next snapshot", _HASH_CACHE_MAX,
+        )
 # Git's "racily clean" rule: filesystem mtime granularity is the kernel tick
 # (can be milliseconds), so two same-size writes inside one tick are
 # indistinguishable by (size, mtime_ns). Never TRUST a cache hit for a file
@@ -485,7 +517,7 @@ def _hash_file_cached(path: Path, st: os.stat_result) -> str:
             hit = _HASH_CACHE.get(key)
             if hit is not None and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
                 _HASH_CACHE.move_to_end(key)
-                return hit[2]
+                return "sha256:" + hit[2].hex()
     file_hash = _hash_file(path)
     try:
         st2 = os.stat(path)
@@ -495,27 +527,27 @@ def _hash_file_cached(path: Path, st: os.stat_result) -> str:
     # streaming read. (Caching a racy-fresh entry is fine — reads inside the
     # racy window bypass the cache anyway.)
     if st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns:
-        with _hash_cache_lock:
-            _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, file_hash)
-            _HASH_CACHE.move_to_end(key)
-            while len(_HASH_CACHE) > _HASH_CACHE_MAX:
-                _HASH_CACHE.popitem(last=False)
+        digest = _digest_of(file_hash)
+        if digest is not None:
+            with _hash_cache_lock:
+                _hash_cache_put(key, st.st_size, st.st_mtime_ns, digest)
     return file_hash
 
 
 def prime_hash_cache(path: Path, file_hash: str) -> None:
     """Record a KNOWN-good hash for a file just written (e.g. a committed
     platform push whose sha256 was verified) so the next snapshot never
-    re-hashes it. Best-effort: a failed stat simply skips the prime."""
+    re-hashes it. Best-effort: a failed stat or a hash that is not a sha256
+    text simply skips the prime (never raises: it runs after a commit)."""
+    digest = _digest_of(file_hash)
+    if digest is None:
+        return
     try:
         st = os.stat(path)
     except OSError:
         return
     with _hash_cache_lock:
-        _HASH_CACHE[str(path)] = (st.st_size, st.st_mtime_ns, file_hash)
-        _HASH_CACHE.move_to_end(str(path))
-        while len(_HASH_CACHE) > _HASH_CACHE_MAX:
-            _HASH_CACHE.popitem(last=False)
+        _hash_cache_put(str(path), st.st_size, st.st_mtime_ns, digest)
 
 
 def snapshot_agent_dir(agent_dir: Path) -> dict[str, str]:
@@ -732,13 +764,31 @@ def prune_empty_parents(file_path: Path, root: Path) -> None:
         except ValueError:
             return
         depth = len(rel.parts)
-        if depth < 2 or (depth == 2 and rel.parts[0] == "users"):
+        if depth < 2 or (depth == 2 and rel.parts[0] == layout.USERS):
             return
         try:
             cur.rmdir()
         except OSError:
             return
         cur = cur.parent
+
+
+def _prune_empty_parents_beneath(root, rel: str) -> None:
+    """``prune_empty_parents`` on the twin: after a delete beneath the root,
+    remove the now-empty parents of ``rel`` bottom-up (each ``rmdir`` from
+    its checked parent), never the root, its depth-1 children or a per-user
+    root; the first directory that is not empty stops the walk."""
+    from ..host import safe_fs
+    parts = rel.split("/")[:-1]
+    while parts:
+        depth = len(parts)
+        if depth < 2 or (depth == 2 and parts[0] == layout.USERS):
+            return
+        try:
+            safe_fs.rmdir_beneath(root, "/".join(parts))
+        except OSError:
+            return
+        parts.pop()
 
 
 def apply_file_push(
@@ -764,103 +814,116 @@ def apply_file_push(
     """
     import os
 
+    from ..host import safe_fs
+
     rel_path = msg.get("path", "")
     action = msg.get("action", "write")
 
     if not rel_path:
         return
 
-    target = (agent_dir / rel_path).resolve()
-    # Security: ensure target is within agent_dir. Use relative_to (not a
-    # string startswith) so a sibling like ``<agent_dir>-evil`` can't pass the
-    # prefix check.
+    # Every step opens beneath the agent's folder, reached strictly from the
+    # agents root, with no component followed: a path swapped for a link after
+    # any check is refused (an OSError the caller acks as an error, the
+    # platform's sync state left un-advanced).
     try:
-        target.relative_to(agent_dir.resolve())
-    except ValueError:
+        parts = safe_fs._components(rel_path)
+    except safe_fs.UnsafePathError:
         logger.warning(f"Rejected file push outside agent dir: {rel_path}")
         return
-
-    partial = target.with_suffix(target.suffix + ".partial")
+    rel = "/".join(parts)
+    partial_rel = rel + ".partial"
     new_hash: str | None = None
 
-    if action == "delete":
-        if target.exists():
-            target.unlink()
+    with safe_fs.open_root(Path(agent_dir).parent, Path(agent_dir).name) as root:
+        if action == "delete":
+            safe_fs.unlink_beneath(root, rel, missing_ok=True)
+            _prune_empty_parents_beneath(root, rel)
             logger.debug(f"Deleted: {rel_path}")
-        prune_empty_parents(target, agent_dir)
-    elif action == "mkdir":
-        target.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Created dir: {rel_path}")
-    elif action == "write":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # Key-present gate, NOT truthiness: "" is a real ZERO-BYTE write
-        # (every platform write sender includes the key). The old truthy gate
-        # silently skipped empty files while the handler still acked ok —
-        # poisoning the platform's converged base.
-        if "content_b64" in msg:
-            data = base64.b64decode(msg.get("content_b64") or "")
-            cap = max_file_size()
-            if len(data) > cap:
-                raise ValueError(
-                    f"pushed file exceeds MAX_FILE_SIZE "
-                    f"({len(data)} > {cap}): {rel_path}"
+        elif action == "mkdir":
+            safe_fs.mkdirs_beneath(root, rel)
+            logger.debug(f"Created dir: {rel_path}")
+        elif action == "write":
+            # Key-present gate, NOT truthiness: "" is a real ZERO-BYTE write
+            # (every platform write sender includes the key). A truthy gate
+            # would skip empty files while the handler still acks ok,
+            # poisoning the platform's converged base.
+            if "content_b64" in msg:
+                data = base64.b64decode(msg.get("content_b64") or "")
+                cap = max_file_size()
+                if len(data) > cap:
+                    raise ValueError(
+                        f"pushed file exceeds MAX_FILE_SIZE "
+                        f"({len(data)} > {cap}): {rel_path}"
+                    )
+                # Integrity check: the platform sends the full-file sha256 on the
+                # inline write. Reject a corrupt payload rather than commit it.
+                expected_hash = msg.get("hash") or ""
+                if expected_hash:
+                    actual = "sha256:" + hashlib.sha256(data).hexdigest()
+                    if actual != expected_hash:
+                        raise ValueError(
+                            f"hash mismatch on write: got {actual} "
+                            f"expected {expected_hash}: {rel_path}"
+                        )
+                # The temp is created O_EXCL beside the name and renamed onto
+                # it within the parent; the Windows AV retry sits in the commit.
+                safe_fs.atomic_write_beneath(root, rel, data, mkdirs=True)
+                logger.debug(f"Wrote: {rel_path} ({len(data)} bytes)")
+                # Snapshot refresh must not depend on the sender attaching a hash:
+                # a stale snapshot echoes the push back as a phantom file_changed
+                # (PTY sessions scan too now). Compute it from the payload if absent.
+                new_hash = expected_hash or (
+                    "sha256:" + hashlib.sha256(data).hexdigest()
                 )
-            # Integrity check: the platform sends the full-file sha256 on the
-            # inline write. Reject a corrupt payload rather than commit it.
+        elif action == "write_chunk":
+            content_b64 = msg.get("content_b64", "")
+            chunk_index = int(msg.get("chunk_index", 0) or 0)
+            if content_b64:
+                # The FIRST chunk truncates; later chunks append. A stale .partial
+                # from an aborted prior transfer must never be appended to: it
+                # would prepend garbage and silently corrupt the file. A link
+                # planted at the staging name goes first (its target stays).
+                try:
+                    fd = safe_fs.open_append_beneath(root, partial_rel, truncate=chunk_index == 0)
+                except safe_fs.SymlinkRefused:
+                    safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
+                    fd = safe_fs.open_append_beneath(root, partial_rel, truncate=chunk_index == 0)
+                with os.fdopen(fd, "ab") as f:
+                    f.write(base64.b64decode(content_b64))
+                    f.flush()
+                    os.fsync(f.fileno())
+                    size_now = os.fstat(f.fileno()).st_size
+                if size_now > max_file_size():
+                    safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
+                    raise ValueError(
+                        f"pushed file exceeds MAX_FILE_SIZE: {rel_path}"
+                    )
+            # Non-empty hash → final chunk → verify the accumulated bytes against the
+            # full-file sha256 BEFORE committing (parity with the pull path's
+            # _commit_pull). A dropped/duplicated/reordered chunk is caught here and
+            # never atomically published as a corrupt file.
             expected_hash = msg.get("hash") or ""
             if expected_hash:
-                actual = "sha256:" + hashlib.sha256(data).hexdigest()
-                if actual != expected_hash:
-                    raise ValueError(
-                        f"hash mismatch on write: got {actual} "
-                        f"expected {expected_hash}: {rel_path}"
-                    )
-            with open(partial, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            atomic_replace(partial, target)
-            logger.debug(f"Wrote: {rel_path} ({len(data)} bytes)")
-            # Snapshot refresh must not depend on the sender attaching a hash —
-            # a stale snapshot echoes the push back as a phantom file_changed
-            # (PTY sessions scan too now). Compute it from the payload if absent.
-            new_hash = expected_hash or (
-                "sha256:" + hashlib.sha256(data).hexdigest()
-            )
-    elif action == "write_chunk":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        content_b64 = msg.get("content_b64", "")
-        chunk_index = int(msg.get("chunk_index", 0) or 0)
-        if content_b64:
-            # The FIRST chunk truncates; later chunks append. A stale .partial
-            # from an aborted prior transfer must never be appended to — it would
-            # prepend garbage and silently corrupt the file. Mirrors the
-            # already-correct _apply_satellite_host_push path.
-            mode = "wb" if chunk_index == 0 else "ab"
-            with open(partial, mode) as f:
-                f.write(base64.b64decode(content_b64))
-                f.flush()
-                os.fsync(f.fileno())
-            if partial.stat().st_size > max_file_size():
-                partial.unlink(missing_ok=True)
-                raise ValueError(
-                    f"pushed file exceeds MAX_FILE_SIZE: {rel_path}"
-                )
-        # Non-empty hash → final chunk → verify the accumulated bytes against the
-        # full-file sha256 BEFORE committing (parity with the pull path's
-        # _commit_pull). A dropped/duplicated/reordered chunk is caught here and
-        # never atomically published as a corrupt file.
-        expected_hash = msg.get("hash") or ""
-        if expected_hash and partial.exists():
-            actual = _hash_file(partial)
-            if actual != expected_hash:
-                partial.unlink(missing_ok=True)
-                raise ValueError(
-                    f"chunked hash mismatch: got {actual} "
-                    f"expected {expected_hash}: {rel_path}"
-                )
-            atomic_replace(partial, target)
-            new_hash = expected_hash
+                try:
+                    pfd, _st = safe_fs.open_regular_for_read(root, partial_rel)
+                except FileNotFoundError:
+                    pfd = None
+                if pfd is not None:
+                    h = hashlib.sha256()
+                    with os.fdopen(pfd, "rb") as fh:
+                        for block in iter(lambda: fh.read(1024 * 1024), b""):
+                            h.update(block)
+                    actual = "sha256:" + h.hexdigest()
+                    if actual != expected_hash:
+                        safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
+                        raise ValueError(
+                            f"chunked hash mismatch: got {actual} "
+                            f"expected {expected_hash}: {rel_path}"
+                        )
+                    safe_fs.commit_partial(root, partial_rel, rel)
+                    new_hash = expected_hash
+    target = Path(agent_dir) / rel
 
     # Refresh snapshot(s) so the next detect_changes scan sees this file as
     # already-known with the same hash (no spurious file_changed event back

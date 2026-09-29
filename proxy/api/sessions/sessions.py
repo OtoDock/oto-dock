@@ -6,24 +6,22 @@ Also exports `verify_api_key` and `verify_session_match` for use by the `api.hoo
 
 import asyncio
 import hmac
-import json
 import logging
+import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 import config
+from auth.providers import UserContext, get_current_user, require_admin
 from storage.agents import agent_store
-from auth.path_policy import SecurityContext
+from storage.pg import run_db_fast
 from services.infra.path_confinement import PathOutsideRoot, join_under, resolve_under
 from core.session.session_state import (
-    _sessions,
     set_session_mode,
     get_pending_result,
-    set_session_security,
-    _record_session_use,
 )
 from core.layers.cli import (
     abort_session,
@@ -33,6 +31,7 @@ from core.layers.cli import (
     interrupt_persistent_session,
 )
 from core.layers.direct import create_direct_session, close_direct_session
+from core import layout
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter()
@@ -40,23 +39,129 @@ router = APIRouter()
 
 # --- Auth ---
 
+# A session token names the person it was minted for (``user_sub``); that
+# person may be gone, or their credentials changed, since the mint. The
+# routes here judge that on the fast lane through the async twins below.
+# The synchronous verifiers never read the store themselves: they stand by
+# the last answer reached for the token's holder, and a miss passes and
+# starts the check on the fast lane, so a token whose person is gone is
+# refused once that check has answered. A pass stands for HOLDER_TTL_S;
+# a refusal for the token's life (the same token never becomes current
+# again), and a full table drops passes before refusals. A person's
+# sessions are closed by the offboarding closer, so a stale token rarely
+# outlives them.
+HOLDER_TTL_S = 60.0
+_HOLDER_ANSWERS_MAX = 4096
+_holder_answers: dict[tuple[str, int], tuple[bool, float]] = {}
+# The holder checks a synchronous miss started, by key, and their tasks.
+_holder_pending: set[tuple[str, int]] = set()
+_holder_checks: set[asyncio.Task] = set()
 
-def verify_api_key(authorization: str | None = Header(None)) -> None:
-    """Validate Bearer token — accepts master API key or session JWT."""
+
+def _holder_key(payload: dict) -> tuple[str, int] | None:
+    sub = payload.get("user_sub") or ""
+    if not sub:
+        return None
+    iat = payload.get("iat")
+    return (sub, iat if isinstance(iat, int) else 0)
+
+
+def _check_holder_soon(payload: dict, key: tuple[str, int]) -> None:
+    """Start the holder check of a synchronous miss on the running loop
+    (none outside one); one at a time per key."""
+    if key in _holder_pending:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _holder_pending.add(key)
+    task = loop.create_task(_holder_ok(payload))
+    _holder_checks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _holder_checks.discard(done)
+        _holder_pending.discard(key)
+        if not done.cancelled() and done.exception() is not None:
+            logger.warning("session token holder check failed: %s", done.exception())
+
+    task.add_done_callback(_done)
+
+
+def _holder_cached(payload: dict) -> bool:
+    key = _holder_key(payload)
+    if key is None:
+        return True
+    hit = _holder_answers.get(key)
+    if hit is None or hit[1] < time.monotonic():
+        _check_holder_soon(payload, key)
+        return True
+    return hit[0]
+
+
+def _remember(key: tuple[str, int], ok: bool, payload: dict, now: float) -> None:
+    """Record an answer: a pass for HOLDER_TTL_S, a refusal until the token
+    expires. A full table drops expired answers, then passes; it is cleared
+    only when refusals alone fill it."""
+    if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
+        for k in [k for k, (good, until) in _holder_answers.items() if good or until < now]:
+            del _holder_answers[k]
+        if len(_holder_answers) >= _HOLDER_ANSWERS_MAX:
+            _holder_answers.clear()
+    if ok:
+        _holder_answers[key] = (True, now + HOLDER_TTL_S)
+        return
+    exp = payload.get("exp")
+    left = (exp - time.time()) if isinstance(exp, (int, float)) else 0.0
+    _holder_answers[key] = (False, now + max(HOLDER_TTL_S, left))
+
+
+async def _holder_ok(payload: dict) -> bool:
+    key = _holder_key(payload)
+    if key is None:
+        return True
+    now = time.monotonic()
+    hit = _holder_answers.get(key)
+    if hit is not None and hit[1] >= now:
+        return hit[0]
+    from auth.providers import session_token_holder_ok
+    ok = bool(await run_db_fast(session_token_holder_ok, payload))
+    _remember(key, ok, payload, time.monotonic())
+    return ok
+
+
+def _bearer_payload(authorization: str | None) -> dict | None:
+    """The session token's payload, or None for the master key
+    (service-to-service: Docker MCPs, the standalone scheduler, phone).
+    401 for anything else."""
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     parts = authorization.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
     token = parts[1]
-    # Master key (service-to-service: Docker MCPs, standalone scheduler, phone)
     if config.is_master_key(token):
-        return
-    # Session-scoped JWT (agent subprocesses: hooks, MCPs)
+        return None
     from auth.session_token import validate_session_token
-    if validate_session_token(token):
-        return
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    payload = validate_session_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return payload
+
+
+def verify_api_key(authorization: str | None = Header(None)) -> None:
+    """Validate a Bearer token: the master API key or a session JWT."""
+    payload = _bearer_payload(authorization)
+    if payload is not None and not _holder_cached(payload):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+async def verify_api_key_async(authorization: str | None) -> None:
+    """``verify_api_key`` that also asks the store whether the token's
+    person still exists and the token is current."""
+    payload = _bearer_payload(authorization)
+    if payload is not None and not await _holder_ok(payload):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def require_master_key(authorization: str | None) -> None:
@@ -70,6 +175,30 @@ def require_master_key(authorization: str | None) -> None:
         raise HTTPException(status_code=403, detail="This endpoint requires the service key")
 
 
+def _session_payload(authorization: str | None, session_id: str) -> dict | None:
+    """The token's payload once its ``sid`` matches the caller-supplied
+    session id, or None for the master key. An empty caller-supplied
+    session id is refused (400), and so is a token with no ``sid`` (403):
+    a token bound to session A must never pass against a blank or another
+    session id. Every mint site sets a real sid."""
+    payload = _bearer_payload(authorization)
+    if payload is None:
+        return None
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
+    token_sid = payload.get("sid", "")
+    # Bytes: a caller-supplied id may carry any character, and a str compare
+    # of a non-ASCII one raises instead of answering.
+    if not isinstance(token_sid, str) or not token_sid or not hmac.compare_digest(
+            token_sid.encode("utf-8", "surrogatepass"),
+            session_id.encode("utf-8", "surrogatepass")):
+        raise HTTPException(
+            status_code=403,
+            detail="Session token does not match request session_id",
+        )
+    return payload
+
+
 def verify_session_match(authorization: str | None, session_id: str) -> None:
     """Validate token AND cross-check its embedded session_id against the
     caller-supplied session_id. Used by hook endpoints where the request body
@@ -79,33 +208,17 @@ def verify_session_match(authorization: str | None, session_id: str) -> None:
     Master API key bypasses the check (service-to-service: Docker MCPs on
     platform, phone server, standalone scheduler).
     """
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Invalid Authorization header")
-    token = parts[1]
-    if config.is_master_key(token):
-        return
-    from auth.session_token import validate_session_token
-    payload = validate_session_token(token)
-    if not payload:
+    payload = _session_payload(authorization, session_id)
+    if payload is not None and not _holder_cached(payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
-    # An empty caller-supplied session_id must NOT silently pass: drop the
-    # `and session_id` clause so a token bound to session A can't be replayed
-    # against a blank/other session_id.
-    if not session_id:
-        raise HTTPException(status_code=400, detail="Missing session_id")
-    token_sid = payload.get("sid", "")
-    # Fail CLOSED on an empty token sid: a session JWT that carries no `sid`
-    # can't be proven to match this request, so it must not pass the
-    # cross-check (the old `token_sid and …` let an empty sid through). Every
-    # mint site sets a real sid; the master key already returned above.
-    if not token_sid or not hmac.compare_digest(token_sid, session_id):
-        raise HTTPException(
-            status_code=403,
-            detail="Session token does not match request session_id",
-        )
+
+
+async def verify_session_match_async(authorization: str | None, session_id: str) -> None:
+    """``verify_session_match`` that also asks the store whether the token's
+    person still exists and the token is current."""
+    payload = _session_payload(authorization, session_id)
+    if payload is not None and not await _holder_ok(payload):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 # --- Endpoints ---
@@ -113,36 +226,55 @@ def verify_session_match(authorization: str | None, session_id: str) -> None:
 
 @router.get("/health")
 async def health():
-    # Liveness + version payload (admin footer + fleet/version checks). Static
-    # constants read once at import — cheap enough for the 10s Docker healthcheck.
-    # community_mcps_version is omitted until it has a runtime source.
+    # The public liveness: the Docker healthcheck reads the status code, the
+    # dashboard's stale-bundle check reads ``build`` (a page without a
+    # dashboard socket asks here when it returns to the foreground and
+    # reloads once if its own stamp differs; read per request, cached on the
+    # file's mtime/size, so a dashboard-only rebuild is seen without a
+    # restart). Nothing else: versions, pins and the loop's telemetry are an
+    # admin's to read (``/v1/admin/health``), not an anonymous caller's.
+    from static_assets import dashboard_build_id
+    return {"status": "ok", "service": "otodock", "build": dashboard_build_id()}
+
+
+@router.get("/v1/admin/health")
+async def admin_health(user: UserContext | None = Depends(get_current_user)):
+    """The version payload (the admin footer, the fleet and version checks)
+    and the loop's telemetry, for a platform admin."""
+    require_admin(user)
     from ws.satellite import MIN_SATELLITE_VERSION
     from core import log_queue, loop_watchdog
-    from static_assets import dashboard_build_id
+    from core.session.session_manager import get_all_layers
+    from storage import pg
     return {
         "status": "ok",
         "service": "otodock",
         "version": config.PINNED_OTODOCK_VERSION,
-        # The dashboard build this server serves (the stamp in dist/index.html;
-        # "" without a dist). A page without a dashboard socket asks here when
-        # it returns to the foreground and reloads once if its own stamp
-        # differs. Read per request: a dashboard-only rebuild must be seen
-        # without a restart (cached on the file's mtime/size).
-        "build": dashboard_build_id(),
+        # The two named fields are frozen (an API contract); cli_versions
+        # carries every registered engine's pin keyed by its binary, so a
+        # fourth engine shows here without an edit.
         "claude_cli_version": config.PINNED_CLAUDE_CODE_VERSION,
         "codex_cli_version": config.PINNED_CODEX_VERSION,
+        "cli_versions": {
+            layer.capabilities.runtime.binary: layer.pinned_cli_version()
+            for layer in get_all_layers().values()
+            if layer.capabilities.runtime.binary
+        },
         "satellite_min_version": MIN_SATELLITE_VERSION,
-        # Event-loop stall counters (core/loop_watchdog.py) and the log
-        # writer's queue (core/log_queue.py) — low-sensitivity liveness
-        # telemetry, same audience as the version fields.
+        # Event-loop stall counters (core/loop_watchdog.py), the log writer's
+        # queue (core/log_queue.py), the pools and lanes (storage/pg.py) and
+        # the descriptor headroom (how many sockets exhaust the proxy: never
+        # in the public answer).
         "loop": loop_watchdog.stats(),
         "log": log_queue.stats(),
+        "db": pg.pool_stats(),
+        "fds": loop_watchdog.fd_stats(),
     }
 
 
 @router.get("/v1/models")
 async def list_models(authorization: str | None = Header(None)):
-    verify_api_key(authorization)
+    await verify_api_key_async(authorization)
     return {
         "object": "list",
         "data": [
@@ -165,7 +297,7 @@ async def get_session_pending(session_id: str, authorization: str | None = Heade
     carries the session's response text and prompt, so a token for session A
     must not be able to drain session B.
     """
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     result = get_pending_result(session_id)
     if result is None:
         raise HTTPException(status_code=404, detail="No pending result")
@@ -179,7 +311,7 @@ async def abort_session_endpoint(session_id: str, authorization: str | None = He
     Kills the process but keeps the session entry so auto-resume works on
     the next message. Falls back to killing direct/one-shot sessions.
     """
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     # Try interrupt (kill process, keep session) for persistent sessions
     killed = await interrupt_persistent_session(session_id)
     if not killed:
@@ -194,7 +326,7 @@ async def abort_session_endpoint(session_id: str, authorization: str | None = He
 @router.delete("/v1/sessions/{session_id}")
 async def close_session_endpoint(session_id: str, authorization: str | None = Header(None)):
     """Gracefully close a persistent session (e.g. phone hangup, chat closed)."""
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     # Try direct session first, then CLI persistent session
     closed = await close_direct_session(session_id)
     if not closed:
@@ -219,7 +351,7 @@ async def change_session_mode(
     Only works for sessions started with use_native_permissions=True (dashboard).
     Valid modes: default, acceptEdits, plan, dontAsk.
     """
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     session = await get_persistent_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -238,7 +370,7 @@ async def change_session_mode(
 
 
 class ModelChangeRequest(BaseModel):
-    model: str  # e.g., "claude-sonnet-5", "claude-opus-5"
+    model: str  # e.g., "claude-sonnet-5", "claude-opus-5-5"
 
 
 @router.patch("/v1/sessions/{session_id}/model")
@@ -246,7 +378,7 @@ async def change_session_model(
     session_id: str, req: ModelChangeRequest, authorization: str | None = Header(None),
 ):
     """Change the LLM model mid-session via the CLI control channel."""
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     session = await get_persistent_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -267,7 +399,7 @@ async def change_session_thinking(
     session_id: str, req: ThinkingRequest, authorization: str | None = Header(None),
 ):
     """Set max thinking tokens mid-session via the CLI control channel."""
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     session = await get_persistent_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -299,7 +431,7 @@ async def native_permission_response(
     this endpoint with the user's decision. The response is written directly
     to stdin -- no lock needed since stdin writes are independent of stdout reads.
     """
-    verify_session_match(authorization, session_id)
+    await verify_session_match_async(authorization, session_id)
     session = await get_persistent_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -307,94 +439,27 @@ async def native_permission_response(
     return {"status": "ok"}
 
 
-class ImplementPlanRequest(BaseModel):
-    plan_path: str  # e.g., "quiet-snuggling-harbor.md" (filename only)
-    mode: str = "acceptEdits"
-    agent: str = ""  # if empty, look up from current session
-
-
-@router.post("/v1/sessions/{session_id}/implement-plan")
-async def implement_plan(
-    session_id: str,
-    req: ImplementPlanRequest,
-    authorization: str | None = Header(None),
-):
-    """Close the plan session and start a new one for implementation.
-
-    Replicates Claude Code CLI's "Clear context and accept edits on" flow:
-    1. Closes the current persistent session
-    2. Creates a new session with the specified permission mode
-    3. Returns the new session_id -- dashboard sends first message with plan path
-    """
-    verify_session_match(authorization, session_id)
-
-    # Look up agent from current session
-    agent_name = req.agent or _sessions.get(session_id, {}).get("agent", "")
-
-    # Close current session
-    await close_persistent_session(session_id)
-
-    # Create new session
-    new_session_id = str(uuid.uuid4())
-    agent_prompt = config.build_agent_prompt(agent_name)
-    from services.mcp import mcp_registry
-    mcp_config, _, _, _, _ = mcp_registry.build_session_mcp_config(agent_name, None)
-
-    await get_or_create_persistent_session(
-        new_session_id,
-        agent_prompt=agent_prompt,
-        mcp_config_path=mcp_config,
-        permission_mode=req.mode,
-        client_type="dashboard",
-        use_native_permissions=True,
-    )
-
-    set_session_mode(new_session_id, "auto")
-    # REST endpoint uses API key auth -> synthetic admin
-    set_session_security(new_session_id, SecurityContext(
-        role="admin",
-        username="",
-        agent=agent_name,
-        is_admin_agent=agent_store.is_admin_only(agent_name),
-    ))
-    _record_session_use(new_session_id, client_type="dashboard", agent=agent_name)
-
-    logger.info(
-        f"Implement plan: closed {session_id}, created {new_session_id} "
-        f"(agent={agent_name}, mode={req.mode}, plan={req.plan_path})"
-    )
-    return {
-        "status": "ok",
-        "new_session_id": new_session_id,
-        "plan_path": req.plan_path,
-        "agent": agent_name,
-        "mode": req.mode,
-    }
-
-
 # --- Plan file endpoints ---
 
 
-def _get_plans_dir(session_id: str | None) -> Path:
-    """Resolve the plans directory for a session.
-
-    Checks the session's persistent .claude/ dir first (sandbox-aware),
-    falls back to ~/.claude/plans/ for legacy/non-sandboxed sessions.
-    For remote sessions this returns the local cache dir (populated on
-    demand via _ensure_remote_plans_cached).
-    """
-    if session_id:
-        from core.session.session_state import get_session_claude_dir
-        claude_dir = get_session_claude_dir(session_id)
-        if claude_dir:
-            plans = Path(claude_dir) / "plans"
-            if plans.is_dir():
-                return plans
-        # Remote session fallback: local cache populated on demand
-        remote_info = _get_remote_session_info(session_id)
-        if remote_info is not None:
-            return _remote_plans_cache_dir(session_id)
-    return Path.home() / ".claude" / "plans"
+def _get_plans_dir(session_id: str | None) -> Path | None:
+    """The plans directory of a session: its persistent .claude/ dir's
+    ``plans`` (sandbox-aware), or for a remote session the local cache dir
+    (filled on demand by ``_ensure_remote_plan_cached``). None when the
+    session has none: no session, a session that registered no claude dir,
+    or one whose plans folder does not exist yet. The proxy account's own
+    home belongs to no session and is never answered."""
+    if not session_id:
+        return None
+    from core.session.session_state import get_session_claude_dir
+    claude_dir = get_session_claude_dir(session_id)
+    if claude_dir:
+        plans = Path(claude_dir) / "plans"
+        if plans.is_dir():
+            return plans
+    if _get_remote_session_info(session_id) is not None:
+        return _remote_plans_cache_dir(session_id)
+    return None
 
 
 def _get_remote_session_info(session_id: str):
@@ -449,9 +514,9 @@ async def _ensure_remote_plan_cached(
     ctx = _session_security.get(session_id)
     username = getattr(ctx, "username", "") if ctx else ""
     if username:
-        rel_path = f"users/{username}/.claude/plans/{filename}"
+        rel_path = f"{layout.user_rel(username)}/.claude/plans/{filename}"
     else:
-        rel_path = f"workspace/.claude/plans/{filename}"
+        rel_path = f"{layout.WORKSPACE}/.claude/plans/{filename}"
 
     from core.remote.satellite_connection import get_connection_manager
     from services.path_policy_v2 import PathRef
@@ -474,34 +539,28 @@ async def _list_remote_plans(session_id: str) -> list[dict]:
     info = _get_remote_session_info(session_id)
     if info is None:
         return []
+    from core.remote.remote_workspace_sync import manifest_request
     from core.remote.satellite_connection import get_connection_manager
-    import uuid as _uuid
     cm = get_connection_manager()
-    conn = cm.get_connection(info.machine_id)
-    if not conn:
-        return []
-
-    command_id = str(_uuid.uuid4())
-    future: asyncio.Future = asyncio.get_event_loop().create_future()
-    cm._pending_acks[command_id] = future
     try:
-        await conn.ws.send_text(json.dumps({
-            "type": "request_manifest",
-            "command_id": command_id,
-            "agent_slug": info.agent_name,
-        }))
-        resp = await asyncio.wait_for(future, timeout=10.0)
-    except (asyncio.TimeoutError, Exception):
+        # The manager's own command path: a paging satellite's frames are
+        # joined there before the wait resolves.
+        resp = await cm.send_command(
+            info.machine_id,
+            manifest_request(cm, info.machine_id, info.agent_name),
+            timeout=10.0,
+        )
+    except Exception:
         return []
-    finally:
-        cm._pending_acks.pop(command_id, None)
+    if not isinstance(resp, dict):
+        return []
 
     # Prefix we want: users/{username}/.claude/plans/ or workspace/.claude/plans/
     from core.session.session_state import _session_security
     ctx = _session_security.get(session_id)
     username = getattr(ctx, "username", "") if ctx else ""
     prefix = (
-        f"users/{username}/.claude/plans/"
+        f"{layout.user_rel(username)}/.claude/plans/"
         if username else "workspace/.claude/plans/"
     )
     entries: list[dict] = []
@@ -530,14 +589,14 @@ async def list_plans(
     Session-bound: a session JWT must name (and match) the session whose
     plans it lists — plan files live in per-user session dirs.
     """
-    verify_session_match(authorization, session_id or "")
+    await verify_session_match_async(authorization, session_id or "")
     # Remote session: ask the satellite for its manifest
     if session_id and _get_remote_session_info(session_id) is not None:
         plans = await _list_remote_plans(session_id)
         return {"plans": sorted(plans, key=lambda p: p["modified"], reverse=True)}
 
     plans_dir = _get_plans_dir(session_id)
-    if not plans_dir.is_dir():
+    if plans_dir is None or not plans_dir.is_dir():
         return {"plans": []}
     plans = []
     for f in sorted(plans_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -560,7 +619,7 @@ async def get_plan_file(
 
     Session-bound like the plan list — see ``list_plans``.
     """
-    verify_session_match(authorization, session_id or "")
+    await verify_session_match_async(authorization, session_id or "")
     if ".." in filename or "/" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
     # Remote session: pull into local cache first
@@ -571,6 +630,8 @@ async def get_plan_file(
         return {"content": cached.read_text(), "filename": filename}
 
     plans_dir = _get_plans_dir(session_id)
+    if plans_dir is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
     try:
         plan_path = resolve_under(plans_dir / filename, plans_dir)
     except PathOutsideRoot:

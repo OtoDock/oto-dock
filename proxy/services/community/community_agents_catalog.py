@@ -31,6 +31,8 @@ from typing import Any
 
 import httpx
 
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
+
 logger = logging.getLogger("claude-proxy.community-agents-catalog")
 
 
@@ -208,13 +210,12 @@ async def _fetch_tarball() -> bytes:
 
 
 def _is_safe_name(name: str) -> bool:
-    if not name:
+    """A clean relative name, unchanged by ``normalize_rel_path``: no leading
+    or trailing slash, no empty, ``.`` or ``..`` segment, no NUL."""
+    try:
+        return bool(name) and normalize_rel_path(name) == name
+    except PathOutsideRoot:
         return False
-    if ".." in name.split("/"):
-        return False
-    if name.startswith("/"):
-        return False
-    return True
 
 
 def _extract_template_subfolder(tarball: bytes, template_slug: str) -> Path:
@@ -241,12 +242,18 @@ def _extract_template_subfolder(tarball: bytes, template_slug: str) -> Path:
                 logger.warning("skipping unsafe tar entry %r", member.name)
                 continue
             dest = tempdir / rel
-            dest_resolved = dest.resolve()
-            if not str(dest_resolved).startswith(str(tempdir.resolve())):
+            try:
+                resolve_under(dest, tempdir)
+            except PathOutsideRoot:
                 logger.warning("path-traversal blocked %r", member.name)
                 continue
             if member.isdir():
                 dest.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isreg():
+                # A link resolves against the archive (a missing target is
+                # a KeyError, a 500); a template is regular files only.
+                logger.warning("skipping non-file tar entry %r", member.name)
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             f = tar.extractfile(member)

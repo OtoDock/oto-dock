@@ -10,11 +10,12 @@ import { useRef, useState, useEffect } from 'react'
 import { useSpeechSession } from '../../hooks/useSpeechSession'
 import { MicGlyph } from './MicGlyph'
 
-export function MicIcon({ onTranscript, onInterim, onActive, onCommit, disabled }: {
+export function MicIcon({ onTranscript, onInterim, onActive, onCommit, discardSignal, disabled }: {
   onTranscript: (text: string) => void
   onInterim?: (text: string) => void       // live partial (replaces, not committed)
   onActive?: (active: boolean) => void      // recording start/stop (for base snapshot)
   onCommit?: () => void                     // clean end (silence/stop, not error)
+  discardSignal?: number                    // bumped on send / chat switch → stop the mic, DROP the tail
   disabled?: boolean
 }) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -34,6 +35,17 @@ export function MicIcon({ onTranscript, onInterim, onActive, onCommit, disabled 
     onCommit: onCommit ? () => onCommit() : undefined,
     onError: showError,
   })
+
+  // A send or a chat switch closes the mic and drops its tail (VoiceControl
+  // does the same). Compared against the previous value, so the mount run
+  // and StrictMode's second run are no-ops.
+  const prevDiscardRef = useRef(discardSignal)
+  useEffect(() => {
+    if (prevDiscardRef.current === discardSignal) return
+    prevDiscardRef.current = discardSignal
+    speech.stop(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [discardSignal])
 
   if (!speech.available) return null
   const recording = speech.status === 'recording'

@@ -247,13 +247,35 @@ export function useModelEngineReconcile({
   return { modelGroups }
 }
 
+// Stored on a chat but never offered: a task's silent mode and a check's
+// read-only profile. The status bar shows them read-only (`auto` as Don't Ask).
+const STORED_ONLY_MODES: ReadonlySet<string> = new Set(['auto', 'judge'])
+
+/** Never leave the permission mode on one the engine does not declare (a
+ *  stale per-agent sticky "plan" restored onto Codex / Direct LLM, a model
+ *  switch across engines): the first declared mode wins. A stored-only mode
+ *  is the chat's own fact and stays. */
+export function usePermissionModeInvariant(
+  mode: string, permissionModes: string[] | undefined, setMode: (m: string) => void,
+) {
+  useEffect(() => {
+    if (STORED_ONLY_MODES.has(mode)) return
+    if (permissionModes && permissionModes.length > 0 && !permissionModes.includes(mode)) {
+      setMode(permissionModes[0])
+    }
+  }, [mode, permissionModes, setMode])
+}
+
 export function useModelEngineHandlers({
-  ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming, isTaskChat,
+  ws, parseModelValue, agentName, chatId, chatActiveLayer, viewedStreaming, warming, isTaskChat,
   setEngineSwitchBusy, setEngineSwitchError, setPendingEngineSwitch, setModel, setSelectedLayer, pendingEngineSwitch,
 }: {
   ws: Stream['ws']
   parseModelValue: Selection['parseModelValue']
   agentName: string | undefined
+  /** The viewed chat, or null in the new-chat state — the pick names it so
+   * the server never applies it to the chat the socket is still bound to. */
+  chatId: string | null
   chatActiveLayer: Selection['chatActiveLayer']
   viewedStreaming: boolean
   warming: boolean
@@ -281,7 +303,7 @@ export function useModelEngineHandlers({
       setPendingEngineSwitch({ layer, model: modelId })
       return
     }
-    ws.changeModel(modelId)
+    ws.changeModel(modelId, chatId)
     setModel(modelId)
     // Sticky for the same agent's next new chat — but never from a task
     // chat: a one-off pick on a run's chat must not rewrite the user's
@@ -293,7 +315,7 @@ export function useModelEngineHandlers({
     if (!ws.streaming) {
       setSelectedLayer(layer)
     }
-  }, [ws, parseModelValue, agentName, chatActiveLayer, viewedStreaming, warming, isTaskChat])
+  }, [ws, parseModelValue, agentName, chatId, chatActiveLayer, viewedStreaming, warming, isTaskChat])
 
   // Cross-engine switch confirm/cancel (EngineSwitchBanner + its dialog).
   const handleEngineSwitchConfirm = useCallback(() => {

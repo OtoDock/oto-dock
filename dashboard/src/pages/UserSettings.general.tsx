@@ -831,3 +831,55 @@ export function NotificationsSection() {
     </div>
   )
 }
+
+
+// ---------------------------------------------------------------------------
+// Apps — what agents may know and do about the apps on this user's screen
+// ---------------------------------------------------------------------------
+
+export function AppsSection() {
+  const { data: prefs } = useMyUiPrefs()
+  const update = useUpdateMyUiPrefs()
+  // Absent means on for both: the bag only stores an opt-out.
+  const focusOn = prefs?.share_focus_with_agents !== false
+  const openOn = prefs?.agents_may_open_apps !== false
+
+  return (
+    <div className="mb-8" data-testid="settings-apps">
+      <h2 className="text-lg font-medium text-p-text mb-3">Apps</h2>
+      <div className="space-y-3">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={focusOn}
+            onChange={(e) => update.mutate({ share_focus_with_agents: e.target.checked })}
+            className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
+          />
+          <span>
+            <span className="block text-sm font-medium text-p-text">Agents know which app I am looking at</span>
+            <span className="block text-sm text-p-text-secondary">
+              While an app is open on your screen, the agent you are talking to is told its name, so
+              "update this" needs no explanation. Nobody else learns what you are looking at.
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={openOn}
+            onChange={(e) => update.mutate({ agents_may_open_apps: e.target.checked })}
+            className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
+          />
+          <span>
+            <span className="block text-sm font-medium text-p-text">Agents may open apps on my screen</span>
+            <span className="block text-sm text-p-text-secondary">
+              An agent can bring up one of its apps for you: in the chat you are in it opens right
+              away, anywhere else you get a notice with an Open button. Only on a screen you are
+              using, a few times a minute at most.
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
+  )
+}

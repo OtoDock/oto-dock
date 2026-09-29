@@ -15,15 +15,26 @@ def test_outbound_accepts_legit_phone_mcp_payload():
         "phone_number": "+302101234567",
         "task_description": "Reserve a table for 4",
         "instructions": "be polite",
-        "route_id": "",
+        "route_id": "r-1",
     })
     assert out["phone_number"] == "+302101234567"
     assert out["task_description"].startswith("Reserve")
 
 
 def test_outbound_accepts_bare_national_number():
-    out = validate_outbound_call({"phone_number": "2101234567", "task_description": "hi"})
+    out = validate_outbound_call({"phone_number": "2101234567", "task_description": "hi",
+                                  "route_id": "r-1"})
     assert out["phone_number"] == "2101234567"
+
+
+@pytest.mark.parametrize("body", [
+    {"phone_number": "+302101234567", "task_description": "x"},                  # no route
+    {"phone_number": "+302101234567", "task_description": "x", "route_id": ""},  # empty route
+])
+def test_outbound_requires_a_route(body):
+    """An origination names its route: the daemon never picks a default."""
+    with pytest.raises(ValidationError):
+        validate_outbound_call(body)
 
 
 @pytest.mark.parametrize("body", [
@@ -59,3 +70,14 @@ def test_register_accepts_legit_dialplan_payload():
 def test_register_rejects_hostile(body):
     with pytest.raises(ValidationError):
         validate_register(body)
+
+
+@pytest.mark.parametrize("number", ["+302101234567\n", "302101234567\n"])
+def test_outbound_number_is_matched_whole(number):
+    """The number rule covers the whole string: a trailing line break is
+    refused here exactly as the proxy relay refuses it."""
+    with pytest.raises(ValidationError):
+        validate_outbound_call({
+            "phone_number": number, "task_description": "call",
+            "instructions": "", "route_id": "r-1",
+        })

@@ -144,6 +144,26 @@ def test_shared_only_chat_editor_plus(temp_db, _as):
     assert client.delete(f"/v1/chats/{cid}").status_code == 200
 
 
+def test_shared_only_pool_lists_and_searches_for_members_only(temp_db, _as):
+    """The shared history's list and search answer the agent's members;
+    anyone else gets 403, never the pool's rows or a content-search hit."""
+    agent_store.create_agent("so-list", "SO", collaborative=False, default_scope="agent")
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "agent::so-list", "so-list")
+    task_store.add_chat_message(cid, "user", "zebrafinance numbers")
+    outsider = _user("user-out", agent_role="editor", agents=(AGENT,))
+    member = _user("user-in", agent_role="viewer", agents=("so-list",))
+    _as(outsider)
+    assert client.get("/v1/chats", params={"agent": "so-list"}).status_code == 403
+    assert client.get("/v1/chats/search",
+                      params={"agent": "so-list", "q": "zebrafinance"}).status_code == 403
+    _as(member)
+    listed = client.get("/v1/chats", params={"agent": "so-list"})
+    assert listed.status_code == 200 and [c["id"] for c in listed.json()["chats"]] == [cid]
+    found = client.get("/v1/chats/search", params={"agent": "so-list", "q": "zebrafinance"})
+    assert found.status_code == 200 and found.json()
+
+
 # ---------------------------------------------------------------------------
 # Delete: the live-run 409 guard + history-only semantics
 # ---------------------------------------------------------------------------
@@ -300,3 +320,271 @@ def test_definition_rename_broadcasts_live_run_chats(temp_db, _as, monkeypatch):
     assert r.status_code == 200, r.text
     assert [c[1] for c in calls] == [live_cid]
     assert calls[0][2] == "Renamed nightly"
+
+
+# ---------------------------------------------------------------------------
+# Off the loop: listing, search, rename, delete, create, dismiss-preview
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+
+
+def _record_title_broadcasts(monkeypatch) -> list:
+    from services.notifications import notification_manager
+    calls: list = []
+    monkeypatch.setattr(notification_manager, "broadcast_chat_title",
+                        lambda *a, **k: calls.append((a, k)))
+    return calls
+
+
+def test_chat_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
+    """The sidebar list and search, flags included, are one executor
+    job each; nothing reads the store on the loop thread."""
+    from api.agents import chats as api
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.add_chat_message(cid, "user", "findme off the loop")
+    worker, _ = _mk_task_chat(chat_id=str(uuid.uuid4()), created_by="user-ed")
+
+    async def scenario():
+        with loop_db_guard.active():
+            listed = await api.list_chats(agent=AGENT, kind="chats", limit=50, user=EDITOR)
+            found = await api.search_chats(q="findme", agent=AGENT, kind="chats",
+                                           limit=20, user=EDITOR)
+        return listed["chats"], found["chats"]
+
+    listed, found = asyncio.run(scenario())
+    rows = {r["id"]: r for r in listed}
+    assert rows[cid]["can_rename"] is True and rows[cid]["can_delete"] is True
+    assert rows[cid]["can_share"] is True
+    # Task chats never list in chat mode, delegate workers included.
+    assert worker not in rows
+    assert [r["id"] for r in found] == [cid] and found[0]["can_rename"] is True
+
+
+def test_rename_lands_through_the_chat_writer_off_the_loop(temp_db, loop_db_guard, monkeypatch):
+    """L2 item 6: the rename's checks run as one executor job and its row
+    write (with the search-row rebuild) rides the chat's writer lane; the
+    response waits for the row, so the sidebar search finds the new title."""
+    from api.agents import chats as api
+    from core.events import chat_writer
+    calls = _record_title_broadcasts(monkeypatch)
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    task_store.add_chat_message(cid, "user", "first message")
+
+    async def scenario():
+        with loop_db_guard.active():
+            res = await api.update_chat(cid, req=api.UpdateChatRequest(title="Zebra plan"),
+                                        user=EDITOR)
+        assert await chat_writer.drain(cid, timeout=5)
+        return res
+
+    res = asyncio.run(scenario())
+    assert res == {"status": "ok", "title": "Zebra plan"}
+    row = task_store.get_chat(cid)
+    assert row["title"] == "Zebra plan" and row["title_generated"] is True
+    assert [r["id"] for r in task_store.search_chats("user-ed", AGENT, "zebra")] == [cid]
+    assert calls and calls[0][0][2] == "Zebra plan"
+
+
+def test_rename_refusals_come_from_the_job(temp_db, monkeypatch):
+    from fastapi import HTTPException
+    from api.agents import chats as api
+    _record_title_broadcasts(monkeypatch)
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+
+    async def scenario():
+        codes = []
+        for who, target, title in ((EDITOR, "nope", "x"), (EDITOR2, cid, "x"),
+                                   (EDITOR, cid, "​")):
+            with pytest.raises(HTTPException) as exc:
+                await api.update_chat(target, req=api.UpdateChatRequest(title=title), user=who)
+            codes.append(exc.value.status_code)
+        return codes
+
+    assert asyncio.run(scenario()) == [404, 403, 400]
+    assert task_store.get_chat(cid)["title"] in ("", None)
+
+
+def test_create_delete_and_dismiss_run_off_the_loop(temp_db, loop_db_guard):
+    """L1 item 8: the chats.py writes (INSERT, DELETE, the preview UPDATE)
+    and the checks in front of them run on the executor."""
+    from api.agents import chats as api
+
+    async def scenario():
+        with loop_db_guard.active():
+            created = await api.create_chat(
+                req=api.CreateChatRequest(agent=AGENT, permission_mode="default"),
+                user=EDITOR)
+            cid = created["chat"]["id"]
+            dismissed = await api.dismiss_preview(cid, "file-1", snapshot_id=None,
+                                                  message_id=None, user=EDITOR)
+            deleted = await api.delete_chat(cid, user=EDITOR)
+        return cid, created["chat"]["user_sub"], dismissed, deleted
+
+    cid, owner, dismissed, deleted = asyncio.run(scenario())
+    assert owner == "user-ed"
+    assert dismissed == {"status": "ok", "dismissed": 0}
+    assert deleted == {"status": "ok"}
+    assert task_store.get_chat(cid) is None
+
+
+def _pin_ledger(monkeypatch):
+    """A deterministic admission ledger (the test_concurrency fixture's
+    shape): plenty of RAM, no caps, a fresh condition for this loop."""
+    import config
+    import core.concurrency as C
+    monkeypatch.setattr(config, "MAX_SESSIONS_PER_USER", 0)
+    monkeypatch.setattr(config, "OTODOCK_MAX_LOCAL_SESSIONS", 0)
+    monkeypatch.setattr(C, "_live_available_mb", lambda: 100_000)
+    for name in ("_sessions", "_session_est", "_session_added_at", "_session_owner", "_line"):
+        getattr(C, name).clear()
+    C._reserved_mb = 0
+    C._parked_tasks = 0
+    C._live_cache = None
+    C._budget_mb = 50_000
+    C._floor_mb = 300
+    C._total_mb = 80_000
+    return C
+
+
+def test_delete_closes_the_chats_live_terminal(temp_db, monkeypatch):
+    """The L1 walk finding: deleting a chat ends its interactive session at
+    once. The fake session releases its ledger reservation the way
+    ``InteractiveSession.close`` does, so the count a person is held to
+    drops with the chat; its queued prompts are dropped, never handed back."""
+    from api.agents import chats as api
+    from core.session import interactive_session
+    C = _pin_ledger(monkeypatch)
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    sid = "sess-" + uuid.uuid4().hex[:8]
+    task_store.update_chat(cid, session_id=sid)
+    closed: list[str] = []
+
+    class FakeTerminal:
+        session_id = sid
+        chat_id = cid
+        alive = True
+        target = None
+        created_at = 1.0
+        _prompt_queue = [{"text": "queued"}]
+
+        async def close(self, *, reason="closed"):
+            closed.append(reason)
+            self.alive = False
+            C.release_chat_slot(self.session_id)
+            interactive_session._sessions.pop(self.session_id, None)
+
+    fake = FakeTerminal()
+    monkeypatch.setitem(interactive_session._sessions, sid, fake)
+
+    async def scenario():
+        C._cond = asyncio.Condition()
+        assert await C.acquire_chat_slot(sid, user_sub="user-ed")
+        assert sid in C._sessions
+        res = await api.delete_chat(cid, user=EDITOR)
+        return res, sid in C._sessions
+
+    res, still_held = asyncio.run(scenario())
+    assert res == {"status": "ok"}
+    assert closed == ["chat_deleted"]
+    assert fake._prompt_queue == []
+    assert still_held is False
+    assert sid not in interactive_session._sessions
+    assert task_store.get_chat(cid) is None
+
+
+def test_delete_still_closes_a_pooled_session_through_its_layer(temp_db, monkeypatch):
+    from api.agents import chats as api
+    from core.session import session_manager
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    sid = "sess-" + uuid.uuid4().hex[:8]
+    task_store.update_chat(cid, session_id=sid)
+    closed: list[str] = []
+
+    class FakeLayer:
+        async def close_session(self, session_id):
+            closed.append(session_id)
+
+    layer = FakeLayer()
+    monkeypatch.setattr(session_manager, "find_layer_for_session",
+                        lambda s: layer if s == sid else None)
+    assert asyncio.run(api.delete_chat(cid, user=EDITOR)) == {"status": "ok"}
+    assert closed == [sid]
+    assert task_store.get_chat(cid) is None
+
+
+def test_delete_waits_for_a_chat_that_is_still_starting(temp_db, monkeypatch):
+    """A warming session is registered nowhere a close can reach, so the
+    delete refuses with its own sentence until the session exists; the row
+    stays. The same for a one-shot wake in flight."""
+    from fastapi import HTTPException
+    from api.agents import chats as api
+    from core.session import session_delivery, warmup_registry
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    monkeypatch.setitem(warmup_registry._inflight, cid,
+                        warmup_registry.InflightWarmup(chat_id=cid, user_sub="user-ed",
+                                                       agent=AGENT))
+
+    async def scenario():
+        with pytest.raises(HTTPException) as exc:
+            await api.delete_chat(cid, user=EDITOR)
+        warmup_registry._inflight.pop(cid, None)
+        monkeypatch.setitem(session_delivery._oneshot_inflight, cid, asyncio.Event())
+        with pytest.raises(HTTPException) as exc2:
+            await api.delete_chat(cid, user=EDITOR)
+        session_delivery._oneshot_inflight.pop(cid, None)
+        return exc.value, exc2.value
+
+    first, second = asyncio.run(scenario())
+    assert first.status_code == 409 and "still starting" in first.detail
+    assert second.status_code == 409 and second.detail == first.detail
+    assert task_store.get_chat(cid) is not None
+
+
+def test_delete_lands_behind_the_chats_queued_writer_job(temp_db, caplog):
+    """The row delete rides the chat's writer lane: a row job queued before
+    it lands first, so nothing fails on the vanished row."""
+    import logging
+    import time
+    from api.agents import chats as api
+    from core.events import chat_writer
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+
+    def slow_row():
+        time.sleep(0.2)
+        return task_store.add_chat_message(cid, "assistant", "landed first")
+
+    async def scenario():
+        fut = chat_writer.submit(cid, slow_row, label="slow")
+        res = await api.delete_chat(cid, user=EDITOR)
+        return await fut, res
+
+    with caplog.at_level(logging.WARNING, logger="claude-proxy.chat-writer"):
+        row_id, res = asyncio.run(scenario())
+    assert row_id > 0 and res == {"status": "ok"}
+    assert task_store.get_chat(cid) is None
+    assert "failed" not in caplog.text
+
+
+def test_a_new_shared_only_chat_carries_no_pick_below_the_editor_tier(temp_db, _as):
+    """On creation, a Shared-only chat runs as the
+    agent, so a caller below the editor tier never leaves a permission mode
+    of its own on the shared row; an editor's pick stays."""
+    agent_store.create_agent("so-new", "SO", collaborative=False, default_scope="agent")
+    contributor = _user("user-c3", agent_role="contributor", agents=("so-new",))
+    editor = _user("user-e3", agent_role="editor", agents=("so-new",))
+    _as(contributor)
+    r = client.post("/v1/chats", json={"agent": "so-new", "permission_mode": "dontAsk"})
+    assert r.status_code == 200, r.text
+    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "default"
+    _as(editor)
+    r = client.post("/v1/chats", json={"agent": "so-new", "permission_mode": "acceptEdits"})
+    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "acceptEdits"

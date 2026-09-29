@@ -17,10 +17,13 @@ from pathlib import Path
 from fastapi import WebSocket, WebSocketDisconnect
 
 import config as app_config
+from core import placement
 from core.remote import file_sync as file_sync_rules
 from core.remote.satellite_connection import get_connection_manager
 from storage import remote_store
 from storage.pg import run_db
+from auth import roles
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.satellite-ws")
 
@@ -30,6 +33,15 @@ logger = logging.getLogger("claude-proxy.satellite-ws")
 # freeze the loop exactly when it must serve pings (the 09-03 incident).
 
 _AUTH_TIMEOUT_S = 5
+
+# The first frame is sized before it is parsed. uvicorn assembles a frame up
+# to its 16 MiB limit, and a parse of that size held the loop about half a
+# second, before anything about the peer was known. The real hello (machine
+# id, secret, capabilities, version) is about 1.5 KB; the cap is strictly
+# above the 64 KB bound ``register`` puts on a persisted capabilities
+# payload, so the two never cross. Counted in characters, the unit the parse
+# cost follows.
+_MAX_AUTH_FRAME_CHARS = 256 * 1024
 
 # Minimum satellite protocol version the proxy accepts.
 #
@@ -85,6 +97,20 @@ _SATELLITE_CONFIG_PY = (
 _VERSION_LINE_RE = re.compile(
     r'^\s*SATELLITE_VERSION\s*=\s*[\'"]([^\'"]+)[\'"]\s*$', re.MULTILINE,
 )
+
+
+def _cli_pins() -> dict[str, str]:
+    """``{pin_key: pinned version}`` for every engine with a CLI binary. The
+    keys are the satellite's WIRE vocabulary (``claude_code`` / ``codex``,
+    frozen — `satellite/host/cli_versions.py` drops unknown keys fail-open),
+    declared on each engine's descriptor; the version is read at call time
+    so a runtime change to ``config.PINNED_*`` reaches the next handshake."""
+    from core.session.session_manager import get_all_layers
+    return {
+        layer.capabilities.runtime.pin_key: layer.pinned_cli_version()
+        for layer in get_all_layers().values()
+        if layer.capabilities.runtime.pin_key
+    }
 
 
 def _read_satellite_version_from_source() -> str | None:
@@ -189,6 +215,19 @@ def _version_at_least(version: str, minimum: str) -> bool:
     return v_parts >= m_parts
 
 
+async def _refuse(websocket: WebSocket, reason: str, *, code: int, close_reason: str,
+                  **extra: str) -> None:
+    """Answer a refused handshake with its ``auth_result`` and close. A peer
+    that already left fails the send (and may fail the close); the refusal
+    ends here all the same."""
+    with contextlib.suppress(Exception):
+        await websocket.send_text(json.dumps({
+            "type": "auth_result", "status": "rejected", "reason": reason, **extra,
+        }))
+    with contextlib.suppress(Exception):
+        await websocket.close(code=code, reason=close_reason)
+
+
 async def ws_satellite_handler(websocket: WebSocket):
     """WebSocket handler for satellite daemon connections."""
     await websocket.accept()
@@ -198,25 +237,28 @@ async def ws_satellite_handler(websocket: WebSocket):
         raw = await asyncio.wait_for(
             websocket.receive_text(), timeout=_AUTH_TIMEOUT_S
         )
+        if len(raw) > _MAX_AUTH_FRAME_CHARS:
+            logger.warning(
+                "Satellite auth frame of %d chars from %s refused before parse "
+                "(cap %d)", len(raw), getattr(websocket, "client", None),
+                _MAX_AUTH_FRAME_CHARS,
+            )
+            await _refuse(websocket, "Auth frame too large", code=4001,
+                          close_reason="Auth frame too large")
+            return
         msg = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError) as e:
-        logger.warning("Satellite auth timeout or invalid JSON: %s", e)
-        with contextlib.suppress(Exception):
-            await websocket.send_text(json.dumps({
-                "type": "auth_result",
-                "status": "rejected",
-                "reason": "Auth timeout or invalid message",
-            }))
-        await websocket.close(code=4001, reason="Auth failed")
+    except WebSocketDisconnect:
+        return
+    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
+        # KeyError: a binary first frame (the socket's text read finds none).
+        logger.warning("Satellite auth timeout or invalid first frame: %r", e)
+        await _refuse(websocket, "Auth timeout or invalid message", code=4001,
+                      close_reason="Auth failed")
         return
 
-    if msg.get("type") != "auth":
-        await websocket.send_text(json.dumps({
-            "type": "auth_result",
-            "status": "rejected",
-            "reason": "First message must be auth",
-        }))
-        await websocket.close(code=4001, reason="Expected auth message")
+    if not isinstance(msg, dict) or msg.get("type") != "auth":
+        await _refuse(websocket, "First message must be auth", code=4001,
+                      close_reason="Expected auth message")
         return
 
     machine_id = msg.get("machine_id", "")
@@ -224,13 +266,18 @@ async def ws_satellite_handler(websocket: WebSocket):
     capabilities = msg.get("capabilities", {})
     sat_version = msg.get("satellite_version", "")
 
+    # The id, the secret and the version are strings and the capabilities an
+    # object: anything else is refused before it reaches the store or the
+    # connection registry.
+    if (not all(isinstance(v, str) for v in (machine_id, machine_secret, sat_version))
+            or not isinstance(capabilities, dict)):
+        await _refuse(websocket, "Malformed auth message", code=4001,
+                      close_reason="Malformed auth")
+        return
+
     if not machine_id or not machine_secret:
-        await websocket.send_text(json.dumps({
-            "type": "auth_result",
-            "status": "rejected",
-            "reason": "Missing machine_id or machine_secret",
-        }))
-        await websocket.close(code=4001, reason="Missing credentials")
+        await _refuse(websocket, "Missing machine_id or machine_secret", code=4001,
+                      close_reason="Missing credentials")
         return
 
     # Machine DB row gone (admin/user deleted it from dashboard).
@@ -244,42 +291,28 @@ async def ws_satellite_handler(websocket: WebSocket):
             "self-uninstall",
             machine_id[:8],
         )
-        await websocket.send_text(json.dumps({
-            "type": "auth_result",
-            "status": "rejected",
-            "reason": "machine_deleted",
-            "action": "uninstall",
-        }))
-        await websocket.close(code=4006, reason="machine_deleted")
+        await _refuse(websocket, "machine_deleted", code=4006, close_reason="machine_deleted",
+                      action="uninstall")
         return
 
     # Reject user-paired satellites trying to reconnect when the
     # admin has disabled the feature. Looking up the machine before
     # verifying the secret is fine — the pairing_scope read is read-only.
-    if (machine.get("pairing_scope") or "") != "admin":
+    if not placement.machine_is_admin_paired(machine):
         from storage import database as _db
         if await run_db(_db.get_platform_setting, "allow_user_paired_machines") == "0":
             logger.info(
                 "Satellite %s rejected: user-paired machines disabled",
                 machine_id[:8],
             )
-            await websocket.send_text(json.dumps({
-                "type": "auth_result",
-                "status": "rejected",
-                "reason": "User-paired machines are disabled by admin policy.",
-            }))
-            await websocket.close(code=4005, reason="feature_disabled_by_admin")
+            await _refuse(websocket, "User-paired machines are disabled by admin policy.",
+                          code=4005, close_reason="feature_disabled_by_admin")
             return
 
     # Verify machine secret
     if not await run_db(remote_store.verify_machine_secret, machine_id, machine_secret):
         logger.warning("Satellite auth failed for machine %s", machine_id[:8])
-        await websocket.send_text(json.dumps({
-            "type": "auth_result",
-            "status": "rejected",
-            "reason": "Invalid credentials",
-        }))
-        await websocket.close(code=4001, reason="Auth rejected")
+        await _refuse(websocket, "Invalid credentials", code=4001, close_reason="Auth rejected")
         return
 
     # --- version policy + auto-update push ---
@@ -399,17 +432,13 @@ async def ws_satellite_handler(websocket: WebSocket):
                 "Satellite %s rejected: version %r < required %s and %s",
                 machine_id[:8], sat_version, MIN_SATELLITE_VERSION, why,
             )
-            await websocket.send_text(json.dumps({
-                "type": "auth_result",
-                "status": "rejected",
-                "reason": (
-                    f"Satellite version {sat_version or 'unknown'} is older "
-                    f"than the proxy's minimum {MIN_SATELLITE_VERSION}, and "
-                    f"{why}. Ask your admin to click "
-                    f"'Update now' in the dashboard."
-                ),
-            }))
-            await websocket.close(code=4001, reason="version too old")
+            await _refuse(
+                websocket,
+                f"Satellite version {sat_version or 'unknown'} is older than the "
+                f"proxy's minimum {MIN_SATELLITE_VERSION}, and {why}. Ask your "
+                f"admin to click 'Update now' in the dashboard.",
+                code=4001, close_reason="version too old",
+            )
             return
         # needs_update but not must_reject and not auto_update: connect
         # normally. Admin will see "Update available" in the dashboard.
@@ -432,7 +461,7 @@ async def ws_satellite_handler(websocket: WebSocket):
             # Device-control consent set, so the
             # satellite can re-check capability grants at tool time.
             "device_grants": sorted(
-                remote_store._parse_device_grants(machine.get("device_grants"))
+                placement.parse_device_grants(machine.get("device_grants"))
             ),
             # Universal per-file sync cap (OTODOCK_MAX_FILE_MB) — the proxy
             # config is the single source of truth; 0.5.103+ satellites apply
@@ -453,10 +482,7 @@ async def ws_satellite_handler(websocket: WebSocket):
         # CLI version pins (VERSIONS.md) — the satellite reconciles its installed
         # claude/codex to these on auth, so the fleet runs the EXACT versions the
         # platform verified. Empty value → satellite skips that CLI (fail-open).
-        "cli_pins": {
-            "claude_code": app_config.PINNED_CLAUDE_CODE_VERSION,
-            "codex": app_config.PINNED_CODEX_VERSION,
-        },
+        "cli_pins": _cli_pins(),  # {pin_key: version} — see _cli_pins
     }))
 
     cm = get_connection_manager()
@@ -529,7 +555,7 @@ def _dashboard_recipients_for_machine(machine: dict) -> list[str]:
     # Admins — best-effort; if listing fails we still notify the owner.
     try:
         for u in _db.list_users() or []:
-            if (u.get("role") or "") == "admin":
+            if roles.is_admin(u.get("role")):
                 subs.add(u["sub"])
     except Exception:
         logger.exception("listing admin users failed")
@@ -657,7 +683,7 @@ async def _broadcast_satellite_updating(
     "Updating <name> to X — reconnects in ~30s" via machineUpdateStore."""
     from datetime import datetime, timezone
     await _push_machine_event(machine, {
-        "type": "satellite_updating",
+        "type": wire.SATELLITE_UPDATING,
         "machine_id": machine_id,
         "machine_name": machine.get("name", ""),
         "from_version": from_version or "unknown",
@@ -672,7 +698,7 @@ async def _broadcast_satellite_updated(
     """Fired after a previously-updating satellite reconnects on the new
     version. Dashboards flash a green confirmation, then dismiss."""
     await _push_machine_event(machine, {
-        "type": "satellite_updated",
+        "type": wire.SATELLITE_UPDATED,
         "machine_id": machine_id,
         "machine_name": machine.get("name", ""),
         "version": version,
@@ -689,7 +715,7 @@ async def _broadcast_satellite_update_failed(
     target; ``paused`` = automatic pushes of it are now suspended (the
     banner tells the admin to use "Update now")."""
     await _push_machine_event(machine, {
-        "type": "satellite_update_failed",
+        "type": wire.SATELLITE_UPDATE_FAILED,
         "machine_id": machine_id,
         "machine_name": machine.get("name", ""),
         "error": error,

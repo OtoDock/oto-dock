@@ -9,7 +9,8 @@ import uuid
 import pytest
 
 from api.hooks.hooks import decide_tool_permission
-from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS, SecurityContext
+from auth.path_policy import SecurityContext
+from core.events import tool_roles
 from core.session import session_state
 
 
@@ -25,7 +26,7 @@ def external_session():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", EXTERNAL_DENIED_CLI_TOOLS)
+@pytest.mark.parametrize("tool", tool_roles.names_of(tool_roles.SHELL))
 async def test_denied_even_for_a_manager_in_auto_mode(external_session, tool):
     decision = await decide_tool_permission(external_session, tool, {"command": "ls"})
     assert decision["decision"] == "deny"

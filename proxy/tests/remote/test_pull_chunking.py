@@ -49,11 +49,12 @@ async def _start_pull(mgr, conn, dest, *, timeout=2.0):
             agent_slug="agent-1", timeout=timeout,
         )
     )
-    # Let pull_file_to_path run up to its `await wait_for(future)`.
-    for _ in range(50):
-        await asyncio.sleep(0)
+    # Let pull_file_to_path open its root (a worker thread) and run up to
+    # its `await wait_for(future)`.
+    for _ in range(400):
         if conn.sent:
             break
+        await asyncio.sleep(0.005)
     rid = conn.sent[0]["request_id"]
     return task, rid, mgr._pending_pulls[rid]
 
@@ -192,3 +193,101 @@ async def test_no_connection_returns_false(tmp_path):
     )
     assert ok is False
     assert not dest.exists()
+
+
+# ---------------------------------------------------------------------------
+# A pull into the agents tree opens beneath the agents root: no component
+# is followed, a link at the partial's name is replaced, never written through
+# ---------------------------------------------------------------------------
+
+
+def _agents_tree(tmp_path, monkeypatch):
+    import config
+    agents = tmp_path / "agents"
+    (agents / "agent-1").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(config, "AGENTS_DIR", agents)
+    return agents, outside
+
+
+@pytest.mark.asyncio
+async def test_a_link_at_a_parent_never_carries_the_pull_outside_the_tree(tmp_path, monkeypatch):
+    agents, outside = _agents_tree(tmp_path, monkeypatch)
+    (agents / "agent-1" / "workspace").symlink_to(outside)
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = agents / "agent-1" / "workspace" / "x.bin"
+    data = b"Q" * 10
+    ok = await asyncio.wait_for(
+        mgr.pull_file_to_path(
+            "m1", PathRef("agent_tree", "workspace/x.bin"), dest,
+            agent_slug="agent-1", timeout=2.0,
+        ),
+        timeout=2.0,
+    )
+    assert ok is False
+    assert conn.sent == []
+    assert not (outside / "x.bin").exists()
+    assert not (outside / "x.bin.partial").exists()
+    assert mgr._pending_pulls == {}
+    assert data
+
+
+@pytest.mark.asyncio
+async def test_a_link_at_the_partial_name_is_replaced_never_written_through(tmp_path, monkeypatch):
+    agents, outside = _agents_tree(tmp_path, monkeypatch)
+    (agents / "agent-1" / "workspace").mkdir()
+    target = outside / "t"
+    target.write_bytes(b"keep")
+    dest = agents / "agent-1" / "workspace" / "x.bin"
+    Path(str(dest) + ".partial").symlink_to(target)
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    data = b"Q" * 10
+    task, rid, st = await _start_pull(mgr, conn, dest)
+    h = hashlib.sha256(data)
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 1, data, last_hash=f"sha256:{h.hexdigest()}"))
+    assert await asyncio.wait_for(task, timeout=1.0) is True
+    assert dest.read_bytes() == data
+    assert target.read_bytes() == b"keep"
+    assert not Path(str(dest) + ".partial").exists()
+    assert rid not in mgr._pending_pulls
+
+
+# ---------------------------------------------------------------------------
+# The commit runs on the file-commit executor, after the stream left the
+# pending map
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_runs_off_the_loop_after_the_stream_is_popped(tmp_path, monkeypatch):
+    import os
+    import threading
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    data = b"Z" * 3000
+    task, rid, st = await _start_pull(mgr, conn, dest)
+    seen = {}
+    real_fsync = os.fsync
+
+    def _fsync(fd):
+        seen["thread"] = threading.current_thread().name
+        seen["pending"] = rid in mgr._pending_pulls
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", _fsync)
+    h = hashlib.sha256(data)
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 1, data, last_hash=f"sha256:{h.hexdigest()}"))
+    assert await task is True
+    assert dest.read_bytes() == data
+    assert seen["thread"].startswith("file-commit")
+    assert seen["pending"] is False
+    # A late chunk after the final one is ignored.
+    mgr._on_pull_chunk(st, _chunk(rid, 1, 1, b"LATE"))
+    assert dest.read_bytes() == data
+    assert not Path(str(dest) + ".partial").exists()

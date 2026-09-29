@@ -33,7 +33,7 @@ services:
     # Fallback must track VERSIONS.md like docker-compose.yml does — a stale
     # default here made bare `docker compose` builds tag phone images 1.2.0
     # (and a bare pull would fetch the genuinely old published 1.2.0).
-    image: ghcr.io/otodock/otodock-phone:${OTODOCK_VERSION:-1.6.1}
+    image: ghcr.io/otodock/otodock-phone:${OTODOCK_VERSION:-1.7.0}
     # Pull the release image when missing; `--build` (or scripts/compose.sh
     # up -d --build) still builds from source using the block below.
     pull_policy: missing
@@ -61,11 +61,16 @@ services:
       # shared config.env (mounted read-only below).
       PROXY_URL: http://otodock-proxy:8400
     ports:
-      # AudioSocket media + the register/outbound HTTP API. The PBX is off-stack,
-      # so these are reachable at the host's LAN IP (set OTO_AUDIOSOCKET_PUBLIC_HOST
-      # on the proxy to that IP).
-      - "9092:9092"
-      - "9093:9093"
+      # AudioSocket media + the register/outbound HTTP API. The AudioSocket port
+      # has NO transport auth, so it must never be internet-reachable: the ports
+      # listen on OTO_PHONE_BIND, else on the address the PBX already dials
+      # (OTO_AUDIOSOCKET_PUBLIC_HOST, a LAN IP this host owns), else on
+      # 127.0.0.1. A public host holding a hostname or an address this host does
+      # not own makes the container fail to start: set OTO_PHONE_BIND to a LAN
+      # IP then. The proxy reaches otodock-phone:9093 over the compose network
+      # and Twilio enters via the proxy relay, so neither depends on this publish.
+      - "${OTO_PHONE_BIND:-${OTO_AUDIOSOCKET_PUBLIC_HOST:-127.0.0.1}}:9092:9092"
+      - "${OTO_PHONE_BIND:-${OTO_AUDIOSOCKET_PUBLIC_HOST:-127.0.0.1}}:9093:9093"
     volumes:
       # Shared secrets only (PROXY_API_KEY + PHONE_API_SECRET), read-only.
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env:ro

@@ -24,14 +24,24 @@ full history regardless of channel.
 """
 
 import asyncio
+import collections
 import contextlib
 import logging
+import time
 import zoneinfo
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from storage.automation import notification_store
 import config
+from core.session import session_kind
+from auth.providers import acting_role_of
+# Imported with the manager: its libraries (pywebpush, google-auth,
+# requests) take about 0.3 s to load, which must never land on the loop at
+# the first alert of a process.
+from services.notifications import push_sender
+from ws import chat_phase
+from ws import wire_events as wire
 
 logger = logging.getLogger("claude-proxy.notifications")
 
@@ -52,10 +62,110 @@ class ConnectionInfo:
     # empty chair, so end-of-turn alerts also take the FCM leg for it, while
     # a hidden tab keeps suppressing the buzz (same-machine multitasking).
     away: bool = False
+    # Live-app frames (APPS.md "Live apps") ride a second queue: the
+    # notify queue is drained only between the viewed chat's turns, and a
+    # push must reach the screen while the agent's own turn is running.
+    live_queue: "LiveQueue | None" = None
+    # What the tab shows right now (`focus` frame: surface + ids); cleared
+    # when the tab hides or the connection drops, never stored anywhere.
+    focus: dict | None = None
+    focus_at: float = 0.0
+    # The platform-catalog feeds an app on this tab asked for, as (agent,
+    # feed) pairs (`catalog_subscribe` frames): a delta reaches a connection
+    # only through one of these, so a tab with no such app costs nothing.
+    # Dropped with the connection; the client re-sends after a reconnect.
+    catalog_feeds: set[tuple[str, str]] = field(default_factory=set)
 
 
 # user_sub → list of all current WS connections for this user
 _user_connections: dict[str, list[ConnectionInfo]] = {}
+
+# Frames a live queue holds before it starts evicting: a burst beyond this
+# is a page nobody can follow.
+LIVE_QUEUE_MAX = 256
+
+_FOCUS_SURFACES = frozenset({"chat", "home", "app"})
+_FOCUS_ID_MAX = 64
+# Catalog subscriptions one connection may hold (apps × feeds on one tab).
+CATALOG_SUBS_MAX = 64
+
+
+class LiveQueue:
+    """The per-connection queue for live-app frames. A state frame for an
+    app replaces the one still waiting for that app (the higher rev wins,
+    so state occupies one slot per app), an open frame is never evicted,
+    and a full queue drops its oldest push first: a burst of pushes nobody
+    could follow yields to the frames that still matter. ``put`` is
+    synchronous and never blocks the writer; ``get`` parks one reader."""
+
+    def __init__(self, maxsize: int = LIVE_QUEUE_MAX) -> None:
+        self._items: collections.deque[dict] = collections.deque()
+        self._maxsize = maxsize
+        self._waiter: asyncio.Future | None = None
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def put(self, frame: dict) -> bool:
+        ftype = frame.get("type")
+        if ftype == wire.APP_STATE:
+            app_id = frame.get("app_id")
+            for i, item in enumerate(self._items):
+                if item.get("type") == wire.APP_STATE and item.get("app_id") == app_id:
+                    if int(frame.get("rev") or 0) >= int(item.get("rev") or 0):
+                        self._items[i] = frame
+                    self._wake()
+                    return True
+        if ftype == wire.CATALOG and frame.get("snapshot") is not None:
+            # A catalog snapshot supersedes whatever waits for the same feed:
+            # the queued snapshot and every delta before it.
+            key = (frame.get("agent"), frame.get("feed"))
+            kept = [item for item in self._items
+                    if not (item.get("type") == wire.CATALOG
+                            and (item.get("agent"), item.get("feed")) == key)]
+            self._items = collections.deque(kept)
+        if len(self._items) >= self._maxsize:
+            # Evict in order of what matters least: the oldest push, then the
+            # oldest catalog delta, then the oldest of anything but an open
+            # (an open frame is never the victim); refuse when only opens wait.
+            victim = None
+            for kind in (wire.APP_PUSH, wire.CATALOG):
+                victim = next(
+                    (i for i, item in enumerate(self._items) if item.get("type") == kind),
+                    None,
+                )
+                if victim is not None:
+                    break
+            if victim is None:
+                victim = next(
+                    (i for i, item in enumerate(self._items) if item.get("type") != wire.OPEN_APP),
+                    None,
+                )
+            if victim is None:
+                return False
+            if ftype == wire.APP_PUSH and self._items[victim].get("type") != wire.APP_PUSH:
+                return False
+            del self._items[victim]
+        self._items.append(frame)
+        self._wake()
+        return True
+
+    def get_nowait(self) -> dict | None:
+        return self._items.popleft() if self._items else None
+
+    async def get(self) -> dict:
+        while not self._items:
+            self._waiter = asyncio.get_running_loop().create_future()
+            try:
+                await self._waiter
+            finally:
+                self._waiter = None
+        return self._items.popleft()
+
+    def _wake(self) -> None:
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
 
 
 def register_user_connection(
@@ -63,6 +173,7 @@ def register_user_connection(
     connection_id: str,
     queue: asyncio.Queue,
     platform: str = "web",
+    live_queue: asyncio.Queue | None = None,
 ) -> None:
     """Track a new WS connection for this user.
 
@@ -78,6 +189,7 @@ def register_user_connection(
         queue=queue,
         active=True,
         platform=platform,
+        live_queue=live_queue,
     ))
 
 
@@ -101,7 +213,112 @@ def set_connection_active(
         if c.connection_id == connection_id:
             c.active = active
             c.away = away and not active
+            # A hidden tab shows nothing; a visible tab nobody touches (a
+            # wall display) keeps its focus.
+            if not active and not away:
+                c.focus = None
+                c.focus_at = 0.0
             return
+
+
+def set_connection_focus(user_sub: str, connection_id: str, focus) -> None:
+    """Record what one tab shows (the dashboard's ``focus`` frame). Anything
+    but a known surface with short ids is treated as no focus."""
+    conn = get_connection(user_sub, connection_id)
+    if conn is None:
+        return
+    clean: dict | None = None
+    if isinstance(focus, dict) and focus.get("surface") in _FOCUS_SURFACES:
+        clean = {"surface": focus["surface"]}
+        for key in ("app_id", "chat_id"):
+            value = focus.get(key)
+            if isinstance(value, str) and 0 < len(value) <= _FOCUS_ID_MAX:
+                clean[key] = value
+        if clean["surface"] == "app" and "app_id" not in clean:
+            clean = None
+    conn.focus = clean
+    conn.focus_at = time.monotonic() if clean else 0.0
+
+
+def connection_focus(user_sub: str, connection_id: str) -> dict | None:
+    """The focus of one connection (a chat turn reads the connection that
+    sent it, so two devices never confuse each other)."""
+    conn = get_connection(user_sub, connection_id)
+    return dict(conn.focus) if conn and conn.focus else None
+
+
+def user_focus(user_sub: str) -> dict | None:
+    """The newest focus across the user's connections (a duplex turn or a
+    phone call has no connection of its own; a wall display counts)."""
+    best: ConnectionInfo | None = None
+    for c in _user_connections.get(user_sub, []):
+        if c.focus and (best is None or c.focus_at > best.focus_at):
+            best = c
+    return dict(best.focus) if best else None
+
+
+def push_live(user_sub: str, frame: dict, *, connection_id: str | None = None) -> int:
+    """Queue a live-app frame on every connection of ``user_sub`` (active or
+    not: a wall display idles into ``away`` and must still update), or on
+    the one named. A full queue drops its oldest frame. Returns how many
+    connections took the frame."""
+    count = 0
+    for c in _user_connections.get(user_sub, []):
+        if connection_id is not None and c.connection_id != connection_id:
+            continue
+        q = c.live_queue
+        if q is None:
+            continue
+        if q.put(frame):
+            count += 1
+        else:
+            logger.debug("live queue full for %s: push dropped", c.connection_id[:8])
+    return count
+
+
+def set_catalog_subscription(user_sub: str, connection_id: str, agent: str, feed: str,
+                             on: bool) -> bool:
+    """Add or drop one (agent, feed) pair on a connection. False when the
+    connection is unknown or full."""
+    conn = get_connection(user_sub, connection_id)
+    if conn is None:
+        return False
+    key = (agent or "", feed or "")
+    if not on:
+        conn.catalog_feeds.discard(key)
+        return True
+    if key in conn.catalog_feeds:
+        return True
+    if len(conn.catalog_feeds) >= CATALOG_SUBS_MAX:
+        return False
+    conn.catalog_feeds.add(key)
+    return True
+
+
+def _catalog_match(conn: ConnectionInfo, agent: str, feed: str) -> bool:
+    # An agent-less frame (the viewer's own feeds across agents) matches a
+    # subscription to that feed under any agent.
+    if not conn.catalog_feeds:
+        return False
+    if agent:
+        return (agent, feed) in conn.catalog_feeds
+    return any(f == feed for _, f in conn.catalog_feeds)
+
+
+def catalog_subscribed(user_sub: str, agent: str, feed: str) -> bool:
+    return any(_catalog_match(c, agent, feed) for c in _user_connections.get(user_sub, []))
+
+
+def push_catalog(user_sub: str, agent: str, feed: str, frame: dict) -> int:
+    """Queue a catalog frame on the user's connections that asked for the
+    feed. Returns how many took it."""
+    count = 0
+    for c in _user_connections.get(user_sub, []):
+        if c.live_queue is None or not _catalog_match(c, agent, feed):
+            continue
+        if c.live_queue.put(frame):
+            count += 1
+    return count
 
 
 def set_connection_platform(user_sub: str, connection_id: str, platform: str) -> None:
@@ -132,17 +349,190 @@ def get_connection(user_sub: str, connection_id: str) -> ConnectionInfo | None:
     return None
 
 
+# --- Audience cache: who sees a shared-only or task chat's live state ---
+#
+# The agent's members plus every platform admin are read on every turn edge
+# of every shared-only chat and agent-scope task run, from synchronous
+# callers on the loop AND from the tailers' worker threads. The list is
+# served from memory: an entry lives _AUDIENCE_TTL_S and is then refreshed
+# behind the read (an executor job on the loop, a synchronous read on a
+# worker thread). A person whose access an admin takes away is dropped at
+# once through the offboarding event and every attach path and platform role
+# change invalidates the entries it touches, so the TTL bounds only the
+# changes that raise neither (an identity provider's role change at login, a
+# row written outside the routes).
+# A refresh that started before a drop is discarded by the entry's generation.
+
+_AUDIENCE_TTL_S = 30.0
+
+
+@dataclass
+class _AudienceEntry:
+    subs: tuple[str, ...]
+    fetched_at: float
+    getter: object          # the store function that filled it (a stand-in misses)
+    generation: int = 0     # bumped by every drop and invalidation
+    stale: bool = False
+    refreshing: bool = False
+
+
+_audience: dict[str, _AudienceEntry] = {}
+_audience_tasks: set[asyncio.Task] = set()
+
+
+def agent_audience(agent: str) -> list[str]:
+    """Every user who sees ``agent``'s shared-only and task chats, from the
+    cache, as a fresh list. Callable from any thread: the first read of an
+    agent per process runs on the caller's thread, later reads never touch
+    the store from the loop."""
+    if not agent:
+        return []
+    getter = notification_store.get_agent_user_subs
+    entry = _audience.get(agent)
+    now = time.monotonic()
+    if entry is not None and entry.getter is getter:
+        if not entry.stale and now - entry.fetched_at < _AUDIENCE_TTL_S:
+            return list(entry.subs)
+        return list(_refresh_audience(agent, entry, getter))
+    subs = tuple(getter(agent))
+    _audience[agent] = _AudienceEntry(subs, now, getter)
+    return list(subs)
+
+
+def _refresh_audience(agent: str, entry: _AudienceEntry, getter) -> tuple[str, ...]:
+    """A stale entry: on the loop thread, serve it and refresh it in one
+    executor job (one in flight per agent); on any other thread, read it
+    right there and serve the result."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        subs = tuple(getter(agent))
+        _store_audience(agent, entry.generation, subs, getter)
+        return subs
+    if not entry.refreshing:
+        entry.refreshing = True
+        task = loop.create_task(_refresh_audience_job(agent, entry.generation, getter))
+        _audience_tasks.add(task)
+        task.add_done_callback(_audience_tasks.discard)
+    return entry.subs
+
+
+async def _refresh_audience_job(agent: str, generation: int, getter) -> None:
+    from storage.pg import run_db
+    try:
+        subs = tuple(await run_db(getter, agent))
+    except Exception:
+        logger.warning("audience refresh of %s failed; serving the last list",
+                       agent, exc_info=True)
+        entry = _audience.get(agent)
+        if entry is not None:
+            entry.refreshing = False
+        return
+    _store_audience(agent, generation, subs, getter)
+
+
+def _store_audience(agent: str, generation: int, subs: tuple[str, ...], getter) -> None:
+    """Land a refreshed list unless the entry moved on while the read was in
+    flight (a drop, an invalidation): then it stays stale and the next read
+    refreshes again."""
+    entry = _audience.get(agent)
+    if entry is None or entry.getter is not getter:
+        return
+    entry.refreshing = False
+    if entry.generation != generation:
+        return
+    _audience[agent] = _AudienceEntry(subs, time.monotonic(), getter, generation)
+
+
+def invalidate_audience(agent: str = "") -> None:
+    """Mark one agent's entry, or every entry, for a refresh on its next read."""
+    entries = [_audience.get(agent)] if agent else list(_audience.values())
+    for entry in entries:
+        if entry is not None:
+            entry.stale = True
+            entry.generation += 1
+
+
+def _drop_from_audience(sub: str, agents) -> None:
+    for agent in agents:
+        entry = _audience.get(agent)
+        if entry is None:
+            continue
+        _audience[agent] = _AudienceEntry(
+            tuple(s for s in entry.subs if s != sub), entry.fetched_at,
+            entry.getter, entry.generation + 1, stale=True)
+
+
+async def _on_offboard(event) -> None:
+    """The offboarding subscriber: a person who lost access to an agent
+    leaves its audience before the admin's request completes; a lost row
+    with access kept (a platform admin unassigned) only refreshes the entry;
+    a lower role changes nothing; a deleted person leaves every entry."""
+    from services.agents import offboarding
+    if event.reason == offboarding.DELETED:
+        _drop_from_audience(event.sub, list(_audience))
+    elif event.reason == offboarding.REMOVED:
+        _drop_from_audience(event.sub, [a.agent for a in event.agents if a.lost_access])
+        for loss in event.agents:
+            if not loss.lost_access:
+                invalidate_audience(loss.agent)
+
+
+def _register_audience_invalidation() -> None:
+    from services.agents import offboarding
+    offboarding.subscribe("audience-cache", _on_offboard, priority=5)
+
+
+def _read_all_audiences() -> dict[str, tuple[str, ...]]:
+    from storage.agents import agent_store
+    return {a["slug"]: tuple(notification_store.get_agent_user_subs(a["slug"]))
+            for a in agent_store.get_all_agents()}
+
+
+def _schedule_audience_warmup() -> None:
+    """Fill the cache for every agent in one executor job at boot, so the
+    first turn edge of an agent finds its entry."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    getter = notification_store.get_agent_user_subs
+
+    async def job() -> None:
+        from storage.pg import run_db
+        try:
+            lists = await run_db(_read_all_audiences)
+        except Exception:
+            logger.warning("audience warm-up failed; entries fill on first use", exc_info=True)
+            return
+        now = time.monotonic()
+        for agent, subs in lists.items():
+            if agent not in _audience:
+                _audience[agent] = _AudienceEntry(subs, now, getter)
+
+    task = loop.create_task(job())
+    _audience_tasks.add(task)
+    task.add_done_callback(_audience_tasks.discard)
+
+
+def reset_audience_cache() -> None:
+    """Forget every entry (tests)."""
+    _audience.clear()
+
+
 def chat_status_targets(owner_sub: str, agent: str) -> list[str]:
     """Real users who should see live/read state for a chat owned by
     ``owner_sub``: the owner — or, for a synthetic owner, every user of the
     agent (admins included). Synthetic owners are the shared-only chat owner
     (``agent::<slug>``) AND the scheduler's agent-scope task-chat owner
     (``task::<slug>``) — the latter fans out so scheduled-run pulses reach the
-    sidebar's task mode. Sync DB hit on the synthetic paths only."""
-    from core.session.visibility import is_shared_chat_owner
-    if is_shared_chat_owner(owner_sub) or owner_sub.startswith("task::"):
+    sidebar's task mode. The synthetic paths read the audience cache."""
+    from core.session.visibility import is_shared_chat_owner, is_task_chat_owner
+    if is_shared_chat_owner(owner_sub) or is_task_chat_owner(owner_sub):
         try:
-            return notification_store.get_agent_user_subs(agent) if agent else []
+            return agent_audience(agent) if agent else []
         except Exception:
             return []
     return [owner_sub] if owner_sub else []
@@ -153,17 +543,31 @@ def broadcast_chat_status(owner_sub: str, chat_id: str, status: str, agent: str 
     started or ended a turn, so the sidebar live-dot is correct even for chats
     generating in the BACKGROUND. Emitted by the pump on every turn start/end
     (viewed, detached, or headless) and by interactive sessions on turn-open
-    transitions. ``owner_sub`` is the chat row's owner; pass ``agent`` so
-    shared-only chats (synthetic ``agent::`` owner) fan out to the agent's
-    users instead of nobody. Best-effort."""
+    transitions. ``status`` is a ``ws.chat_phase.WIRE_PHASES`` word —
+    ``streaming`` or ``ready`` — and nothing else (a programming error, not a
+    runtime condition: every emitter passes the constant). ``owner_sub`` is
+    the chat row's owner; pass ``agent`` so shared-only chats (synthetic
+    ``agent::`` owner) fan out to the agent's users instead of nobody.
+    Best-effort."""
+    if status not in chat_phase.WIRE_PHASES:
+        raise ValueError(f"chat_status carries streaming or ready, not {status!r}")
     if not chat_id:
         return
-    for sub in chat_status_targets(owner_sub, agent):
+    targets = chat_status_targets(owner_sub, agent)
+    for sub in targets:
         for c in _user_connections.get(sub, []):
             try:
-                c.queue.put_nowait({"type": "chat_status", "chat_id": chat_id, "status": status})
+                c.queue.put_nowait({"type": wire.CHAT_STATUS, "chat_id": chat_id, "status": status})
             except Exception as e:
                 logger.debug("chat_status broadcast: %s", e)
+    # The catalog's ``sessions`` feed rides the live queue (drained during a
+    # turn), never the notify queue above (drained between turns); the same
+    # targets, so the fan-out is computed once.
+    try:
+        from api.apps import catalog
+        catalog.chat_status_changed(targets, chat_id, status, agent)
+    except Exception as e:
+        logger.debug("catalog sessions delta: %s", e)
 
 
 def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
@@ -176,7 +580,7 @@ def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
     for sub in chat_status_targets(owner_sub, agent):
         for c in _user_connections.get(sub, []):
             try:
-                c.queue.put_nowait({"type": "chat_read", "chat_id": chat_id})
+                c.queue.put_nowait({"type": wire.CHAT_READ, "chat_id": chat_id})
             except Exception as e:
                 logger.debug("chat_read broadcast: %s", e)
 
@@ -197,7 +601,7 @@ def broadcast_engine_switched(
         for c in _user_connections.get(sub, []):
             try:
                 c.queue.put_nowait({
-                    "type": "engine_switched", "chat_id": chat_id,
+                    "type": wire.ENGINE_SWITCHED, "chat_id": chat_id,
                     "execution_path": execution_path, "model": model,
                 })
             except Exception as e:
@@ -215,7 +619,7 @@ def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> Non
         return
     for c in _user_connections.get(user_sub, []):
         try:
-            c.queue.put_nowait({"type": "goal_update", "chat_id": chat_id, "goal": goal})
+            c.queue.put_nowait({"type": wire.GOAL_UPDATE, "chat_id": chat_id, "goal": goal})
         except Exception as e:
             logger.debug("goal_update broadcast: %s", e)
 
@@ -232,7 +636,7 @@ def broadcast_chat_rows(user_sub: str, chat_id: str, agent: str = "") -> None:
     for c in _user_connections.get(user_sub, []):
         try:
             c.queue.put_nowait(
-                {"type": "chat_rows", "chat_id": chat_id, "agent": agent})
+                {"type": wire.CHAT_ROWS, "chat_id": chat_id, "agent": agent})
         except Exception as e:
             logger.debug("chat_rows broadcast: %s", e)
 
@@ -251,9 +655,16 @@ def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "
     for sub in chat_status_targets(user_sub, agent):
         for c in _user_connections.get(sub, []):
             try:
-                c.queue.put_nowait({"type": "title_updated", "chat_id": chat_id, "title": title})
+                c.queue.put_nowait({"type": wire.TITLE_UPDATED, "chat_id": chat_id, "title": title})
             except Exception as e:
                 logger.debug("title_updated broadcast: %s", e)
+    # The catalog's ``sessions`` feed carries the title too (a chat created
+    # untitled is filled in when the title lands).
+    try:
+        from api.apps import catalog
+        catalog.chat_meta_changed(chat_id, {"title": title}, owner=user_sub, agent=agent or None)
+    except Exception as e:
+        logger.debug("catalog sessions title delta: %s", e)
 
 
 # --- Per-chat turn origin (which device sent the last user prompt) ---
@@ -264,6 +675,10 @@ def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "
 # In-memory — after a proxy restart fire_ephemeral falls back to the legacy
 # activity-based rule until the chat's next user send.
 _chat_turn_origin: dict[str, tuple[str, str]] = {}
+# chat_id → the user whose connection sent the last prompt. In a shared chat
+# that is not always the user the session was warmed for; an agent opening
+# an app on "the user's screen" must mean the human who is actually there.
+_chat_turn_user: dict[str, str] = {}
 
 
 def set_chat_turn_origin(user_sub: str, chat_id: str, connection_id: str) -> None:
@@ -274,6 +689,19 @@ def set_chat_turn_origin(user_sub: str, chat_id: str, connection_id: str) -> Non
     conn = get_connection(user_sub, connection_id)
     if conn:
         _chat_turn_origin[chat_id] = (connection_id, conn.platform)
+        _chat_turn_user[chat_id] = user_sub
+
+
+def chat_turn_origin(chat_id: str) -> tuple[str, str, str] | None:
+    """``(connection_id, platform, user_sub)`` of the chat's last sender
+    while that connection is still registered, else None."""
+    origin = _chat_turn_origin.get(chat_id)
+    user_sub = _chat_turn_user.get(chat_id, "")
+    if not origin or not user_sub:
+        return None
+    if get_connection(user_sub, origin[0]) is None:
+        return None
+    return origin[0], origin[1], user_sub
 
 
 # --- Target resolution ---
@@ -341,11 +769,13 @@ async def fire_notification(
     notification_id: str | None = None,
     agent_slug: str | None = None,
     chat_id: str | None = None,
+    href: str = "",
 ) -> list[dict]:
     """Fire a notification to all resolved targets.
 
     Creates a delivery record per user (so the inbox is always populated regardless of channel)
     then routes to WS / native push per the mutually-exclusive policy in ``_deliver_to_user``.
+    ``href`` is a dashboard path the row opens instead of the agent/chat deep link.
     """
     user_subs = await asyncio.to_thread(resolve_targets, scope, target)
     if not user_subs:
@@ -367,6 +797,7 @@ async def fire_notification(
             notification_id=notification_id,
             agent_slug=agent_slug,
             chat_id=chat_id,
+            href=href,
         )
         deliveries.append(delivery)
         await _deliver_to_user(user_sub, delivery)
@@ -452,7 +883,7 @@ async def fire_ephemeral(
     even while the CLI terminal is open on the remote machine.
     """
     frame = {
-        "type": "turn_complete", "chat_id": chat_id,
+        "type": wire.TURN_COMPLETE, "chat_id": chat_id,
         "title": title, "body": body,
     }
     origin = None
@@ -516,7 +947,6 @@ async def fire_ephemeral(
         return  # legacy rule: an engaged device's in-app ping covers it
 
     try:
-        from services.notifications.push_sender import send_fcm
         from storage.automation import notification_store as ns
         # Deep link for the tap — same route rules as _deliver_to_user's
         # click_url. Ephemeral pushes historically carried NO link, so tapping
@@ -526,15 +956,15 @@ async def fire_ephemeral(
         if chat_id:
             # Task chats open the chat page with task mode toggled on; the
             # /runs/{id} resolver redirect stays the agent-less fallback.
-            if chat_id.startswith("task-"):
-                click_url = f"/runs/{chat_id[5:]}"
+            if session_kind.is_task_chat_id(chat_id):
+                click_url = f"/runs/{session_kind.run_id_of_chat(chat_id)}"
             try:
                 from storage import database as task_store
                 _chat = await asyncio.to_thread(task_store.get_chat, chat_id)
                 _agent = (_chat or {}).get("agent")
                 if _agent:
                     click_url = (f"/chat/{_agent}/{chat_id}?tasks=1"
-                                 if chat_id.startswith("task-")
+                                 if session_kind.is_task_chat_id(chat_id)
                                  else f"/chat/{_agent}/{chat_id}")
             except Exception:
                 pass  # link is best-effort — the push itself still matters
@@ -544,7 +974,7 @@ async def fire_ephemeral(
         for sub in subscriptions:
             if sub["platform"] == "android":
                 _tokens += 1
-                if await send_fcm(sub["subscription_data"], {
+                if await push_sender.send_fcm(sub["subscription_data"], {
                     "title": title,
                     "body": body,
                     "severity": "info",
@@ -555,8 +985,6 @@ async def fire_ephemeral(
                     _ok += 1
         _route(f"native push — android tokens={_tokens} sent={_ok}"
                + ("" if _tokens else " (no Android push registration for this user)"))
-    except ImportError:
-        logger.debug("push_sender not available yet, skipping ephemeral push")
     except Exception as e:
         logger.warning(f"Failed to send ephemeral push to {user_sub}: {e}")
 
@@ -575,6 +1003,7 @@ def _build_delivery_payload(delivery: dict) -> dict:
         "delivered_at": delivery["delivered_at"],
         "agent_slug": delivery.get("agent_slug"),
         "chat_id": delivery.get("chat_id"),
+        "href": delivery.get("href") or "",
     }
 
 
@@ -612,8 +1041,6 @@ async def broadcast_file_updated(
         from storage import database as task_store
 
         user_subs = await asyncio.to_thread(resolve_targets, "agent", agent_slug)
-        if not user_subs:
-            return
         # base64url of the AGENTS_DIR-relative path == api.media.wopi.encode_file_id,
         # so the client can match this event to an open Collabora preview by its
         # file_id without a path round-trip.
@@ -622,7 +1049,7 @@ async def broadcast_file_updated(
             f"{agent_slug}/{rel_path}".encode()
         ).decode().rstrip("=")
         msg = {
-            "type": "file_updated",
+            "type": wire.FILE_UPDATED,
             "agent_slug": agent_slug,
             "rel_path": rel_path,
             "file_id": file_id,
@@ -634,18 +1061,10 @@ async def broadcast_file_updated(
             msg["pin"] = True
 
         def _role_and_name(user_sub: str) -> tuple[str, str]:
-            # Effective per-agent role (mirrors ws.dashboard._effective_agent_role):
-            # platform admins are "admin"; otherwise the per-agent assignment.
-            u = task_store.get_user(user_sub) or {}
-            if u.get("role") == "admin":
-                role = "admin"
-            else:
-                role = (task_store.get_user_agent_roles(user_sub) or {}).get(
-                    agent_slug, "viewer",
-                )
-            return role, (task_store.get_username_by_sub(user_sub) or "")
+            return acting_role_of(user_sub, agent_slug), (task_store.get_username_by_sub(user_sub) or "")
 
-        for user_sub in user_subs:
+        told: list[str] = []
+        for user_sub in user_subs or []:
             if exclude_user_sub and user_sub == exclude_user_sub:
                 continue
             active = [c for c in _user_connections.get(user_sub, []) if c.active]
@@ -659,6 +1078,18 @@ async def broadcast_file_updated(
                 continue
             for c in active:
                 await _safe_put(c.queue, msg)
+            told.append(user_sub)
+        # The catalog's ``file_changes`` feed, ONE delta per change: frames to
+        # the users told above (on the live queue, so an open app hears it
+        # mid-turn), and the agent's app servers and handlers take it once,
+        # whether or not anyone is watching.
+        try:
+            from api.apps import catalog
+            catalog.file_changed(told, agent_slug, rel_path,
+                                 file_id=file_id if source == "collabora" else "",
+                                 source=source)
+        except Exception as e:
+            logger.debug("catalog file_changes delta: %s", e)
     except Exception:
         logger.debug(
             "broadcast_file_updated failed for %s/%s",
@@ -680,11 +1111,17 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
     active_conns = get_active_connections(user_sub)
     all_conns = get_all_connections(user_sub)
     inactive_conns = [c for c in all_conns if not c.active]
+    # The catalog's ``notifications`` feed (apps showing the viewer's inbox).
+    try:
+        from api.apps import catalog
+        catalog.notification_delivered(user_sub, delivery)
+    except Exception as e:
+        logger.debug("catalog notifications delta: %s", e)
 
     if active_conns:
         # WS toast to every actively-engaged device.
         for c in active_conns:
-            ok = await _safe_put(c.queue, {"type": "notification", "delivery": payload})
+            ok = await _safe_put(c.queue, {"type": wire.NOTIFICATION, "delivery": payload})
             if ok:
                 logger.debug(
                     f"Notification delivered via WS (active) to {user_sub} "
@@ -692,29 +1129,30 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
                 )
         # Silent inbox update to any inactive WS so its badge stays in sync.
         for c in inactive_conns:
-            await _safe_put(c.queue, {"type": "notification_silent", "delivery": payload})
+            await _safe_put(c.queue, {"type": wire.NOTIFICATION_SILENT, "delivery": payload})
         return
 
     # No active connection — native push is the alert channel.
     push_attempted = False
     try:
-        from services.notifications.push_sender import send_to_user
         _agent = delivery.get("agent_slug")
         _cid = delivery.get("chat_id")
-        if delivery.get("source") == "file_conflict" and _agent:
+        if delivery.get("href"):
+            click_url = delivery["href"]
+        elif delivery.get("source") == "file_conflict" and _agent:
             # File-conflict notifications deep-link to the workspace Recover bin
             # (no chat_id); AgentChat reads ?recover=1 and opens the modal.
             click_url = f"/chat/{_agent}?recover=1"
-        elif _cid and _cid.startswith("task-"):
+        elif session_kind.is_task_chat_id(_cid):
             # Task notifications deep-link to the chat page with task mode on;
             # without an agent slug, the /runs/{run_id} resolver redirects.
             click_url = (f"/chat/{_agent}/{_cid}?tasks=1" if _agent
-                         else f"/runs/{_cid[5:]}")
+                         else f"/runs/{session_kind.run_id_of_chat(_cid)}")
         elif _agent and _cid:
             click_url = f"/chat/{_agent}/{_cid}"
         else:
             click_url = "/"
-        await send_to_user(user_sub, {
+        await push_sender.send_to_user(user_sub, {
             # Native push has no agent header → the display name rides the
             # title (in-app rows keep the raw title + a header, see push_title).
             "title": push_title(delivery["title"], _agent),
@@ -729,15 +1167,13 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
             f"Notification delivered via native push to {user_sub} "
             f"(no active connection): {delivery['title']}"
         )
-    except ImportError:
-        logger.debug("push_sender not available yet, skipping push")
     except Exception as e:
         logger.warning(f"Push delivery failed to {user_sub}: {e}")
 
     # Silent inbox update to all connected-but-inactive WSes so the badge/inbox stay current
     # when the user returns to the dashboard.
     for c in all_conns:
-        await _safe_put(c.queue, {"type": "notification_silent", "delivery": payload})
+        await _safe_put(c.queue, {"type": wire.NOTIFICATION_SILENT, "delivery": payload})
 
     if not all_conns and not push_attempted:
         logger.debug(f"No delivery channel for {user_sub} — entry remains in DB inbox only")
@@ -750,6 +1186,8 @@ _scheduler_ref = None  # Set at startup
 
 def start() -> None:
     """Initialize notification system. Called at proxy startup after scheduler.start()."""
+    _register_audience_invalidation()
+    _schedule_audience_warmup()
     if config.SCHEDULER_MODE == "standalone":
         logger.info(
             "Notification manager started "

@@ -15,12 +15,50 @@ layer compares it for creator-scoped edit/delete.
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from storage.pg import get_conn
 
 logger = logging.getLogger(__name__)
 
 MAX_LEVELS = 8
+REACHES = ("adjacent", "subtree")
+
+
+class Wiring(NamedTuple):
+    """What a delegation mode wires between a department's levels."""
+
+    down: bool   # each member → the level(s) below
+    up: bool     # each member → the level(s) above
+    peers: bool  # members of one level → each other
+
+
+# The one place the mode words are spelled: the compiler and the prompt line
+# ask the predicates, the API and the store validate against the keys, and
+# the dashboard mirror is lib/kinds/department.ts (tests/core/test_kinds.py
+# binds the two). ``reach`` (adjacent | subtree)
+# says how many levels ``down`` and ``up`` span; it is independent of the
+# mode and applies to whatever the mode wires.
+MODE_WIRING: dict[str, Wiring] = {
+    "off": Wiring(down=False, up=False, peers=False),
+    "down": Wiring(down=True, up=False, peers=False),
+    "down_across": Wiring(down=True, up=False, peers=True),
+    "both": Wiring(down=True, up=True, peers=True),
+}
+MODES = tuple(MODE_WIRING)
+DEFAULT_MODE = "down"
+
+
+def _check_reach(reach: str) -> None:
+    if reach not in REACHES:
+        raise ValueError(f"reach must be 'adjacent' or 'subtree', got {reach!r}")
+
+
+def _check_mode(mode: str) -> None:
+    if mode not in MODE_WIRING:
+        raise ValueError(
+            f"mode must be one of {', '.join(MODES)}, got {mode!r}"
+        )
 
 
 def _now() -> str:
@@ -28,9 +66,7 @@ def _now() -> str:
 
 
 def _dept_row(row: dict) -> dict:
-    d = dict(row)
-    d["auto_delegation"] = bool(d["auto_delegation"])
-    return d
+    return dict(row)
 
 
 def _levels_for(conn, department_id: str) -> list[dict]:
@@ -89,26 +125,31 @@ def create_department(
     name: str,
     created_by_sub: str,
     *,
-    auto_delegation: bool = True,
+    mode: str = DEFAULT_MODE,
     reach: str = "adjacent",
     level_names: list[str] | None = None,
 ) -> dict:
-    """Create a department with its initial levels (rank = list order)."""
+    """Create a department with its initial levels (rank = list order).
+
+    A new department wires delegation downward only unless the caller picks
+    another mode (the column default 'both' exists for the migration of
+    pre-existing rows, never for a new one).
+    """
     names = [n.strip() for n in (level_names or ["Head", "Team"]) if n.strip()]
     if not names:
         raise ValueError("At least one level is required")
     if len(names) > MAX_LEVELS:
         raise ValueError(f"At most {MAX_LEVELS} levels allowed")
-    if reach not in ("adjacent", "subtree"):
-        raise ValueError(f"reach must be 'adjacent' or 'subtree', got {reach!r}")
+    _check_mode(mode)
+    _check_reach(reach)
     dept_id = f"dept-{uuid.uuid4().hex[:12]}"
     now = _now()
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO departments "
-            "(id, name, created_by_sub, auto_delegation, reach, created_at, updated_at) "
+            "(id, name, created_by_sub, mode, reach, created_at, updated_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (dept_id, name, created_by_sub, auto_delegation, reach, now, now),
+            (dept_id, name, created_by_sub, mode, reach, now, now),
         )
         for rank, level_name in enumerate(names):
             conn.execute(
@@ -121,13 +162,13 @@ def create_department(
 
 
 def update_department(department_id: str, **fields) -> dict | None:
-    """Partial update of name / auto_delegation / reach / position_hint."""
-    allowed = {"name", "auto_delegation", "reach", "position_hint"}
+    """Partial update of name / mode / reach / position_hint."""
+    allowed = {"name", "mode", "reach", "position_hint"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
-    if "reach" in updates and updates["reach"] not in ("adjacent", "subtree"):
-        raise ValueError(
-            f"reach must be 'adjacent' or 'subtree', got {updates['reach']!r}"
-        )
+    if "mode" in updates:
+        _check_mode(updates["mode"])
+    if "reach" in updates:
+        _check_reach(updates["reach"])
     if not updates:
         return get_department(department_id)
     updates["updated_at"] = _now()

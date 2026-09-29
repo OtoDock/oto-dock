@@ -2,7 +2,7 @@
 // sandboxed artifact/app iframes (same pattern as lib/fileUpdates).
 //
 // Iframes swallow touch events, so the dashboard's drawer gestures die when
-// the finger lands on a mini-app/artifact. The injected runtime inside the
+// the finger lands on an app/artifact. The injected runtime inside the
 // frame (UI_RUNTIME, proxy-side) recognizes the same horizontal swipe as
 // useSwipeGesture and posts `{type:'swipe', dir}`; the HOST component
 // (AppFrame/UiArtifact) validates the source window and emits here with its

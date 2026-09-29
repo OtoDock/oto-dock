@@ -1,5 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { isTaskChatId } from '../lib/session/kind'
+import { isLiveRunStatus, type RunStatus } from '../lib/status/run'
 
 export interface Run {
   id: string
@@ -7,7 +9,7 @@ export interface Run {
   agent: string
   trigger_type: string
   trigger_source: string | null
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'limit_exceeded'
+  status: RunStatus
   started_at: string | null
   completed_at: string | null
   duration_ms: number | null
@@ -19,6 +21,10 @@ export interface Run {
   task_type: string | null
   cost_usd: number
   chat_id: string | null
+  /** Background commands and subagents still running when the run
+   * completed (the session was kept for them; their output is not in the
+   * run). Absent on an older proxy. */
+  background_pending?: number
   /** 'user' for tasks created in the user's scope; 'agent' for agent-scoped
    * tasks (the common case for triggers, schedules, internal agents).
    * Drives the workspace overlay's chip filter on task chats. */
@@ -112,7 +118,7 @@ export const useRun = (runId: string) =>
     },
     refetchInterval: (query) => {
       const data = query.state.data as Run | undefined
-      return data?.status === 'running' || data?.status === 'pending' ? 3_000 : false
+      return isLiveRunStatus(data?.status) ? 3_000 : false
     },
   })
 
@@ -127,10 +133,10 @@ export const useRunByChat = (chatId: string | null) =>
       if (!res.ok) throw new Error('Run not found')
       return res.json()
     },
-    enabled: !!chatId && chatId.startsWith('task-'),
+    enabled: isTaskChatId(chatId),
     refetchInterval: (query) => {
       const data = query.state.data as Run | undefined
-      return data?.status === 'running' || data?.status === 'pending' ? 3_000 : false
+      return isLiveRunStatus(data?.status) ? 3_000 : false
     },
   })
 

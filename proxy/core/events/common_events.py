@@ -28,6 +28,7 @@ BG_COMMAND_START = "bg_command_start"  # run_in_background Bash spawned (CLI tas
 BG_COMMAND_END = "bg_command_end"      # background command finished (CLI task_updated{completed}/task_notification)
 DELEGATE_SPAWN = "delegate_spawn"  # delegate_task MCP tool
 DELEGATE_RESULT = "delegate_result"
+CHECK_VERDICT = "check_verdict"    # a check's verdict on the turn (CHECKS.md), injected by the evaluator
 WORKFLOW_START = "workflow_start"      # dynamic-workflow tool spawned (CLI task_started:local_workflow)
 WORKFLOW_PROGRESS = "workflow_progress"  # live phase/agent tree snapshot (CLI task_progress.workflow_progress)
 WORKFLOW_END = "workflow_end"          # workflow finished (CLI task_notification / task_updated)
@@ -123,6 +124,13 @@ class CommonEvent:
     DELEGATE_SPAWN:
         {"task_name": str, "agent": str}
 
+    CHECK_VERDICT:
+        The card event of services/checks/render.card_event: {"check": str,
+        "status": "pass"|"fail"|"error"|"skipped", "summary": str,
+        "findings": list, "round": int, "rounds": int, "ran_on": str, ...}.
+        Forwarded as-is, kept in the live state and persisted as an event
+        row, in order with the turn's blocks.
+
     PLAN_MODE:
         {"action": "enter"|"exit"}
         On exit with plan content (from ExitPlanMode tool_input):
@@ -173,7 +181,10 @@ class CommonEvent:
         {"message": str}
 
     QUEUE_TURN:
-        {"text": str}
+        {"text": str, "event_data": dict}
+        text = the raw user text of the drained batch (the user row);
+        event_data = the row's attachment meta ({"images": [{name, path}],
+        "files": [{path, name}]}), empty when the batch carried none.
 
     ARTIFACT_TURN:
         {"interactions": [{"token": str, "title": str, "payload": Any,
@@ -185,6 +196,63 @@ class CommonEvent:
     type: str
     data: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class TurnInput:
+    """One user message as the engine and the transcript each see it.
+
+    ``text`` is the raw typed text (the ``chat_messages`` row); ``cli_text``
+    is the engine prompt: the same text plus the sandbox-virtual paths of
+    the attached photos and files for engines that open them with their
+    Read tool. ``images`` are the vision blocks of an engine that takes
+    photos inline (Direct LLM) — empty otherwise. ``image_meta`` and
+    ``files`` are the row's attachment meta (``{name, path}`` per photo,
+    ``{path, name}`` per file); they ride the ``queued`` / ``steered`` /
+    ``queue_sent`` frames so the dashboard renders the chips and can hand
+    the attachments back to the composer on a cancel.
+
+    The shape is what the idle send builds, what a steer writes into the
+    live turn, and what the pump's message queue holds — so a message sent
+    while the agent works loses nothing an idle send would carry.
+    """
+
+    text: str
+    cli_text: str = ""
+    images: list[dict] = field(default_factory=list)
+    image_meta: list[dict] = field(default_factory=list)
+    files: list[dict] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.cli_text:
+            self.cli_text = self.text
+
+    @property
+    def event_meta(self) -> dict:
+        """The row's ``event_data`` dict: only the keys with content."""
+        meta: dict = {}
+        if self.image_meta:
+            meta["images"] = list(self.image_meta)
+        if self.files:
+            meta["files"] = list(self.files)
+        return meta
+
+    def frame_fields(self) -> dict:
+        """The attachment keys a queue/steer frame carries — absent when the
+        message has none, so text-only frames keep their exact shape."""
+        return self.event_meta
+
+    @classmethod
+    def combine(cls, items: "list[TurnInput]") -> "TurnInput":
+        """A drained batch as ONE turn: texts joined with a blank line (the
+        user row and the engine prompt alike), attachments concatenated."""
+        return cls(
+            text="\n\n".join(i.text for i in items),
+            cli_text="\n\n".join(i.cli_text for i in items),
+            images=[b for i in items for b in i.images],
+            image_meta=[m for i in items for m in i.image_meta],
+            files=[f for i in items for f in i.files],
+        )
 
 
 def goal_payload_to_state(data: dict) -> dict | None:
